@@ -1189,6 +1189,14 @@ per-cycle hash is not tested. An earlier build asserted it byte-exact in normal 
 went set-level. Un-claiming it (rather than chasing a race-invariant *logical-allocation* trigger — a GC
 redesign, since the runtime tracks only the physical live set) is the right call for the narrow benefit.
 
+This is also the **convergence point for "full determinism under `-race`"**: `-race` perturbs only the
+physical layer, so once the scheduler-determinism fix removed the other physical leak (system-goroutine
+RNG contention), this byte-based trigger is plausibly the *sole* remaining `-race`/binary-composition
+nondeterminism in the contract layer. Elevating per-cycle to deterministic ≡ achieving full `-race`
+determinism. The map-then-trigger plan (map to confirm GC is the only source; then a logical-allocation
+trigger, tractable for the floored small-live-set case) is in
+`docs/issues/dst-percycle-gc-discovery-determinism.md`.
+
 **An experiment proved the byte-layer fragility is reducible (and then proved the fix unnecessary).**
 Instrumenting `mallocgc` to count bubble allocations showed the bubble's logical allocation **count and
 requested bytes are `-race`-invariant** (`allocs = 40000`, `bytes = 10240000`, bit-identical normal vs
