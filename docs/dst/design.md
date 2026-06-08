@@ -1069,7 +1069,11 @@ below the GOGC scaling point), so `numGC = bubble-growth / heapMinimum`, and the
 `-race`-deterministic *within* a `-race` build — hence `numGC` and the total discovered set are
 deterministic under `-race`. The *per-cycle split* still jitters under `-race`: the heap trigger is
 *checked* at span-grab boundaries (`mallocgc`'s `checkGCTrigger`), which `-race`'s redzones shift, so the
-exact allocation a GC fires at moves by ±span.
+exact allocation a GC fires at moves by ±span. Measured: the split is **bimodal** under `-race` (the
+per-cycle hash takes one of two values run-to-run; `numGC` and the total set are stable). Un-relaxing
+this needs a race-invariant *logical-allocation* trigger (a real GC-trigger redesign, since the runtime
+tracks only the physical live set) for a narrow benefit — tracked in
+`docs/issues/dst-race-percycle-gc-timing.md`.
 
 **An experiment proved the byte-layer fragility is reducible (and then proved the fix unnecessary).**
 Instrumenting `mallocgc` to count bubble allocations showed the bubble's logical allocation **count and
