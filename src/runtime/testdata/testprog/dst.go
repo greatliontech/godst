@@ -42,6 +42,43 @@ func init() {
 	register("DSTWeakClearing", DSTWeakClearing)
 	register("DSTGCOffBound", DSTGCOffBound)
 	register("DSTProcessIdentity", DSTProcessIdentity)
+	register("DSTFinChain", DSTFinChain)
+}
+
+// dstMakeFinChain builds a 3-level finalizer chain in a dropped frame: c1's
+// finalizer keeps c2 alive, c2's keeps c3, and c3's finalizer touches a bubble
+// channel. Each object is reachable only through the previous object's pending
+// finalizer, so the chain resolves one GC per level. Three levels guarantee the
+// channel-touching tail (c3) is not reached by the ordinary Run-end teardown
+// (which drains ~2 levels) and would leak to the post-Run reap without the
+// Run-end fixpoint.
+//
+//go:noinline
+func dstMakeFinChain(ch chan int) {
+	c3 := &dstFinObj{}
+	runtime.SetFinalizer(c3, func(p *dstFinObj) { ch <- 99 })
+	c2 := &dstFinObj{}
+	runtime.SetFinalizer(c2, func(p *dstFinObj) { runtime.KeepAlive(c3) })
+	c1 := &dstFinObj{}
+	runtime.SetFinalizer(c1, func(p *dstFinObj) { runtime.KeepAlive(c2) })
+	runtime.KeepAlive(c1)
+}
+
+// DSTFinChain drops a finalizer chain whose tail touches a bubble channel and
+// then returns immediately (no in-run quiescence to resolve it), exercising the
+// Run-end fixpoint drain (design.md D4: Run-end fixpoint). Without the
+// fixpoint, the tail's finalizer runs on the post-Run reap's async fing
+// (g.bubble == nil) and its send fatals "send on synctest channel from outside
+// bubble"; with it, the whole chain runs in-bubble. Prints "ok" iff the run
+// completes without a fatal.
+func DSTFinChain() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(n, func() {
+		ch := make(chan int, 1) // buffered: the finalizer send must not block
+		dstMakeFinChain(ch)
+		_ = ch
+	})
+	os.Stdout.WriteString("ok\n")
 }
 
 // DSTProcessIdentity checks that os.Getpid/os.Hostname return the simulated

@@ -640,3 +640,16 @@ func TestDSTProcessIdentity(t *testing.T) {
 		t.Fatalf("process identity not simulated correctly:\n got=%q\nwant=%q", out, want)
 	}
 }
+
+// TestDSTFinalizerChainNoLeak verifies the Run-end fixpoint drain resolves a
+// finalizer chain whose tail touches a bubble channel fully in-bubble, so it does
+// not leak to the post-Run reap and fatal (design.md D4: Run-end fixpoint).
+// Mutation check: reverting the dstStopGCDrain fixpoint to a single drain makes
+// the testprog fatal instead of printing "ok".
+func TestDSTFinalizerChainNoLeak(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTFinChain", "DSTSEED=1", "GOGC=off"))
+	if out != "ok" {
+		t.Fatalf("finalizer chain not resolved in-bubble (got %q): a channel-touching "+
+			"chain tail leaked to the post-Run reap", out)
+	}
+}

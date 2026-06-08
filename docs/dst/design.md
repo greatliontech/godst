@@ -779,10 +779,22 @@ successive GC cycles. The full set is finalized by `Run` end. (A per-quiescence 
 over-run relative to the invariant *and* loop forever on a finalizer that re-registers itself with
 `SetFinalizer`.) The single `gopark` after the drain still waits for any bubble goroutine a finalizer
 *unblocked* — e.g. a finalizer that sends on a channel another goroutine receives on — to run and
-re-block before virtual time advances. One residual: a finalizer-chain **tail** whose finalizer touches
-a bubble channel and that is not resolved in-bubble before `Run` end is run by the post-`Run` reap on
-`fing` (bubble == nil) and fatals; narrow (protodb is unaffected — independent, channel-free
-finalizers), tracked in `docs/issues/dst-finalizer-chain-channel-tail.md`.
+re-block before virtual time advances.
+
+**Run-end fixpoint (resolves the chain-tail hazard).** The single-GC-per-quiescence rule is right
+*during* the run (it matches production chain resolution), but at `Run` **end** there is no later
+quiescence, so a chain whose **tail** touches a bubble channel and is dropped near the end (object B
+reachable only through object A's still-pending finalizer) would otherwise be discovered only by the
+post-`Run` reap — run on the async `fing`/cleanup goroutine (`g.bubble == nil`) — and the tail's
+channel op would fatal. So `dstStopGCDrain` loops GC+drain until a GC discovers nothing new
+(`dstDrainAtQuiescence` returns whether it made progress), resolving the whole chain **in-bubble**
+before teardown. This is bounded (`dstRunEndDrainRounds`) so a self-re-registering callback
+(`SetFinalizer`/`AddCleanup` of the object from its own callback) cannot spin forever — at the cap the
+residual falls through to the reap as before, the pathological case, not a chain. It is sound because
+the SUT has exited (everything is dead, so running the full chain is correct) and changes no in-run
+quiescence behavior; the cleanup drain (Chunk C) is covered identically (the loop checks both
+`finPending` and `cleanupPending`). Regression: `DSTFinChain` (a 3-level chain with a channel-touching
+tail) fatals on the post-`Run` reap without the fixpoint, prints `ok` with it.
 
 #### D5 — Scavenger off (dimension 9)
 

@@ -404,13 +404,17 @@ func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
 // finalizer/cleanup set observed at this quiescence is the deterministic dead set
 // (invariants DST-FIN-2, DST-CLEANUP-2).
 //
-// Exactly one GC, not a fixpoint: an object kept alive only by another
-// finalizable object's still-pending callback is *in* the quiescent live set (the
-// GC marks it to keep it for that callback), so it is not yet dead here and must
-// not run — its callback runs at a later quiescence once the earlier one has run,
-// exactly as production resolves finalizer/cleanup chains across successive GC
-// cycles. The full set runs by Run end. (A fixpoint of GC+drain would also loop
-// forever on a callback that re-registers itself with SetFinalizer/AddCleanup.)
+// Exactly one GC per *quiescence* (not a fixpoint): an object kept alive only by
+// another finalizable object's still-pending callback is *in* the quiescent live
+// set (the GC marks it to keep it for that callback), so it is not yet dead here
+// and must not run — its callback runs at a later quiescence once the earlier one
+// has run, exactly as production resolves finalizer/cleanup chains across
+// successive GC cycles. An unbounded per-quiescence fixpoint would also loop
+// forever on a callback that re-registers itself (SetFinalizer/AddCleanup of the
+// object from its own callback). At *Run end*, where there is no later quiescence,
+// dstStopGCDrain instead loops this a bounded number of rounds to resolve chains
+// fully in-bubble (see dstRunEndDrainRounds); that is why this returns whether it
+// made progress.
 //
 // The drain itself runs *all* currently-queued finalizers then cleanups
 // (dstDrainFinq/dstDrainCleanups loop until empty), absorbing any a callback
@@ -418,13 +422,17 @@ func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
 // finished and the bubble is quiescent again — which also waits for any bubble
 // goroutine a callback unblocked (e.g. one that sends on a channel another
 // goroutine is receiving on) to run and re-block, before virtual time advances.
-func (bubble *synctestBubble) dstDrainAtQuiescence() {
+// It reports whether it drained a level (the GC discovered dead finalizable/
+// cleanup-bearing objects and ran their callbacks); false means the GC found
+// nothing, which the Run-end fixpoint uses to detect that a finalizer/cleanup
+// chain is fully resolved.
+func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 	if bubble.gcDrain == nil {
-		return
+		return false
 	}
 	GC()
 	if !finPending() && !cleanupPending() {
-		return
+		return false
 	}
 	// Wake the drain to run the queued finalizers and cleanups, then park the root
 	// until the drain has finished and the bubble is quiescent again. Reuses the
@@ -432,7 +440,16 @@ func (bubble *synctestBubble) dstDrainAtQuiescence() {
 	// exactly as in the main loop.
 	goready(bubble.gcDrain, 0)
 	gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
+	return true
 }
+
+// dstRunEndDrainRounds bounds the Run-end finalizer/cleanup fixpoint so a callback
+// that re-registers itself (SetFinalizer(p, fn) inside fn, or AddCleanup of p
+// from p's own cleanup) cannot spin the drain forever. Real finalizer/cleanup
+// chains are shallow, so the loop almost always converges in one or two rounds;
+// the cap only bounds the pathological self-resurrecting case, whose residual
+// callbacks fall through to the post-Run reap as they did before this fixpoint.
+const dstRunEndDrainRounds = 256
 
 // dstStopGCDrain runs a final drain and stops the drain goroutine at Run
 // end. Called by the driver after the run loop, when the bubble is quiescent,
@@ -446,8 +463,21 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 	if bubble.gcDrain == nil {
 		return
 	}
-	// Run finalizers made dead by the run finishing (e.g. bubble.main's locals).
-	bubble.dstDrainAtQuiescence()
+	// Run finalizers/cleanups made dead by the run finishing (e.g. bubble.main's
+	// locals), draining finalizer/cleanup *chains* to a fixpoint. Unlike a
+	// quiescence point during the run — where exactly one GC runs, so a chain
+	// resolves one level per quiescence as in production (DST-FIN-2) — at Run end
+	// the SUT has exited and there is no later quiescence, so a chained callback
+	// left pending (object B reachable only through object A's still-pending
+	// finalizer) would leak to the post-Run reap on the async fing/cleanup
+	// goroutine (g.bubble == nil) and a channel-touching tail would fatal. Loop
+	// until a GC discovers nothing new, so the whole chain runs in-bubble; bounded
+	// by dstRunEndDrainRounds against a self-re-registering callback.
+	for i := 0; i < dstRunEndDrainRounds; i++ {
+		if !bubble.dstDrainAtQuiescence() {
+			break
+		}
+	}
 	lock(&bubble.mu)
 	bubble.gcDrainExit = true
 	unlock(&bubble.mu)
