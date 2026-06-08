@@ -13,8 +13,7 @@ I/O into the bubble and then layers fault injection on top.
 
 | Feature | Order | Summary |
 |---------|-------|---------|
-| [dst-network](dst-network.md) | first I/O feature | In-memory deterministic `net` (Dial/Listen/Conn/PacketConn/DNS + interfaces) so unmodified networked code is reproducible without modeling the network. Channel-backed, synctest-durable, address-registry; determinism rides the existing scheduler. The reliable base for network faults. Subsumes the old net.Interfaces deferral. |
-| [dst-disk](dst-disk.md) | after network | In-memory deterministic filesystem (os file ops, deterministic ReadDir order) so unmodified file-using code is reproducible. The base for disk faults (latency/EIO/ENOSPC/torn writes). |
+| [dst-disk](dst-disk.md) | next | In-memory deterministic filesystem (os file ops, deterministic ReadDir order) so unmodified file-using code is reproducible. The base for disk faults (latency/EIO/ENOSPC/torn writes). |
 | [dst-io](dst-io.md) | after disk | Deterministic file/pipe/stdio I/O for whatever network and disk don't cover (os.Pipe, std streams). |
 
 ## Deferrals

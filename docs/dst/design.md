@@ -136,9 +136,9 @@ hostname/pid/NumCPU) by deliberate choice — no SUT has needed per-run variatio
 lean; they are single constants in `runtime/dst.go` if that changes.
 
 One identity surface is **not yet virtualized**: `net.Interfaces`/`net.InterfaceAddrs` (interface
-MAC/IP) still report the real host's interfaces under a run. They fold into the pending **network**
-feature, which returns a fixed synthetic interface set consistent with the in-memory network's
-addressing (see `docs/issues/dst-network.md`). In fork scope there is no per-node virtualized-network
+MAC/IP) still report the real host's interfaces under a run. They are a follow-on of the landed
+in-memory network feature (see "In-memory deterministic network" below): a fixed synthetic interface
+set consistent with that network's addressing. In fork scope there is no per-node virtualized-network
 subsystem to source per-node identity from, so a fixed synthetic set — with per-run `Options` variation
 if ever needed — is the correct shape.
 
@@ -176,6 +176,32 @@ use).
   **uncached** (before `sync.Once`), so the real-user cache is never contaminated and stays valid for
   outside-run use; `uid`/`gid` have a single int source of truth (`os/user` formats the string form),
   so `os.Getuid` and `os/user.Current` cannot disagree.
+
+### In-memory deterministic network (the first I/O feature)
+
+This is a **contract change**: real network I/O moves from "out of scope, the program models it
+in-memory" to **owned by the fork**, so unmodified networked code is reproducible under DST without
+being rewired through an injected transport.
+
+Under a run, `net.Dial`/`net.Listen` stop touching the OS and run on an in-process **address registry**:
+`Listen` registers a simulated listener; `Dial` looks it up and hands the dialer end of a new connection
+back while pushing the server end onto the listener's accept queue. A connection is a `net.Pipe`
+endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with the
+simulated local/remote `*net.TCPAddr`. The seam is the exported `Dial`/`DialContext`/`ListenConfig.Listen`
+(the `os.Getpid` altitude), gated on `dstActive()` so it compiles out without `-tags dst`; net's internal
+lookups stay real (the program does not exercise real sockets under DST).
+
+**Determinism is free.** Connection/accept/delivery order is just the goroutine schedule, which is
+already deterministic — no new seed, no new RNG. The registry is keyed by a per-run epoch (`dstNetEpoch`,
+bumped in `dstActivate`) so it resets between runs with no teardown hook. Enforced by `TestDSTNet`
+(a two-node exchange replays byte-identically across processes; the per-run reset lets a second run
+re-Listen the same address). This is the reliable, in-order **base** on which network faults
+(partition/drop/reorder/latency) layer later as policies on the same registry+conns.
+
+**Caveat (fidelity).** `Dial` returns the `net.Conn` *interface*; code that type-asserts the concrete
+`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. DNS resolution, UDP
+(`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed synthetic set consistent with this
+addressing) are follow-on increments. FIPS/Boring-style configs are out of scope as elsewhere.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -248,7 +274,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 
 | Source | Mechanism | Status |
 |---|---|---|
-| Goroutine scheduling order | per-g RNG tree + single-P + sysmon neutralized + the get-side selection hook (Seq 5) | ✅ |
+| Goroutine scheduling order | per-g RNG tree + single-P + sysmon neutralized + the get-side selection hook (Seq 5); system (non-bubble) goroutines isolated from the seeded RNG | ✅ |
 | `select` poll order | per-g `g.dstrand` | ✅ |
 | map iteration order | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`) | ✅ |
 | `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
@@ -256,7 +282,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
-| network I/O | in-memory deterministic `net` | ⏳ |
+| network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem | ⏳ |
 | other I/O (files, pipes, stdio) | in-memory deterministic I/O | ⏳ |
 | faults (scheduling / net / disk / crash) | fault-orchestration layer | ⏳ |
@@ -333,14 +359,28 @@ the fixed seams, so later steps add, never rewrite.
   scheduling faults (delay/deprioritize a runnable G) folds into the fault-orchestration feature below.
   Turns reproducibility into *directed* exploration.
 
+- **System-goroutine isolation (scheduling robustness). LANDED.** The seeded scheduling RNG
+  (`dstSchedRand`) advances only for selections among *bubble* goroutines; runtime-infrastructure
+  goroutines (`g.bubble == nil`) are scheduled by a fixed RNG-free policy (`dstFindRunnable` prefers
+  them in candidate order). Without this, how often infrastructure goroutines need scheduling — which is
+  timing- and binary-composition-dependent — would consume a varying number of RNG draws and shift the
+  program's interleaving (a rare nondeterminism a heavy `import` like `net` exposed). Invariant:
+  `rngDraws == decisions − sysScheds`, enforced by `TestDSTSchedSystemIsolation`.
+
+- **Network (in-memory deterministic `net`). LANDED (first I/O feature).** Under DST, `net.Dial`/`Listen`
+  run on an in-process address registry instead of the OS: `Dial` ↔ `Accept` hand each other a
+  `net.Pipe`-backed connection pair (channel I/O, synctest-durable, deadlines on the fake clock) wrapped
+  with simulated addresses, so unmodified networked code is reproducible without modeling the network
+  itself. Determinism rides the scheduler (no new seed plumbing); the registry is keyed by a per-run
+  epoch so it resets between runs. The reliable, in-order base for network faults. See the "In-memory
+  deterministic network" section above; tested by `TestDSTNet`. Caveat: only the `net.Conn` interface — code type-asserting
+  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/UDP/Unix/`net.Interfaces` are follow-ons.
+
 ### Pending features
 
-These bring real I/O into the bubble and then layer fault injection on top. Each is virtualized
-in-memory and deterministic, riding the existing scheduling/time determinism (no new seed plumbing).
+These bring the remaining real I/O into the bubble and then layer fault injection on top. Each is
+virtualized in-memory and deterministic, riding the existing scheduling/time determinism.
 
-- **Network** — an in-memory, deterministic `net` (`Dial`/`Listen`/`Conn`/`PacketConn`/DNS) under DST,
-  so unmodified networked code is reproducible without modeling the network itself. The reliable,
-  in-order base on which network faults are later layered.
 - **Disk / filesystem** — an in-memory, deterministic filesystem under DST (file ops, directory
   iteration), the base for disk faults.
 - **I/O** — deterministic file/pipe/stdio I/O for whatever the network and filesystem layers do not
@@ -1101,12 +1141,14 @@ set-at-quiescence to **per-cycle discovery determinism**.
 **Validation + the Seq-5 boundary (measured).** The entry-GC baseline holds: `bubbleMarked =
 heapMarked − base` is identical across runs (12/12) — the GC trajectory is deterministic. Finalizer
 discovery is then **fully deterministic for non-contended workloads** (single goroutine, ring buffer:
-20/20). For **multi-goroutine + `Gosched` contention** a ~15 % residual remains, and a controlled
-experiment proves it is **the Seq-5 scheduling-order axis, not the GC**: removing the `Gosched` makes
-the *same* workload 20/20 deterministic, and a race-free interleaving observable is nondeterministic
-with **GC entirely off** (4 distinct/10). So with contention, *which* objects sit in each per-goroutine
-structure at the (deterministic) GC instant varies with the runnable-goroutine order — which Seq 5
-controls. **Scope of the A.5 tighten:** per-cycle discovery is deterministic *given* a deterministic
+20/20). A **multi-goroutine + `Gosched` contention** residual once measured here (~15 %; with GC
+entirely off, a race-free interleaving observable was 4 distinct/10) was proven to be **the
+scheduling-order axis, not the GC**: removing the `Gosched` made the *same* workload 20/20
+deterministic. That residual is now **closed** by the system-goroutine-isolation fix (above): the
+remaining nondeterminism was infrastructure goroutines consuming the bubble's scheduling RNG a
+timing-varying number of times; isolating them makes the runnable order — and thus *which* objects sit
+in each per-goroutine structure at the (deterministic) GC instant — a pure function of the seed even
+under contention. **Scope of the A.5 tighten:** per-cycle discovery is deterministic *given* a deterministic
 runnable order; under contention it is an interleaving-sensitive observable, dependent on that order
 (the scheduling-order axis, Seq 5) exactly as every such observable is — which is why the
 discovery test is single-goroutine, to isolate the GC trigger from that axis. (`finqueued` is

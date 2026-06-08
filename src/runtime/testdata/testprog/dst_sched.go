@@ -12,7 +12,26 @@ import (
 	"sync/atomic"
 	"testing/simulation"
 	"time"
+	_ "unsafe" // for go:linkname
 )
+
+//go:linkname dstSchedStatsFP runtime.dstSchedStatsFP
+func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64)
+
+// DSTSchedStats runs a contended workload inside simulation.Run and prints the
+// scheduling counters "decisions sysScheds rngDraws". It anchors the
+// system-goroutine-isolation invariant: rngDraws == decisions - sysScheds (the
+// scheduling RNG advances once per bubble-goroutine selection, never for a system
+// one), and sysScheds > 0 (the contended workload does interleave system
+// goroutines). Without the isolation, system selections would draw from the
+// bubble RNG, making the interleaving nondeterministic.
+func DSTSchedStats() {
+	seed, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(seed, func() { _ = schedMutex() })
+	d, sys, rng := dstSchedStatsFP()
+	os.Stdout.WriteString(strconv.FormatUint(d, 10) + " " +
+		strconv.FormatUint(sys, 10) + " " + strconv.FormatUint(rng, 10) + "\n")
+}
 
 // Seq-5 derisk probes. Each scenario records the order in which participating
 // goroutines reach a shared observation point, inside simulation.Run, and prints the
@@ -22,6 +41,7 @@ import (
 // single interleaving == the gap Seq 5 closes). DSTSCENARIO selects the scenario.
 func init() {
 	register("DSTSchedScenario", DSTSchedScenario)
+	register("DSTSchedStats", DSTSchedStats)
 }
 
 // schedRecorder is a race-free interleaving recorder: each goroutine claims a

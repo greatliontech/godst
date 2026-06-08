@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"internal/synctest"
 	"math/rand/v2"
+	"net"
 	"os"
 	"os/user"
 	"runtime"
@@ -48,6 +49,7 @@ func init() {
 	register("DSTProcessIdentity", DSTProcessIdentity)
 	register("DSTIdentityExtra", DSTIdentityExtra)
 	register("DSTCryptoRand", DSTCryptoRand)
+	register("DSTNet", DSTNet)
 	register("DSTFinChain", DSTFinChain)
 	register("DSTMemLimit", DSTMemLimit)
 }
@@ -146,6 +148,63 @@ func DSTProcessIdentity() {
 	os.Stdout.WriteString("def=" + def + " custom=" + custom +
 		" restored=" + strconv.FormatBool(restored) +
 		" realoverridden=" + strconv.FormatBool(realOverridden) + "\n")
+}
+
+// DSTNet exercises the in-memory deterministic network: inside simulation.Run a
+// server Listens/Accepts and a client Dials over net's TCP API, exchange a
+// request/response over the simulated connection, with the simulated addresses.
+// With the real OS network this could not run deterministically (or at all in a
+// sandbox); here it is a function of the seed. Prints a summary line; two runs (a
+// and b) check same-seed determinism and that the per-run registry reset (b's
+// Listen on the same address must not be "address already in use").
+func DSTNet() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	exchange := func() string {
+		var out string
+		simulation.Run(n, func() {
+			const addr = "10.0.0.1:9000"
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				out = "listen err: " + err.Error()
+				return
+			}
+			done := make(chan string, 1)
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					done <- "accept err: " + err.Error()
+					return
+				}
+				buf := make([]byte, 16)
+				nr, _ := c.Read(buf)
+				msg := string(buf[:nr])
+				c.Write([]byte("echo:" + msg))
+				from := c.RemoteAddr().String()
+				c.Close()
+				done <- "server saw " + msg + " from " + from
+			}()
+			client, err := net.Dial("tcp", addr)
+			if err != nil {
+				out = "dial err: " + err.Error()
+				return
+			}
+			client.Write([]byte("ping"))
+			buf := make([]byte, 32)
+			nr, _ := client.Read(buf)
+			resp := string(buf[:nr])
+			srv := <-done
+			out = "resp=" + resp + " local=" + client.LocalAddr().String() +
+				" remote=" + client.RemoteAddr().String() + " | " + srv
+		})
+		return out
+	}
+	a := exchange()
+	b := exchange()
+	if a != b {
+		os.Stdout.WriteString("DIVERGED\n a=" + a + "\n b=" + b + "\n")
+		return
+	}
+	os.Stdout.WriteString(a + "\n")
 }
 
 // DSTIdentityExtra checks the rest of the process-identity surface beyond

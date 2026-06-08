@@ -524,6 +524,9 @@ func (d *Dialer) Dial(network, address string) (Conn, error) {
 // See func [Dial] for a description of the network and address
 // parameters.
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
+	if dstActive() {
+		return dstDial(network, address) // deterministic simulation: see net/dst.go
+	}
 	ctx, cancel := d.dialCtx(ctx)
 	defer cancel()
 
@@ -872,6 +875,9 @@ func (lc *ListenConfig) SetMultipathTCP(use bool) {
 // The ctx argument is used while resolving the address on which to listen;
 // it does not affect the returned Listener.
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {
+	if dstActive() {
+		return dstListen(network, address) // deterministic simulation: see net/dst.go
+	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}

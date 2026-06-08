@@ -29,6 +29,23 @@ import (
 // the per-g routing hot paths and by sysmon.
 var dstSeed atomic.Uint64
 
+// dstRunEpoch is a monotonic counter bumped once per run (dstActivate), so a
+// consumer can detect a new run and reset per-run in-memory state.
+var dstRunEpoch atomic.Uint64
+
+// dstNetEpoch returns the current run's epoch (0 outside a run). net keys its
+// simulated-network registry by it: a different epoch means a new run, so the
+// registry resets — keeping listeners from one run out of the next, with no
+// explicit teardown hook. Read by net via linkname.
+//
+//go:linkname dstNetEpoch
+func dstNetEpoch() uint64 {
+	if !dstActive() {
+		return 0
+	}
+	return dstRunEpoch.Load()
+}
+
 // dstActive reports whether deterministic simulation testing is active.
 //
 // The dstBuild guard is load-bearing for cost, not just correctness: dstBuild is
@@ -40,7 +57,10 @@ var dstSeed atomic.Uint64
 // without dstBuild anyway: simulation.Run requires the tag, and dstActivate is an
 // unexported test-only linkname.)
 //
+// The push linkname lets net pull it to gate the simulated network at Dial/Listen.
+//
 //go:nosplit
+//go:linkname dstActive
 func dstActive() bool {
 	return dstBuild && dstSeed.Load() != 0
 }
@@ -64,6 +84,11 @@ func dstActivate(seed uint64) {
 	if seed == 0 {
 		seed = 1
 	}
+	// Bump the per-run epoch so per-run in-memory state keyed by it (e.g. net's
+	// simulated-network registry) resets between runs without an explicit hook:
+	// a consumer that sees a new epoch discards its old state. One dstActivate per
+	// simulation.Run, so one epoch per run/bubble.
+	dstRunEpoch.Add(1)
 	// Root the caller, then turn routing on. Correctness does not rely on the
 	// atomic ordering the store provides: every goroutine that can draw under DST
 	// is either created after activation (newproc1 seeds it from its parent, with
@@ -161,7 +186,28 @@ func dstSchedRandUint64() uint64 {
 	z := dstSchedRand
 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
 	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	dstSchedRNGDraws++
 	return z ^ (z >> 31)
+}
+
+// Per-bubble scheduling counters underpinning the system-goroutine-isolation
+// invariant (see dstFindRunnable): under the Random strategy, rngDraws ==
+// decisions - sysScheds — the scheduling RNG advances once per bubble-goroutine
+// selection and never for a system (bubble==nil) one, so the program's
+// interleaving is a pure function of the seed, independent of timing-/composition-
+// varying system-goroutine activity. (Under PCT the bubble selection is priority-
+// driven and draws dstSchedRand at goroutine creation, not at selection, so
+// rngDraws is lower; the isolation — no system selection draws — is what matters
+// and holds for both.) Reset per bubble. Read by the regression test via linkname.
+var dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws uint64
+
+func dstSchedStatsReset() {
+	dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws = 0, 0, 0
+}
+
+//go:linkname dstSchedStatsFP
+func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64) {
+	return dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws
 }
 
 // dstSchedRandn returns a deterministic value in [0,n) from the scheduling RNG,

@@ -7731,7 +7731,33 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 		unlock(&sched.lock)
 		return nil, false
 	}
-	gp, inheritTime = c.removeAt(dstSchedSelect(&c, total))
+	dstSchedDecisions++
+	// Runtime-internal goroutines outside any bubble (g.bubble == nil — the
+	// runtime's own goroutines, e.g. the background mark worker or the main
+	// goroutine; the bubble's finalizer/cleanup drains have g.bubble set and are not
+	// these) are not the simulated program, and how often they need scheduling is
+	// timing- and binary-composition-dependent. If their selection drew from the
+	// bubble's scheduling RNG, that timing-varying draw count would shift every
+	// subsequent bubble-goroutine selection — the same seed would then produce
+	// different interleavings across processes. That bug was rare (~1% of runs) but
+	// grew with binary size (a bare `import "net"` reliably triggered it, since its
+	// bulk adds startup-goroutine timing variance), so it passed on lean binaries and
+	// surfaced on heavy ones. This isolates it away entirely: schedule any such
+	// runnable goroutine first, by a fixed RNG-free policy; dstSchedRand advances only
+	// for selections among bubble goroutines, so the interleaving is a pure function
+	// of the seed regardless of system-goroutine timing (0 divergences over 600+
+	// cross-process runs; mutation-tested by TestDSTSchedSystemIsolation). (Sound because under DST no g.bubble==nil goroutine is persistently
+	// runnable while bubble goroutines are: GC marks stop-the-world in-bubble and
+	// sysmon is neutralized, so these run once and block — they cannot starve the
+	// bubble. In practice they are only ever the sole runnable candidate.)
+	var sel uint32
+	if k, ok := c.firstSystemG(total); ok {
+		sel = k
+		dstSchedSysScheds++
+	} else {
+		sel = dstSchedSelect(&c, total)
+	}
+	gp, inheritTime = c.removeAt(sel)
 	unlock(&sched.lock)
 	return gp, inheritTime
 }
@@ -7787,6 +7813,19 @@ type dstCandidates struct {
 // strategies (PCT) that must inspect candidates before choosing. The global-runq
 // branch walks the linked list (O(k)); the runnable set is short under the
 // single-P simulation. Caller holds sched.lock.
+// firstSystemG returns the index of the first candidate goroutine that is not
+// part of a synctest bubble (g.bubble == nil) — runtime infrastructure rather
+// than the simulated program — or false if every candidate is a bubble goroutine.
+// Scanned in candidate order, so the choice is deterministic.
+func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
+	for k := uint32(0); k < total; k++ {
+		if gp := c.at(k); gp != nil && gp.bubble == nil {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
 func (c *dstCandidates) at(k uint32) *g {
 	pp := c.pp
 	if k < c.ringN {

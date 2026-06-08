@@ -663,6 +663,56 @@ func TestDSTCryptoRandDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTNet verifies the in-memory deterministic network (the first I/O feature):
+// inside simulation.Run a client/server exchange over net.Dial/Listen completes
+// with the simulated addresses, replays byte-identically across processes, and the
+// per-run registry resets between runs (the second of two in-process runs Listens
+// on the same address without "address already in use"). Network I/O that cannot
+// run deterministically — or at all in a sandbox — on the real OS is here a
+// function of the seed. Mutation check: dropping the dstNetEpoch reset makes the
+// second run fail "address already in use" (DIVERGED); not gating Dial/Listen on
+// dstActive() makes it hit the real network (refused/hang).
+func TestDSTNet(t *testing.T) {
+	const want = "resp=echo:ping local=127.0.0.1:40000 remote=10.0.0.1:9000 | server saw ping from 127.0.0.1:40000"
+	out1 := strings.TrimSpace(runTestProgDST(t, "DSTNet", "DSTSEED=42"))
+	if out1 != want {
+		t.Fatalf("in-memory net exchange wrong:\n got=%q\nwant=%q", out1, want)
+	}
+	out2 := strings.TrimSpace(runTestProgDST(t, "DSTNet", "DSTSEED=42"))
+	if out2 != out1 {
+		t.Fatalf("in-memory net not reproducible across processes:\nrun1=%q\nrun2=%q", out1, out2)
+	}
+}
+
+// TestDSTSchedSystemIsolation verifies the system-goroutine-isolation invariant
+// that keeps the schedule deterministic regardless of timing-/composition-varying
+// runtime-infrastructure scheduling: under DST the scheduling RNG advances exactly
+// once per *bubble* goroutine selection and never for a system (bubble==nil) one.
+// So for a contended workload under the Random strategy, rngDraws == decisions -
+// sysScheds, with sysScheds>0 (system goroutines are interleaved). Without isolation, system selections
+// would draw from the bubble RNG, and how often they occur (timing/binary
+// composition) would shift every subsequent selection — the nondeterminism a bare
+// `import "net"` exposed (~1% of runs). Mutation check: making dstFindRunnable
+// select system goroutines via dstSchedSelect (drawing RNG) makes rngDraws ==
+// decisions != decisions - sysScheds.
+func TestDSTSchedSystemIsolation(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTSchedStats", "DSTSEED=12345"))
+	f := strings.Fields(out)
+	if len(f) != 3 {
+		t.Fatalf("bad stats output %q, want \"decisions sysScheds rngDraws\"", out)
+	}
+	decisions, _ := strconv.Atoi(f[0])
+	sysScheds, _ := strconv.Atoi(f[1])
+	rngDraws, _ := strconv.Atoi(f[2])
+	if sysScheds <= 0 {
+		t.Fatalf("no system goroutines scheduled (%q): the workload does not exercise the isolation", out)
+	}
+	if rngDraws != decisions-sysScheds {
+		t.Fatalf("scheduling RNG drew for system goroutines (not isolated): rngDraws=%d, want decisions-sysScheds=%d-%d=%d",
+			rngDraws, decisions, sysScheds, decisions-sysScheds)
+	}
+}
+
 // TestDSTFinalizerChainNoLeak verifies the Run-end fixpoint drain resolves a
 // finalizer chain whose tail touches a bubble channel fully in-bubble, so it does
 // not leak to the post-Run reap and fatal (design.md D4: Run-end fixpoint).

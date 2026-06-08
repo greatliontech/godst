@@ -222,6 +222,7 @@ func synctestRun(f func()) {
 			// in isolation, independent of what scheduled before this bubble. See
 			// dstSchedRand.
 			dstSchedRand = dstSchedRoot(dstSeed.Load())
+			dstSchedStatsReset()
 			if dstSchedKind == dstSchedPCT {
 				// Re-root the PCT state (change points, step counter) for this bubble.
 				// Goroutine priorities are assigned at creation (newproc1), so the
