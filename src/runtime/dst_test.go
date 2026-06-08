@@ -6,6 +6,7 @@ package runtime_test
 
 import (
 	"internal/race"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -651,5 +652,50 @@ func TestDSTFinalizerChainNoLeak(t *testing.T) {
 	if out != "ok" {
 		t.Fatalf("finalizer chain not resolved in-bubble (got %q): a channel-touching "+
 			"chain tail leaked to the post-Run reap", out)
+	}
+}
+
+// TestDSTMemStatsDeterministic verifies the RSS-derived MemStats fields are
+// deterministic under DST: HeapReleased/HeapIdle are reported as synthetic 0
+// (the simulation does not model OS memory), and the bubble-local fields are
+// reproducible across runs (design.md D6: deterministic RSS MemStats).
+// Mutation check: removing the readmemstats_m override makes HeapIdle reflect the
+// (nonzero, process-history-dependent) free heap.
+func TestDSTMemStatsDeterministic(t *testing.T) {
+	for i := 0; i < 6; i++ {
+		out := strings.TrimSpace(runTestProgDST(t, "DSTMemStats", "DSTSEED=12345", "GOGC=100"))
+		if out != "0 0" {
+			t.Fatalf("RSS-derived MemStats not deterministic-synthetic under DST (run %d, got %q): "+
+				"HeapReleased and HeapIdle carry process history and must be reported as 0", i+1, out)
+		}
+	}
+}
+
+// TestDSTMemoryLimit verifies Options.MemoryLimit deterministically bounds the
+// bubble's heap growth (design.md D6: Options.MemoryLimit): a
+// tighter limit forces more GCs, and the GC count is reproducible. Mutation
+// check: ignoring dstMemLimit in the trigger makes the two limits produce the
+// same count.
+func TestDSTMemoryLimit(t *testing.T) {
+	run := func(limit string) int {
+		out := strings.TrimSpace(runTestProgDST(t, "DSTMemLimit", "DSTSEED=1", "GOGC=off", "DSTMEMLIMIT="+limit))
+		n, err := strconv.Atoi(out)
+		if err != nil {
+			t.Fatalf("bad NumGC output %q: %v", out, err)
+		}
+		return n
+	}
+	tight := run("2097152") // 2 MiB
+	loose := run("8388608") // 8 MiB
+	if tight < 2 {
+		t.Fatalf("MemoryLimit did not bound the heap: tight-limit numGC=%d (heap grew unbounded?)", tight)
+	}
+	if tight <= loose {
+		t.Fatalf("MemoryLimit had no effect: 2 MiB numGC=%d not greater than 8 MiB numGC=%d", tight, loose)
+	}
+	for i := 0; i < 3; i++ {
+		if run("2097152") != tight {
+			t.Fatalf("MemoryLimit numGC nondeterministic across runs (run %d): got %d, want %d", i+1, run("2097152"), tight)
+		}
 	}
 }

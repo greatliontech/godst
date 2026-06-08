@@ -814,19 +814,27 @@ sub-observable byte-noise of the heap trigger (D2), so a SUT that branches coars
 replays, one that compares them byte-exactly may see noise. Weak-pointer clearing (dimension 7) is
 deterministic at the set level — confirmed in Chunk D (`TestDSTWeakClearingDeterministic`).
 
-**`GOMEMLIMIT` and RSS stats are *not* deterministic under DST — corrected by Chunk D.** The earlier
-claim here ("`GOMEMLIMIT` needs no special handling … observably deterministic") was written before A.5
-landed and is **wrong**. A.5 replaced the production heap goal (which was `min(gcPercentHeapGoal,
-memoryLimitHeapGoal)`) with a *GOGC-only* bubble-relative trigger, so **`GOMEMLIMIT` is now ignored** by
-the DST trigger. And it cannot simply be re-added: `memoryLimitHeapGoal` derives from `mappedReady`
-(total mapped memory), which is **not bubble-local** and is **nondeterministic** under DST (measured
-~115 KB run-to-run spread: mmap-arena history + ASLR + scavenger-off accumulation). Honoring it makes
-`NumGC` wobble (measured 8/9 at a tight `GOMEMLIMIT`). The same `mappedReady`/RSS noise makes
-`HeapReleased` nondeterministic (~0.5 MB swing) even with the scavenger parked (D5) — sweep-time
-`madvise` on layout-dependent freed spans. A.5's bubble-local technique does not transfer, because
-GOMEMLIMIT's semantics are inherently *total-memory*, not bubble-local. What GOMEMLIMIT should mean
-under DST is an **open question** — see `docs/issues/dst-gomemlimit-rss-nondeterminism.md`; a SUT must
-not branch on `GOMEMLIMIT`-driven `NumGC` or on RSS-derived stats (`HeapReleased`/`HeapIdle`) under DST.
+**`GOMEMLIMIT` and RSS stats under DST — resolved by Chunk G.** The *env* `GOMEMLIMIT` still cannot be
+honored deterministically: A.5 replaced the production heap goal (`min(gcPercentHeapGoal,
+memoryLimitHeapGoal)`) with a *GOGC-only* bubble-relative trigger, and `memoryLimitHeapGoal` derives
+from `mappedReady` (total mapped memory), which is **not bubble-local** and **nondeterministic** under
+DST (~115 KB run-to-run: mmap-arena history + ASLR + scavenger-off accumulation); honoring it makes
+`NumGC` wobble (8/9 at a tight limit). GOMEMLIMIT's semantics are inherently *total-RSS*, which DST
+does not model (the scavenger is parked, D5). Two fixes give the user a deterministic equivalent:
+- **`Options.MemoryLimit`** — a per-run knob that bounds the bubble's *own* heap growth
+  (`heapLive - dstHeapBase`), which is bubble-local and deterministic, so `NumGC` under the limit is
+  reproducible (`TestDSTMemoryLimit`; the trigger in `mgc.go` `gcTrigger.test`). Redefined semantics
+  under DST: *bound bubble heap growth*, not *bound total RSS*. It is an upper bound on top of the GOGC
+  trigger; when `GOGC=off` it is the sole bound (the `defaultHeapMinimum` floor is skipped so a limit
+  set above it is honored).
+- **Deterministic RSS `MemStats`** — `ReadMemStats` reports the RSS-derived heap fields
+  (`HeapReleased`, `HeapIdle`, and `HeapSys`'s idle component) as synthetic deterministic 0 under DST,
+  since their real values carry `mappedReady`/sweep-`madvise` process noise (`readmemstats_m`;
+  `TestDSTMemStatsDeterministic`). The bubble-local fields (`HeapAlloc`, `HeapInuse`, `Mallocs`/`Frees`,
+  `NumGC`) remain accurate; the process-total `Sys`/`*Sys`/`HeapAlloc` fields carry small process-state
+  jitter and are not claimed byte-exact (the GC-timing layer). A SUT that sizes by memory pressure
+  should read `HeapAlloc`/`HeapInuse` (bubble-local) and use `Options.MemoryLimit`, not the env
+  `GOMEMLIMIT` or `HeapReleased`/`HeapIdle`.
 
 **So that memory is always bounded** regardless of config, the DST trigger falls back to a fixed
 `defaultHeapMinimum` floor when `GOGC=off` (`gcPercent < 0`), instead of never firing — a GOGC=off
@@ -836,11 +844,14 @@ deterministically). `defaultHeapMinimum`, the constant, not `gcController.heapMi
 `defaultHeapMinimum*GOGC/100` and overflows to garbage when `GOGC=off`.
 
 > **Invariant DST-MEM-1 (observable memory determinism).** Under DST, the GC-set-level memory
-> observables a SUT can read — `NumGC` (under GOGC) and the set of weak pointers cleared — are a
-> deterministic function of the seed. *Violation:* a SUT branches on `NumGC` or on which weak refs
-> cleared and sees different values across runs of one seed. *Enforced:*
-> `TestDSTGCAllocBoundDeterministic`, `TestDSTWeakClearingDeterministic`. (`GOMEMLIMIT`-driven `NumGC`
-> and RSS-derived stats are **excluded** — nondeterministic, see above and the filed open issue.)
+> observables a SUT can read — `NumGC` (under GOGC or `Options.MemoryLimit`), the set of weak pointers
+> cleared, and the RSS-derived `MemStats` fields (`HeapReleased`/`HeapIdle`, reported as synthetic 0) —
+> are a deterministic function of the seed. *Violation:* a SUT branches on `NumGC`, on which weak refs
+> cleared, or on `HeapReleased`/`HeapIdle`, and sees different values across runs of one seed.
+> *Enforced:* `TestDSTGCAllocBoundDeterministic`, `TestDSTWeakClearingDeterministic`,
+> `TestDSTMemoryLimit`, `TestDSTMemStatsDeterministic`. (Excluded — *not* claimed byte-exact: `NumGC`
+> driven by the *env* `GOMEMLIMIT`, and the process-total `Sys`/`*Sys`/`HeapAlloc` fields, which carry
+> process-state jitter; a SUT must size by bubble-local heap and `Options.MemoryLimit` instead.)
 >
 > **Invariant DST-MEM-2 (always memory-bounded).** Under DST, a bubble that allocates is
 > deterministically memory-bounded for *any* GOGC/GOMEMLIMIT config: the heap trigger always fires for

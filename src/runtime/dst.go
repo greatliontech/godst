@@ -315,6 +315,21 @@ func dstSimGetpid() (int, bool) { return dstSimPID, dstSimEnvSet }
 //go:linkname dstSimGethostname
 func dstSimGethostname() (string, bool) { return dstSimHostname, dstSimEnvSet }
 
+// dstMemLimit is the per-run deterministic bubble-local heap-growth budget
+// (testing/simulation Options.MemoryLimit; 0 = no limit). Unlike GOMEMLIMIT —
+// whose total-RSS semantics are not bubble-local and so not deterministic under
+// DST (the scavenger is parked and total mapped memory carries process history) —
+// this bounds the bubble's *own* heap growth (heapLive - dstHeapBase), which is
+// deterministic, so the GC count under a memory limit is reproducible. Set before
+// dstActivate, read by the heap trigger (gcTrigger.test).
+var dstMemLimit int64
+
+// dstSetMemLimit records the per-run bubble-local memory budget. Called by
+// testing/simulation.run before dstActivate; reset to 0 on return.
+//
+//go:linkname dstSetMemLimit
+func dstSetMemLimit(limit int64) { dstMemLimit = limit }
+
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //

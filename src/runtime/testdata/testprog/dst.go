@@ -43,6 +43,52 @@ func init() {
 	register("DSTGCOffBound", DSTGCOffBound)
 	register("DSTProcessIdentity", DSTProcessIdentity)
 	register("DSTFinChain", DSTFinChain)
+	register("DSTMemStats", DSTMemStats)
+	register("DSTMemLimit", DSTMemLimit)
+}
+
+// dstMemSink keeps the most recent allocation live so the rest become garbage.
+var dstMemSink []byte
+
+// DSTMemStats churns ~8 MB of heap then GCs and reads MemStats inside the
+// simulation. The RSS-derived fields (HeapReleased, HeapIdle) carry process
+// history and sweep-time madvise that vary run to run; under DST they are
+// reported as deterministic synthetic 0. Prints "HeapReleased HeapIdle". (The
+// process-total live-heap fields like HeapAlloc carry process state and are not
+// claimed byte-exact — the same layer as the GC-timing observable.)
+func DSTMemStats() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var ms runtime.MemStats
+	simulation.Run(n, func() {
+		for i := 0; i < 4096; i++ {
+			dstMemSink = make([]byte, 2048)
+			dstMemSink[0] = byte(i)
+		}
+		dstMemSink = nil
+		runtime.GC()
+		runtime.ReadMemStats(&ms)
+	})
+	os.Stdout.WriteString(strconv.FormatUint(ms.HeapReleased, 10) + " " +
+		strconv.FormatUint(ms.HeapIdle, 10) + "\n")
+}
+
+// DSTMemLimit allocates ~16 MB of non-blocking garbage under a deterministic
+// bubble-local Options.MemoryLimit (DSTMEMLIMIT bytes) and prints the resulting
+// NumGC. A tighter limit forces more GCs; the count is deterministic.
+func DSTMemLimit() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	limit, _ := strconv.ParseInt(os.Getenv("DSTMEMLIMIT"), 10, 64)
+	var ngc uint32
+	simulation.RunWith(n, simulation.Options{MemoryLimit: limit}, func() {
+		for i := 0; i < 16384; i++ {
+			dstMemSink = make([]byte, 1024)
+			dstMemSink[0] = byte(i)
+		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		ngc = ms.NumGC
+	})
+	os.Stdout.WriteString(strconv.FormatUint(uint64(ngc), 10) + "\n")
 }
 
 // dstMakeFinChain builds a 3-level finalizer chain in a dropped frame: c1's

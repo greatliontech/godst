@@ -725,23 +725,42 @@ func (t gcTrigger) test() bool {
 			// boundaries that -race's redzones shift. See the layered contract in the
 			// testing/simulation package doc.
 			hm := gcController.heapMarked
+			live := gcController.heapLive.Load()
+			base := dstHeapBase.Load()
+			// Deterministic bubble-local memory limit (Options.MemoryLimit). The env
+			// GOMEMLIMIT cannot be honored deterministically under DST — its goal
+			// derives from total mapped memory, which is not bubble-local and varies
+			// run to run (the scavenger is parked and process mmap history/ASLR perturb
+			// it). This knob instead bounds the bubble's *own* heap growth (heapLive -
+			// dstHeapBase), which is deterministic, so the GC count under the limit is
+			// reproducible. Redefined semantics under DST: "bound bubble heap growth",
+			// not "bound total RSS". When set it is an upper bound applied on top of the
+			// GOGC trigger (GOGC may still fire earlier for a small live set).
+			if dstMemLimit > 0 && live > base && live-base >= uint64(dstMemLimit) {
+				return true
+			}
+			gp := gcController.gcPercent.Load()
 			var target uint64
-			if gp := gcController.gcPercent.Load(); gp < 0 {
-				// GOGC=off. Production would leave the heap unbounded unless a
-				// GOMEMLIMIT goal applies; DST cannot honor GOMEMLIMIT
-				// deterministically — its goal derives from total mapped memory,
-				// which is not bubble-local and varies run to run (D6, "GOMEMLIMIT
-				// and RSS stats are not deterministic"). So that a GOGC=off bubble
-				// that allocates is still *deterministically* memory-bounded rather
-				// than growing without limit, fall back to a fixed floor instead of
-				// never triggering. Use the constant defaultHeapMinimum, not
+			switch {
+			case gp < 0 && dstMemLimit > 0:
+				// GOGC=off with a memory limit: the heap is bounded solely by the limit
+				// (handled above); do not also apply the floor, which would undercut a
+				// limit set above defaultHeapMinimum.
+				return false
+			case gp < 0:
+				// GOGC=off, no limit. Production would leave the heap unbounded; so a
+				// GOGC=off bubble that allocates is still *deterministically* bounded
+				// rather than growing without limit, fall back to a fixed floor instead
+				// of never triggering. Use the constant defaultHeapMinimum, not
 				// gcController.heapMinimum, which is defaultHeapMinimum*GOGC/100 and so
 				// overflows to garbage when GOGC=off (gcPercent == -1). Bubbles that
-				// allocate below this floor (e.g. the logical-only DST tests) still
-				// never GC.
+				// allocate below this floor (e.g. the logical-only DST tests) never GC.
 				target = defaultHeapMinimum
-			} else {
-				base := dstHeapBase.Load()
+			default:
+				// Per-bubble relative target: the GOGC ratio of the bubble's *own* live
+				// set (heapMarked - dstHeapBase), excluding the run-to-run-varying
+				// process baseline, so the GC-trigger crossing — and thus finalizer/weak
+				// discovery — is a deterministic function of the bubble's allocation.
 				bubbleMarked := uint64(0)
 				if hm > base {
 					bubbleMarked = hm - base
@@ -751,7 +770,7 @@ func (t gcTrigger) test() bool {
 					target = gcController.heapMinimum
 				}
 			}
-			return gcController.heapLive.Load() >= hm+target
+			return live >= hm+target
 		}
 		trigger, _ := gcController.trigger()
 		return gcController.heapLive.Load() >= trigger

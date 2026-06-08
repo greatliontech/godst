@@ -78,6 +78,9 @@ func dstSetSimEnv(hostname string, pid int)
 //go:linkname dstClearSimEnv runtime.dstClearSimEnv
 func dstClearSimEnv()
 
+//go:linkname dstSetMemLimit runtime.dstSetMemLimit
+func dstSetMemLimit(limit int64)
+
 // Strategy selects how RunWith explores goroutine interleavings. All strategies
 // are sound (they only reorder goroutines that are simultaneously runnable, a
 // real degree of freedom) and deterministic (a function of the seed); they differ
@@ -124,6 +127,15 @@ type Options struct {
 	// default — so even plain Run is reproducible for a SUT that reads pid/hostname.
 	Hostname string
 	PID      int
+
+	// MemoryLimit, if > 0, is a deterministic bubble-local memory budget in bytes:
+	// the simulation triggers GC to keep the program's *own* heap growth within it.
+	// It is the deterministic substitute for GOMEMLIMIT, whose total-RSS semantics
+	// cannot be modeled deterministically under the simulation (the scavenger is
+	// parked and total mapped memory carries process history). Unlike GOMEMLIMIT it
+	// bounds the program's heap growth, not total process RSS; 0 leaves memory
+	// bounded by GOGC (and a floor when GOGC=off).
+	MemoryLimit int64
 }
 
 // default simulated process identity (see Options.Hostname/PID).
@@ -202,10 +214,10 @@ func RunWith(seed uint64, opts Options, f func()) {
 	if pid == 0 {
 		pid = defaultPID
 	}
-	run(seed, kind, depth, steps, hostname, pid, f)
+	run(seed, kind, depth, steps, hostname, pid, opts.MemoryLimit, f)
 }
 
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid int, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid int, memLimit int64, f func()) {
 	if !dstBuilt() {
 		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	}
@@ -213,11 +225,13 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid int, 
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
 	dstSetSimEnv(hostname, pid) // before dstActivate: published to the bubble by the activation store
+	dstSetMemLimit(memLimit)
 	dstActivate(seed)
 	defer func() {
 		dstDeactivate()
 		dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
 		dstClearSimEnv()
+		dstSetMemLimit(0)
 		// Evict sync.Pool entries that outlive the bubble (a pooled channel is
 		// stamped with this bubble; reusing it in the next Run fatals). Two cycles
 		// clear the Pool victim cache. This is a cross-Run pool-lifetime fix,
