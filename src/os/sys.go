@@ -6,5 +6,8 @@ package os
 
 // Hostname returns the host name reported by the kernel.
 func Hostname() (name string, err error) {
+	if h, ok := dstSimGethostname(); ok {
+		return h, nil // deterministic simulation: see os/dst.go
+	}
 	return hostname()
 }

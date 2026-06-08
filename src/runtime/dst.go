@@ -272,6 +272,49 @@ func dstPCTAssignPrio(newg *g) {
 	newg.dstPrio = dstPCTBase + int64(dstSchedRandUint64()&0x7fffffff)
 }
 
+// Simulated process identity. Under DST the testing/simulation package fixes
+// os.Getpid and os.Hostname to deterministic values, closing the determinism
+// hole a SUT that reads pid/hostname (for node IDs, temp names, pid-seeded RNGs)
+// would otherwise have: the real machine's pid/hostname vary per run and per host.
+// Set by dstSetSimEnv *before* dstActivate, so the activation's atomic store
+// publishes them to the bubble's goroutines; read by os.Getpid/os.Hostname via
+// the linkname'd accessors below. dstSimEnvSet is false on the white-box
+// dstActivate path (no public Run), so os returns the real identity there.
+var (
+	dstSimPID      int
+	dstSimHostname string
+	dstSimEnvSet   bool
+)
+
+// dstSetSimEnv records the simulated process identity for the next run. Called by
+// testing/simulation.run before dstActivate; cleared by dstClearSimEnv on return.
+//
+//go:linkname dstSetSimEnv
+func dstSetSimEnv(hostname string, pid int) {
+	dstSimHostname = hostname
+	dstSimPID = pid
+	dstSimEnvSet = true
+}
+
+// dstClearSimEnv stops simulating process identity (run end).
+//
+//go:linkname dstClearSimEnv
+func dstClearSimEnv() {
+	dstSimEnvSet = false
+	dstSimHostname = ""
+	dstSimPID = 0
+}
+
+// dstSimGetpid and dstSimGethostname are read by os.Getpid/os.Hostname (via
+// linkname) to return the simulated identity during a run; the bool reports
+// whether process identity is being simulated.
+//
+//go:linkname dstSimGetpid
+func dstSimGetpid() (int, bool) { return dstSimPID, dstSimEnvSet }
+
+//go:linkname dstSimGethostname
+func dstSimGethostname() (string, bool) { return dstSimHostname, dstSimEnvSet }
+
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //

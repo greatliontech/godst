@@ -41,6 +41,30 @@ func init() {
 	register("DSTCleanupChanOpPriorG", DSTCleanupChanOpPriorG)
 	register("DSTWeakClearing", DSTWeakClearing)
 	register("DSTGCOffBound", DSTGCOffBound)
+	register("DSTProcessIdentity", DSTProcessIdentity)
+}
+
+// DSTProcessIdentity checks that os.Getpid/os.Hostname return the simulated
+// process identity inside simulation.Run (a deterministic default, or the value
+// set via Options), and the real machine's identity outside it. Prints
+// "def=<pid>/<host> custom=<pid>/<host> restored=<bool> realoverridden=<bool>".
+func DSTProcessIdentity() {
+	host := func() string { h, _ := os.Hostname(); return h }
+	realPID, realHost := os.Getpid(), host()
+	var def, custom string
+	simulation.Run(1, func() {
+		def = strconv.Itoa(os.Getpid()) + "/" + host()
+	})
+	simulation.RunWith(1, simulation.Options{Hostname: "node7", PID: 4242}, func() {
+		custom = strconv.Itoa(os.Getpid()) + "/" + host()
+	})
+	restored := os.Getpid() == realPID && host() == realHost
+	// realoverridden confirms the real identity differs from the simulated default,
+	// so def=1/sim is a genuine override and not a coincidence.
+	realOverridden := realPID != 1 || realHost != "sim"
+	os.Stdout.WriteString("def=" + def + " custom=" + custom +
+		" restored=" + strconv.FormatBool(restored) +
+		" realoverridden=" + strconv.FormatBool(realOverridden) + "\n")
 }
 
 // dstFinqSeqFP returns the per-cycle finalizer-discovery sequence hash (bubble-

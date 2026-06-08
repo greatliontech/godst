@@ -628,3 +628,15 @@ func TestDSTSchedulePCTChangePoints(t *testing.T) {
 		t.Fatalf("PCT change points had no effect: matched-bound and out-of-range-bound runs were identical for all %d seeds (change-point deprioritization is dead)", len(dstSchedSeeds))
 	}
 }
+
+// TestDSTProcessIdentity verifies the simulation fixes os.Getpid/os.Hostname to a
+// deterministic identity inside Run (a default, or the Options value), and
+// restores the real machine's identity afterward. Closes the determinism hole a
+// SUT reading pid/hostname would otherwise have.
+func TestDSTProcessIdentity(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTProcessIdentity"))
+	const want = "def=1/sim custom=4242/node7 restored=true realoverridden=true"
+	if out != want {
+		t.Fatalf("process identity not simulated correctly:\n got=%q\nwant=%q", out, want)
+	}
+}

@@ -72,6 +72,12 @@ func dstBuilt() bool
 //go:linkname dstSetSchedStrategy runtime.dstSetSchedStrategy
 func dstSetSchedStrategy(kind uint8, depth, steps int32)
 
+//go:linkname dstSetSimEnv runtime.dstSetSimEnv
+func dstSetSimEnv(hostname string, pid int)
+
+//go:linkname dstClearSimEnv runtime.dstClearSimEnv
+func dstClearSimEnv()
+
 // Strategy selects how RunWith explores goroutine interleavings. All strategies
 // are sound (they only reorder goroutines that are simultaneously runnable, a
 // real degree of freedom) and deterministic (a function of the seed); they differ
@@ -110,7 +116,21 @@ type Options struct {
 	// the priority-change points are placed uniformly in [1,Steps]. Ignored unless
 	// Strategy==PCT. Default 1000; a rough over-estimate is fine.
 	Steps int
+
+	// Hostname and PID are the simulated process identity: within Run, os.Hostname
+	// and os.Getpid return these instead of the real machine's values (which vary
+	// per run and per host, and would leak nondeterminism into any program under
+	// test that reads them). Both Run and RunWith fix them — to "sim" and 1 by
+	// default — so even plain Run is reproducible for a SUT that reads pid/hostname.
+	Hostname string
+	PID      int
 }
+
+// default simulated process identity (see Options.Hostname/PID).
+const (
+	defaultHostname = "sim"
+	defaultPID      = 1
+)
 
 // Run runs f inside a deterministic simulation seeded by seed: with the same
 // seed, the scheduling of goroutines started within f and the runtime
@@ -146,7 +166,7 @@ type Options struct {
 // bare for{}) will not be preempted and will stall the simulation; real code
 // rarely does this.
 func Run(seed uint64, f func()) {
-	run(seed, kindRandom, 0, 0, f)
+	RunWith(seed, Options{}, f)
 }
 
 // RunWith is Run with an explicit exploration Strategy (Random or PCT). Use it to
@@ -174,20 +194,30 @@ func RunWith(seed uint64, opts Options, f func()) {
 			steps = int32(opts.Steps)
 		}
 	}
-	run(seed, kind, depth, steps, f)
+	hostname := opts.Hostname
+	if hostname == "" {
+		hostname = defaultHostname
+	}
+	pid := opts.PID
+	if pid == 0 {
+		pid = defaultPID
+	}
+	run(seed, kind, depth, steps, hostname, pid, f)
 }
 
-func run(seed uint64, kind uint8, depth, steps int32, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid int, f func()) {
 	if !dstBuilt() {
 		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	}
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
+	dstSetSimEnv(hostname, pid) // before dstActivate: published to the bubble by the activation store
 	dstActivate(seed)
 	defer func() {
 		dstDeactivate()
 		dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
+		dstClearSimEnv()
 		// Evict sync.Pool entries that outlive the bubble (a pooled channel is
 		// stamped with this bubble; reusing it in the next Run fatals). Two cycles
 		// clear the Pool victim cache. This is a cross-Run pool-lifetime fix,

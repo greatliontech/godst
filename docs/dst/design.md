@@ -101,6 +101,20 @@ testing construct, not a `runtime` sub-package.
   exercise the per-g mechanism under `GOMAXPROCS>1` M-migration that `Run` (single-P) cannot
   reproduce. This is the only non-`Run` entry and is not a user surface.
 
+### Deterministic process identity (`Options.Hostname` / `Options.PID`)
+
+`os.Getpid()` and `os.Hostname()` return the **real** machine's values, which vary per run and per
+host — a determinism hole for any SUT that derives identity or seeds from them (node IDs, temp paths,
+the `pid`-seeded RNGs some libraries use, including goutils' `LockGuardedRand`). So under a run the
+simulation fixes them: `os.Getpid`/`os.Hostname` are patched to return a simulated identity when DST
+is active (`os/dst.go` bridges to `runtime` via `//go:linkname`; the runtime holds the per-run values,
+set by `testing/simulation.run` *before* `dstActivate` so the activation's atomic store publishes them
+to the bubble, and cleared on return). Both `Run` and `RunWith` fix the identity — to `"sim"` and `1`
+by default — so even plain `Run` is reproducible here; `RunWith{Hostname, PID}` overrides. This is the
+one place the fork patches a package other than `runtime`/`testing/simulation`, and it is unavoidable:
+the SUT calls `os.*` directly. The white-box `dstActivate` path leaves identity unset (real values),
+as it is not a user surface.
+
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
 Map *iteration order* depends on the process-global hash key (`aeshash`/`memhash`), set at **startup**
