@@ -27,14 +27,18 @@ fires on **physical heap bytes** (`heapLive`), which redzones shift by ±1 span.
 the trigger and you get full `-race` determinism. There is no separate "race
 problem" and "GC problem."
 
-**The scheduler-determinism fix (commit `d8f46779a6`) already removed the *other*
+**The scheduler-determinism fix (commit `d8f46779a6`) already removed *one*
 physical/timing leak.** That bug — system (`g.bubble==nil`) goroutines consuming the
 bubble's seeded scheduling RNG a timing-varying number of times — was the same shape
 (a physical/timing quantity leaking into a seeded stream) and was *worse* under
 `-race`. It is fixed (system goroutines scheduled RNG-free; invariant `rngDraws ==
-decisions - sysScheds`, `TestDSTSchedSystemIsolation`). So the GC byte-trigger is
-**plausibly the last** physical leak in the contract layer — a hypothesis the
-mapping phase must *confirm*, not assume.
+decisions - sysScheds`, `TestDSTSchedSystemIsolation`).
+
+The mapping phase (Phase 1, below) then **confirmed the GC byte-trigger is the sole
+remaining *within-build* `-race` source — but refuted "plausibly the last leak"**: it
+also found a *second*, independent **cross-build** leak of the same class (the map
+hash key — see "Phase 1 — MAP RESULT"), now fixed. So "the GC byte-trigger is the last
+one" was not a safe assumption; the map had to be drawn.
 
 ## Behaviour (the thing to fix)
 
@@ -77,6 +81,44 @@ finalizer-discovery sequence (`finqueued − dstFinqBase` folded per in-bubble G
 the `dstFinqSeq` probe was removed when the discovery test went set-level; re-add it
 temporarily), the GC-trigger crossing points, weak-clear order. Outcome: a confirmed
 map (GC trigger is the lone source) or a list of other sources to address first.
+
+### Phase 1 — MAP RESULT (measured, 300–600 runs/build, net-heavy testprog)
+
+Two corrections to the assumptions above; the map was *not* what was assumed.
+
+1. **GC per-cycle discovery is the sole *within-build* `-race` source — confirmed.** Over 300
+   runs/build, every logical observable (goroutine interleaving across 5 scenarios, select order,
+   per-g `math/rand`) and every GC *set-level* observable (`numGC`, the full finalizer run-set
+   count+sum, the weak-cleared set) is `distinct=1` in *both* normal and `-race` builds. Only the
+   GC *per-cycle* observables diverge: the per-cycle finalizer-discovery sequence (`finq`), the
+   per-cycle `heapMarked` crossing (`mark`), and per-cycle weak-clear timing — the last is
+   *bit-identical* to `finq` every run (weak clearing rides the same sweep-pass crossing, not an
+   independent source).
+2. **Correction A — per-cycle is *not* byte-exact in a fixed normal build.** It is already
+   non-deterministic in a *normal* build at scale (`finq` 3–4 distinct/300, `mark` 5–7); `-race`
+   merely *amplifies* the same span-crossing wobble (4–8 distinct/300). The "byte-exact per-cycle in
+   a fixed normal build" claim (design.md) was measured at 1/10 runs and does not survive 300. ⟹ the
+   Phase-2 logical-allocation trigger fixes the normal-build and `-race` per-cycle determinism *at
+   once* — one defect, not two. The set-level contract (DST-GC-1) holds in both builds (the `runCount`
+   /`runSum`/`numGC` invariance above).
+3. **Correction B — a *second*, independent source: the map hash key (now FIXED, Phase 2b).** Multi-
+   group (`≥16`-element) map iteration order is **build/composition-dependent**: deterministic
+   *within* a build (`distinct=1`/600) but different normal-vs-`-race`. Root-caused: the per-g RNG
+   stream is byte-identical across builds (anchors before/after a map match; single-group `≤8` maps
+   match), `useAeshash=true` in both — but the `-tags dst` AES hash key `aeskeysched` is the normal
+   build's **shifted by exactly one word** under `-race` (`race[i]==normal[i-1]` across 6 words),
+   because `alginit` fills it from `bootstrapRand` at a startup *stream position* that `-race` shifts
+   by one extra draw. Shifted key → different `hash & mask` placement → different multi-group order;
+   single-group maps place in insertion order (hash-independent) → invariant. **Same defect class as
+   the scheduler leak.** Fixed by deriving the key from a fixed constant under `-tags dst`
+   (`alg.go` `dstFixedHashKey`); enforced by `TestDSTMapHashKeyBuildInvariant`. See design.md
+   "Map hash key requires `-tags dst`".
+
+**Net:** for *within-build* `-race` replay (the meaningful "determinism under `-race`": a SUT runs in
+one build) the GC per-cycle byte-trigger is the lone remaining source (Phase 2 below). For
+*cross-build / composition* identity, there were two sources; the map hash key is now fixed, leaving
+the GC trigger. The trace-hash probe used to draw this map is temporary (re-added per the plan above)
+and is reverted before commit.
 
 ### Phase 2 — TRIGGER (the real work)
 

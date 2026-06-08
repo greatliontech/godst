@@ -5,6 +5,11 @@
 package runtime_test
 
 import (
+	"internal/platform"
+	"internal/testenv"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -144,6 +149,66 @@ func TestDSTDeterministicMap(t *testing.T) {
 	out3 := runTestProgDST(t, "DSTMapOrder", dstEnv("67890")...)
 	if out3 == out1 {
 		t.Fatalf("different seeds produced identical map order (seed has no effect): %q", out1)
+	}
+}
+
+// buildTestProgExplicit builds the testprog with the given flags verbatim, NOT
+// inheriting the test binary's own -race mode (unlike buildTestProg, which
+// appends -race when the test runs under -race). This lets a single test compare
+// a normal-dst build against a -race-dst build.
+func buildTestProgExplicit(t *testing.T, exe string, flags ...string) {
+	t.Helper()
+	cmd := exec.Command(testenv.GoToolPath(t), append([]string{"build", "-o", exe}, flags...)...)
+	cmd.Dir = "testdata/testprog"
+	cmd = testenv.CleanCmdEnv(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building testprog %v: %v\n%s", flags, err, out)
+	}
+}
+
+// TestDSTMapHashKeyBuildInvariant verifies that the -tags dst global map hash key
+// is position-independent, so map iteration order is identical across builds — in
+// particular between a normal-dst build and a -race-dst build. The key is fixed
+// by -tags dst (randinit seeds the global RNG from a constant), but deriving it
+// from bootstrapRand drew from the global RNG at a startup *stream position* that
+// -race shifts by one draw (composition/instrumentation varies the preceding
+// draw count), so it was only fixed *per build*: a >=16-element map iterated in a
+// different order under -race. alg.go now derives the key from a fixed constant
+// (dstFixedHashKey), position-independently. Per-map m.seed still varies order by
+// seed (TestDSTDeterministicMap); only this one global key is fixed, now
+// identically across builds.
+//
+// Mutation check: reverting alg.go to fill the key from bootstrapRand makes the
+// -race build's order differ from the normal build's, failing here.
+func TestDSTMapHashKeyBuildInvariant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the extra -race build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+
+	dir := t.TempDir()
+	normalExe := filepath.Join(dir, "tp_normal")
+	raceExe := filepath.Join(dir, "tp_race")
+	buildTestProgExplicit(t, normalExe, "-tags=dst")
+	buildTestProgExplicit(t, raceExe, "-tags=dst", "-race")
+
+	// DSTMapOrder iterates a 48-element (multi-group) map, whose order depends on
+	// the global hash key; single-group maps (<=8) place keys in insertion order
+	// and are invariant regardless, so they would not detect a key shift.
+	env := dstEnv("12345")
+	normalOut := runBuiltTestProg(t, normalExe, "DSTMapOrder", env...)
+	raceOut := runBuiltTestProg(t, raceExe, "DSTMapOrder", env...)
+	if strings.TrimSpace(normalOut) == "" {
+		t.Fatal("empty map order output")
+	}
+	if normalOut != raceOut {
+		t.Fatalf("map iteration order differs between a normal-dst and a -race-dst build "+
+			"(the -tags dst global hash key is not build-invariant):\nnormal=%q\n  race=%q",
+			normalOut, raceOut)
 	}
 }
 

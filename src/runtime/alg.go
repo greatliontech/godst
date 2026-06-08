@@ -402,6 +402,18 @@ func alginit() {
 		initAlgAES()
 		return
 	}
+	if dstBuild {
+		// See initAlgAES: derive the fallback hash key from a fixed constant,
+		// position-independently, so map iteration order is identical across builds
+		// and binary compositions under -tags dst. uintptr() mirrors the production
+		// truncation on 32-bit.
+		var k [len(hashkey)]uint64
+		dstFixedHashKey(k[:], dstHashKeySaltFallback)
+		for i := range hashkey {
+			hashkey[i] = uintptr(k[i])
+		}
+		return
+	}
 	for i := range hashkey {
 		hashkey[i] = uintptr(bootstrapRand())
 	}
@@ -409,10 +421,51 @@ func alginit() {
 
 func initAlgAES() {
 	useAeshash = true
-	// Initialize with random data so hash collisions will be hard to engineer.
 	key := (*[hashRandomBytes / 8]uint64)(unsafe.Pointer(&aeskeysched))
+	if dstBuild {
+		// -tags dst fixes the global map hash key for determinism (randinit seeds
+		// the global RNG from a constant; see design.md "Map hash key requires
+		// -tags dst"). But filling the key from bootstrapRand draws from the global
+		// RNG at whatever *stream position* alginit reaches, and that position
+		// depends on how many startup draws preceded it — which varies with binary
+		// composition and -race/-msan instrumentation. So a bootstrapRand-derived
+		// key is only fixed *per build*: a different build shifts the key (measured:
+		// -race shifts it one word), changing multi-group map iteration order
+		// (keys land in different groups via hash & mask). Derive the key from a
+		// fixed constant instead, so it is position-independent and the key — and
+		// thus map order — is identical across builds and compositions, realizing
+		// the spec's fixed-key intent fully. Per-map seed variation (m.seed) is
+		// unaffected; only this one process-global key is fixed.
+		dstFixedHashKey(key[:], dstHashKeySaltAES)
+		return
+	}
+	// Initialize with random data so hash collisions will be hard to engineer.
 	for i := range key {
 		key[i] = bootstrapRand()
+	}
+}
+
+// Distinct (nonzero) salts so the AES key schedule and the non-AES fallback hash
+// key are independent constants. Only one is used per process (depending on AES
+// support), so this is defensive — but it keeps the two key streams decorrelated.
+const (
+	dstHashKeySaltAES      = 0x6165736b65793031 // "aeskey01"
+	dstHashKeySaltFallback = 0x66616c6c6b793031 // "fallky01"
+)
+
+// dstFixedHashKey fills words from a fixed constant via splitmix64, for -tags dst
+// builds (see initAlgAES). Mirrors dstFixedSeed (rand.go): the value is arbitrary
+// but fixed and salted per key, so the derived map hash key is identical every
+// run AND across builds/compositions — unlike a bootstrapRand-derived key, whose
+// value depends on the composition-varying startup stream position.
+func dstFixedHashKey(words []uint64, salt uint64) {
+	x := uint64(0x686b657964737401) ^ salt // "hkeydst\x01"
+	for i := range words {
+		x += 0x9e3779b97f4a7c15
+		z := x
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		words[i] = z ^ (z >> 31)
 	}
 }
 
