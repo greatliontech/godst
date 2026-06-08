@@ -710,40 +710,43 @@ func (t gcTrigger) test() bool {
 	switch t.kind {
 	case gcTriggerHeap:
 		if dstActive() {
-			// Per-bubble relative trigger: fire when the bubble's growth since the
-			// last mark reaches the GOGC ratio of the bubble's *own* live set
-			// (heapMarked - dstHeapBase), excluding the run-to-run-varying process
-			// baseline. This makes the GC *set level* — numGC and the total
-			// finalizer/weak set discovered — a deterministic function of the
-			// bubble's allocation, which is the contract (DST-GC-1). The heapMinimum
-			// floor is the same as production. See docs/dst/design.md.
+			// Per-bubble relative trigger: fire when the bubble's allocation since the
+			// last mark (dstHeapAlloc) reaches the GOGC ratio of the bubble's *own*
+			// live set (heapMarked - dstHeapBase), excluding the run-to-run-varying
+			// process baseline. This makes the GC *set level* — numGC and the total
+			// finalizer/weak set discovered — a deterministic function of the bubble's
+			// allocation (the contract, DST-GC-1). The heapMinimum floor is as
+			// production. See docs/dst/design.md.
 			//
-			// The trigger fires on heap *bytes*, so *which cycle* discovers a given
-			// object is byte-exact only in a fixed normal build and sub-observable
-			// noise otherwise — not part of the contract and not tested. -race/-msan
-			// redzones shift the span-grab boundaries the trigger is checked at, and a
-			// change in binary composition shifts the entry span-fill phase; either
-			// moves the per-cycle split by ±span. numGC and the total set are
-			// unaffected (for the small-live-set workloads DST targets the target
-			// floors at heapMinimum and bubble growth is invariant). See the layered
-			// contract in the testing/simulation package doc.
+			// It fires on dstHeapAlloc — bytes summed per-object at allocation
+			// (mallocgc) — NOT physical heapLive. heapLive advances span-granularly
+			// (a whole span when grabbed, mcache.go), so the allocation at which it
+			// crosses the target depends on the entry span-fill phase, which varies
+			// run to run (and is perturbed by -race/binary composition); that moved
+			// *which cycle* discovered a given object. Per-object accumulation crosses
+			// at a deterministic allocation, so per-cycle discovery is a deterministic
+			// function of the seed in normal AND -race builds — not merely the set
+			// level. (A rare sub-object residual remains in the GOGC-scaled target via
+			// the dstHeapBase process baseline; sub-observable, see DST-MEM-1.)
 			hm := gcController.heapMarked
-			live := gcController.heapLive.Load()
 			base := dstHeapBase.Load()
 			// Deterministic bubble-local memory limit (Options.MemoryLimit). The env
 			// GOMEMLIMIT cannot be honored deterministically under DST — its goal
 			// derives from total mapped memory, which is not bubble-local and varies
 			// run to run (the scavenger is parked and process mmap history/ASLR perturb
 			// it). This knob instead bounds the bubble's *own* heap growth (heapLive -
-			// dstHeapBase), which is deterministic, so the GC count under the limit is
-			// reproducible. Redefined semantics under DST: "bound bubble heap growth",
-			// not "bound total RSS". When set it is an upper bound applied on top of the
-			// GOGC trigger (GOGC may still fire earlier for a small live set).
-			if dstMemLimit > 0 && live > base && live-base >= uint64(dstMemLimit) {
+			// dstHeapBase), which is deterministic at the set level, so the GC *count*
+			// under the limit is reproducible. Redefined semantics under DST: "bound
+			// bubble heap growth", not "bound total RSS". When set it is an upper bound
+			// applied on top of the GOGC trigger (GOGC may still fire earlier for a small
+			// live set). NB: this crossing is still physical span-granular heapLive, so a
+			// MemoryLimit-governed cycle is set-level-deterministic but NOT per-cycle
+			// race-deterministic like the dstHeapAlloc-driven GOGC trigger below — see
+			// docs/issues/dst-memlimit-percycle-determinism.md.
+			if live := gcController.heapLive.Load(); dstMemLimit > 0 && live > base && live-base >= uint64(dstMemLimit) {
 				return true
 			}
 			gp := gcController.gcPercent.Load()
-			var target uint64
 			switch {
 			case gp < 0 && dstMemLimit > 0:
 				// GOGC=off with a memory limit: the heap is bounded solely by the limit
@@ -758,22 +761,22 @@ func (t gcTrigger) test() bool {
 				// gcController.heapMinimum, which is defaultHeapMinimum*GOGC/100 and so
 				// overflows to garbage when GOGC=off (gcPercent == -1). Bubbles that
 				// allocate below this floor (e.g. the logical-only DST tests) never GC.
-				target = defaultHeapMinimum
+				return dstHeapAlloc.Load() >= defaultHeapMinimum
 			default:
 				// Per-bubble relative target: the GOGC ratio of the bubble's *own* live
 				// set (heapMarked - dstHeapBase), excluding the run-to-run-varying
-				// process baseline, so the GC-trigger crossing — and thus finalizer/weak
-				// discovery — is a deterministic function of the bubble's allocation.
+				// process baseline, so the GC count and the total finalizer/weak set are
+				// a deterministic function of the bubble's allocation.
 				bubbleMarked := uint64(0)
 				if hm > base {
 					bubbleMarked = hm - base
 				}
-				target = bubbleMarked * uint64(gp) / 100
+				target := bubbleMarked * uint64(gp) / 100
 				if target < gcController.heapMinimum {
 					target = gcController.heapMinimum
 				}
+				return dstHeapAlloc.Load() >= target
 			}
-			return live >= hm+target
 		}
 		trigger, _ := gcController.trigger()
 		return gcController.heapLive.Load() >= trigger

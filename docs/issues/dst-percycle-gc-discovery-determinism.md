@@ -120,33 +120,56 @@ one build) the GC per-cycle byte-trigger is the lone remaining source (Phase 2 b
 the GC trigger. The trace-hash probe used to draw this map is temporary (re-added per the plan above)
 and is reverted before commit.
 
-### Phase 2 — TRIGGER (the real work)
+### Phase 2 — TRIGGER — DONE
 
-A **race-invariant trigger driven by *logical* allocation** — sum of *requested*
-sizes (known at `mallocgc` before size-class rounding + redzones), not physical
-`heapLive`. Tractability is split:
+Both sources the Phase-1 map found are fixed. The authoritative write-up is now
+design.md ("How per-cycle discovery is made deterministic under `-race`" and "Map
+hash key requires `-tags dst`"); this records the outcome and the corrections to
+the original plan.
 
-- **Common DST case — tractable.** For small live sets the target *floors* at
-  `defaultHeapMinimum` (a constant; see the `gp < 0` / floor branch in `mgc.go`). So
-  the trigger reduces to "logical bytes allocated since bubble entry ≥ constant",
-  and logical bytes *are* race-invariant. This likely gets most DST workloads to
-  per-cycle `-race` determinism. Implement a per-bubble logical-allocated-bytes
-  counter (accumulate the requested `size` at `mallocgc` under `dstActive()`) and
-  drive the floored trigger from it.
-- **GOGC-scaled case — hard remainder.** When the live set is large enough that the
-  target is GOGC × the *live* set, that live set is physical (`heapMarked`,
-  post-mark, redzone-inflated), so the target itself is race-variant. A fully
-  race-invariant target needs a *logical* live set the runtime does not track. This
-  is the real redesign, for memory-pressure-adaptive SUTs (less common). Likely a
-  separate increment; may stay out-of-contract if the cost/benefit doesn't justify.
+**2b — map hash key (cross-build).** Fixed: the `-tags dst` AES hash key is derived
+from a fixed constant (`alg.go` `dstFixedHashKey`), position-independent, so
+multi-group map order is build/composition-invariant. Enforced by
+`TestDSTMapHashKeyBuildInvariant`. Committed (`fix(dst): make the -tags dst map hash
+key build/composition-invariant`).
 
-Rejected: **quantize/pin the crossing** to a coarse granularity (hacky; only works
-if target ≫ span; perturbs the normal-build split too).
+**2a — GC per-cycle trigger.** Fixed, with two corrections to the plan above, both
+established by trace-hash localization (a throwaway `DSTMapProbeVerbose` capturing
+the raw per-cycle trigger inputs):
 
-## Current state (option 3 — shipped)
+- *The counter is per-object `elemsize`, not "requested size".* The original premise
+  (requested size, pre-rounding) is deterministic but in the wrong units; `elemsize`
+  (size-class size) is equally deterministic and `-race`-invariant **and** in
+  `heapMarked`'s units, so the GOGC-scaled comparison is **exact**, not merely
+  proportional. The counter (`dstHeapAlloc`) sums `elemsize` per allocation at the
+  `mallocgc` dispatcher, and the trigger is checked **per allocation** (not at span
+  grabs). Localization: the *logical* crossing point is deterministic; only
+  span-granular `heapLive` accounting was not.
+- *The GOGC-scaled case is NOT a hard remainder; no "logical live set" is needed.*
+  The instrumentation showed `heapMarked` is deterministic given a deterministic
+  crossing — the feared physical-live-set redesign (C) was an over-estimate. Driving
+  the GOGC-scaled crossing off `dstHeapAlloc` makes per-cycle discovery deterministic
+  for the large-live-set regime too (measured 300/300, normal and `-race`). Only a
+  rare **sub-object** residual remains in the GOGC-scaled target via the `dstHeapBase`
+  process baseline — sub-observable, the `HeapAlloc`/`HeapInuse` byte-noise class
+  (DST-MEM-1), does not flip discovery.
 
-Set-level is the contract and is `-race`-robust; per-cycle discovery timing is
-documented as sub-observable noise a SUT must not assert on (design.md D1 / layered
-contract; the `testing/simulation` package doc). `TestDSTGCFinalizerDiscoveryDeterministic`
-asserts set-level in all builds; the relative trigger is mutation-guarded by
-`TestDSTMemoryLimit`'s baseline-independence check.
+Enforced by `TestDSTGCPerCycleDiscoveryDeterministic` (mid-run partial discovery
+reproduces across same-seed runs, floored and GOGC-scaled, in normal and `-race`
+builds; mutation-guarded: reverting to the `heapLive` crossing or dropping the
+per-allocation check makes it wobble).
+
+Rejected during the investigation: **requested-size counter** (unit mismatch for the
+GOGC-scaled target); **logical live-set redesign** (C — unnecessary, `heapMarked` is
+deterministic); **quantize/pin the crossing** to a coarse granularity (hacky).
+
+## Status — RESOLVED
+
+Per-cycle GC discovery is deterministic under `-race` (within-build replay) and
+across builds/compositions, for both the floored and GOGC-scaled regimes — the
+"full determinism under `-race`" goal. The contract is now stated in design.md (the
+layered-contract table's per-cycle row is `holds`); `TestDSTGCFinalizerDiscovery
+Deterministic` (set-level) and `TestDSTGCPerCycleDiscoveryDeterministic` (per-cycle)
+guard it. The temporary trace-hash probe used to map and localize the sources is
+reverted before commit. This doc is retained for provenance; design.md is
+authoritative.

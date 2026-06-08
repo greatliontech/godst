@@ -282,13 +282,12 @@ func TestDSTGCAllocBoundDeterministic(t *testing.T) {
 // allocates finalizable objects with varied lifetimes. The testprog prints
 // "numGC total".
 //
-// The assertion is the DST contract (DST-GC-1; see the testing/simulation package
-// doc): the set-level observable — the GC count and the total set of finalizers
-// discovered — is deterministic, and is -race-robust because the trigger fires
-// the right number of times with the right total under -race too. (Which GC
-// *cycle* discovers a given object is sub-observable byte-trigger noise — ±span,
-// sensitive to -race redzones and binary composition — so it is not part of the
-// contract and not asserted here; design.md D1.) This test guards finalizer
+// The assertion is the set-level observable (DST-GC-1; see the testing/simulation
+// package doc): the GC count and the total set of finalizers discovered are
+// deterministic, -race-robust. (Which GC *cycle* discovers a given object — the
+// per-cycle split — is also deterministic now, via the per-object dstHeapAlloc
+// trigger, and is asserted separately by TestDSTGCPerCycleDiscoveryDeterministic;
+// this test pins the coarser set level.) This test guards finalizer
 // *set-level* determinism (the total discovered set is reproducible). The relative
 // trigger the set level rests on is mutation-guarded separately by
 // TestDSTMemoryLimit (its baseline-independence check fails if the dstHeapBase
@@ -309,6 +308,49 @@ func TestDSTGCFinalizerDiscoveryDeterministic(t *testing.T) {
 		if out != first {
 			t.Fatalf("finalizer set-level discovery diverged (run %d): numGC/total "+
 				"nondeterministic\nfirst=%q\ngot  =%q", i+1, first, out)
+		}
+	}
+}
+
+// TestDSTGCPerCycleDiscoveryDeterministic verifies that *per-cycle* finalizer
+// discovery is deterministic, including under -race: the DST heap trigger fires on
+// per-object allocated bytes (dstHeapAlloc), not span-granular heapLive, so *which*
+// GC cycle discovers a given object is a reproducible function of the seed — not
+// merely the GC set level (DSTGCFinDiscovery covers set-level). The testprog reads
+// a mid-run partial finalizer-discovery count, which depends on the trigger
+// crossings (unlike the run-end total, it is sensitive to *when* each cycle fires).
+// The same seed must reproduce it across runs, for the floored (small live set) and
+// GOGC-scaled (large pinned live set) regimes, in normal AND -race builds (the
+// harness builds the testprog with -race when the test runs under -race).
+//
+// Mutation check: reverting the trigger to fire on heapLive (span-granular) instead
+// of dstHeapAlloc makes the mid-run partial wobble run-to-run — the span crossing
+// lands at a different allocation as the entry span-fill phase varies between
+// process runs — so the same-seed runs diverge and this fails.
+//
+// (This asserts within-build replay determinism, the -race contract. The raw
+// finqueued-based count also carries pre-bubble stdlib finalizers that survive the
+// entry GC and die in-bubble, whose count varies between *builds* but is constant
+// within one binary; a SUT observes its own finalizers, which are build-invariant.)
+func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
+	for _, regime := range []struct {
+		name string
+		env  []string
+	}{
+		{"floored", []string{"DSTSEED=12345", "GOGC=100"}},
+		{"gogc-scaled", []string{"DSTSEED=12345", "GOGC=100", "DSTBIGLIVE=16"}},
+	} {
+		first := strings.TrimSpace(runTestProgDST(t, "DSTGCPerCycle", regime.env...))
+		f := strings.Fields(first)
+		if len(f) != 2 || f[0] == "0" {
+			t.Fatalf("%s: no mid-run per-cycle discovery recorded (%q)", regime.name, first)
+		}
+		for i := 0; i < 5; i++ {
+			if got := strings.TrimSpace(runTestProgDST(t, "DSTGCPerCycle", regime.env...)); got != first {
+				t.Fatalf("%s: per-cycle discovery not reproducible across same-seed runs (run %d): "+
+					"the trigger crossing is not per-object deterministic\nfirst=%q\ngot  =%q",
+					regime.name, i+1, first, got)
+			}
 		}
 	}
 }

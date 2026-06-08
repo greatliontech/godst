@@ -134,14 +134,17 @@ func dstActivate(seed uint64) {
 // GC count and the total set of finalizers/weak refs discovered are a
 // deterministic function of the bubble's own allocation (the contract; DST-GC-1).
 //
-// The trigger fires on heap *bytes*, so *which cycle* discovers a given object is
-// byte-exact only in a fixed normal build and is sub-observable noise otherwise
-// (perturbed by -race/-msan redzones or a change in binary composition). That
-// per-cycle byte-exactness is NOT part of the contract and is not tested — a SUT
-// relies on the set level and on scheduling/values/replay, which are unaffected.
-// If a SUT drops references to pre-bubble objects so process-live falls below this
-// baseline, the trigger degrades soundly to the heapMinimum floor (gcTrigger.test
-// guards heapMarked > dstHeapBase).
+// The trigger crossing itself is driven off per-object allocated bytes
+// (dstHeapAlloc), not physical heapLive, so *which cycle* discovers a given object
+// is also a deterministic function of the seed in normal AND -race builds (Phase
+// 2a; see dstHeapAlloc and design.md "How per-cycle discovery is made deterministic
+// under -race"). dstHeapBase only enters the GOGC-scaled *target*
+// ((heapMarked - dstHeapBase)*GOGC/100); it carries a rare sub-object residual
+// (a pre-bubble transient captured at entry) that does not flip discovery and is
+// the HeapAlloc/HeapInuse byte-noise class (DST-MEM-1). If a SUT drops references
+// to pre-bubble objects so process-live falls below this baseline, the trigger
+// degrades soundly to the heapMinimum floor (gcTrigger.test guards heapMarked >
+// dstHeapBase).
 var dstHeapBase atomic.Uint64
 
 // dstFinqBase is the finqueued snapshot at bubble entry. finqueued is a
@@ -149,6 +152,40 @@ var dstHeapBase atomic.Uint64
 // of pre-bubble finalizers, so only the delta from this baseline is
 // bubble-deterministic.
 var dstFinqBase atomic.Uint64
+
+// dstHeapAlloc is the count of bytes allocated since the last GC, summed
+// per-object at the mallocgc dispatcher under dstActive using each object's
+// size-class size (elemsize). It is the deterministic, per-object analogue of
+// heapLive's growth (heapLive - heapMarked) used to drive the DST heap trigger.
+//
+// heapLive advances *span-granularly* — gcController.update accounts a whole span
+// (npages*pageSize) when it is grabbed (mcache.go), so heapLive - heapMarked jumps
+// in span chunks and the allocation at which it crosses the GC trigger depends on
+// the bubble's entry span-fill phase, which varies run to run. That moves *which*
+// GC cycle discovers a given object (set-level totals are unaffected; per-cycle
+// discovery is) — in normal builds, and worse under -race. Summing elemsize
+// per-object instead advances exactly once per allocation, so the crossing lands
+// at a deterministic allocation. elemsize is a deterministic function of the
+// requested size (size classes are fixed) and is -race-invariant (the race
+// detector uses shadow memory, not object redzones), and it is in heapMarked's
+// units (the GC counts the same slot size), so the GOGC-scaled comparison below is
+// exact, not merely proportional.
+//
+// The DST heap trigger (gcTrigger.test) fires both the *floored* case (target ==
+// heapMinimum: GOGC=off, or a live set small enough that the GOGC target floors)
+// and the *GOGC-scaled* case (target == (heapMarked - base)*GOGC/100) on this
+// counter, and the dispatcher checks the trigger on every allocation (not only at
+// span grabs), so the cycle boundary lands at the exact per-object crossing. That
+// makes per-cycle finalizer/weak discovery a deterministic function of the seed in
+// normal AND -race builds, not merely the GC set level. (The GOGC-scaled target
+// carries a rare sub-object residual from the process baseline captured in
+// dstHeapBase at entry — sub-observable, the same class as HeapAlloc/HeapInuse byte
+// noise the contract already steers away from; see DST-MEM-1.)
+//
+// Reset to 0 at every GC (resetLive, the same point heapLive resets to
+// heapMarked) and at bubble entry (synctestRun), so it measures the bubble's own
+// net allocation since the last collection.
+var dstHeapAlloc atomic.Uint64
 
 // dstBubbleFinqFP returns the bubble-local count of finalizers queued so far
 // (finqueued minus the bubble-entry baseline) — the *set-level* finalizer-

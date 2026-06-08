@@ -35,6 +35,7 @@ func init() {
 	register("DSTPoolAcrossRuns", DSTPoolAcrossRuns)
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
+	register("DSTGCPerCycle", DSTGCPerCycle)
 	register("DSTFinChanOp", DSTFinChanOp)
 	register("DSTFinRunSet", DSTFinRunSet)
 	register("DSTFinSpawn", DSTFinSpawn)
@@ -305,6 +306,48 @@ func DSTGCFinDiscovery() {
 	})
 	os.Stdout.WriteString(strconv.FormatUint(uint64(ngc), 10) + " " +
 		strconv.FormatUint(dstBubbleFinqFP(), 10) + "\n")
+}
+
+// DSTGCPerCycle exercises *per-cycle* finalizer discovery determinism (Tier 2,
+// A.5 with the per-object dstHeapAlloc trigger). A single goroutine (no Seq-5
+// interleaving axis) churns finalizable objects through a ring; at a fixed
+// mid-run allocation it reads the bubble-local count of finalizers discovered so
+// far (dstBubbleFinqFP). That partial count is a *per-cycle* observable: it
+// depends on which GC cycles have fired by that allocation, i.e. on the trigger
+// crossings — unlike the run-end total, which is set-level. Because the DST heap
+// trigger fires on per-object allocated bytes (not span-granular heapLive), the
+// crossings land at deterministic allocations, so the partial count is a
+// deterministic function of the seed in normal AND -race builds, and identical
+// across them. DSTBIGLIVE (MB) optionally pins a large live set so the
+// GOGC-scaled target (not the floor) governs. Prints "<partial> <total>".
+func DSTGCPerCycle() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	bigMB, _ := strconv.Atoi(os.Getenv("DSTBIGLIVE"))
+	var partial, total uint64
+	simulation.Run(n, func() {
+		var big []*dstFinObj
+		const dstFinObjSize = 256 // sizeof(dstFinObj): struct{ b [256]byte }
+		for m := 0; m < bigMB*(1<<20)/dstFinObjSize; m++ {
+			o := &dstFinObj{}
+			o.b[0] = byte(m)
+			big = append(big, o)
+		}
+		const N, K = 120000, 512
+		ring := make([]*dstFinObj, K)
+		for i := 0; i < N; i++ {
+			o := &dstFinObj{}
+			o.b[0] = byte(i)
+			runtime.SetFinalizer(o, func(p *dstFinObj) { _ = p.b[0] })
+			ring[i%K] = o // evicted entries die with a finalizer set
+			if i == N/2 {
+				partial = dstBubbleFinqFP() // per-cycle: discovered by the mid-run cycles
+			}
+		}
+		total = dstBubbleFinqFP()
+		runtime.KeepAlive(big)
+	})
+	os.Stdout.WriteString(strconv.FormatUint(partial, 10) + " " +
+		strconv.FormatUint(total, 10) + "\n")
 }
 
 // dstSliceSink forces the allocations in DSTGCAllocBound to escape to the heap

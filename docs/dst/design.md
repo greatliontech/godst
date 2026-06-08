@@ -1143,10 +1143,12 @@ set-at-quiescence to **per-cycle discovery determinism**.
   is not polluted by entry garbage the first in-bubble GC would otherwise free (which would drive
   `heapMarked` below `base`). (`runtime/dst.go`.)
 - `gcTrigger.test` (`gcTriggerHeap`, `mgc.go`) under `dstActive` fires when
-  `heapLive ≥ heapMarked + max((heapMarked − dstHeapBase)·GOGC/100, heapMinimum)` — the production GOGC
-  rule with the scaling term on the bubble's *own* live (`heapMarked − dstHeapBase`), excluding the
-  run-to-run-varying process baseline. No per-cycle rebase is needed: `base` is fixed at entry and
-  `heapMarked` updates each cycle, so the target tracks the bubble's live set faithfully.
+  `dstHeapAlloc ≥ max((heapMarked − dstHeapBase)·GOGC/100, heapMinimum)` — the production GOGC rule with
+  the scaling term on the bubble's *own* live (`heapMarked − dstHeapBase`), excluding the
+  run-to-run-varying process baseline, but driven off **`dstHeapAlloc`** (per-object allocated bytes since
+  the last GC) rather than physical `heapLive` (Phase 2a — see the layered-contract section for why). No
+  per-cycle rebase is needed: `base` is fixed at entry and `heapMarked` updates each cycle, so the target
+  tracks the bubble's live set faithfully.
 - Regression tests over the permanent `dstBubbleFinqFP` hook (the bubble-local total finalizers
   discovered, `finqueued − dstFinqBase`): `TestDSTGCFinalizerDiscoveryDeterministic` asserts the
   set-level finalizer discovery (`numGC` + total) is reproducible. The `dstHeapBase` baseline subtraction
@@ -1177,58 +1179,71 @@ process-cumulative, so the test hook
 subtracts a bubble-entry baseline — without that subtraction the entry GC's varying pre-bubble finalizer
 count masquerades as nondeterminism; a probe-level trap worth recording.)
 
-**The layered determinism contract (the `-race` boundary) — what makes A.5 *trustworthy*, not just
-clever.** A.5's per-cycle discovery determinism lives in the **physical** layer (it fires on heap
-*bytes*: `heapLive` vs `heapMarked − base`). Any tool that rewrites the heap byte-for-byte — `-race`,
-`-msan`, a different build — perturbs it, because it perturbs the bubble's own per-allocation sizes
-(not just the baseline, which A.5 *does* subtract out). This is **inherent**, not a defect: you cannot
-keep byte-exact heap accounting while an instrumenter rewrites the heap. So the determinism guarantee is
-**layered**, and the layering is the trust contract (mirrored in the `testing/simulation` package doc):
+**The layered determinism contract (the `-race` boundary).** The determinism guarantee is **layered**,
+and the layering is the trust contract (mirrored in the `testing/simulation` package doc). Originally the
+GC per-cycle layer fired on physical `heapLive` and so was *not* `-race`-robust; Phase 2a moved it to
+per-object `dstHeapAlloc` and pulled it into the contract (last row, and the "How per-cycle discovery is
+made deterministic" subsection below the table):
 
 | layer | guarantee | basis | under `-race` |
 |---|---|---|---|
 | **Logical** | scheduling, select, map, `math/rand`, values, **replay** | per-g RNG + single-P | **holds** (verified: 8/8 DST logical tests pass under `-race`, incl. GOMAXPROCS=4 churn; no race reports) |
 | **Finalizer set @ quiescence** | the finalizer/cleanup *set* run by a quiescence point = objects logically unreachable there | reachability (logical) | **holds** (lands with Chunk B's drain) |
 | **GC set-level** (`numGC`, total finalizer/weak set) | the GC count and the *set* of objects discovered | heap bytes, but target floors at `heapMinimum` | **holds** (the 2 GC tests pass under `-race`) |
-| **GC per-cycle byte-exact** — *which cycle* discovers an object | heap bytes (physical) | **not in contract** (see below) |
+| **GC per-cycle** — *which cycle* discovers an object | **per-object allocated bytes** (`dstHeapAlloc`) | **holds** for the GOGC trigger (Phase 2a; `TestDSTGCPerCycleDiscoveryDeterministic`) |
 
-The contract is sound because the **unconditional** layers (logical + set-at-quiescence + GC set-level)
-are what a SUT normally relies on. The GC-determinism test asserts the **set-level** layer (`numGC` +
-total finalizers) and runs in all builds (`TestDSTGCFinalizerDiscoveryDeterministic`); it does **not**
-assert the per-cycle split. Fail-loud, not silent.
+All four layers hold under the GOGC trigger (floored and GOGC-scaled). The set-level test (`numGC` +
+total finalizers, `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial
+discovery, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in all builds. **One regime is exempt at
+the per-cycle layer:** when `Options.MemoryLimit` is set and the *limit* crossing (not the GOGC target)
+governs a cycle, the trigger still fires on physical span-granular `heapLive − base` (`mgc.go`
+`gcTrigger.test`), so that cycle is set-level deterministic (`numGC` reproducible,
+`TestDSTMemoryLimit`) but its per-cycle split is not `-race`-deterministic. Driving the limit crossing
+off `dstHeapAlloc` too is a tracked follow-on —
+`docs/issues/dst-memlimit-percycle-determinism.md`.
 
-**Why per-cycle byte-exact is not in the contract.** A.5's per-bubble relative trigger *does* make
-finalizer discovery byte-exact per-cycle in a fixed normal build (a real bonus — discovery is per-cycle,
-not merely set-at-quiescence), but that byte-exactness is **fragile and sub-observable**: the trigger
-fires on heap *bytes*, checked at span-grab boundaries (`mallocgc`'s `checkGCTrigger`), so anything that
-shifts the byte↔object mapping by a span moves *which cycle* discovers an object. `-race`/`-msan`
-redzones do it (the split goes **bimodal** — two values run-to-run; `numGC` and the total set stay
-stable); so does a change in **binary composition** (e.g. linking a heavy import shifts the bubble's
-entry span-fill phase). Because no SUT can rely on it portably, the contract is set-level only and the
-per-cycle hash is not tested. An earlier build asserted it byte-exact in normal builds (gated on
-`internal/race.Enabled`) and tracked the `-race` jitter as an open issue; both were removed when the test
-went set-level. Un-claiming it (rather than chasing a race-invariant *logical-allocation* trigger — a GC
-redesign, since the runtime tracks only the physical live set) is the right call for the narrow benefit.
+**How per-cycle discovery is made deterministic under `-race` (Phase 2a).** The earlier framing scoped
+per-cycle determinism out of the contract because the trigger fired on **physical `heapLive`**, which
+advances **span-granularly** — `gcController.update` accounts a whole span (`npages*pageSize`) when it is
+grabbed (`mcache.go`), so `heapLive − heapMarked` jumps in span chunks and the allocation at which it
+crosses the GC trigger depends on the bubble's **entry span-fill phase**, which varies run to run (worse
+under `-race`/composition, which shift it). That moved *which cycle* discovered a given object. A
+trace-hash localization (instrumenting the raw per-cycle trigger inputs — see the issue doc) pinned it
+precisely: the **logical crossing point is deterministic, only the span-granular `heapLive` accounting is
+not**, and `heapMarked` is deterministic given a deterministic crossing (so no "logical live set" is
+needed — that was an over-estimate of the fix).
 
-This is also the **convergence point for "full determinism under `-race`"**: `-race` perturbs only the
-physical layer, so once the scheduler-determinism fix removed the other physical leak (system-goroutine
-RNG contention), this byte-based trigger is plausibly the *sole* remaining `-race`/binary-composition
-nondeterminism in the contract layer. Elevating per-cycle to deterministic ≡ achieving full `-race`
-determinism. The map-then-trigger plan (map to confirm GC is the only source; then a logical-allocation
-trigger, tractable for the floored small-live-set case) is in
-`docs/issues/dst-percycle-gc-discovery-determinism.md`.
+The fix is to drive the trigger off **`dstHeapAlloc`** — bytes summed **per-object at allocation**
+(`mallocgc`), using each object's size-class size (`elemsize`) — instead of `heapLive`, and to check the
+trigger on **every** allocation (the `mallocgc` dispatcher, gated `dstActive()`), not only at span grabs.
+`elemsize` is a deterministic function of the requested size (size classes are fixed), is
+`-race`-invariant (the race detector uses shadow memory, not object redzones — object *sizes* are
+identical under `-race`), and is in `heapMarked`'s units (the GC counts the same slot size), so the
+GOGC-scaled comparison `dstHeapAlloc ≥ (heapMarked − base)·GOGC/100` is **exact**, not merely
+proportional. The cycle boundary then lands at a deterministic allocation, so per-cycle finalizer/weak
+discovery is a deterministic function of the seed in normal **and** `-race` builds, and across binary
+compositions — for both the floored and the GOGC-scaled regime (measured: 300/300 identical, normal and
+`-race`, both regimes).
 
-**An experiment proved the byte-layer fragility is reducible (and then proved the fix unnecessary).**
-Instrumenting `mallocgc` to count bubble allocations showed the bubble's logical allocation **count and
-requested bytes are `-race`-invariant** (`allocs = 40000`, `bytes = 10240000`, bit-identical normal vs
-`-race`). A requested-bytes trigger under `-race` was built on that — and then **removed as
-over-engineering**: a mutation test showed the existing byte/GOGC trigger *already* passes the `-race`
-tests (set-level), because the target floors at `heapMinimum` (above). Making *per-cycle byte-exact*
-hold under `-race` would require checking the trigger on **every** allocation rather than at span grabs —
-the `checkGCTrigger` sites across `malloc.go`, `malloc_stubs.go`, and the *generated* per-size-class
-paths plus their generator — genuinely invasive, and not needed (a program must not rely on finalizer
-timing; the set-level layer is what the trust contract rests on). So per-cycle byte-exact stays a
-normal-build refinement.
+To give the per-object accumulation a single choke point, `-tags dst` routes every heap allocation
+through the `mallocgc` dispatcher (the compiler-emitted per-size-class fast paths are gated off,
+`sizeSpecializedMallocEnabled && !dstBuild`; they are off by default and already off under `-race`).
+Production builds are byte-identical — every piece is under `dstActive()`/`dstBuild`, dead-code-eliminated
+when off.
+
+**Residual (sub-observable, accepted).** The GOGC-scaled target's basis `heapMarked − base` carries a
+rare sub-object wobble from the process baseline captured in `dstHeapBase` at entry (a pre-bubble
+transient that survives the entry GC); it does not flip discovery in practice and is the same class as
+the `HeapAlloc`/`HeapInuse` byte noise the contract already steers away from (DST-MEM-1). Independently,
+the raw `finqueued`-based observable also counts **pre-bubble stdlib finalizers** that survive the entry
+GC and die in-bubble, whose count differs between *builds* (process startup) though it is constant within
+one binary; a SUT observes its *own* finalizers, which are build-invariant, so this does not affect the
+contract — the per-cycle test asserts within-build replay (the `-race` contract) on the mid-run partial.
+
+This closes the **convergence point for "full determinism under `-race`"**: the Phase-1 map confirmed the
+byte-based GC trigger was the sole remaining within-build `-race`/composition nondeterminism in the
+contract layer (after the system-goroutine-isolation fix and the build-invariant hash key); driving it
+off per-object `dstHeapAlloc` removes it. See `docs/issues/dst-percycle-gc-discovery-determinism.md`.
 
 **Faithful-collapse note (nit).** The DST trigger goal is `heapMarked + (heapMarked − base)·GOGC/100`,
 vs production's `heapMarked + (heapMarked + lastStackScan + globalsScan)·GOGC/100`. DST both subtracts

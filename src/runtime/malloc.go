@@ -1036,7 +1036,15 @@ const doubleCheckMalloc = false
 // mallocgc implementation: the experiment must be enabled, and none of the sanitizers should
 // be enabled. The tables used to select the size-specialized malloc function do not compile
 // properly on plan9, so size-specialized malloc is also disabled on plan9.
-const sizeSpecializedMallocEnabled = goexperiment.SizeSpecializedMalloc && GOOS != "plan9" && !asanenabled && !raceenabled && !msanenabled && !valgrindenabled
+// !dstBuild: under -tags dst, route every heap allocation through the mallocgc
+// dispatcher rather than the compiler-emitted per-size-class fast paths, so the
+// DST per-bubble allocation accounting and trigger check (dstHeapAlloc; see below
+// in mallocgc) have a single choke point. The size-specialized
+// experiment is off by default and already off under -race/-msan/-asan, so this
+// only matters if it is explicitly enabled together with -tags dst; the guard
+// keeps DST determinism robust to that. dstBuild is a constant, so this is free
+// (and unchanged) in non-dst builds.
+const sizeSpecializedMallocEnabled = goexperiment.SizeSpecializedMalloc && GOOS != "plan9" && !asanenabled && !raceenabled && !msanenabled && !valgrindenabled && !dstBuild
 
 // runtimeFreegcEnabled is the set of conditions where we enable the runtime.freegc
 // implementation and the corresponding allocation-related changes: the experiment must be
@@ -1195,6 +1203,29 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// Post-malloc debug hooks.
 	if debug.malloc {
 		postMallocgcDebug(x, elemsize, typ)
+	}
+
+	if dstActive() {
+		// Accumulate this object's size-class size (elemsize) into the per-bubble
+		// allocation counter, then check the DST heap trigger — on EVERY allocation,
+		// not only at span grabs. The DST trigger fires when dstHeapAlloc crosses a
+		// per-object target (floor, or the GOGC ratio of heapMarked), so the cycle
+		// boundary lands at the exact, deterministic allocation rather than at a
+		// span-grab boundary (heapLive advances span-granularly, mcache.go), which
+		// varies run to run with the entry span-fill phase. That makes *which* GC
+		// cycle discovers a given object a deterministic function of the seed in
+		// normal AND -race builds. elemsize matches heapMarked's units (the GC counts
+		// the slot size), so the GOGC-scaled comparison is exact, and it is
+		// deterministic and -race-invariant (size classes do not change under -race,
+		// which uses shadow memory, not redzones). Under -tags dst the
+		// size-specialized fast paths are disabled (sizeSpecializedMallocEnabled), so
+		// every heap allocation passes through here exactly once with elemsize set. x
+		// is already published (publicationBarrier/gcmarknewobject ran and mp.mallocing
+		// is reset), so a GC started here will not collect it.
+		dstHeapAlloc.Add(int64(elemsize))
+		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+			gcStart(t)
+		}
 	}
 	return x
 }

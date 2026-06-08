@@ -917,6 +917,13 @@ func (c *gcControllerState) releaseNextGCMarkWorker(pp *p) {
 func (c *gcControllerState) resetLive(bytesMarked uint64) {
 	c.heapMarked = bytesMarked
 	c.heapLive.Store(bytesMarked)
+	if dstActive() {
+		// Re-baseline the per-bubble allocation counter at the same point heapLive
+		// resets to heapMarked, so it measures bytes allocated *since this GC* — the
+		// deterministic, per-object analogue of heapLive - heapMarked that drives the
+		// DST heap trigger. See runtime/dst.go dstHeapAlloc.
+		dstHeapAlloc.Store(0)
+	}
 	c.heapScan.Store(uint64(c.heapScanWork.Load()))
 	c.lastHeapScan = uint64(c.heapScanWork.Load())
 	c.lastStackScan.Store(uint64(c.stackScanWork.Load()))

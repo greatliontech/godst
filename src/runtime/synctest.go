@@ -223,6 +223,7 @@ func synctestRun(f func()) {
 			// dstSchedRand.
 			dstSchedRand = dstSchedRoot(dstSeed.Load())
 			dstSchedStatsReset()
+			dstHeapAlloc.Store(0) // start the bubble's per-object alloc counter clean
 			if dstSchedKind == dstSchedPCT {
 				// Re-root the PCT state (change points, step counter) for this bubble.
 				// Goroutine priorities are assigned at creation (newproc1), so the
