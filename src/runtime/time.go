@@ -740,7 +740,17 @@ func (t *timer) maybeAdd() {
 			// Re-randomize timer order.
 			// We could do this for all timers, but unbubbled timers are highly
 			// unlikely to have the same when.
-			t.rand = cheaprand()
+			//
+			// Under deterministic scheduling (DST active), draw this
+			// tie-break from the adding goroutine's per-g DST stream rather than
+			// the per-m cheaprand stream, so the firing order of fake (synctest
+			// bubble) timers that share a wake time is reproducible and immune to
+			// which m runs the goroutine. See dstrandUint64.
+			if dstActive() {
+				t.rand = uint32(dstrandUint64(getg()))
+			} else {
+				t.rand = cheaprand()
+			}
 		}
 		t.state |= timerHeaped
 		when = t.when

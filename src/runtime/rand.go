@@ -42,14 +42,23 @@ func randinit() {
 	}
 
 	seed := &globalRand.seed
-	if len(startupRand) >= 16 &&
+	switch {
+	case dstBuild:
+		// In a DST build (-tags dst), seed the global generator from a fixed
+		// constant so the process-global map hash key (derived in alginit via
+		// bootstrapRand) is identical every run. Map iteration order is still
+		// seed-varied via the per-g m.seed; only this global key must be fixed,
+		// and it cannot be re-seeded at runtime without corrupting maps created
+		// before DST activation. See docs/dst/design.md.
+		dstFixedSeed(seed)
+	case len(startupRand) >= 16 &&
 		// Check that at least the first two words of startupRand weren't
 		// cleared by any libc initialization.
-		!allZero(startupRand[:8]) && !allZero(startupRand[8:16]) {
+		!allZero(startupRand[:8]) && !allZero(startupRand[8:16]):
 		for i, c := range startupRand {
 			seed[i%len(seed)] ^= c
 		}
-	} else {
+	default:
 		if readRandom(seed[:]) != len(seed) || allZero(seed[:]) {
 			// readRandom should never fail, but if it does we'd rather
 			// not make Go binaries completely unusable, so make up
@@ -62,21 +71,27 @@ func randinit() {
 	clear(seed[:])
 
 	if startupRand != nil {
-		// Overwrite startupRand instead of clearing it, in case cgo programs
-		// access it after we used it.
-		for len(startupRand) > 0 {
-			buf := make([]byte, 8)
-			for {
-				if x, ok := globalRand.state.Next(); ok {
-					byteorder.BEPutUint64(buf, x)
-					break
+		if dstBuild {
+			// Don't consume the global generator to scrub startupRand in a DST
+			// build: keep the hash-key derivation at a fixed stream position.
+			startupRand = nil
+		} else {
+			// Overwrite startupRand instead of clearing it, in case cgo programs
+			// access it after we used it.
+			for len(startupRand) > 0 {
+				buf := make([]byte, 8)
+				for {
+					if x, ok := globalRand.state.Next(); ok {
+						byteorder.BEPutUint64(buf, x)
+						break
+					}
+					globalRand.state.Refill()
 				}
-				globalRand.state.Refill()
+				n := copy(startupRand, buf)
+				startupRand = startupRand[n:]
 			}
-			n := copy(startupRand, buf)
-			startupRand = startupRand[n:]
+			startupRand = nil
 		}
-		startupRand = nil
 	}
 
 	globalRand.init = true
@@ -115,6 +130,20 @@ func allZero(b []byte) bool {
 		acc |= x
 	}
 	return acc == 0
+}
+
+// dstFixedSeed fills the 32-byte global chacha8 key from a fixed constant via
+// splitmix64, for DST builds (see randinit). The value is arbitrary but fixed,
+// so the derived map hash key is the same every run; it is never all-zero.
+func dstFixedSeed(seed *[32]byte) {
+	x := uint64(0x6470736565643031) // "dpseed01"
+	for i := 0; i < len(seed); i += 8 {
+		x += 0x9e3779b97f4a7c15
+		z := x
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		byteorder.BEPutUint64(seed[i:i+8], z^(z>>31))
+	}
 }
 
 // bootstrapRand returns a random uint64 from the global random generator.
@@ -158,11 +187,25 @@ func rand32() uint32 {
 //go:nosplit
 //go:linkname rand
 func rand() uint64 {
+	gp := getg()
+	if dstActive() {
+		// Under deterministic scheduling, draw from the per-g DST stream. rand is
+		// the source for the math/rand and math/rand/v2 globals (linkname'd to
+		// runtime.rand), for map seeds/iteration (maps.rand), and for
+		// compiler-emitted map seeds and NaN-key hashing — all application-
+		// observable, and all drawn at counts that are a function of the
+		// goroutine's own logical history, so routing them per-g is correct.
+		// The one internal caller drawn at a load-dependent count on a user
+		// goroutine's stack — mrandinit, when a new m is spawned — is exempted
+		// there (it seeds from bootstrapRand under DST). randomizeScheduler's
+		// randn (proc.go) is -race-only and outside DST scope.
+		return dstrandUint64(gp)
+	}
 	// Note: We avoid acquirem here so that in the fast path
 	// there is just a getg, an inlined c.Next, and a return.
 	// The performance difference on a 16-core AMD is
 	// 3.7ns/call this way versus 4.3ns/call with acquirem (+16%).
-	mp := getg().m
+	mp := gp.m
 	c := &mp.chacha8
 	for {
 		// Note: c.Next is marked nosplit,
@@ -181,7 +224,50 @@ func rand() uint64 {
 
 //go:linkname maps_rand internal/runtime/maps.rand
 func maps_rand() uint64 {
+	// rand() already draws map seeds and iteration offsets from the per-g DST
+	// stream under DST, so map order is a function of the
+	// creating and iterating goroutine's logical history, not of which m runs it.
 	return rand()
+}
+
+// dstrandUint64 returns the next value of g's deterministic DST RNG stream,
+// advancing it. It is used only under DST, to make
+// per-goroutine randomness — select poll order, map seed and iteration order,
+// and child-goroutine seeds — a function of the goroutine's own logical history,
+// independent of which m runs it and of runtime-internal RNG draws (work
+// stealing, goroutine tracking) that share the per-m streams. The stream is a
+// splitmix64 sequence keyed by gp.dstrand, seeded as a deterministic tree: the
+// root from the DST seed (dstActivate, or a synctest bubble re-root via
+// dstBubbleRoot) and each child from its parent at newproc1.
+//
+//go:nosplit
+func dstrandUint64(gp *g) uint64 {
+	gp.dstrand += 0x9e3779b97f4a7c15
+	z := gp.dstrand
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// dstrandn returns a deterministic value in [0,n) from g's DST RNG stream.
+//
+//go:nosplit
+func dstrandn(gp *g, n uint32) uint32 {
+	return uint32((uint64(uint32(dstrandUint64(gp))) * uint64(n)) >> 32)
+}
+
+// dstBubbleRoot derives a synctest bubble's per-g tree root from the process DST
+// seed, independent of the bubble's position in the global goroutine tree. This
+// re-roots the tree per bubble so a bubble's randomness is reproducible
+// regardless of what ran before it in the same process — i.e. a test reproduces
+// identically in isolation. It is a splitmix64 step so the bubble root differs
+// from g0's raw root (schedinit). A future per-bubble seed (the public DST
+// control API) would override this.
+func dstBubbleRoot(seed uint64) uint64 {
+	seed += 0x9e3779b97f4a7c15
+	seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9
+	seed = (seed ^ (seed >> 27)) * 0x94d049bb133111eb
+	return seed ^ (seed >> 31)
 }
 
 // mrandinit initializes the random state of an m.
@@ -192,7 +278,20 @@ func mrandinit(mp *m) {
 	}
 	bootstrapRandReseed() // erase key we just extracted
 	mp.chacha8.Init64(seed)
-	mp.cheaprand = rand()
+	if dstActive() {
+		// Don't seed from rand() under DST: rand() routes through the caller
+		// goroutine's per-g stream, and mrandinit can run on a user goroutine's
+		// stack (ready -> wakep -> newm -> allocm -> mcommoninit -> mrandinit, no
+		// systemstack switch). Drawing here would advance that goroutine's per-g
+		// stream by a load-dependent amount (new-m creation timing) and so
+		// reintroduce the nondeterminism the per-g tree removes. Seed from the
+		// global bootstrap generator instead; the new m's cheaprand is not
+		// application-observable under DST (select/map/math-rand use the per-g
+		// stream).
+		mp.cheaprand = bootstrapRand()
+	} else {
+		mp.cheaprand = rand()
+	}
 }
 
 // randn is like rand() % n but faster.

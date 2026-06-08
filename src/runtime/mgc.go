@@ -709,6 +709,50 @@ func (t gcTrigger) test() bool {
 	}
 	switch t.kind {
 	case gcTriggerHeap:
+		if dstActive() {
+			// Per-bubble relative trigger: fire when the bubble's growth since the
+			// last mark reaches the GOGC ratio of the bubble's *own* live set
+			// (heapMarked - dstHeapBase), excluding the run-to-run-varying process
+			// baseline. This makes the GC-trigger crossing — and thus finalizer/weak
+			// discovery — a deterministic function of the bubble's allocation. The
+			// heapMinimum floor is the same as production. See docs/dst/design.md.
+			//
+			// Under -race this is set-level (numGC + total finalizer set)
+			// deterministic but not byte-exact per-cycle: for the small-live-set
+			// workloads DST targets, target floors at heapMinimum and the bubble's
+			// growth is -race-invariant, so numGC is deterministic by construction;
+			// the per-cycle split jitters because the trigger is checked at span-grab
+			// boundaries that -race's redzones shift. See the layered contract in the
+			// runtime/dst package doc.
+			hm := gcController.heapMarked
+			var target uint64
+			if gp := gcController.gcPercent.Load(); gp < 0 {
+				// GOGC=off. Production would leave the heap unbounded unless a
+				// GOMEMLIMIT goal applies; DST cannot honor GOMEMLIMIT
+				// deterministically — its goal derives from total mapped memory,
+				// which is not bubble-local and varies run to run (D6, "GOMEMLIMIT
+				// and RSS stats are not deterministic"). So that a GOGC=off bubble
+				// that allocates is still *deterministically* memory-bounded rather
+				// than growing without limit, fall back to a fixed floor instead of
+				// never triggering. Use the constant defaultHeapMinimum, not
+				// gcController.heapMinimum, which is defaultHeapMinimum*GOGC/100 and so
+				// overflows to garbage when GOGC=off (gcPercent == -1). Bubbles that
+				// allocate below this floor (e.g. the logical-only DST tests) still
+				// never GC.
+				target = defaultHeapMinimum
+			} else {
+				base := dstHeapBase.Load()
+				bubbleMarked := uint64(0)
+				if hm > base {
+					bubbleMarked = hm - base
+				}
+				target = bubbleMarked * uint64(gp) / 100
+				if target < gcController.heapMinimum {
+					target = gcController.heapMinimum
+				}
+			}
+			return gcController.heapLive.Load() >= hm+target
+		}
 		trigger, _ := gcController.trigger()
 		return gcController.heapLive.Load() >= trigger
 	case gcTriggerTime:
@@ -784,6 +828,15 @@ func gcStart(trigger gcTrigger) {
 	if debug.gcstoptheworld == 1 {
 		mode = gcForceMode
 	} else if debug.gcstoptheworld == 2 {
+		mode = gcForceBlockMode
+	}
+	if dstActive() {
+		// DST: force stop-the-world GC with synchronous sweep. Concurrent mark
+		// would interleave nondeterministically with runnable bubble goroutines,
+		// and lazy/proportional sweep would float finalizer/weak-handle discovery
+		// order; gcForceBlockMode does mark and sweep with the world stopped, so
+		// the whole cycle is a deterministic function of the (deterministic) heap.
+		// See docs/dst/design.md (Tier 2, D2/D3).
 		mode = gcForceBlockMode
 	}
 
@@ -1386,6 +1439,11 @@ func gcMarkTermination(stw worldStop) {
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)
 		stwSwept = gcSweep(work.mode)
+		if dstActive() {
+			// Record the per-cycle finalizer-discovery observable (after sweep has
+			// queued this cycle's finalizers). Test-only; see dstFinqSeq.
+			dstRecordFinqSeq()
+		}
 	})
 
 	mp.traceback = 0

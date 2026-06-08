@@ -507,6 +507,8 @@ type g struct {
 	atomicstatus atomic.Uint32
 	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
 	goid         uint64
+	dstrand      uint64 // deterministic per-g RNG state for DST (runtime/dst); unused when DST off
+	dstPrio      int64  // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting
@@ -1267,6 +1269,7 @@ const (
 	waitReasonSynctestSelect                          // "select (durable)"
 	waitReasonSynctestWaitGroupWait                   // "sync.WaitGroup.Wait (durable)"
 	waitReasonCleanupWait                             // "cleanup wait"
+	waitReasonSynctestGCDrain                         // "synctest GC drain"
 )
 
 var waitReasonStrings = [...]string{
@@ -1317,6 +1320,7 @@ var waitReasonStrings = [...]string{
 	waitReasonSynctestSelect:        "select (durable)",
 	waitReasonSynctestWaitGroupWait: "sync.WaitGroup.Wait (durable)",
 	waitReasonCleanupWait:           "cleanup wait",
+	waitReasonSynctestGCDrain:       "synctest GC drain",
 }
 
 func (w waitReason) String() string {
@@ -1395,6 +1399,11 @@ var isIdleInSynctest = [len(waitReasonStrings)]bool{
 	waitReasonSynctestChanReceive:   true,
 	waitReasonSynctestChanSend:      true,
 	waitReasonSynctestSelect:        true,
+	// The DST finalizer-drain goroutine, when parked with no finalizers to run,
+	// is durably idle: it is woken only by the synctest driver at a quiescence
+	// point. Without this, an idle drain would keep running > 0 so the bubble
+	// never quiesces and virtual time never advances (invariant DST-FIN-3).
+	waitReasonSynctestGCDrain: true,
 }
 
 var (

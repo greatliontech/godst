@@ -170,7 +170,15 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	}
 
 	// Create another G if necessary.
-	if gcCleanups.needG() {
+	//
+	// Not under DST: a cleanup G is a process-global system goroutine created via
+	// `go runCleanups()`, which draws from the caller's per-g DST RNG stream
+	// (newproc1) and persists across Runs (ng stays nonzero), so whether it is
+	// created during a Run would depend on process history — breaking the
+	// reproducible-in-isolation property. Under DST the bubble drain runs cleanups
+	// instead, so no async cleanup G is needed; pre-bubble and post-Run cleanups
+	// are drained bubble-less in dstActivate.
+	if !dstActive() && gcCleanups.needG() {
 		gcCleanups.createGs()
 	}
 
@@ -716,45 +724,74 @@ var gcCleanups cleanupQueue
 func runCleanups() {
 	for {
 		b := gcCleanups.dequeue()
-		if raceenabled {
-			// Approximately: adds a happens-before edge between the cleanup
-			// argument being mutated and the call to the cleanup below.
-			racefingo()
-		}
-
-		gcCleanups.beginRunningCleanups()
-		for i := 0; i < int(b.n); i++ {
-			c := b.cleanups[i]
-			b.cleanups[i] = cleanupFn{}
-
-			var racectx uintptr
-			if raceenabled {
-				// Enter a new race context so the race detector can catch
-				// potential races between cleanups, even if they execute on
-				// the same goroutine.
-				//
-				// Synchronize on fn. This would fail to find races on the
-				// closed-over values in fn (suppose arg is passed to multiple
-				// AddCleanup calls) if arg was not unique, but it is.
-				racerelease(unsafe.Pointer(c.arg))
-				racectx = raceEnterNewCtx()
-				raceacquire(unsafe.Pointer(c.arg))
-			}
-
-			// Execute the next cleanup.
-			c.call(c.fn, c.arg)
-
-			if raceenabled {
-				// Restore the old context.
-				raceRestoreCtx(racectx)
-			}
-		}
-		gcCleanups.endRunningCleanups()
-		gcCleanups.executed.Add(int64(b.n))
-
-		atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
-		gcCleanups.free.push(&b.lfnode)
+		runCleanupBlock(b)
 	}
+}
+
+// runCleanupBlock runs every cleanup in b, then frees b. Shared by the async
+// cleanup goroutines (runCleanups) and the DST bubble drain (dstDrainCleanups), so
+// a cleanup runs identically whichever goroutine drives it. The caller must hold
+// no cleanup lock.
+func runCleanupBlock(b *cleanupBlock) {
+	if raceenabled {
+		// Approximately: adds a happens-before edge between the cleanup
+		// argument being mutated and the call to the cleanup below.
+		racefingo()
+	}
+
+	gcCleanups.beginRunningCleanups()
+	for i := 0; i < int(b.n); i++ {
+		c := b.cleanups[i]
+		b.cleanups[i] = cleanupFn{}
+
+		var racectx uintptr
+		if raceenabled {
+			// Enter a new race context so the race detector can catch
+			// potential races between cleanups, even if they execute on
+			// the same goroutine.
+			//
+			// Synchronize on fn. This would fail to find races on the
+			// closed-over values in fn (suppose arg is passed to multiple
+			// AddCleanup calls) if arg was not unique, but it is.
+			racerelease(unsafe.Pointer(c.arg))
+			racectx = raceEnterNewCtx()
+			raceacquire(unsafe.Pointer(c.arg))
+		}
+
+		// Execute the next cleanup.
+		c.call(c.fn, c.arg)
+
+		if raceenabled {
+			// Restore the old context.
+			raceRestoreCtx(racectx)
+		}
+	}
+	gcCleanups.endRunningCleanups()
+	gcCleanups.executed.Add(int64(b.n))
+
+	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
+	gcCleanups.free.push(&b.lfnode)
+}
+
+// dstDrainCleanups runs every currently-queued cleanup on the calling goroutine,
+// returning once the full-block queue is empty. Used by the DST bubble drain so
+// cleanups run on a bubble goroutine (g.bubble set) rather than the async cleanup
+// pool (g.bubble == nil), which would fatal on a bubble channel op (invariant
+// DST-CLEANUP-1). The caller must hold no cleanup lock. The quiescence GC's sweep
+// has already flushed per-P partial blocks into the full queue (mgcsweep.go), so
+// the full queue holds every cleanup queued up to this quiescence.
+func dstDrainCleanups() {
+	for gcCleanups.tryTakeWork() {
+		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
+		runCleanupBlock(b)
+	}
+}
+
+// cleanupPending reports whether any cleanups have been queued but not yet
+// executed. Used by the DST quiescence drain to decide whether to wake the drain.
+func cleanupPending() bool {
+	queued, executed := gcCleanups.readQueueStats()
+	return queued != executed
 }
 
 // blockUntilEmpty blocks until either the cleanup queue is emptied

@@ -1326,6 +1326,21 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// Furthermore, by setting the runway so that CPU resources are divided
 	// this way, assuming that the cons/mark ratio is correct, we make that
 	// division a reality.
+	//
+	// Note on DST: runway is intentionally NOT special-cased here, even though it
+	// is the only trigger input derived from wall-clock time (via consMark, whose
+	// idleUtilization term carries idle-mark-worker time — assists are 0 under STW,
+	// but idle mark workers still run because gcForceBlockMode does not set
+	// debug.gcstoptheworld). Pinning runway to a constant was tried and removed: it
+	// does NOT make the trigger deterministic, because the trigger also depends on
+	// heapLive/heapMarked (via the goal and sweepDistMinTrigger), which carry
+	// run-to-run accounting noise of their own (process heap history at bubble
+	// entry, internal allocations) that cascades through the trigger feedback loop.
+	// Byte-exact trigger determinism is therefore neither achievable here nor
+	// required: what DST guarantees is OBSERVABLE program determinism (allocation
+	// results, scheduling, and — via STW eliminating concurrent floating garbage —
+	// the GC count), which holds with or without a runway override. So we leave the
+	// production runway formula untouched. See docs/dst/design.md (Tier 2, D1).
 	c.runway.Store(uint64((c.consMark * (1 - gcGoalUtilization) / (gcGoalUtilization)) * float64(c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load())))
 }
 

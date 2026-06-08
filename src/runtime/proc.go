@@ -3440,7 +3440,11 @@ top:
 	// Check the global runnable queue once in a while to ensure fairness.
 	// Otherwise two goroutines can completely occupy the local runqueue
 	// by constantly respawning each other.
-	if pp.schedtick%61 == 0 && !sched.runq.empty() {
+	//
+	// Skipped under DST: the unified DST selection below already considers the
+	// global runq alongside the local one, so this FIFO peek would otherwise pull
+	// a global goroutine ahead of the seeded choice and perturb determinism.
+	if (!dstActive() || gomaxprocs != 1) && pp.schedtick%61 == 0 && !sched.runq.empty() {
 		lock(&sched.lock)
 		gp := globrunqget()
 		unlock(&sched.lock)
@@ -3450,14 +3454,28 @@ top:
 	}
 
 	// Wake up the finalizer G.
-	if fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
+	//
+	// Under DST the async finalizer goroutine fing must not run: its g.bubble is
+	// nil, so a finalizer doing a bubble channel op would fatal, and its async
+	// timing is nondeterministic. During a dst.Run, finq accumulates and is
+	// drained by the bubble-scoped drain at each synctest quiescence point
+	// (synctest.go), so finalizers run deterministically on a bubble goroutine
+	// (invariants DST-FIN-1, DST-FIN-2). After the run, dstActive is false again
+	// and fing resumes normally.
+	if !dstActive() && fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
 		if gp := wakefing(); gp != nil {
 			ready(gp, 0, true)
 		}
 	}
 
 	// Wake up one or more cleanup Gs.
-	if gcCleanups.needsWake() {
+	//
+	// Gated under DST for the same reason as the finalizer G above: during a
+	// dst.Run, cleanups must run on the bubble-scoped drain at quiescence (with
+	// g.bubble set, deterministically), not on the async cleanup pool (g.bubble
+	// == nil, nondeterministic). Cleanups accumulate in gcCleanups and are drained
+	// by synctestGCDrain (invariants DST-CLEANUP-1, DST-CLEANUP-2).
+	if !dstActive() && gcCleanups.needsWake() {
 		gcCleanups.wake()
 	}
 
@@ -3465,21 +3483,30 @@ top:
 		asmcgocall(*cgo_yield, nil)
 	}
 
-	// local runq
-	if gp, inheritTime := runqget(pp); gp != nil {
-		return gp, inheritTime, false
-	}
+	// Under DST at P=1, select the next goroutine from the unified runnable set
+	// (runnext + local ring + global runq) via the scheduling strategy. Returns
+	// nil only when nothing is runnable, so we fall through to netpoll/idle.
+	if dstActive() && gomaxprocs == 1 {
+		if gp, inheritTime := dstFindRunnable(pp); gp != nil {
+			return gp, inheritTime, false
+		}
+	} else {
+		// local runq
+		if gp, inheritTime := runqget(pp); gp != nil {
+			return gp, inheritTime, false
+		}
 
-	// global runq
-	if !sched.runq.empty() {
-		lock(&sched.lock)
-		gp, q := globrunqgetbatch(int32(len(pp.runq)) / 2)
-		unlock(&sched.lock)
-		if gp != nil {
-			if runqputbatch(pp, &q); !q.empty() {
-				throw("Couldn't put Gs into empty local runq")
+		// global runq
+		if !sched.runq.empty() {
+			lock(&sched.lock)
+			gp, q := globrunqgetbatch(int32(len(pp.runq)) / 2)
+			unlock(&sched.lock)
+			if gp != nil {
+				if runqputbatch(pp, &q); !q.empty() {
+					throw("Couldn't put Gs into empty local runq")
+				}
+				return gp, false, false
 			}
-			return gp, false, false
 		}
 	}
 
@@ -5372,6 +5399,19 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 			newg.goroutineProfiled.Store(goroutineProfileSatisfied)
 		}
 	}
+	if dstActive() {
+		// Seed the child's deterministic DST RNG from the parent's stream,
+		// extending the deterministic goroutine tree. Draw before the
+		// trackingSeq cheaprand below so the child's seed depends only on
+		// logical ancestry, not on runtime-internal per-m draws.
+		newg.dstrand = dstrandUint64(callergp)
+		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
+			// PCT: give the new goroutine a random base priority from the scheduling
+			// RNG (a scheduling property, not part of the per-g logical stream). The
+			// creation order is deterministic, so the draw sequence is too.
+			dstPCTAssignPrio(newg)
+		}
+	}
 	// Track initial transition?
 	newg.trackingSeq = uint8(cheaprand())
 	if newg.trackingSeq%gTrackingPeriod == 0 {
@@ -6600,13 +6640,21 @@ func sysmon() {
 			idle++
 		}
 		// check if we need to force a GC
-		if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && forcegc.idle.Load() {
-			lock(&forcegc.lock)
-			forcegc.idle.Store(false)
-			var list gList
-			list.push(forcegc.g)
-			injectglist(&list)
-			unlock(&forcegc.lock)
+		//
+		// Under deterministic scheduling (DST active), skip the
+		// time-triggered GC: sysmon fires it on real wall-clock (forcegcperiod),
+		// so a long-running DST simulation would inject forcegc.g at a
+		// nondeterministic logical point. Heap-triggered GC, deterministic given
+		// deterministic allocation, is unaffected. See docs/dst/design.md.
+		if !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && forcegc.idle.Load() {
+				lock(&forcegc.lock)
+				forcegc.idle.Store(false)
+				var list gList
+				list.push(forcegc.g)
+				injectglist(&list)
+				unlock(&forcegc.lock)
+			}
 		}
 		if debug.schedtrace > 0 && lasttrace+int64(debug.schedtrace)*1000000 <= now {
 			lasttrace = now
@@ -6662,7 +6710,14 @@ func retake(now int64) uint32 {
 			pd.schedtick = uint32(schedt)
 			pd.schedwhen = now
 		} else if pd.schedwhen+forcePreemptNS <= now {
-			preemptone(pp)
+			// Under deterministic scheduling (DST active), time-based
+			// preemption of a running goroutine would inject a wall-clock
+			// dependent yield point: at GOMAXPROCS=1 it changes which goroutine
+			// runs when, making a multi-goroutine interleaving nondeterministic.
+			// Skip it; syscall retaking below is preserved. See docs/dst/design.md.
+			if !dstActive() {
+				preemptone(pp)
+			}
 			// If pp is in a syscall, preemptone doesn't work.
 			// The goroutine nor the thread can respond to a
 			// preemption request because they're not in Go code,
@@ -7309,6 +7364,28 @@ func globrunqgetbatch(n int32) (gp *g, q gQueue) {
 	return
 }
 
+// removeAt removes and returns the i-th element (0-based from the head) of q.
+// Caller must hold whatever lock guards q. Used by the DST scheduler to remove a
+// strategy-chosen goroutine from the global runq; O(i) in the queue length, which
+// is short under the single-P deterministic simulation.
+func (q *gQueue) removeAt(i uint32) *g {
+	if i == 0 {
+		return q.pop()
+	}
+	prev := q.head.ptr()
+	for ; i > 1; i-- {
+		prev = prev.schedlink.ptr()
+	}
+	gp := prev.schedlink.ptr()
+	prev.schedlink = gp.schedlink
+	if q.tail.ptr() == gp {
+		q.tail.set(prev)
+	}
+	gp.schedlink = 0
+	q.size--
+	return gp
+}
+
 // pMask is an atomic bitstring with one bit per P.
 type pMask []uint32
 
@@ -7487,7 +7564,12 @@ func runqput(pp *p, gp *g, next bool) {
 		// risk starvation.
 		next = false
 	}
-	if randomizeScheduler && next && randn(2) == 0 {
+	if randomizeScheduler && !dstActive() && next && randn(2) == 0 {
+		// Under DST the get-side seam (dstRunqget) owns interleaving diversity from
+		// the seeded scheduling RNG; the -race put-side shuffle must defer to it, or
+		// it would perturb the enqueue order (and, via randn->per-g rand, the
+		// enqueuing goroutine's stream) nondeterministically. Free in normal builds:
+		// randomizeScheduler is a const false there, so this whole branch is elided.
 		next = false
 	}
 
@@ -7538,7 +7620,7 @@ func runqputslow(pp *p, gp *g, h, t uint32) bool {
 	}
 	batch[n] = gp
 
-	if randomizeScheduler {
+	if randomizeScheduler && !dstActive() { // DST owns ordering at get-side; see runqput
 		for i := uint32(1); i <= n; i++ {
 			j := cheaprandn(i + 1)
 			batch[i], batch[j] = batch[j], batch[i]
@@ -7576,7 +7658,7 @@ func runqputbatch(pp *p, q *gQueue) {
 		n++
 	}
 
-	if randomizeScheduler {
+	if randomizeScheduler && !dstActive() { // DST owns ordering at get-side; see runqput
 		off := func(o uint32) uint32 {
 			return (pp.runqtail + o) % uint32(len(pp.runq))
 		}
@@ -7616,6 +7698,138 @@ func runqget(pp *p) (gp *g, inheritTime bool) {
 			return gp, false
 		}
 	}
+}
+
+// dstFindRunnable selects the next runnable goroutine under DST at GOMAXPROCS=1
+// from the *unified* runnable set — runnext, the local ring, and the global runq
+// — via the active scheduling strategy. This is the single "which runnable
+// goroutine proceeds next" choke point under DST: a strategy (uniform-random
+// today; PCT and scheduling faults later) chooses over the whole runnable set
+// rather than per-queue, which is required for any global-priority policy and
+// gives strictly more interleaving diversity even for uniform-random (a
+// Gosched'd goroutine on the global runq can now interleave ahead of a locally
+// woken one). Returns nil if no goroutine is runnable, so findRunnable falls
+// through to netpoll/idle.
+//
+// Sound because every candidate is already runnable — past the channel/mutex/
+// happens-before edge that made it so — so their relative order is a real degree
+// of freedom the runtime+OS could also take. Deterministic because the choice is
+// the seeded scheduling RNG over a deterministically-enumerated set. Safe only at
+// P=1 (dst.Run pins it): with no other P there is no concurrent stealer racing
+// the local ring, so the non-FIFO ring removal uses plain loads/stores rather
+// than the steal-synchronizing CAS. Holds sched.lock to touch the global runq;
+// the local ring is P-owned and uncontended at P=1.
+func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
+	lock(&sched.lock)
+	c := dstCandidates{pp: pp, hasNext: pp.runnext != 0, h: pp.runqhead}
+	c.ringN = pp.runqtail - c.h
+	total := c.ringN + uint32(sched.runq.size)
+	if c.hasNext {
+		total++
+	}
+	if total == 0 {
+		unlock(&sched.lock)
+		return nil, false
+	}
+	gp, inheritTime = c.removeAt(dstSchedSelect(&c, total))
+	unlock(&sched.lock)
+	return gp, inheritTime
+}
+
+// dstSchedSelect returns the index in [0,total) of the candidate to run next
+// under the active scheduling strategy. Random draws uniformly; PCT runs the
+// highest-priority candidate and fires any due priority-change point.
+func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
+	if dstSchedKind == dstSchedPCT {
+		return dstPCTSelect(c, total)
+	}
+	return dstSchedRandn(total)
+}
+
+// dstPCTSelect implements the PCT choice: advance the step counter, pick the
+// runnable candidate with the highest priority (ties broken by goid, for
+// determinism), and if this step is a priority-change point, deprioritize the
+// chosen goroutine (it still runs this step but sorts low afterward), creating
+// the priority inversion that exposes a depth-d bug.
+func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
+	dstPCT.step++
+	best := uint32(0)
+	bg := c.at(0)
+	bestPrio, bestGoid := bg.dstPrio, bg.goid
+	for k := uint32(1); k < total; k++ {
+		g := c.at(k)
+		if g.dstPrio > bestPrio || (g.dstPrio == bestPrio && g.goid < bestGoid) {
+			best, bestPrio, bestGoid = k, g.dstPrio, g.goid
+		}
+	}
+	for i := int32(0); i < dstPCT.nchange; i++ {
+		if !dstPCT.applied[i] && dstPCT.step == dstPCT.changeAt[i] {
+			c.at(best).dstPrio = dstPCT.changeLow[i]
+			dstPCT.applied[i] = true
+		}
+	}
+	return best
+}
+
+// dstCandidates is a stack-allocated view of the unified runnable set for one
+// scheduling decision, indexed [0,total): the local ring occupies [0,ringN);
+// runnext (if present) is at ringN; the global runq follows. It carries no
+// goroutine slice, so enumerating/removing a candidate allocates nothing (which
+// would otherwise perturb GC determinism).
+type dstCandidates struct {
+	pp      *p
+	hasNext bool
+	h       uint32 // runqhead snapshot
+	ringN   uint32
+}
+
+// at returns the k-th candidate goroutine without removing it, for priority-based
+// strategies (PCT) that must inspect candidates before choosing. The global-runq
+// branch walks the linked list (O(k)); the runnable set is short under the
+// single-P simulation. Caller holds sched.lock.
+func (c *dstCandidates) at(k uint32) *g {
+	pp := c.pp
+	if k < c.ringN {
+		return pp.runq[(c.h+k)%uint32(len(pp.runq))].ptr()
+	}
+	if c.hasNext && k == c.ringN {
+		return pp.runnext.ptr()
+	}
+	gi := k - c.ringN
+	if c.hasNext {
+		gi--
+	}
+	n := sched.runq.head.ptr()
+	for ; gi > 0; gi-- {
+		n = n.schedlink.ptr()
+	}
+	return n
+}
+
+// removeAt removes and returns the k-th candidate goroutine, plus inheritTime
+// (true only for runnext, matching runqget). Caller holds sched.lock.
+func (c *dstCandidates) removeAt(k uint32) (*g, bool) {
+	pp := c.pp
+	if k < c.ringN {
+		// Local-ring element: swap the head element into the vacated slot and
+		// advance the head, keeping the ring contiguous (order within the ring is
+		// irrelevant — selection is by the strategy, not FIFO position).
+		idx := (c.h + k) % uint32(len(pp.runq))
+		gp := pp.runq[idx].ptr()
+		pp.runq[idx] = pp.runq[c.h%uint32(len(pp.runq))]
+		atomic.StoreRel(&pp.runqhead, c.h+1)
+		return gp, false
+	}
+	if c.hasNext && k == c.ringN {
+		gp := pp.runnext.ptr()
+		pp.runnext = 0
+		return gp, true
+	}
+	gi := k - c.ringN
+	if c.hasNext {
+		gi--
+	}
+	return sched.runq.removeAt(gi), false
 }
 
 // runqdrain drains the local runnable queue of pp and returns all goroutines in it.

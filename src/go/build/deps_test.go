@@ -138,6 +138,10 @@ var depsRules = `
 	RUNTIME
 	< arena;
 
+	# runtime/dst is the deterministic-simulation-testing control API.
+	RUNTIME, internal/synctest
+	< runtime/dst;
+
 	syscall !< io;
 	reflect !< sort;
 

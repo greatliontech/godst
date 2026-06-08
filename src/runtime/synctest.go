@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -36,6 +37,16 @@ type synctestBubble struct {
 	total   int // total goroutines
 	running int // non-blocked goroutines
 	active  int // other sources of activity
+
+	// DST: the persistent finalizer-drain goroutine. Under DST, finalizers are
+	// not run by the async system goroutine (fing); they accumulate in finq and
+	// are run on gcDrain at each quiescence point, so they run on a goroutine
+	// with g.bubble set, deterministically scheduled (see dstDrainAtQuiescence).
+	// nil when DST is not active for this bubble. gcDrainExit, set under
+	// bubble.mu before the final wake, tells gcDrain to exit so it does not
+	// outlive the Run and trip the total != 1 deadlock check.
+	gcDrain     *g
+	gcDrainExit bool
 }
 
 // changegstatus is called when the non-lock status of a g changes.
@@ -198,8 +209,53 @@ func synctestRun(f func()) {
 	systemstack(func() {
 		fv := *(**funcval)(unsafe.Pointer(&f))
 		bubble.main = newproc1(fv, gp, pc, false, waitReasonZero)
+		if dstActive() {
+			// Re-root the per-g DST tree at this bubble so the bubble's
+			// randomness is independent of what ran before it in this process: a
+			// bubble (test) is then reproducible in isolation. Without this,
+			// bubble.main would inherit the caller's tree position, which depends
+			// on global goroutine-creation order. Safe here: bubble.main is not
+			// yet runnable on any queue. See dstBubbleRoot.
+			bubble.main.dstrand = dstBubbleRoot(dstSeed.Load())
+			// Re-root the scheduling RNG at this bubble too, so the seeded
+			// interleaving (which runnable goroutine proceeds next) is reproducible
+			// in isolation, independent of what scheduled before this bubble. See
+			// dstSchedRand.
+			dstSchedRand = dstSchedRoot(dstSeed.Load())
+			if dstSchedKind == dstSchedPCT {
+				// Re-root the PCT state (change points, step counter) for this bubble.
+				// Goroutine priorities are assigned at creation (newproc1), so the
+				// bubble's goroutines — created after this — get fresh priorities from
+				// the just-re-rooted scheduling RNG. Note bubble.main (created at
+				// newproc1 above, *before* this re-root) drew its priority from the
+				// activation-rooted stream state; that is still deterministic per seed
+				// (only deterministic, bubble-less draws occur between activation and
+				// here at P=1), it just comes from a different stream position than its
+				// children. Do not reorder the main creation after the re-root expecting
+				// to "fix" this — it would change the stream and is unnecessary.
+				dstSchedRootPCT()
+			}
+		}
 		pp := getg().m.p.ptr()
 		runqput(pp, bubble.main, true)
+		if dstActive() {
+			// Start the per-bubble finalizer drain. Created here, exactly once per
+			// Run, so it advances the root's DST RNG stream a fixed number of times
+			// (bubble.main was already created and independently re-rooted above, and
+			// the root creates no other goroutines) — a per-quiescence spawn would
+			// perturb the seeds of goroutines the root creates. It inherits g.bubble
+			// from the root (gp.bubble, set above) via newproc1, so finalizers it runs
+			// may touch bubble channels (invariant DST-FIN-1). See synctestGCDrain.
+			//
+			// Record the drain's entry PC before newproc1 so isSystemGoroutine (called
+			// from newproc1) classifies it as a user goroutine and gives it the bubble.
+			// Set here rather than via a static initializer to avoid an init cycle.
+			synctestGCDrainPC = abi.FuncPCABIInternal(synctestGCDrain)
+			drainf := synctestGCDrain
+			drainfv := *(**funcval)(unsafe.Pointer(&drainf))
+			bubble.gcDrain = newproc1(drainfv, gp, pc, false, waitReasonZero)
+			runqput(pp, bubble.gcDrain, true)
+		}
 		wakep()
 	})
 
@@ -216,6 +272,12 @@ func synctestRun(f func()) {
 			gp.m.curg = curg
 		})
 		gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
+		// The bubble has reached quiescence (all goroutines but the root durably
+		// blocked). Under DST, run the deterministic finalizer drain before
+		// advancing virtual time, so the set of finalizers run by the next
+		// quiescence point is the deterministic dead set (invariant DST-FIN-2).
+		// No-op (no GC) when this bubble has no DST drain.
+		bubble.dstDrainAtQuiescence()
 		lock(&bubble.mu)
 		if bubble.active < 0 {
 			throw("active < 0")
@@ -233,7 +295,15 @@ func synctestRun(f func()) {
 		}
 		bubble.now = next
 	}
+	unlock(&bubble.mu)
 
+	// Under DST, drain any finalizers made dead by the run finishing and stop the
+	// drain goroutine so it does not outlive the bubble and inflate total past the
+	// root, which would spuriously trip the total != 1 deadlock check below
+	// (invariant DST-FIN-3). No-op when this bubble has no DST drain.
+	bubble.dstStopGCDrain()
+
+	lock(&bubble.mu)
 	total := bubble.total
 	unlock(&bubble.mu)
 	if raceenabled {
@@ -277,6 +347,115 @@ func synctestidle_c(gp *g, _ unsafe.Pointer) bool {
 	}
 	unlock(&gp.bubble.mu)
 	return canIdle
+}
+
+// synctestGCDrainPC is the entry PC of synctestGCDrain, set by
+// synctestRun before the first drain is created and read by isSystemGoroutine to
+// identify the drain goroutine by its start function. Held in a var (rather than
+// referenced via abi.FuncPCABIInternal at the isSystemGoroutine use site) so that
+// isSystemGoroutine carries no static reference to the drain's body, which would
+// close a package initialization cycle through mallocgc/mallocScanTable. Zero
+// until the first DST bubble runs; no real goroutine has startpc 0.
+var synctestGCDrainPC uintptr
+
+// synctestGCDrain is the body of the per-bubble DST GC-callback drain goroutine
+// (started by synctestRun under dstActive). It parks until the synctest driver
+// wakes it at a quiescence point, runs every queued finalizer and cleanup — on
+// this goroutine, whose g.bubble is the Run's bubble, so a callback may do bubble
+// channel ops without fatal (invariants DST-FIN-1, DST-CLEANUP-1) — then re-parks.
+// It exits when the driver sets gcDrainExit at Run end, so it does not outlive the
+// bubble. Finalizers run before cleanups, deterministically.
+//
+// Identified by PC in isSystemGoroutine so it is treated as a user goroutine; do
+// not rename without updating that check.
+func synctestGCDrain() {
+	bubble := getg().bubble
+	for {
+		gopark(synctestGCDrainCommit, nil, waitReasonSynctestGCDrain, traceBlockSynctest, 0)
+		lock(&bubble.mu)
+		exit := bubble.gcDrainExit
+		unlock(&bubble.mu)
+		if exit {
+			return
+		}
+		dstDrainFinq()
+		dstDrainCleanups()
+	}
+}
+
+// synctestGCDrainCommit commits the drain goroutine's park. The wake is
+// driven entirely by the synctest driver (dstDrainAtQuiescence / stop), which
+// only wakes the drain once it is parked and the bubble is quiescent, so there is
+// no concurrent wake to guard against; the park unconditionally commits.
+func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
+	return true
+}
+
+// dstDrainAtQuiescence runs the deterministic finalizer + cleanup drain at a
+// synctest quiescence point. It is called by the driver after the bubble has
+// reached quiescence (all goroutines but the root durably blocked), with
+// bubble.mu NOT held. It is a no-op (and runs no GC) when the bubble has no DST
+// drain.
+//
+// It forces one fresh STW GC (deterministic under DST), which discovers the
+// objects unreachable from the quiescent live set and queues their finalizers and
+// cleanups (the GC's sweep flushes per-P cleanup blocks; folding in any already
+// queued by mid-burst heap triggers), then wakes gcDrain to run them, so the
+// finalizer/cleanup set observed at this quiescence is the deterministic dead set
+// (invariants DST-FIN-2, DST-CLEANUP-2).
+//
+// Exactly one GC, not a fixpoint: an object kept alive only by another
+// finalizable object's still-pending callback is *in* the quiescent live set (the
+// GC marks it to keep it for that callback), so it is not yet dead here and must
+// not run — its callback runs at a later quiescence once the earlier one has run,
+// exactly as production resolves finalizer/cleanup chains across successive GC
+// cycles. The full set runs by Run end. (A fixpoint of GC+drain would also loop
+// forever on a callback that re-registers itself with SetFinalizer/AddCleanup.)
+//
+// The drain itself runs *all* currently-queued finalizers then cleanups
+// (dstDrainFinq/dstDrainCleanups loop until empty), absorbing any a callback
+// queues by allocating. The gopark then parks the root until the drain has
+// finished and the bubble is quiescent again — which also waits for any bubble
+// goroutine a callback unblocked (e.g. one that sends on a channel another
+// goroutine is receiving on) to run and re-block, before virtual time advances.
+func (bubble *synctestBubble) dstDrainAtQuiescence() {
+	if bubble.gcDrain == nil {
+		return
+	}
+	GC()
+	if !finPending() && !cleanupPending() {
+		return
+	}
+	// Wake the drain to run the queued finalizers and cleanups, then park the root
+	// until the drain has finished and the bubble is quiescent again. Reuses the
+	// driver's own idle park, so the active/running accounting is maintained
+	// exactly as in the main loop.
+	goready(bubble.gcDrain, 0)
+	gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
+}
+
+// dstStopGCDrain runs a final drain and stops the drain goroutine at Run
+// end. Called by the driver after the run loop, when the bubble is quiescent,
+// with bubble.mu NOT held. No-op when the bubble has no DST drain.
+//
+// The drain is a bubble goroutine and so counts toward bubble.total; if it
+// survived the Run, total would be 2 (root + drain) at a clean exit and trip the
+// total != 1 deadlock check. So tell it to exit, wake it, and wait for it to die
+// (its exit decrements total) before the driver reads total (invariant DST-FIN-3).
+func (bubble *synctestBubble) dstStopGCDrain() {
+	if bubble.gcDrain == nil {
+		return
+	}
+	// Run finalizers made dead by the run finishing (e.g. bubble.main's locals).
+	bubble.dstDrainAtQuiescence()
+	lock(&bubble.mu)
+	bubble.gcDrainExit = true
+	unlock(&bubble.mu)
+	goready(bubble.gcDrain, 0)
+	// Park the root until the drain has observed gcDrainExit and exited; its
+	// _Grunning->_Gdead transition decrements total and wakes the root.
+	gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
+	bubble.gcDrain = nil
 }
 
 //go:linkname synctestWait internal/synctest.Wait

@@ -188,7 +188,16 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.c.timer.maybeRunChan(cas.c)
 		}
 
-		j := cheaprandn(uint32(norder + 1))
+		// Under deterministic scheduling (DST active), draw the poll
+		// order from this goroutine's per-g DST stream instead of the per-m
+		// cheaprand stream, so the chosen ready case depends only on the
+		// goroutine's logical history. See dstrandUint64.
+		var j uint32
+		if dstActive() {
+			j = dstrandn(gp, uint32(norder+1))
+		} else {
+			j = cheaprandn(uint32(norder + 1))
+		}
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
 		norder++

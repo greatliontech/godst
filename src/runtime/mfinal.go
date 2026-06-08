@@ -167,6 +167,18 @@ func wakefing() *g {
 }
 
 func createfing() {
+	// Not under DST: fing is created via `go runFinalizers()`, which draws from
+	// the calling goroutine's per-g DST RNG stream (newproc1) and persists across
+	// Runs (fingStatus stays fingCreated), so creating it during a Run — e.g. on a
+	// SUT whose first SetFinalizer is inside dst.Run — would perturb the bubble
+	// goroutine's stream in a process-history-dependent way, breaking the
+	// reproducible-in-isolation property. Under DST the bubble drain runs
+	// finalizers instead, so fing is not needed during a Run; this mirrors the
+	// createGs gate for cleanups (mcleanup.go). When fing already exists (the
+	// common case — a stdlib finalizer creates it at startup) this is a no-op.
+	if dstActive() {
+		return
+	}
 	// start the finalizer goroutine exactly once
 	if fingStatus.Load() == fingUninitialized && fingStatus.CompareAndSwap(fingUninitialized, fingCreated) {
 		go runFinalizers()
@@ -191,12 +203,6 @@ func finReadQueueStats() (queued, executed uint64) {
 
 // This is the goroutine that runs all of the finalizers.
 func runFinalizers() {
-	var (
-		frame    unsafe.Pointer
-		framecap uintptr
-		argRegs  int
-	)
-
 	gp := getg()
 	lock(&finlock)
 	fing = gp
@@ -210,85 +216,132 @@ func runFinalizers() {
 			gopark(finalizercommit, unsafe.Pointer(&finlock), waitReasonFinalizerWait, traceBlockSystemGoroutine, 1)
 			continue
 		}
-		argRegs = intArgRegs
 		unlock(&finlock)
-		if raceenabled {
-			racefingo()
-		}
-		for fb != nil {
-			n := fb.cnt
-			for i := n; i > 0; i-- {
-				f := &fb.fin[i-1]
+		runFinqBlocks(fb)
+	}
+}
 
-				var regs abi.RegArgs
-				// The args may be passed in registers or on stack. Even for
-				// the register case, we still need the spill slots.
-				// TODO: revisit if we remove spill slots.
-				//
-				// Unfortunately because we can have an arbitrary
-				// amount of returns and it would be complex to try and
-				// figure out how many of those can get passed in registers,
-				// just conservatively assume none of them do.
-				framesz := unsafe.Sizeof((any)(nil)) + f.nret
-				if framecap < framesz {
-					// The frame does not contain pointers interesting for GC,
-					// all not yet finalized objects are stored in finq.
-					// If we do not mark it as FlagNoScan,
-					// the last finalized object is not collected.
-					frame = mallocgc(framesz, nil, true)
-					framecap = framesz
-				}
-				if f.fint == nil {
-					throw("missing type in finalizer")
-				}
-				r := frame
-				if argRegs > 0 {
-					r = unsafe.Pointer(&regs.Ints)
-				} else {
-					// frame is effectively uninitialized
-					// memory. That means we have to clear
-					// it before writing to it to avoid
-					// confusing the write barrier.
-					*(*[2]uintptr)(frame) = [2]uintptr{}
-				}
-				switch f.fint.Kind() {
-				case abi.Pointer:
-					// direct use of pointer
-					*(*unsafe.Pointer)(r) = f.arg
-				case abi.Interface:
-					ityp := (*interfacetype)(unsafe.Pointer(f.fint))
-					// set up with empty interface
-					(*eface)(r)._type = &f.ot.Type
-					(*eface)(r).data = f.arg
-					if len(ityp.Methods) != 0 {
-						// convert to interface with methods
-						// this conversion is guaranteed to succeed - we checked in SetFinalizer
-						(*iface)(r).tab = assertE2I(ityp, (*eface)(r)._type)
-					}
-				default:
-					throw("bad type kind in finalizer")
-				}
-				fingStatus.Or(fingRunningFinalizer)
-				reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
-				fingStatus.And(^fingRunningFinalizer)
+// runFinqBlocks runs every finalizer in the chain of blocks starting at fb, in
+// reverse-LIFO order within each block, and returns the drained blocks to the
+// free cache. The caller must not hold finlock and must have already detached fb
+// from finq (set finq = nil) under finlock.
+//
+// It is shared by the async system finalizer goroutine (runFinalizers) and the
+// DST bubble drain (dstDrainFinq), so a finalizer runs identically whichever
+// goroutine drives it.
+func runFinqBlocks(fb *finBlock) {
+	var (
+		frame    unsafe.Pointer
+		framecap uintptr
+	)
+	argRegs := intArgRegs
+	if raceenabled {
+		racefingo()
+	}
+	for fb != nil {
+		n := fb.cnt
+		for i := n; i > 0; i-- {
+			f := &fb.fin[i-1]
 
-				// Drop finalizer queue heap references
-				// before hiding them from markroot.
-				// This also ensures these will be
-				// clear if we reuse the finalizer.
-				f.fn = nil
-				f.arg = nil
-				f.ot = nil
-				atomic.Store(&fb.cnt, i-1)
+			var regs abi.RegArgs
+			// The args may be passed in registers or on stack. Even for
+			// the register case, we still need the spill slots.
+			// TODO: revisit if we remove spill slots.
+			//
+			// Unfortunately because we can have an arbitrary
+			// amount of returns and it would be complex to try and
+			// figure out how many of those can get passed in registers,
+			// just conservatively assume none of them do.
+			framesz := unsafe.Sizeof((any)(nil)) + f.nret
+			if framecap < framesz {
+				// The frame does not contain pointers interesting for GC,
+				// all not yet finalized objects are stored in finq.
+				// If we do not mark it as FlagNoScan,
+				// the last finalized object is not collected.
+				frame = mallocgc(framesz, nil, true)
+				framecap = framesz
 			}
-			next := fb.next
-			lock(&finlock)
-			finexecuted += uint64(n)
-			fb.next = finc
-			finc = fb
-			unlock(&finlock)
-			fb = next
+			if f.fint == nil {
+				throw("missing type in finalizer")
+			}
+			r := frame
+			if argRegs > 0 {
+				r = unsafe.Pointer(&regs.Ints)
+			} else {
+				// frame is effectively uninitialized
+				// memory. That means we have to clear
+				// it before writing to it to avoid
+				// confusing the write barrier.
+				*(*[2]uintptr)(frame) = [2]uintptr{}
+			}
+			switch f.fint.Kind() {
+			case abi.Pointer:
+				// direct use of pointer
+				*(*unsafe.Pointer)(r) = f.arg
+			case abi.Interface:
+				ityp := (*interfacetype)(unsafe.Pointer(f.fint))
+				// set up with empty interface
+				(*eface)(r)._type = &f.ot.Type
+				(*eface)(r).data = f.arg
+				if len(ityp.Methods) != 0 {
+					// convert to interface with methods
+					// this conversion is guaranteed to succeed - we checked in SetFinalizer
+					(*iface)(r).tab = assertE2I(ityp, (*eface)(r)._type)
+				}
+			default:
+				throw("bad type kind in finalizer")
+			}
+			fingStatus.Or(fingRunningFinalizer)
+			reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
+			fingStatus.And(^fingRunningFinalizer)
+
+			// Drop finalizer queue heap references
+			// before hiding them from markroot.
+			// This also ensures these will be
+			// clear if we reuse the finalizer.
+			f.fn = nil
+			f.arg = nil
+			f.ot = nil
+			atomic.Store(&fb.cnt, i-1)
 		}
+		next := fb.next
+		lock(&finlock)
+		finexecuted += uint64(n)
+		fb.next = finc
+		finc = fb
+		unlock(&finlock)
+		fb = next
+	}
+}
+
+// finPending reports whether any finalizers have been queued but not yet
+// executed. Used by the DST quiescence drain to decide whether to wake the drain
+// goroutine and to detect when the finalizer fixpoint is reached. finqueued and
+// finexecuted are process-cumulative, but their equality is exact: they are equal
+// iff finq is empty and no finalizer is mid-run.
+func finPending() bool {
+	lock(&finlock)
+	pending := finqueued != finexecuted
+	unlock(&finlock)
+	return pending
+}
+
+// dstDrainFinq runs every currently-queued finalizer on the calling goroutine,
+// returning once finq is empty. Used by the DST bubble finalizer drain so that
+// finalizers run on a bubble goroutine (deterministically scheduled, with
+// g.bubble set) rather than on the async system finalizer goroutine fing — which
+// has g.bubble == nil and would fatal on a bubble channel op (invariant
+// DST-FIN-1). The caller must not hold finlock.
+func dstDrainFinq() {
+	for {
+		lock(&finlock)
+		fb := finq
+		finq = nil
+		unlock(&finlock)
+		if fb == nil {
+			return
+		}
+		runFinqBlocks(fb)
 	}
 }
 
