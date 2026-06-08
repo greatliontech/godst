@@ -277,22 +277,44 @@ func dstPCTAssignPrio(newg *g) {
 // hole a SUT that reads pid/hostname (for node IDs, temp names, pid-seeded RNGs)
 // would otherwise have: the real machine's pid/hostname vary per run and per host.
 // Set by dstSetSimEnv *before* dstActivate, so the activation's atomic store
-// publishes them to the bubble's goroutines; read by os.Getpid/os.Hostname via
-// the linkname'd accessors below. dstSimEnvSet is false on the white-box
-// dstActivate path (no public Run), so os returns the real identity there.
+// publishes them to the bubble's goroutines; read by os.Getpid/os.Hostname etc.
+// and runtime.NumCPU via the linkname'd accessors below. dstSimEnvSet is false on
+// the white-box dstActivate path (no public Run), so the real identity is
+// returned there. Hostname, PID, and NumCPU are configurable (testing/simulation
+// Options); the remaining identity (ppid, uid/gid, the current user) is fixed to
+// the deterministic constants below, which testing/simulation documents.
 var (
 	dstSimPID      int
 	dstSimHostname string
+	dstSimNumCPU   int // simulated runtime.NumCPU(); 0 leaves NumCPU real
 	dstSimEnvSet   bool
+)
+
+// Fixed simulated identity returned during a run for the parts testing/simulation
+// does not make configurable. Deterministic constants so a SUT that derives state
+// from them (file modes, default config/data dirs, uid-keyed maps) replays
+// identically. uid/gid are a single int source of truth — os/user formats the
+// string forms it reports via strconv.Itoa, so os.Getuid and os/user.Current
+// cannot disagree. uid/gid are a distinctive value (not the ubiquitous 1000) so
+// the simulated identity is observably an override rather than coinciding with a
+// host's first interactive user.
+const (
+	dstSimPPID     = 1
+	dstSimUID      = 7777
+	dstSimGID      = 7777
+	dstSimUsername = "sim"
+	dstSimUserName = "sim" // full ("GECOS") name
+	dstSimHomeDir  = "/home/sim"
 )
 
 // dstSetSimEnv records the simulated process identity for the next run. Called by
 // testing/simulation.run before dstActivate; cleared by dstClearSimEnv on return.
 //
 //go:linkname dstSetSimEnv
-func dstSetSimEnv(hostname string, pid int) {
+func dstSetSimEnv(hostname string, pid, numcpu int) {
 	dstSimHostname = hostname
 	dstSimPID = pid
+	dstSimNumCPU = numcpu
 	dstSimEnvSet = true
 }
 
@@ -303,17 +325,45 @@ func dstClearSimEnv() {
 	dstSimEnvSet = false
 	dstSimHostname = ""
 	dstSimPID = 0
+	dstSimNumCPU = 0
 }
 
-// dstSimGetpid and dstSimGethostname are read by os.Getpid/os.Hostname (via
-// linkname) to return the simulated identity during a run; the bool reports
-// whether process identity is being simulated.
+// The accessors below are read by os.Getpid/Getppid/Getuid/.../os.Hostname and
+// os/user.Current (via linkname) to return the simulated identity during a run;
+// the bool reports whether process identity is being simulated. runtime.NumCPU
+// reads dstSimNumCPU/dstSimEnvSet directly (same package).
 //
 //go:linkname dstSimGetpid
 func dstSimGetpid() (int, bool) { return dstSimPID, dstSimEnvSet }
 
 //go:linkname dstSimGethostname
 func dstSimGethostname() (string, bool) { return dstSimHostname, dstSimEnvSet }
+
+//go:linkname dstSimGetppid
+func dstSimGetppid() (int, bool) { return dstSimPPID, dstSimEnvSet }
+
+//go:linkname dstSimGetuid
+func dstSimGetuid() (int, bool) { return dstSimUID, dstSimEnvSet }
+
+//go:linkname dstSimGetgid
+func dstSimGetgid() (int, bool) { return dstSimGID, dstSimEnvSet }
+
+// Effective uid/gid equal the simulated uid/gid (euid==uid, gid==egid, as in a
+// non-setuid process).
+//
+//go:linkname dstSimGeteuid
+func dstSimGeteuid() (int, bool) { return dstSimUID, dstSimEnvSet }
+
+//go:linkname dstSimGetegid
+func dstSimGetegid() (int, bool) { return dstSimGID, dstSimEnvSet }
+
+// dstSimUser is read by os/user.Current to return the simulated current user. It
+// returns uid/gid as ints from the single source of truth; os/user formats them.
+//
+//go:linkname dstSimUser
+func dstSimUser() (uid, gid int, username, name, home string, ok bool) {
+	return dstSimUID, dstSimGID, dstSimUsername, dstSimUserName, dstSimHomeDir, dstSimEnvSet
+}
 
 // dstMemLimit is the per-run deterministic bubble-local heap-growth budget
 // (testing/simulation Options.MemoryLimit; 0 = no limit). Unlike GOMEMLIMIT —

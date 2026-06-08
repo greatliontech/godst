@@ -28,22 +28,42 @@ func runtime_args() []string // in package runtime
 // Getuid returns the numeric user id of the caller.
 //
 // On Windows, it returns -1.
-func Getuid() int { return syscall.Getuid() }
+func Getuid() int {
+	if uid, ok := dstSimGetuid(); ok {
+		return uid // deterministic simulation: see os/dst.go
+	}
+	return syscall.Getuid()
+}
 
 // Geteuid returns the numeric effective user id of the caller.
 //
 // On Windows, it returns -1.
-func Geteuid() int { return syscall.Geteuid() }
+func Geteuid() int {
+	if euid, ok := dstSimGeteuid(); ok {
+		return euid // deterministic simulation: see os/dst.go
+	}
+	return syscall.Geteuid()
+}
 
 // Getgid returns the numeric group id of the caller.
 //
 // On Windows, it returns -1.
-func Getgid() int { return syscall.Getgid() }
+func Getgid() int {
+	if gid, ok := dstSimGetgid(); ok {
+		return gid // deterministic simulation: see os/dst.go
+	}
+	return syscall.Getgid()
+}
 
 // Getegid returns the numeric effective group id of the caller.
 //
 // On Windows, it returns -1.
-func Getegid() int { return syscall.Getegid() }
+func Getegid() int {
+	if egid, ok := dstSimGetegid(); ok {
+		return egid // deterministic simulation: see os/dst.go
+	}
+	return syscall.Getegid()
+}
 
 // Getgroups returns a list of the numeric ids of groups that the caller belongs to.
 //

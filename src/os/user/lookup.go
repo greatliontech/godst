@@ -4,7 +4,10 @@
 
 package user
 
-import "sync"
+import (
+	"strconv"
+	"sync"
+)
 
 const (
 	userFile  = "/etc/passwd"
@@ -19,6 +22,19 @@ var colon = []byte{':'}
 // Subsequent calls will return the cached value and will not reflect
 // changes to the current user.
 func Current() (*User, error) {
+	if uid, gid, username, name, home, ok := dstSimUser(); ok {
+		// Deterministic simulation: return a synthetic current user, uncached, so
+		// the real user is still resolved outside the run (the dstSimUser check
+		// runs before the cache, and we never populate the cache here). uid/gid are
+		// formatted from the runtime's single int source of truth. See os/user/dst.go.
+		return &User{
+			Uid:      strconv.Itoa(uid),
+			Gid:      strconv.Itoa(gid),
+			Username: username,
+			Name:     name,
+			HomeDir:  home,
+		}, nil
+	}
 	cache.Do(func() { cache.u, cache.err = current() })
 	if cache.err != nil {
 		return nil, cache.err

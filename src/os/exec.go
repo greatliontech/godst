@@ -244,7 +244,12 @@ func Getpid() int {
 }
 
 // Getppid returns the process id of the caller's parent.
-func Getppid() int { return syscall.Getppid() }
+func Getppid() int {
+	if ppid, ok := dstSimGetppid(); ok {
+		return ppid // deterministic simulation: see os/dst.go
+	}
+	return syscall.Getppid()
+}
 
 // FindProcess looks for a running process by its pid.
 //

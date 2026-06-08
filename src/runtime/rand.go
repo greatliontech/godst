@@ -256,6 +256,35 @@ func dstrandn(gp *g, n uint32) uint32 {
 	return uint32((uint64(uint32(dstrandUint64(gp))) * uint64(n)) >> 32)
 }
 
+// dstReadRandom fills b from the active run's deterministic per-g RNG stream and
+// reports true, or returns false (filling nothing) when no run is active. It is
+// the crypto/rand entropy seam: crypto/internal/sysrand.Read calls it first, so
+// inside a Run all crypto/rand output — UUIDs, TLS nonces, tokens, key material —
+// is a reproducible function of the seed, drawn from the same per-g stream as
+// math/rand. Production crypto is untouched: dstActive() is false outside a run
+// (dstSeed is never set in production — only simulation.Run, which requires
+// -tags dst, sets it), so the OS-entropy path is taken there. The gate is the
+// same cheap atomic load rand() already does on its hot path. Bytes are drawn
+// big-endian per 8-byte word, matching dstFixedSeed.
+//
+//go:linkname dstReadRandom
+func dstReadRandom(b []byte) bool {
+	if !dstActive() {
+		return false
+	}
+	gp := getg()
+	for len(b) >= 8 {
+		byteorder.BEPutUint64(b, dstrandUint64(gp))
+		b = b[8:]
+	}
+	if len(b) > 0 {
+		var tmp [8]byte
+		byteorder.BEPutUint64(tmp[:], dstrandUint64(gp))
+		copy(b, tmp[:])
+	}
+	return true
+}
+
 // dstBubbleRoot derives a synctest bubble's per-g tree root from the process DST
 // seed, independent of the bubble's position in the global goroutine tree. This
 // re-roots the tree per bubble so a bubble's randomness is reproducible

@@ -46,6 +46,18 @@ func runTestProgDST(t *testing.T, name string, env ...string) string {
 	return runBuiltTestProg(t, exe, name, env...)
 }
 
+// runTestProgDSTSim runs a simulation testprog from the separate "testprogdst"
+// binary, which carries the heavy-import (crypto/rand, os/user) cases kept out of
+// the lean "testprog" so they do not perturb its byte-exact per-cycle
+// GC-discovery test (the documented ±1-span finalizer-timing fragility).
+func runTestProgDSTSim(t *testing.T, name string, env ...string) string {
+	exe, err := buildTestProg(t, "testprogdst", "-tags=dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runBuiltTestProg(t, exe, name, env...)
+}
+
 // TestDSTDeterministicSelect verifies that DST makes select poll
 // order a reproducible function of the seed: the same seed yields an identical
 // schedule across runs, and a different seed yields a different one. Without the
@@ -639,6 +651,39 @@ func TestDSTProcessIdentity(t *testing.T) {
 	const want = "def=1/sim custom=4242/node7 restored=true realoverridden=true"
 	if out != want {
 		t.Fatalf("process identity not simulated correctly:\n got=%q\nwant=%q", out, want)
+	}
+}
+
+// TestDSTIdentityExtra verifies the rest of the process-identity surface beyond
+// pid/hostname is simulated deterministically inside Run and restored outside it:
+// os.Getppid/Getuid/Getgid/Geteuid/Getegid, os/user.Current, and runtime.NumCPU
+// (the last overridable via Options.NumCPU). Mutation check: dropping any
+// dstSim* accessor branch in os/runtime changes the corresponding field.
+func TestDSTIdentityExtra(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDSTSim(t, "DSTIdentityExtra"))
+	const want = "inside=[1 7777 7777 7777 7777 8 7777:7777:sim:/home/sim] customcpu=3 restoredids=true"
+	if out != want {
+		t.Fatalf("extended identity not simulated correctly:\n got=%q\nwant=%q", out, want)
+	}
+}
+
+// TestDSTCryptoRandDeterministic verifies INV-CRYPTO: crypto/rand is a
+// reproducible function of the seed inside Run (and only inside it). It asserts
+// same-seed determinism (eq), that the stream varies with the seed (seedvaries,
+// so it is not a constant), that two reads outside a run still differ (realdiffers
+// — production crypto/rand is untouched), and that the seed-keyed output is
+// identical across two separate processes (replay). This holds under -race
+// (the per-g RNG drives it). Mutation check: making dstReadRandom return false
+// (no fill) breaks eq and the cross-process replay; ignoring the seed breaks
+// seedvaries.
+func TestDSTCryptoRandDeterministic(t *testing.T) {
+	out1 := strings.TrimSpace(runTestProgDSTSim(t, "DSTCryptoRand", "DSTSEED=12345"))
+	out2 := strings.TrimSpace(runTestProgDSTSim(t, "DSTCryptoRand", "DSTSEED=12345"))
+	if !strings.Contains(out1, " eq=true seedvaries=true realdiffers=true") {
+		t.Fatalf("crypto/rand not deterministic/seed-varying/real-outside under DST: %q", out1)
+	}
+	if out1 != out2 {
+		t.Fatalf("crypto/rand not reproducible across processes for the same seed:\nrun1=%q\nrun2=%q", out1, out2)
 	}
 }
 

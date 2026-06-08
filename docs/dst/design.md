@@ -101,19 +101,67 @@ testing construct, not a `runtime` sub-package.
   exercise the per-g mechanism under `GOMAXPROCS>1` M-migration that `Run` (single-P) cannot
   reproduce. This is the only non-`Run` entry and is not a user surface.
 
-### Deterministic process identity (`Options.Hostname` / `Options.PID`)
+### Deterministic process identity (`Options.Hostname` / `Options.PID` / `Options.NumCPU`)
 
-`os.Getpid()` and `os.Hostname()` return the **real** machine's values, which vary per run and per
-host — a determinism hole for any SUT that derives identity or seeds from them (node IDs, temp paths,
-the `pid`-seeded RNGs some libraries use, including goutils' `LockGuardedRand`). So under a run the
-simulation fixes them: `os.Getpid`/`os.Hostname` are patched to return a simulated identity when DST
-is active (`os/dst.go` bridges to `runtime` via `//go:linkname`; the runtime holds the per-run values,
-set by `testing/simulation.run` *before* `dstActivate` so the activation's atomic store publishes them
-to the bubble, and cleared on return). Both `Run` and `RunWith` fix the identity — to `"sim"` and `1`
-by default — so even plain `Run` is reproducible here; `RunWith{Hostname, PID}` overrides. This is the
-one place the fork patches a package other than `runtime`/`testing/simulation`, and it is unavoidable:
-the SUT calls `os.*` directly. The white-box `dstActivate` path leaves identity unset (real values),
-as it is not a user surface.
+The process identity a SUT can observe returns the **real** machine's values, which vary per run and
+per host — a determinism hole for any SUT that derives identity or seeds from them (node IDs, temp
+paths, the `pid`-seeded RNGs some libraries use, including goutils' `LockGuardedRand`; pool/shard
+counts sized by `runtime.NumCPU`; uid-keyed file modes). So under a run the simulation fixes the whole
+surface when DST is active: `os.Getpid`/`Getppid`/`Hostname`, `os.Getuid`/`Getgid`/`Geteuid`/`Getegid`,
+`os/user.Current`, and `runtime.NumCPU` (`os/dst.go` and `os/user/dst.go` bridge to `runtime` via
+`//go:linkname`; `runtime.NumCPU` reads the runtime state directly; the runtime holds the per-run
+values, set by `testing/simulation.run` *before* `dstActivate` so the activation's atomic store
+publishes them to the bubble, and cleared on return).
+
+Three values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), and `NumCPU` (default `8`,
+reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
+real concurrency for the schedule to explore). The rest are fixed deterministic constants documented
+on `Options`: `ppid=1`, `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the
+simulated identity is observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
+Both `Run` and `RunWith` fix the identity, so even plain `Run` is reproducible here. This
+and the crypto/rand seam below are the only places the fork patches packages other than
+`runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
+The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.
+
+One identity surface is deliberately **out of scope** here: `net.Interfaces`/`net.InterfaceAddrs` still
+report the real host's interfaces (MAC/IP). Their correct simulated shape is per-node identity sourced
+from the not-yet-designed virtualized network, so virtualizing them is deferred to that subsystem
+(`docs/issues/dst-net-interfaces-virtualization.md`); a global fixed stub now would be the wrong shape.
+
+### Deterministic crypto/rand (the entropy seam)
+
+`crypto/rand` (UUIDs, TLS nonces, tokens, key material) reads OS entropy, a determinism hole the seam
+map below originally scoped *app-side* (each SUT/library injecting its own crypto seam, e.g. protodb's
+`internal/idsource`). That scoping rested on the assumption that `crypto/rand` is not runtime-seedable.
+It is: in the standard configuration every `crypto/rand` read funnels through the single chokepoint
+`crypto/internal/sysrand.Read` (the non-FIPS `drbg.Read` is just `sysrand.Read(b)`), so one hook there
+makes *all* of `crypto/rand` a reproducible function of the seed for free — exactly as the runtime RNG
+seed already covers `math/rand[/v2]`. `crypto/internal/sysrand/dst.go` bridges to
+`runtime.dstReadRandom`, which fills the buffer from the calling goroutine's per-g DST stream when a
+run is active and returns false otherwise (so production crypto/rand and process-startup entropy are
+untouched: `dstActive()` is false outside a run — `dstSeed` is only set by `simulation.Run`, which
+requires `-tags dst` — the same cheap atomic load `rand()` already does on its hot path). This holds under `-race`
+(the per-g RNG drives it). Boundary: only the **standard** configuration is deterministic — FIPS mode
+keeps a process-global SP 800-90A DRBG whose counter the seam does not control, and BoringCrypto uses
+its own generator; neither is a simulation configuration (both need cgo/special builds DST does not
+use).
+
+**Invariants enforced by the identity/crypto seams:**
+
+- **INV-CRYPTO** (security-critical): `crypto/rand` returns OS cryptographic entropy in every reachable
+  state *except* inside an active run, where it returns the deterministic per-seed stream — i.e. it is
+  never predictable outside a run, and never in a non-`-tags dst` build. Enforced by
+  `TestDSTCryptoRandDeterministic` (deterministic + seed-varying inside a run; two reads *outside* a run
+  differ) and structurally by the `dstActive()` gate (`dstSeed` is never set on any production path: its
+  only setters are `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate`
+  linkname used solely by the runtime's own white-box tests).
+- **INV-IDENTITY**: within a run, every identity read (`pid`/`ppid`/`hostname`/`uid`/`gid`/`euid`/`egid`/
+  `NumCPU`/`os/user.Current`) is a fixed function of the run config, and is restored to the real value
+  outside the run. Enforced by `TestDSTProcessIdentity` and `TestDSTIdentityExtra` (the latter also
+  asserts the whole surface is restored after the run). The simulated `os/user.Current` is returned
+  **uncached** (before `sync.Once`), so the real-user cache is never contaminated and stays valid for
+  outside-run use; `uid`/`gid` have a single int source of truth (`os/user` formats the string form),
+  so `os.Getuid` and `os/user.Current` cannot disagree.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -196,7 +244,7 @@ Status legend: ✅ owned by an existing mechanism · 🔧 owned via a fork patch
 | **Network (gRPC admin)** | protodb | gRPC server/listener | ⛔ not yet | in-memory `net.Listener`/`Conn` (bufconn-style), userspace, additive |
 | **Random** | pebble | `math/rand/v2` globals (iterator sampling `iterator.go:11`, arenaskl `skl.go:48`, batchskl PCG seeded from the global `skl.go:175`, invariants) — all `linkname`'d to `runtime.rand` | ✅ via runtime seed | **covered by Seq 1, no pebble rand patch** |
 | **Random** | dragonboat/goutils | `LockGuardedRand` = `rand.New(rand.NewSource(pid+time))` private instance (`goutils/random/rand.go:49,57`) → `Reseed` seam | 🔧 fork patch (unavoidable) | **unreachable by runtime seed** — patch stays; optionally reseed from the v2 global to ride Seq 1 |
-| **Random** | protodb | `internal/idsource` (crypto/rand seam) | ✅ | unchanged |
+| **Random** | protodb | `internal/idsource` (crypto/rand seam) | ✅ | **covered by the runtime crypto/rand seam** (`sysrand.Read`) — no protodb crypto patch needed; `idsource` rides it like pebble's `math/rand` |
 | **Random (runtime)** | go | select/map RNG `rand.go` | ⛔ entropy-seeded | **owns it** — deterministic seed |
 | **Crashes** | protodb | `crashpoint` registry; checkers `internal/dstcheck`; INV-TEST1 gate | ✅ | unchanged |
 | **Concurrency** | dragonboat | `Expert.Engine` shards (set 1 today) | 🟡 forced to 1 | **run real shard counts** under deterministic scheduling |
@@ -209,11 +257,14 @@ logic-level, orthogonal to scheduling.
 
 What the runtime seed (Seq 1) DOES cover for free: any dependency whose randomness bottoms out in
 `math/rand` / `math/rand/v2` **top-level** functions — these are `//go:linkname`'d to `runtime.rand`
-(`math/rand/v2/rand.go:256-265`, `math/rand/rand.go:334,352`). Pebble's production randomness is
-entirely of this form, so no pebble rand patch is needed. Rule of thumb: a dep is runtime-seedable
-for free iff it uses bare `rand.Foo()`; it needs its own seam iff it holds a private
-`rand.New`/`NewSource`/`NewPCG`/`crypto/rand` instance. Classify with:
-`git grep -nE 'rand\.New\(|rand\.NewSource|rand\.NewPCG|crypto/rand' -- '*.go' ':!*_test.go'`.
+(`math/rand/v2/rand.go:256-265`, `math/rand/rand.go:334,352`) — **and `crypto/rand`**, which the
+runtime crypto/rand seam (`sysrand.Read`, above) routes through the same per-g stream in the standard
+configuration. Pebble's production randomness is entirely of the `math/rand` form, so no pebble rand
+patch is needed; protodb's `idsource` is `crypto/rand`-based and is now covered too. Rule of thumb: a
+dep is runtime-seedable for free iff its randomness bottoms out in bare `rand.Foo()` **or**
+`crypto/rand`; it needs its own seam only iff it holds a *private* `rand.New`/`NewSource`/`NewPCG`
+instance (a non-default `crypto/rand.Reader` likewise bypasses the seam). Classify the private-instance
+case with: `git grep -nE 'rand\.New\(|rand\.NewSource|rand\.NewPCG' -- '*.go' ':!*_test.go'`.
 
 ## Scope (full / final form)
 

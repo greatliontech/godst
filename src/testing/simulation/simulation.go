@@ -9,10 +9,17 @@
 // It makes the following deterministic, as a function of the seed and the
 // program's logical structure: the order in which runnable goroutines are
 // scheduled, select poll order, map iteration order, the math/rand and
-// math/rand/v2 top-level functions, and synctest timer ordering. It does not
+// math/rand/v2 top-level functions, crypto/rand, synctest timer ordering, and
+// the process identity a program observes (os.Getpid/Getppid/Hostname,
+// os.Getuid/Getgid/Geteuid/Getegid, os/user.Current, runtime.NumCPU). It does not
 // make wall-clock time, real network/file I/O, or cgo deterministic; programs
 // under test must confine themselves to goroutines, channels, sync primitives,
 // and time (real I/O is modeled in-memory).
+//
+// The determinism boundary is Run itself: these are virtualized only inside a
+// Run. Nondeterminism a program captures *before* Run — e.g. reading time.Now or
+// a real pid in an init function and stashing it in a package variable — is
+// outside the contract; acquire such values inside Run.
 //
 // It finds logical concurrency bugs — ordering, atomicity, deadlock, lost
 // wakeup, stale read. It runs single-threaded and does not reproduce data races
@@ -26,11 +33,12 @@
 // The guarantee is layered, so nothing is over-promised:
 //
 //   - Logical determinism (unconditional). Goroutine scheduling order, select
-//     poll order, map iteration order, math/rand[/v2], synctest timer ordering,
-//     and the values the program computes are a reproducible function of the
-//     seed. This is the contract the simulation exists for, and it holds under
-//     -race (it is driven by a per-goroutine deterministic RNG and
-//     single-threaded execution, neither of which the race detector perturbs).
+//     poll order, map iteration order, math/rand[/v2], crypto/rand, synctest timer
+//     ordering, the simulated process identity, and the values the program
+//     computes are a reproducible function of the seed. This is the contract the
+//     simulation exists for, and it holds under -race (it is driven by a
+//     per-goroutine deterministic RNG and single-threaded execution, neither of
+//     which the race detector perturbs).
 //   - GC set-level (unconditional). The GC count and the total set of objects
 //     whose finalizers/weak refs are discovered are deterministic, including under
 //     -race (the trigger fires the right number of times with the right total).
@@ -73,7 +81,7 @@ func dstBuilt() bool
 func dstSetSchedStrategy(kind uint8, depth, steps int32)
 
 //go:linkname dstSetSimEnv runtime.dstSetSimEnv
-func dstSetSimEnv(hostname string, pid int)
+func dstSetSimEnv(hostname string, pid, numcpu int)
 
 //go:linkname dstClearSimEnv runtime.dstClearSimEnv
 func dstClearSimEnv()
@@ -125,8 +133,27 @@ type Options struct {
 	// per run and per host, and would leak nondeterminism into any program under
 	// test that reads them). Both Run and RunWith fix them — to "sim" and 1 by
 	// default — so even plain Run is reproducible for a SUT that reads pid/hostname.
+	//
+	// The rest of the process-identity surface is fixed to deterministic constants
+	// during a run (not configurable): os.Getppid is 1; os.Getuid/Geteuid are 7777
+	// and os.Getgid/Getegid are 7777; os/user.Current reports user "sim" (uid/gid
+	// 7777, home "/home/sim"). crypto/rand is seeded from the run's deterministic
+	// RNG, so UUIDs/nonces/tokens/keys replay too — outside a run crypto/rand is
+	// unaffected and remains the real OS source. (crypto/rand is deterministic in
+	// the standard configuration only; FIPS mode keeps a process-global SP 800-90A
+	// DRBG and BoringCrypto its own generator, neither of which is a simulation
+	// configuration.)
 	Hostname string
 	PID      int
+
+	// NumCPU is the simulated runtime.NumCPU() within Run (default 8; any value
+	// <= 0 selects the default). GOMAXPROCS is independently forced to 1 for
+	// determinism, but NumCPU is reported separately, so a SUT that sizes worker
+	// pools or shards by NumCPU still creates real concurrency for the simulation
+	// to explore — fixed here so it is reproducible across hosts rather than the
+	// real machine's core count. A value of 1 makes the simulated machine
+	// single-CPU.
+	NumCPU int
 
 	// MemoryLimit, if > 0, is a deterministic bubble-local memory budget in bytes:
 	// the simulation triggers GC to keep the program's *own* heap growth within it.
@@ -138,10 +165,11 @@ type Options struct {
 	MemoryLimit int64
 }
 
-// default simulated process identity (see Options.Hostname/PID).
+// default simulated process identity (see Options.Hostname/PID/NumCPU).
 const (
 	defaultHostname = "sim"
 	defaultPID      = 1
+	defaultNumCPU   = 8
 )
 
 // Run runs f inside a deterministic simulation seeded by seed: with the same
@@ -214,17 +242,24 @@ func RunWith(seed uint64, opts Options, f func()) {
 	if pid == 0 {
 		pid = defaultPID
 	}
-	run(seed, kind, depth, steps, hostname, pid, opts.MemoryLimit, f)
+	numcpu := opts.NumCPU
+	if numcpu <= 0 {
+		// <= 0, not == 0: a negative NumCPU must not fall through to the real host
+		// count (the runtime gate is dstSimNumCPU > 0), which would silently leak a
+		// per-host value into the run. Both 0 and negative mean "use the default".
+		numcpu = defaultNumCPU
+	}
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, f)
 }
 
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid int, memLimit int64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, f func()) {
 	if !dstBuilt() {
 		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	}
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
-	dstSetSimEnv(hostname, pid) // before dstActivate: published to the bubble by the activation store
+	dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
 	dstSetMemLimit(memLimit)
 	dstActivate(seed)
 	defer func() {

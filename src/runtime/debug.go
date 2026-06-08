@@ -152,6 +152,13 @@ func SetDefaultGOMAXPROCS() {
 // at process startup. Changes to operating system CPU allocation after
 // process startup are not reflected.
 func NumCPU() int {
+	if dstSimEnvSet && dstSimNumCPU > 0 {
+		// Deterministic simulation: report the simulated CPU count so a SUT that
+		// sizes pools/shards by NumCPU is reproducible across hosts. GOMAXPROCS is
+		// independently forced to 1, so the goroutines it creates still multiplex
+		// deterministically. Real value outside a run.
+		return dstSimNumCPU
+	}
 	return int(numCPUStartup)
 }
 
