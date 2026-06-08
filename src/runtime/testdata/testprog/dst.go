@@ -643,7 +643,7 @@ func DSTGCOffBound() {
 var dstChanPool = sync.Pool{New: func() any { return make(chan int, 1) }}
 
 // DSTPoolAcrossRuns exercises a sync.Pool of channels reused across two simulation.Run
-// calls — the pattern (e.g. Pebble's writeTaskPool) that fatals under plain
+// calls — a pattern (a pool of channels reused across runs) that fatals under plain
 // synctest, because a channel created in one bubble is reused in the next. simulation.Run
 // reaps pools when it returns, so the second run gets a fresh, bubble-local
 // channel and the reuse succeeds. Without the reap, the second run would fatal

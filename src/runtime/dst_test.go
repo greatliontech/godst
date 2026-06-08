@@ -112,8 +112,8 @@ func TestDSTBubbleReproducible(t *testing.T) {
 // must be identical across runs. Drawing from the per-m chacha8 stream makes
 // this diverge run-to-run; the per-g DST stream makes it depend only on the
 // goroutine's logical history. This covers application/library use of the
-// rand.* top-level functions (e.g. Pebble's iterator sampling and skiplist
-// heights, and sync.Pool via runtime.randn).
+// rand.* top-level functions (e.g. randomized sampling, skiplist heights) and
+// sync.Pool via runtime.randn.
 func TestDSTMathRandChurn(t *testing.T) {
 	env := dstChurnEnv("12345")
 	first := runTestProgDST(t, "DSTMathRandChurn", env...)
@@ -161,9 +161,9 @@ func TestDSTSysmonNoPreempt(t *testing.T) {
 
 // TestDSTPoolReapedAcrossRuns verifies that dst.Run reaps sync.Pools when it
 // returns, so a channel pooled in one run is not reused (and rejected by
-// synctest) in the next. This is the pattern that otherwise requires patching
-// libraries like Pebble to allocate a fresh channel per use. GOGC=off ensures the
-// reap is the only thing that clears the pool.
+// synctest) in the next. This is the pattern that otherwise requires a library
+// pooling channels to allocate a fresh one per use. GOGC=off ensures the reap is
+// the only thing that clears the pool.
 func TestDSTPoolReapedAcrossRuns(t *testing.T) {
 	out := runTestProgDST(t, "DSTPoolAcrossRuns", "GOGC=off")
 	if out != "ok 2\n" {

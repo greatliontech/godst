@@ -1,36 +1,41 @@
-# Deterministic Goroutine Scheduling for protodb DST — Scope & Sequence
+# Deterministic Simulation Testing (DST) for Go
 
-Status: **draft / exploration**. This is the requirements contract and cross-repo seam map
-for the *one* DST axis protodb does not yet own at runtime: **goroutine scheduling order**.
-Code conforms to this doc, not the reverse.
+Status: **working**. This is the design contract for a fork of the Go toolchain that adds
+**deterministic simulation testing** to the runtime. Built with `-tags dst` and driven through the
+`testing/simulation` public API, a program's goroutine scheduling, runtime randomness, time, garbage
+collection, and process identity become a reproducible function of a seed. It is a general-purpose
+facility — any Go program can use it; it is not tied to any particular application. Code conforms to
+this doc, not the reverse.
 
-Repos in play:
-- **go fork** (`thegrumpylion/go`, this repo, branch `dst`) — the runtime patch lives here.
-- **protodb** (`thegrumpylion/protodb`) — the system under test; already has a mature DST harness.
-- **pebble** (`thegrumpylion/pebble` fork) — storage; `vfs.FS`/`errorfs` seams + value-rand/time patches.
-- **dragonboat** (`lni/dragonboat`) + **goutils** (`thegrumpylion/goutils` fork) — Raft; transport/FS/LogDB
-  seams via `Expert` config + the `LockGuardedRand` seed patch.
+## The problem
 
-## The real situation (not greenfield)
+A concurrent Go program is hard to test deterministically because the **runtime itself** injects
+nondeterminism into "what happens next": the goroutine schedule, `select` poll order, map iteration
+order, `math/rand`/`crypto/rand`, GC timing, and wall-clock time all vary run to run. So a
+concurrency bug that reproduces one run in a thousand is nearly impossible to debug, and a green test
+proves little about the interleavings it did *not* happen to hit.
 
-protodb already controls four of the five DST axes (see Seam map). The axis no mechanism owns is
-**scheduling order**. protodb's own `docs/testing.md`:
+DST removes that. Inside `testing/simulation.Run(seed, f)`, every source above is a deterministic
+function of `seed`: the same seed replays the same execution — every goroutine interleaving, every
+random value, every GC cycle — so a failure found once is reproducible forever, and sweeping seeds
+explores the interleaving space systematically (optionally PCT-directed; see Seq 5).
 
-> synctest does NOT order runnable goroutines or mutex acquisition — determinism on a concurrent
-> path requires structuring so exactly one goroutine is runnable per step.
+It builds on `testing/synctest`, which virtualizes time and provides the goroutine-group "bubble",
+and adds the piece synctest deliberately does not: **ordering of runnable goroutines** (synctest's own
+docs note it does not order runnable goroutines or mutex acquisition). Without that, determinism on a
+concurrent path requires structuring the program so exactly one goroutine is runnable per step — a
+fragile discipline that does not survive real concurrency. DST moves that ordering from program
+discipline to **runtime enforcement**, so determinism holds with *many* runnable goroutines.
 
-Today that is achieved by **structural discipline**: single-shard dragonboat
-(`ExecShards/CommitShards/ApplyShards/SnapshotShards/CloseShards = 1`), a transport that sorts
-outgoing and serializes incoming delivery. It is fragile and does not scale to real concurrency
-(multi-shard Raft, concurrent pebble compaction, a gRPC admin server).
-
-**This change moves scheduling-order determinism from structural discipline to runtime enforcement**,
-so determinism survives *many* runnable goroutines.
+What DST does **not** virtualize today: real network/file I/O and cgo. A program under test confines
+itself to goroutines, channels, sync primitives, and time, and models real I/O in-memory. Bringing I/O
+into the fork (an in-memory deterministic network, filesystem, and file/pipe I/O) is the main set of
+pending features — see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
-Inside a `synctest` bubble, with `GOMAXPROCS=1`, `asyncpreemptoff=1`, and protodb's already-simulated
-I/O, the *only* remaining nondeterminism in "which goroutine runs next" is:
+Inside a `synctest` bubble, with `GOMAXPROCS=1`, `asyncpreemptoff=1`, and I/O modeled in-memory, the
+*only* remaining nondeterminism in "which goroutine runs next" is:
 
 1. `select` poll order — `select.go` (`cheaprandn`).
 2. map iteration order — per-map seed + iterator offsets (`internal/runtime/maps`, via `maps.rand`).
@@ -104,9 +109,9 @@ testing construct, not a `runtime` sub-package.
 ### Deterministic process identity (`Options.Hostname` / `Options.PID` / `Options.NumCPU`)
 
 The process identity a SUT can observe returns the **real** machine's values, which vary per run and
-per host — a determinism hole for any SUT that derives identity or seeds from them (node IDs, temp
-paths, the `pid`-seeded RNGs some libraries use, including goutils' `LockGuardedRand`; pool/shard
-counts sized by `runtime.NumCPU`; uid-keyed file modes). So under a run the simulation fixes the whole
+per host — a determinism hole for any program that derives identity or seeds from them (node IDs, temp
+paths, the `pid`-seeded RNGs some libraries use; pool/shard counts sized by `runtime.NumCPU`; uid-keyed
+file modes). So under a run the simulation fixes the whole
 surface when DST is active: `os.Getpid`/`Getppid`/`Hostname`, `os.Getuid`/`Getgid`/`Geteuid`/`Getegid`,
 `os/user.Current`, and `runtime.NumCPU` (`os/dst.go` and `os/user/dst.go` bridge to `runtime` via
 `//go:linkname`; `runtime.NumCPU` reads the runtime state directly; the runtime holds the per-run
@@ -130,16 +135,18 @@ host identity — harmless, because the white-box runtime tests exercise the per
 hostname/pid/NumCPU) by deliberate choice — no SUT has needed per-run variation, and the surface stays
 lean; they are single constants in `runtime/dst.go` if that changes.
 
-One identity surface is deliberately **out of scope** here: `net.Interfaces`/`net.InterfaceAddrs` still
-report the real host's interfaces (MAC/IP). Their correct simulated shape is per-node identity sourced
-from the not-yet-designed virtualized network, so virtualizing them is deferred to that subsystem
-(`docs/issues/dst-net-interfaces-virtualization.md`); a global fixed stub now would be the wrong shape.
+One identity surface is **not yet virtualized**: `net.Interfaces`/`net.InterfaceAddrs` (interface
+MAC/IP) still report the real host's interfaces under a run. They fold into the pending **network**
+feature, which returns a fixed synthetic interface set consistent with the in-memory network's
+addressing (see `docs/issues/dst-network.md`). In fork scope there is no per-node virtualized-network
+subsystem to source per-node identity from, so a fixed synthetic set — with per-run `Options` variation
+if ever needed — is the correct shape.
 
 ### Deterministic crypto/rand (the entropy seam)
 
-`crypto/rand` (UUIDs, TLS nonces, tokens, key material) reads OS entropy, a determinism hole the seam
-map below originally scoped *app-side* (each SUT/library injecting its own crypto seam, e.g. protodb's
-`internal/idsource`). That scoping rested on the assumption that `crypto/rand` is not runtime-seedable.
+`crypto/rand` (UUIDs, TLS nonces, tokens, key material) reads OS entropy, a determinism hole one might
+expect to handle *app-side* (each program injecting its own crypto seam). That assumes `crypto/rand` is
+not runtime-seedable.
 It is: in the standard configuration every `crypto/rand` read funnels through the single chokepoint
 `crypto/internal/sysrand.Read` (the non-FIPS `drbg.Read` is just `sysrand.Read(b)`), so one hook there
 makes *all* of `crypto/rand` a reproducible function of the seed for free — exactly as the runtime RNG
@@ -205,10 +212,10 @@ it (channel FIFO, mutex handoff, happens-before) has already applied its orderin
 `GOMAXPROCS=1` + `asyncpreemptoff` is **sound but not complete**. It explores a *subset* of real
 interleavings: it cannot reproduce a data race requiring two goroutines to physically execute the
 same instant, nor preemption at an arbitrary instruction. It finds **logical** concurrency bugs
-(ordering, atomicity-of-logic, deadlock, lost wakeup, stale read, split-brain) — protodb's bug
-classes — **not** physical memory races. Those remain the job of `-race`. The harness and `-race`
-are complementary. Completeness can be *increased* additively by injecting cooperative preemption
-points at function entries (PCT-style), still deterministically — see Sequence.
+(ordering, atomicity-of-logic, deadlock, lost wakeup, stale read, split-brain) — **not** physical
+memory races. Those remain the job of `-race`. The simulation and `-race` are complementary.
+Completeness can be *increased* additively by injecting cooperative preemption points at function
+entries (PCT-style), still deterministically — see Seq 5.
 
 ### Non-foreclosure invariant
 
@@ -233,73 +240,69 @@ points at function entries (PCT-style), still deterministically — see Sequence
 **Principle:** never *add* scheduler choices; *take over* the choices it already makes
 nondeterministically. Minimality and soundness are the same property.
 
-## Cross-repo seam map (the "seams upfront" deliverable)
+## Nondeterminism sources and who owns them
 
-Status legend: ✅ owned by an existing mechanism · 🔧 owned via a fork patch you maintain ·
-🟡 workaround today, simplified by this change · ⛔ not yet covered.
+What the fork makes deterministic under DST, what is pending, and what a program under test still owns.
 
-| Axis | Repo | Seam (file/interface) | Status today | This change |
-|---|---|---|---|---|
-| **Scheduling order** | go | `select.go:191`, `rand.go` seed, sysmon `proc.go:6672`, `randomizeScheduler` `proc.go:7515` | 🟡 structural single-runnable discipline | **owns it** — seed + neutralize + control hook |
-| **Time** | protodb | `internal/hlc` injectable wall; `testing/synctest` fake clock | ✅ | unchanged (composes) |
-| **Time** | pebble | `db.timeNow` (injectable); `crtime.NowMono` (not) ; `time.NewTimer`/`Sleep` | 🔧/🟡 | timers virtualized by synctest once durable; `crtime` still needs a seam |
-| **Time** | dragonboat | tick loop `nodehost.go:1824` wall ticker; `RTTMillisecond` logical | 🟡 | tick ticker is wall-driven → drive from fake clock once bubbled+single-P |
-| **Disk** | pebble | `vfs.FS` (`Options.FS`), `vfs.NewMem`, `errorfs`, `NewCrashableMem` | ✅ | unchanged |
-| **Disk** | dragonboat | `Expert.FS` (`internal/vfs` → `lni/vfs`), `Expert.LogDBFactory`, `tan`/pebble logdb | ✅ | unchanged |
-| **Disk** | protodb | `kv.WithFS`, `crashpoint`, `SimulateCrashRestart` (strict-mem) | ✅ | unchanged |
-| **Network** | dragonboat | `Expert.TransportFactory` + `raftio.ITransport`; `plugin/chan` ChanTransport | ✅ | sorted/serialized transport → **seed-driven order, drop the sort** (🟡→✅) |
-| **Network (gRPC admin)** | protodb | gRPC server/listener | ⛔ not yet | in-memory `net.Listener`/`Conn` (bufconn-style), userspace, additive |
-| **Random** | pebble | `math/rand/v2` globals (iterator sampling `iterator.go:11`, arenaskl `skl.go:48`, batchskl PCG seeded from the global `skl.go:175`, invariants) — all `linkname`'d to `runtime.rand` | ✅ via runtime seed | **covered by Seq 1, no pebble rand patch** |
-| **Random** | dragonboat/goutils | `LockGuardedRand` = `rand.New(rand.NewSource(pid+time))` private instance (`goutils/random/rand.go:49,57`) → `Reseed` seam | 🔧 fork patch (unavoidable) | **unreachable by runtime seed** — patch stays; optionally reseed from the v2 global to ride Seq 1 |
-| **Random** | protodb | `internal/idsource` (crypto/rand seam) | ✅ | **covered by the runtime crypto/rand seam** (`sysrand.Read`) — no protodb crypto patch needed; `idsource` rides it like pebble's `math/rand` |
-| **Random (runtime)** | go | select/map RNG `rand.go` | ⛔ entropy-seeded | **owns it** — deterministic seed |
-| **Crashes** | protodb | `crashpoint` registry; checkers `internal/dstcheck`; INV-TEST1 gate | ✅ | unchanged |
-| **Concurrency** | dragonboat | `Expert.Engine` shards (set 1 today) | 🟡 forced to 1 | **run real shard counts** under deterministic scheduling |
-| **Concurrency** | pebble | `MaxConcurrentCompactions`, `DisableAutomaticCompactions` | 🟡 throttled | **run real concurrency** deterministically |
+Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of scope (the program models it).
 
-What the runtime change does **not** remove: the 🔧 **goutils** value-rand patch (`LockGuardedRand`
-is a private `rand.NewSource(pid+time)` instance, never touches `runtime.rand` — unreachable by the
-runtime seed) and library **time** seams (`crtime.NowMono`, dragonboat wall ticker). Those are
-logic-level, orthogonal to scheduling.
+| Source | Mechanism | Status |
+|---|---|---|
+| Goroutine scheduling order | per-g RNG tree + single-P + sysmon neutralized + the get-side selection hook (Seq 5) | ✅ |
+| `select` poll order | per-g `g.dstrand` | ✅ |
+| map iteration order | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`) | ✅ |
+| `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
+| `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
+| time, timers, tickers | `testing/synctest` fake clock | ✅ |
+| GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
+| process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
+| network I/O | in-memory deterministic `net` | ⏳ |
+| filesystem / disk I/O | in-memory deterministic filesystem | ⏳ |
+| other I/O (files, pipes, stdio) | in-memory deterministic I/O | ⏳ |
+| faults (scheduling / net / disk / crash) | fault-orchestration layer | ⏳ |
+| cgo | — | ⛔ |
+| raw pointer addresses (ASLR, `%p`, `uintptr`) | — | ⛔ (program discipline) |
 
-What the runtime seed (Seq 1) DOES cover for free: any dependency whose randomness bottoms out in
-`math/rand` / `math/rand/v2` **top-level** functions — these are `//go:linkname`'d to `runtime.rand`
-(`math/rand/v2/rand.go:256-265`, `math/rand/rand.go:334,352`) — **and `crypto/rand`**, which the
-runtime crypto/rand seam (`sysrand.Read`, above) routes through the same per-g stream in the standard
-configuration. Pebble's production randomness is entirely of the `math/rand` form, so no pebble rand
-patch is needed; protodb's `idsource` is `crypto/rand`-based and is now covered too. Rule of thumb: a
-dep is runtime-seedable for free iff its randomness bottoms out in bare `rand.Foo()` **or**
-`crypto/rand`; it needs its own seam only iff it holds a *private* `rand.New`/`NewSource`/`NewPCG`
-instance (a non-default `crypto/rand.Reader` likewise bypasses the seam). Classify the private-instance
-case with: `git grep -nE 'rand\.New\(|rand\.NewSource|rand\.NewPCG' -- '*.go' ':!*_test.go'`.
+**Library randomness — seeded for free or needs a seam?** A dependency's randomness is covered with no
+patch iff it bottoms out in the `math/rand`/`math/rand/v2` **top-level** functions (`//go:linkname`'d to
+`runtime.rand`) or `crypto/rand` (routed through the `sysrand.Read` seam) — both draw from the per-g
+stream. It needs its own seam only if it holds a *private* `rand.New`/`NewSource`/`NewPCG` instance (or
+installs a non-default `crypto/rand.Reader`), which the runtime seed cannot reach. Find those with:
+`git grep -nE 'rand\.New\(|rand\.NewSource|rand\.NewPCG' -- '*.go' ':!*_test.go'`, then reseed the
+instance from a seeded source or inject it.
 
 ## Scope (full / final form)
 
-A protodb DST run spins up an entire cluster (N dragonboat nodes + pebble stores + the gRPC admin
-plane) inside one `synctest` bubble, as a deterministic function of a seed, with all five axes owned:
+A DST run executes an arbitrary Go program inside one `synctest` bubble as a deterministic function of
+a seed. A distributed system under test — N nodes, their storage, their transport — runs as N goroutine
+trees in the *same* bubble, all driven by the one seed. The axes:
 
-- **Time** — one fake clock (synctest); dragonboat ticks + pebble timers driven from it.
 - **Scheduling** — runtime-enforced deterministic ordering of all runnable goroutines from the seed;
-  optional strategy-driven control (randomized → PCT → exhaustive) at the same hook; cooperative
+  optional strategy-driven control (random → PCT → exhaustive) at the same hook; cooperative
   preemption-point injection for completeness.
-- **Network** — in-process simulated transport (dragonboat `ChanTransport`-style + gRPC bufconn),
-  with sound faults: latency (= fake timer), partition, reorder, drop, duplicate.
-- **Disk** — `vfs.NewMem`/`errorfs`/crashable-mem; sound faults: latency, EIO/ENOSPC, torn/lost
-  unsynced writes on crash.
-- **Random** — seeded everywhere: runtime (select/map), libraries (goutils/pebble patches), app
-  (idsource).
-- **Faults** — node crash/restart, net faults, disk faults, *scheduling* faults (delay/deprioritize
-  a goroutine) — each anchored to a real degree of freedom (sound).
-- Driven by a seed; replay-exact; failures shrinkable; invariants checked by `internal/dstcheck`.
+- **Time** — one fake clock (synctest); all timers and tickers driven from it.
+- **Random** — seeded everywhere the runtime owns it (select/map/`math/rand`/`crypto/rand`); a library
+  holding a private RNG instance reseeds from a seeded source.
+- **Network / Disk / I/O** — in-memory and deterministic (pending features), with sound faults: latency
+  (= a fake timer), partition/reorder/drop/duplicate; EIO/ENOSPC; torn/lost unsynced writes on crash.
+- **Faults** — node crash/restart, net faults, disk faults, and *scheduling* faults
+  (delay/deprioritize a goroutine) — each anchored to a real degree of freedom, so sound (pending).
+- Driven by a seed; replay-exact; failures shrinkable; invariants checked by the program's own
+  assertions.
 
-## Sequence (increments — each useful, none requires retrofit)
+## Roadmap
 
-> Note: Seq 1a/1b landed enabling DST via `GODEBUG=dstseed`. That enablement layer was later
-> **pivoted to the public `testing/simulation` API** (see Enablement / Decisions); the per-g mechanism they
-> describe is unchanged. The bullets below record what each increment built.
+The runtime substrate is **landed**: the per-g RNG + scheduling (Seq 1, Seq 5), the
+`testing/simulation` API, and — beyond the original sequence — deterministic process identity,
+crypto/rand, GC, memory bounding, and a hardening pass (each documented in its own section). The
+remaining work is the **I/O and fault** features (the ⏳ rows of the source table). Each step respects
+the fixed seams, so later steps add, never rewrite.
 
+> Note: Seq 1a/1b originally enabled DST via `GODEBUG=dstseed`; that was pivoted to the public
+> `testing/simulation` API (see Enablement). The per-g mechanism is unchanged. The bullets below record
+> what each increment built.
 
-Each step respects the fixed seams above, so later steps add, never rewrite.
+### Landed
 
 - **Seq 1a — Runtime RNG seeding (go fork). LANDED.** `GODEBUG=dstseed=<int32>` deterministically
   seeds the global chacha8 RNG (`rand.go` `randinit`), so the `math/rand[/v2]` globals (linkname'd to
@@ -319,37 +322,36 @@ Each step respects the fixed seams above, so later steps add, never rewrite.
   `TestDSTSelectChurn` (identical across runs under GOMAXPROCS=4 M-churn — the test that distinguishes
   per-g from per-m: per-g 0 divergences, per-m ~58/60), `TestDSTDeterministicMap` (same seed →
   identical map order, different seed → different).
-  `randomizeScheduler`-as-seeded-var (interleaving *diversity*) is not done here — lands with Seq 5.
+  `randomizeScheduler`-as-seeded-var (interleaving *diversity*) is not part of 1b — it is Seq 5 (5a),
+  which landed later.
 
-- **Seq 2 — Drop the single-runnable discipline in protodb.** With Seq 1 live, raise dragonboat
-  shards above 1 and remove the transport sort/serialize; let the seed order them. Re-run the existing
-  `testharness` suite; confirm determinism holds. **Useful:** removes the most fragile workaround;
-  proves Seq 1 against the real system.
+- **Seq 5 — Scheduling control + sound scheduling faults. LANDED (5a/5b).** See "Seq 5 design" below
+  for the validated seam and framing (the residual it addresses is seed-*invariance*, i.e. one explored
+  interleaving — not nondeterminism). **5a** seeded interleaving diversity (get-side selection at the
+  `findRunnable` seam from a per-bubble scheduling RNG; default strategy = seeded-random); **5b** the
+  strategy hook at the same choice point (random → PCT, exposed via `RunWith(Options, f)`). **5c** sound
+  scheduling faults (delay/deprioritize a runnable G) folds into the fault-orchestration feature below.
+  Turns reproducibility into *directed* exploration.
 
-- **Seq 3 — Concurrent pebble under DST.** Stop throttling compaction (drop
-  `DisableAutomaticCompactions`/concurrency=1); run real background compaction deterministically.
-  **Useful:** exercises storage concurrency the harness previously hid.
+### Pending features
 
-- **Seq 4 — gRPC admin plane under DST.** In-memory `net.Listener`/`Conn` (bufconn-style) for the
-  admin gRPC server+client; its goroutines become synctest-durable and deterministically ordered.
-  **Useful:** brings the admin interface (network+goroutines+time) into the bubble — your second ask.
+These bring real I/O into the bubble and then layer fault injection on top. Each is virtualized
+in-memory and deterministic, riding the existing scheduling/time determinism (no new seed plumbing).
 
-- **Seq 5 — Scheduling control + sound scheduling faults.** See "Seq 5 design" below for the
-  validated seam and framing (the residual is seed-*invariance*, i.e. one explored interleaving — not
-  nondeterminism). Increments: **5a** seeded interleaving diversity (get-side selection at
-  `runqget`/`globrunqget` from a per-bubble scheduling RNG, deferring the `-race` `randomizeScheduler`
-  shuffle under DST; default strategy = seeded-random); **5b** the
-  strategy hook at the same choice points (seeded-random → biased/adversarial → PCT cooperative
-  preemption-point injection → optionally exhaustive/DPOR), exposed via `RunWith(Options, f)`; **5c**
-  sound scheduling faults (delay/deprioritize a runnable G), each anchored to the real "which-runnable
-  -next" degree of freedom. **Useful:** turns reproducibility into *directed* exploration; raises
-  completeness.
+- **Network** — an in-memory, deterministic `net` (`Dial`/`Listen`/`Conn`/`PacketConn`/DNS) under DST,
+  so unmodified networked code is reproducible without modeling the network itself. The reliable,
+  in-order base on which network faults are later layered.
+- **Disk / filesystem** — an in-memory, deterministic filesystem under DST (file ops, directory
+  iteration), the base for disk faults.
+- **I/O** — deterministic file/pipe/stdio I/O for whatever the network and filesystem layers do not
+  cover.
+- **Fault orchestration** — compose scheduling, network, disk, and crash/restart faults under one seed,
+  with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound); the
+  scheduling- and network/disk-fault targets share one *victim-designation* contract designed here.
 
-- **Seq 6 — Full-cluster fault orchestration.** Compose net+disk+crash+scheduling faults under one
-  seed with `dstcheck` invariants + replay + shrinking. **Useful:** the super-duper form.
-
-Ordering rationale: Seq 1 is a precondition for all; Seq 2–4 each independently retire a workaround
-and widen what runs in the bubble; Seq 5–6 layer exploration power on the now-stable substrate.
+Ordering: the landed runtime substrate is a precondition for all; the I/O features (network → disk →
+io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
+once there is something to fault.
 
 ## Seq 5 design: seeded interleaving diversity (validated seam + framing)
 
@@ -422,17 +424,17 @@ Both strategies share the seam's soundness (only runnable goroutines are ever ch
 (every draw is from the seeded scheduling RNG, advanced in a deterministic order at P=1). `g.dstPrio`
 and the PCT state are unused under Random and when DST is off.
 
-**Scheduling faults (5c) are folded into Seq 6, not built here (deliberate, Spec-first).** A scheduling
-fault splits into two shapes on opposite sides of the foreclosure line. *Jitter* (a per-decision
-seeded probability to defer the chosen goroutine) is self-contained but marginal — it largely overlaps
-what Random already explores and dilutes PCT's directed-search guarantee. The valuable, distinct form
-for a distributed SUT is the *straggler* (pin a designated node's goroutines low — "what if node 2 is
-slow?"), but that needs a **victim-designation** contract, which is exactly what the undesigned Seq-6
-fault-orchestration layer (compose net+disk+crash+scheduling faults under one seed) owns. Building a
-targeting scheme now would risk a throwaway retrofit. PCT's change points already provide seeded,
-sound deprioritization of whichever goroutine runs at a change point, covering much of the
-"deprioritize a runnable G" ground in the meantime. So scheduling faults land with Seq 6, designed
-against the orchestration contract. The seam is ready for them: a fault is just another policy at
+**Scheduling faults (5c) are folded into the fault-orchestration feature, not built here (deliberate,
+Spec-first).** A scheduling fault splits into two shapes on opposite sides of the foreclosure line.
+*Jitter* (a per-decision seeded probability to defer the chosen goroutine) is self-contained but
+marginal — it largely overlaps what Random already explores and dilutes PCT's directed-search
+guarantee. The valuable, distinct form for a distributed program is the *straggler* (pin a designated
+node's goroutines low — "what if node 2 is slow?"), but that needs a **victim-designation** contract,
+which is exactly what the undesigned fault-orchestration feature (compose net+disk+crash+scheduling
+faults under one seed) owns. Building a targeting scheme now would risk a throwaway retrofit. PCT's
+change points already provide seeded, sound deprioritization of whichever goroutine runs at a change
+point, covering much of the "deprioritize a runnable G" ground in the meantime. So scheduling faults
+land with the fault-orchestration feature, designed against its orchestration contract. The seam is ready for them: a fault is just another policy at
 `dstSchedSelect`, fed through `RunWith` options.
 
 **Empirical validation (probe suite `DSTSchedScenario`, derisked before folding in).** Five scenarios
@@ -507,20 +509,15 @@ just incomplete).
   "Deterministic GC for DST" below. Current state (Tier 0): `simulation.Run` disables GC during a run and
   reaps `sync.Pool`s on return (a stopgap). The full scope and tiers are written up so the depth of
   fix is a deliberate choice, not a default.
-- **dragonboat tick clock**: the wall ticker (`nodehost.go:1841`) must be driven from fake time once
-  bubbled+single-P; verify it virtualizes cleanly or needs a tick seam (logical `RTTMillisecond`
-  already exists).
-- **Where the cross-repo scope doc canonically lives**: this runtime spec stays in the go fork;
-  the protodb-side contract updates (Seq 2–6) belong in `protodb/docs/testing.md`.
-- **Upstreamability**: whether the Seq 1 runtime knobs are kept as a fork patch or shaped to be
-  proposable upstream (the `randomizeScheduler`-as-knob framing is the most upstream-friendly).
+- **Upstreamability**: whether the runtime knobs are kept as a fork patch or shaped to be proposable
+  upstream (the `randomizeScheduler`-as-knob framing is the most upstream-friendly).
 
 ## Deterministic GC for DST (full scope)
 
 Goal: GC under DST that is **deterministic**, **production-faithful** (the SUT sees real GC semantics —
 finalizers run, weak refs clear, memory is bounded, memory-pressure behaviour is present), and
-**general** (works for *any* SUT in this fork, not only protodb's blocking-heavy, finalizer-light
-stack). "It works for protodb today" is not the bar — the fork's DST must work for the fork's projects.
+**general** (works for *any* program, not only blocking-heavy, finalizer-light ones). "It works for one
+program today" is not the bar — the fork's DST must work for any program built with it.
 
 ### Why GC is nondeterministic under DST (derisked findings)
 
@@ -594,8 +591,8 @@ quiescence-only MVP leaves.
 12. **Memory-pressure-adaptive SUTs / `GOMEMLIMIT` / `ReadMemStats`.** If the SUT changes behaviour
     based on memory (cache eviction under pressure, `GOMEMLIMIT`-driven GC, reading `MemStats`), then
     GC *timing* becomes app-observable and must be deterministic *and* production-plausible — the
-    heap-ratio trigger's numbers matter, not just their determinism. Pebble sizes by explicit config,
-    not GC pressure, so protodb is fine; a general SUT may not be.
+    heap-ratio trigger's numbers matter, not just their determinism. A program sized by explicit config
+    (not GC pressure) is fine here; a memory-pressure-adaptive one may not be.
 
 ### Tiers (choose deliberately)
 
@@ -604,7 +601,7 @@ quiescence-only MVP leaves.
   A working stopgap, not a design.
 - **Tier 1 — quiescence GC.** Force GC at synctest quiescence points; leave `fing` async. Deterministic
   and memory-bounded **for blocking-heavy SUTs that neither observe finalizer timing nor run
-  channel-touching finalizers** (covers protodb). Covers dimensions 1–2 (at quiescence), 7–10 (largely
+  channel-touching finalizers**. Covers dimensions 1–2 (at quiescence), 7–10 (largely
   free). **Leaves** dimensions 3–6 (finalizer determinism/bubble-awareness/cleanups), 11 (alloc-bound),
   12 (memory-pressure). Constraints must be documented, not hidden. **Does *not* delete the Tier-0
   `sync.Pool` reap** — that reap is a *cross-Run pool-lifetime* fix (a channel `Put` in Run 1 is `Get`
@@ -1069,8 +1066,8 @@ with it). Scaling `target` with the bubble's live set the obvious way — `bubbl
 process baseline live, which varies. A GOGC-faithful *and* deterministic target needs a **clean
 per-bubble live measure**: force a GC at bubble entry so `base` is process-*live* (not entry garbage),
 then `bubbleLive = heapMarked − base` is deterministic if the process baseline is stable during the
-bubble. For protodb (sized by explicit config, not GC pressure — D6) the **fixed target suffices**; a
-general memory-pressure-adaptive SUT wants the GOGC-scaled-with-entry-GC version. Either stays a faithful
+bubble. For a program sized by explicit config (not GC pressure — D6) the **fixed target suffices**; a
+memory-pressure-adaptive one wants the GOGC-scaled-with-entry-GC version. Either stays a faithful
 GOGC collapse (fixed = a floor; scaled = the real ratio); neither is *finer* than production.
 
 **Decision for the build (supersedes the prior plan):** adopt the per-bubble relative trigger as the DST
@@ -1110,8 +1107,10 @@ the *same* workload 20/20 deterministic, and a race-free interleaving observable
 with **GC entirely off** (4 distinct/10). So with contention, *which* objects sit in each per-goroutine
 structure at the (deterministic) GC instant varies with the runnable-goroutine order — which Seq 5
 controls. **Scope of the A.5 tighten:** per-cycle discovery is deterministic *given* a deterministic
-runnable order; it inherits the Seq-5 gap for contended workloads exactly as every interleaving-sensitive
-observable does, and closes fully when Seq 5 lands. (`finqueued` is process-cumulative, so the test hook
+runnable order; under contention it is an interleaving-sensitive observable, dependent on that order
+(the scheduling-order axis, Seq 5) exactly as every such observable is — which is why the
+discovery test is single-goroutine, to isolate the GC trigger from that axis. (`finqueued` is
+process-cumulative, so the test hook
 subtracts a bubble-entry baseline — without that subtraction the entry GC's varying pre-bubble finalizer
 count masquerades as nondeterminism; a probe-level trap worth recording.)
 
@@ -1156,7 +1155,7 @@ over-engineering**: a mutation test showed the existing byte/GOGC trigger *alrea
 tests (set-level), because the target floors at `heapMinimum` (above). Making *per-cycle byte-exact*
 hold under `-race` would require checking the trigger on **every** allocation rather than at span grabs —
 the `checkGCTrigger` sites across `malloc.go`, `malloc_stubs.go`, and the *generated* per-size-class
-paths plus their generator — genuinely invasive, and not needed (protodb does not observe finalizer
+paths plus their generator — genuinely invasive, and not needed (a program must not rely on finalizer
 timing; the set-level layer is what the trust contract rests on). So per-cycle byte-exact stays a
 normal-build refinement.
 

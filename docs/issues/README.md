@@ -1,11 +1,24 @@
 # Issue docs
 
-Tracked follow-ups deferred out of a chunk. Each entry carries a `Lands:` trigger
-(a chunk number or a condition). The chunk-start gate (sub-chunk `N.1`) scans this
-index for entries resolving to the current chunk; the close-out gate promotes any
-load-bearing rationale inline and deletes the resolved entry.
+Tracked follow-ups and **pending features**. Each entry carries a `Lands:` trigger
+(a chunk number, a condition, or "pending feature" for planned roadmap work). The
+chunk-start gate (sub-chunk `N.1`) scans this index for entries resolving to the
+current chunk; the close-out gate promotes any load-bearing rationale inline and
+deletes the resolved entry.
+
+## Pending features
+
+The I/O and fault features on the design.md Roadmap — planned work that brings real
+I/O into the bubble and then layers fault injection on top.
+
+| Feature | Order | Summary |
+|---------|-------|---------|
+| [dst-network](dst-network.md) | first I/O feature | In-memory deterministic `net` (Dial/Listen/Conn/PacketConn/DNS + interfaces) so unmodified networked code is reproducible without modeling the network. Channel-backed, synctest-durable, address-registry; determinism rides the existing scheduler. The reliable base for network faults. Subsumes the old net.Interfaces deferral. |
+| [dst-disk](dst-disk.md) | after network | In-memory deterministic filesystem (os file ops, deterministic ReadDir order) so unmodified file-using code is reproducible. The base for disk faults (latency/EIO/ENOSPC/torn writes). |
+| [dst-io](dst-io.md) | after disk | Deterministic file/pipe/stdio I/O for whatever network and disk don't cover (os.Pipe, std streams). |
+
+## Deferrals
 
 | Issue | Lands | Summary |
 |-------|-------|---------|
-| [dst-net-interfaces-virtualization](dst-net-interfaces-virtualization.md) | when the virtualized-network subsystem is designed (Seq 2–4) | net.Interfaces/InterfaceAddrs are not virtualized under DST, so a SUT enumerating interfaces sees the real host's MACs/IPs. Deferred (not built) as a foreclosure: the correct shape is per-node interfaces sourced from the not-yet-designed virtualized network, so a global fixed stub now would be torn out later. The other identity knobs (pid/ppid/hostname/uid/gid/NumCPU/user/crypto-rand) landed. |
-| [dst-percycle-gc-discovery-determinism](dst-percycle-gc-discovery-determinism.md) | when a SUT demonstrably needs deterministic per-cycle GC-discovery timing (under -race or in general) | Per-cycle GC/finalizer-discovery timing (which cycle discovers a given object) is deliberately out-of-contract — set-level (numGC + total set) is the guarantee and is -race-robust. The byte-based span-granular trigger makes the per-cycle split move ±1 span under -race redzones or a change in binary composition. Elevating per-cycle to deterministic needs a race-invariant logical-allocation trigger (a real GC-trigger redesign; the runtime tracks only the physical live set) for a benefit no SUT has demonstrated. Tracks that optional work + root cause. |
+| [dst-percycle-gc-discovery-determinism](dst-percycle-gc-discovery-determinism.md) | when a program demonstrably needs deterministic per-cycle GC-discovery timing (under -race or in general) | Per-cycle GC/finalizer-discovery timing (which cycle discovers a given object) is deliberately out-of-contract — set-level (numGC + total set) is the guarantee and is -race-robust. The byte-based span-granular trigger makes the per-cycle split move ±1 span under -race redzones or a change in binary composition. Elevating per-cycle to deterministic needs a race-invariant logical-allocation trigger (a real GC-trigger redesign; the runtime tracks only the physical live set) for a benefit no program has demonstrated. Tracks that optional work + root cause. |
