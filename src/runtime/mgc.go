@@ -723,7 +723,7 @@ func (t gcTrigger) test() bool {
 			// growth is -race-invariant, so numGC is deterministic by construction;
 			// the per-cycle split jitters because the trigger is checked at span-grab
 			// boundaries that -race's redzones shift. See the layered contract in the
-			// runtime/dst package doc.
+			// testing/simulation package doc.
 			hm := gcController.heapMarked
 			var target uint64
 			if gp := gcController.gcPercent.Load(); gp < 0 {

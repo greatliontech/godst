@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package dst provides deterministic simulation testing (DST): a mode in which
-// goroutine scheduling and runtime randomness are a reproducible function of a
-// seed, so concurrent code replays identically across runs.
+// Package simulation provides deterministic simulation testing (DST): a mode in
+// which goroutine scheduling and runtime randomness are a reproducible function
+// of a seed, so concurrent code replays identically across runs.
 //
-// DST makes the following deterministic, as a function of the seed and the
+// It makes the following deterministic, as a function of the seed and the
 // program's logical structure: the order in which runnable goroutines are
 // scheduled, select poll order, map iteration order, the math/rand and
 // math/rand/v2 top-level functions, and synctest timer ordering. It does not
@@ -14,12 +14,12 @@
 // under test must confine themselves to goroutines, channels, sync primitives,
 // and time (real I/O is modeled in-memory).
 //
-// DST finds logical concurrency bugs — ordering, atomicity, deadlock, lost
+// It finds logical concurrency bugs — ordering, atomicity, deadlock, lost
 // wakeup, stale read. It runs single-threaded and does not reproduce data races
 // that require two goroutines to execute the same instant; those remain the job
 // of the race detector. The two are complementary: the race detector tracks
-// happens-before, not physical timing, so running DST under -race checks the
-// reproducible interleaving DST is exploring for data races.
+// happens-before, not physical timing, so running under -race checks the
+// reproducible interleaving the simulation is exploring for data races.
 //
 // # Determinism contract (what is and is not guaranteed)
 //
@@ -28,9 +28,9 @@
 //   - Logical determinism (unconditional). Goroutine scheduling order, select
 //     poll order, map iteration order, math/rand[/v2], synctest timer ordering,
 //     and the values the program computes are a reproducible function of the
-//     seed. This is the contract DST exists for, and it holds under -race (it is
-//     driven by a per-goroutine deterministic RNG and single-threaded execution,
-//     neither of which the race detector perturbs).
+//     seed. This is the contract the simulation exists for, and it holds under
+//     -race (it is driven by a per-goroutine deterministic RNG and
+//     single-threaded execution, neither of which the race detector perturbs).
 //   - GC set-level (unconditional). The GC count and the total set of objects
 //     whose finalizers/weak refs are discovered are deterministic, including under
 //     -race (the trigger fires the right number of times with the right total).
@@ -43,7 +43,13 @@
 // A program whose correctness depends on *when* a finalizer runs is observing the
 // conditional layer; one that only relies on scheduling/values/replay (the usual
 // case) rests entirely on the unconditional layer.
-package dst
+//
+// # Build constraint
+//
+// Run and RunWith require building with -tags dst, which fixes the process-global
+// map hash key (a precondition for deterministic map iteration order that cannot
+// be set at runtime). They panic if the binary was not built with that tag.
+package simulation
 
 import (
 	"internal/synctest"
@@ -151,7 +157,7 @@ func Run(seed uint64, f func()) {
 // Example: explore depth-3 bugs over a seed sweep.
 //
 //	for seed := uint64(1); seed <= 100000; seed++ {
-//		dst.RunWith(seed, dst.Options{Strategy: dst.PCT, Depth: 3}, func() {
+//		simulation.RunWith(seed, simulation.Options{Strategy: simulation.PCT, Depth: 3}, func() {
 //			// start cluster, run workload, assert invariants
 //		})
 //	}
@@ -173,7 +179,7 @@ func RunWith(seed uint64, opts Options, f func()) {
 
 func run(seed uint64, kind uint8, depth, steps int32, f func()) {
 	if !dstBuilt() {
-		panic("runtime/dst: Run requires building with -tags dst (for a reproducible map hash key)")
+		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	}
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)

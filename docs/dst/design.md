@@ -50,7 +50,7 @@ RNG (Seq 1a) makes select/map order reproducible only in a fully controlled run:
 the number of those internal draws, which m a goroutine lands on, and load-dependent helper-goroutine
 creation all vary, shifting the application's select/map stream (measured: ~1% divergence under CPU
 load; one churn run diverged 58/60). The fix is a **per-goroutine deterministic RNG** (`g.dstrand`,
-splitmix64) seeded as a **deterministic tree**: the root from the DST seed (via the `runtime/dst`
+splitmix64) seeded as a **deterministic tree**: the root from the DST seed (via the `testing/simulation`
 API — see Enablement below; each `synctest` bubble re-roots independently),
 each child from its parent at `newproc1`. select poll order and `maps.rand` draw from this per-g
 stream under DST, so a goroutine's select/map order is a function of its own logical history only —
@@ -76,12 +76,18 @@ goroutine's per-g stream by a load-dependent amount.
 (`proc.go:7534/7585/7623`). The change turns it from a compile-time chaos const into a runtime,
 seeded, *controllable* policy — and routes `select` through the same seeded source.
 
-## Enablement: the `runtime/dst` API (the control surface)
+## Enablement: the `testing/simulation` API (the control surface)
 
 DST is enabled and seeded through a **public API**, not GODEBUG. The original `GODEBUG=dstseed`
 knob has been **removed**.
 
-- **`runtime/dst.Run(seed uint64, f func())`** is the entry point. It **enforces the determinism
+The public API lives at **`testing/simulation`**, a sibling of the `testing/synctest` it builds on:
+the user surface is a thin, dependency-light wrapper (`runtime` + `internal/synctest` only), while the
+determinism *mechanism* lives in `runtime` and is reached via `//go:linkname`. This mirrors how
+`testing/synctest` is the public face of an `internal/synctest` mechanism — the public name is a
+testing construct, not a `runtime` sub-package.
+
+- **`simulation.Run(seed uint64, f func())`** is the entry point. It **enforces the determinism
   preconditions itself** — they are not user knobs that can be forgotten: it sets `GOMAXPROCS(1)`,
   disables async preemption, activates DST + seeds, runs `f` in a `synctest` bubble (re-rooted from
   the seed), and restores everything on return (including on panic). `Run` is bubble-scoped: each
@@ -90,7 +96,7 @@ knob has been **removed**.
 - **Runtime core** (`runtime/dst.go`): `dstSeed atomic.Uint64` (0 = off) is the live flag the hot
   paths and sysmon read; `dstActive()` is the hot-path check; `dstActivate(seed)` roots the caller's
   per-g stream then sets the flag; `dstSetAsyncPreemptOff`, `dstDeactivate`, `dstBuilt` support `Run`.
-  These are reached from `runtime/dst` (and white-box tests) via `//go:linkname`.
+  These are reached from `testing/simulation` (and white-box tests) via `//go:linkname`.
 - **`dstActivate` is also used directly by white-box runtime tests** (via `$DSTSEED`), so they can
   exercise the per-g mechanism under `GOMAXPROCS>1` M-migration that `Run` (single-P) cannot
   reproduce. This is the only non-`Run` entry and is not a user surface.
@@ -102,7 +108,7 @@ in `alginit` from OS entropy for hash-flooding protection. It cannot be re-seede
 corrupting maps created before activation (including runtime/stdlib-internal ones the bubble then
 touches). So a deterministic map order needs a **build-time** signal: **`-tags dst`** makes `randinit`
 seed the global generator from a fixed constant (`dstFixedSeed`), fixing the hash key. Map order is
-still *seed-varied* via the per-g `m.seed`; only this one global key is fixed. `dst.Run` **panics if
+still *seed-varied* via the per-g `m.seed`; only this one global key is fixed. `simulation.Run` **panics if
 the binary was not built with `-tags dst`**, so the constraint can't be silently violated. A
 `-tags dst` binary has a fixed hash key for all maps (hash-flooding exposure) — acceptable for a test
 build, and absent from normal builds.
@@ -217,7 +223,7 @@ plane) inside one `synctest` bubble, as a deterministic function of a seed, with
 ## Sequence (increments — each useful, none requires retrofit)
 
 > Note: Seq 1a/1b landed enabling DST via `GODEBUG=dstseed`. That enablement layer was later
-> **pivoted to the public `runtime/dst` API** (see Enablement / Decisions); the per-g mechanism they
+> **pivoted to the public `testing/simulation` API** (see Enablement / Decisions); the per-g mechanism they
 > describe is unchanged. The bullets below record what each increment built.
 
 
@@ -276,7 +282,7 @@ and widen what runs in the bubble; Seq 5–6 layer exploration power on the now-
 ## Seq 5 design: seeded interleaving diversity (validated seam + framing)
 
 **The framing correction (measured, not assumed).** Seq 5 is *not* a determinism fix. Seq 1a/1b
-already made multi-runnable scheduling under `dst.Run` both **deterministic** and **sound**: a
+already made multi-runnable scheduling under `simulation.Run` both **deterministic** and **sound**: a
 GOMAXPROCS=1 bubble with N goroutines contending through `Gosched` replays *one* interleaving across
 runs (probe `DSTSchedScenario`: 1 distinct over same-seed runs). The residual is the opposite of
 nondeterminism — the schedule is **seed-invariant**: every seed (1, 2, 3, 12345, 999, 777, 424242)
@@ -285,7 +291,7 @@ interleaving regardless of seed; an ordering bug reachable only under a *differe
 is invisible — running N seeds re-runs the same interleaving N times. Seq 5 closes this completeness
 gap by making "which runnable goroutine proceeds next" a **seeded** function: different seeds explore
 different *sound* interleavings. (An earlier exploratory note that the `Gosched`/global-runq path was
-*nondeterministic* was measured on a raw non-DST program; under the actual `dst.Run` harness — sysmon
+*nondeterministic* was measured on a raw non-DST program; under the actual `simulation.Run` harness — sysmon
 gated, asyncpreemptoff, single P, per-g RNG — it is deterministic. The fault is diversity, not noise.)
 
 **The seam: a single unified choke point in `findRunnable` (validated).** At GOMAXPROCS=1 the runnable
@@ -318,17 +324,17 @@ policy under DST" intends. It is free in normal builds (`randomizeScheduler` is 
 whole branch — and the `dstActive()` call — is elided).
 
 **Gate: `dstActive() && gomaxprocs == 1`.** The non-FIFO ring removal is safe only with no concurrent
-stealer — guaranteed at one P. `dst.Run` pins GOMAXPROCS=1, so the public API always qualifies; the
+stealer — guaranteed at one P. `simulation.Run` pins GOMAXPROCS=1, so the public API always qualifies; the
 white-box `dstActivate` path at GOMAXPROCS>1 (the per-g churn tests) leaves scheduling FIFO (those
 tests assert per-g RNG robustness, not scheduling order). At P=1 there is no stealer, so the unified
 seam holds `sched.lock` (to touch the global runq) and uses plain ring loads/stores rather than the
 steal-synchronizing CAS.
 
-**Strategies (the `dst.RunWith` control surface).** The strategy is a per-run choice consulted at the
+**Strategies (the `simulation.RunWith` control surface).** The strategy is a per-run choice consulted at the
 unified seam, `dstSchedSelect(candidates) → index`:
-- **Random** (default; `dst.Run` and `dst.RunWith{Strategy:Random}`): uniform pick over the runnable
+- **Random** (default; `simulation.Run` and `simulation.RunWith{Strategy:Random}`): uniform pick over the runnable
   set from the scheduling RNG. Different seeds → different sound interleavings.
-- **PCT** (`dst.RunWith{Strategy:PCT, Depth:d, Steps:K}`): Probabilistic Concurrency Testing. Each
+- **PCT** (`simulation.RunWith{Strategy:PCT, Depth:d, Steps:K}`): Probabilistic Concurrency Testing. Each
   goroutine gets a random base priority at creation (`g.dstPrio`, drawn from the scheduling RNG in
   `newproc1`, well above the change-point low band); the seam runs the highest-priority runnable
   goroutine (ties by goid, for determinism). `d−1` **priority-change points** are placed at random
@@ -375,7 +381,7 @@ system goroutine with no application-meaningful `g.dstrand`. So seeded schedulin
 dedicated **per-bubble DST scheduling RNG** (splitmix64), re-rooted per bubble exactly like the per-g
 tree (`dstBubbleRoot`), advanced once per scheduling decision. At GOMAXPROCS=1 the *sequence* of
 scheduling decisions is itself deterministic (1a/1b), so a single stream advanced per decision stays
-a deterministic function of the seed. (At GOMAXPROCS>1 it would not be — but `dst.Run` pins P=1.)
+a deterministic function of the seed. (At GOMAXPROCS>1 it would not be — but `simulation.Run` pins P=1.)
 
 **Soundness (the load-bearing argument).** The seam only ever reorders Gs that are *already runnable*
 — present in `runnext`/the local ring/the global runq — i.e. each is already past the primitive
@@ -415,18 +421,18 @@ just incomplete).
 
 ## Decisions (settled)
 
-- **Control surface: a public `runtime/dst` API** (not GODEBUG, not internal). `GODEBUG=dstseed` is
+- **Control surface: a public `testing/simulation` API** (not GODEBUG, not internal). `GODEBUG=dstseed` is
   removed. Seq 5 (strategy/faults) extends this same public API (`RunWith(Options, f)`).
 - **Bubble-scoped**: the per-g seed/control re-roots per `synctest` bubble (order-immune
   reproduction). Process-level enablers (`GOMAXPROCS=1`, async/sysmon preemption off) are enforced by
-  `dst.Run` for the duration of a call.
+  `simulation.Run` for the duration of a call.
 - **Map hash key via `-tags dst`** (see Enablement) — the one precondition the runtime API cannot
-  cover, enforced by a `dst.Run` panic.
+  cover, enforced by a `simulation.Run` panic.
 
 ## Open questions
 
 - **GC under DST** is its own design problem with a full scope of its own — see
-  "Deterministic GC for DST" below. Current state (Tier 0): `dst.Run` disables GC during a run and
+  "Deterministic GC for DST" below. Current state (Tier 0): `simulation.Run` disables GC during a run and
   reaps `sync.Pool`s on return (a stopgap). The full scope and tiers are written up so the depth of
   fix is a deliberate choice, not a default.
 - **dragonboat tick clock**: the wall ticker (`nodehost.go:1841`) must be driven from fake time once
@@ -521,7 +527,7 @@ quiescence-only MVP leaves.
 
 ### Tiers (choose deliberately)
 
-- **Tier 0 — current.** GC off during a run + `sync.Pool` reap on `dst.Run` return. *Unsound*: no
+- **Tier 0 — current.** GC off during a run + `sync.Pool` reap on `simulation.Run` return. *Unsound*: no
   in-run finalizers, unbounded intra-run memory, relies on a Pool-victim-cache implementation detail.
   A working stopgap, not a design.
 - **Tier 1 — quiescence GC.** Force GC at synctest quiescence points; leave `fing` async. Deterministic
@@ -842,7 +848,7 @@ mid-burst heap trigger can be added independently of the drain, and the drain's 
 deterministic quiescent live set, not on a deterministic trigger byte (which does not exist — D2).
 
 1. **STW forcing + GC enabled in-run** (D2; **Chunk A — landed**). Force `gcForceBlockMode` under
-   `dstActive`; stop disabling GC in `dst.Run`; park the scavenger (D5). No runway code (D1: the override
+   `dstActive`; stop disabling GC in `simulation.Run`; park the scavenger (D5). No runway code (D1: the override
    was tried and dropped as ineffective). Delivers memory bounding (dimension 11) and observable
    determinism (`numGC`, alloc, sched). Tests: `TestDSTGCAllocBoundDeterministic` (numGC>0 + cross-run
    identity). Foreclosure check: none — STW is the safe in-bubble default and the precondition for 2/4.
@@ -1006,7 +1012,7 @@ clever.** A.5's per-cycle discovery determinism lives in the **physical** layer 
 `-msan`, a different build — perturbs it, because it perturbs the bubble's own per-allocation sizes
 (not just the baseline, which A.5 *does* subtract out). This is **inherent**, not a defect: you cannot
 keep byte-exact heap accounting while an instrumenter rewrites the heap. So the determinism guarantee is
-**layered**, and the layering is the trust contract (mirrored in the `runtime/dst` package doc):
+**layered**, and the layering is the trust contract (mirrored in the `testing/simulation` package doc):
 
 | layer | guarantee | basis | under `-race` |
 |---|---|---|---|

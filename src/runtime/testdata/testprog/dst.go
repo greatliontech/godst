@@ -9,10 +9,10 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
-	"runtime/dst"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"testing/simulation"
 	"time"
 	_ "unsafe" // for go:linkname
 	"weak"
@@ -70,7 +70,7 @@ type dstFinObj struct{ b [256]byte }
 func DSTGCFinDiscovery() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var ngc uint32
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		const K = 512
 		ring := make([]*dstFinObj, K)
 		for i := 0; i < 40000; i++ {
@@ -98,7 +98,7 @@ var dstSliceSink [16][]byte
 func dstEscape(id int, b []byte) { dstSliceSink[id&15] = b }
 
 // DSTGCAllocBound allocates heavily across several goroutines that do not block
-// during allocation, inside dst.Run with GC enabled. A non-blocking alloc-heavy
+// during allocation, inside simulation.Run with GC enabled. A non-blocking alloc-heavy
 // span never reaches a synctest quiescence point, so the *heap* trigger — not
 // quiescence — is what bounds memory (design dimension 11). Under STW (Tier 2,
 // D2) the number of GC cycles is deterministic (no concurrent floating garbage),
@@ -109,7 +109,7 @@ func DSTGCAllocBound() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var sum uint64
 	var ngc uint32
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		const G = 4
 		done := make(chan uint64, G)
 		for g := 0; g < G; g++ {
@@ -147,7 +147,7 @@ func dstMakeFinSender(ch chan int) {
 }
 
 // DSTFinChanOp checks that a finalizer doing a bubble channel op runs without
-// fatal inside dst.Run (invariant DST-FIN-1): the finalizer must run on the
+// fatal inside simulation.Run (invariant DST-FIN-1): the finalizer must run on the
 // bubble-scoped drain goroutine (g.bubble == the bubble), not the async system
 // finalizer goroutine fing (g.bubble == nil), which would fatal with "send on
 // synctest channel from outside bubble". The main goroutine drops the object,
@@ -158,7 +158,7 @@ func dstMakeFinSender(ch chan int) {
 func DSTFinChanOp() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var got int
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		ch := make(chan int, 1)
 		dstMakeFinSender(ch)
 		got = <-ch
@@ -181,13 +181,13 @@ func dstMakeFinSpawner(ch chan int) {
 }
 
 // DSTFinSpawn checks that a finalizer that spawns a goroutine works inside
-// dst.Run (D4 dimension 5): the spawned goroutine inherits the bubble (so its
+// simulation.Run (D4 dimension 5): the spawned goroutine inherits the bubble (so its
 // channel op does not fatal) and is deterministically scheduled and accounted (so
 // the bubble does not deadlock or advance past it). Prints "ok 7".
 func DSTFinSpawn() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var got int
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		ch := make(chan int, 1)
 		dstMakeFinSpawner(ch)
 		got = <-ch
@@ -214,7 +214,7 @@ var dstFinRunSum atomic.Uint64
 func DSTFinRunSet() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var gotCount, gotSum uint64
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		const N = 2000
 		ring := make([]*dstFinObj, 64)
 		for i := 0; i < N; i++ {
@@ -232,7 +232,7 @@ func DSTFinRunSet() {
 		}
 		// Snapshot the counters INSIDE the bubble, after an intervening quiescence
 		// (time.Sleep blocks on a fake timer, forcing the drain to run). This makes
-		// the assertion require the in-bubble drain: reading after dst.Run returns
+		// the assertion require the in-bubble drain: reading after simulation.Run returns
 		// would let the post-Run reap (runtime.GC()×2 after dstDeactivate) run any
 		// missed finalizers on fing and launder the count.
 		time.Sleep(time.Millisecond)
@@ -261,7 +261,7 @@ func dstMakeCleanupSender(ch chan int) {
 func DSTCleanupChanOp() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var got int
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		ch := make(chan int, 1)
 		dstMakeCleanupSender(ch)
 		got = <-ch
@@ -269,7 +269,7 @@ func DSTCleanupChanOp() {
 	os.Stdout.WriteString("ok " + strconv.Itoa(got) + "\n")
 }
 
-// dstForcePriorCleanupG forces a cleanup goroutine to exist before any dst.Run by
+// dstForcePriorCleanupG forces a cleanup goroutine to exist before any simulation.Run by
 // running a cleanup outside DST (createGs is ungated there). The resulting cleanup
 // goroutine persists, parked on dequeue, so a later Run exercises the cleanup WAKE
 // gate (the createGs gate alone does not, since no cleanup G is created in-Run).
@@ -293,7 +293,7 @@ func DSTCleanupChanOpPriorG() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	dstForcePriorCleanupG()
 	var got int
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		ch := make(chan int, 1)
 		dstMakeCleanupSender(ch)
 		got = <-ch
@@ -311,7 +311,7 @@ var dstCleanupRunSum atomic.Uint64
 func DSTCleanupRunSet() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var gotCount, gotSum uint64
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		const N = 2000
 		ring := make([]*dstFinObj, 64)
 		for i := 0; i < N; i++ {
@@ -345,7 +345,7 @@ func DSTCleanupRNGIsolation() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	measure := func(withCleanup bool) uint64 {
 		var r uint64
-		dst.Run(n, func() {
+		simulation.Run(n, func() {
 			if withCleanup {
 				o := &dstFinObj{}
 				runtime.AddCleanup(o, func(int) {}, 0)
@@ -385,9 +385,9 @@ func dstMakePreBubbleCleanup() {
 func DSTCleanupPreBubble() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	dstForcePriorCleanupG()   // park the cleanup goroutine
-	dstMakePreBubbleCleanup() // test object, dead before dst.Run's entry GC
+	dstMakePreBubbleCleanup() // test object, dead before simulation.Run's entry GC
 	var atStart bool
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		atStart = dstPreBubbleCleanupRan.Load()
 	})
 	os.Stdout.WriteString(strconv.FormatBool(atStart) + "\n")
@@ -405,18 +405,18 @@ func dstMakePreBubbleFin() {
 
 // DSTFinPreBubble checks that the entry GC's *pre-bubble* finalizers run
 // bubble-less in dstActivate, not in-bubble at the first quiescence (the M2 fix
-// in dst.go). A finalizable object is created and dropped before dst.Run, so
+// in dst.go). A finalizable object is created and dropped before simulation.Run, so
 // dstActivate's entry GC discovers it dead. With the pre-bubble drain it runs
 // DURING dstActivate (before f starts), so f's first read sees the flag set;
 // without it, the finalizer would sit in finq (fing is gated under DST) and not
 // run until the first in-bubble quiescence, so f's first read would see it unset.
-// Runs with GOGC=off so no GC fires before dst.Run (which would run the finalizer
+// Runs with GOGC=off so no GC fires before simulation.Run (which would run the finalizer
 // early on the ungated fing). Prints "true".
 func DSTFinPreBubble() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	dstMakePreBubbleFin() // pre-bubble object: dead before dst.Run's entry GC
+	dstMakePreBubbleFin() // pre-bubble object: dead before simulation.Run's entry GC
 	var atStart bool
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		atStart = dstPreBubbleFinRan.Load() // M2: already true; without M2: false
 	})
 	os.Stdout.WriteString(strconv.FormatBool(atStart) + "\n")
@@ -432,7 +432,7 @@ func DSTFinPreBubble() {
 func DSTWeakClearing() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var gotCleared, gotAlive int
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		const W = 256
 		weaks := make([]weak.Pointer[dstFinObj], W)
 		objs := make([]*dstFinObj, W)
@@ -467,7 +467,7 @@ func DSTWeakClearing() {
 func DSTGCOffBound() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var ngc uint32
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		for i := 0; i < 40000; i++ {
 			b := make([]byte, 512)
 			b[0] = byte(i)
@@ -482,16 +482,16 @@ func DSTGCOffBound() {
 
 var dstChanPool = sync.Pool{New: func() any { return make(chan int, 1) }}
 
-// DSTPoolAcrossRuns exercises a sync.Pool of channels reused across two dst.Run
+// DSTPoolAcrossRuns exercises a sync.Pool of channels reused across two simulation.Run
 // calls — the pattern (e.g. Pebble's writeTaskPool) that fatals under plain
-// synctest, because a channel created in one bubble is reused in the next. dst.Run
+// synctest, because a channel created in one bubble is reused in the next. simulation.Run
 // reaps pools when it returns, so the second run gets a fresh, bubble-local
 // channel and the reuse succeeds. Without the reap, the second run would fatal
 // with "send on synctest channel from outside bubble".
 func DSTPoolAcrossRuns() {
 	use := func(seed uint64, v int) int {
 		var got int
-		dst.Run(seed, func() {
+		simulation.Run(seed, func() {
 			ch := dstChanPool.Get().(chan int)
 			ch <- v
 			got = <-ch
@@ -505,7 +505,7 @@ func DSTPoolAcrossRuns() {
 
 // dstActivate is the low-level runtime entry that turns DST on and roots the
 // calling goroutine's per-g RNG tree. These white-box tests use it directly
-// (rather than runtime/dst.Run) so they can exercise the per-g mechanism under
+// (rather than simulation.Run) so they can exercise the per-g mechanism under
 // GOMAXPROCS>1 M-migration, which Run (single-P) cannot reproduce.
 //
 //go:linkname dstActivate runtime.dstActivate
@@ -519,14 +519,14 @@ func dstActivateFromEnv() {
 	}
 }
 
-// DSTRunDeterminism exercises the public runtime/dst.Run API: it records a
+// DSTRunDeterminism exercises the public simulation.Run API: it records a
 // select order inside a deterministic simulation seeded by $DSTSEED. Run
 // enforces GOMAXPROCS=1 and disables async/time preemption itself, so the test
 // sets no other knobs. The same seed yields an identical sequence.
 func DSTRunDeterminism() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var buf []byte
-	dst.Run(n, func() {
+	simulation.Run(n, func() {
 		buf = dstSelectSeq(64)
 	})
 	buf = append(buf, '\n')

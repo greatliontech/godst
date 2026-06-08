@@ -12,9 +12,9 @@
 // (GOMAXPROCS=1) and no asynchronous or time-based preemption, this makes
 // goroutine scheduling and randomness a reproducible function of the seed.
 //
-// The public entry point is package runtime/dst. dstActivate is also linkname'd
+// The public entry point is package testing/simulation. dstActivate is also linkname'd
 // by the runtime's own white-box tests, which exercise the per-g mechanism under
-// GOMAXPROCS>1 M-migration that runtime/dst.Run (single-P) cannot reproduce.
+// GOMAXPROCS>1 M-migration that testing/simulation.Run (single-P) cannot reproduce.
 // See docs/dst/design.md.
 
 package runtime
@@ -37,7 +37,7 @@ func dstActive() bool {
 }
 
 // dstBuilt reports whether the program was built with -tags dst (so the map hash
-// key is deterministic). runtime/dst.Run requires this.
+// key is deterministic). testing/simulation.Run requires this.
 //
 //go:linkname dstBuilt
 func dstBuilt() bool {
@@ -102,7 +102,7 @@ func dstActivate(seed uint64) {
 // bubble's own (deterministic) allocation.
 //
 // This determinism is conditional (the physical/"GC timing" layer of the DST
-// contract — see the runtime/dst package doc): it assumes the bubble's own
+// contract — see the testing/simulation package doc): it assumes the bubble's own
 // per-allocation byte sizes are stable run to run. Tools that rewrite the heap —
 // the race detector (-race), the memory sanitizer — add varying allocations and
 // relax it; the logical layer (scheduling/values/replay) is unaffected. If a SUT
@@ -206,7 +206,7 @@ var (
 )
 
 // dstSetSchedStrategy selects the scheduling strategy for the next dst.Run. Called
-// by runtime/dst.RunWith before activation; Run (no options) leaves the default
+// by testing/simulation.RunWith before activation; Run (no options) leaves the default
 // random strategy.
 //
 //go:linkname dstSetSchedStrategy
@@ -272,7 +272,7 @@ func dstPCTAssignPrio(newg *g) {
 	newg.dstPrio = dstPCTBase + int64(dstSchedRandUint64()&0x7fffffff)
 }
 
-// dstDeactivate turns DST off. Used by runtime/dst.Run to restore normal
+// dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //
 //go:linkname dstDeactivate
@@ -281,7 +281,7 @@ func dstDeactivate() {
 }
 
 // dstSetAsyncPreemptOff sets debug.asyncpreemptoff and returns its previous
-// value, so runtime/dst.Run can disable asynchronous (signal-based) preemption
+// value, so testing/simulation.Run can disable asynchronous (signal-based) preemption
 // for the duration of a run and restore it afterward. Disabling it (together
 // with the sysmon gates, which key on dstActive) leaves preemption only at
 // deterministic cooperative points.

@@ -507,7 +507,7 @@ type g struct {
 	atomicstatus atomic.Uint32
 	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
 	goid         uint64
-	dstrand      uint64 // deterministic per-g RNG state for DST (runtime/dst); unused when DST off
+	dstrand      uint64 // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
 	dstPrio      int64  // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked

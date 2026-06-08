@@ -12,7 +12,7 @@ import (
 
 // dstEnv is the white-box DST knob combination for the low-level mechanism
 // testprogs (which call runtime.dstActivate via $DSTSEED rather than the
-// runtime/dst.Run API): a fixed seed, no async preemption, single P, and GC off,
+// testing/simulation.Run API): a fixed seed, no async preemption, single P, and GC off,
 // so that a non-blocking goroutine's randomness is a pure function of the seed.
 func dstEnv(seed string) []string {
 	return []string{
@@ -35,7 +35,7 @@ func dstChurnEnv(seed string) []string {
 }
 
 // runTestProgDST builds the testprog with -tags dst (which fixes the global map
-// hash key, a precondition for deterministic map order and for runtime/dst.Run)
+// hash key, a precondition for deterministic map order and for testing/simulation.Run)
 // and runs the named function.
 func runTestProgDST(t *testing.T, name string, env ...string) string {
 	exe, err := buildTestProg(t, "testprog", "-tags=dst")
@@ -216,7 +216,7 @@ func TestDSTGCAllocBoundDeterministic(t *testing.T) {
 // single-goroutine workload (no Seq-5 interleaving) allocates finalizable objects
 // with varied lifetimes. The testprog prints "numGC total perCycleHash".
 //
-// The assertion is layered to the determinism contract (see runtime/dst package
+// The assertion is layered to the determinism contract (see testing/simulation package
 // doc): the set-level observable (numGC + total finalizers discovered) is
 // asserted always — it is -race-robust because the requested-bytes trigger fires
 // the right number of times with the right total under -race too. The byte-exact
@@ -467,7 +467,7 @@ func TestDSTGCOffMemoryBounded(t *testing.T) {
 	}
 }
 
-// TestDSTRunAPI exercises the public runtime/dst.Run API end-to-end: Run itself
+// TestDSTRunAPI exercises the public testing/simulation.Run API end-to-end: Run itself
 // enforces GOMAXPROCS=1 and disables async/time preemption, so the test sets no
 // scheduling knobs (only the seed and GC off). The same seed replays an
 // identical schedule; a different seed yields a different one.

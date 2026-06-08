@@ -7,6 +7,6 @@
 package runtime
 
 // dstBuild is false in a normal build: the map hash key is seeded from OS
-// entropy (hash-flooding protection) and runtime/dst.Run refuses to run. See
+// entropy (hash-flooding protection) and testing/simulation.Run refuses to run. See
 // dst_on.go and docs/dst/design.md.
 const dstBuild = false

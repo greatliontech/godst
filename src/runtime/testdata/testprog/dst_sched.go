@@ -7,15 +7,15 @@ package main
 import (
 	"os"
 	"runtime"
-	"runtime/dst"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"testing/simulation"
 	"time"
 )
 
 // Seq-5 derisk probes. Each scenario records the order in which participating
-// goroutines reach a shared observation point, inside dst.Run, and prints the
+// goroutines reach a shared observation point, inside simulation.Run, and prints the
 // resulting interleaving signature (one digit per goroutine id). Running a
 // scenario across same-seed runs characterizes determinism; across different
 // seeds characterizes seed-variation (seed-invariant == the schedule explores a
@@ -53,10 +53,10 @@ func DSTSchedScenario() {
 	// uses the default random strategy.
 	pctDepth, _ := strconv.Atoi(os.Getenv("DSTPCT"))
 	pctSteps, _ := strconv.Atoi(os.Getenv("DSTPCTSTEPS"))
-	run := dst.Run
+	run := simulation.Run
 	if pctDepth > 0 {
 		run = func(s uint64, f func()) {
-			dst.RunWith(s, dst.Options{Strategy: dst.PCT, Depth: pctDepth, Steps: pctSteps}, f)
+			simulation.RunWith(s, simulation.Options{Strategy: simulation.PCT, Depth: pctDepth, Steps: pctSteps}, f)
 		}
 	}
 	var sig string
