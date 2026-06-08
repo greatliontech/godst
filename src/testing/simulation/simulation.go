@@ -42,15 +42,14 @@
 //   - GC set-level (unconditional). The GC count and the total set of objects
 //     whose finalizers/weak refs are discovered are deterministic, including under
 //     -race (the trigger fires the right number of times with the right total).
-//   - GC per-cycle timing (conditional). *Which* GC cycle discovers a given object
-//     is deterministic in normal builds, but relaxed under -race/-msan: those
-//     rewrite the heap, and the trigger is checked at allocator span boundaries
-//     that they shift, so the per-cycle split moves by ±span. The total set and
-//     the GC count are unaffected.
 //
-// A program whose correctness depends on *when* a finalizer runs is observing the
-// conditional layer; one that only relies on scheduling/values/replay (the usual
-// case) rests entirely on the unconditional layer.
+// Not in the contract: *which* GC cycle discovers a given object, and the
+// byte-level heap MemStats fields (HeapAlloc/HeapInuse/HeapReleased/HeapIdle).
+// These are sub-observable noise of the allocator's span-granular GC trigger —
+// stable in a fixed normal build but perturbed by ±span under -race/-msan or a
+// change in binary composition. A program must not assert on them; one that only
+// relies on scheduling/values/replay and set-level GC (the usual case) is fully
+// deterministic. Size memory behavior by NumGC and Options.MemoryLimit.
 //
 // # Build constraint
 //

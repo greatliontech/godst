@@ -531,21 +531,6 @@ func readmemstats_m(stats *MemStats) {
 	stats.HeapIdle = gcController.heapFree.load() + gcController.heapReleased.load()
 	stats.HeapInuse = gcController.heapInUse.load()
 	stats.HeapReleased = gcController.heapReleased.load()
-	if dstActive() {
-		// Under DST the simulation does not model OS-level memory: the scavenger is
-		// parked (D5), and total mapped/idle/released memory carries process history
-		// (mmap history, ASLR, sweep-time madvise on heap-layout-dependent spans)
-		// that is not bubble-local, so HeapReleased/HeapIdle vary run to run. Report
-		// the RSS-derived heap fields as deterministic synthetic values (no idle or
-		// released heap) so ReadMemStats is reproducible. The bubble-local fields —
-		// HeapAlloc, HeapInuse, Mallocs/Frees, NumGC — remain accurate and
-		// deterministic; a SUT that sizes by heap *pressure* should read those. The
-		// process-level Sys/*Sys totals are left as-is (OS-mapping accounting, not a
-		// bubble-local observable). See docs/dst/design.md (D6).
-		stats.HeapReleased = 0
-		stats.HeapIdle = 0
-		stats.HeapSys = stats.HeapInuse
-	}
 	stats.HeapObjects = nMalloc - nFree
 	stats.StackInuse = stackInUse
 	// memstats.stacks_sys is only memory mapped directly for OS stacks.

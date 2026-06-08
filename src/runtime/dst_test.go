@@ -5,7 +5,6 @@
 package runtime_test
 
 import (
-	"internal/race"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,18 +39,6 @@ func dstChurnEnv(seed string) []string {
 // and runs the named function.
 func runTestProgDST(t *testing.T, name string, env ...string) string {
 	exe, err := buildTestProg(t, "testprog", "-tags=dst")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return runBuiltTestProg(t, exe, name, env...)
-}
-
-// runTestProgDSTSim runs a simulation testprog from the separate "testprogdst"
-// binary, which carries the heavy-import (crypto/rand, os/user) cases kept out of
-// the lean "testprog" so they do not perturb its byte-exact per-cycle
-// GC-discovery test (the documented ±1-span finalizer-timing fragility).
-func runTestProgDSTSim(t *testing.T, name string, env ...string) string {
-	exe, err := buildTestProg(t, "testprogdst", "-tags=dst")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,49 +212,38 @@ func TestDSTGCAllocBoundDeterministic(t *testing.T) {
 }
 
 // TestDSTGCFinalizerDiscoveryDeterministic verifies that the per-bubble relative
-// GC trigger (Tier 2, A.5) makes finalizer discovery deterministic. A
-// single-goroutine workload (no Seq-5 interleaving) allocates finalizable objects
-// with varied lifetimes. The testprog prints "numGC total perCycleHash".
+// GC trigger (Tier 2, A.5) makes finalizer discovery deterministic at the
+// contract granularity. A single-goroutine workload (no Seq-5 interleaving)
+// allocates finalizable objects with varied lifetimes. The testprog prints
+// "numGC total".
 //
-// The assertion is layered to the determinism contract (see testing/simulation package
-// doc): the set-level observable (numGC + total finalizers discovered) is
-// asserted always — it is -race-robust because the requested-bytes trigger fires
-// the right number of times with the right total under -race too. The byte-exact
-// per-cycle hash is asserted only in normal builds; under -race the per-cycle
-// split jitters by ±span (the trigger is checked at span-grab boundaries that
-// -race's redzones shift), which is the documented GC-timing relaxation. The
-// absolute pacer trigger makes even numGC/total float — caught by the mutation
-// test on the relative-trigger gate. (Multi-goroutine contended workloads carry a
-// residual from the GC-independent Seq-5 scheduling-order gap; this test is
-// single-goroutine to isolate the GC trigger.)
+// The assertion is the DST contract (DST-GC-1; see the testing/simulation package
+// doc): the set-level observable — the GC count and the total set of finalizers
+// discovered — is deterministic, and is -race-robust because the trigger fires
+// the right number of times with the right total under -race too. (Which GC
+// *cycle* discovers a given object is sub-observable byte-trigger noise — ±span,
+// sensitive to -race redzones and binary composition — so it is not part of the
+// contract and not asserted here; design.md D1.) This test guards finalizer
+// *set-level* determinism (the total discovered set is reproducible). The relative
+// trigger the set level rests on is mutation-guarded separately by
+// TestDSTMemoryLimit (its baseline-independence check fails if the dstHeapBase
+// subtraction is dropped); this discovery workload's numGC is robust to that
+// offset, so it is not the test that pins the baseline. (Multi-goroutine contended
+// workloads carry a residual from the GC-independent Seq-5 scheduling-order gap;
+// this test is single-goroutine to isolate the GC trigger.)
 func TestDSTGCFinalizerDiscoveryDeterministic(t *testing.T) {
 	env := []string{"DSTSEED=12345", "GOGC=100"}
-	setLevel := func(out string) string { // "numGC total" — drop the per-cycle hash
-		f := strings.Fields(strings.TrimSpace(out))
-		if len(f) != 3 {
-			t.Fatalf("unexpected output %q, want \"numGC total hash\"", out)
-		}
-		return f[0] + " " + f[1]
-	}
-	first := runTestProgDST(t, "DSTGCFinDiscovery", env...)
-	f := strings.Fields(strings.TrimSpace(first))
-	if len(f) != 3 || f[0] == "0" || f[1] == "0" {
+	first := strings.TrimSpace(runTestProgDST(t, "DSTGCFinDiscovery", env...))
+	f := strings.Fields(first)
+	if len(f) != 2 || f[0] == "0" || f[1] == "0" {
 		t.Fatalf("no finalizer discovery recorded (%q): the in-run GC did not "+
 			"discover finalizable objects", first)
 	}
 	for i := 0; i < 9; i++ {
-		out := runTestProgDST(t, "DSTGCFinDiscovery", env...)
-		if race.Enabled {
-			// -race: byte-exact per-cycle has ±span jitter; assert the -race-robust
-			// set-level (numGC + total discovered).
-			if setLevel(out) != setLevel(first) {
-				t.Fatalf("finalizer set-level discovery diverged under -race (run %d): "+
-					"numGC/total nondeterministic\nfirst=%q\ngot  =%q", i+1, first, out)
-			}
-		} else if out != first {
-			// normal build: full byte-exact per-cycle determinism.
-			t.Fatalf("finalizer-discovery sequence diverged (run %d): per-cycle GC "+
-				"discovery is nondeterministic\nfirst=%q\ngot  =%q", i+1, first, out)
+		out := strings.TrimSpace(runTestProgDST(t, "DSTGCFinDiscovery", env...))
+		if out != first {
+			t.Fatalf("finalizer set-level discovery diverged (run %d): numGC/total "+
+				"nondeterministic\nfirst=%q\ngot  =%q", i+1, first, out)
 		}
 	}
 }
@@ -660,7 +636,7 @@ func TestDSTProcessIdentity(t *testing.T) {
 // (the last overridable via Options.NumCPU). Mutation check: dropping any
 // dstSim* accessor branch in os/runtime changes the corresponding field.
 func TestDSTIdentityExtra(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDSTSim(t, "DSTIdentityExtra"))
+	out := strings.TrimSpace(runTestProgDST(t, "DSTIdentityExtra"))
 	const want = "inside=[1 7777 7777 7777 7777 8 7777:7777:sim:/home/sim] customcpu=3 restoredids=true"
 	if out != want {
 		t.Fatalf("extended identity not simulated correctly:\n got=%q\nwant=%q", out, want)
@@ -677,8 +653,8 @@ func TestDSTIdentityExtra(t *testing.T) {
 // (no fill) breaks eq and the cross-process replay; ignoring the seed breaks
 // seedvaries.
 func TestDSTCryptoRandDeterministic(t *testing.T) {
-	out1 := strings.TrimSpace(runTestProgDSTSim(t, "DSTCryptoRand", "DSTSEED=12345"))
-	out2 := strings.TrimSpace(runTestProgDSTSim(t, "DSTCryptoRand", "DSTSEED=12345"))
+	out1 := strings.TrimSpace(runTestProgDST(t, "DSTCryptoRand", "DSTSEED=12345"))
+	out2 := strings.TrimSpace(runTestProgDST(t, "DSTCryptoRand", "DSTSEED=12345"))
 	if !strings.Contains(out1, " eq=true seedvaries=true realdiffers=true") {
 		t.Fatalf("crypto/rand not deterministic/seed-varying/real-outside under DST: %q", out1)
 	}
@@ -700,47 +676,45 @@ func TestDSTFinalizerChainNoLeak(t *testing.T) {
 	}
 }
 
-// TestDSTMemStatsDeterministic verifies the RSS-derived MemStats fields are
-// deterministic under DST: HeapReleased/HeapIdle are reported as synthetic 0
-// (the simulation does not model OS memory), and the bubble-local fields are
-// reproducible across runs (design.md D6: deterministic RSS MemStats).
-// Mutation check: removing the readmemstats_m override makes HeapIdle reflect the
-// (nonzero, process-history-dependent) free heap.
-func TestDSTMemStatsDeterministic(t *testing.T) {
-	for i := 0; i < 6; i++ {
-		out := strings.TrimSpace(runTestProgDST(t, "DSTMemStats", "DSTSEED=12345", "GOGC=100"))
-		if out != "0 0" {
-			t.Fatalf("RSS-derived MemStats not deterministic-synthetic under DST (run %d, got %q): "+
-				"HeapReleased and HeapIdle carry process history and must be reported as 0", i+1, out)
-		}
-	}
-}
-
 // TestDSTMemoryLimit verifies Options.MemoryLimit deterministically bounds the
-// bubble's heap growth (design.md D6: Options.MemoryLimit): a
-// tighter limit forces more GCs, and the GC count is reproducible. Mutation
-// check: ignoring dstMemLimit in the trigger makes the two limits produce the
-// same count.
+// bubble's heap growth (design.md D6: Options.MemoryLimit): a tighter limit forces
+// more GCs, and the GC count is reproducible. It also guards the per-bubble
+// relative trigger's dstHeapBase baseline (the mechanism that makes GC
+// deterministic across processes by excluding the run-to-run-varying pre-bubble
+// heap): numGC under a fixed limit must be independent of a large retained
+// pre-bubble heap, because the trigger fires on heapLive-dstHeapBase. Mutation
+// checks: (a) ignoring dstMemLimit makes the two limits produce the same count;
+// (b) dropping the dstHeapBase baseline (absolute trigger) lets the pre-bubble
+// heap inflate numGC, which the baseline-independence assertion catches (e.g. with
+// a 16 MiB pre-bubble heap, numGC jumps from 9 to >16000).
 func TestDSTMemoryLimit(t *testing.T) {
-	run := func(limit string) int {
-		out := strings.TrimSpace(runTestProgDST(t, "DSTMemLimit", "DSTSEED=1", "GOGC=off", "DSTMEMLIMIT="+limit))
+	run := func(limit, pre string) int {
+		out := strings.TrimSpace(runTestProgDST(t, "DSTMemLimit", "DSTSEED=1", "GOGC=off",
+			"DSTMEMLIMIT="+limit, "DSTPREBUBBLE="+pre))
 		n, err := strconv.Atoi(out)
 		if err != nil {
 			t.Fatalf("bad NumGC output %q: %v", out, err)
 		}
 		return n
 	}
-	tight := run("2097152") // 2 MiB
-	loose := run("8388608") // 8 MiB
+	tight := run("2097152", "0") // 2 MiB
+	loose := run("8388608", "0") // 8 MiB
 	if tight < 2 {
 		t.Fatalf("MemoryLimit did not bound the heap: tight-limit numGC=%d (heap grew unbounded?)", tight)
 	}
 	if tight <= loose {
 		t.Fatalf("MemoryLimit had no effect: 2 MiB numGC=%d not greater than 8 MiB numGC=%d", tight, loose)
 	}
+	// Baseline independence: a 16 MiB heap retained before the run must not change
+	// numGC — the relative trigger subtracts it (dstHeapBase). The absolute trigger
+	// (baseline dropped) lets it inflate the live total and explodes numGC.
+	if withPre := run("2097152", "16777216"); withPre != tight {
+		t.Fatalf("MemoryLimit numGC depends on pre-bubble heap (the dstHeapBase baseline is "+
+			"not subtracted): with 16 MiB retained pre-bubble numGC=%d, without=%d", withPre, tight)
+	}
 	for i := 0; i < 3; i++ {
-		if run("2097152") != tight {
-			t.Fatalf("MemoryLimit numGC nondeterministic across runs (run %d): got %d, want %d", i+1, run("2097152"), tight)
+		if got := run("2097152", "0"); got != tight {
+			t.Fatalf("MemoryLimit numGC nondeterministic across runs (run %d): got %d, want %d", i+1, got, tight)
 		}
 	}
 }

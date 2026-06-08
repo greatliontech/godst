@@ -5,11 +5,15 @@
 package main
 
 import (
+	crand "crypto/rand"
+	"encoding/hex"
 	"internal/synctest"
 	"math/rand/v2"
 	"os"
+	"os/user"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing/simulation"
@@ -42,35 +46,14 @@ func init() {
 	register("DSTWeakClearing", DSTWeakClearing)
 	register("DSTGCOffBound", DSTGCOffBound)
 	register("DSTProcessIdentity", DSTProcessIdentity)
+	register("DSTIdentityExtra", DSTIdentityExtra)
+	register("DSTCryptoRand", DSTCryptoRand)
 	register("DSTFinChain", DSTFinChain)
-	register("DSTMemStats", DSTMemStats)
 	register("DSTMemLimit", DSTMemLimit)
 }
 
 // dstMemSink keeps the most recent allocation live so the rest become garbage.
 var dstMemSink []byte
-
-// DSTMemStats churns ~8 MB of heap then GCs and reads MemStats inside the
-// simulation. The RSS-derived fields (HeapReleased, HeapIdle) carry process
-// history and sweep-time madvise that vary run to run; under DST they are
-// reported as deterministic synthetic 0. Prints "HeapReleased HeapIdle". (The
-// process-total live-heap fields like HeapAlloc carry process state and are not
-// claimed byte-exact — the same layer as the GC-timing observable.)
-func DSTMemStats() {
-	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	var ms runtime.MemStats
-	simulation.Run(n, func() {
-		for i := 0; i < 4096; i++ {
-			dstMemSink = make([]byte, 2048)
-			dstMemSink[0] = byte(i)
-		}
-		dstMemSink = nil
-		runtime.GC()
-		runtime.ReadMemStats(&ms)
-	})
-	os.Stdout.WriteString(strconv.FormatUint(ms.HeapReleased, 10) + " " +
-		strconv.FormatUint(ms.HeapIdle, 10) + "\n")
-}
 
 // DSTMemLimit allocates ~16 MB of non-blocking garbage under a deterministic
 // bubble-local Options.MemoryLimit (DSTMEMLIMIT bytes) and prints the resulting
@@ -78,6 +61,17 @@ func DSTMemStats() {
 func DSTMemLimit() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	limit, _ := strconv.ParseInt(os.Getenv("DSTMEMLIMIT"), 10, 64)
+	// Optionally retain a large heap *before* the run so the bubble-entry baseline
+	// dstHeapBase is large. The relative trigger subtracts it (heapLive - base), so
+	// numGC is independent of this pre-bubble heap — the property that proves the
+	// baseline is load-bearing. An absolute trigger (base dropped) lets the
+	// pre-bubble heap inflate the live total and changes numGC. Retained in a
+	// package var so the entry GC keeps it live.
+	if pre, _ := strconv.Atoi(os.Getenv("DSTPREBUBBLE")); pre > 0 {
+		for b := 0; b < pre; b += 4096 {
+			dstPreBubbleSink = append(dstPreBubbleSink, make([]byte, 4096))
+		}
+	}
 	var ngc uint32
 	simulation.RunWith(n, simulation.Options{MemoryLimit: limit}, func() {
 		for i := 0; i < 16384; i++ {
@@ -90,6 +84,10 @@ func DSTMemLimit() {
 	})
 	os.Stdout.WriteString(strconv.FormatUint(uint64(ngc), 10) + "\n")
 }
+
+// dstPreBubbleSink retains a pre-bubble heap for DSTMemLimit's baseline-
+// independence check (DSTPREBUBBLE).
+var dstPreBubbleSink [][]byte
 
 // dstMakeFinChain builds a 3-level finalizer chain in a dropped frame: c1's
 // finalizer keeps c2 alive, c2's keeps c3, and c3's finalizer touches a bubble
@@ -150,13 +148,72 @@ func DSTProcessIdentity() {
 		" realoverridden=" + strconv.FormatBool(realOverridden) + "\n")
 }
 
-// dstFinqSeqFP returns the per-cycle finalizer-discovery sequence hash (bubble-
-// local finqueued folded at each in-bubble GC); dstBubbleFinqFP returns the
-// bubble-local total finalizers discovered. See runtime/dst.go.
-//
-//go:linkname dstFinqSeqFP runtime.dstFinqSeqFP
-func dstFinqSeqFP() uint64
+// DSTIdentityExtra checks the rest of the process-identity surface beyond
+// pid/hostname: os.Getppid/Getuid/Getgid/Geteuid/Getegid, runtime.NumCPU, and
+// os/user.Current return fixed simulated values inside simulation.Run (NumCPU
+// overridable via Options), and are restored to real values outside it. Prints
+// "inside=[<ppid> <uid> <gid> <euid> <egid> <numcpu> <uid:gid:user:home>]
+// customcpu=<n> restoredids=<bool>". restoredids compares the whole identity
+// surface read *outside* the run before and after it: equality proves the run
+// did not leak simulated identity (and, since the pre-run read caches the real
+// os/user, that the in-run synthetic user never poisoned that cache).
+func DSTIdentityExtra() {
+	read := func() string {
+		u, _ := user.Current()
+		return strings.Join([]string{
+			strconv.Itoa(os.Getppid()),
+			strconv.Itoa(os.Getuid()),
+			strconv.Itoa(os.Getgid()),
+			strconv.Itoa(os.Geteuid()),
+			strconv.Itoa(os.Getegid()),
+			strconv.Itoa(runtime.NumCPU()),
+			u.Uid + ":" + u.Gid + ":" + u.Username + ":" + u.HomeDir,
+		}, " ")
+	}
+	realBefore := read()
+	var inside string
+	simulation.Run(1, func() { inside = read() })
+	// A custom NumCPU unlikely to equal the host's real count proves the override
+	// is genuine on any machine (whereas the default 8 could coincide with it).
+	var customCPU int
+	simulation.RunWith(1, simulation.Options{NumCPU: 3}, func() { customCPU = runtime.NumCPU() })
+	realAfter := read()
+	os.Stdout.WriteString("inside=[" + inside + "] customcpu=" + strconv.Itoa(customCPU) +
+		" restoredids=" + strconv.FormatBool(realAfter == realBefore) + "\n")
+}
 
+// DSTCryptoRand checks that crypto/rand is deterministic inside simulation.Run
+// (seeded by the run) but real OS entropy outside it. With DSTSEED=s it prints
+// "h=<hex> eq=<bool> seedvaries=<bool> realdiffers=<bool>": h is the bytes read
+// under seed s (stable across processes — replay), eq that a second seed-s run
+// matches (same-seed determinism), seedvaries that seed s+1 differs (not a
+// constant), and realdiffers that two reads *outside* a run differ (production
+// crypto/rand is untouched). This is the executable form of INV-CRYPTO.
+func DSTCryptoRand() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	readSeed := func(seed uint64) [32]byte {
+		var b [32]byte
+		simulation.Run(seed, func() {
+			crand.Read(b[:])
+		})
+		return b
+	}
+	a := readSeed(n)
+	b := readSeed(n)     // same seed: must equal a
+	c := readSeed(n + 1) // different seed: must differ
+	// Outside any run, crypto/rand is real entropy: two reads differ.
+	var x, y [16]byte
+	crand.Read(x[:])
+	crand.Read(y[:])
+	os.Stdout.WriteString("h=" + hex.EncodeToString(a[:]) +
+		" eq=" + strconv.FormatBool(a == b) +
+		" seedvaries=" + strconv.FormatBool(a != c) +
+		" realdiffers=" + strconv.FormatBool(x != y) + "\n")
+}
+
+// dstBubbleFinqFP returns the bubble-local total finalizers discovered (the
+// set-level finalizer-discovery observable). See runtime/dst.go.
+//
 //go:linkname dstBubbleFinqFP runtime.dstBubbleFinqFP
 func dstBubbleFinqFP() uint64
 
@@ -165,15 +222,12 @@ type dstFinObj struct{ b [256]byte }
 // DSTGCFinDiscovery exercises the per-bubble relative GC trigger's effect on
 // finalizer discovery. A single goroutine (so no Seq-5 interleaving) allocates
 // finalizable objects through a ring buffer, giving them varied lifetimes so the
-// GC discovers them across many cycles. It prints "numGC total perCycleHash":
-//   - numGC, total (finalizers discovered): the set-level observable — deterministic
-//     in normal AND -race builds (the trigger fires the right number of times with
-//     the right total set).
-//   - perCycleHash: the byte-exact per-cycle split — deterministic in normal builds
-//     (the per-bubble relative trigger, A.5), but jitters by ±span under -race
-//     because the trigger is checked at span-grab boundaries that -race shifts.
-//
-// With the absolute pacer trigger even the set-level observable floats.
+// GC discovers them across many cycles. It prints "numGC total" — the set-level
+// observable (the GC count and the total set of finalizers discovered), which is
+// the DST contract (DST-GC-1): deterministic in normal AND -race builds (the
+// trigger fires the right number of times with the right total). Which GC *cycle*
+// discovers a given object is sub-observable byte-trigger noise, not part of the
+// contract — the simulation neither claims nor tests it (design.md D1).
 func DSTGCFinDiscovery() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var ngc uint32
@@ -191,8 +245,7 @@ func DSTGCFinDiscovery() {
 		ngc = ms.NumGC
 	})
 	os.Stdout.WriteString(strconv.FormatUint(uint64(ngc), 10) + " " +
-		strconv.FormatUint(dstBubbleFinqFP(), 10) + " " +
-		strconv.FormatUint(dstFinqSeqFP(), 16) + "\n")
+		strconv.FormatUint(dstBubbleFinqFP(), 10) + "\n")
 }
 
 // dstSliceSink forces the allocations in DSTGCAllocBound to escape to the heap

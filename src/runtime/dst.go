@@ -31,9 +31,18 @@ var dstSeed atomic.Uint64
 
 // dstActive reports whether deterministic simulation testing is active.
 //
+// The dstBuild guard is load-bearing for cost, not just correctness: dstBuild is
+// a constant (dst_on.go/dst_off.go), so in a non-`-tags dst` build dstActive()
+// folds to a constant false and every `if dstActive()` branch — on the rand() and
+// scheduler hot paths included — is dead-code-eliminated. The DST machinery then
+// has zero footprint unless the build opted in. In a `-tags dst` build the guard
+// is true and this is the runtime seed load as before. (dstSeed is never set
+// without dstBuild anyway: simulation.Run requires the tag, and dstActivate is an
+// unexported test-only linkname.)
+//
 //go:nosplit
 func dstActive() bool {
-	return dstSeed.Load() != 0
+	return dstBuild && dstSeed.Load() != 0
 }
 
 // dstBuilt reports whether the program was built with -tags dst (so the map hash
@@ -91,61 +100,38 @@ func dstActivate(seed uint64) {
 	dstDrainCleanups()
 	dstHeapBase.Store(gcController.heapMarked)
 	dstFinqBase.Store(finqueued)
-	dstFinqSeq.Store(0)
 }
 
 // dstHeapBase is the process-live heap snapshot taken at bubble entry (after a
 // forced GC). The DST heap trigger (gcTrigger.test) fires on the bubble's growth
 // relative to this baseline, so the process's pre-bubble heap history — which
-// varies run to run — does not perturb when GC fires inside the bubble, making
-// the GC trajectory and finalizer/weak discovery a deterministic function of the
-// bubble's own (deterministic) allocation.
+// varies run to run — does not perturb the GC *set level* inside the bubble: the
+// GC count and the total set of finalizers/weak refs discovered are a
+// deterministic function of the bubble's own allocation (the contract; DST-GC-1).
 //
-// This determinism is conditional (the physical/"GC timing" layer of the DST
-// contract — see the testing/simulation package doc): it assumes the bubble's own
-// per-allocation byte sizes are stable run to run. Tools that rewrite the heap —
-// the race detector (-race), the memory sanitizer — add varying allocations and
-// relax it; the logical layer (scheduling/values/replay) is unaffected. If a SUT
-// drops references to pre-bubble objects so process-live falls below this
+// The trigger fires on heap *bytes*, so *which cycle* discovers a given object is
+// byte-exact only in a fixed normal build and is sub-observable noise otherwise
+// (perturbed by -race/-msan redzones or a change in binary composition). That
+// per-cycle byte-exactness is NOT part of the contract and is not tested — a SUT
+// relies on the set level and on scheduling/values/replay, which are unaffected.
+// If a SUT drops references to pre-bubble objects so process-live falls below this
 // baseline, the trigger degrades soundly to the heapMinimum floor (gcTrigger.test
 // guards heapMarked > dstHeapBase).
 var dstHeapBase atomic.Uint64
 
-// dstFinqSeq is a rolling hash of the per-cycle bubble-local finalizer-queued
-// count — finqueued minus dstFinqBase, the cumulative count snapshotted at bubble
-// entry — sampled at each in-bubble GC cycle. The baseline subtraction is
-// essential: finqueued is a process-cumulative counter, and the entry GC queues a
-// run-to-run-varying number of pre-bubble finalizers, so the absolute count is
-// not bubble-deterministic but the delta is. A deterministic dstFinqSeq across
-// runs of the same seed means GC discovered the same finalizable objects at the
-// same cycles. Recorded only under DST.
-var dstFinqSeq atomic.Uint64
-var dstFinqBase atomic.Uint64 // finqueued snapshot at bubble entry
-
-// dstRecordFinqSeq folds the current bubble-local finqueued delta into dstFinqSeq.
-// Called at each in-bubble GC cycle (after sweep, when this cycle's finalizers are
-// queued).
-func dstRecordFinqSeq() {
-	rel := finqueued - dstFinqBase.Load()
-	h := dstFinqSeq.Load()
-	if h == 0 {
-		h = 1469598103934665603
-	}
-	dstFinqSeq.Store((h ^ rel) * 1099511628211)
-}
-
-// dstFinqSeqFP returns the current finalizer-discovery sequence hash, for tests.
-//
-//go:linkname dstFinqSeqFP
-func dstFinqSeqFP() uint64 { return dstFinqSeq.Load() }
+// dstFinqBase is the finqueued snapshot at bubble entry. finqueued is a
+// process-cumulative counter, and the entry GC queues a run-to-run-varying number
+// of pre-bubble finalizers, so only the delta from this baseline is
+// bubble-deterministic.
+var dstFinqBase atomic.Uint64
 
 // dstBubbleFinqFP returns the bubble-local count of finalizers queued so far
-// (finqueued minus the bubble-entry baseline). Unlike the per-cycle dstFinqSeq
-// hash, this *total* is -race-robust: the GC count and the total set of
-// discovered finalizers are deterministic under -race even though the per-cycle
-// split is not (the trigger is checked at span-grab boundaries, which -race
-// shifts). Tests assert the per-cycle hash in normal builds and this set-level
-// total under -race.
+// (finqueued minus the bubble-entry baseline) — the *set-level* finalizer-
+// discovery observable. This total is the contract (DST-GC-1): the GC count and
+// the total set of discovered finalizers are deterministic, including under
+// -race. (Which GC *cycle* discovers a given object is not part of the contract —
+// it is sub-observable byte-trigger noise; the simulation does not claim or test
+// it. See design.md D1.)
 //
 //go:linkname dstBubbleFinqFP
 func dstBubbleFinqFP() uint64 { return finqueued - dstFinqBase.Load() }

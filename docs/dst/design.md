@@ -122,6 +122,13 @@ Both `Run` and `RunWith` fix the identity, so even plain `Run` is reproducible h
 and the crypto/rand seam below are the only places the fork patches packages other than
 `runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
 The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.
+This is a deliberate gating asymmetry: identity is gated on `dstSimEnvSet` (set only by
+`testing/simulation.run`), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
+by `dstActivate` too). So a white-box run sees seeded RNG, scheduling, and crypto/rand but the *real*
+host identity — harmless, because the white-box runtime tests exercise the per-g mechanism under
+`GOMAXPROCS>1` and never read identity. `uid`/`gid`/`ppid` are fixed (not configurable like
+hostname/pid/NumCPU) by deliberate choice — no SUT has needed per-run variation, and the surface stays
+lean; they are single constants in `runtime/dst.go` if that changes.
 
 One identity surface is deliberately **out of scope** here: `net.Interfaces`/`net.InterfaceAddrs` still
 report the real host's interfaces (MAC/IP). Their correct simulated shape is per-node identity sourced
@@ -878,14 +885,17 @@ does not model (the scavenger is parked, D5). Two fixes give the user a determin
   under DST: *bound bubble heap growth*, not *bound total RSS*. It is an upper bound on top of the GOGC
   trigger; when `GOGC=off` it is the sole bound (the `defaultHeapMinimum` floor is skipped so a limit
   set above it is honored).
-- **Deterministic RSS `MemStats`** — `ReadMemStats` reports the RSS-derived heap fields
-  (`HeapReleased`, `HeapIdle`, and `HeapSys`'s idle component) as synthetic deterministic 0 under DST,
-  since their real values carry `mappedReady`/sweep-`madvise` process noise (`readmemstats_m`;
-  `TestDSTMemStatsDeterministic`). The bubble-local fields (`HeapAlloc`, `HeapInuse`, `Mallocs`/`Frees`,
-  `NumGC`) remain accurate; the process-total `Sys`/`*Sys`/`HeapAlloc` fields carry small process-state
-  jitter and are not claimed byte-exact (the GC-timing layer). A SUT that sizes by memory pressure
-  should read `HeapAlloc`/`HeapInuse` (bubble-local) and use `Options.MemoryLimit`, not the env
-  `GOMEMLIMIT` or `HeapReleased`/`HeapIdle`.
+- **RSS-derived `MemStats` are out-of-contract** — `HeapReleased`, `HeapIdle`, and `HeapSys`'s idle
+  component carry `mappedReady`/sweep-`madvise` process noise that is not bubble-local, so they are
+  **not** deterministic under DST and a SUT must not assert on them (same status as the init-time
+  boundary: nondeterminism the SUT must not read, not nondeterminism the fork hides). An earlier version
+  zeroed these fields to make `ReadMemStats` reproducible; that was removed as a SUT-accommodation — it
+  *falsified* a runtime value (there are idle spans; it reported 0) to serve a SUT that read fields the
+  contract already steers away from, and it didn't even cover the `Sys`/`*Sys` fields that jitter the
+  same way. The honest contract is the one below: only the *set-level* observables are deterministic. A
+  SUT that sizes by memory should branch on `NumGC` and use `Options.MemoryLimit`, never `HeapReleased`/
+  `HeapIdle` (and only coarsely on `HeapAlloc`/`HeapInuse`, which carry the sub-observable byte noise of
+  the heap trigger — D2).
 
 **So that memory is always bounded** regardless of config, the DST trigger falls back to a fixed
 `defaultHeapMinimum` floor when `GOGC=off` (`gcPercent < 0`), instead of never firing — a GOGC=off
@@ -895,14 +905,14 @@ deterministically). `defaultHeapMinimum`, the constant, not `gcController.heapMi
 `defaultHeapMinimum*GOGC/100` and overflows to garbage when `GOGC=off`.
 
 > **Invariant DST-MEM-1 (observable memory determinism).** Under DST, the GC-set-level memory
-> observables a SUT can read — `NumGC` (under GOGC or `Options.MemoryLimit`), the set of weak pointers
-> cleared, and the RSS-derived `MemStats` fields (`HeapReleased`/`HeapIdle`, reported as synthetic 0) —
-> are a deterministic function of the seed. *Violation:* a SUT branches on `NumGC`, on which weak refs
-> cleared, or on `HeapReleased`/`HeapIdle`, and sees different values across runs of one seed.
-> *Enforced:* `TestDSTGCAllocBoundDeterministic`, `TestDSTWeakClearingDeterministic`,
-> `TestDSTMemoryLimit`, `TestDSTMemStatsDeterministic`. (Excluded — *not* claimed byte-exact: `NumGC`
-> driven by the *env* `GOMEMLIMIT`, and the process-total `Sys`/`*Sys`/`HeapAlloc` fields, which carry
-> process-state jitter; a SUT must size by bubble-local heap and `Options.MemoryLimit` instead.)
+> observables a SUT can read — `NumGC` (under GOGC or `Options.MemoryLimit`) and the set of weak pointers
+> cleared — are a deterministic function of the seed. *Violation:* a SUT branches on `NumGC` or on which
+> weak refs cleared and sees different values across runs of one seed. *Enforced:*
+> `TestDSTGCAllocBoundDeterministic`, `TestDSTWeakClearingDeterministic`, `TestDSTMemoryLimit`.
+> (Out-of-contract — *not* deterministic, the SUT must not assert on them: the RSS-derived fields
+> `HeapReleased`/`HeapIdle`/`HeapSys`-idle, the byte-level live-heap fields `HeapAlloc`/`HeapInuse`, the
+> process-total `Sys`/`*Sys` fields, and `NumGC` driven by the *env* `GOMEMLIMIT` — all carry process or
+> sub-observable byte noise; a SUT sizes by `NumGC` and `Options.MemoryLimit` instead.)
 >
 > **Invariant DST-MEM-2 (always memory-bounded).** Under DST, a bubble that allocates is
 > deterministically memory-bounded for *any* GOGC/GOMEMLIMIT config: the heap trigger always fires for
@@ -1009,9 +1019,12 @@ below is not adopted; with it adopted, the drain may run **per-GC** and discover
 deterministic.
 
 **As built (Chunk B), discovery is per-cycle but the drain still runs at quiescence — these are
-separate axes.** A.5's relative trigger (adopted) makes *discovery* per-cycle deterministic: which GC
-cycle queues a given object is a deterministic function of the seed (the `dstFinqSeq` per-cycle hash,
-normal builds). That is independent of *when the queued finalizers run*. Chunk B runs them on the drain
+separate axes.** A.5's relative trigger (adopted) makes *discovery* per-cycle deterministic in a fixed
+normal build: which GC cycle queues a given object is a function of the seed. (That per-cycle
+byte-exactness is **not in the contract** and is not tested — it is sub-observable byte-trigger noise,
+perturbed by -race or binary composition; the hardening that downgraded the discovery test to set-level
+removed the `dstFinqSeq` per-cycle probe. See the layered-contract section below.) That is independent
+of *when the queued finalizers run*. Chunk B runs them on the drain
 **at quiescence**, not per-GC, deliberately: a per-GC (mid-burst) drain would execute user finalizers
 while SUT goroutines are mid-execution (between cooperative yields), interleaving finalizer side effects
 with the SUT; at quiescence every SUT goroutine is durably blocked, so finalizers run in isolation and
@@ -1076,9 +1089,17 @@ set-at-quiescence to **per-cycle discovery determinism**.
   rule with the scaling term on the bubble's *own* live (`heapMarked − dstHeapBase`), excluding the
   run-to-run-varying process baseline. No per-cycle rebase is needed: `base` is fixed at entry and
   `heapMarked` updates each cycle, so the target tracks the bubble's live set faithfully.
-- Regression test `TestDSTGCFinalizerDiscoveryDeterministic` over a permanent `dstFinqSeqFP` hook (the
-  bubble-local — `finqueued − dstFinqBase` — per-cycle finalizer-queue sequence). Mutation-verified:
-  reverting to the absolute trigger makes the discovery sequence diverge.
+- Regression tests over the permanent `dstBubbleFinqFP` hook (the bubble-local total finalizers
+  discovered, `finqueued − dstFinqBase`): `TestDSTGCFinalizerDiscoveryDeterministic` asserts the
+  set-level finalizer discovery (`numGC` + total) is reproducible. The `dstHeapBase` baseline subtraction
+  itself — the part that cancels the run-to-run-varying pre-bubble heap — is mutation-guarded by
+  `TestDSTMemoryLimit`'s **baseline-independence** check: `numGC` under a fixed limit must not change when
+  a large heap is retained *before* the run (16 MiB). Dropping the baseline (absolute trigger) lets that
+  pre-bubble heap inflate the live total, so `numGC` explodes (9 → >16000) and the check fails. (The
+  discovery workload's sparse `numGC` is robust to the baseline offset, so it is not the test that pins
+  it — a gap the byte-exact-per-cycle hash papered over before it was removed; the new check closes it.)
+  The per-cycle `dstFinqSeq` probe used during bring-up was removed when the discovery test went
+  set-level.
 
 **Validation + the Seq-5 boundary (measured).** The entry-GC baseline holds: `bubbleMarked =
 heapMarked − base` is identical across runs (12/12) — the GC trajectory is deterministic. Finalizer
@@ -1107,24 +1128,25 @@ keep byte-exact heap accounting while an instrumenter rewrites the heap. So the 
 | **Logical** | scheduling, select, map, `math/rand`, values, **replay** | per-g RNG + single-P | **holds** (verified: 8/8 DST logical tests pass under `-race`, incl. GOMAXPROCS=4 churn; no race reports) |
 | **Finalizer set @ quiescence** | the finalizer/cleanup *set* run by a quiescence point = objects logically unreachable there | reachability (logical) | **holds** (lands with Chunk B's drain) |
 | **GC set-level** (`numGC`, total finalizer/weak set) | the GC count and the *set* of objects discovered | heap bytes, but target floors at `heapMinimum` | **holds** (the 2 GC tests pass under `-race`) |
-| **GC per-cycle byte-exact** (A.5) — *which cycle* discovers an object | heap bytes (physical) | **relaxed** |
+| **GC per-cycle byte-exact** — *which cycle* discovers an object | heap bytes (physical) | **not in contract** (see below) |
 
 The contract is sound because the **unconditional** layers (logical + set-at-quiescence + GC set-level)
-are what a SUT normally relies on. The two GC-determinism tests **run and pass under `-race`** asserting
-the set-level layer (`numGC` + total finalizers), and assert the byte-exact per-cycle hash only in normal
-builds (`dst_test.go`, gated on `internal/race.Enabled`). Fail-loud, not silent.
+are what a SUT normally relies on. The GC-determinism test asserts the **set-level** layer (`numGC` +
+total finalizers) and runs in all builds (`TestDSTGCFinalizerDiscoveryDeterministic`); it does **not**
+assert the per-cycle split. Fail-loud, not silent.
 
-**Why set-level holds under `-race` by construction; why per-cycle does not.** For the small-live-set
-workloads DST targets, the relative trigger's target floors at `heapMinimum` (the bubble live set is
-below the GOGC scaling point), so `numGC = bubble-growth / heapMinimum`, and the bubble growth is
-`-race`-deterministic *within* a `-race` build — hence `numGC` and the total discovered set are
-deterministic under `-race`. The *per-cycle split* still jitters under `-race`: the heap trigger is
-*checked* at span-grab boundaries (`mallocgc`'s `checkGCTrigger`), which `-race`'s redzones shift, so the
-exact allocation a GC fires at moves by ±span. Measured: the split is **bimodal** under `-race` (the
-per-cycle hash takes one of two values run-to-run; `numGC` and the total set are stable). Un-relaxing
-this needs a race-invariant *logical-allocation* trigger (a real GC-trigger redesign, since the runtime
-tracks only the physical live set) for a narrow benefit — tracked in
-`docs/issues/dst-race-percycle-gc-timing.md`.
+**Why per-cycle byte-exact is not in the contract.** A.5's per-bubble relative trigger *does* make
+finalizer discovery byte-exact per-cycle in a fixed normal build (a real bonus — discovery is per-cycle,
+not merely set-at-quiescence), but that byte-exactness is **fragile and sub-observable**: the trigger
+fires on heap *bytes*, checked at span-grab boundaries (`mallocgc`'s `checkGCTrigger`), so anything that
+shifts the byte↔object mapping by a span moves *which cycle* discovers an object. `-race`/`-msan`
+redzones do it (the split goes **bimodal** — two values run-to-run; `numGC` and the total set stay
+stable); so does a change in **binary composition** (e.g. linking a heavy import shifts the bubble's
+entry span-fill phase). Because no SUT can rely on it portably, the contract is set-level only and the
+per-cycle hash is not tested. An earlier build asserted it byte-exact in normal builds (gated on
+`internal/race.Enabled`) and tracked the `-race` jitter as an open issue; both were removed when the test
+went set-level. Un-claiming it (rather than chasing a race-invariant *logical-allocation* trigger — a GC
+redesign, since the runtime tracks only the physical live set) is the right call for the narrow benefit.
 
 **An experiment proved the byte-layer fragility is reducible (and then proved the fix unnecessary).**
 Instrumenting `mallocgc` to count bubble allocations showed the bubble's logical allocation **count and

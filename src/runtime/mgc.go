@@ -713,17 +713,20 @@ func (t gcTrigger) test() bool {
 			// Per-bubble relative trigger: fire when the bubble's growth since the
 			// last mark reaches the GOGC ratio of the bubble's *own* live set
 			// (heapMarked - dstHeapBase), excluding the run-to-run-varying process
-			// baseline. This makes the GC-trigger crossing — and thus finalizer/weak
-			// discovery — a deterministic function of the bubble's allocation. The
-			// heapMinimum floor is the same as production. See docs/dst/design.md.
+			// baseline. This makes the GC *set level* — numGC and the total
+			// finalizer/weak set discovered — a deterministic function of the
+			// bubble's allocation, which is the contract (DST-GC-1). The heapMinimum
+			// floor is the same as production. See docs/dst/design.md.
 			//
-			// Under -race this is set-level (numGC + total finalizer set)
-			// deterministic but not byte-exact per-cycle: for the small-live-set
-			// workloads DST targets, target floors at heapMinimum and the bubble's
-			// growth is -race-invariant, so numGC is deterministic by construction;
-			// the per-cycle split jitters because the trigger is checked at span-grab
-			// boundaries that -race's redzones shift. See the layered contract in the
-			// testing/simulation package doc.
+			// The trigger fires on heap *bytes*, so *which cycle* discovers a given
+			// object is byte-exact only in a fixed normal build and sub-observable
+			// noise otherwise — not part of the contract and not tested. -race/-msan
+			// redzones shift the span-grab boundaries the trigger is checked at, and a
+			// change in binary composition shifts the entry span-fill phase; either
+			// moves the per-cycle split by ±span. numGC and the total set are
+			// unaffected (for the small-live-set workloads DST targets the target
+			// floors at heapMinimum and bubble growth is invariant). See the layered
+			// contract in the testing/simulation package doc.
 			hm := gcController.heapMarked
 			live := gcController.heapLive.Load()
 			base := dstHeapBase.Load()
@@ -1458,11 +1461,6 @@ func gcMarkTermination(stw worldStop) {
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)
 		stwSwept = gcSweep(work.mode)
-		if dstActive() {
-			// Record the per-cycle finalizer-discovery observable (after sweep has
-			// queued this cycle's finalizers). Test-only; see dstFinqSeq.
-			dstRecordFinqSeq()
-		}
 	})
 
 	mp.traceback = 0
