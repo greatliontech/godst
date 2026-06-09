@@ -863,8 +863,9 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    *Coverage boundary:* this covers `sync.Mutex.Lock` (and transitively `sync.RWMutex.Lock`'s writer lock,
    via `rw.w.Lock()`) and blocking `chansend`/`chanrecv`; `sync.RWMutex.RLock` (the reader sema path),
    `select`'s non-blocking channel ops, `Mutex.TryLock`, and `sync.Once` are NOT yet auto-hooked (an
-   unmodified SUT whose outcome turns on *those* acquisition orders is not yet explored). Shared-address
-   filtering for the auto-instrumentation explosion remains a follow-up (increment 6).
+   unmodified SUT whose outcome turns on *those* acquisition orders is not yet explored; tracked in
+   `docs/issues/dst-l2-sync-acquisition-coverage.md`). Shared-address filtering for the
+   auto-instrumentation explosion remains a follow-up (increment 6).
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
    records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
    (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
@@ -926,8 +927,9 @@ mutex/channel SUT's acquisition order is explored (`TestDSTExploreSyncAutoInstru
 in `Lock` before the CAS, not the `semacquire` slow path (which the uncontended fast-path winner never
 reaches — too late to make its acquisition a conflict). `RWMutex.RLock`, `select`'s non-blocking ops,
 `TryLock`, and `Once` are not yet auto-hooked (a SUT whose outcome turns on those acquisition orders is
-not yet covered). Finalizer-timing observation stays out of scope until *every* access is recorded; the
-`dporExplore` dependency loop documents the relation.
+not yet covered; tracked in `docs/issues/dst-l2-sync-acquisition-coverage.md`). Finalizer-timing
+observation stays out of scope until *every* access is recorded; the `dporExplore` dependency loop
+documents the relation.
 5. **Source-DPOR — sleep sets + weak-initial source sets** (D3) — **VALIDATED [V].** The former
    `dporExplore` was a *persistent-set* DPOR: sound + complete, but it re-explored Mazurkiewicz-*equivalent*
    interleavings via different prefixes (the per-frame `done` set precludes exact-duplicate prefixes, so
@@ -1661,7 +1663,7 @@ advances **span-granularly** — `gcController.update` accounts a whole span (`n
 grabbed (`mcache.go`), so `heapLive − heapMarked` jumps in span chunks and the allocation at which it
 crosses the GC trigger depends on the bubble's **entry span-fill phase**, which varies run to run (worse
 under `-race`/composition, which shift it). That moved *which cycle* discovered a given object. A
-trace-hash localization (instrumenting the raw per-cycle trigger inputs — see the issue doc) pinned it
+trace-hash localization (instrumenting the raw per-cycle trigger inputs) pinned it
 precisely: the **logical crossing point is deterministic, only the span-granular `heapLive` accounting is
 not**, and `heapMarked` is deterministic given a deterministic crossing (so no "logical live set" is
 needed — that was an over-estimate of the fix).
@@ -1696,7 +1698,7 @@ contract — the per-cycle test asserts within-build replay (the `-race` contrac
 This closes the **convergence point for "full determinism under `-race`"**: the Phase-1 map confirmed the
 byte-based GC trigger was the sole remaining within-build `-race`/composition nondeterminism in the
 contract layer (after the system-goroutine-isolation fix and the build-invariant hash key); driving it
-off per-object `dstHeapAlloc` removes it. See `docs/issues/dst-percycle-gc-discovery-determinism.md`.
+off per-object `dstHeapAlloc` removes it. The original investigation plan is retained below.
 
 **Faithful-collapse note (nit).** The DST trigger goal is `heapMarked + (heapMarked − base)·GOGC/100`,
 vs production's `heapMarked + (heapMarked + lastStackScan + globalsScan)·GOGC/100`. DST both subtracts
