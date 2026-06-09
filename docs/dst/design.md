@@ -660,7 +660,7 @@ mutex is sound and is exactly the interleaving Gap A needs.
   reorderings are pruned. Two transitions are *dependent* iff they record the same nonzero conflict
   identity — a shared memory address (`dstAccessYield`) **or** a synchronization object's identity
   (`dstSyncAcquire`) — with ≥1 write, by different goroutines, and are not happens-before-ordered.
-  (Synchronization-acquisition order is a dependency: omitting it drops a class — see "Completeness
+  (Synchronization object decision order is a dependency: omitting it drops a class — see "Completeness
   boundary".) *violation:* a non-equivalent interleaving — hence a reachable bug — is omitted, so
   "explored to exhaustion" is a false negative. *Encoding:* **`TestDSTExploreSweep`** — for a generated
   family of small closed programs (reads/writes over shared vars, with/without mutexes; plus channel
@@ -679,22 +679,23 @@ mutex is sound and is exactly the interleaving Gap A needs.
 
 A **transition boundary** under Level 2 is, at a safe point on a SUT (bubble) goroutine, either (a) an
 instrumented **memory access** (read/write/range) to a *shared* address (`dstAccessYield`), or (b) a
-**synchronization acquisition** — a mutex `Lock`, a channel send/recv rendezvous, etc. — recorded as a
-write-conflict on the sync object's identity (`dstSyncAcquire`) — *in addition to* the existing coarse
-boundaries (block/select/`Gosched`/create), which remain. At a boundary the active strategy may switch
-goroutines, so the scheduler can interleave at the grain of a single access.
+**synchronization object decision** — mutex/RWMutex acquire, try, release, channel send/recv/select/close —
+recorded as a write-conflict on the sync object's identity (`dstSyncAcquire`) — *in addition to* the
+existing coarse boundaries (block/select/`Gosched`/create), which remain. At a boundary the active strategy
+may switch goroutines, so the scheduler can interleave at the grain of a single access.
 
-The acquisition boundary (b) is **load-bearing for completeness, not just granularity**: *which*
-contending goroutine acquires a sync object first is a real scheduling choice that can change the
-outcome, but it is decided at a transition that performs *no memory access* (a goroutine reaching its
-`Lock` records nothing), so without (b) DPOR treats that decision as independent of everything and
-silently drops the alternative-acquisition-order Mazurkiewicz classes (a DST-L2-3 violation —
-`TestDSTExploreSweep` fails 23/289 with `dstSyncAcquire` neutered). Announced *before* the blocking op
-and modeled as a write-conflict (acquisitions do not commute), two acquisitions of the same object by
-different goroutines become a co-enabled, concurrent, conflicting pair whose **both** orderings the
-existing HB-DPOR explores — with no change to the dependency/race test. This is the standard DPOR
-treatment of locks; it is faithful (`executions ⊆ real`: the real scheduler can switch before any
-goroutine acquires) and sound (a pre-acquire yield never runs a blocked G).
+The sync-object decision boundary (b) is **load-bearing for completeness, not just granularity**: *which*
+contending goroutine acquires/releases/closes a sync object first is a real scheduling choice that can
+change the outcome, but it is decided at a transition that performs *no memory access* (a goroutine
+reaching its `Lock`, `TryLock`, `Unlock`, or `close` records nothing), so without (b) DPOR treats that
+decision as independent of everything and silently drops the alternative sync-decision-order Mazurkiewicz
+classes (a DST-L2-3 violation — `TestDSTExploreSweep` fails 23/289 with `dstSyncAcquire` neutered).
+Announced *before* the state decision/transition and modeled as a write-conflict (same-object sync
+decisions do not commute), two decisions on the same object by different goroutines become a co-enabled,
+concurrent, conflicting pair whose **both** orderings the existing HB-DPOR explores — with no change to the
+dependency/race test. This is the standard DPOR treatment of locks, extended to non-blocking decisions and
+their release/close counterparts; it is faithful (`executions ⊆ real`: the real scheduler can switch before
+any goroutine changes the sync state) and sound (a pre-decision yield never runs a blocked G).
 
 - **Where.** The `-race` hooks are the access-observation choke point. They are NOSPLIT ABIInternal
   assembly, deliberately wrapper-free to preserve caller-PC capture for reports (`race_*.s`), so they
@@ -846,25 +847,26 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    emits plain `race*` exactly as upstream (DST-L2-4 — verified absent in non-dst and dst-without-race
    builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
    (`TestDSTExploreAutoInstrument`: the lost update is found, DPOR outcome set == Exhaustive). Foreclosure:
-   feeds the same seam. **Runtime sync-primitive hooks for `dstSyncAcquire`: IMPLEMENTED [V]** — the
-   blocking channel ops (`chan.go` `chansend`/`chanrecv`, before `lock(&c.lock)`, identity = the `*hchan`)
-   and `sync.Mutex.Lock` (`internal/sync.Mutex.Lock`, before the fast-path CAS, identity = the mutex
-   pointer — the same value `race.Acquire` uses) auto-announce a `dstSyncAcquire` write-conflict, so an
-   UNMODIFIED mutex/channel program's acquisition order is explored with no hand annotation. The mutex
-   hook is in `Lock` (NOT the `semacquire` slow path): `semacquire` is reached only by the *contended
-   loser*, after the uncontended winner already took the fast-path CAS, so it is too late to record the
-   winner's acquisition as a conflict — only a pre-CAS announce on the path *every* acquirer takes makes
-   both orders a co-enabled conflicting pair. Gated by the SAME `dstBuild && raceenabled` / `//go:build
-   dst && race` condition as the memory auto-instrumentation (so non-dst, plain-`-race`, and
-   dst-without-race builds are byte-identical — DST-L2-4, objdump-verified: no `dstSyncAcquire` call in
-   `Lock`/`chansend`/`chanrecv` outside a `-tags dst -race` build), and confined to the scheduled strategy
-   by the runtime guard. Acceptance: `TestDSTExploreSyncAutoInstrument` — an unmodified mutex SUT and an
-   unmodified channel SUT each reach BOTH acquisition orders under DPOR (vs 1 with the hook neutered).
-   *Coverage boundary:* this covers `sync.Mutex.Lock` (and transitively `sync.RWMutex.Lock`'s writer lock,
-   via `rw.w.Lock()`) and blocking `chansend`/`chanrecv`; `sync.RWMutex.RLock` (the reader sema path),
-   `select`'s non-blocking channel ops, `Mutex.TryLock`, and `sync.Once` are NOT yet auto-hooked (an
-   unmodified SUT whose outcome turns on *those* acquisition orders is not yet explored; tracked in
-   `docs/issues/dst-l2-sync-acquisition-coverage.md`). Shared-address filtering for the
+   feeds the same seam. **Runtime sync-primitive hooks for `dstSyncAcquire`: IMPLEMENTED [V]** — channel
+   ops (`chan.go` `chansend`/`chanrecv` before `lock(&c.lock)`, `closechan` before the closed-state
+   transition, identity = the `*hchan`) and mutex/RWMutex state decisions (`internal/sync.Mutex`
+   `Lock`/`TryLock`/`Unlock`, identity = the mutex pointer; `sync.RWMutex` reader/writer admission and
+   release, identity = the embedded writer mutex) auto-announce a `dstSyncAcquire` write-conflict. An
+   UNMODIFIED mutex/channel program's sync-object decision order is therefore explored with no hand
+   annotation. The mutex hook is in `Lock` (NOT the `semacquire` slow path): `semacquire` is reached only by
+   the *contended loser*, after the uncontended winner already took the fast-path CAS, so it is too late to
+   record the winner's acquisition as a conflict — only a pre-CAS announce on the path *every* acquirer
+   takes makes both orders a co-enabled conflicting pair. `TryLock`/`TryRLock` announce before failed-state
+   rejection; `Unlock`/`RUnlock`/`closechan` announce before state transitions that can flip racing
+   non-blocking decisions. Gated by the SAME `dstBuild && raceenabled` / `//go:build dst && race` condition
+   as the memory auto-instrumentation (so non-dst, plain-`-race`, and dst-without-race builds are
+   byte-identical — DST-L2-4), and confined to the scheduled strategy by the runtime guard. Acceptance:
+   `TestDSTExploreSyncAutoInstrument` — unmodified mutex/channel/RWMutex/select/close/Once SUTs each reach
+   BOTH sync-decision outcomes under DPOR (vs 1 with the corresponding hook neutered). *Coverage:* this
+   covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (transitively via `rw.w.Lock()`),
+   `sync.RWMutex.RLock`/`TryRLock`/`RUnlock`/`Unlock`, blocking and non-blocking `chansend`/`chanrecv`,
+   `closechan`, blocking and non-blocking `selectgo` channel send/recv paths, and `sync.Once`'s first
+   execution path (transitively through its internal `Mutex`). Shared-address filtering for the
    auto-instrumentation explosion remains a follow-up (increment 6).
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
    records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
@@ -897,39 +899,47 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
 across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
 (`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for
-memory accesses, `dstSyncAcquire` for synchronization acquisitions — D1), and the Exhaustive + DPOR
+memory accesses, `dstSyncAcquire` for synchronization object decisions — D1), and the Exhaustive + DPOR
 engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). Still
 inflated by `gcDrain`/`WaitGroup`/coarse-point decisions in the trace (increment 6 filtering + increment 2
-HB pruning address this); soundness + completeness for SUTs whose accesses and acquisitions are recorded
+HB pruning address this); soundness + completeness for SUTs whose accesses and sync-object decisions are recorded
 is independent of that inflation, and enforced over a generated family by `TestDSTExploreSweep`.
 
 **Completeness boundary (addr=0 transitions).** DPOR's dependency relation pairs transitions that record
-a nonzero conflict identity: a shared **memory access** (`dstAccessYield`) **or** a **synchronization
-acquisition** (`dstSyncAcquire`, recording the sync object's identity as a write-conflict — D1).
+a nonzero conflict identity: a shared **memory access** (`dstAccessYield`) **or** a **synchronization object
+decision** (`dstSyncAcquire`, recording the sync object's identity as a write-conflict — D1).
 Transitions that record none — pure infrastructure decisions (goroutine creation, `WaitGroup` wakeups,
 the isolated `gcDrain` finalizer goroutine) — remain independent of everything, which is correct because
-they carry no outcome-determining order choice a recorded access/acquisition does not already capture
+they carry no outcome-determining order choice a recorded access/sync-object decision does not already capture
 (the created goroutine's own accesses, the post-`Wait` accesses, … are the recorded transitions). So the
 relation is sound and complete *for SUTs whose shared memory accesses **and** synchronization
-acquisitions are recorded as transitions, and that do not observe finalizer/cleanup timing* — enforced
-over a generated family (mutex- and channel-acquisition-order cases included) by the
+object decisions are recorded as transitions, and that do not observe finalizer/cleanup timing* — enforced
+over a generated family (mutex- and channel-decision-order cases included) by the
 `TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 289 SUTs).
 
 An **earlier draft of this note was wrong**: it claimed completeness for "SUTs whose shared *accesses* are
-all annotated," overlooking that **synchronization-acquisition order is itself a dependency**. A
+all annotated," overlooking that **synchronization object decision order is itself a dependency**. A
 mutex-bracketed program with every access annotated still lost a class (`prog#257`: exhaustive 2
 outcomes, DPOR 1) because the lock-order-determining decision is an `addr=0` transition. `dstSyncAcquire`
 (D1) closes it with no change to the dependency/race test; the sweep enforces it (23/289 → 0). For the
-manual-hook validation phase the SUT annotates acquisitions; the dst-race compiler/runtime phase records
-them automatically — **now implemented** (increment 1): blocking `chansend`/`chanrecv` and
-`internal/sync.Mutex.Lock` auto-announce `dstSyncAcquire` under `-tags dst -race`, so an unmodified
-mutex/channel SUT's acquisition order is explored (`TestDSTExploreSyncAutoInstrument`). The mutex hook is
-in `Lock` before the CAS, not the `semacquire` slow path (which the uncontended fast-path winner never
-reaches — too late to make its acquisition a conflict). `RWMutex.RLock`, `select`'s non-blocking ops,
-`TryLock`, and `Once` are not yet auto-hooked (a SUT whose outcome turns on those acquisition orders is
-not yet covered; tracked in `docs/issues/dst-l2-sync-acquisition-coverage.md`). Finalizer-timing
-observation stays out of scope until *every* access is recorded; the `dporExplore` dependency loop
-documents the relation.
+manual-hook validation phase the SUT annotates sync-object decisions; the dst-race compiler/runtime phase
+records them automatically — **now implemented** (increment 1): channel ops, close, and mutex/RWMutex
+state decisions auto-announce `dstSyncAcquire` under `-tags dst -race`, so an unmodified mutex/channel SUT's
+decision order is explored (`TestDSTExploreSyncAutoInstrument`). The mutex hook is
+in `Lock` before the CAS, in `TryLock` before even the locked-state rejection, and in `Unlock` before the
+release that can flip a racing `TryLock`, not the `semacquire` slow path (which the uncontended fast-path
+winner never reaches — too late to record its acquisition as a conflict). `RWMutex.RLock`/`TryRLock` announce
+on the same writer-mutex identity as `RWMutex.Lock`, including failed `TryRLock` admission attempts;
+`RWMutex.Unlock`/`RUnlock` announce the same identity before release transitions that can flip racing try
+attempts. Blocking and non-blocking select channel cases announce each candidate channel before taking
+channel locks, `closechan` announces before the closed-state transition that can flip a non-blocking receive,
+and `Once` is covered by its internal mutex.
+`TestDSTExploreSyncAutoInstrument` now covers mutex, channel, RWMutex reader-vs-writer, TryLock,
+failed TryLock/TryRLock decisions, release-vs-try decisions, blocking and non-blocking select send/recv,
+close-vs-receive decisions, and Once winner order under `-tags dst -race`.
+Finalizer-timing observation
+stays out of scope until *every* access is recorded; the `dporExplore` dependency loop documents the
+relation.
 5. **Source-DPOR — sleep sets + weak-initial source sets** (D3) — **VALIDATED [V].** The former
    `dporExplore` was a *persistent-set* DPOR: sound + complete, but it re-explored Mazurkiewicz-*equivalent*
    interleavings via different prefixes (the per-frame `done` set precludes exact-duplicate prefixes, so
@@ -945,10 +955,10 @@ documents the relation.
       DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the committed
       micro-SUTs. This is the real DST-L2-3 guard. **VALIDATED [V] — and it immediately earned its keep:**
       it exposed a *pre-existing* DST-L2-3 completeness defect (the persistent-set DPOR dropped every
-      **synchronization-acquisition-order** class — 23/289 SUTs, all-and-only mutex/channel cases),
-      because the lock/rendezvous-order decision is an `addr=0` transition the dependency relation
+      **synchronization-object-decision-order** class in the sweep — 23/289 SUTs, all-and-only
+      mutex/channel cases), because the lock/rendezvous-order decision is an `addr=0` transition the dependency relation
       ignored. **Fixed before sleep sets** (a reduction layered on an incomplete search would drop even
-      more): `dstSyncAcquire` (D1) records acquisitions as conflicting transitions — zero brain change —
+      more): `dstSyncAcquire` (D1) records sync-object decisions as conflicting transitions — zero brain change —
       and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/289 → 0). Optimality (sleep
       sets) is therefore built on a foundation the sweep proves complete.
    2. **Source-DPOR (sleep sets + weak-initial backtracks) — VALIDATED [V].** Each `dporFrame` gains a

@@ -1174,24 +1174,27 @@ func TestDSTExploreAutoInstrument(t *testing.T) {
 	}
 }
 
-// TestDSTExploreSyncAutoInstrument is the acceptance for runtime sync-acquisition
+// TestDSTExploreSyncAutoInstrument is the acceptance for runtime sync-decision
 // auto-hooks (deferral 1): an UNMODIFIED SUT whose outcome depends on lock /
-// rendezvous acquisition order, built -tags dst -race, must have DPOR reach BOTH
-// acquisition orders with NO manual dstSyncAcquire. The compiler auto-instruments
-// shared memory accesses, but the acquisition-order decision is an addr=0 transition
-// and the in-section accesses are object-serialized (HB-ordered, not a reorderable
-// race), so DPOR keeps only one order UNLESS the runtime auto-hooks the acquisition
-// itself (internal/sync.Mutex.Lock and chan.go chansend/chanrecv → dstSyncAcquire).
+// rendezvous/release/close decision order, built -tags dst -race, must have DPOR
+// reach BOTH decision outcomes with NO manual dstSyncAcquire. The compiler
+// auto-instruments shared memory accesses, but the sync-object decision is an addr=0
+// transition and the in-section accesses are object-serialized (HB-ordered, not a
+// reorderable race), so DPOR keeps only one order UNLESS the runtime auto-hooks the
+// decision itself (mutex Lock/TryLock/Unlock, failed TryLock/TryRLock decisions, RWMutex
+// reader/writer admission and release, channel ops/close, blocking and non-blocking
+// select channel cases, and Once's mutex-backed first execution path →
+// dstSyncAcquire).
 //
 // The oracle is DPOR-only against a construction-known ground truth, not a
 // DPOR-vs-Exhaustive comparison: under -race the compiler instruments every memory
 // access, so Exhaustive enumerates the access-granularity explosion (a trivial RMW
 // already hits ~19k schedules) and is intractable here until shared-address filtering
 // lands — so that cross-check belongs with the filtering increment. Each SUT is two
-// symmetric goroutines contending for one object, which has EXACTLY two acquisition
-// orders, so the test asserts, for both the mutex and channel SUTs:
+// symmetric goroutines contending over one object decision, which has EXACTLY two
+// outcomes, so the test asserts for each sync-decision SUT:
 //   - Exhausted == true: DPOR cleanly finished (not budget-truncated).
-//   - Outcomes == 2: both acquisition orders were reached (DST-L2-3 for this shape).
+//   - Outcomes == 2: both decision outcomes were reached (DST-L2-3 for this shape).
 //     With the runtime sync hook neutered DPOR finds 1 — the teeth.
 //
 // Built explicitly WITH -race (the sync auto-hooks are gated on -tags dst + -race,
@@ -1199,7 +1202,7 @@ func TestDSTExploreAutoInstrument(t *testing.T) {
 // where the race detector is unavailable.
 func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 	if testing.Short() {
-		t.Skip("-short: skips the dst-race sync-acquisition auto-instrumentation build")
+		t.Skip("-short: skips the dst-race sync-decision auto-instrumentation build")
 	}
 	testenv.MustHaveGoBuild(t)
 	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
@@ -1209,7 +1212,7 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "tp_race")
 	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
 	out := runBuiltTestProg(t, exe, "DSTExploreSyncAuto", "DSTSEED=1")
-	for _, sut := range []string{"mutex", "chan"} {
+	for _, sut := range []string{"mutex", "chan", "rwmutex", "tryrlockfail", "tryrlockrelease", "trywlockrelease", "trylock", "trylockfail", "trylockrelease", "selectsend", "selectblocksend", "selectnbsend", "selectrecv", "selectblockrecv", "selectnbrecv", "chanclose", "once"} {
 		if exploreField(t, out, sut+"Exhausted") != "true" {
 			t.Fatalf("unmodified %s SUT did not cleanly exhaust under DPOR (budget "+
 				"truncation, not a clean acceptance):\n%s", sut, out)
@@ -1217,9 +1220,9 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 		if n, err := strconv.Atoi(exploreField(t, out, sut+"Outcomes")); err != nil {
 			t.Fatalf("bad %sOutcomes field in %q: %v", sut, out, err)
 		} else if n != 2 {
-			t.Fatalf("runtime %s-acquisition auto-hook missing or ineffective: DPOR reached "+
-				"%d acquisition orders on the unmodified %s SUT, want 2 (both orders). Without "+
-				"the auto-hook the acquisition order is an addr=0 transition DPOR cannot reverse, "+
+			t.Fatalf("runtime %s sync-decision auto-hook missing or ineffective: DPOR reached "+
+				"%d decision outcomes on the unmodified %s SUT, want 2 (both outcomes). Without "+
+				"the auto-hook the sync-object decision is an addr=0 transition DPOR cannot reverse, "+
 				"so it finds 1 — DST-L2-3:\n%s", sut, n, sut, out)
 		}
 	}

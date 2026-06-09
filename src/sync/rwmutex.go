@@ -69,6 +69,9 @@ func (rw *RWMutex) RLock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
 	}
+	if dstHookEnabled {
+		dstSyncAcquireRWMutex(rw)
+	}
 	if rw.readerCount.Add(1) < 0 {
 		// A writer is pending, wait for it.
 		runtime_SemacquireRWMutexR(&rw.readerSem, false, 0)
@@ -88,6 +91,9 @@ func (rw *RWMutex) TryRLock() bool {
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
+	}
+	if dstHookEnabled {
+		dstSyncAcquireRWMutex(rw)
 	}
 	for {
 		c := rw.readerCount.Load()
@@ -116,6 +122,9 @@ func (rw *RWMutex) RUnlock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		race.Disable()
+	}
+	if dstHookEnabled {
+		dstSyncAcquireRWMutex(rw)
 	}
 	if r := rw.readerCount.Add(-1); r < 0 {
 		// Outlined slow-path to allow the fast-path to be inlined
@@ -203,6 +212,9 @@ func (rw *RWMutex) Unlock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Release(unsafe.Pointer(&rw.readerSem))
 		race.Disable()
+	}
+	if dstHookEnabled {
+		dstSyncAcquireRWMutex(rw)
 	}
 
 	// Announce to readers there is no active writer.

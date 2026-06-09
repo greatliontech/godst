@@ -13,6 +13,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -420,21 +421,23 @@ func multiOutcomeSUT() bool {
 	return false
 }
 
-// --- Runtime sync-acquisition auto-hook acceptance (deferral 1) ----------------
+// --- Runtime sync-decision auto-hook acceptance (deferral 1) -------------------
 //
 // The memory-access compiler auto-instrumentation (increment 1) makes an
-// unmodified SUT's shared READS/WRITES explorable, but NOT its lock/rendezvous
-// ACQUISITION order: that decision is an addr=0 transition (a goroutine reaching
-// its Lock records no memory access), and the in-section accesses are
+// unmodified SUT's shared READS/WRITES explorable, but NOT its lock/rendezvous/
+// release/close decision order: that decision is an addr=0 transition (a goroutine
+// reaching its Lock records no memory access), and the in-section accesses are
 // mutex-SERIALIZED (happens-before-ordered, not a reorderable race), so DPOR keeps
-// only one acquisition order while Exhaustive — which branches on which goroutine
-// runs first — finds both. That is the prog#257 completeness gap (DST-L2-3). Wiring
-// the runtime sync primitives to dstSyncAcquire (internal/sync.Mutex.Lock and
-// chan.go chansend/chanrecv, gated to a -tags dst -race build) records each
-// acquisition as a write-conflict on the object's identity, so two acquisitions of
-// the same object by different goroutines are a co-enabled, concurrent, conflicting
-// pair DPOR explores BOTH ways — with NO manual annotation. The two SUTs below pin
-// that for the two primitives the acceptance covers (mutex, channel).
+// only one decision outcome while Exhaustive — which branches on which goroutine runs
+// first — finds both. That is the prog#257 completeness gap (DST-L2-3). Wiring
+// the runtime sync primitives to dstSyncAcquire (internal/sync.Mutex Lock/TryLock/
+// Unlock, sync.RWMutex reader/writer admission and release, chan.go chansend/
+// chanrecv/closechan, and selectgo's blocking and non-blocking channel cases, gated
+// to a -tags dst -race build) records each sync-object decision
+// as a write-conflict on the object's identity. Matching decisions on the same object
+// by different goroutines are then co-enabled, concurrent, conflicting pairs DPOR
+// explores BOTH ways — with NO manual annotation. The SUTs below pin the primitives
+// the acceptance covers.
 
 // syncAutoSeen accumulates the distinct observable outcomes of the unmodified
 // sync-order SUT currently under Explore (reset before each Explore call; written
@@ -502,10 +505,420 @@ func autoChanOrderSUT() bool {
 	return false
 }
 
-// DSTExploreSyncAuto is the acceptance for runtime sync-acquisition auto-hooks
-// (deferral 1): an UNMODIFIED SUT whose outcome depends on lock / rendezvous
-// acquisition order, built -tags dst -race, must have DPOR reach BOTH acquisition
-// orders with NO manual dstSyncAcquire. It runs the mutex- and channel-order SUTs
+// autoRWMutexRLockOrderSUT distinguishes whether a reader admits before or after a
+// writer. The writer's Lock is already covered by the embedded writer mutex hook; the
+// reader side must announce the same identity before readerCount admission.
+func autoRWMutexRLockOrderSUT() bool {
+	var rw sync.RWMutex
+	x := 0
+	read := -1
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rw.Lock()
+		x = 1
+		rw.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		rw.RLock()
+		read = x
+		rw.RUnlock()
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(read)] = true
+	return false
+}
+
+// autoTryRLockFailedDecisionSUT distinguishes a TryRLock attempt that races before a
+// writer Lock from one that reaches the already-write-locked rejection path. That
+// failed decision must still announce the RWMutex identity so DPOR can reverse it.
+func autoTryRLockFailedDecisionSUT() bool {
+	var rw sync.RWMutex
+	attempted := make(chan struct{}, 1)
+	success := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rw.Lock()
+		<-attempted
+		rw.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		if rw.TryRLock() {
+			success = true
+			rw.RUnlock()
+		}
+		attempted <- struct{}{}
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.FormatBool(success)] = true
+	return false
+}
+
+// autoTryRLockReleaseDecisionSUT distinguishes a TryRLock attempt before a writer
+// releases from one after it releases. The writer Unlock must record the same RWMutex
+// identity as the read attempt.
+func autoTryRLockReleaseDecisionSUT() bool {
+	var rw sync.RWMutex
+	rw.Lock()
+	success := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rw.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		if rw.TryRLock() {
+			success = true
+			rw.RUnlock()
+		}
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.FormatBool(success)] = true
+	return false
+}
+
+// autoRWMutexTryLockReleaseDecisionSUT distinguishes a writer TryLock attempt before
+// the last reader releases from one after it releases. RUnlock must therefore record
+// the writer-mutex identity too.
+func autoRWMutexTryLockReleaseDecisionSUT() bool {
+	var rw sync.RWMutex
+	rw.RLock()
+	success := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rw.RUnlock()
+	}()
+	go func() {
+		defer wg.Done()
+		if rw.TryLock() {
+			success = true
+			rw.Unlock()
+		}
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.FormatBool(success)] = true
+	return false
+}
+
+// autoTryLockOrderSUT distinguishes which goroutine wins a non-blocking TryLock on
+// an initially-unlocked mutex. The winner writes only its own flag (no shared write
+// conflict for DPOR to reverse) and yields while holding the lock so the other
+// goroutine can observe failure. A successful TryLock is an acquisition just like
+// Lock; the hook must fire before the CAS that chooses the winner.
+func autoTryLockOrderSUT() bool {
+	var mu sync.Mutex
+	got := [2]bool{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			if mu.TryLock() {
+				got[id] = true
+				runtime.Gosched()
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	if got[0] {
+		winner = 1
+	} else if got[1] {
+		winner = 2
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoTryLockFailedDecisionSUT distinguishes a TryLock attempt that races before a
+// Lock from one that reaches the already-locked rejection path. A hook only on the
+// successful CAS misses the failed-attempt outcome class.
+func autoTryLockFailedDecisionSUT() bool {
+	var mu sync.Mutex
+	attempted := make(chan struct{}, 1)
+	success := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mu.Lock()
+		<-attempted
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		if mu.TryLock() {
+			success = true
+			mu.Unlock()
+		}
+		attempted <- struct{}{}
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.FormatBool(success)] = true
+	return false
+}
+
+// autoTryLockReleaseDecisionSUT distinguishes a TryLock attempt before a mutex
+// releases from one after it releases. Unlock must share the TryLock identity.
+func autoTryLockReleaseDecisionSUT() bool {
+	var mu sync.Mutex
+	mu.Lock()
+	success := false
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		if mu.TryLock() {
+			success = true
+			mu.Unlock()
+		}
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.FormatBool(success)] = true
+	return false
+}
+
+// autoSelectSendOrderSUT uses a two-case non-blocking select so the compiler routes
+// through selectgo, not the one-case selectnbsend helper. Both cases use the shared
+// channel, so the SUT can only pass if selectgo announces that selected identity.
+func autoSelectSendOrderSUT() bool {
+	ch := make(chan int, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			select {
+			case ch <- id:
+			case ch <- id:
+			default:
+			}
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	select {
+	case winner = <-ch:
+	default:
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoSelectBlockSendOrderSUT is the blocking selectgo send twin.
+func autoSelectBlockSendOrderSUT() bool {
+	ch := make(chan int)
+	first, second := 0, 0
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		first = <-ch
+		second = <-ch
+	}()
+	for i := 1; i <= 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			select {
+			case ch <- id:
+			case ch <- id:
+			}
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(first)+","+strconv.Itoa(second)] = true
+	return false
+}
+
+// autoSelectNBSendOrderSUT exercises the compiler's one-case select+default rewrite
+// through selectnbsend/chansend(block=false). It is the helper-path twin of the
+// selectgo SUT above.
+func autoSelectNBSendOrderSUT() bool {
+	ch := make(chan int, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			select {
+			case ch <- id:
+			default:
+			}
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	select {
+	case winner = <-ch:
+	default:
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoSelectRecvOrderSUT is the receive twin: one buffered value, two goroutines
+// using a two-case non-blocking select on the same shared channel, and the receiving
+// goroutine's id records the decision outcome.
+func autoSelectRecvOrderSUT() bool {
+	ch := make(chan int, 1)
+	ch <- 1
+	got := [2]int{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			select {
+			case got[idx] = <-ch:
+			case got[idx] = <-ch:
+			default:
+			}
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	if got[0] != 0 {
+		winner = 1
+	} else if got[1] != 0 {
+		winner = 2
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoSelectBlockRecvOrderSUT is the blocking selectgo receive twin. The first value
+// sent on ch identifies which receiver was queued first by its blocking select.
+func autoSelectBlockRecvOrderSUT() bool {
+	ch := make(chan int)
+	got := [2]int{}
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for i := 0; i < 2; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			select {
+			case got[idx] = <-ch:
+			case got[idx] = <-ch:
+			}
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		ch <- 1
+		ch <- 2
+	}()
+	wg.Wait()
+	winner := 0
+	if got[0] == 1 {
+		winner = 1
+	} else if got[1] == 1 {
+		winner = 2
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoSelectNBRecvOrderSUT exercises the compiler's one-case select+default rewrite
+// through selectnbrecv/chanrecv(block=false).
+func autoSelectNBRecvOrderSUT() bool {
+	ch := make(chan int, 1)
+	ch <- 1
+	got := [2]int{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			select {
+			case got[idx] = <-ch:
+			default:
+			}
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	if got[0] != 0 {
+		winner = 1
+	} else if got[1] != 0 {
+		winner = 2
+	}
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoChanCloseRecvDecisionSUT distinguishes a non-blocking receive before close
+// from one after close. closechan must announce the same channel identity as recv.
+func autoChanCloseRecvDecisionSUT() bool {
+	ch := make(chan int)
+	outcome := "default"
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		close(ch)
+	}()
+	go func() {
+		defer wg.Done()
+		select {
+		case _, ok := <-ch:
+			if ok {
+				outcome = "value"
+			} else {
+				outcome = "closed"
+			}
+		default:
+		}
+	}()
+	wg.Wait()
+	syncAutoSeen[outcome] = true
+	return false
+}
+
+// autoOnceOrderSUT pins sync.Once's successful first execution path. Once is covered
+// transitively by its internal Mutex.Lock hook; this SUT prevents that coverage from
+// being accidentally lost.
+func autoOnceOrderSUT() bool {
+	var once sync.Once
+	winner := 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			once.Do(func() { winner = id })
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// DSTExploreSyncAuto is the acceptance for runtime sync-decision auto-hooks
+// (deferral 1): an UNMODIFIED SUT whose outcome depends on lock / rendezvous /
+// release / close decision order, built -tags dst -race, must have DPOR reach BOTH
+// decision outcomes with NO manual dstSyncAcquire. It runs the sync-decision SUTs
 // under DPOR and prints, per SUT: "<name>Dpor=<n> <name>Outcomes=<k>
 // <name>Exhausted=<bool>".
 //
@@ -515,14 +928,14 @@ func autoChanOrderSUT() bool {
 // schedules) and is intractable for a mutex/channel SUT until shared-address
 // filtering lands. So the DPOR-vs-Exhaustive auto-completeness cross-check belongs
 // with that filtering increment. Here the ground truth is known by construction —
-// two symmetric goroutines contending for one object have EXACTLY two acquisition
-// orders — so Outcomes==2 (both orders reached) is the completeness signal and
+// two symmetric goroutines contending over one sync-object decision have EXACTLY two
+// outcomes — so Outcomes==2 (both outcomes reached) is the completeness signal and
 // Exhausted==true confirms a clean finish. Without the runtime auto-hook the
-// acquisition order is an addr=0 transition DPOR cannot reverse (the in-section
-// accesses are object-serialized / HB-ordered, not a reorderable race), so DPOR finds
-// only 1 order — the teeth. (DPOR's completeness on sync-acquisition transitions,
-// auto or manual, is the same relation TestDSTExploreSweep proves against Exhaustive
-// on the hand-annotated family.) Meaningful only in a -tags dst -race build.
+// decision order is an addr=0 transition DPOR cannot reverse (the in-section accesses
+// are object-serialized / HB-ordered, not a reorderable race), so DPOR finds only 1
+// outcome — the teeth. (DPOR's completeness on sync-decision transitions, auto or
+// manual, is the same relation TestDSTExploreSweep proves against Exhaustive on the
+// hand-annotated family.) Meaningful only in a -tags dst -race build.
 func DSTExploreSyncAuto() {
 	seed := dstSeedEnv()
 	check := func(name string, sut func() bool) {
@@ -535,6 +948,21 @@ func DSTExploreSyncAuto() {
 	os.Stdout.WriteString("syncauto\n")
 	check("mutex", autoMutexOrderSUT)
 	check("chan", autoChanOrderSUT)
+	check("rwmutex", autoRWMutexRLockOrderSUT)
+	check("tryrlockfail", autoTryRLockFailedDecisionSUT)
+	check("tryrlockrelease", autoTryRLockReleaseDecisionSUT)
+	check("trywlockrelease", autoRWMutexTryLockReleaseDecisionSUT)
+	check("trylock", autoTryLockOrderSUT)
+	check("trylockfail", autoTryLockFailedDecisionSUT)
+	check("trylockrelease", autoTryLockReleaseDecisionSUT)
+	check("selectsend", autoSelectSendOrderSUT)
+	check("selectblocksend", autoSelectBlockSendOrderSUT)
+	check("selectnbsend", autoSelectNBSendOrderSUT)
+	check("selectrecv", autoSelectRecvOrderSUT)
+	check("selectblockrecv", autoSelectBlockRecvOrderSUT)
+	check("selectnbrecv", autoSelectNBRecvOrderSUT)
+	check("chanclose", autoChanCloseRecvDecisionSUT)
+	check("once", autoOnceOrderSUT)
 }
 
 // --- Generated-family equivalence validator (DST-L2-3 completeness guard) ------

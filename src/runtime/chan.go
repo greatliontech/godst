@@ -193,6 +193,12 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if c.bubble != nil && getg().bubble != c.bubble {
 		fatal("send on synctest channel from outside bubble")
 	}
+	if dstBuild && raceenabled && !block {
+		// A non-blocking send that fails in this run may be the successful acquirer in
+		// a reversed run. Announce before the fast-fail check so DPOR can reverse that
+		// order; spurious failed-attempt conflicts only over-explore.
+		dstSyncAcquire(unsafe.Pointer(c))
+	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
 	//
@@ -225,10 +231,9 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// by hand). The dstBuild && raceenabled compile-time constants gate it to a
 	// -tags dst -race build — the same gate as the memory-access auto-instrumentation
 	// and dead-code-eliminated otherwise, so non-dst, plain -race, and dst-without-race
-	// binaries are byte-identical (DST-L2-4). The announce is before c.lock is taken, so
-	// dstSyncAcquire's safe-point guard (m.locks==0, bubble g, scheduled strategy) admits
-	// the yield, which requeues this g and never runs a blocked G (DST-L2-1); only
-	// blocking ops reach here (block), not select's non-blocking probes.
+	// binaries are byte-identical (DST-L2-4). The announce is before c.lock is taken,
+	// so dstSyncAcquire's safe-point guard can yield without running a blocked G
+	// (DST-L2-1).
 	if dstBuild && raceenabled && block {
 		dstSyncAcquire(unsafe.Pointer(c))
 	}
@@ -432,6 +437,11 @@ func closechan(c *hchan) {
 	if c.bubble != nil && getg().bubble != c.bubble {
 		fatal("close of synctest channel from outside bubble")
 	}
+	if dstBuild && raceenabled {
+		// Closing a channel can flip a racing non-blocking receive from default to the
+		// closed receive case. Record the channel identity before the state transition.
+		dstSyncAcquire(unsafe.Pointer(c))
+	}
 
 	lock(&c.lock)
 	if c.closed != 0 {
@@ -557,6 +567,12 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	if c.timer != nil {
 		c.timer.maybeRunChan(c)
+	}
+	if dstBuild && raceenabled && !block {
+		// A non-blocking receive that fails in this run may be the successful acquirer
+		// in a reversed run. Announce before the fast-fail check so DPOR can reverse
+		// that order; spurious failed-attempt conflicts only over-explore.
+		dstSyncAcquire(unsafe.Pointer(c))
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.

@@ -81,6 +81,13 @@ func (m *Mutex) Lock() {
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) TryLock() bool {
+	// DST Level-2: TryLock's success/failure is also an acquisition-order decision.
+	// Announce before even the locked-state rejection so a failed attempt in this run
+	// can be reversed into the successful acquirer in another run. Failed-attempt
+	// conflicts only over-explore and remain sound.
+	if dstHookEnabled {
+		dstSyncAcquire(m)
+	}
 	old := m.state
 	if old&(mutexLocked|mutexStarving) != 0 {
 		return false
@@ -195,6 +202,11 @@ func (m *Mutex) Unlock() {
 	if race.Enabled {
 		_ = m.state
 		race.Release(unsafe.Pointer(m))
+	}
+	if dstHookEnabled {
+		// Unlock can flip a racing TryLock from failure to success; record the same
+		// object identity before releasing the state bit so DPOR can reverse that order.
+		dstSyncAcquire(m)
 	}
 
 	// Fast path: drop lock bit.

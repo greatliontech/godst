@@ -257,6 +257,22 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		}
 	}
 
+	// DST Level-2: select cases acquire channels inside selectgo rather than through
+	// chansend/chanrecv's hook path. Announce each unique channel before taking any
+	// channel locks so the safe-point guard can yield. This is a conservative
+	// dependency for multi-channel selects: it may wake extra backtracks, but it cannot
+	// keep an outcome-determining channel decision order invisible.
+	if dstBuild && raceenabled {
+		var lastc *hchan
+		for _, o := range lockorder {
+			c := scases[o].c
+			if c != lastc {
+				dstSyncAcquire(unsafe.Pointer(c))
+				lastc = c
+			}
+		}
+	}
+
 	// lock all the channels involved in the select
 	sellock(scases, lockorder)
 
