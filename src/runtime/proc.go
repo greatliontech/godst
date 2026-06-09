@@ -5405,6 +5405,12 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// trackingSeq cheaprand below so the child's seed depends only on
 		// logical ancestry, not on runtime-internal per-m draws.
 		newg.dstrand = dstrandUint64(callergp)
+		// Clear any stale per-bubble scheduled-strategy index and pending access from
+		// a prior bubble (g structs are pooled); the index is (re)assigned lazily at
+		// first candidacy and the access is set per dstAccessYield. See dst_explore.go.
+		newg.dstSeq = 0
+		newg.dstAccAddr = 0
+		newg.dstAccWrite = false
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
 			// PCT: give the new goroutine a random base priority from the scheduling
 			// RNG (a scheduling property, not part of the per-g logical stream). The
@@ -7766,8 +7772,11 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 // under the active scheduling strategy. Random draws uniformly; PCT runs the
 // highest-priority candidate and fires any due priority-change point.
 func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
-	if dstSchedKind == dstSchedPCT {
+	switch dstSchedKind {
+	case dstSchedPCT:
 		return dstPCTSelect(c, total)
+	case dstSchedScheduled:
+		return dstScheduledSelect(c, total)
 	}
 	return dstSchedRandn(total)
 }

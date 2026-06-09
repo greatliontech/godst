@@ -509,6 +509,9 @@ type g struct {
 	goid         uint64
 	dstrand      uint64 // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
 	dstPrio      int64  // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
+	dstSeq       uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
+	dstAccAddr   uintptr // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR; unused otherwise
+	dstAccWrite  bool    // DST pending access is a write (vs read); paired with dstAccAddr
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting

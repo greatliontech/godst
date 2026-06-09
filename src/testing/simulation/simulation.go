@@ -79,6 +79,33 @@ func dstBuilt() bool
 //go:linkname dstSetSchedStrategy runtime.dstSetSchedStrategy
 func dstSetSchedStrategy(kind uint8, depth, steps int32)
 
+// Level-2 exploration substrate (scheduled strategy + trace recorder; see
+// explore.go and runtime/dst_explore.go).
+//
+//go:linkname dstExploreInit runtime.dstExploreInit
+func dstExploreInit(maxDecisions, maxEnabledTotal int)
+
+//go:linkname dstSetSchedule runtime.dstSetSchedule
+func dstSetSchedule(prefix []uint64)
+
+//go:linkname dstTraceLenFP runtime.dstTraceLenFP
+func dstTraceLenFP() int
+
+//go:linkname dstTraceChosenFP runtime.dstTraceChosenFP
+func dstTraceChosenFP(i int) uint64
+
+//go:linkname dstTraceAccessFP runtime.dstTraceAccessFP
+func dstTraceAccessFP(i int) (addr uintptr, write bool)
+
+//go:linkname dstTraceEnabledFP runtime.dstTraceEnabledFP
+func dstTraceEnabledFP(i int) []uint64
+
+//go:linkname dstTraceOverflowFP runtime.dstTraceOverflowFP
+func dstTraceOverflowFP() bool
+
+//go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
+func dstScheduleAbortedFP() bool
+
 //go:linkname dstSetSimEnv runtime.dstSetSimEnv
 func dstSetSimEnv(hostname string, pid, numcpu int)
 
@@ -107,10 +134,12 @@ const (
 	PCT
 )
 
-// runtime strategy kinds (must match runtime/dst.go: dstSchedRandom, dstSchedPCT).
+// runtime strategy kinds (must match runtime/dst.go: dstSchedRandom, dstSchedPCT,
+// dstSchedScheduled).
 const (
 	kindRandom uint8 = iota
 	kindPCT
+	kindScheduled // follow an explicit schedule prefix; used by Explore (see explore.go)
 )
 
 // Options configures RunWith. The zero Options is equivalent to Run (Random).
@@ -248,16 +277,23 @@ func RunWith(seed uint64, opts Options, f func()) {
 		// per-host value into the run. Both 0 and negative mean "use the default".
 		numcpu = defaultNumCPU
 	}
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, f)
 }
 
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, f func()) {
+// run sets the determinism preconditions, activates DST, and runs f in a synctest
+// bubble, restoring everything on return (including on panic). When kind is
+// kindScheduled, prefix is the explicit decision sequence the scheduled strategy
+// follows (see explore.go); for the other strategies prefix is nil.
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
 	if !dstBuilt() {
 		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	}
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
+	if kind == kindScheduled {
+		dstSetSchedule(prefix)
+	}
 	dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
 	dstSetMemLimit(memLimit)
 	dstActivate(seed)

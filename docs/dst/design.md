@@ -260,9 +260,11 @@ it (channel FIFO, mutex handoff, happens-before) has already applied its orderin
 interleavings: it cannot reproduce a data race requiring two goroutines to physically execute the
 same instant, nor preemption at an arbitrary instruction. It finds **logical** concurrency bugs
 (ordering, atomicity-of-logic, deadlock, lost wakeup, stale read, split-brain) — **not** physical
-memory races. Those remain the job of `-race`. The simulation and `-race` are complementary.
-Completeness can be *increased* additively by injecting cooperative preemption points at function
-entries (PCT-style), still deterministically — see Seq 5.
+memory races (torn/reordered/stale reads under a weak memory model). Those remain the job of `-race`.
+The simulation and `-race` are complementary. Completeness in the *interleaving* dimension (Gap A) is
+*increased* additively by injecting cooperative preemption points — at function entries (PCT-style, Seq
+5) and, fully, at memory-access granularity pruned by DPOR (see **Level 2**), still deterministically.
+The physical-memory-model dimension (Gap B) is a different mechanism and stays with `-race`.
 
 ### Non-foreclosure invariant
 
@@ -409,10 +411,16 @@ virtualized in-memory and deterministic, riding the existing scheduling/time det
 - **Fault orchestration** — compose scheduling, network, disk, and crash/restart faults under one seed,
   with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound); the
   scheduling- and network/disk-fault targets share one *victim-designation* contract designed here.
+- **Level 2 — access-granularity interleaving + DPOR** — make the `-race` access hooks double as DST
+  scheduling decision points, so the simulation explores interleavings at memory-access granularity,
+  pruned by DPOR, with the HB race detector as oracle. Closes Gap A (the interleaving-granularity half of
+  the Completeness caveat) completely. Designed in full above ("Level 2 — …"); a scheduling-completeness
+  axis, orthogonal to the I/O features.
 
 Ordering: the landed runtime substrate is a precondition for all; the I/O features (network → disk →
 io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
-once there is something to fault.
+once there is something to fault. Level 2 extends the scheduling axis itself and depends only on the
+landed Seq-5 seam + `-race`.
 
 ## Seq 5 design: seeded interleaving diversity (validated seam + framing)
 
@@ -553,6 +561,306 @@ Single-tier: GOMAXPROCS=1 is the only tier; no distributed/clustered collapse ap
 Seed-*variation* (different seeds → different interleavings) is the feature 5a delivers, asserted by a
 diversity test; it is a completeness gain, not a safety invariant (a seed-invariant schedule is sound,
 just incomplete).
+
+## Level 2 — access-granularity interleaving + DPOR (systematic concurrency testing)
+
+Status: **design**. This is the completeness extension the Completeness caveat names ("Completeness can
+be increased additively by injecting cooperative preemption points … still deterministically — see Seq
+5"), carried to its full form: make the `-race` detector's memory-access instrumentation points double
+as DST scheduling decision points, so the simulation explores interleavings at **memory-access
+granularity**, pruned by **Dynamic Partial-Order Reduction (DPOR)**, with the happens-before race
+detector confirming races. The result is a deterministic, systematic concurrency+race explorer: a
+reproducible replacement for the "run it a thousand times and hope" race lottery.
+
+### The gap it closes (measured)
+
+Seq 5 made *which runnable goroutine proceeds next* a seeded, strategy-driven choice — but the
+**interleaving atoms** at `GOMAXPROCS=1` are still the spans *between* cooperative yield points (channel
+block, select, `Gosched`, mutex contention, goroutine create). A bug that requires a context switch at a
+specific instruction *between two operations that never yield* is unreachable at this granularity, for
+**every** seed and **every** Seq-5 strategy. Two faults split out (the Completeness caveat's two halves):
+
+- **Gap A — interleaving granularity.** The switch point the bug needs falls between yield points. This
+  is what Level 2 closes.
+- **Gap B — physical-race *consequences* under weak memory** (torn/reordered/stale reads a relaxed
+  hardware/compiler memory model permits). Reproducing these needs a relaxed-memory model checker, a
+  fundamentally different mechanism from interleaving — a single sequential execution cannot produce a
+  reordering. This stays where the top-tier contract already puts it: **the job of `-race`**, the
+  complementary tool (Completeness caveat). Level 2 does not address Gap B and is designed not to
+  foreclose a later memory-model axis.
+
+Gap A is **demonstrated, and demonstrably pure granularity** (derisk corpus, `testdata/testprog/`
+under `simulation.Run`, seeds 1..N):
+
+| corpus fault | random | PCT(d3) | oracle |
+|---|---|---|---|
+| unconditional data race | 40/40 | 40/40 | `-race` (caught regardless of granularity — HB sees the pair however it runs) **[V]** |
+| interleaving-conditional data race | 20/40 | 19/40 | `-race` (caught on the seed fraction whose coarse interleaving makes the pair concurrent) **[V]** |
+| atomicity violation (mutex-protected), **no yield in the gap** | **0/200** | **0/200** | none — `-race` stays silent (not a data race; 0/40 control), the SUT assertion never trips **[V]** |
+| *identical* atomicity violation, **one yield in the gap** | **93/200** | 2–4/200 | SUT assertion **[V]** |
+
+The two atomicity rows differ by **exactly one scheduling point**. Without it the fault is invisible to
+every seed and every current strategy; with it, uniform-random finds it ~half the time. The miss is
+**purely interleaving granularity** — not logic, not reachability, not search strategy. Auto-inserting
+that yield point at every (shared) memory access is Level 2. (PCT finds the depth-1 atomicity violation
+*less* than random — PCT's priority discipline targets depth-*d* bugs; the strategies are complementary,
+and neither closes the no-yield case. **[V]**)
+
+### Spec-first gate
+
+- canonical: this doc's Seq-5 seam (`dstFindRunnable`/`dstSchedSelect`, `proc.go`) + the top-tier
+  **Soundness**, **Non-foreclosure**, **Completeness** invariants + the control-surface table.
+- contract (top-tier): *the controllable surface is "which runnable goroutine proceeds next," hooked only
+  where the runtime already makes an unspecified/RNG-driven choice; **executions ⊆ real**.*
+- mechanism: (D1) access-granularity cooperative yield points auto-inserted at the `-race` access hooks
+  under a dst-race compiler mode, **guarded to safe points**, feeding the **same** `dstFindRunnable`
+  seam; (D2) a happens-before tracker; (D3) stateless DPOR as a `dstSchedSelect` strategy; (D4) an outer
+  `Explore` loop + public API; the `-race` HB detector is the oracle (D5).
+- collapse-check: faithful. **Not finer** — a yield at a user memory access is a real degree of freedom
+  (the OS can deschedule a goroutine between any two instructions); the guard forbids exactly the yields
+  the runtime could *not* take (lock held, on g0, non-bubble), so no choice the real system lacks is
+  added. **Not coarser** — adds transition boundaries, removes none of the existing coarse ones. **Not
+  foreclosing** — DPOR specializes the same selection seam (random→PCT→DPOR→optimal-DPOR); access yields
+  are the design's own additive completeness mechanism; the outer loop is built *on* the seam, not a new
+  shape for it. Gap B (weak memory) is a different mechanism and is left to `-race`, unforeclosed.
+- Single-tier: `GOMAXPROCS=1` is the only tier; the soundness collapse is "reorder only the already-
+  runnable set," unchanged from Seq 5.
+
+### Why the safe-point soundness is structural, not a runtime gamble (derisked)
+
+The `-race` access hooks (`raceread`/`racewrite`/`racereadrange`/`racewriterange`) are compiler-inserted
+**only** into functions the compiler instruments, and the compiler **excludes** the runtime and the
+synchronization primitives: `runtime`, `internal/runtime/*`, `sync`, `sync/atomic` carry `NoInstrument`/
+`NoRaceFunc` (`cmd/internal/objabi/pkgspecial.go`). Disassembly confirms it: **0** race hooks inside
+`sync.(*Mutex).Lock`/`Unlock`, **0** inside `runtime.goyield_m`, **19** inside an ordinary user function.
+**[V]** So a yield-at-access can fire only in user / non-primitive-stdlib code — **never** inside a mutex
+primitive, a channel op, or the scheduler. The dangerous "yield while manipulating lock state / holding a
+runtime lock" is unrepresentable by construction. The residual (e.g. a `procPin` reached from
+instrumented code) is caught by the **safe-point guard**, and *skipping a yield point is always sound*
+(it only reduces completeness) — so no unsound yield can ever occur. Yielding while holding a *user*
+mutex is sound and is exactly the interleaving Gap A needs.
+
+### Project invariants (Level 2)
+
+- **DST-L2-1 (entailed: soundness).** Every injected access yield corresponds to a real degree of
+  freedom; the seam still selects only among the already-runnable set. *violation:* a failure
+  (split-brain, lost commit, false race) reachable only because the harness switched at a point the real
+  runtime could not (lock held, on g0, a not-yet-runnable G) — a false positive while every documented
+  ordering guarantee holds. *Encoding:* structural (the guard `dstActive && g.bubble != nil && g ==
+  m.curg && m.locks == 0`; selection reads only runq contents) **+** a regression test that a
+  mutex-protected non-atomic counter under access-granularity yielding still reaches exactly `G·K` (no
+  lost update — a blocked G is never run), and channel/mutex-ordered operations keep their order.
+- **DST-L2-2 (clause-explicit: determinism).** Same `(seed, schedule)` → identical execution, identical
+  recorded access stream, identical verdict (race report / assertion). *violation:* replay of a fixed
+  `(seed, schedule)` diverges, so a found bug is not reproducible. *Encoding:* a per-`(seed, schedule)`
+  trace-hash stability probe (1 distinct over N runs, normal **and** `-race`), mutation-tested.
+- **DST-L2-3 (entailed: DPOR completeness).** The explored set contains at least one execution from every
+  Mazurkiewicz trace-equivalence class reachable by the SUT — equivalently, for every pair of *dependent*
+  (same address, ≥1 write, different goroutine, not happens-before-ordered) co-enabled transitions, both
+  orderings are explored, and only provably-equivalent (independent) reorderings are pruned. *violation:*
+  a non-equivalent interleaving — hence a reachable bug — is omitted, so "explored to exhaustion" is a
+  false negative. *Encoding:* for small closed programs, the explored outcome set equals brute-force
+  enumeration of all sound interleavings; a corpus of bugs with known minimal interleavings is each found
+  within the explored set.
+- **DST-L2-4 (clause-explicit: production untouched).** A non-`-tags dst` build, and a `-tags dst` build
+  *without* `-race`, are byte-identical to their upstream/Seq-5 equivalents. *violation:* a production or
+  plain-`-race` binary differs. *Encoding:* the compiler emits identical code when the dst-race mode is
+  off (the access hooks revert to the plain `race*` symbols); all runtime machinery is under
+  `dstBuild`/`dstActive` and dead-code-eliminated otherwise.
+
+### Mechanism
+
+#### D1 — Access-granularity yield points (the new transition boundary)
+
+A **transition boundary** under Level 2 is an instrumented memory access (read/write/range) executed by
+a SUT (bubble) goroutine at a safe point, to a *shared* address — *in addition to* the existing coarse
+boundaries (block/select/`Gosched`/create), which remain. At a boundary the active strategy may switch
+goroutines, so the scheduler can interleave at the grain of a single access.
+
+- **Where.** The `-race` hooks are the access-observation choke point. They are NOSPLIT ABIInternal
+  assembly, deliberately wrapper-free to preserve caller-PC capture for reports (`race_*.s`), so they
+  cannot host a splittable yield (`goyield` calls `mcall`). The yield is therefore a **Go-level hook**.
+- **Auto-instrumentation: a dst-race compiler mode (DECIDED — Option 1, "separate yield call, oracle
+  untouched").** Under `-tags dst` **and** `-race`, the compiler's instrument pass
+  (`cmd/compile/internal/ssagen` `instrument2`) emits an **additional** call `runtime.dstAccessYield(addr,
+  isWrite)` immediately **before** each existing `race{read,write,readrange,writerange}` hook — it does
+  **not** replace or reroute the race hook. `dstAccessYield` records the access (addr, isWrite — D3) and
+  makes the guarded yield decision; the unchanged race hook then records in TSan exactly as upstream,
+  reading its own return address off `(SP)`, so **report PC attribution and detection behavior are
+  byte-identical to a stock `-race` build**. The mode is gated by a compiler flag `cmd/go` sets when both
+  the `dst` tag and `-race` are present; with the flag off, `instrument2` emits the plain `race*` hooks
+  exactly as upstream (DST-L2-4). Two correctness properties this buys over rerouting the race symbol
+  (the rejected Option 2): **(i)** the TSan oracle is never modified — perfect attribution, identical
+  detection; **(ii)** `raceread` stays `NOSPLIT`, so instrumented `//go:nosplit` functions still link —
+  the *new* splittable `dstAccessYield` is simply **not emitted in nosplit functions** (the compiler
+  checks `fn.Pragma&Nosplit`; skipping a yield point is always sound). `dstAccessYield` is DST's own
+  transition hook — it is *not* TSan's — so the DPOR access stream rides it, not a hijacked detector
+  hook. (Rejected Option 2 — replace `raceread` with a Go shim that yields then forwards to `racereadpc`
+  — would make `raceread` splittable, breaking nosplit instrumented callers, and reroute every access
+  through a different TSan entry with hand-derived PC bookkeeping across six arch asm files: more
+  fragile under rebase and modifies the oracle. We do not optimize for upstreamability — this fork
+  rebases continuously — but Option 1 is chosen on *correctness*, not upstreamability: untouched oracle +
+  nosplit-safe.)
+- **The yield primitive.** `goyield`-shaped: requeue the current G on the local runq and `schedule()` →
+  `findRunnable` → `dstFindRunnable` (the existing seam). The current G stays runnable, so the seam never
+  runs a blocked G — soundness is inherited from Seq 5 unchanged.
+- **The safe-point guard** (DST-L2-1): yield only when `dstActive() && g.bubble != nil && g == g.m.curg
+  && g.m.locks == 0 && !g.dstInRaceHook` (the last a reentrancy guard). Any failure → record the access
+  but do not yield (sound; reduces completeness only).
+- **Shared-address filtering (tractability + faithfulness).** A yield is meaningful only at an address
+  ≥2 goroutines access — a private/stack/single-owner access is independent (Mazurkiewicz), and yielding
+  there explores nothing new while multiplying transitions. An access is a transition iff it *conflicts*
+  with a prior access by a different goroutine (same address, ≥1 write) that is **not** happens-before-
+  ordered before it (D2). Single-owner and HB-ordered accesses record but do not yield. This is the
+  primary control on the access-granularity explosion; its magnitude is measured in increment 1.
+
+#### D2 — Happens-before tracking (the dependency relation)
+
+DPOR's dependency relation needs, for any two accesses, whether they are causally ordered. The runtime
+**records** the synchronization events it already owns — `goready`/`injectglist`/`netpollready` (the
+non-foreclosure choke points), channel send/recv, sema acquire/release (mutex), goroutine create/exit —
+into the per-bubble transition log, and the DPOR engine **computes the vector clocks / HB relation
+offline**, between Runs. Two conflicting accesses are **dependent** iff neither clock dominates the other
+(concurrent); HB-ordered pairs are pruned (their order is fixed and sound). Offline (not live hot-path
+clocks) because the runtime is a pure recorder + schedule-follower under the stateless re-execution
+model — the scheduling decision during a Run needs only the prefix, never HB; HB is needed only by the
+post-Run backtrack analysis. The recorded events are the same ones the scheduler controls, so the HB is
+self-contained (no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain
+the faithful oracle, which the conflict-set cross-check against `-race` reports validates.
+
+#### D3 — Stateless DPOR as a `dstSchedSelect` strategy
+
+DST already **re-executes** `simulation.Run(seed, f)` from the start per run, so **stateless** DPOR fits
+exactly: each schedule is one re-execution guided by a thread-choice prefix + backtrack/sleep sets, no
+stored global states.
+
+- **Schedule representation.** A prefix `[]goid` of thread choices, plus per-decision backtrack and sleep
+  sets. Goids are deterministic given a fixed prefix (per-g tree + deterministic creation order), so a
+  prefix replays exactly; the suffix runs the strategy default (lowest-goid, deterministic).
+- **At the seam.** `dstSchedSelect` gains a `dstSchedDPOR` branch: if the decision index is within the
+  prefix, return the candidate index whose goid matches the prescribed choice; else pick the default and
+  let the post-run analysis add backtracks. Installed per bubble at the synctest re-root point (the
+  `dstSchedRootPCT()` slot, `synctest.go`), like every other per-bubble scheduling state.
+- **Post-run analysis (the DPOR core).** After each Run, walk the recorded transition trace; for every
+  pair of dependent co-enabled transitions `(t_i, t_j)`, `i<j`, that is *reversible* (running `t_j`'s
+  thread at `t_i`'s decision is enabled), add a backtrack point at the pre-`t_i` decision to schedule
+  `t_j`'s thread there — unless a **sleep set** proves that ordering already explored. This is **optimal
+  DPOR** (source/sleep sets): no two explored schedules are Mazurkiewicz-equivalent.
+- **Soundness + determinism inherited:** every decision still picks an enabled (runnable) thread
+  (DST-L2-1); each Run is fully determined by its schedule (DST-L2-2).
+
+#### D4 — The `Explore` outer loop + public API
+
+The driver lives above the seam, orchestrating repeated Runs:
+
+- `simulation.Explore(seed uint64, opts Options, f func()) Report` — runs the DPOR worklist: pop a
+  schedule, execute `f` under it, analyze the trace, push new schedules, until the worklist is empty
+  (the pruned interleaving space is **exhausted**) or an `opts` budget (max schedules / max steps) is
+  hit. `Report` carries pass/exhausted/budget-hit + every found failure (a `-race` report or a SUT
+  panic/assertion) with the exact schedule to reproduce it.
+- `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
+  `RunWith(seed, Options{Strategy: DPOR, Schedule: s}, f)` replays one schedule for reproduction/debug.
+- **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
+  much was covered — "exhausted" and "budget-hit" are distinct verdicts; the latter is never reported as
+  the former.
+
+#### D5 — The race detector as deterministic oracle (derisked)
+
+Each explored interleaving runs under `-race`. The HB detector fires for an unsynchronized access pair
+even at `GOMAXPROCS=1` serial execution (it is clock-based, not timing-based), and the report is a
+deterministic function of the seed/schedule (same seed → 100/100 identical normalized report; even a
+*conditional* race's detect/no-detect verdict is stable per seed, 0/30 vs 30/30 — no flicker). **[V]** So
+a race found in any explored schedule is reproducible forever by that schedule. Atomicity violations
+(invisible to `-race`) are caught by the SUT's own assertions in the same explored interleaving.
+
+### Soundness argument (load-bearing collapse-check)
+
+The seam still only ever reorders goroutines that are *already runnable* — an access yield merely
+requeues the running G and reschedules, so every candidate is past the primitive that made it runnable,
+exactly as in Seq 5. The new freedom is *when* a SUT goroutine yields (now also at shared-memory
+accesses), and that freedom is real: on a real multi-core machine the OS can deschedule a goroutine
+between any two instructions, so any reordering of access-separated spans is an execution the real
+runtime+OS can produce. The guard forecloses precisely the points the real runtime cannot take a switch
+at (lock held, on g0, non-bubble), and those are *also* the points the compiler never instruments — so
+the structural exclusion and the guard agree. Therefore executions ⊆ real (top-tier Soundness), and the
+seam never pulls from a wait queue, so a causally-ordered pair is unrepresentable as a reorder candidate
+— soundness is structural, not a runtime check.
+
+### Increment sequence (each useful; none forecloses another)
+
+The ordering key: **every piece hooks to the existing `dstFindRunnable` seam or to "an access happened,"
+never to a new control shape** — so the strategy (D3), the outer loop (D4), and the auto-instrumentation
+(D1) compose without retrofit. **Build order (DECIDED — sequencing (b)): prove the DPOR brain (2–4) on
+the *manual* hook first, then switch the transition source to auto-instrumentation (1's compiler half).**
+The DPOR algorithm is the hard, research-grade core; validating it is cleaner when the transition set is
+hand-controlled (and checkable against brute-force) rather than fed by every auto-inserted access.
+Auto-instrumentation then only changes *where* transitions come from, not the algorithm — non-foreclosing
+by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred until the brain is proven.)
+
+1. **Access-yield + transition-record substrate.** Runtime `dstYieldPoint`/`dstAccessYield` + the
+   safe-point guard + a per-bubble **transition recorder** (an ordered event log: scheduling decisions
+   with the enabled goid set, accesses with goid/addr/isWrite/step, and sync events for offline HB —
+   D2). **Manual-hook half: VALIDATED [V]** — mutex-counter soundness probe reaches exactly `G·K` at
+   access granularity incl. yields while holding a user lock (DST-L2-1; 200/200 over 50 seeds, normal and
+   `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
+   per-run yield magnitude measured (every access yields → filtering is increment 6). **Compiler half
+   (Option 1): deferred** to after 2–4 per sequencing (b). Foreclosure: feeds the same seam.
+2. **Happens-before — recorded events, computed offline** (D2). The runtime records the sync events into
+   the transition log; the DPOR engine builds the vector clocks/HB relation **offline** between Runs
+   (cleaner for the stateless re-execution model than live hot-path clocks, and keeps the runtime a pure
+   recorder + schedule-follower). Delivers the dependency relation for D3 and the HB pruning. Foreclosure:
+   additive recording.
+3. **DPOR strategy** (D3; **VALIDATED [V]**). Iterative stateless DPOR over the schedule recorder
+   (`dporExplore` in `testing/simulation/explore.go`): dependency = same nonzero address, ≥1 write,
+   different stable index (`g.dstSeq`); backtrack points added at ancestor decisions; deterministic
+   backtrack pick. Measured against the Exhaustive baseline: **sound** (mutex-counter 0 failures over the
+   whole space — `TestDSTExploreFindsAtomicityViolation`), **complete** (counter race: DPOR and
+   Exhaustive reach the *identical* outcome set — DST-L2-3, `TestDSTExploreComplete`: 2-goroutine
+   `{1,2}` committed; 3-goroutine `{1,2,3}` measured in bring-up), **deterministic + seed-independent**,
+   and a real reduction (atomicity 180→10; 2-goroutine counter 180→10; 3-goroutine counter 20160→539).
+   Foreclosure: a strategy at the seam.
+4. **`Explore` outer loop + API** (D4; **VALIDATED [V]**). `simulation.Explore(seed, mode, sut)` drives
+   repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
+   DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow` (exhausted vs
+   budget-hit distinct — no silent cap). *(After 4: increment 2's HB pruning + increment 6's filtering
+   cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
+
+**As built so far (this session) — the substrate + brain are proven on the manual hook:** the stable
+per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
+across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
+(`dstScheduledSelect` runs on g0 under `sched.lock`), the access-yield hook (`dstAccessYield`), and the
+Exhaustive + DPOR engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling
+subset). Still inflated by `gcDrain`/`WaitGroup`/coarse-point decisions in the trace (increment 6
+filtering + increment 2 HB pruning address this); soundness + completeness for the annotated SUTs is
+independent of that inflation.
+
+**Completeness boundary (addr=0 transitions).** DPOR's dependency relation requires a recorded nonzero
+access address, so transitions that record none — infrastructure decisions (goroutine creation,
+`WaitGroup` wakeups, the `gcDrain` finalizer goroutine) and any SUT access not hand-annotated with
+`dstAccessYield` — are treated as independent of everything. This is sound and complete *for SUTs whose
+shared accesses are all annotated and that do not observe finalizer/cleanup timing* (the committed,
+hand-annotated case): finalizer discovery is quiescence-deterministic (the GC contract), so the drain's
+scheduling does not change SUT-observable outcomes. It is **not** complete for a SUT that observes
+finalizer timing — that case is closed when the dst-race compiler mode (increment 1) records *every*
+access and the happens-before tracker (increment 2) records sync edges, replacing the
+addr=0-independence assumption with the real access + HB relation. The `dporExplore` dependency loop
+documents this.
+5. **Optimal DPOR** (D3 sleep/source sets). Prune redundant schedules to one-per-class. Delivers
+   efficiency (DST-L2-3 tightens from "covers every class" to "explores no class twice"). Foreclosure:
+   refines the worklist, not the seam.
+6. **Shared-address filtering** (D1, using D2). Only contended, non-HB-ordered accesses are transitions.
+   Delivers tractability (the explosion control). Foreclosure: narrows transitions; fewer yields is
+   always sound.
+
+### Open questions (resolved by measurement during the build, not pre-judged)
+
+- **Explosion magnitude.** How many per-run yield points a realistic SUT generates, and how aggressively
+  shared-address filtering (6) must prune — measured in increment 1 before the compiler work commits.
+- **HB source (DECIDED).** DST-side, computed **offline** from recorded sync events (not live hot-path
+  clocks, not TSan's C-internal clocks) — it must match `-race`'s own HB, cross-checked against `-race`
+  reports.
+- **Budget policy when the space exceeds the budget.** Report partial coverage with a precise "covered N
+  of an unknown total" — never a silent cap (DST-L2-3 / No silent downscoping).
 
 ## Decisions (settled)
 

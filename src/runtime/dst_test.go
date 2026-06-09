@@ -881,3 +881,111 @@ func TestDSTMemoryLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestDSTAccessYieldSound verifies the Level-2 access-granularity yield substrate
+// is sound and deterministic (DST-L2-1/2). DSTYieldSound performs G*K=200
+// mutex-protected non-atomic increments with a yield WHILE the lock is held: a
+// sound seam never runs a goroutine blocked on Lock, so yielding inside a critical
+// section preserves mutual exclusion and the counter must reach exactly 200. The
+// output is a deterministic function of the seed (two same-seed runs match). See
+// docs/dst/design.md "Level 2 — access-granularity interleaving + DPOR".
+func TestDSTAccessYieldSound(t *testing.T) {
+	out1 := runTestProgDST(t, "DSTYieldSound", "DSTSEED=1")
+	if !strings.HasPrefix(out1, "ok 200 ") {
+		t.Fatalf("access-granularity yield is unsound (lost an update inside a critical "+
+			"section): got %q, want exactly-once increments %q", out1, "ok 200 yields=...")
+	}
+	if out2 := runTestProgDST(t, "DSTYieldSound", "DSTSEED=1"); out1 != out2 {
+		t.Fatalf("access-granularity yield not deterministic across same-seed runs:\n run1=%q\n run2=%q", out1, out2)
+	}
+}
+
+// TestDSTExploreFindsAtomicityViolation verifies the systematic explorer finds, in
+// a single Explore call, the atomicity violation that the coarse random/PCT
+// strategies miss for every seed (0/200). It also confirms the explorer is sound
+// (the mutex-protected counter SUT yields no failing interleaving) and
+// deterministic. See docs/dst/design.md (Level 2, DST-L2-1/2).
+func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
+	out := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor")
+	if exploreFailures(t, out) == 0 {
+		t.Fatalf("Explore did not find the atomicity violation that requires a mid-gap "+
+			"interleaving: %q", out)
+	}
+	if !strings.Contains(out, "exhausted=true") || !strings.Contains(out, "overflow=false") {
+		t.Fatalf("Explore did not cleanly exhaust the atomicity SUT's interleaving space: %q", out)
+	}
+	if out2 := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor"); out != out2 {
+		t.Fatalf("Explore not deterministic across same-seed runs:\n run1=%q\n run2=%q", out, out2)
+	}
+	// Soundness: the mutex-protected counter has NO buggy interleaving — a sound
+	// explorer reports zero failures over the whole space, under both modes.
+	for _, mode := range []string{"dpor", "exhaustive"} {
+		s := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=mutexcount", "DSTMODE="+mode)
+		if exploreFailures(t, s) != 0 {
+			t.Fatalf("explorer (%s) reported a spurious failure on the sound mutex counter "+
+				"(ran a blocked goroutine?): %q", mode, s)
+		}
+	}
+}
+
+// TestDSTExploreComplete verifies DPOR is COMPLETE — it reaches the identical set
+// of reachable outcomes as exhaustive enumeration, while exploring strictly fewer
+// interleavings. If DPOR's outcome set were a subset, it would be silently missing
+// reachable states (bugs). See docs/dst/design.md (Level 2, DST-L2-3).
+func TestDSTExploreComplete(t *testing.T) {
+	exh := runTestProgDST(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=exhaustive")
+	dpor := runTestProgDST(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=dpor")
+	exhSet, dporSet := exploreOutcomes(t, exh), exploreOutcomes(t, dpor)
+	if exhSet != dporSet {
+		t.Fatalf("DPOR is incomplete: reaches outcomes %q but exhaustive reaches %q", dporSet, exhSet)
+	}
+	exhN, dporN := exploreSchedules(t, exh), exploreSchedules(t, dpor)
+	if dporN >= exhN {
+		t.Fatalf("DPOR did not reduce the interleaving count: dpor=%d, exhaustive=%d", dporN, exhN)
+	}
+}
+
+// exploreField returns the value of "key=" in an Explore output line.
+func exploreField(t *testing.T, out, key string) string {
+	t.Helper()
+	for _, f := range strings.Fields(out) {
+		if rest, ok := strings.CutPrefix(f, key+"="); ok {
+			return rest
+		}
+	}
+	t.Fatalf("Explore output missing %q=: %q", key, out)
+	return ""
+}
+
+func exploreFailures(t *testing.T, out string) int {
+	t.Helper()
+	n, err := strconv.Atoi(exploreField(t, out, "failures"))
+	if err != nil {
+		t.Fatalf("bad failures field in %q: %v", out, err)
+	}
+	return n
+}
+
+func exploreSchedules(t *testing.T, out string) int {
+	t.Helper()
+	n, err := strconv.Atoi(exploreField(t, out, "schedules"))
+	if err != nil {
+		t.Fatalf("bad schedules field in %q: %v", out, err)
+	}
+	return n
+}
+
+// exploreOutcomes returns the "outcomes=[...]" set as a canonical string.
+func exploreOutcomes(t *testing.T, out string) string {
+	t.Helper()
+	i := strings.Index(out, "outcomes=[")
+	if i < 0 {
+		t.Fatalf("Explore output missing outcomes=[...]: %q", out)
+	}
+	rest := out[i+len("outcomes="):]
+	j := strings.IndexByte(rest, ']')
+	if j < 0 {
+		t.Fatalf("Explore output has unterminated outcomes=[: %q", out)
+	}
+	return rest[:j+1]
+}

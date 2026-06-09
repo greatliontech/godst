@@ -271,6 +271,7 @@ func dstSchedRandn(n uint32) uint32 {
 const (
 	dstSchedRandom uint8 = iota
 	dstSchedPCT
+	dstSchedScheduled // follow an explicit schedule prefix (exhaustive / DPOR exploration); see dst_explore.go
 )
 
 var (

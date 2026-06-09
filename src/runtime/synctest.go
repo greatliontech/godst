@@ -236,6 +236,11 @@ func synctestRun(f func()) {
 				// children. Do not reorder the main creation after the re-root expecting
 				// to "fix" this — it would change the stream and is unnecessary.
 				dstSchedRootPCT()
+			} else if dstSchedKind == dstSchedScheduled {
+				// Reset the scheduled-strategy state (step counter, trace) for this
+				// bubble. The prefix itself is installed by the brain (dstSetSchedule)
+				// before the Run and persists across the re-root. See dst_explore.go.
+				dstScheduleReset()
 			}
 		}
 		pp := getg().m.p.ptr()
