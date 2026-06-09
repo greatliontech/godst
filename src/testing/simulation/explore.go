@@ -33,14 +33,21 @@ type Failure struct {
 	// (dstSeq, not goid) chosen in decision order — that reproduces this failure
 	// when fed back as the scheduled strategy's prefix.
 	Schedule []uint64
+	// Race is true iff the -race detector reported a NEW data race during this
+	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
+	// (sut returned true). In a non-race build Race is always false. The detector
+	// dedups by signature, so each distinct race yields exactly one Race failure —
+	// the first schedule that exhibits it, a deterministic reproducer.
+	Race bool
 }
 
 // ExploreResult reports an Explore run.
 type ExploreResult struct {
 	// Schedules is the number of interleavings actually explored.
 	Schedules int
-	// Failures lists every explored interleaving in which the SUT returned true,
-	// each with its reproducing schedule.
+	// Failures lists every explored interleaving that exhibited a bug — the SUT
+	// returned true (an assertion failure) OR the -race detector reported a new data
+	// race (Failure.Race; see D5) — each with its reproducing schedule.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
@@ -95,11 +102,15 @@ type exploreTrace struct {
 }
 
 // runOnce runs sut once under the scheduled strategy following prefix, and copies
-// out the recorded trace. failed is sut's verdict for this interleaving.
-func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed bool, tr exploreTrace) {
+// out the recorded trace. failed is sut's verdict for this interleaving; raced is
+// true iff the -race detector reported a NEW data race during this run (D5 oracle;
+// always false in a non-race build — dstRaceErrors returns 0).
+func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed, raced bool, tr exploreTrace) {
+	racesBefore := dstRaceErrors()
 	run(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
 		failed = sut()
 	})
+	raced = dstRaceErrors() > racesBefore
 	tr.overflow = dstTraceOverflowFP() || dstEdgeOverflowFP()
 	tr.aborted = dstScheduleAbortedFP()
 	if tr.aborted {
@@ -148,13 +159,13 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 		} else {
 			visited[k] = true
 		}
-		failed, tr := runOnce(seed, prefix, sut)
+		failed, raced, tr := runOnce(seed, prefix, sut)
 		res.Schedules++
 		if tr.overflow {
 			res.Overflow = true
 		}
-		if failed {
-			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix)})
+		if failed || raced {
+			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
 		}
 		for i := len(prefix); i < len(tr.procs); i++ {
 			for _, g := range tr.enabled[i] {
@@ -243,13 +254,13 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 		for i, fr := range stack {
 			prefix[i] = fr.proc
 		}
-		failed, tr := runOnce(seed, prefix, sut)
+		failed, raced, tr := runOnce(seed, prefix, sut)
 		res.Schedules++
 		if tr.overflow {
 			res.Overflow = true
 		}
-		if failed {
-			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix)})
+		if failed || raced {
+			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
 		}
 		// runOnce panics on a divergent (aborted) replay, so the trace here is always
 		// a faithful replay of the followed prefix.

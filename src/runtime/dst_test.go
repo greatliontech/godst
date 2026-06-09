@@ -1059,3 +1059,52 @@ func TestDSTExploreSweep(t *testing.T) {
 			"dropping sleep sets → 85, dropping to the persistent-set search → 125):\n%s", maxDpor, out)
 	}
 }
+
+// TestDSTExploreRaceOracle verifies the -race detector works as Explore's data-race
+// oracle (D5): an explored interleaving that exhibits an unsynchronized access pair
+// is reported as a Failure with Race=true, with the schedule that reproduces it. The
+// SUT (raceOracleSUT) has two unsynchronized writes and NO assertion, so a data race
+// is the ONLY possible finding — proving Explore surfaces races, not just SUT
+// assertions. The detector fires even at the GOMAXPROCS=1 serial execution DST uses
+// (it is clock-based, not timing-based), and the verdict is a deterministic function
+// of (seed, schedule): two same-seed runs report the identical first-race schedule.
+//
+// Built explicitly WITH -race (the oracle is race-only; dstRaceErrors returns 0
+// otherwise). Skipped where the race detector is unavailable. The testprog exits
+// nonzero (race detector exit) and prints a DATA RACE report to stderr; runBuiltTestProg
+// ignores the exit code, and the assertions parse only the deterministic "raceoracle"
+// summary fields (not the address-bearing report). See docs/dst/design.md (Level 2, D5).
+func TestDSTExploreRaceOracle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the -race oracle build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	exe := filepath.Join(t.TempDir(), "tp_race")
+	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
+	// uncond: an unconditional write-write race — the oracle must fire (proves -race
+	// works as the oracle under simulation.Run's GOMAXPROCS=1 serial execution).
+	// cond: an INTERLEAVING-CONDITIONAL race manifesting only when the reader acquires
+	// the mutex first — the explorer must reach that schedule (via the
+	// sync-acquisition-order machinery) for the oracle to see it; a coarse scheduler
+	// would miss it on the other acquisition order.
+	for _, mode := range []string{"uncond", "cond"} {
+		out := runBuiltTestProg(t, exe, "DSTExploreRaceOracle", "DSTSEED=1", "DSTRACE="+mode)
+		if races, err := strconv.Atoi(exploreField(t, out, "races")); err != nil {
+			t.Fatalf("bad races field in %q: %v", out, err)
+		} else if races < 1 {
+			t.Fatalf("race oracle (%s) found no data race (D5 oracle not firing under "+
+				"simulation.Run / explorer did not reach the racy interleaving):\n%s", mode, out)
+		}
+		// The first-race schedule is a deterministic function of the seed (DST-L2-2 +
+		// D5): a second same-seed run reproduces it. Compare the parsed schedule, not
+		// the full output, whose race report carries nondeterministic addresses.
+		out2 := runBuiltTestProg(t, exe, "DSTExploreRaceOracle", "DSTSEED=1", "DSTRACE="+mode)
+		if a, b := exploreField(t, out, "firstrace"), exploreField(t, out2, "firstrace"); a != b {
+			t.Fatalf("race oracle (%s) nondeterministic: first-race schedule %q vs %q", mode, a, b)
+		}
+	}
+}

@@ -25,6 +25,7 @@ func init() {
 	register("DSTExplore", DSTExplore)
 	register("DSTExploreOutcomes", DSTExploreOutcomes)
 	register("DSTExploreSweep", DSTExploreSweep)
+	register("DSTExploreRaceOracle", DSTExploreRaceOracle)
 }
 
 // dstYieldPoint is a cooperative yield with no recorded access; dstAccessYield
@@ -217,6 +218,95 @@ func DSTExplore() {
 		}
 		os.Stdout.WriteString(s + "]\n")
 	}
+}
+
+// raceOracleSUT has two goroutines write a shared int with NO synchronization — an
+// unconditional data race the -race detector (D5 oracle) must report. There is no SUT
+// assertion (it returns false), so the ONLY failure signal is the race: it proves
+// Explore surfaces data races, not just assertion failures. The access-yields make
+// the two writes interleavable DPOR transitions.
+func raceOracleSUT() bool {
+	var x int
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x), true); x = 1 }()
+	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x), true); x = 2 }()
+	wg.Wait()
+	return false
+}
+
+// raceCondSUT has an INTERLEAVING-CONDITIONAL data race: the race manifests only on
+// the schedule where the reader acquires the mutex first. The writer sets x then a
+// done flag under the lock; the reader reads done under the lock and, only if the
+// writer has not run yet (done==0, i.e. the reader acquired first), reads x OUTSIDE
+// any lock — racing the writer's later x=1. When the writer acquires first the reader
+// sees done==1 and never touches x: no race. So a coarse scheduler that happens to run
+// the writer first misses the race entirely; the explorer, which explores both
+// acquisition orders (dstSyncAcquire on the mutex — the sync-acquisition-order
+// machinery), reaches the reader-first schedule and the -race oracle reports it. No
+// SUT assertion: the race is the finding.
+func raceCondSUT() bool {
+	var x, done int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		dstSyncAcquire(unsafe.Pointer(&mu))
+		mu.Lock()
+		x = 1
+		done = 1
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		dstSyncAcquire(unsafe.Pointer(&mu))
+		mu.Lock()
+		d := done
+		mu.Unlock()
+		if d == 0 {
+			dstAccessYield(unsafe.Pointer(&x), false)
+			_ = x // unsynchronized read, reached only when the reader acquired first
+		}
+	}()
+	wg.Wait()
+	return false
+}
+
+// DSTExploreRaceOracle runs a race SUT (DSTRACE=uncond|cond, default uncond) under
+// Explore and prints "raceoracle schedules=<n> races=<m> exhausted=<bool>
+// firstrace=[g,g,...]". races counts the Failures the -race oracle flagged
+// (Failure.Race); firstrace is the schedule that reproduces the first one
+// (comma-separated, no spaces, so it is a single output token). Meaningful only in a
+// -race build; in a non-race build races=0.
+func DSTExploreRaceOracle() {
+	sut := raceOracleSUT
+	if os.Getenv("DSTRACE") == "cond" {
+		sut = raceCondSUT
+	}
+	res := simulation.Explore(dstSeedEnv(), simulation.DPOR, sut)
+	races := 0
+	firstRace := "[]"
+	for _, f := range res.Failures {
+		if !f.Race {
+			continue
+		}
+		races++
+		if races == 1 {
+			s := "["
+			for i, g := range f.Schedule {
+				if i > 0 {
+					s += ","
+				}
+				s += strconv.FormatUint(g, 10)
+			}
+			firstRace = s + "]"
+		}
+	}
+	os.Stdout.WriteString("raceoracle schedules=" + strconv.Itoa(res.Schedules) +
+		" races=" + strconv.Itoa(races) +
+		" exhausted=" + strconv.FormatBool(res.Exhausted) +
+		" firstrace=" + firstRace + "\n")
 }
 
 // dstOutcomes collects the distinct final values multiOutcomeSUT produces across

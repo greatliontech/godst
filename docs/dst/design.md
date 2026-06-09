@@ -788,7 +788,7 @@ The driver lives above the seam, orchestrating repeated Runs:
   much was covered — "exhausted" and "budget-hit" are distinct verdicts; the latter is never reported as
   the former.
 
-#### D5 — The race detector as deterministic oracle (derisked)
+#### D5 — The race detector as deterministic oracle (**IMPLEMENTED [V]**)
 
 Each explored interleaving runs under `-race`. The HB detector fires for an unsynchronized access pair
 even at `GOMAXPROCS=1` serial execution (it is clock-based, not timing-based), and the report is a
@@ -796,6 +796,16 @@ deterministic function of the seed/schedule (same seed → 100/100 identical nor
 *conditional* race's detect/no-detect verdict is stable per seed, 0/30 vs 30/30 — no flicker). **[V]** So
 a race found in any explored schedule is reproducible forever by that schedule. Atomicity violations
 (invisible to `-race`) are caught by the SUT's own assertions in the same explored interleaving.
+
+Wired into `Explore`: `runOnce` reads `runtime.RaceErrors()` (via the build-tagged
+`dstRaceErrors` — real under `-race`, 0 otherwise) before and after each scheduled Run; a NEW race makes
+the schedule a `Failure` with `Race=true`. The detector dedups by signature, so each distinct race yields
+exactly one `Race` failure — the first schedule that exhibits it, a deterministic reproducer. Enforced by
+`TestDSTExploreRaceOracle`: an unconditional write-write race is reported (the oracle fires under
+`simulation.Run`), and an *interleaving-conditional* race — manifesting only when the reader acquires a
+mutex first (`raceCondSUT`) — is found by exploring both acquisition orders and reported with a
+non-trivial reproducing schedule, both deterministic across same-seed runs. A non-`-race` build still
+enumerates interleavings and reports SUT-assertion failures; it records no data-race failures.
 
 ### Soundness argument (load-bearing collapse-check)
 
