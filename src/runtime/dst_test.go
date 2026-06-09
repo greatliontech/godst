@@ -1010,3 +1010,37 @@ func TestDSTExploreHBPrunes(t *testing.T) {
 			"the address-only relation explores ~21): %q", n, out)
 	}
 }
+
+// TestDSTExploreSweep is the DST-L2-3 completeness guard: a generated family of
+// small concurrent programs (2-3 goroutines; reads/writes over 1-2 shared vars;
+// with and without mutex synchronization) plus hand-written hard SUTs (a channel
+// rendezvous-order choice) is explored under BOTH DPOR and brute-force Exhaustive,
+// and DPOR must reach the IDENTICAL set of observable outcomes for every one. This
+// is the real net that the micro-SUTs (TestDSTExploreComplete, a single no-mutex
+// program) only weakly approximate.
+//
+// It specifically guards the synchronization-acquisition-order classes: WHICH
+// goroutine acquires a mutex / rendezvous on a channel first is a real scheduling
+// choice that changes the outcome, but it occurs at a transition recording no
+// memory access, so DPOR drops one order unless each acquisition is recorded as a
+// conflicting transition (runtime.dstSyncAcquire). With that hook neutered the
+// sweep fails 23/289; with it, 0 — so it has teeth. See docs/dst/design.md
+// (Level 2, DST-L2-3 + "Completeness boundary").
+//
+// Built WITHOUT -race: completeness is a property of the DPOR algorithm, not the
+// detector, and the no-mutex SUTs contain intentional data races the detector would
+// otherwise report. Skipped under -short (it is exhaustive over the family);
+// TestDSTExploreComplete still provides basic completeness coverage there.
+func TestDSTExploreSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the exhaustive-equivalence completeness sweep")
+	}
+	testenv.MustHaveGoBuild(t)
+	exe := filepath.Join(t.TempDir(), "tp_dst")
+	buildTestProgExplicit(t, exe, "-tags=dst")
+	out := runBuiltTestProg(t, exe, "DSTExploreSweep", "DSTSEED=1")
+	if exploreField(t, out, "mismatches") != "0" {
+		t.Fatalf("DPOR completeness sweep found mismatches vs exhaustive enumeration "+
+			"(a dropped Mazurkiewicz class — DST-L2-3 violation):\n%s", out)
+	}
+}

@@ -182,11 +182,15 @@ type dporFrame struct {
 
 // dporExplore is iterative stateless Dynamic Partial-Order Reduction. It explores
 // one interleaving per Mazurkiewicz equivalence class: two transitions are
-// *dependent* iff they touch the same address with at least one write, by
-// different goroutines; only orderings of dependent transitions are explored
-// (independent reorderings are provably equivalent and pruned). Each run
-// re-executes from the start following the stack's chosen prefix; the dependency
-// analysis over the resulting trace adds backtrack points at ancestor decisions.
+// *dependent* iff they record the same nonzero conflict identity with at least one
+// write, by different goroutines — where the identity is a shared memory address
+// (dstAccessYield) OR a synchronization object's identity (dstSyncAcquire, recording
+// a mutex/channel acquisition as a write-conflict so its acquisition ORDER is a
+// dependency; see runtime/dst_explore.go and design.md "Completeness boundary").
+// Only orderings of dependent transitions are explored (independent reorderings are
+// provably equivalent and pruned). Each run re-executes from the start following the
+// stack's chosen prefix; the dependency analysis over the resulting trace adds
+// backtrack points at ancestor decisions.
 func dporExplore(seed uint64, sut func() bool) ExploreResult {
 	var res ExploreResult
 	var stack []*dporFrame
@@ -215,23 +219,30 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 				done:      map[uint64]bool{},
 			})
 		}
-		// Dependency analysis: two transitions are dependent iff they touch the same
-		// nonzero address with at least one write, by different goroutines, AND are
-		// CONCURRENT (neither happens-before the other — clocks computed from the
-		// recorded goready edges + program order). The concurrency test prunes
-		// mutex/channel-serialized pairs the address-only relation would over-explore.
+		// Dependency analysis: two transitions are dependent iff they record the same
+		// nonzero conflict identity with at least one write, by different goroutines,
+		// AND are CONCURRENT (neither happens-before the other — clocks computed from
+		// the recorded goready edges + program order). The identity is a memory address
+		// (dstAccessYield) or a synchronization object's identity (dstSyncAcquire); the
+		// concurrency test prunes mutex/channel-SERIALIZED pairs the identity relation
+		// would over-explore, while an acquisition ORDER (which contender acquires
+		// first) is a co-enabled concurrent conflicting pair and IS explored both ways.
 		// For each dependent pair (i<j) the reverse ordering must be explored — add a
 		// backtrack at decision i to run j's goroutine there (if it was enabled at i;
 		// else, conservatively, every goroutine enabled at i).
 		//
-		// addr==0 transitions are treated as independent of everything. Today those
-		// are infrastructure decisions that record no memory access — goroutine
-		// creation, WaitGroup wakeups, and the finalizer-drain goroutine (gcDrain is
-		// also isolated from the schedule in firstSystemG) — plus any SUT access not
-		// hand-annotated with dstAccessYield. Sound and complete for SUTs whose shared
-		// accesses are all annotated and that do not observe finalizer/cleanup timing
-		// (the committed case). The dst-race compiler mode (increment 1) will record
-		// every access, removing the annotation assumption.
+		// addr==0 transitions are treated as independent of everything. Those are pure
+		// infrastructure decisions that record neither a memory access nor a sync
+		// acquisition — goroutine creation, WaitGroup wakeups, and the finalizer-drain
+		// goroutine (gcDrain is also isolated from the schedule in firstSystemG): they
+		// carry no outcome-determining order choice a recorded access/acquisition does
+		// not already capture. Sound and complete for SUTs whose shared accesses AND
+		// synchronization acquisitions are recorded (dstAccessYield + dstSyncAcquire)
+		// and that do not observe finalizer/cleanup timing — enforced over a generated
+		// family by TestDSTExploreSweep (DPOR outcome set == exhaustive). The dst-race
+		// compiler/runtime phase records accesses and acquisitions automatically,
+		// removing the manual-annotation assumption. See design.md "Completeness
+		// boundary (addr=0 transitions)".
 		clk, pidx := dporClocks(tr)
 		for j := 0; j < n; j++ {
 			for i := j - 1; i >= 0; i-- {

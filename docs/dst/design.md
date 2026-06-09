@@ -656,12 +656,17 @@ mutex is sound and is exactly the interleaving Gap A needs.
   trace-hash stability probe (1 distinct over N runs, normal **and** `-race`), mutation-tested.
 - **DST-L2-3 (entailed: DPOR completeness).** The explored set contains at least one execution from every
   Mazurkiewicz trace-equivalence class reachable by the SUT — equivalently, for every pair of *dependent*
-  (same address, ≥1 write, different goroutine, not happens-before-ordered) co-enabled transitions, both
-  orderings are explored, and only provably-equivalent (independent) reorderings are pruned. *violation:*
-  a non-equivalent interleaving — hence a reachable bug — is omitted, so "explored to exhaustion" is a
-  false negative. *Encoding:* for small closed programs, the explored outcome set equals brute-force
-  enumeration of all sound interleavings; a corpus of bugs with known minimal interleavings is each found
-  within the explored set.
+  co-enabled transitions, both orderings are explored, and only provably-equivalent (independent)
+  reorderings are pruned. Two transitions are *dependent* iff they record the same nonzero conflict
+  identity — a shared memory address (`dstAccessYield`) **or** a synchronization object's identity
+  (`dstSyncAcquire`) — with ≥1 write, by different goroutines, and are not happens-before-ordered.
+  (Synchronization-acquisition order is a dependency: omitting it drops a class — see "Completeness
+  boundary".) *violation:* a non-equivalent interleaving — hence a reachable bug — is omitted, so
+  "explored to exhaustion" is a false negative. *Encoding:* **`TestDSTExploreSweep`** — for a generated
+  family of small closed programs (reads/writes over shared vars, with/without mutexes; plus channel
+  rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
+  every member (289 SUTs, mutation-tested: 23 fail with `dstSyncAcquire` neutered). The committed
+  micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
 - **DST-L2-4 (clause-explicit: production untouched).** A non-`-tags dst` build, and a `-tags dst` build
   *without* `-race`, are byte-identical to their upstream/Seq-5 equivalents. *violation:* a production or
   plain-`-race` binary differs. *Encoding:* the compiler emits identical code when the dst-race mode is
@@ -672,10 +677,24 @@ mutex is sound and is exactly the interleaving Gap A needs.
 
 #### D1 — Access-granularity yield points (the new transition boundary)
 
-A **transition boundary** under Level 2 is an instrumented memory access (read/write/range) executed by
-a SUT (bubble) goroutine at a safe point, to a *shared* address — *in addition to* the existing coarse
+A **transition boundary** under Level 2 is, at a safe point on a SUT (bubble) goroutine, either (a) an
+instrumented **memory access** (read/write/range) to a *shared* address (`dstAccessYield`), or (b) a
+**synchronization acquisition** — a mutex `Lock`, a channel send/recv rendezvous, etc. — recorded as a
+write-conflict on the sync object's identity (`dstSyncAcquire`) — *in addition to* the existing coarse
 boundaries (block/select/`Gosched`/create), which remain. At a boundary the active strategy may switch
 goroutines, so the scheduler can interleave at the grain of a single access.
+
+The acquisition boundary (b) is **load-bearing for completeness, not just granularity**: *which*
+contending goroutine acquires a sync object first is a real scheduling choice that can change the
+outcome, but it is decided at a transition that performs *no memory access* (a goroutine reaching its
+`Lock` records nothing), so without (b) DPOR treats that decision as independent of everything and
+silently drops the alternative-acquisition-order Mazurkiewicz classes (a DST-L2-3 violation —
+`TestDSTExploreSweep` fails 23/289 with `dstSyncAcquire` neutered). Announced *before* the blocking op
+and modeled as a write-conflict (acquisitions do not commute), two acquisitions of the same object by
+different goroutines become a co-enabled, concurrent, conflicting pair whose **both** orderings the
+existing HB-DPOR explores — with no change to the dependency/race test. This is the standard DPOR
+treatment of locks; it is faithful (`executions ⊆ real`: the real scheduler can switch before any
+goroutine acquires) and sound (a pre-acquire yield never runs a blocked G).
 
 - **Where.** The `-race` hooks are the access-observation choke point. They are NOSPLIT ABIInternal
   assembly, deliberately wrapper-free to preserve caller-PC capture for reports (`race_*.s`), so they
@@ -835,23 +854,34 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 **As built so far (this session) — the substrate + brain are proven on the manual hook:** the stable
 per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
 across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
-(`dstScheduledSelect` runs on g0 under `sched.lock`), the access-yield hook (`dstAccessYield`), and the
-Exhaustive + DPOR engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling
-subset). Still inflated by `gcDrain`/`WaitGroup`/coarse-point decisions in the trace (increment 6
-filtering + increment 2 HB pruning address this); soundness + completeness for the annotated SUTs is
-independent of that inflation.
+(`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for
+memory accesses, `dstSyncAcquire` for synchronization acquisitions — D1), and the Exhaustive + DPOR
+engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). Still
+inflated by `gcDrain`/`WaitGroup`/coarse-point decisions in the trace (increment 6 filtering + increment 2
+HB pruning address this); soundness + completeness for SUTs whose accesses and acquisitions are recorded
+is independent of that inflation, and enforced over a generated family by `TestDSTExploreSweep`.
 
-**Completeness boundary (addr=0 transitions).** DPOR's dependency relation requires a recorded nonzero
-access address, so transitions that record none — infrastructure decisions (goroutine creation,
-`WaitGroup` wakeups, the `gcDrain` finalizer goroutine) and any SUT access not hand-annotated with
-`dstAccessYield` — are treated as independent of everything. This is sound and complete *for SUTs whose
-shared accesses are all annotated and that do not observe finalizer/cleanup timing* (the committed,
-hand-annotated case): finalizer discovery is quiescence-deterministic (the GC contract), so the drain's
-scheduling does not change SUT-observable outcomes. It is **not** complete for a SUT that observes
-finalizer timing — that case is closed when the dst-race compiler mode (increment 1) records *every*
-access and the happens-before tracker (increment 2) records sync edges, replacing the
-addr=0-independence assumption with the real access + HB relation. The `dporExplore` dependency loop
-documents this.
+**Completeness boundary (addr=0 transitions).** DPOR's dependency relation pairs transitions that record
+a nonzero conflict identity: a shared **memory access** (`dstAccessYield`) **or** a **synchronization
+acquisition** (`dstSyncAcquire`, recording the sync object's identity as a write-conflict — D1).
+Transitions that record none — pure infrastructure decisions (goroutine creation, `WaitGroup` wakeups,
+the isolated `gcDrain` finalizer goroutine) — remain independent of everything, which is correct because
+they carry no outcome-determining order choice a recorded access/acquisition does not already capture
+(the created goroutine's own accesses, the post-`Wait` accesses, … are the recorded transitions). So the
+relation is sound and complete *for SUTs whose shared memory accesses **and** synchronization
+acquisitions are recorded as transitions, and that do not observe finalizer/cleanup timing* — enforced
+over a generated family (mutex- and channel-acquisition-order cases included) by the
+`TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 289 SUTs).
+
+An **earlier draft of this note was wrong**: it claimed completeness for "SUTs whose shared *accesses* are
+all annotated," overlooking that **synchronization-acquisition order is itself a dependency**. A
+mutex-bracketed program with every access annotated still lost a class (`prog#257`: exhaustive 2
+outcomes, DPOR 1) because the lock-order-determining decision is an `addr=0` transition. `dstSyncAcquire`
+(D1) closes it with no change to the dependency/race test; the sweep enforces it (23/289 → 0). For the
+manual-hook validation phase the SUT annotates acquisitions; the dst-race compiler/runtime phase records
+them automatically (channel ops in the runtime; a dst hook in `sync.Mutex`/the sema layer). Finalizer-
+timing observation stays out of scope until that phase records *every* access; the `dporExplore`
+dependency loop documents the relation.
 5. **Optimal DPOR** (D3 sleep/source sets) — **NEXT; not started.** The current `dporExplore` is a
    *persistent-set* DPOR: sound + complete (verified), but it re-explores Mazurkiewicz-*equivalent*
    interleavings via different prefixes (the per-frame `done` set precludes exact-duplicate prefixes, so
@@ -863,8 +893,15 @@ documents this.
    for it. **Build order for this increment (do in this order):**
    1. **Validator first** (so the safety net exists before the algorithm): a brute-force-equivalence
       sweep — a *generated family* of small SUTs (vary goroutine count, accesses, sync) — asserting the
-      optimal-DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the 3
-      committed micro-SUTs. This is the real DST-L2-3 guard.
+      DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the committed
+      micro-SUTs. This is the real DST-L2-3 guard. **VALIDATED [V] — and it immediately earned its keep:**
+      it exposed a *pre-existing* DST-L2-3 completeness defect (the persistent-set DPOR dropped every
+      **synchronization-acquisition-order** class — 23/289 SUTs, all-and-only mutex/channel cases),
+      because the lock/rendezvous-order decision is an `addr=0` transition the dependency relation
+      ignored. **Fixed before sleep sets** (a reduction layered on an incomplete search would drop even
+      more): `dstSyncAcquire` (D1) records acquisitions as conflicting transitions — zero brain change —
+      and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/289 → 0). Optimality (sleep
+      sets) is therefore built on a foundation the sweep proves complete.
    2. **Sleep sets in the iterative stateless model** (Godefroid sleep sets, or optimal source-DPOR,
       Abdulla et al. 2014). Each `dporFrame` gains a `sleep` set; a thread stays asleep (not explored at
       that frame) until a *dependent* transition wakes it. Care: the iterative re-execution rebuilds the

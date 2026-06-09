@@ -26,28 +26,54 @@ import "unsafe" // for go:linkname and the access-yield hook
 // the per-run yield magnitude, read via dstAccessYieldFP.
 var dstAccessYieldPoints uint64
 
-// dstAccessYield is the access-granularity cooperative yield + access record: the
-// Level-2 transition boundary (D1). Placed at a memory access — manually for the
-// build-order-(b) validation phase, by the dst-race compiler mode later — it
-// records the pending access on the goroutine (for DPOR's dependency relation) and
-// lets the deterministic scheduler switch at this access.
-//
-// Safe-point guard (DST-L2-1): yield only on a bubble (SUT) goroutine running on
-// its own stack with no runtime lock held; otherwise return without yielding —
-// skipping a yield is always sound (it only forgoes an interleaving). goyield
-// requeues the current G and reschedules through dstFindRunnable, so the seam never
-// runs a blocked G; soundness is inherited from Seq 5 unchanged.
-//
-//go:linkname dstAccessYield
-func dstAccessYield(addr unsafe.Pointer, write bool) {
+// dstYieldAccess is the shared core of every Level-2 transition-boundary hook: it
+// records the pending transition (addr, write) on the current goroutine for DPOR's
+// dependency relation and yields, subject to the safe-point guard. The guard
+// (DST-L2-1) lives here, in ONE place, so it cannot drift across the hooks: yield
+// only on a bubble (SUT) goroutine running on its own stack with no runtime lock
+// held; otherwise return without yielding — skipping a yield is always sound (it
+// only forgoes an interleaving). goyield requeues the current G and reschedules
+// through dstFindRunnable, so the seam never runs a blocked G; soundness is
+// inherited from Seq 5 unchanged.
+func dstYieldAccess(addr uintptr, write bool) {
 	gp := getg()
 	if !dstActive() || gp.bubble == nil || gp != gp.m.curg || gp.m.locks != 0 {
 		return
 	}
-	gp.dstAccAddr = uintptr(addr)
+	gp.dstAccAddr = addr
 	gp.dstAccWrite = write
 	dstAccessYieldPoints++
 	goyield()
+}
+
+// dstAccessYield is the access-granularity cooperative yield + access record: the
+// Level-2 transition boundary (D1) at a MEMORY access — manually for the
+// build-order-(b) validation phase, by the dst-race compiler mode later. It records
+// the pending access (addr, isWrite) and lets the deterministic scheduler switch at
+// this access.
+//
+//go:linkname dstAccessYield
+func dstAccessYield(addr unsafe.Pointer, write bool) {
+	dstYieldAccess(uintptr(addr), write)
+}
+
+// dstSyncAcquire is the Level-2 transition boundary for a synchronization
+// ACQUISITION (mutex Lock, channel send/recv rendezvous, ...): it announces the
+// sync object's identity as a write-conflict and yields BEFORE the blocking op, so
+// the order in which contending goroutines acquire the object is itself a DPOR
+// transition. Two acquisitions of the same object by different goroutines are then a
+// co-enabled, concurrent, conflicting pair whose BOTH orderings DPOR explores —
+// without which a program whose outcome depends on acquisition order silently loses
+// Mazurkiewicz classes (DST-L2-3; see TestDSTExploreSweep, which fails 23/289 with
+// this hook neutered). Modeled as a write-conflict because acquisitions do not
+// commute. Same guard/soundness as dstAccessYield (a pre-acquire yield is sound: the
+// real scheduler can switch before any goroutine acquires the object). Placed
+// manually for the validation phase; the auto-instrumentation phase wires the
+// runtime sync primitives (chan ops; a dst hook in sync.Mutex/the sema layer) to it.
+//
+//go:linkname dstSyncAcquire
+func dstSyncAcquire(id unsafe.Pointer) {
+	dstYieldAccess(uintptr(id), true)
 }
 
 // dstYieldPoint is a cooperative yield with no specific memory access recorded — a
@@ -55,13 +81,7 @@ func dstAccessYield(addr unsafe.Pointer, write bool) {
 //
 //go:linkname dstYieldPoint
 func dstYieldPoint() {
-	gp := getg()
-	if !dstActive() || gp.bubble == nil || gp != gp.m.curg || gp.m.locks != 0 {
-		return
-	}
-	gp.dstAccAddr = 0
-	dstAccessYieldPoints++
-	goyield()
+	dstYieldAccess(0, false)
 }
 
 //go:linkname dstAccessYieldFP
