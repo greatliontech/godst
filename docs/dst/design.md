@@ -937,12 +937,15 @@ from `mappedReady` (total mapped memory), which is **not bubble-local** and **no
 DST (~115 KB run-to-run: mmap-arena history + ASLR + scavenger-off accumulation); honoring it makes
 `NumGC` wobble (8/9 at a tight limit). GOMEMLIMIT's semantics are inherently *total-RSS*, which DST
 does not model (the scavenger is parked, D5). Two fixes give the user a deterministic equivalent:
-- **`Options.MemoryLimit`** — a per-run knob that bounds the bubble's *own* heap growth
-  (`heapLive - dstHeapBase`), which is bubble-local and deterministic, so `NumGC` under the limit is
-  reproducible (`TestDSTMemoryLimit`; the trigger in `mgc.go` `gcTrigger.test`). Redefined semantics
-  under DST: *bound bubble heap growth*, not *bound total RSS*. It is an upper bound on top of the GOGC
-  trigger; when `GOGC=off` it is the sole bound (the `defaultHeapMinimum` floor is skipped so a limit
-  set above it is honored).
+- **`Options.MemoryLimit`** — a per-run knob that bounds the bubble's *own* net heap, expressed as the
+  per-object deterministic measure `bubbleMarked + dstHeapAlloc` (live-at-last-mark + per-object bytes
+  allocated since), the deterministic analogue of physical `heapLive - dstHeapBase`. This is bubble-local
+  and per-object deterministic, so both `NumGC` *and which cycle discovers each object* under the limit
+  are reproducible in normal and `-race` builds (`TestDSTMemoryLimit` for the set level;
+  `TestDSTGCPerCycleDiscoveryDeterministic`'s memlimit regime for per-cycle; the trigger in `mgc.go`
+  `gcTrigger.test`). Redefined semantics under DST: *bound bubble net heap growth*, not *bound total
+  RSS*. It is an upper bound on top of the GOGC trigger; when `GOGC=off` it is the sole bound (the
+  `defaultHeapMinimum` floor is skipped so a limit set above it is honored).
 - **RSS-derived `MemStats` are out-of-contract** — `HeapReleased`, `HeapIdle`, and `HeapSys`'s idle
   component carry `mappedReady`/sweep-`madvise` process noise that is not bubble-local, so they are
   **not** deterministic under DST and a SUT must not assert on them (same status as the init-time
@@ -1190,17 +1193,15 @@ made deterministic" subsection below the table):
 | **Logical** | scheduling, select, map, `math/rand`, values, **replay** | per-g RNG + single-P | **holds** (verified: 8/8 DST logical tests pass under `-race`, incl. GOMAXPROCS=4 churn; no race reports) |
 | **Finalizer set @ quiescence** | the finalizer/cleanup *set* run by a quiescence point = objects logically unreachable there | reachability (logical) | **holds** (lands with Chunk B's drain) |
 | **GC set-level** (`numGC`, total finalizer/weak set) | the GC count and the *set* of objects discovered | heap bytes, but target floors at `heapMinimum` | **holds** (the 2 GC tests pass under `-race`) |
-| **GC per-cycle** — *which cycle* discovers an object | **per-object allocated bytes** (`dstHeapAlloc`) | **holds** for the GOGC trigger (Phase 2a; `TestDSTGCPerCycleDiscoveryDeterministic`) |
+| **GC per-cycle** — *which cycle* discovers an object | **per-object allocated bytes** (`dstHeapAlloc`) | **holds** (Phase 2a; `TestDSTGCPerCycleDiscoveryDeterministic`) |
 
-All four layers hold under the GOGC trigger (floored and GOGC-scaled). The set-level test (`numGC` +
-total finalizers, `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial
-discovery, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in all builds. **One regime is exempt at
-the per-cycle layer:** when `Options.MemoryLimit` is set and the *limit* crossing (not the GOGC target)
-governs a cycle, the trigger still fires on physical span-granular `heapLive − base` (`mgc.go`
-`gcTrigger.test`), so that cycle is set-level deterministic (`numGC` reproducible,
-`TestDSTMemoryLimit`) but its per-cycle split is not `-race`-deterministic. Driving the limit crossing
-off `dstHeapAlloc` too is a tracked follow-on —
-`docs/issues/dst-memlimit-percycle-determinism.md`.
+All four layers are unconditional. Every DST heap-trigger crossing fires on `dstHeapAlloc` (per-object
+allocated bytes): the floored case (`target == heapMinimum`), the GOGC-scaled case
+(`target == (heapMarked − base)·GOGC/100`), and the `Options.MemoryLimit` case (the bubble's net heap
+`bubbleMarked + dstHeapAlloc` vs the limit). The set-level test (`numGC` + total finalizers,
+`TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial discovery for the
+floored, GOGC-scaled, and `MemoryLimit` regimes, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in
+all builds.
 
 **How per-cycle discovery is made deterministic under `-race` (Phase 2a).** The earlier framing scoped
 per-cycle determinism out of the contract because the trigger fired on **physical `heapLive`**, which

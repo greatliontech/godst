@@ -335,18 +335,24 @@ func TestDSTGCFinalizerDiscoveryDeterministic(t *testing.T) {
 func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
 	for _, regime := range []struct {
 		name string
+		prog string
 		env  []string
 	}{
-		{"floored", []string{"DSTSEED=12345", "GOGC=100"}},
-		{"gogc-scaled", []string{"DSTSEED=12345", "GOGC=100", "DSTBIGLIVE=16"}},
+		{"floored", "DSTGCPerCycle", []string{"DSTSEED=12345", "GOGC=100"}},
+		{"gogc-scaled", "DSTGCPerCycle", []string{"DSTSEED=12345", "GOGC=100", "DSTBIGLIVE=16"}},
+		// MemoryLimit-governed (GOGC=off so the per-object limit crossing is the sole
+		// trigger). A small finalizable rate + bulk non-finalizable garbage so the
+		// limit fires without a finalizer-resurrection GC storm; the limit crossing
+		// (bubbleMarked + dstHeapAlloc) is per-object, so the partial is reproducible.
+		{"memlimit", "DSTMemLimitPerCycle", []string{"DSTSEED=12345", "GOGC=off", "DSTMEMLIMIT=4194304"}},
 	} {
-		first := strings.TrimSpace(runTestProgDST(t, "DSTGCPerCycle", regime.env...))
+		first := strings.TrimSpace(runTestProgDST(t, regime.prog, regime.env...))
 		f := strings.Fields(first)
 		if len(f) != 2 || f[0] == "0" {
 			t.Fatalf("%s: no mid-run per-cycle discovery recorded (%q)", regime.name, first)
 		}
 		for i := 0; i < 5; i++ {
-			if got := strings.TrimSpace(runTestProgDST(t, "DSTGCPerCycle", regime.env...)); got != first {
+			if got := strings.TrimSpace(runTestProgDST(t, regime.prog, regime.env...)); got != first {
 				t.Fatalf("%s: per-cycle discovery not reproducible across same-seed runs (run %d): "+
 					"the trigger crossing is not per-object deterministic\nfirst=%q\ngot  =%q",
 					regime.name, i+1, first, got)

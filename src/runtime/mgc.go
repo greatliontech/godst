@@ -730,20 +730,29 @@ func (t gcTrigger) test() bool {
 			// the dstHeapBase process baseline; sub-observable, see DST-MEM-1.)
 			hm := gcController.heapMarked
 			base := dstHeapBase.Load()
+			// bubbleMarked is the bubble's *own* live set at the last mark
+			// (heapMarked - dstHeapBase), excluding the run-to-run-varying process
+			// baseline. The bubble's net heap *now* is then bubbleMarked + dstHeapAlloc
+			// (live-at-last-mark + per-object bytes allocated since) — the per-object
+			// deterministic analogue of the physical heapLive - base. Both the memory
+			// limit and the GOGC target are expressed against these, so every crossing
+			// is per-cycle race-deterministic, not just set-level.
+			bubbleMarked := uint64(0)
+			if hm > base {
+				bubbleMarked = hm - base
+			}
 			// Deterministic bubble-local memory limit (Options.MemoryLimit). The env
 			// GOMEMLIMIT cannot be honored deterministically under DST — its goal
 			// derives from total mapped memory, which is not bubble-local and varies
 			// run to run (the scavenger is parked and process mmap history/ASLR perturb
-			// it). This knob instead bounds the bubble's *own* heap growth (heapLive -
-			// dstHeapBase), which is deterministic at the set level, so the GC *count*
-			// under the limit is reproducible. Redefined semantics under DST: "bound
+			// it). This knob instead bounds the bubble's *own* net heap
+			// (bubbleMarked + dstHeapAlloc), a deterministic per-object measure, so both
+			// the GC count and *which cycle* discovers each object under the limit are
+			// reproducible (normal and -race). Redefined semantics under DST: "bound
 			// bubble heap growth", not "bound total RSS". When set it is an upper bound
 			// applied on top of the GOGC trigger (GOGC may still fire earlier for a small
-			// live set). NB: this crossing is still physical span-granular heapLive, so a
-			// MemoryLimit-governed cycle is set-level-deterministic but NOT per-cycle
-			// race-deterministic like the dstHeapAlloc-driven GOGC trigger below — see
-			// docs/issues/dst-memlimit-percycle-determinism.md.
-			if live := gcController.heapLive.Load(); dstMemLimit > 0 && live > base && live-base >= uint64(dstMemLimit) {
+			// live set).
+			if dstMemLimit > 0 && bubbleMarked+dstHeapAlloc.Load() >= uint64(dstMemLimit) {
 				return true
 			}
 			gp := gcController.gcPercent.Load()
@@ -763,14 +772,9 @@ func (t gcTrigger) test() bool {
 				// allocate below this floor (e.g. the logical-only DST tests) never GC.
 				return dstHeapAlloc.Load() >= defaultHeapMinimum
 			default:
-				// Per-bubble relative target: the GOGC ratio of the bubble's *own* live
-				// set (heapMarked - dstHeapBase), excluding the run-to-run-varying
-				// process baseline, so the GC count and the total finalizer/weak set are
-				// a deterministic function of the bubble's allocation.
-				bubbleMarked := uint64(0)
-				if hm > base {
-					bubbleMarked = hm - base
-				}
+				// Per-bubble relative target: the GOGC ratio of the bubble's own live
+				// set, so the GC count and the total finalizer/weak set are a
+				// deterministic function of the bubble's allocation.
 				target := bubbleMarked * uint64(gp) / 100
 				if target < gcController.heapMinimum {
 					target = gcController.heapMinimum

@@ -36,6 +36,7 @@ func init() {
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
 	register("DSTGCPerCycle", DSTGCPerCycle)
+	register("DSTMemLimitPerCycle", DSTMemLimitPerCycle)
 	register("DSTFinChanOp", DSTFinChanOp)
 	register("DSTFinRunSet", DSTFinRunSet)
 	register("DSTFinSpawn", DSTFinSpawn)
@@ -306,6 +307,42 @@ func DSTGCFinDiscovery() {
 	})
 	os.Stdout.WriteString(strconv.FormatUint(uint64(ngc), 10) + " " +
 		strconv.FormatUint(dstBubbleFinqFP(), 10) + "\n")
+}
+
+// DSTMemLimitPerCycle exercises per-cycle finalizer discovery under
+// Options.MemoryLimit without the finalizer-resurrection GC storm: a SMALL rate of
+// finalizable objects (so the resurrected pile stays well under the limit) is
+// interleaved with BULK non-finalizable garbage (single sink slot, so it dies
+// immediately) that drives the memlimit crossings. The mid-run partial discovery
+// count depends on the limit crossings; with the per-object dstHeapAlloc crossing
+// it is a deterministic function of the seed (normal and -race). Prints
+// "<partial> <total>"; under a tight limit the run ends mid-stream, so <total> is
+// also a per-cycle (not set-level) observable — both fields must replay.
+func DSTMemLimitPerCycle() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	limit, _ := strconv.ParseInt(os.Getenv("DSTMEMLIMIT"), 10, 64)
+	var partial, total uint64
+	simulation.RunWith(n, simulation.Options{MemoryLimit: limit}, func() {
+		const NF, K, bulk = 4000, 512, 40
+		ring := make([]*dstFinObj, K)
+		for i := 0; i < NF; i++ {
+			o := &dstFinObj{}
+			o.b[0] = byte(i)
+			runtime.SetFinalizer(o, func(p *dstFinObj) { _ = p.b[0] })
+			ring[i%K] = o // evicted entries die with a finalizer set
+			for j := 0; j < bulk; j++ {
+				b := make([]byte, 256) // non-finalizable garbage, drives the memlimit
+				b[0] = byte(j)
+				dstEscape(0, b)
+			}
+			if i == NF/2 {
+				partial = dstBubbleFinqFP()
+			}
+		}
+		total = dstBubbleFinqFP()
+	})
+	os.Stdout.WriteString(strconv.FormatUint(partial, 10) + " " +
+		strconv.FormatUint(total, 10) + "\n")
 }
 
 // DSTGCPerCycle exercises *per-cycle* finalizer discovery determinism (Tier 2,
