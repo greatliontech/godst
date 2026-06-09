@@ -26,6 +26,7 @@ func init() {
 	register("DSTExploreOutcomes", DSTExploreOutcomes)
 	register("DSTExploreSweep", DSTExploreSweep)
 	register("DSTExploreRaceOracle", DSTExploreRaceOracle)
+	register("DSTExploreAuto", DSTExploreAuto)
 }
 
 // dstYieldPoint is a cooperative yield with no recorded access; dstAccessYield
@@ -61,46 +62,49 @@ func dstSeedEnv() uint64 {
 	return s
 }
 
-// DSTYieldSound is the access-granularity soundness probe (DST-L2-1). G goroutines
-// each do K rounds of (Lock; read; YIELD-while-holding-the-lock; write; Unlock;
-// YIELD). The mid-critical-section yield is the load-bearing case: it yields while
-// a USER mutex is held (sync.Mutex does not bump m.locks, so the guard permits it).
-// A sound seam never runs a goroutine blocked on Lock, so mutual exclusion holds
-// and the non-atomic counter must reach exactly G*K; if yield-at-access ran a
-// blocked G inside the critical section, updates would be lost and the count would
-// be < G*K. Prints "ok <count> yields=<n>" iff exact, else "BAD <count>". Replayed
-// across same-seed runs it is identical (determinism, DST-L2-2); yields is the
-// per-run yield magnitude.
-func DSTYieldSound() {
-	const G, K = 5, 40
+// yieldLockedSUT is the access-granularity SOUNDNESS SUT (DST-L2-1): G goroutines do
+// K mutex-protected non-atomic increments, with an access-yield WHILE the lock is held
+// — the load-bearing case (sync.Mutex does not bump m.locks, so the safe-point guard
+// permits yielding inside a user critical section). A sound seam never runs a
+// goroutine blocked on Lock, so mutual exclusion holds and the counter reaches exactly
+// G*K on EVERY interleaving; returns true (bug) only on a lost update. dstSyncAcquire
+// makes the lock-acquisition order a transition so Explore visits both orders (else
+// the space would be a single schedule and the test vacuous).
+func yieldLockedSUT() bool {
+	const G, K = 2, 2
+	var mu sync.Mutex
 	count := 0
-	var yields uint64
-	simulation.Run(dstSeedEnv(), func() {
-		dstAccessYieldReset()
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		wg.Add(G)
-		for g := 0; g < G; g++ {
-			go func() {
-				defer wg.Done()
-				for k := 0; k < K; k++ {
-					mu.Lock()
-					tmp := count
-					dstYieldPoint() // yield while holding the lock (must stay sound)
-					count = tmp + 1
-					mu.Unlock()
-					dstYieldPoint() // yield outside the lock
-				}
-			}()
-		}
-		wg.Wait()
-		yields = dstAccessYieldFP()
-	})
-	if count == G*K {
-		os.Stdout.WriteString("ok " + strconv.Itoa(count) + " yields=" + strconv.FormatUint(yields, 10) + "\n")
-	} else {
-		os.Stdout.WriteString("BAD " + strconv.Itoa(count) + "\n")
+	var wg sync.WaitGroup
+	wg.Add(G)
+	for i := 0; i < G; i++ {
+		go func() {
+			defer wg.Done()
+			for k := 0; k < K; k++ {
+				dstSyncAcquire(unsafe.Pointer(&mu))
+				mu.Lock()
+				t := count
+				dstAccessYield(unsafe.Pointer(&count), true) // yield WHILE holding the lock
+				count = t + 1
+				mu.Unlock()
+			}
+		}()
 	}
+	wg.Wait()
+	return count != G*K
+}
+
+// DSTYieldSound EXPLORES yieldLockedSUT (scheduled strategy) and prints "yieldsound
+// schedules=<n> failures=<f> exhausted=<bool>". Access-granularity yielding is a
+// scheduled-strategy mechanism (inert under Random/PCT, where a plain simulation.Run
+// would land), so the soundness of yield-while-holding-a-lock must be checked under
+// Explore: failures==0 means a blocked goroutine was never run inside a critical
+// section (DST-L2-1); schedules>1 confirms the yield actually drove interleavings (not
+// a vacuous pass).
+func DSTYieldSound() {
+	res := simulation.Explore(dstSeedEnv(), simulation.DPOR, yieldLockedSUT)
+	os.Stdout.WriteString("yieldsound schedules=" + strconv.Itoa(res.Schedules) +
+		" failures=" + strconv.Itoa(len(res.Failures)) +
+		" exhausted=" + strconv.FormatBool(res.Exhausted) + "\n")
 }
 
 // atomicityViolSUT is an Explore SUT: two withdrawals of 100 from a balance of
@@ -307,6 +311,83 @@ func DSTExploreRaceOracle() {
 		" races=" + strconv.Itoa(races) +
 		" exhausted=" + strconv.FormatBool(res.Exhausted) +
 		" firstrace=" + firstRace + "\n")
+}
+
+// unmodifiedRMWSUT is a plain, UNINSTRUMENTED SUT: two goroutines do an
+// unsynchronized read-modify-write of a shared counter. It carries NO manual
+// dstAccessYield/dstSyncAcquire. Under -tags dst -race the compiler auto-inserts a
+// yield before each memory-access race hook (increment 1), so the explorer can
+// interleave the reads and writes and reach the lost update (final counter == 1, not
+// 2). On a coarse scheduler the two RMWs run to completion uninterrupted (final == 2)
+// and the bug is invisible. This is the end-to-end proof that compiler
+// auto-instrumentation feeds the explorer with no hand-annotation — the lost update
+// surfaces as a non-race SUT-assertion failure. (The unsynchronized access is also a
+// data race the -race oracle reports, as a separate Race failure.) Returns true on
+// the lost update.
+var autoOutcomes = map[int]bool{}
+
+func unmodifiedRMWSUT() bool {
+	c := 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			t := c
+			c = t + 1
+		}()
+	}
+	wg.Wait()
+	autoOutcomes[c] = true
+	return c != 2
+}
+
+// DSTExploreAuto runs unmodifiedRMWSUT under BOTH Exhaustive and DPOR and prints
+// "auto exh=<n> dpor=<m> assertfail=<a> racefail=<r> complete=<bool>". It is the
+// increment-1 acceptance AND a guard for the source-DPOR fallback:
+//   - assertfail counts non-race DPOR Failures (the lost update — reachable ONLY
+//     because auto-instrumentation made the RMW accesses interleavable, with NO manual
+//     hooks: the headline proof that the compiler feeds the explorer). racefail counts
+//     -race-oracle Failures on the same auto-instrumented accesses.
+//   - complete is DPOR's reachable-outcome set == Exhaustive's. unmodifiedRMWSUT's
+//     dense auto-instrumentation triggers addSourceBacktrack's no-enabled-weak-initial
+//     path, so this equality validates that skipping there is complete (DST-L2-3) — a
+//     case the manual-hook family sweep does not reach.
+//
+// Meaningful only in a -tags dst -race build (else no auto-instrumentation).
+func DSTExploreAuto() {
+	seed := dstSeedEnv()
+	// DPOR first, so its -race-oracle count (racefail) is not pre-empted by the race
+	// detector's dedup during the Exhaustive pass over the same racy SUT.
+	for k := range autoOutcomes {
+		delete(autoOutcomes, k)
+	}
+	dpor := simulation.Explore(seed, simulation.DPOR, unmodifiedRMWSUT)
+	dporSet := map[string]bool{}
+	for v := range autoOutcomes {
+		dporSet[strconv.Itoa(v)] = true
+	}
+	for k := range autoOutcomes {
+		delete(autoOutcomes, k)
+	}
+	exh := simulation.Explore(seed, simulation.Exhaustive, unmodifiedRMWSUT)
+	exhSet := map[string]bool{}
+	for v := range autoOutcomes {
+		exhSet[strconv.Itoa(v)] = true
+	}
+	assertfail, racefail := 0, 0
+	for _, f := range dpor.Failures {
+		if f.Race {
+			racefail++
+		} else {
+			assertfail++
+		}
+	}
+	os.Stdout.WriteString("auto exh=" + strconv.Itoa(exh.Schedules) +
+		" dpor=" + strconv.Itoa(dpor.Schedules) +
+		" assertfail=" + strconv.Itoa(assertfail) +
+		" racefail=" + strconv.Itoa(racefail) +
+		" complete=" + strconv.FormatBool(sameSet(exhSet, dporSet)) + "\n")
 }
 
 // dstOutcomes collects the distinct final values multiOutcomeSUT produces across

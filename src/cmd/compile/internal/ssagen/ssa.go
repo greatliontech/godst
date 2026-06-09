@@ -167,6 +167,7 @@ func InitConfig() {
 	ir.Syms.Racereadrange = typecheck.LookupRuntimeFunc("racereadrange")
 	ir.Syms.Racewrite = typecheck.LookupRuntimeFunc("racewrite")
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
+	ir.Syms.DstAccessYield = typecheck.LookupRuntimeFunc("dstAccessYield")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
@@ -1575,6 +1576,20 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	}
 	if needWidth {
 		args = append(args, s.constInt(types.Types[types.TUINTPTR], w))
+	}
+
+	// DST Level-2 (dst-race mode): immediately before the race hook, emit a
+	// cooperative access-yield so this memory access is a deterministic scheduling
+	// decision point (design.md D1). It is an ADDITIONAL call — the race hook below is
+	// unchanged, so TSan detection/PC-attribution stay byte-identical to a stock -race
+	// build (the oracle is never modified). Gated to -race with -d=dstrace (cmd/go sets
+	// it only for -tags dst + -race); off → this is dead and instrument2 emits exactly
+	// upstream (DST-L2-4). Skipped in //go:nosplit functions because dstAccessYield →
+	// goyield is splittable (skipping a yield only forgoes an interleaving — always
+	// sound). Not emitted for the MSan-only move kind (race uses read/write only). The
+	// runtime's own safe-point guard (bubble G, no runtime lock) handles the rest.
+	if base.Debug.DstRace != 0 && base.Flag.Race && kind != instrumentMove && s.curfn.Pragma&ir.Nosplit == 0 {
+		s.rtcall(ir.Syms.DstAccessYield, true, nil, addr, s.constBool(kind == instrumentWrite))
 	}
 	s.rtcall(fn, true, nil, args...)
 }

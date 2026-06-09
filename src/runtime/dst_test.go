@@ -50,6 +50,22 @@ func runTestProgDST(t *testing.T, name string, env ...string) string {
 	return runBuiltTestProg(t, exe, name, env...)
 }
 
+// runTestProgDSTNoRace builds the testprog with -tags=dst but NEVER -race (unlike
+// runTestProgDST, whose buildTestProg appends -race when the outer test runs under
+// -race). The DPOR brain-validation Explore tests use it: they validate the algorithm
+// on the SUTs' CONTROLLED manual dstAccessYield/dstSyncAcquire transitions, which the
+// dst-race compiler auto-instrumentation (active only under -race) would perturb by
+// adding a yield at every memory access. Completeness/optimality/soundness of the
+// brain are -race-independent; the auto-instrumentation path is exercised separately
+// by TestDSTExploreAutoInstrument, and the data-race oracle by TestDSTExploreRaceOracle.
+func runTestProgDSTNoRace(t *testing.T, name string, env ...string) string {
+	t.Helper()
+	testenv.MustHaveGoBuild(t)
+	exe := filepath.Join(t.TempDir(), "tp_dst")
+	buildTestProgExplicit(t, exe, "-tags=dst")
+	return runBuiltTestProg(t, exe, name, env...)
+}
+
 // TestDSTDeterministicSelect verifies that DST makes select poll
 // order a reproducible function of the seed: the same seed yields an identical
 // schedule across runs, and a different seed yields a different one. Without the
@@ -882,20 +898,29 @@ func TestDSTMemoryLimit(t *testing.T) {
 	}
 }
 
-// TestDSTAccessYieldSound verifies the Level-2 access-granularity yield substrate
-// is sound and deterministic (DST-L2-1/2). DSTYieldSound performs G*K=200
-// mutex-protected non-atomic increments with a yield WHILE the lock is held: a
-// sound seam never runs a goroutine blocked on Lock, so yielding inside a critical
-// section preserves mutual exclusion and the counter must reach exactly 200. The
-// output is a deterministic function of the seed (two same-seed runs match). See
-// docs/dst/design.md "Level 2 — access-granularity interleaving + DPOR".
+// TestDSTAccessYieldSound verifies the Level-2 access-granularity yield substrate is
+// sound and deterministic (DST-L2-1/2). DSTYieldSound EXPLORES a mutex-protected
+// non-atomic counter with a yield WHILE the lock is held: a sound seam never runs a
+// goroutine blocked on Lock, so yielding inside a critical section preserves mutual
+// exclusion and the counter reaches exactly G*K on every interleaving → zero failures.
+// schedules>1 confirms the yield drove interleavings (not a vacuous pass). Built
+// NON-race (access-granularity yielding is a scheduled-strategy mechanism; the dst-race
+// compiler auto-instrumentation, active only under -race, would add unrelated yields).
+// Deterministic across same-seed runs (DST-L2-2). See docs/dst/design.md "Level 2".
 func TestDSTAccessYieldSound(t *testing.T) {
-	out1 := runTestProgDST(t, "DSTYieldSound", "DSTSEED=1")
-	if !strings.HasPrefix(out1, "ok 200 ") {
-		t.Fatalf("access-granularity yield is unsound (lost an update inside a critical "+
-			"section): got %q, want exactly-once increments %q", out1, "ok 200 yields=...")
+	out1 := runTestProgDSTNoRace(t, "DSTYieldSound", "DSTSEED=1")
+	if exploreFailures(t, out1) != 0 {
+		t.Fatalf("access-granularity yield is unsound: a goroutine blocked on Lock was run "+
+			"inside a critical section (lost update): %q", out1)
 	}
-	if out2 := runTestProgDST(t, "DSTYieldSound", "DSTSEED=1"); out1 != out2 {
+	if n := exploreSchedules(t, out1); n <= 1 {
+		t.Fatalf("yield-while-locked test is vacuous: only %d schedule(s) — the access-yield "+
+			"did not drive interleavings: %q", n, out1)
+	}
+	if !strings.Contains(out1, "exhausted=true") {
+		t.Fatalf("yield-while-locked interleaving space not exhausted: %q", out1)
+	}
+	if out2 := runTestProgDSTNoRace(t, "DSTYieldSound", "DSTSEED=1"); out1 != out2 {
 		t.Fatalf("access-granularity yield not deterministic across same-seed runs:\n run1=%q\n run2=%q", out1, out2)
 	}
 }
@@ -906,7 +931,7 @@ func TestDSTAccessYieldSound(t *testing.T) {
 // (the mutex-protected counter SUT yields no failing interleaving) and
 // deterministic. See docs/dst/design.md (Level 2, DST-L2-1/2).
 func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
-	out := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor")
+	out := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor")
 	if exploreFailures(t, out) == 0 {
 		t.Fatalf("Explore did not find the atomicity violation that requires a mid-gap "+
 			"interleaving: %q", out)
@@ -914,13 +939,13 @@ func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
 	if !strings.Contains(out, "exhausted=true") || !strings.Contains(out, "overflow=false") {
 		t.Fatalf("Explore did not cleanly exhaust the atomicity SUT's interleaving space: %q", out)
 	}
-	if out2 := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor"); out != out2 {
+	if out2 := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor"); out != out2 {
 		t.Fatalf("Explore not deterministic across same-seed runs:\n run1=%q\n run2=%q", out, out2)
 	}
 	// Soundness: the mutex-protected counter has NO buggy interleaving — a sound
 	// explorer reports zero failures over the whole space, under both modes.
 	for _, mode := range []string{"dpor", "exhaustive"} {
-		s := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=mutexcount", "DSTMODE="+mode)
+		s := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=mutexcount", "DSTMODE="+mode)
 		if exploreFailures(t, s) != 0 {
 			t.Fatalf("explorer (%s) reported a spurious failure on the sound mutex counter "+
 				"(ran a blocked goroutine?): %q", mode, s)
@@ -933,8 +958,8 @@ func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
 // interleavings. If DPOR's outcome set were a subset, it would be silently missing
 // reachable states (bugs). See docs/dst/design.md (Level 2, DST-L2-3).
 func TestDSTExploreComplete(t *testing.T) {
-	exh := runTestProgDST(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=exhaustive")
-	dpor := runTestProgDST(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=dpor")
+	exh := runTestProgDSTNoRace(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=exhaustive")
+	dpor := runTestProgDSTNoRace(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=dpor")
 	exhSet, dporSet := exploreOutcomes(t, exh), exploreOutcomes(t, dpor)
 	if exhSet != dporSet {
 		t.Fatalf("DPOR is incomplete: reaches outcomes %q but exhaustive reaches %q", dporSet, exhSet)
@@ -998,7 +1023,7 @@ func exploreOutcomes(t *testing.T, out string) string {
 // over-explores them (21). The <=10 bound passes with HB pruning (4) and fails
 // without it (21), so it has teeth. See docs/dst/design.md (Level 2, increment 2).
 func TestDSTExploreHBPrunes(t *testing.T) {
-	out := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=twopair", "DSTMODE=dpor")
+	out := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=twopair", "DSTMODE=dpor")
 	if exploreFailures(t, out) != 0 {
 		t.Fatalf("explorer reported a spurious race on channel-ordered (not racing) accesses: %q", out)
 	}
@@ -1106,5 +1131,45 @@ func TestDSTExploreRaceOracle(t *testing.T) {
 		if a, b := exploreField(t, out, "firstrace"), exploreField(t, out2, "firstrace"); a != b {
 			t.Fatalf("race oracle (%s) nondeterministic: first-race schedule %q vs %q", mode, a, b)
 		}
+	}
+}
+
+// TestDSTExploreAutoInstrument is the increment-1 acceptance: the dst-race compiler
+// mode auto-inserts a dstAccessYield before each -race memory-access hook, so an
+// UNMODIFIED SUT (no manual dstAccessYield/dstSyncAcquire) becomes explorable.
+// unmodifiedRMWSUT is two goroutines doing an unsynchronized read-modify-write of a
+// shared counter; the lost update (final != 2) is reachable ONLY because the compiler
+// made the reads/writes interleavable. The test asserts:
+//   - assertfail >= 1: Explore found the lost-update interleaving with no hand
+//     annotation (auto-instrumentation feeds the explorer end-to-end).
+//   - complete == true: DPOR's reachable-outcome set equals brute-force Exhaustive's.
+//     The dense auto-instrumentation triggers source-DPOR's no-enabled-weak-initial
+//     path (addSourceBacktrack), which the hand-annotated family sweep never reaches;
+//     this equality is the guard that SKIPPING there is complete (DST-L2-3) rather
+//     than the panic an earlier draft wrongly asserted.
+//
+// Built explicitly WITH -race (auto-instrumentation is gated on -tags dst + -race).
+// Skipped where the race detector is unavailable.
+func TestDSTExploreAutoInstrument(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the dst-race auto-instrumentation build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	exe := filepath.Join(t.TempDir(), "tp_race")
+	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
+	out := runBuiltTestProg(t, exe, "DSTExploreAuto", "DSTSEED=1")
+	if a, err := strconv.Atoi(exploreField(t, out, "assertfail")); err != nil {
+		t.Fatalf("bad assertfail field in %q: %v", out, err)
+	} else if a < 1 {
+		t.Fatalf("compiler auto-instrumentation did not feed the explorer: the unmodified "+
+			"RMW SUT's lost-update interleaving was not found (assertfail=0):\n%s", out)
+	}
+	if exploreField(t, out, "complete") != "true" {
+		t.Fatalf("source-DPOR dropped a class on the auto-instrumented SUT (the "+
+			"no-enabled-weak-initial fallback is not complete — DST-L2-3):\n%s", out)
 	}
 }

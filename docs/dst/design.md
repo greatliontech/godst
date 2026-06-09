@@ -838,7 +838,16 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    access granularity incl. yields while holding a user lock (DST-L2-1; 200/200 over 50 seeds, normal and
    `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
    per-run yield magnitude measured (every access yields → filtering is increment 6). **Compiler half
-   (Option 1): deferred** to after 2–4 per sequencing (b). Foreclosure: feeds the same seam.
+   (Option 1): IMPLEMENTED [V]** — `cmd/compile` `instrument2` (ssagen) emits an additional
+   `runtime.dstAccessYield(addr, isWrite)` immediately before each `race{read,write,readrange,writerange}`
+   hook, gated by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race`
+   are both present; the race hook itself is untouched (oracle byte-identical), the yield is skipped in
+   `//go:nosplit` functions (`goyield` is splittable; skipping is sound), and with the flag off the pass
+   emits plain `race*` exactly as upstream (DST-L2-4 — verified absent in non-dst and dst-without-race
+   builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
+   (`TestDSTExploreAutoInstrument`: the lost update is found, DPOR outcome set == Exhaustive). Foreclosure:
+   feeds the same seam. (Runtime sync-primitive hooks for `dstSyncAcquire` — chan ops, a `sync.Mutex`/sema
+   hook — and shared-address filtering for the auto-instrumentation explosion remain follow-ups.)
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
    records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
    (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
@@ -941,10 +950,14 @@ dependency loop documents the relation.
    reproducible on demand via `DSTSWEEP=heavy`, is also complete (12.5× reduction, 161242→12892). Payoff is
    modest on tiny SUTs (persistent-set is already near-optimal there), larger as independent transitions
    multiply. `TestDSTExploreSweep` enforces both completeness (mismatches=0) and the optimality bound
-   (`maxDpor` < 80; persistent-set regresses to 125, dropping sleep to 85). The source-set add always finds
-   an enabled weak-initial (a witness-minimal event's process is necessarily enabled at its decision —
-   `addSourceBacktrack` asserts this with a panic rather than a silent all-enabled add; fallbacks=0 over
-   both sweeps).
+   (`maxDpor` < 80; persistent-set regresses to 125, dropping sleep to 85). When the source-set witness has
+   no enabled weak-initial at a decision (every process that could lead to e_j is blocked until e_i runs),
+   the reversed order is UNREACHABLE from that state and `addSourceBacktrack` adds no backtrack — skipping,
+   not the all-enabled add (which under sleep sets could drop a class), and not a panic. The hand-annotated
+   family sweep never reaches this path (`fallbacks=0`); the dst-race compiler's denser auto-instrumentation
+   does (a read-modify-write whose read and write both yield), and `TestDSTExploreAutoInstrument` validates
+   that skipping there stays complete (DPOR outcome set == Exhaustive). (An earlier draft wrongly asserted
+   this path unreachable and panicked; auto-instrumentation showed it is reachable.)
 6. **Infrastructure isolation + shared-address filtering** (D1, using D2). *gcDrain isolation* —
    **VALIDATED [V]**: the bubble's finalizer-drain goroutine is scheduled RNG-free as infrastructure
    under the scheduled strategy (`firstSystemG`), so it leaves the recorded schedule/DPOR search; cut the

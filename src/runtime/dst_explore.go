@@ -37,7 +37,14 @@ var dstAccessYieldPoints uint64
 // inherited from Seq 5 unchanged.
 func dstYieldAccess(addr uintptr, write bool) {
 	gp := getg()
-	if !dstActive() || gp.bubble == nil || gp != gp.m.curg || gp.m.locks != 0 {
+	// Access-granularity yielding is a Level-2 (scheduled-strategy) mechanism. Under
+	// the Seq-5 Random/PCT strategies the interleaving atoms are the coarse cooperative
+	// points, and an extra yield at every access would perturb those strategies — which
+	// matters now that the dst-race compiler mode auto-inserts this at EVERY memory
+	// access under -race (so any -tags dst -race run, not just Explore, reaches here).
+	// Gating to dstSchedScheduled confines access yields to Explore; non-scheduled
+	// strategies are byte-for-byte unaffected.
+	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil || gp != gp.m.curg || gp.m.locks != 0 {
 		return
 	}
 	gp.dstAccAddr = addr

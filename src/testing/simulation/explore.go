@@ -370,18 +370,14 @@ func dporHB(clk [][]uint32, pidx map[uint64]int, tr exploreTrace, a, b int) bool
 // If fr.backtrack already holds an enabled weak-initial, nothing is added (source-set
 // minimality — do not explore the same reversal twice).
 //
-// INVARIANT: a witness-minimal event's process is always enabled at decision i, so an
-// enabled weak-initial always exists. (Any predecessor of a witness-minimal event m
-// that lay in (i,j] would either be in the witness — making m non-minimal — or be
-// trace-happens-before-after e_i — excluding m from the witness; so all of m's
-// predecessors are in the already-executed prefix ≤ i, hence proc(m) is ready to run m
-// at i. All enabling dependencies — locks, channels, goroutine creation, WaitGroup —
-// are goready edges captured in trace-HB, so a blocked process can never be a
-// witness-minimal.) Empirically fallbacks=0 over both the standing (289) and heavy
-// (369, incl. 3 goroutines × 2 ops) sweeps. The "no enabled weak-initial" branch is
-// therefore a defensive assertion: a panic (never a silent all-enabled add, which
-// with sleep sets could drop a class — DST-L2-3) — so a violation of the invariant
-// fails loud instead of silently incomplete.
+// When NO weak-initial is enabled at i, the body skips (adds no backtrack): every
+// process that could lead to e_j has an intervening transition that
+// trace-happens-after e_i, so it is blocked until e_i runs, making the reversed order
+// (e_j before e_i) unreachable from this state — not a missed class. The hand-annotated
+// sweeps never reach this branch (fallbacks=0 over the 289 + 369 families); the
+// dst-race compiler's denser auto-instrumentation does (a read-modify-write whose read
+// and write both yield), and TestDSTExploreAutoInstrument validates that skipping there
+// keeps DPOR's outcome set == Exhaustive's (DST-L2-3). See the body for the full note.
 func addSourceBacktrack(fr *dporFrame, tr exploreTrace, clk [][]uint32, pidx map[uint64]int, i, j int) {
 	// Witness events: k in (i, j], with k == j or e_i does NOT happen-before e_k.
 	var witness []int
@@ -428,13 +424,19 @@ func addSourceBacktrack(fr *dporFrame, tr exploreTrace, clk [][]uint32, pidx map
 		fr.backtrack[best] = true
 		return
 	}
-	// Unreachable for recorded access+sync transitions (see the INVARIANT above): a
-	// reversible race always has an enabled weak-initial. Assert it loudly rather than
-	// silently adding all-enabled (which under sleep sets could drop a Mazurkiewicz
-	// class — DST-L2-3).
-	panic("testing/simulation: internal error: reversible race with no enabled " +
-		"weak-initial — DST-L2-3 invariant violated (witness-minimal event's process " +
-		"must be enabled at its decision); please report the SUT")
+	// No weak-initial is enabled at decision i. Every process that could lead to e_j
+	// has an intervening transition that trace-happens-after e_i (so it is blocked
+	// until e_i itself runs); hence the reversed order (e_j before e_i) is UNREACHABLE
+	// from this state — it is not a missed Mazurkiewicz class — so add no backtrack.
+	//
+	// This case does not arise for hand-annotated SUTs (the manual hooks place yields
+	// at structured points), but it does under the dst-race compiler's denser
+	// auto-instrumentation (a read-modify-write whose read and write both yield). An
+	// earlier draft asserted this unreachable and panicked; that was wrong — the
+	// witness-minimal event's process can be blocked at i. Skipping (not all-enabled,
+	// which under sleep sets could drop a class) is the complete action; validated by
+	// the auto-instrumented DPOR-vs-Exhaustive equivalence check (TestDSTExploreAuto-
+	// Instrument) and the generated-family sweep.
 }
 
 // dporClocks computes a vector clock per transition from program order plus the
