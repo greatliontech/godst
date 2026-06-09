@@ -1027,6 +1027,15 @@ func TestDSTExploreHBPrunes(t *testing.T) {
 // sweep fails 23/289; with it, 0 — so it has teeth. See docs/dst/design.md
 // (Level 2, DST-L2-3 + "Completeness boundary").
 //
+// It ALSO guards source-DPOR OPTIMALITY: the sweep reports maxDpor, the largest
+// per-program DPOR schedule count. Full source-DPOR (sleep sets + weak-initial source
+// sets) holds maxDpor=69 on this family. Mutation-measured regressions: dropping
+// sleep (weak-initials only) → 85; dropping both → the persistent-set search → 125.
+// The <80 bound below therefore catches a regression of EITHER mechanism (the
+// remaining one, dropping weak-initials, makes the search incomplete and is caught by
+// mismatches instead). Completeness (mismatches=0) is the hard invariant; this is the
+// optimality regression catch. maxDpor is deterministic for the fixed family+seed.
+//
 // Built WITHOUT -race: completeness is a property of the DPOR algorithm, not the
 // detector, and the no-mutex SUTs contain intentional data races the detector would
 // otherwise report. Skipped under -short (it is exhaustive over the family);
@@ -1042,5 +1051,11 @@ func TestDSTExploreSweep(t *testing.T) {
 	if exploreField(t, out, "mismatches") != "0" {
 		t.Fatalf("DPOR completeness sweep found mismatches vs exhaustive enumeration "+
 			"(a dropped Mazurkiewicz class — DST-L2-3 violation):\n%s", out)
+	}
+	if maxDpor, err := strconv.Atoi(exploreField(t, out, "maxDpor")); err != nil {
+		t.Fatalf("bad maxDpor field in %q: %v", out, err)
+	} else if maxDpor >= 80 {
+		t.Fatalf("DPOR optimality regressed: maxDpor=%d (full source-DPOR holds 69; "+
+			"dropping sleep sets → 85, dropping to the persistent-set search → 125):\n%s", maxDpor, out)
 	}
 }

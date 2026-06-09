@@ -275,9 +275,11 @@ type spProg struct {
 }
 
 // sweepFamily deterministically enumerates the validation corpus. Each shape
-// stresses a different part of the dependency/HB machinery; all stay within a
-// small exhaustive budget so brute-force is feasible.
-func sweepFamily() []spProg {
+// stresses a different part of the dependency/HB machinery; the standing families
+// (1)-(4) + named SUTs stay within a small exhaustive budget so brute-force is
+// feasible (~8s). With heavy==true it also appends the slow stress families (5)-(6)
+// (~140s) — opt-in via DSTSWEEP=heavy, not run every build.
+func sweepFamily(heavy bool) []spProg {
 	var fam []spProg
 	rw2 := []spOp{{'R', 0}, {'W', 0}, {'R', 1}, {'W', 1}} // 2 vars, read/write
 	rw1 := []spOp{{'R', 0}, {'W', 0}}                     // 1 var, read/write
@@ -326,6 +328,40 @@ func sweepFamily() []spProg {
 				gb := []spOp{{'L', 0}, b, {'U', 0}}
 				gc := []spOp{{'L', 0}, c, {'U', 0}}
 				fam = append(fam, spProg{nVars: 1, nMu: 1, gor: [][]spOp{ga, gb, gc}})
+			}
+		}
+	}
+	if !heavy {
+		// Standing sweep stops here (~8s). The heavy families below add no bug class
+		// the standing families miss — the trace-HB source-set regression is already
+		// caught by family (3) (a sync-HB source set drops a class there, e.g.
+		// prog#274/276) — but they exercise the weak-initial/sleep interaction (and the
+		// all-enabled fallback) far harder, so DSTSWEEP=heavy runs them on demand.
+		return fam
+	}
+	// (5) 3 goroutines, 2 ops each over 1 var, NO sync — a write among independent
+	// MULTI-op readers: the hardest stress on the trace-happens-before weak-initials
+	// (exhaustive up to ~2520/program). Validated complete (mismatches=0).
+	for _, a := range rw1 {
+		for _, b := range rw1 {
+			for _, c := range rw1 {
+				for _, d := range rw1 {
+					for _, e := range rw1 {
+						for _, f := range rw1 {
+							fam = append(fam, spProg{nVars: 1, gor: [][]spOp{{a, b}, {c, d}, {e, f}}})
+						}
+					}
+				}
+			}
+		}
+	}
+	// (6) 4 goroutines, 1 op each over 1 var — higher-multiplicity contention.
+	for _, a := range rw1 {
+		for _, b := range rw1 {
+			for _, c := range rw1 {
+				for _, d := range rw1 {
+					fam = append(fam, spProg{nVars: 1, gor: [][]spOp{{a}, {b}, {c}, {d}}})
+				}
 			}
 		}
 	}
@@ -512,6 +548,9 @@ func sweepCheck(st *sweepStats, seed uint64, label string, sut func() bool) {
 	case dporRes.Schedules > exhRes.Schedules:
 		bad("dpor=" + strconv.Itoa(dporRes.Schedules) + ">exh=" + strconv.Itoa(exhRes.Schedules))
 	default:
+		// Optimality stats (totDpor/maxDpor/optimal) accumulate only for mismatch-free
+		// programs — they are a metric layered behind the completeness gate, not a
+		// completeness signal themselves (a dropped class shows up as a mismatch above).
 		st.totExh += exhRes.Schedules
 		st.totDpor += dporRes.Schedules
 		if exhRes.Schedules > st.maxExh {
@@ -536,7 +575,7 @@ func sweepCheck(st *sweepStats, seed uint64, label string, sut func() bool) {
 // totDpor/totExh quantify the reduction. On a mismatch it also prints a "firstBad="
 // detail line and the list of failing labels for debugging.
 func DSTExploreSweep() {
-	fam := sweepFamily()
+	fam := sweepFamily(os.Getenv("DSTSWEEP") == "heavy")
 	named := namedSweepSUTs()
 	seed := dstSeedEnv()
 	st := &sweepStats{}

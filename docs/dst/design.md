@@ -760,11 +760,16 @@ stored global states.
   prefix, return the candidate index whose goid matches the prescribed choice; else pick the default and
   let the post-run analysis add backtracks. Installed per bubble at the synctest re-root point (the
   `dstSchedRootPCT()` slot, `synctest.go`), like every other per-bubble scheduling state.
-- **Post-run analysis (the DPOR core).** After each Run, walk the recorded transition trace; for every
-  pair of dependent co-enabled transitions `(t_i, t_j)`, `i<j`, that is *reversible* (running `t_j`'s
-  thread at `t_i`'s decision is enabled), add a backtrack point at the pre-`t_i` decision to schedule
-  `t_j`'s thread there — unless a **sleep set** proves that ordering already explored. This is **optimal
-  DPOR** (source/sleep sets): no two explored schedules are Mazurkiewicz-equivalent.
+- **Post-run analysis (the DPOR core — source-DPOR).** After each Run, walk the recorded transition
+  trace; for every reversible race — a *concurrent* (sync-HB) dependent pair `(t_i, t_j)`, `i<j` — add a
+  backtrack point at the pre-`t_i` decision. The backtrack is a **weak-initial** of the race witness
+  (`addSourceBacktrack`), computed over the **trace happens-before** (`dporTraceClocks`), NOT `t_j`'s
+  thread directly: `t_j`'s thread may be asleep at `t_i`, and a weak-initial is by construction not
+  sleep-blocked for the reversal. **Sleep sets** carry each frame's already-explored / inherited threads
+  (filtered by independence with the chosen transition) and skip an asleep backtrack choice, removing the
+  equivalence-class re-exploration a plain backtrack set incurs. This is **source-DPOR** (Abdulla et al.
+  2014): complete (no Mazurkiewicz class dropped — `TestDSTExploreSweep`) and a strong reduction toward
+  one schedule per class (not the fully-optimal wakeup-tree variant, which is left unforeclosed).
 - **Soundness + determinism inherited:** every decision still picks an enabled (runnable) thread
   (DST-L2-1); each Run is fully determined by its schedule (DST-L2-2).
 
@@ -882,15 +887,16 @@ manual-hook validation phase the SUT annotates acquisitions; the dst-race compil
 them automatically (channel ops in the runtime; a dst hook in `sync.Mutex`/the sema layer). Finalizer-
 timing observation stays out of scope until that phase records *every* access; the `dporExplore`
 dependency loop documents the relation.
-5. **Optimal DPOR** (D3 sleep/source sets) — **NEXT; not started.** The current `dporExplore` is a
-   *persistent-set* DPOR: sound + complete (verified), but it re-explores Mazurkiewicz-*equivalent*
+5. **Source-DPOR — sleep sets + weak-initial source sets** (D3) — **VALIDATED [V].** The former
+   `dporExplore` was a *persistent-set* DPOR: sound + complete, but it re-explored Mazurkiewicz-*equivalent*
    interleavings via different prefixes (the per-frame `done` set precludes exact-duplicate prefixes, so
-   the residual redundancy is equivalence-class, not duplication — only sleep/source sets remove it).
-   Tightens DST-L2-3 from "covers every class" to "explores no class twice". Foreclosure: refines the
-   worklist, not the seam. **This is the riskiest remaining algorithmic piece** — a wrong sleep set
-   silently drops a class (DPOR misses a reachable bug while still reporting `Exhausted=true`), the exact
-   failure mode the effort guards against; the micro-SUT completeness tests (small spaces) are a weak net
-   for it. **Build order for this increment (do in this order):**
+   the residual redundancy is equivalence-class). Source-DPOR (Abdulla, Aronis, Jonsson & Sagonas, POPL
+   2014) removes it, tightening DST-L2-3 from "covers every class" toward "explores no class twice".
+   Foreclosure: refines the worklist, not the seam. **This was the riskiest remaining algorithmic piece** —
+   a wrong sleep set silently drops a class (DPOR misses a reachable bug while still reporting
+   `Exhausted=true`); the micro-SUT completeness tests are a weak net for it. The generated-family sweep
+   (`TestDSTExploreSweep`, step 1) is the real net, and it earned its keep twice during this build (see
+   step 2). **Build order for this increment (done in this order):**
    1. **Validator first** (so the safety net exists before the algorithm): a brute-force-equivalence
       sweep — a *generated family* of small SUTs (vary goroutine count, accesses, sync) — asserting the
       DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the committed
@@ -902,17 +908,33 @@ dependency loop documents the relation.
       more): `dstSyncAcquire` (D1) records acquisitions as conflicting transitions — zero brain change —
       and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/289 → 0). Optimality (sleep
       sets) is therefore built on a foundation the sweep proves complete.
-   2. **Sleep sets in the iterative stateless model** (Godefroid sleep sets, or optimal source-DPOR,
-      Abdulla et al. 2014). Each `dporFrame` gains a `sleep` set; a thread stays asleep (not explored at
-      that frame) until a *dependent* transition wakes it. Care: the iterative re-execution rebuilds the
-      stack each run, so sleep-set propagation across re-executions (child sleep = parent sleep filtered
-      by independence with the chosen transition) must be threaded through frame creation in the
-      `for d := len(stack); d < n` extension loop. Reuse the existing `dporConcurrent` (HB-aware
-      independence). Validate against the increment-1 validator at every step.
-   3. **Adversarial review** focused exclusively on the incompleteness failure mode (does any sleep-set
-      propagation drop a class?), plus the usual determinism/soundness pass.
-   Expected payoff: modest on the committed micro-SUTs (already practical), large on realistic SUTs with
-   many independent transitions. Do this with **full context** — it is completeness-critical and intricate.
+   2. **Source-DPOR (sleep sets + weak-initial backtracks) — VALIDATED [V].** Each `dporFrame` gains a
+      `sleep` set: a frame inherits the parent's asleep + already-explored goroutines, FILTERED by
+      independence with the transition the parent chose (a commuting goroutine stays asleep, a dependent
+      one is woken), threaded through the `for d := len(stack); d < n` extension loop; an asleep backtrack
+      choice is skipped. Sleep alone is INCOMPLETE with a crude backtrack rule — **the sweep caught it**
+      (a write between two independent reads dropped a class, prog#273). The fix is **source sets**: when a
+      reversible race (concurrent dependent pair e_i, e_j) is found, add a **weak-initial** of the witness
+      to `backtrack(i)` (`addSourceBacktrack`) rather than e_j's process directly, so the reversal survives
+      sleep-pruning. The witness/weak-initials require the **TRACE happens-before** (`dporTraceClocks` —
+      transitive closure of the dependency relation, ordering conflicting accesses), NOT the sync-only HB
+      (`dporClocks`): **the sweep caught the sync-HB version too** (an independent read became a spurious
+      weak-initial; prog#274/276). With trace-HB the sweep is complete. Two relations coexist by design:
+      the reorderability GATE uses sync-HB (`dporConcurrent` — a conflicting pair with no sync between them
+      is reorderable); the weak-initial/`notdep` uses trace-HB. Sleep independence is address-only
+      (conservative — can only under-prune, never drop a class).
+   3. **Adversarial review** (incompleteness failure mode + determinism/soundness) — run per the
+      Adversarial loop on the change set.
+   Measured (289-program standing sweep, mismatches=0): source-DPOR vs the persistent-set baseline cuts
+   the worst-program schedule count `maxDpor` 125→69 and the family total `totDpor` 2352→1962; a
+   369-program run (incl. 3 goroutines × 2 ops and 4-way contention, exhaustive up to 2520/program),
+   reproducible on demand via `DSTSWEEP=heavy`, is also complete (12.5× reduction, 161242→12892). Payoff is
+   modest on tiny SUTs (persistent-set is already near-optimal there), larger as independent transitions
+   multiply. `TestDSTExploreSweep` enforces both completeness (mismatches=0) and the optimality bound
+   (`maxDpor` < 80; persistent-set regresses to 125, dropping sleep to 85). The source-set add always finds
+   an enabled weak-initial (a witness-minimal event's process is necessarily enabled at its decision —
+   `addSourceBacktrack` asserts this with a panic rather than a silent all-enabled add; fallbacks=0 over
+   both sweeps).
 6. **Infrastructure isolation + shared-address filtering** (D1, using D2). *gcDrain isolation* —
    **VALIDATED [V]**: the bubble's finalizer-drain goroutine is scheduled RNG-free as infrastructure
    under the scheduled strategy (`firstSystemG`), so it leaves the recorded schedule/DPOR search; cut the
