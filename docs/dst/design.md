@@ -962,8 +962,13 @@ not yet covered). Finalizer-timing observation stays out of scope until *every* 
       (`dporClocks`): **the sweep caught the sync-HB version too** (an independent read became a spurious
       weak-initial; prog#274/276). With trace-HB the sweep is complete. Two relations coexist by design:
       the reorderability GATE uses sync-HB (`dporConcurrent` — a conflicting pair with no sync between them
-      is reorderable); the weak-initial/`notdep` uses trace-HB. Sleep independence is address-only
-      (conservative — can only under-prune, never drop a class).
+      is reorderable); the weak-initial/`notdep` uses trace-HB. Sleep independence is deliberately
+      coarser than the dependency relation: sleep-set entries are carried across stateless
+      re-executions, but raw access addresses are run-local (the same logical object can receive a
+      different numeric address after explorer-side allocations). So `addr=0` transitions and read/read
+      pairs commute; any nonzero pair with at least one write wakes the sleeper. The race gate still uses
+      per-run address equality + HB. This can only under-prune, never keep a dependent transition asleep
+      and drop a class.
    3. **Adversarial review** (incompleteness failure mode + determinism/soundness) — run per the
       Adversarial loop on the change set.
    Measured (289-program standing sweep, mismatches=0): source-DPOR vs the persistent-set baseline cuts

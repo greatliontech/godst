@@ -52,8 +52,8 @@ type ExploreResult struct {
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
 	Exhausted bool
-	// Overflow is true iff some run exceeded the per-bubble trace budget; coverage
-	// is then INCOMPLETE (reported, never silently capped).
+	// Overflow is true iff some run exceeded the per-bubble trace, edge, or access-log
+	// budget; coverage is then INCOMPLETE (reported, never silently capped).
 	Overflow bool
 }
 
@@ -63,6 +63,7 @@ const (
 	exploreMaxDecisions    = 1 << 14
 	exploreMaxEnabledTotal = 1 << 18
 	exploreMaxEdges        = 1 << 16
+	exploreMaxAccesses     = 1 << 16
 )
 
 // Explore systematically explores the sound interleavings of sut under seed. sut
@@ -78,7 +79,7 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 	if !dstBuilt() {
 		panic("testing/simulation: Explore requires building with -tags dst")
 	}
-	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges)
+	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges, exploreMaxAccesses)
 	if mode == DPOR {
 		return dporExplore(seed, sut)
 	}
@@ -89,16 +90,26 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 // runtime's per-bubble buffers (which the next run overwrites).
 type exploreTrace struct {
 	procs   []uint64   // [decision] chosen goroutine (stable per-bubble index, dstSeq)
-	addrs   []uintptr  // [decision] transition's access address (0 = none)
-	writes  []bool     // [decision] transition's access is a write
 	enabled [][]uint64 // [decision] enabled goroutine set (dstSeq indices)
+	// Access log: EVERY instrumented access in execution order, decoupled from the
+	// decision trace (a single-owner access records here without yielding, so it is
+	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
+	// per-decision addrs, so a conflicting pair whose first access was single-owner (so
+	// did not yield) is still reversed. accStep[k] is the dstScheduleStep the access
+	// occurred under: an access with step s was performed by procs[s-1] (the goroutine
+	// chosen at decision s-1) during the interval after decision s-1, so its reversal
+	// anchors at decision s-1. accSeq[k] therefore equals procs[accStep[k]-1].
+	accSeq   []uint64
+	accAddr  []uintptr
+	accWrite []bool
+	accStep  []int
 	// Happens-before edges (goready: edgeFrom happens-before edgeTo's resumption),
-	// edgeStep = the dstScheduleStep when the goready fired = (transition index)+1.
+	// edgeStep = the dstScheduleStep when the goready fired.
 	edgeFrom []uint64
 	edgeTo   []uint64
 	edgeStep []int
 	aborted  bool // prefix named a non-enabled goroutine (a replay-determinism bug)
-	overflow bool // run exceeded the trace or edge budget (coverage incomplete)
+	overflow bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
 }
 
 // runOnce runs sut once under the scheduled strategy following prefix, and copies
@@ -124,15 +135,21 @@ func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed, raced bool,
 		panic("testing/simulation: internal error: schedule prefix diverged on replay " +
 			"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
 	}
+	tr.overflow = tr.overflow || dstAccLogOverflowFP()
 	n := dstTraceLenFP()
 	tr.procs = make([]uint64, n)
-	tr.addrs = make([]uintptr, n)
-	tr.writes = make([]bool, n)
 	tr.enabled = make([][]uint64, n)
 	for i := 0; i < n; i++ {
 		tr.procs[i] = dstTraceChosenFP(i)
-		tr.addrs[i], tr.writes[i] = dstTraceAccessFP(i)
 		tr.enabled[i] = append([]uint64(nil), dstTraceEnabledFP(i)...) // copy: aliases runtime buffer
+	}
+	a := dstAccLogLenFP()
+	tr.accSeq = make([]uint64, a)
+	tr.accAddr = make([]uintptr, a)
+	tr.accWrite = make([]bool, a)
+	tr.accStep = make([]int, a)
+	for i := 0; i < a; i++ {
+		tr.accSeq[i], tr.accAddr[i], tr.accWrite[i], tr.accStep[i] = dstAccLogAtFP(i)
 	}
 	m := dstEdgeLenFP()
 	tr.edgeFrom = make([]uint64, m)
@@ -183,31 +200,53 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 	return res
 }
 
-// dporTrans is a transition's conflict identity for sleep-set independence: the
-// recorded access/acquisition address (0 = none) and whether it is a write.
+// dporTrans is one access's sleep-set pruning identity: its run-local address
+// (0 = no conflict identity) and whether it is a write.
 type dporTrans struct {
 	addr  uintptr
 	write bool
 }
 
-// indepTrans reports whether transitions a and b commute (are independent): they do
-// NOT both touch the same nonzero address with at least one write. Address-only
-// (no happens-before refinement). For sleep sets this is CONSERVATIVE — it can only
-// judge fewer pairs independent, which can only shrink sleep sets, which can only
-// make DPOR explore MORE, never drop a class. So it is sound for completeness
-// (DST-L2-3) while still pruning the bulk of the equivalence-class redundancy.
+// indepTrans reports the conservative independence relation used only for sleep-set
+// pruning. Sleep transitions are carried across stateless re-executions, but raw
+// access addresses are run-local: the same logical object can have different numeric
+// addresses in sibling runs after the explorer allocates. Therefore a nonzero access
+// with a write is treated as dependent on every other nonzero access. This may wake
+// extra sleepers (less pruning) but cannot keep a genuinely dependent transition
+// asleep and drop a class. Read/read and addr==0 transitions still commute.
 func indepTrans(a, b dporTrans) bool {
-	return a.addr == 0 || b.addr == 0 || a.addr != b.addr || !(a.write || b.write)
+	return a.addr == 0 || b.addr == 0 || !(a.write || b.write)
 }
 
-// dporFrame is one decision on the DPOR DFS stack.
+// indepSets reports whether two interval access-SETS commute: no access in a conflicts
+// with any access in b. A decision's "transition" under shared-address filtering is the
+// SET of accesses the chosen goroutine performed in its interval — single-owner
+// accesses record but do not yield, so one interval can hold several accesses plus the
+// conflicting one that yielded. For sleep sets this is CONSERVATIVE: a possible
+// conflict in ANY pair wakes the sleeper, so it can only wake more goroutines, never
+// wrongly keep one asleep — it cannot drop a class (DST-L2-3) while still pruning the
+// bulk of the equivalence-class redundancy.
+func indepSets(a, b []dporTrans) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if !indepTrans(x, y) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// dporFrame is one decision on the DPOR DFS stack. Its "transition" is the SET of
+// accesses the chosen goroutine performed in its interval (the access-log entries with
+// accStep == this decision's index + 1).
 type dporFrame struct {
-	proc      uint64               // the goroutine currently chosen at this decision
-	enabled   []uint64             // enabled goroutines at this decision (deterministic order)
-	backtrack map[uint64]bool      // goroutines that must be explored here (source set)
-	done      map[uint64]bool      // goroutines already explored here
-	doneTrans map[uint64]dporTrans // explored goroutines' transition at this decision (for sleep propagation)
-	sleep     map[uint64]dporTrans // goroutines asleep here (their pending transition): exploring them is redundant — skip
+	proc      uint64                 // the goroutine currently chosen at this decision
+	enabled   []uint64               // enabled goroutines at this decision (deterministic order)
+	backtrack map[uint64]bool        // goroutines that must be explored here (source set)
+	done      map[uint64]bool        // goroutines already explored here
+	doneTrans map[uint64][]dporTrans // explored goroutines' interval access-set here (for sleep propagation)
+	sleep     map[uint64][]dporTrans // goroutines asleep here (their interval access-set): redundant to explore — skip
 }
 
 // dporExplore is iterative stateless SOURCE-DPOR with SLEEP SETS (Abdulla, Aronis,
@@ -226,7 +265,7 @@ type dporFrame struct {
 //
 //   - SLEEP SETS. A frame inherits, from its parent, the parent's asleep +
 //     already-explored goroutines FILTERED by independence with the transition the
-//     parent chose (indepTrans). A goroutine that commutes with the chosen one would
+//     parent chose (indepSets). A goroutine that commutes with the chosen one would
 //     only re-derive an already-explored equivalent interleaving, so it stays asleep;
 //     a DEPENDENT one is woken. An asleep backtrack choice is skipped.
 //
@@ -239,13 +278,15 @@ type dporFrame struct {
 //     — which is provably not sleep-blocked for that ordering. This is what makes the
 //     sleep-pruned search complete (DST-L2-3), enforced by TestDSTExploreSweep.
 //
-// Independence for sleep is address-only (conservative); the race relation uses the
-// happens-before clocks (dporConcurrent), so mutex/channel-SERIALIZED conflicts are
-// pruned while a free acquisition ORDER is explored both ways. addr==0 transitions
-// (goroutine creation, WaitGroup wakeups, the isolated gcDrain goroutine) record no
-// conflict identity and are independent of everything — they carry no
-// outcome-determining order choice a recorded access/acquisition does not already
-// capture. See design.md "Completeness boundary (addr=0 transitions)".
+// Independence for sleep is deliberately coarser than the dependency relation because
+// sleep transitions cross stateless re-executions and raw addresses are run-local; a
+// nonzero access with a write wakes any nonzero sleeper. The race relation itself uses
+// per-run addresses plus the happens-before clocks (dporConcurrent), so mutex/channel-
+// SERIALIZED conflicts are pruned while a free acquisition ORDER is explored both ways.
+// addr==0 transitions (goroutine creation, WaitGroup wakeups, the isolated gcDrain
+// goroutine) record no conflict identity and are independent of everything — they
+// carry no outcome-determining order choice a recorded access/acquisition does not
+// already capture. See design.md "Completeness boundary (addr=0 transitions)".
 func dporExplore(seed uint64, sut func() bool) ExploreResult {
 	var res ExploreResult
 	var stack []*dporFrame
@@ -265,24 +306,34 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 		// runOnce panics on a divergent (aborted) replay, so the trace here is always
 		// a faithful replay of the followed prefix.
 		n := len(tr.procs)
-		// Extend the stack with the transitions this run newly revealed. Each new
-		// frame inherits its sleep set from its parent: the parent's asleep set plus
-		// the siblings it has already explored (doneTrans), FILTERED by independence
-		// with the transition the parent chose. A sleeping goroutine has not executed
-		// since it was put to sleep, so the pending transition stored with it stays
-		// valid down the frames it sleeps through.
+		// Per-decision interval access-set: decision d's transition is the SET of
+		// accesses performed in its interval — the access-log entries with
+		// accStep == d+1 (performed by procs[d]). Under shared-address filtering an
+		// interval may hold several single-owner accesses plus the conflicting one that
+		// yielded; with yield-at-every-access each interval is a singleton.
+		intervalSet := make([][]dporTrans, n)
+		for k := range tr.accSeq {
+			if d := tr.accStep[k] - 1; d >= 0 && d < n {
+				intervalSet[d] = append(intervalSet[d], dporTrans{addr: tr.accAddr[k], write: tr.accWrite[k]})
+			}
+		}
+		// Extend the stack with the decisions this run newly revealed. Each new frame
+		// inherits its sleep set from its parent: the parent's asleep + already-explored
+		// goroutines, FILTERED by independence with the parent's chosen interval set. A
+		// sleeping goroutine has not executed since it was put to sleep, so the access
+		// set stored with it stays valid down the frames it sleeps through.
 		for d := len(stack); d < n; d++ {
-			sleep := map[uint64]dporTrans{}
+			sleep := map[uint64][]dporTrans{}
 			if d > 0 {
 				par := stack[d-1]
-				pt := dporTrans{addr: tr.addrs[d-1], write: tr.writes[d-1]}
+				pt := intervalSet[d-1]
 				for q, qt := range par.sleep {
-					if indepTrans(qt, pt) {
+					if indepSets(qt, pt) {
 						sleep[q] = qt
 					}
 				}
 				for q, qt := range par.doneTrans {
-					if indepTrans(qt, pt) {
+					if indepSets(qt, pt) {
 						sleep[q] = qt
 					}
 				}
@@ -292,39 +343,45 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 				enabled:   tr.enabled[d],
 				backtrack: map[uint64]bool{tr.procs[d]: true},
 				done:      map[uint64]bool{},
-				doneTrans: map[uint64]dporTrans{},
+				doneTrans: map[uint64][]dporTrans{},
 				sleep:     sleep,
 			})
 		}
-		// Source-set race analysis: for every reversible race (concurrent dependent
-		// pair) e_i, e_j (i<j), add a weak-initial of the witness to backtrack(i). The
-		// REORDERABILITY gate uses the SYNC happens-before (dporClocks): a conflicting
-		// pair with no synchronization between them is reorderable. The weak-initial /
-		// notdep computation uses the TRACE happens-before (dporTraceClocks), which also
-		// orders conflicting pairs, so an independent access never becomes a spurious
-		// weak-initial.
+		// Source-set race analysis over the ACCESS LOG: for every reversible race (a
+		// concurrent dependent pair of log entries i<j), add a weak-initial of the
+		// witness to the backtrack of the decision BEFORE log entry i — decision
+		// accStep[i]-1, the choice point that ran i's goroutine (so a weak-initial run
+		// there reaches j before i). The REORDERABILITY gate uses the SYNC
+		// happens-before (dporClocks); the weak-initial / notdep computation uses the
+		// TRACE happens-before (dporTraceClocks), which also orders conflicting accesses
+		// so an independent access never becomes a spurious weak-initial. Both clocks
+		// are over log entries.
 		clk, pidx := dporClocks(tr)
 		traceClk, tracePidx := dporTraceClocks(tr)
-		for j := 0; j < n; j++ {
+		nLog := len(tr.accSeq)
+		for j := 0; j < nLog; j++ {
 			for i := j - 1; i >= 0; i-- {
-				if tr.addrs[i] != 0 && tr.addrs[i] == tr.addrs[j] &&
-					(tr.writes[i] || tr.writes[j]) && tr.procs[i] != tr.procs[j] &&
-					dporConcurrent(clk, pidx, tr, i, j) {
-					addSourceBacktrack(stack[i], tr, traceClk, tracePidx, i, j)
+				if tr.accAddr[i] != 0 && tr.accAddr[i] == tr.accAddr[j] &&
+					(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j] {
+					if dporConcurrent(clk, pidx, tr, i, j) {
+						if d := tr.accStep[i] - 1; d >= 0 && d < n {
+							addSourceBacktrack(stack[d], tr.enabled[d], tr, traceClk, tracePidx, i, j)
+						}
+					}
 				}
 			}
 		}
 		// Backtrack to the deepest decision with an unexplored, NON-ASLEEP backtrack
 		// choice (deterministic enabled order); discard fully-explored frames. As each
-		// chosen goroutine's subtree completes, record its transition (doneTrans, from
-		// this run's trace at that depth — the prefix matched so stack[d].proc ==
-		// tr.procs[d]) so children inherit it into their sleep set.
+		// chosen goroutine's subtree completes, record its interval access-set
+		// (doneTrans — the prefix matched so stack[d].proc == procs[d]) so children
+		// inherit it into their sleep set.
 		picked := false
 		for len(stack) > 0 {
 			d := len(stack) - 1
 			top := stack[d]
 			top.done[top.proc] = true
-			top.doneTrans[top.proc] = dporTrans{addr: tr.addrs[d], write: tr.writes[d]}
+			top.doneTrans[top.proc] = intervalSet[d]
 			for _, g := range top.enabled {
 				if top.backtrack[g] && !top.done[g] {
 					if _, asleep := top.sleep[g]; asleep {
@@ -348,50 +405,50 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 	return res
 }
 
-// dporHB reports whether transition a happens-before transition b (a → b) per the
-// vector clocks: b's clock has seen a's process up to at least a's tick.
+// dporHB reports whether access a happens-before access b (a → b) per the vector
+// clocks (a, b are ACCESS-LOG indices): b's clock has seen a's goroutine up to at
+// least a's tick.
 func dporHB(clk [][]uint32, pidx map[uint64]int, tr exploreTrace, a, b int) bool {
-	pa := pidx[tr.procs[a]]
+	pa := pidx[tr.accSeq[a]]
 	return clk[b][pa] >= clk[a][pa]
 }
 
-// addSourceBacktrack adds a WEAK-INITIAL of the race (i,j) witness to fr.backtrack
-// (fr = the frame at decision i), so the reversed ordering of the concurrent
-// dependent pair e_i ⋖ e_j survives sleep-set pruning.
+// addSourceBacktrack adds a WEAK-INITIAL of the race witness for the concurrent
+// dependent ACCESS-LOG pair (i, j), i<j, to fr.backtrack — where fr is the frame at
+// the decision BEFORE log entry i (decision accStep[i]-1) and enabled is that
+// decision's enabled set — so the reversed ordering e_i ⋖ e_j survives sleep-set
+// pruning. i and j are ACCESS-LOG indices.
 //
-// The witness is the events after decision i, up to and including e_j, that e_i does
-// not happen-before (so they could precede e_i's reversal) — always including e_j. A
-// process p is a WEAK-INITIAL of the witness iff its first witness event has no
-// earlier witness event happening-before it: p can be scheduled first at decision i
-// and lead toward e_j-before-e_i. Adding such a p (rather than e_j's process
-// directly) is the source-DPOR fix: e_j's process may be asleep at i, but a
-// weak-initial is, by construction, not sleep-blocked for this ordering.
+// The witness is the log entries after i, up to and including j, that e_i does NOT
+// happen-before (so they could precede e_i's reversal) — always including j. A
+// goroutine p is a WEAK-INITIAL of the witness iff its first witness entry has no
+// earlier witness entry happening-before it: p can be scheduled first at the decision
+// and lead toward e_j-before-e_i. Adding such a p (rather than e_j's goroutine
+// directly) is the source-DPOR fix: e_j's goroutine may be asleep, but a weak-initial
+// is by construction not sleep-blocked for this ordering.
 //
 // If fr.backtrack already holds an enabled weak-initial, nothing is added (source-set
-// minimality — do not explore the same reversal twice).
-//
-// When NO weak-initial is enabled at i, the body skips (adds no backtrack): every
-// process that could lead to e_j has an intervening transition that
+// minimality). When NO weak-initial is enabled, the body skips (adds no backtrack):
+// every goroutine that could lead to e_j has an intervening access that
 // trace-happens-after e_i, so it is blocked until e_i runs, making the reversed order
-// (e_j before e_i) unreachable from this state — not a missed class. The hand-annotated
-// sweeps never reach this branch (fallbacks=0 over the 289 + 369 families); the
-// dst-race compiler's denser auto-instrumentation does (a read-modify-write whose read
-// and write both yield), and TestDSTExploreAutoInstrument validates that skipping there
-// keeps DPOR's outcome set == Exhaustive's (DST-L2-3). See the body for the full note.
-func addSourceBacktrack(fr *dporFrame, tr exploreTrace, clk [][]uint32, pidx map[uint64]int, i, j int) {
-	// Witness events: k in (i, j], with k == j or e_i does NOT happen-before e_k.
+// unreachable from this state — not a missed class. The hand-annotated sweeps never
+// reach this branch; the dst-race compiler's denser auto-instrumentation does (a
+// read-modify-write whose read and write both yield), and the DPOR-vs-Exhaustive
+// equivalence checks validate that skipping there keeps DPOR complete (DST-L2-3).
+func addSourceBacktrack(fr *dporFrame, enabled []uint64, tr exploreTrace, clk [][]uint32, pidx map[uint64]int, i, j int) {
+	// Witness entries: k in (i, j], with k == j or e_i does NOT happen-before e_k.
 	var witness []int
 	for k := i + 1; k <= j; k++ {
 		if k == j || !dporHB(clk, pidx, tr, i, k) {
 			witness = append(witness, k)
 		}
 	}
-	// Weak-initials: a process whose FIRST witness event is happens-before-minimal
-	// within the witness (no earlier witness event happens-before it).
+	// Weak-initials: a goroutine whose FIRST witness entry is happens-before-minimal
+	// within the witness (no earlier witness entry happens-before it).
 	wi := map[uint64]bool{}
 	seenProc := map[uint64]bool{}
 	for idx, k := range witness {
-		p := tr.procs[k]
+		p := tr.accSeq[k]
 		if seenProc[p] {
 			continue
 		}
@@ -408,14 +465,14 @@ func addSourceBacktrack(fr *dporFrame, tr exploreTrace, clk [][]uint32, pidx map
 		}
 	}
 	// If an enabled weak-initial is already scheduled here, this reversal is covered.
-	for _, g := range tr.enabled[i] {
+	for _, g := range enabled {
 		if wi[g] && fr.backtrack[g] {
 			return
 		}
 	}
 	// Add the lowest-dstSeq enabled weak-initial.
 	have, best := false, uint64(0)
-	for _, g := range tr.enabled[i] {
+	for _, g := range enabled {
 		if wi[g] && (!have || g < best) {
 			have, best = true, g
 		}
@@ -424,33 +481,26 @@ func addSourceBacktrack(fr *dporFrame, tr exploreTrace, clk [][]uint32, pidx map
 		fr.backtrack[best] = true
 		return
 	}
-	// No weak-initial is enabled at decision i. Every process that could lead to e_j
-	// has an intervening transition that trace-happens-after e_i (so it is blocked
-	// until e_i itself runs); hence the reversed order (e_j before e_i) is UNREACHABLE
-	// from this state — it is not a missed Mazurkiewicz class — so add no backtrack.
-	//
-	// This case does not arise for hand-annotated SUTs (the manual hooks place yields
-	// at structured points), but it does under the dst-race compiler's denser
-	// auto-instrumentation (a read-modify-write whose read and write both yield). An
-	// earlier draft asserted this unreachable and panicked; that was wrong — the
-	// witness-minimal event's process can be blocked at i. Skipping (not all-enabled,
-	// which under sleep sets could drop a class) is the complete action; validated by
-	// the auto-instrumented DPOR-vs-Exhaustive equivalence check (TestDSTExploreAuto-
-	// Instrument) and the generated-family sweep.
+	// No weak-initial is enabled — the reversed order is UNREACHABLE from this state
+	// (every goroutine that could lead to e_j is blocked until e_i runs); not a missed
+	// Mazurkiewicz class, so add no backtrack. (Skipping, not an all-enabled add, which
+	// under sleep sets could drop a class. The denser auto-instrumentation reaches this;
+	// the DPOR-vs-Exhaustive equivalence checks validate it stays complete.)
 }
 
-// dporClocks computes a vector clock per transition from program order plus the
-// recorded goready happens-before edges, so dporConcurrent can test whether two
-// transitions are causally ordered. clk[i] is transition i's proc's vector clock
-// snapshot right after its program-order tick; pidx maps a goroutine's stable
-// index (dstSeq) to a vector position.
+// dporClocks computes a SYNC happens-before vector clock per ACCESS-LOG entry from
+// program order plus the recorded goready edges, so dporConcurrent can test whether
+// two accesses are causally ordered. clk[k] is access k's goroutine's clock snapshot
+// right after access k's program-order tick; pidx maps a goroutine's stable index
+// (dstSeq) to a vector position.
 //
-// Processing is in execution (trace) order: at transition i, tick proc_i's own
-// component and snapshot; then apply every goready edge observed during that
-// transition (edgeStep == i+1, since the transition chosen at decision i runs with
-// dstScheduleStep == i+1), flowing the readier's current clock into the readied's
-// (so the readied's later transitions inherit the happens-before). Edges recorded
-// before the first decision (step 0) flow a zero clock and are no-ops.
+// Processing is in execution order, grouped by step (the access log is sorted by
+// accStep, which is non-decreasing in execution order): for each step s, tick and
+// snapshot every access in interval s (accStep == s), then apply every goready edge
+// observed during interval s (edgeStep == s), flowing the readier's current clock into
+// the readied's so its later accesses inherit the happens-before. A step with no
+// accesses (a coarse-point-only interval) still applies its edges. Edges at step 0
+// (before the first decision) flow zero clocks and are no-ops.
 func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	pidx = make(map[uint64]int)
 	addProc := func(p uint64) {
@@ -458,7 +508,7 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			pidx[p] = len(pidx)
 		}
 	}
-	for _, p := range tr.procs {
+	for _, p := range tr.accSeq {
 		addProc(p)
 	}
 	for i := range tr.edgeFrom {
@@ -484,30 +534,45 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			}
 		}
 	}
+	maxStep := 0
+	for _, s := range tr.accStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	for _, s := range tr.edgeStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	nLog := len(tr.accSeq)
+	clk = make([][]uint32, nLog)
 	applyEdges(0) // pre-first-decision edges (zero clocks; no-op, applied for faithfulness)
-	n := len(tr.procs)
-	clk = make([][]uint32, n)
-	for i := 0; i < n; i++ {
-		pi := pidx[tr.procs[i]]
-		cur[pi][pi]++
-		clk[i] = append([]uint32(nil), cur[pi]...)
-		applyEdges(i + 1) // goready edges observed while transition i ran
+	li := 0
+	for s := 1; s <= maxStep; s++ {
+		for li < nLog && tr.accStep[li] == s {
+			pi := pidx[tr.accSeq[li]]
+			cur[pi][pi]++
+			clk[li] = append([]uint32(nil), cur[pi]...)
+			li++
+		}
+		applyEdges(s)
 	}
 	return clk, pidx
 }
 
-// dporTraceClocks computes the TRACE happens-before — the Mazurkiewicz partial order
-// = the transitive closure of the DEPENDENCY relation in trace order, plus program
-// order and the recorded sync (goready) edges. Unlike dporClocks (sync edges +
-// program order only), it ALSO orders every pair of conflicting transitions (same
-// nonzero address, >=1 write) by their trace order: a later conflicting access
-// causally depends on the earlier one in THIS execution. This is the relation
-// source-DPOR's notdep / weak-initials need — "which events can move before e_i" =
-// those NOT trace-happens-before-after e_i — so that an independent access (e.g. a
-// concurrent read of a variable e_i wrote) does not become a spurious weak-initial.
-// dporConcurrent deliberately still uses dporClocks: reorderability is a SYNC
-// question, and under the trace order every conflicting pair is ordered, which is the
-// wrong test for the race gate.
+// dporTraceClocks computes the TRACE happens-before over ACCESS-LOG entries — the
+// Mazurkiewicz partial order = the transitive closure of the DEPENDENCY relation in
+// trace order, plus program order and the recorded sync (goready) edges. Unlike
+// dporClocks (sync edges + program order only), it ALSO orders every pair of
+// conflicting accesses (same nonzero address, >=1 write) by their log order: a later
+// conflicting access causally depends on the earlier one in THIS execution. This is
+// the relation source-DPOR's notdep / weak-initials need — "which accesses can move
+// before e_i" = those NOT trace-happening-after e_i — so that an independent access
+// (e.g. a concurrent read of a variable e_i wrote) does not become a spurious
+// weak-initial. dporConcurrent deliberately still uses dporClocks: reorderability is a
+// SYNC question, and under the trace order every conflicting pair is ordered, which is
+// the wrong test for the race gate.
 func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	pidx = make(map[uint64]int)
 	addProc := func(p uint64) {
@@ -515,7 +580,7 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			pidx[p] = len(pidx)
 		}
 	}
-	for _, p := range tr.procs {
+	for _, p := range tr.accSeq {
 		addProc(p)
 	}
 	for i := range tr.edgeFrom {
@@ -541,33 +606,48 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			}
 		}
 	}
-	applyEdges(0)
-	n := len(tr.procs)
-	clk = make([][]uint32, n)
-	for i := 0; i < n; i++ {
-		pi := pidx[tr.procs[i]]
-		// Conflict edges: a later access to the same address with >=1 write causally
-		// depends on every earlier conflicting access — merge their clocks in, so e_i
-		// trace-happens-before every later conflicting transition.
-		for m := 0; m < i; m++ {
-			if tr.addrs[m] != 0 && tr.addrs[m] == tr.addrs[i] && (tr.writes[m] || tr.writes[i]) {
-				mergeInto(cur[pi], clk[m])
-			}
+	maxStep := 0
+	for _, s := range tr.accStep {
+		if s > maxStep {
+			maxStep = s
 		}
-		cur[pi][pi]++
-		clk[i] = append([]uint32(nil), cur[pi]...)
-		applyEdges(i + 1)
+	}
+	for _, s := range tr.edgeStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	nLog := len(tr.accSeq)
+	clk = make([][]uint32, nLog)
+	applyEdges(0)
+	li := 0
+	for s := 1; s <= maxStep; s++ {
+		for li < nLog && tr.accStep[li] == s {
+			pi := pidx[tr.accSeq[li]]
+			// Conflict edges: a later access to the same address with >=1 write causally
+			// depends on every earlier conflicting access — merge their clocks in, so e_i
+			// trace-happens-before every later conflicting access.
+			for m := 0; m < li; m++ {
+				if tr.accAddr[m] != 0 && tr.accAddr[m] == tr.accAddr[li] && (tr.accWrite[m] || tr.accWrite[li]) {
+					mergeInto(cur[pi], clk[m])
+				}
+			}
+			cur[pi][pi]++
+			clk[li] = append([]uint32(nil), cur[pi]...)
+			li++
+		}
+		applyEdges(s)
 	}
 	return clk, pidx
 }
 
-// dporConcurrent reports whether transitions i and j (i<j, different goroutines)
-// are concurrent — neither happens-before the other. Transition a happens-before b
-// iff b's clock has seen a's proc up to at least a's tick; the pair is concurrent
-// iff neither direction holds.
+// dporConcurrent reports whether accesses i and j (i<j ACCESS-LOG indices, different
+// goroutines) are concurrent — neither sync-happens-before the other. Access a
+// happens-before b iff b's clock has seen a's goroutine up to at least a's tick; the
+// pair is concurrent iff neither direction holds.
 func dporConcurrent(clk [][]uint32, pidx map[uint64]int, tr exploreTrace, i, j int) bool {
-	pi := pidx[tr.procs[i]]
-	pj := pidx[tr.procs[j]]
+	pi := pidx[tr.accSeq[i]]
+	pj := pidx[tr.accSeq[j]]
 	iBeforeJ := clk[j][pi] >= clk[i][pi]
 	jBeforeI := clk[i][pj] >= clk[j][pj]
 	return !iBeforeJ && !jBeforeI

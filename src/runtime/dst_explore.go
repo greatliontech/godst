@@ -156,6 +156,50 @@ var (
 	dstEdgeOverflow bool
 )
 
+// Access log buffers (shared-address filtering, increment 6). Unlike the per-decision
+// trace (which records the access of the goroutine CHOSEN at each scheduling
+// decision), the access log records EVERY instrumented access in execution order —
+// (accessing goroutine dstSeq, addr, isWrite, the dstScheduleStep it occurred under) —
+// decoupled from whether the access yielded. This decoupling is what lets the runtime
+// FILTER: a single-owner access can "record but not yield" (design.md D1) while the
+// brain still sees it for the dependency relation. The brain sources DPOR's
+// dependency/HB relation from this log (not the decision trace), so a conflicting
+// pair whose FIRST access was single-owner-at-the-time (hence did not yield, so is not
+// a decision) is still reversed. Pre-sized (never grown under the lock); over-budget
+// sets dstAccLogOverflow (reported, never a silent cap).
+var (
+	dstAccLogSeq      []uint64
+	dstAccLogAddr     []uintptr
+	dstAccLogWrite    []bool
+	dstAccLogStep     []int32
+	dstAccLogN        int
+	dstAccLogOverflow bool
+)
+
+// dstRecordAccess appends one access to the log in COMMIT order: (seq, addr, write,
+// step), where step is the dstScheduleStep the access commits under (so an access with
+// step s was committed by the goroutine chosen at decision s-1, and its reversal
+// anchors at decision s-1). Logging in COMMIT order, not announce order, is
+// load-bearing: an access is *announced* at dstAccessYield (when the goroutine reaches
+// it and yields) but *commits* only when the goroutine is next resumed — those orders
+// differ, and the dependency relation needs the order the memory operations actually
+// take effect. So a YIELDING access is logged at the scheduling decision that resumes
+// it (dstScheduledSelect, step = dstScheduleStep+1); a NON-yielding (shared-address-
+// filtered) access commits inline with no reschedule, so announce order == commit
+// order and it is logged at dstAccessYield (step = dstScheduleStep). Allocation-free;
+// the dstScheduledSelect caller runs under sched.lock, so this must not allocate.
+func dstRecordAccess(seq uint64, addr uintptr, write bool, step int) {
+	if dstAccLogN < len(dstAccLogSeq) {
+		dstAccLogSeq[dstAccLogN] = seq
+		dstAccLogAddr[dstAccLogN] = addr
+		dstAccLogWrite[dstAccLogN] = write
+		dstAccLogStep[dstAccLogN] = int32(step)
+		dstAccLogN++
+	} else {
+		dstAccLogOverflow = true
+	}
+}
+
 // dstRecordReadyEdge records the happens-before edge readier -> readied at a
 // goready, under the scheduled strategy. Both ends are assigned a stable index if
 // needed (lazy, like first candidacy). Called from goready before the systemstack
@@ -186,10 +230,11 @@ func dstRecordReadyEdge(readier, readied *g) {
 // dstExploreInit pre-sizes the trace buffers for the exploration. Called by the
 // brain once, on a normal goroutine (off-lock), before any scheduled Run.
 // maxDecisions bounds the per-bubble decision count; maxEnabledTotal bounds the
-// total enabled-set entries across all decisions in one bubble.
+// total enabled-set entries across all decisions in one bubble; maxAccesses bounds
+// the per-bubble access-log entries.
 //
 //go:linkname dstExploreInit
-func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges int) {
+func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstTraceChosen = make([]uint64, maxDecisions)
 	dstTraceEnabOff = make([]int32, maxDecisions)
 	dstTraceEnabLen = make([]int32, maxDecisions)
@@ -199,6 +244,10 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges int) {
 	dstEdgeFrom = make([]uint64, maxEdges)
 	dstEdgeTo = make([]uint64, maxEdges)
 	dstEdgeStep = make([]int32, maxEdges)
+	dstAccLogSeq = make([]uint64, maxAccesses)
+	dstAccLogAddr = make([]uintptr, maxAccesses)
+	dstAccLogWrite = make([]bool, maxAccesses)
+	dstAccLogStep = make([]int32, maxAccesses)
 }
 
 // dstScheduleReset prepares the scheduled-strategy state for a new bubble. Called
@@ -213,6 +262,8 @@ func dstScheduleReset() {
 	dstSeqCtr = 0
 	dstEdgeN = 0
 	dstEdgeOverflow = false
+	dstAccLogN = 0
+	dstAccLogOverflow = false
 }
 
 // dstScheduledSelect implements the scheduled strategy at the unified seam. Every
@@ -252,6 +303,17 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		dstTraceChosen[dstTraceN] = chosen.dstSeq
 		dstTraceAddr[dstTraceN] = chosen.dstAccAddr
 		dstTraceWrite[dstTraceN] = chosen.dstAccWrite
+		// Log this decision's transition in COMMIT order: the chosen goroutine announced
+		// its pending access (set dstAccAddr) at an earlier dstAccessYield and yielded;
+		// it is now resumed to commit it, in the interval after this decision (so it runs
+		// with dstScheduleStep+1). One log entry per decision — INCLUDING coarse points
+		// (block/create/pure yield), recorded with addr==0 — so the log mirrors the
+		// decision sequence the DPOR happens-before clocks and source-set witness range
+		// over (a coarse transition is independent of everything, addr==0, but it ticks
+		// its goroutine's clock and can be a weak-initial, exactly as a decision does).
+		// Logging here (not at the announce) gives the order the memory operations
+		// actually take effect.
+		dstRecordAccess(chosen.dstSeq, chosen.dstAccAddr, chosen.dstAccWrite, dstScheduleStep+1)
 		// Consume the pending access: the transition about to run performs it
 		// exactly once. Without this, a goroutine that next blocks at a *coarse*
 		// point (channel/WaitGroup) rather than at another dstAccessYield would carry
@@ -308,8 +370,8 @@ func dstTraceLenFP() int { return dstTraceN }
 func dstTraceChosenFP(i int) uint64 { return dstTraceChosen[i] }
 
 // dstTraceAccessFP reports the memory access the transition chosen at decision i
-// performed: addr (0 = none) and whether it was a write. The DPOR dependency
-// relation pairs decisions with the same nonzero addr where at least one is a write.
+// performed: addr (0 = none) and whether it was a write. Kept as part of the
+// decision-trace interface; log-based DPOR uses dstAccLogAtFP for dependency/HB.
 //
 //go:linkname dstTraceAccessFP
 func dstTraceAccessFP(i int) (addr uintptr, write bool) {
@@ -347,6 +409,24 @@ func dstEdgeAtFP(i int) (from, to uint64, step int) {
 
 //go:linkname dstEdgeOverflowFP
 func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
+
+// dstAccLogLenFP reports the access-log entry count recorded by the last run;
+// dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, isWrite, the
+// dstScheduleStep it occurred under). The brain sources DPOR's dependency/HB relation
+// from this log (decoupled from the decision trace) so single-owner accesses can be
+// filtered to non-yields without losing the dependency. dstAccLogOverflowFP reports a
+// budget overflow (coverage incomplete — never a silent cap).
+//
+//go:linkname dstAccLogLenFP
+func dstAccLogLenFP() int { return dstAccLogN }
+
+//go:linkname dstAccLogAtFP
+func dstAccLogAtFP(i int) (seq uint64, addr uintptr, write bool, step int) {
+	return dstAccLogSeq[i], dstAccLogAddr[i], dstAccLogWrite[i], int(dstAccLogStep[i])
+}
+
+//go:linkname dstAccLogOverflowFP
+func dstAccLogOverflowFP() bool { return dstAccLogOverflow }
 
 // dstScheduleAbortedFP reports whether the last run's prefix was invalid for that
 // execution (named a non-enabled dstSeq at some decision).
