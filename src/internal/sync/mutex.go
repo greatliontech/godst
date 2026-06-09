@@ -59,6 +59,13 @@ const (
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Lock() {
+	// DST Level-2: announce the impending acquisition on the mutex identity BEFORE the
+	// fast-path CAS, so the lock-acquisition order is a DPOR transition. The
+	// dstHookEnabled const folds this away outside a -tags dst -race build, so Lock is
+	// byte-identical to upstream (DST-L2-4); see dst_on.go/dst_off.go.
+	if dstHookEnabled {
+		dstSyncAcquire(m)
+	}
 	// Fast path: grab unlocked mutex.
 	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
 		if race.Enabled {

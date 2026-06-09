@@ -27,6 +27,7 @@ func init() {
 	register("DSTExploreSweep", DSTExploreSweep)
 	register("DSTExploreRaceOracle", DSTExploreRaceOracle)
 	register("DSTExploreAuto", DSTExploreAuto)
+	register("DSTExploreSyncAuto", DSTExploreSyncAuto)
 }
 
 // dstYieldPoint is a cooperative yield with no recorded access; dstAccessYield
@@ -417,6 +418,123 @@ func multiOutcomeSUT() bool {
 	wg.Wait()
 	dstOutcomes[counter] = true
 	return false
+}
+
+// --- Runtime sync-acquisition auto-hook acceptance (deferral 1) ----------------
+//
+// The memory-access compiler auto-instrumentation (increment 1) makes an
+// unmodified SUT's shared READS/WRITES explorable, but NOT its lock/rendezvous
+// ACQUISITION order: that decision is an addr=0 transition (a goroutine reaching
+// its Lock records no memory access), and the in-section accesses are
+// mutex-SERIALIZED (happens-before-ordered, not a reorderable race), so DPOR keeps
+// only one acquisition order while Exhaustive — which branches on which goroutine
+// runs first — finds both. That is the prog#257 completeness gap (DST-L2-3). Wiring
+// the runtime sync primitives to dstSyncAcquire (internal/sync.Mutex.Lock and
+// chan.go chansend/chanrecv, gated to a -tags dst -race build) records each
+// acquisition as a write-conflict on the object's identity, so two acquisitions of
+// the same object by different goroutines are a co-enabled, concurrent, conflicting
+// pair DPOR explores BOTH ways — with NO manual annotation. The two SUTs below pin
+// that for the two primitives the acceptance covers (mutex, channel).
+
+// syncAutoSeen accumulates the distinct observable outcomes of the unmodified
+// sync-order SUT currently under Explore (reset before each Explore call; written
+// once per interleaving). Package-global for the same reason as sweepSeen.
+var syncAutoSeen map[string]bool
+
+// autoMutexOrderSUT is an UNMODIFIED mutex SUT (no manual dstAccessYield /
+// dstSyncAcquire): two goroutines each acquire a shared mutex and write their id to a
+// shared int under it. The final value is the id of whichever acquired LAST, so it
+// pins the lock-ACQUISITION order — a free scheduling choice with two reachable
+// outcomes (1 and 2). The in-section write is mutex-serialized (HB-ordered, not a
+// reorderable race), so ONLY the runtime mutex auto-hook (internal/sync.Mutex.Lock →
+// dstSyncAcquire on the mutex identity) makes the acquisition order a DPOR
+// transition; without it DPOR keeps one order (the prog#257 gap). Kept to a single
+// shared write per goroutine so brute-force Exhaustive stays tractable under the
+// dense -race memory auto-instrumentation (shared-address filtering is a later
+// increment). Records into syncAutoSeen; always returns false.
+func autoMutexOrderSUT() bool {
+	var mu sync.Mutex
+	last := 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			last = id
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(last)] = true
+	return false
+}
+
+// autoChanOrderSUT is an UNMODIFIED channel SUT (no manual hooks): two senders send
+// distinct values to one unbuffered channel; a receiver receives twice into two
+// scalars. The recorded pair is the rendezvous order — a free scheduling choice with
+// two reachable outcomes ("1,2" and "2,1"). Only the runtime channel auto-hook
+// (chan.go chansend/chanrecv → dstSyncAcquire on the hchan identity) makes the
+// rendezvous order a DPOR transition; without it DPOR drops one order (DST-L2-3),
+// exactly as for mutex acquisition. The receiver writes two scalars (no append /
+// growslice) so Exhaustive stays tractable under -race memory auto-instrumentation.
+// Records into syncAutoSeen; always returns false.
+func autoChanOrderSUT() bool {
+	ch := make(chan int)
+	var first, second int
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for s := 1; s <= 2; s++ {
+		s := s
+		go func() {
+			defer wg.Done()
+			ch <- s
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		first = <-ch
+		second = <-ch
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(first)+","+strconv.Itoa(second)] = true
+	return false
+}
+
+// DSTExploreSyncAuto is the acceptance for runtime sync-acquisition auto-hooks
+// (deferral 1): an UNMODIFIED SUT whose outcome depends on lock / rendezvous
+// acquisition order, built -tags dst -race, must have DPOR reach BOTH acquisition
+// orders with NO manual dstSyncAcquire. It runs the mutex- and channel-order SUTs
+// under DPOR and prints, per SUT: "<name>Dpor=<n> <name>Outcomes=<k>
+// <name>Exhausted=<bool>".
+//
+// The oracle is DPOR-only, NOT a DPOR-vs-Exhaustive comparison: under -race the
+// compiler auto-instruments EVERY memory access, so brute-force Exhaustive enumerates
+// the access-granularity explosion (a trivial unsynchronized RMW already hits ~19k
+// schedules) and is intractable for a mutex/channel SUT until shared-address
+// filtering lands. So the DPOR-vs-Exhaustive auto-completeness cross-check belongs
+// with that filtering increment. Here the ground truth is known by construction —
+// two symmetric goroutines contending for one object have EXACTLY two acquisition
+// orders — so Outcomes==2 (both orders reached) is the completeness signal and
+// Exhausted==true confirms a clean finish. Without the runtime auto-hook the
+// acquisition order is an addr=0 transition DPOR cannot reverse (the in-section
+// accesses are object-serialized / HB-ordered, not a reorderable race), so DPOR finds
+// only 1 order — the teeth. (DPOR's completeness on sync-acquisition transitions,
+// auto or manual, is the same relation TestDSTExploreSweep proves against Exhaustive
+// on the hand-annotated family.) Meaningful only in a -tags dst -race build.
+func DSTExploreSyncAuto() {
+	seed := dstSeedEnv()
+	check := func(name string, sut func() bool) {
+		syncAutoSeen = map[string]bool{}
+		dpor := simulation.Explore(seed, simulation.DPOR, sut)
+		os.Stdout.WriteString(name + "Dpor=" + strconv.Itoa(dpor.Schedules) +
+			" " + name + "Outcomes=" + strconv.Itoa(len(syncAutoSeen)) +
+			" " + name + "Exhausted=" + strconv.FormatBool(dpor.Exhausted && !dpor.Overflow) + "\n")
+	}
+	os.Stdout.WriteString("syncauto\n")
+	check("mutex", autoMutexOrderSUT)
+	check("chan", autoChanOrderSUT)
 }
 
 // --- Generated-family equivalence validator (DST-L2-3 completeness guard) ------

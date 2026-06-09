@@ -219,6 +219,20 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
+	// DST Level-2: announce this blocking send's impending channel acquisition on the
+	// hchan identity BEFORE taking c.lock, so the order in which contending goroutines
+	// acquire the channel is a DPOR transition (the manual chanChoiceSUT does the same
+	// by hand). The dstBuild && raceenabled compile-time constants gate it to a
+	// -tags dst -race build — the same gate as the memory-access auto-instrumentation
+	// and dead-code-eliminated otherwise, so non-dst, plain -race, and dst-without-race
+	// binaries are byte-identical (DST-L2-4). The announce is before c.lock is taken, so
+	// dstSyncAcquire's safe-point guard (m.locks==0, bubble g, scheduled strategy) admits
+	// the yield, which requeues this g and never runs a blocked G (DST-L2-1); only
+	// blocking ops reach here (block), not select's non-blocking probes.
+	if dstBuild && raceenabled && block {
+		dstSyncAcquire(unsafe.Pointer(c))
+	}
+
 	lock(&c.lock)
 
 	if c.closed != 0 {
@@ -581,6 +595,14 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
+	}
+
+	// DST Level-2: announce this blocking recv's impending channel acquisition on the
+	// hchan identity BEFORE taking c.lock, so the rendezvous order is a DPOR transition.
+	// Gated to a -tags dst -race build (dead-code-eliminated otherwise, DST-L2-4); see
+	// the matching note in chansend.
+	if dstBuild && raceenabled && block {
+		dstSyncAcquire(unsafe.Pointer(c))
 	}
 
 	lock(&c.lock)

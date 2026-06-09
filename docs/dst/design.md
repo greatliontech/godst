@@ -846,8 +846,25 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    emits plain `race*` exactly as upstream (DST-L2-4 — verified absent in non-dst and dst-without-race
    builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
    (`TestDSTExploreAutoInstrument`: the lost update is found, DPOR outcome set == Exhaustive). Foreclosure:
-   feeds the same seam. (Runtime sync-primitive hooks for `dstSyncAcquire` — chan ops, a `sync.Mutex`/sema
-   hook — and shared-address filtering for the auto-instrumentation explosion remain follow-ups.)
+   feeds the same seam. **Runtime sync-primitive hooks for `dstSyncAcquire`: IMPLEMENTED [V]** — the
+   blocking channel ops (`chan.go` `chansend`/`chanrecv`, before `lock(&c.lock)`, identity = the `*hchan`)
+   and `sync.Mutex.Lock` (`internal/sync.Mutex.Lock`, before the fast-path CAS, identity = the mutex
+   pointer — the same value `race.Acquire` uses) auto-announce a `dstSyncAcquire` write-conflict, so an
+   UNMODIFIED mutex/channel program's acquisition order is explored with no hand annotation. The mutex
+   hook is in `Lock` (NOT the `semacquire` slow path): `semacquire` is reached only by the *contended
+   loser*, after the uncontended winner already took the fast-path CAS, so it is too late to record the
+   winner's acquisition as a conflict — only a pre-CAS announce on the path *every* acquirer takes makes
+   both orders a co-enabled conflicting pair. Gated by the SAME `dstBuild && raceenabled` / `//go:build
+   dst && race` condition as the memory auto-instrumentation (so non-dst, plain-`-race`, and
+   dst-without-race builds are byte-identical — DST-L2-4, objdump-verified: no `dstSyncAcquire` call in
+   `Lock`/`chansend`/`chanrecv` outside a `-tags dst -race` build), and confined to the scheduled strategy
+   by the runtime guard. Acceptance: `TestDSTExploreSyncAutoInstrument` — an unmodified mutex SUT and an
+   unmodified channel SUT each reach BOTH acquisition orders under DPOR (vs 1 with the hook neutered).
+   *Coverage boundary:* this covers `sync.Mutex.Lock` (and transitively `sync.RWMutex.Lock`'s writer lock,
+   via `rw.w.Lock()`) and blocking `chansend`/`chanrecv`; `sync.RWMutex.RLock` (the reader sema path),
+   `select`'s non-blocking channel ops, `Mutex.TryLock`, and `sync.Once` are NOT yet auto-hooked (an
+   unmodified SUT whose outcome turns on *those* acquisition orders is not yet explored). Shared-address
+   filtering for the auto-instrumentation explosion remains a follow-up (increment 6).
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
    records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
    (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
@@ -903,9 +920,14 @@ mutex-bracketed program with every access annotated still lost a class (`prog#25
 outcomes, DPOR 1) because the lock-order-determining decision is an `addr=0` transition. `dstSyncAcquire`
 (D1) closes it with no change to the dependency/race test; the sweep enforces it (23/289 → 0). For the
 manual-hook validation phase the SUT annotates acquisitions; the dst-race compiler/runtime phase records
-them automatically (channel ops in the runtime; a dst hook in `sync.Mutex`/the sema layer). Finalizer-
-timing observation stays out of scope until that phase records *every* access; the `dporExplore`
-dependency loop documents the relation.
+them automatically — **now implemented** (increment 1): blocking `chansend`/`chanrecv` and
+`internal/sync.Mutex.Lock` auto-announce `dstSyncAcquire` under `-tags dst -race`, so an unmodified
+mutex/channel SUT's acquisition order is explored (`TestDSTExploreSyncAutoInstrument`). The mutex hook is
+in `Lock` before the CAS, not the `semacquire` slow path (which the uncontended fast-path winner never
+reaches — too late to make its acquisition a conflict). `RWMutex.RLock`, `select`'s non-blocking ops,
+`TryLock`, and `Once` are not yet auto-hooked (a SUT whose outcome turns on those acquisition orders is
+not yet covered). Finalizer-timing observation stays out of scope until *every* access is recorded; the
+`dporExplore` dependency loop documents the relation.
 5. **Source-DPOR — sleep sets + weak-initial source sets** (D3) — **VALIDATED [V].** The former
    `dporExplore` was a *persistent-set* DPOR: sound + complete, but it re-explored Mazurkiewicz-*equivalent*
    interleavings via different prefixes (the per-frame `done` set precludes exact-duplicate prefixes, so
