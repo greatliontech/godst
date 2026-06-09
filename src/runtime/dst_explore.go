@@ -112,19 +112,66 @@ var (
 	dstTraceOverflow bool
 )
 
+// Happens-before edge buffers (increment 2). Each goready under the scheduled
+// strategy records that the readier goroutine happens-before the readied one's
+// resumption: edge e is (dstEdgeFrom[e] readier -> dstEdgeTo[e] readied) observed
+// during the transition with dstScheduleStep == dstEdgeStep[e]. The DPOR engine
+// builds vector clocks offline from these + program order, so two conflicting
+// accesses are dependent only if they are CONCURRENT (neither happens-before the
+// other) — pruning mutex/channel-serialized pairs the conservative relation would
+// over-explore. Pre-sized (never grown under the lock); over-budget sets
+// dstEdgeOverflow (reported, never a silent cap).
+var (
+	dstEdgeFrom     []uint64
+	dstEdgeTo       []uint64
+	dstEdgeStep     []int32
+	dstEdgeN        int
+	dstEdgeOverflow bool
+)
+
+// dstRecordReadyEdge records the happens-before edge readier -> readied at a
+// goready, under the scheduled strategy. Both ends are assigned a stable index if
+// needed (lazy, like first candidacy). Called from goready before the systemstack
+// switch (readier == getg()); skips when either end is not a bubble goroutine
+// (a system/driver wake carries no application HB). Allocation-free.
+func dstRecordReadyEdge(readier, readied *g) {
+	if readier == nil || readied == nil || readier.bubble == nil || readied.bubble == nil {
+		return
+	}
+	if readier.dstSeq == 0 {
+		dstSeqCtr++
+		readier.dstSeq = dstSeqCtr
+	}
+	if readied.dstSeq == 0 {
+		dstSeqCtr++
+		readied.dstSeq = dstSeqCtr
+	}
+	if dstEdgeN < len(dstEdgeFrom) {
+		dstEdgeFrom[dstEdgeN] = readier.dstSeq
+		dstEdgeTo[dstEdgeN] = readied.dstSeq
+		dstEdgeStep[dstEdgeN] = int32(dstScheduleStep)
+		dstEdgeN++
+	} else {
+		dstEdgeOverflow = true
+	}
+}
+
 // dstExploreInit pre-sizes the trace buffers for the exploration. Called by the
 // brain once, on a normal goroutine (off-lock), before any scheduled Run.
 // maxDecisions bounds the per-bubble decision count; maxEnabledTotal bounds the
 // total enabled-set entries across all decisions in one bubble.
 //
 //go:linkname dstExploreInit
-func dstExploreInit(maxDecisions, maxEnabledTotal int) {
+func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges int) {
 	dstTraceChosen = make([]uint64, maxDecisions)
 	dstTraceEnabOff = make([]int32, maxDecisions)
 	dstTraceEnabLen = make([]int32, maxDecisions)
 	dstTraceEnabFlat = make([]uint64, maxEnabledTotal)
 	dstTraceAddr = make([]uintptr, maxDecisions)
 	dstTraceWrite = make([]bool, maxDecisions)
+	dstEdgeFrom = make([]uint64, maxEdges)
+	dstEdgeTo = make([]uint64, maxEdges)
+	dstEdgeStep = make([]int32, maxEdges)
 }
 
 // dstScheduleReset prepares the scheduled-strategy state for a new bubble. Called
@@ -137,6 +184,8 @@ func dstScheduleReset() {
 	dstTraceFlatN = 0
 	dstTraceOverflow = false
 	dstSeqCtr = 0
+	dstEdgeN = 0
+	dstEdgeOverflow = false
 }
 
 // dstScheduledSelect implements the scheduled strategy at the unified seam. Every
@@ -256,6 +305,21 @@ func dstTraceEnabledFP(i int) []uint64 {
 //
 //go:linkname dstTraceOverflowFP
 func dstTraceOverflowFP() bool { return dstTraceOverflow }
+
+// dstEdgeLenFP reports the happens-before edge count recorded by the last run, and
+// dstEdgeAtFP reports edge i as (readier index, readied index, the dstScheduleStep
+// at which the goready occurred). dstEdgeOverflowFP reports a budget overflow.
+//
+//go:linkname dstEdgeLenFP
+func dstEdgeLenFP() int { return dstEdgeN }
+
+//go:linkname dstEdgeAtFP
+func dstEdgeAtFP(i int) (from, to uint64, step int) {
+	return dstEdgeFrom[i], dstEdgeTo[i], int(dstEdgeStep[i])
+}
+
+//go:linkname dstEdgeOverflowFP
+func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
 
 // dstScheduleAbortedFP reports whether the last run's prefix was invalid for that
 // execution (named a non-enabled dstSeq at some decision).

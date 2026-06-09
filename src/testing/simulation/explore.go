@@ -55,6 +55,7 @@ type ExploreResult struct {
 const (
 	exploreMaxDecisions    = 1 << 14
 	exploreMaxEnabledTotal = 1 << 18
+	exploreMaxEdges        = 1 << 16
 )
 
 // Explore systematically explores the sound interleavings of sut under seed. sut
@@ -70,7 +71,7 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 	if !dstBuilt() {
 		panic("testing/simulation: Explore requires building with -tags dst")
 	}
-	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal)
+	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges)
 	if mode == DPOR {
 		return dporExplore(seed, sut)
 	}
@@ -80,12 +81,17 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 // exploreTrace is one scheduled run's recorded decision trace, copied out of the
 // runtime's per-bubble buffers (which the next run overwrites).
 type exploreTrace struct {
-	procs    []uint64   // [decision] chosen goroutine (stable per-bubble index, dstSeq)
-	addrs    []uintptr  // [decision] transition's access address (0 = none)
-	writes   []bool     // [decision] transition's access is a write
-	enabled  [][]uint64 // [decision] enabled goroutine set (dstSeq indices)
-	aborted  bool       // prefix named a non-enabled goroutine (a replay-determinism bug)
-	overflow bool       // run exceeded the trace budget (coverage incomplete)
+	procs   []uint64   // [decision] chosen goroutine (stable per-bubble index, dstSeq)
+	addrs   []uintptr  // [decision] transition's access address (0 = none)
+	writes  []bool     // [decision] transition's access is a write
+	enabled [][]uint64 // [decision] enabled goroutine set (dstSeq indices)
+	// Happens-before edges (goready: edgeFrom happens-before edgeTo's resumption),
+	// edgeStep = the dstScheduleStep when the goready fired = (transition index)+1.
+	edgeFrom []uint64
+	edgeTo   []uint64
+	edgeStep []int
+	aborted  bool // prefix named a non-enabled goroutine (a replay-determinism bug)
+	overflow bool // run exceeded the trace or edge budget (coverage incomplete)
 }
 
 // runOnce runs sut once under the scheduled strategy following prefix, and copies
@@ -94,7 +100,7 @@ func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed bool, tr exp
 	run(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
 		failed = sut()
 	})
-	tr.overflow = dstTraceOverflowFP()
+	tr.overflow = dstTraceOverflowFP() || dstEdgeOverflowFP()
 	tr.aborted = dstScheduleAbortedFP()
 	if tr.aborted {
 		// The prefix named a goroutine not enabled at its decision: this replay
@@ -116,6 +122,13 @@ func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed bool, tr exp
 		tr.procs[i] = dstTraceChosenFP(i)
 		tr.addrs[i], tr.writes[i] = dstTraceAccessFP(i)
 		tr.enabled[i] = append([]uint64(nil), dstTraceEnabledFP(i)...) // copy: aliases runtime buffer
+	}
+	m := dstEdgeLenFP()
+	tr.edgeFrom = make([]uint64, m)
+	tr.edgeTo = make([]uint64, m)
+	tr.edgeStep = make([]int, m)
+	for i := 0; i < m; i++ {
+		tr.edgeFrom[i], tr.edgeTo[i], tr.edgeStep[i] = dstEdgeAtFP(i)
 	}
 	return
 }
@@ -203,26 +216,28 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 			})
 		}
 		// Dependency analysis: two transitions are dependent iff they touch the same
-		// nonzero address with at least one write, by different goroutines. For each
-		// dependent pair (i<j) the reverse ordering must be explored — add a backtrack
-		// at decision i to run j's goroutine there (if it was enabled at i; else,
-		// conservatively, every goroutine enabled at i).
+		// nonzero address with at least one write, by different goroutines, AND are
+		// CONCURRENT (neither happens-before the other — clocks computed from the
+		// recorded goready edges + program order). The concurrency test prunes
+		// mutex/channel-serialized pairs the address-only relation would over-explore.
+		// For each dependent pair (i<j) the reverse ordering must be explored — add a
+		// backtrack at decision i to run j's goroutine there (if it was enabled at i;
+		// else, conservatively, every goroutine enabled at i).
 		//
 		// addr==0 transitions are treated as independent of everything. Today those
 		// are infrastructure decisions that record no memory access — goroutine
-		// creation, WaitGroup wakeups, and the finalizer-drain goroutine (gcDrain) —
-		// plus any SUT access not hand-annotated with dstAccessYield. This is sound
-		// and complete for SUTs whose shared accesses are all annotated and that do
-		// not observe finalizer/cleanup *timing* (the committed case): finalizer
-		// discovery is quiescence-deterministic per the GC contract, so the drain's
-		// scheduling does not change SUT-observable outcomes. When the dst-race
-		// compiler mode (increment 1) records every access and the happens-before
-		// tracker (increment 2) records sync edges, this addr==0-independence
-		// assumption is replaced by the real access + HB relation.
+		// creation, WaitGroup wakeups, and the finalizer-drain goroutine (gcDrain is
+		// also isolated from the schedule in firstSystemG) — plus any SUT access not
+		// hand-annotated with dstAccessYield. Sound and complete for SUTs whose shared
+		// accesses are all annotated and that do not observe finalizer/cleanup timing
+		// (the committed case). The dst-race compiler mode (increment 1) will record
+		// every access, removing the annotation assumption.
+		clk, pidx := dporClocks(tr)
 		for j := 0; j < n; j++ {
 			for i := j - 1; i >= 0; i-- {
 				if tr.addrs[i] != 0 && tr.addrs[i] == tr.addrs[j] &&
-					(tr.writes[i] || tr.writes[j]) && tr.procs[i] != tr.procs[j] {
+					(tr.writes[i] || tr.writes[j]) && tr.procs[i] != tr.procs[j] &&
+					dporConcurrent(clk, pidx, tr, i, j) {
 					if containsU(tr.enabled[i], tr.procs[j]) {
 						stack[i].backtrack[tr.procs[j]] = true
 					} else {
@@ -266,6 +281,75 @@ func containsU(s []uint64, v uint64) bool {
 		}
 	}
 	return false
+}
+
+// dporClocks computes a vector clock per transition from program order plus the
+// recorded goready happens-before edges, so dporConcurrent can test whether two
+// transitions are causally ordered. clk[i] is transition i's proc's vector clock
+// snapshot right after its program-order tick; pidx maps a goroutine's stable
+// index (dstSeq) to a vector position.
+//
+// Processing is in execution (trace) order: at transition i, tick proc_i's own
+// component and snapshot; then apply every goready edge observed during that
+// transition (edgeStep == i+1, since the transition chosen at decision i runs with
+// dstScheduleStep == i+1), flowing the readier's current clock into the readied's
+// (so the readied's later transitions inherit the happens-before). Edges recorded
+// before the first decision (step 0) flow a zero clock and are no-ops.
+func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
+	pidx = make(map[uint64]int)
+	addProc := func(p uint64) {
+		if _, ok := pidx[p]; !ok {
+			pidx[p] = len(pidx)
+		}
+	}
+	for _, p := range tr.procs {
+		addProc(p)
+	}
+	for i := range tr.edgeFrom {
+		addProc(tr.edgeFrom[i])
+		addProc(tr.edgeTo[i])
+	}
+	P := len(pidx)
+	cur := make([][]uint32, P)
+	for i := range cur {
+		cur[i] = make([]uint32, P)
+	}
+	flow := func(from, to int) { // to = elementwise-max(to, from)
+		for k := 0; k < P; k++ {
+			if cur[from][k] > cur[to][k] {
+				cur[to][k] = cur[from][k]
+			}
+		}
+	}
+	applyEdges := func(step int) {
+		for e := range tr.edgeStep {
+			if tr.edgeStep[e] == step {
+				flow(pidx[tr.edgeFrom[e]], pidx[tr.edgeTo[e]])
+			}
+		}
+	}
+	applyEdges(0) // pre-first-decision edges (zero clocks; no-op, applied for faithfulness)
+	n := len(tr.procs)
+	clk = make([][]uint32, n)
+	for i := 0; i < n; i++ {
+		pi := pidx[tr.procs[i]]
+		cur[pi][pi]++
+		clk[i] = append([]uint32(nil), cur[pi]...)
+		applyEdges(i + 1) // goready edges observed while transition i ran
+	}
+	return clk, pidx
+}
+
+// dporConcurrent reports whether transitions i and j (i<j, different goroutines)
+// are concurrent — neither happens-before the other. Transition a happens-before b
+// iff b's clock has seen a's proc up to at least a's tick; the pair is concurrent
+// iff neither direction holds.
+func dporConcurrent(clk [][]uint32, pidx map[uint64]int, tr exploreTrace, i, j int) bool {
+	pi := pidx[tr.procs[i]]
+	pj := pidx[tr.procs[j]]
+	iBeforeJ := clk[j][pi] >= clk[i][pi]
+	jBeforeI := clk[i][pj] >= clk[j][pj]
+	return !iBeforeJ && !jBeforeI
 }
 
 // encodePrefix packs a decision prefix into a string key for the visited set

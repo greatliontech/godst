@@ -148,6 +148,29 @@ func mutexCountSUT() bool {
 	return count != G*K
 }
 
+// twoPairSUT runs two independent producer/consumer pairs concurrently. Within
+// each pair the shared access (producer writes xN, consumer reads xN after the
+// channel handoff) is happens-before-ordered, so it is NOT a race; the two pairs
+// touch different addresses, so there is no cross-pair conflict. There is genuine
+// scheduling freedom (the pairs interleave), but no two CONCURRENT conflicting
+// accesses exist. A DPOR with happens-before pruning recognizes this and explores
+// a minimal number of schedules; the address-only relation treats each pair's
+// ordered write/read as a dependency and over-explores it. Returns true (bug) only
+// if a consumer fails to see its producer's value — which never happens.
+func twoPairSUT() bool {
+	var x1, x2 int
+	ch1 := make(chan int)
+	ch2 := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x1), true); x1 = 1; ch1 <- 1 }()
+	go func() { defer wg.Done(); <-ch1; dstAccessYield(unsafe.Pointer(&x1), false); _ = x1 }()
+	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x2), true); x2 = 1; ch2 <- 1 }()
+	go func() { defer wg.Done(); <-ch2; dstAccessYield(unsafe.Pointer(&x2), false); _ = x2 }()
+	wg.Wait()
+	return x1 != 1 || x2 != 1
+}
+
 // DSTExplore runs simulation.Explore on a named SUT (DSTEXPLORE) under a mode
 // (DSTMODE=dpor|exhaustive) and prints "schedules=<n> failures=<m>
 // exhausted=<bool> overflow=<bool>" plus the first failing schedule.
@@ -158,6 +181,8 @@ func DSTExplore() {
 		sut = atomicityViolSUT
 	case "mutexcount":
 		sut = mutexCountSUT
+	case "twopair":
+		sut = twoPairSUT
 	default:
 		os.Stdout.WriteString("UNKNOWN_SUT\n")
 		return

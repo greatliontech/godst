@@ -83,7 +83,7 @@ func dstSetSchedStrategy(kind uint8, depth, steps int32)
 // explore.go and runtime/dst_explore.go).
 //
 //go:linkname dstExploreInit runtime.dstExploreInit
-func dstExploreInit(maxDecisions, maxEnabledTotal int)
+func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges int)
 
 //go:linkname dstSetSchedule runtime.dstSetSchedule
 func dstSetSchedule(prefix []uint64)
@@ -102,6 +102,15 @@ func dstTraceEnabledFP(i int) []uint64
 
 //go:linkname dstTraceOverflowFP runtime.dstTraceOverflowFP
 func dstTraceOverflowFP() bool
+
+//go:linkname dstEdgeLenFP runtime.dstEdgeLenFP
+func dstEdgeLenFP() int
+
+//go:linkname dstEdgeAtFP runtime.dstEdgeAtFP
+func dstEdgeAtFP(i int) (from, to uint64, step int)
+
+//go:linkname dstEdgeOverflowFP runtime.dstEdgeOverflowFP
+func dstEdgeOverflowFP() bool
 
 //go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool

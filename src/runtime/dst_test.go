@@ -989,3 +989,24 @@ func exploreOutcomes(t *testing.T, out string) string {
 	}
 	return rest[:j+1]
 }
+
+// TestDSTExploreHBPrunes verifies that DPOR's happens-before pruning works: in
+// twoPairSUT two producer/consumer pairs interleave freely, but each pair's shared
+// access is channel-ordered (not a race). A DPOR that recognizes the
+// happens-before order prunes the futile reorderings of those ordered accesses and
+// explores 4 schedules with no failures; the address-only relation (no HB)
+// over-explores them (21). The <=10 bound passes with HB pruning (4) and fails
+// without it (21), so it has teeth. See docs/dst/design.md (Level 2, increment 2).
+func TestDSTExploreHBPrunes(t *testing.T) {
+	out := runTestProgDST(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=twopair", "DSTMODE=dpor")
+	if exploreFailures(t, out) != 0 {
+		t.Fatalf("explorer reported a spurious race on channel-ordered (not racing) accesses: %q", out)
+	}
+	if !strings.Contains(out, "exhausted=true") {
+		t.Fatalf("explorer did not exhaust twoPairSUT's space: %q", out)
+	}
+	if n := exploreSchedules(t, out); n > 10 {
+		t.Fatalf("happens-before pruning ineffective: explored %d schedules (want <=10; "+
+			"the address-only relation explores ~21): %q", n, out)
+	}
+}

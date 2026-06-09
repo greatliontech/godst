@@ -805,11 +805,18 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
    per-run yield magnitude measured (every access yields → filtering is increment 6). **Compiler half
    (Option 1): deferred** to after 2–4 per sequencing (b). Foreclosure: feeds the same seam.
-2. **Happens-before — recorded events, computed offline** (D2). The runtime records the sync events into
-   the transition log; the DPOR engine builds the vector clocks/HB relation **offline** between Runs
-   (cleaner for the stateless re-execution model than live hot-path clocks, and keeps the runtime a pure
-   recorder + schedule-follower). Delivers the dependency relation for D3 and the HB pruning. Foreclosure:
-   additive recording.
+2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
+   records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
+   (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
+   so Random/PCT/non-dst are unaffected); the DPOR engine builds vector clocks **offline** from those
+   edges + program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to
+   *concurrent* conflicting pairs only. Mutex/channel-serialized conflicts are pruned. Measured on
+   `twoPairSUT` (two channel-ordered producer/consumer pairs interleaving freely): exhaustive 4032,
+   address-only DPOR 21, **HB-DPOR 4** — all 0 failures (`TestDSTExploreHBPrunes`, mutation-verified: the
+   `<=10` bound fails at 21 when the concurrency test is disabled). On pure-race SUTs (atomicity/counter,
+   no synchronized accesses) HB correctly finds the conflicts concurrent and changes nothing —
+   completeness preserved (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks)
+   keeps the runtime a pure recorder + schedule-follower. Foreclosure: additive recording.
 3. **DPOR strategy** (D3; **VALIDATED [V]**). Iterative stateless DPOR over the schedule recorder
    (`dporExplore` in `testing/simulation/explore.go`): dependency = same nonzero address, ≥1 write,
    different stable index (`g.dstSeq`); backtrack points added at ancestor decisions; deterministic
@@ -848,9 +855,16 @@ documents this.
 5. **Optimal DPOR** (D3 sleep/source sets). Prune redundant schedules to one-per-class. Delivers
    efficiency (DST-L2-3 tightens from "covers every class" to "explores no class twice"). Foreclosure:
    refines the worklist, not the seam.
-6. **Shared-address filtering** (D1, using D2). Only contended, non-HB-ordered accesses are transitions.
-   Delivers tractability (the explosion control). Foreclosure: narrows transitions; fewer yields is
-   always sound.
+6. **Infrastructure isolation + shared-address filtering** (D1, using D2). *gcDrain isolation* —
+   **VALIDATED [V]**: the bubble's finalizer-drain goroutine is scheduled RNG-free as infrastructure
+   under the scheduled strategy (`firstSystemG`), so it leaves the recorded schedule/DPOR search; cut the
+   exhaustive count ~9× (e.g. counter exhaustive 180→20) with no change to DPOR (it already pruned
+   gcDrain as addr=0) and no effect on Random/PCT (`TestDSTSchedSystemIsolation` green). *Shared-address
+   filtering proper* (only contended addresses are transitions) is **deferred to the dst-race compiler
+   phase** (increment 1): with manual hooks the SUT author annotates only shared accesses, so there is
+   nothing to filter yet; once the compiler auto-inserts a hook at *every* access, single-owner/stack
+   accesses must be filtered to non-transitions. Foreclosure: narrows transitions; fewer yields is always
+   sound.
 
 ### Open questions (resolved by measurement during the build, not pre-judged)
 

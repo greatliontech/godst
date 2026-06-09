@@ -479,6 +479,13 @@ func goparkunlock(lock *mutex, reason waitReason, traceReason traceBlockReason, 
 //
 //go:linkname goready
 func goready(gp *g, traceskip int) {
+	if dstActive() && dstSchedKind == dstSchedScheduled {
+		// Record the happens-before edge (this goroutine -> gp) for the DPOR
+		// dependency relation. getg() here is the readier (the unlocker/sender/etc.,
+		// before the systemstack switch). Gated on the scheduled strategy so Random/
+		// PCT and non-dst builds are unaffected. See dst_explore.go.
+		dstRecordReadyEdge(getg(), gp)
+	}
 	systemstack(func() {
 		ready(gp, traceskip, true)
 	})
@@ -7818,23 +7825,38 @@ type dstCandidates struct {
 	ringN   uint32
 }
 
-// at returns the k-th candidate goroutine without removing it, for priority-based
-// strategies (PCT) that must inspect candidates before choosing. The global-runq
-// branch walks the linked list (O(k)); the runnable set is short under the
-// single-P simulation. Caller holds sched.lock.
-// firstSystemG returns the index of the first candidate goroutine that is not
-// part of a synctest bubble (g.bubble == nil) — runtime infrastructure rather
-// than the simulated program — or false if every candidate is a bubble goroutine.
-// Scanned in candidate order, so the choice is deterministic.
+// firstSystemG returns the index of the first candidate that should be scheduled
+// RNG-free as infrastructure rather than as part of the simulated program:
+// goroutines outside any synctest bubble (g.bubble == nil), and — under the
+// scheduled (exploration) strategy only — the bubble's finalizer-drain goroutine
+// (gcDrain). gcDrain records no application memory access, and its scheduling is
+// not an interleaving degree of freedom the explorer should branch on (it
+// runs-and-parks at bubble start, then only at deterministic quiescence points);
+// isolating it here keeps it out of the recorded schedule/DPOR search. Returns
+// false if no candidate qualifies. Scanned in candidate order, so the choice is
+// deterministic. Random/PCT deliberately leave gcDrain in the seeded selection:
+// its scheduling is already deterministic there, so isolating it would change
+// their interleavings without removing any nondeterminism.
 func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 	for k := uint32(0); k < total; k++ {
-		if gp := c.at(k); gp != nil && gp.bubble == nil {
+		gp := c.at(k)
+		if gp == nil {
+			continue
+		}
+		if gp.bubble == nil {
+			return k, true
+		}
+		if dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp {
 			return k, true
 		}
 	}
 	return 0, false
 }
 
+// at returns the k-th candidate goroutine without removing it, for priority-based
+// strategies (PCT) that must inspect candidates before choosing. The global-runq
+// branch walks the linked list (O(k)); the runnable set is short under the
+// single-P simulation. Caller holds sched.lock.
 func (c *dstCandidates) at(k uint32) *g {
 	pp := c.pp
 	if k < c.ringN {
