@@ -665,7 +665,7 @@ mutex is sound and is exactly the interleaving Gap A needs.
   "explored to exhaustion" is a false negative. *Encoding:* **`TestDSTExploreSweep`** — for a generated
   family of small closed programs (reads/writes over shared vars, with/without mutexes; plus channel
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
-  every member (289 SUTs, mutation-tested: 23 fail with `dstSyncAcquire` neutered). The committed
+  every member (290 SUTs, mutation-tested: 23 fail with `dstSyncAcquire` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
 - **DST-L2-4 (clause-explicit: production untouched).** A non-`-tags dst` build, and a `-tags dst` build
   *without* `-race`, are byte-identical to their upstream/Seq-5 equivalents. *violation:* a production or
@@ -689,7 +689,7 @@ contending goroutine acquires/releases/closes a sync object first is a real sche
 change the outcome, but it is decided at a transition that performs *no memory access* (a goroutine
 reaching its `Lock`, `TryLock`, `Unlock`, or `close` records nothing), so without (b) DPOR treats that
 decision as independent of everything and silently drops the alternative sync-decision-order Mazurkiewicz
-classes (a DST-L2-3 violation — `TestDSTExploreSweep` fails 23/289 with `dstSyncAcquire` neutered).
+classes (a DST-L2-3 violation — `TestDSTExploreSweep` fails 23/290 with `dstSyncAcquire` neutered).
 Announced *before* the state decision/transition and modeled as a write-conflict (same-object sync
 decisions do not commute), two decisions on the same object by different goroutines become a co-enabled,
 concurrent, conflicting pair whose **both** orderings the existing HB-DPOR explores — with no change to the
@@ -761,7 +761,11 @@ non-foreclosure choke points), channel send/recv, sema acquire/release (mutex), 
    during a Run needs only the prefix, never HB; HB is needed only by the post-Run backtrack analysis. The
    recorded events are the same ones the scheduler controls, so the HB is self-contained (no dependence on
    TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful oracle, which the
-   conflict-set cross-check against `-race` reports validates.
+   conflict-set cross-check against `-race` reports validates. Timer-fire wakeups in synctest fake time are
+   validated by `TestDSTExploreTimerHB`: two goroutines sleep until the same virtual time and then race on a
+   shared variable; Exhaustive reaches both read outcomes (`timerhb exh=12`), and DPOR matches them while
+   exhausted (`timerhb dpor=3`, two outcomes). So the currently-recorded timer wake edges do not over-order
+   that reachable timer-gated conflict shape.
 
 #### D3 — Stateless DPOR as a `dstSchedSelect` strategy
 
@@ -938,13 +942,13 @@ they carry no outcome-determining order choice a recorded access/sync-object dec
 relation is sound and complete *for SUTs whose shared memory accesses **and** synchronization
 object decisions are recorded as transitions, and that do not observe finalizer/cleanup timing* — enforced
 over a generated family (mutex- and channel-decision-order cases included) by the
-`TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 289 SUTs).
+`TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 290 SUTs).
 
 An **earlier draft of this note was wrong**: it claimed completeness for "SUTs whose shared *accesses* are
 all annotated," overlooking that **synchronization object decision order is itself a dependency**. A
 mutex-bracketed program with every access annotated still lost a class (`prog#257`: exhaustive 2
 outcomes, DPOR 1) because the lock-order-determining decision is an `addr=0` transition. `dstSyncAcquire`
-(D1) closes it with no change to the dependency/race test; the sweep enforces it (23/289 → 0). For the
+(D1) closes it with no change to the dependency/race test; the sweep enforces it (23/290 → 0). For the
 manual-hook validation phase the SUT annotates sync-object decisions; the dst-race compiler/runtime phase
 records them automatically — **now implemented** (increment 1): channel ops, close, and mutex/RWMutex
 state decisions auto-announce `dstSyncAcquire` under `-tags dst -race`, so an unmodified mutex/channel SUT's
@@ -978,11 +982,11 @@ relation.
       DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the committed
       micro-SUTs. This is the real DST-L2-3 guard. **VALIDATED [V] — and it immediately earned its keep:**
       it exposed a *pre-existing* DST-L2-3 completeness defect (the persistent-set DPOR dropped every
-      **synchronization-object-decision-order** class in the sweep — 23/289 SUTs, all-and-only
+      **synchronization-object-decision-order** class in the sweep — 23/290 SUTs, all-and-only
       mutex/channel cases), because the lock/rendezvous-order decision is an `addr=0` transition the dependency relation
       ignored. **Fixed before sleep sets** (a reduction layered on an incomplete search would drop even
       more): `dstSyncAcquire` (D1) records sync-object decisions as conflicting transitions — zero brain change —
-      and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/289 → 0). Optimality (sleep
+      and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/290 → 0). Optimality (sleep
       sets) is therefore built on a foundation the sweep proves complete.
    2. **Source-DPOR (sleep sets + weak-initial backtracks) — VALIDATED [V].** Each `dporFrame` gains a
       `sleep` set: a frame inherits the parent's asleep + already-explored goroutines, FILTERED by
@@ -1006,10 +1010,12 @@ relation.
       and drop a class.
    3. **Adversarial review** (incompleteness failure mode + determinism/soundness) — run per the
       Adversarial loop on the change set.
-   Measured (289-program standing sweep, mismatches=0): source-DPOR vs the persistent-set baseline cuts
-   the worst-program schedule count `maxDpor` 125→69 and the family total `totDpor` 2352→1962; a
-   369-program run (incl. 3 goroutines × 2 ops and 4-way contention, exhaustive up to 2520/program),
-   reproducible on demand via `DSTSWEEP=heavy`, is also complete (12.5× reduction, 161242→12892). Payoff is
+   Measured (290-program standing sweep, mismatches=0, including the timer-gated HB SUT): source-DPOR vs
+   the persistent-set baseline cuts the worst-program schedule count `maxDpor` 125→69; current totals are
+   `totExh=13414`, `totDpor=1965`; a
+   370-program run (incl. the timer-HB SUT, 3 goroutines × 2 ops, and 4-way contention; exhaustive up to
+   2520/program), reproducible on demand via `DSTSWEEP=heavy`, is also complete (12.5× reduction,
+   161254→12895). Payoff is
    modest on tiny SUTs (persistent-set is already near-optimal there), larger as independent transitions
    multiply. `TestDSTExploreSweep` enforces both completeness (mismatches=0) and the optimality bound
    (`maxDpor` < 80; persistent-set regresses to 125, dropping sleep to 85). When the source-set witness has

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing/simulation"
+	"time"
 	"unsafe" // for go:linkname and access-yield addresses
 )
 
@@ -31,6 +32,7 @@ func init() {
 	register("DSTExploreRaceReplay", DSTExploreRaceReplay)
 	register("DSTExploreAuto", DSTExploreAuto)
 	register("DSTExploreSyncAuto", DSTExploreSyncAuto)
+	register("DSTExploreTimerHB", DSTExploreTimerHB)
 }
 
 // dstYieldPoint is a cooperative yield with no recorded access; dstAccessYield
@@ -1532,6 +1534,68 @@ func chanChoiceSUT() bool {
 	return false
 }
 
+var timerHBSeen map[string]bool
+
+// timerHBSUT gates both sides of an unsynchronized read/write behind fake timers.
+// When virtual time advances, both timers fire before either goroutine resumes, so
+// the post-sleep read and write are co-enabled. DPOR must therefore reach both read
+// outcomes; treating timer-fire wakeups as ordering the two goroutines would silently
+// drop one class (DST-L2-3).
+func timerHBSUT() bool {
+	x := 0
+	read := -1
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Nanosecond)
+		dstAccessYield(unsafe.Pointer(&x), false)
+		read = x
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Nanosecond)
+		dstAccessYield(unsafe.Pointer(&x), true)
+		x = 1
+	}()
+	wg.Wait()
+	outcome := strconv.Itoa(read)
+	if timerHBSeen != nil {
+		timerHBSeen[outcome] = true
+	}
+	if sweepSeen != nil {
+		sweepSeen[outcome] = true
+	}
+	return false
+}
+
+func timerHBCompare(seed uint64) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
+	timerHBSeen = map[string]bool{}
+	dpor = simulation.Explore(seed, simulation.DPOR, timerHBSUT)
+	dporSet = map[string]bool{}
+	for v := range timerHBSeen {
+		dporSet[v] = true
+	}
+	timerHBSeen = map[string]bool{}
+	exh = simulation.Explore(seed, simulation.Exhaustive, timerHBSUT)
+	exhSet = map[string]bool{}
+	for v := range timerHBSeen {
+		exhSet[v] = true
+	}
+	return exh, dpor, exhSet, dporSet
+}
+
+func DSTExploreTimerHB() {
+	exh, dpor, exhSet, dporSet := timerHBCompare(dstSeedEnv())
+	os.Stdout.WriteString("timerhb exh=" + strconv.Itoa(exh.Schedules) +
+		" dpor=" + strconv.Itoa(dpor.Schedules) +
+		" outcomes=" + strconv.Itoa(len(exhSet)) +
+		" complete=" + strconv.FormatBool(sameSet(exhSet, dporSet)) +
+		" exhExhausted=" + strconv.FormatBool(exh.Exhausted) +
+		" dporExhausted=" + strconv.FormatBool(dpor.Exhausted) +
+		" overflow=" + strconv.FormatBool(exh.Overflow || dpor.Overflow) + "\n")
+}
+
 // namedSweepSUT is a hand-written hard SUT for the equivalence sweep, beyond the
 // generated interpreter family (which models only reads/writes/mutexes).
 type namedSweepSUT struct {
@@ -1542,6 +1606,7 @@ type namedSweepSUT struct {
 func namedSweepSUTs() []namedSweepSUT {
 	return []namedSweepSUT{
 		{"chan-choice", chanChoiceSUT},
+		{"timer-hb", timerHBSUT},
 	}
 }
 

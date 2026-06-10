@@ -1038,10 +1038,31 @@ func TestDSTExploreHBPrunes(t *testing.T) {
 	}
 }
 
+// TestDSTExploreTimerHB validates that fake-timer wake edges do not make DPOR prune
+// a timer-gated race as happens-before-ordered. Both goroutines sleep until the same
+// virtual time; after the root fires both timers, their read/write accesses are
+// co-enabled and Exhaustive reaches both read outcomes. DPOR must match that outcome
+// set while still reporting exhausted coverage.
+func TestDSTExploreTimerHB(t *testing.T) {
+	out := runTestProgDSTNoRace(t, "DSTExploreTimerHB", "DSTSEED=1")
+	if exploreField(t, out, "complete") != "true" {
+		t.Fatalf("DPOR dropped a timer-gated memory class (timer wake HB over-ordered a race):\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "outcomes")); err != nil {
+		t.Fatalf("bad outcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("timer-gated SUT outcome set changed: outcomes=%d, want 2:\n%s", n, out)
+	}
+	if exploreField(t, out, "exhExhausted") != "true" || exploreField(t, out, "dporExhausted") != "true" || exploreField(t, out, "overflow") != "false" {
+		t.Fatalf("timer-gated exploration did not finish cleanly:\n%s", out)
+	}
+}
+
 // TestDSTExploreSweep is the DST-L2-3 completeness guard: a generated family of
 // small concurrent programs (2-3 goroutines; reads/writes over 1-2 shared vars;
-// with and without mutex synchronization) plus hand-written hard SUTs (a channel
-// rendezvous-order choice) is explored under BOTH DPOR and brute-force Exhaustive,
+// with and without mutex synchronization) plus hand-written hard SUTs (channel
+// rendezvous order and timer-gated memory conflicts) is explored under BOTH DPOR
+// and brute-force Exhaustive,
 // and DPOR must reach the IDENTICAL set of observable outcomes for every one. This
 // is the real net that the micro-SUTs (TestDSTExploreComplete, a single no-mutex
 // program) only weakly approximate.
@@ -1051,7 +1072,7 @@ func TestDSTExploreHBPrunes(t *testing.T) {
 // choice that changes the outcome, but it occurs at a transition recording no
 // memory access, so DPOR drops one order unless each acquisition is recorded as a
 // conflicting transition (runtime.dstSyncAcquire). With that hook neutered the
-// sweep fails 23/289; with it, 0 — so it has teeth. See docs/dst/design.md
+// sweep fails 23/290; with it, 0 — so it has teeth. See docs/dst/design.md
 // (Level 2, DST-L2-3 + "Completeness boundary").
 //
 // It ALSO guards source-DPOR OPTIMALITY: the sweep reports maxDpor, the largest
