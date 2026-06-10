@@ -1089,7 +1089,7 @@ func TestDSTExploreSweep(t *testing.T) {
 
 // TestDSTExploreRaceOracle verifies the -race detector works as Explore's data-race
 // oracle (D5): an explored interleaving that exhibits an unsynchronized access pair
-// is reported as a Failure with Race=true, with the schedule that reproduces it. The
+// is reported as a Failure with Race=true, with replay metadata that reproduces it. The
 // SUT (raceOracleSUT) has two unsynchronized writes and NO assertion, so a data race
 // is the ONLY possible finding — proving Explore surfaces races, not just SUT
 // assertions. The detector fires even at the GOMAXPROCS=1 serial execution DST uses
@@ -1127,12 +1127,48 @@ func TestDSTExploreRaceOracle(t *testing.T) {
 				"simulation.Run / explorer did not reach the racy interleaving):\n%s", mode, out)
 		}
 		// The first-race schedule is a deterministic function of the seed (DST-L2-2 +
-		// D5): a second same-seed run reproduces it. Compare the parsed schedule, not
-		// the full output, whose race report carries nondeterministic addresses.
+		// D5). Compare the parsed schedule, not the full output, whose race report
+		// carries nondeterministic addresses.
 		out2 := runBuiltTestProg(t, exe, "DSTExploreRaceOracle", "DSTSEED=1", "DSTRACE="+mode)
 		if a, b := exploreField(t, out, "firstrace"), exploreField(t, out2, "firstrace"); a != b {
 			t.Fatalf("race oracle (%s) nondeterministic: first-race schedule %q vs %q", mode, a, b)
 		}
+	}
+}
+
+// TestDSTExploreRaceReplay verifies a race failure first observed under replay-promoted
+// access forces carries a complete replay token. The replay runs in a fresh process so
+// TSan's process-global report dedup does not mask the reproduced race.
+func TestDSTExploreRaceReplay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the -race replay build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	exe := filepath.Join(t.TempDir(), "tp_race")
+	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
+	out := runBuiltTestProg(t, exe, "DSTExploreRaceReplay", "DSTSEED=1")
+	if races, err := strconv.Atoi(exploreField(t, out, "races")); err != nil {
+		t.Fatalf("bad races field in %q: %v", out, err)
+	} else if races < 1 {
+		t.Fatalf("race replay fixture did not find a race failure:\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "forcecount")); err != nil {
+		t.Fatalf("bad forcecount field in %q: %v", out, err)
+	} else if n == 0 {
+		t.Fatalf("race failure did not carry promoted access forces:\n%s", out)
+	}
+	schedule := exploreField(t, out, "schedule")
+	forces := exploreField(t, out, "forces")
+	if schedule == "_" || forces == "_" {
+		t.Fatalf("race failure replay token incomplete: schedule=%q forces=%q\n%s", schedule, forces, out)
+	}
+	replay := runBuiltTestProg(t, exe, "DSTExploreRaceReplay", "DSTSEED=1", "DSTREPLAY=1", "DSTSCHEDULE="+schedule, "DSTFORCES="+forces)
+	if exploreField(t, replay, "raced") != "true" {
+		t.Fatalf("race failure replay did not reproduce the race:\nexplore=%s\nreplay=%s", out, replay)
 	}
 }
 

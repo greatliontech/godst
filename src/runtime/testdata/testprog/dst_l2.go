@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing/simulation"
 	"unsafe" // for go:linkname and access-yield addresses
@@ -27,6 +28,7 @@ func init() {
 	register("DSTExploreOutcomes", DSTExploreOutcomes)
 	register("DSTExploreSweep", DSTExploreSweep)
 	register("DSTExploreRaceOracle", DSTExploreRaceOracle)
+	register("DSTExploreRaceReplay", DSTExploreRaceReplay)
 	register("DSTExploreAuto", DSTExploreAuto)
 	register("DSTExploreSyncAuto", DSTExploreSyncAuto)
 }
@@ -311,6 +313,114 @@ func DSTExploreRaceOracle() {
 		" races=" + strconv.Itoa(races) +
 		" exhausted=" + strconv.FormatBool(res.Exhausted) +
 		" firstrace=" + firstRace + "\n")
+}
+
+func encodeSchedule(schedule []uint64) string {
+	if len(schedule) == 0 {
+		return "_"
+	}
+	parts := make([]string, len(schedule))
+	for i, g := range schedule {
+		parts[i] = strconv.FormatUint(g, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+func decodeSchedule(s string) []uint64 {
+	if s == "" || s == "_" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]uint64, len(parts))
+	for i, p := range parts {
+		v, err := strconv.ParseUint(p, 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func encodeAccessForces(forces []simulation.AccessForce) string {
+	if len(forces) == 0 {
+		return "_"
+	}
+	parts := make([]string, len(forces))
+	for i, f := range forces {
+		parts[i] = strconv.FormatUint(f.Seq, 10) + ":" + strconv.FormatUint(f.Count, 10) + ":" + strconv.FormatUint(uint64(f.PCKey), 16)
+	}
+	return strings.Join(parts, ",")
+}
+
+func decodeAccessForces(s string) []simulation.AccessForce {
+	if s == "" || s == "_" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]simulation.AccessForce, len(parts))
+	for i, p := range parts {
+		fields := strings.Split(p, ":")
+		if len(fields) != 3 {
+			panic("bad force token: " + p)
+		}
+		seq, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		count, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		pc, err := strconv.ParseUint(fields[2], 16, 0)
+		if err != nil {
+			panic(err)
+		}
+		out[i] = simulation.AccessForce{Seq: seq, Count: count, PCKey: uintptr(pc)}
+	}
+	return out
+}
+
+func firstRaceFailure(res simulation.ExploreResult) (simulation.Failure, bool) {
+	var first simulation.Failure
+	found := false
+	for _, f := range res.Failures {
+		if !f.Race {
+			continue
+		}
+		if len(f.AccessForces) != 0 {
+			return f, true
+		}
+		if !found {
+			first, found = f, true
+		}
+	}
+	return first, found
+}
+
+// DSTExploreRaceReplay prints a race failure's full replay token, or replays a token
+// in a fresh process. It uses the auto-instrumented R/W/R SUT because its filtered
+// access stream exercises replay-promoted access forces.
+func DSTExploreRaceReplay() {
+	seed := dstSeedEnv()
+	if os.Getenv("DSTREPLAY") == "1" {
+		failure := simulation.Failure{
+			Schedule:     decodeSchedule(os.Getenv("DSTSCHEDULE")),
+			AccessForces: decodeAccessForces(os.Getenv("DSTFORCES")),
+		}
+		_, raced := simulation.Replay(seed, failure, unmodifiedRWRSUT)
+		os.Stdout.WriteString("racereplay raced=" + strconv.FormatBool(raced) + "\n")
+		return
+	}
+
+	failure, ok := firstRaceFailure(simulation.Explore(seed, simulation.DPOR, unmodifiedRWRSUT))
+	if !ok {
+		os.Stdout.WriteString("racereplay races=0 schedule=_ forces=_ forcecount=0\n")
+		return
+	}
+	os.Stdout.WriteString("racereplay races=1 schedule=" + encodeSchedule(failure.Schedule) +
+		" forces=" + encodeAccessForces(failure.AccessForces) +
+		" forcecount=" + strconv.Itoa(len(failure.AccessForces)) + "\n")
 }
 
 // unmodifiedRMWSUT is a plain, UNINSTRUMENTED SUT: two goroutines do an

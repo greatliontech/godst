@@ -13,6 +13,12 @@ import (
 //go:linkname dstAccessYield runtime.dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool)
 
+//go:linkname dstAccessYieldFP runtime.dstAccessYieldFP
+func dstAccessYieldFP() uint64
+
+//go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
+func dstAccessYieldReset()
+
 func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -26,6 +32,46 @@ func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	})
 	if !tr.overflow {
 		t.Fatalf("access-log overflow did not mark trace incomplete")
+	}
+}
+
+func TestReplayInstallsAccessForces(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race so manual dstAccessYield uses the shared-address filter")
+	}
+
+	x := 0
+	sut := func() bool {
+		dstAccessYield(unsafe.Pointer(&x), true)
+		x = 1
+		return false
+	}
+
+	dstExploreInit(64, 64, 64, 64)
+	dstAccessYieldReset()
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+	unforced := dstAccessYieldFP()
+	force := AccessForce{}
+	for i := range tr.accSeq {
+		if tr.accCount[i] != 0 && tr.accPC[i] != 0 {
+			force = AccessForce{Seq: tr.accSeq[i], Count: tr.accCount[i], PCKey: tr.accPC[i]}
+			break
+		}
+	}
+	if force.Count == 0 {
+		t.Fatalf("missing replayable access metadata: %#v", tr)
+	}
+
+	dstAccessYieldReset()
+	failed, raced := Replay(1, Failure{AccessForces: []AccessForce{force}}, sut)
+	if failed || raced {
+		t.Fatalf("replay reported unexpected failure: failed=%v raced=%v", failed, raced)
+	}
+	if got := dstAccessYieldFP(); got <= unforced {
+		t.Fatalf("Replay did not install the forced access yield: unforced=%d forced=%d", unforced, got)
 	}
 }
 

@@ -738,8 +738,9 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   access records into the per-bubble access log inline and does not call `goyield`; a conflicting access
   still yields and is logged when the goroutine is resumed, preserving commit order. Because a prior-only
   filter cannot know that a later access will need a split inside the same inline interval, the brain
-  promotes observed unsafe inline accesses to forced replay yield points keyed by `(dstSeq, hook ordinal,
-  hook PC)` and restarts the pass until no new promotion is needed. Auto-instrumented accesses to the
+   promotes observed unsafe inline accesses to forced replay yield points keyed by `(dstSeq, hook ordinal,
+   hook PC key)`, where the PC key is function-name + offset based rather than an absolute address, and
+   restarts the pass until no new promotion is needed. Auto-instrumented accesses to the
   current goroutine's stack log as `addr=0` (private; no conflict identity), while explicit manual/sync
   identities keep their addresses. If the bounded live filter state overflows, the runtime conservatively
   yields every later access (less pruning, never a dropped class). Non-race manual hooks remain explicit
@@ -795,9 +796,8 @@ The driver lives above the seam, orchestrating repeated Runs:
   schedule, execute `f` under it, analyze the trace, push new schedules, until the worklist is empty
   (the pruned interleaving space is **exhausted**) or an `opts` budget (max schedules / max steps) is
   hit. `Report` carries pass/exhausted/budget-hit + every found failure (a `-race` report or a SUT
-  panic/assertion) with the observing schedule. Assertion failures reproduce from that schedule; a race
-  first observed before access-force convergence may also require promotion state not yet exposed by the
-  public replay surface.
+  panic/assertion) with replay metadata: the observing schedule plus any forced access-yield watchpoints
+  active when the failure was observed.
 - `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
   `RunWith(seed, Options{Strategy: DPOR, Schedule: s}, f)` replays one schedule for reproduction/debug.
 - **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
@@ -810,21 +810,22 @@ Each explored interleaving runs under `-race`. The HB detector fires for an unsy
 even at `GOMAXPROCS=1` serial execution (it is clock-based, not timing-based), and the report is a
 deterministic function of the seed/schedule (same seed → 100/100 identical normalized report; even a
    *conditional* race's detect/no-detect verdict is stable per seed, 0/30 vs 30/30 — no flicker). **[V]** So
-   a race found in an explored interleaving is a stable observation; exact public replay from only the
-   schedule is subject to the access-force caveat below. Atomicity violations (invisible to `-race`) are
-   caught by the SUT's own assertions in the same explored interleaving.
+   a race found in an explored interleaving is a stable observation; exact public replay uses the schedule
+   plus the access-force set recorded on the failure. Atomicity violations (invisible to `-race`) are caught
+   by the SUT's own assertions in the same explored interleaving.
 
 Wired into `Explore`: `runOnce` reads `runtime.RaceErrors()` (via the build-tagged
 `dstRaceErrors` — real under `-race`, 0 otherwise) before and after each scheduled Run; a NEW race makes
 the schedule a `Failure` with `Race=true`. The detector dedups by signature, so each distinct race yields
-exactly one `Race` failure — the first schedule that exhibits it. If that first report occurs before
-access-force convergence, exact public replay also needs the internal force set (tracked deferral); the
-race is still surfaced rather than lost to TSan dedup. Enforced by `TestDSTExploreRaceOracle`: an
+ exactly one `Race` failure — the first schedule that exhibits it, including any access-force set active in
+ that pass so `simulation.Replay` can reproduce it in a fresh process even if later passes do not re-report
+ due to TSan dedup. Enforced by `TestDSTExploreRaceOracle`: an
 unconditional write-write race is reported (the oracle fires under `simulation.Run`), and an
 *interleaving-conditional* race — manifesting only when the reader acquires a mutex first (`raceCondSUT`) —
-is found by exploring both acquisition orders and reported with a non-trivial schedule, both deterministic
-across same-seed runs. A non-`-race` build still enumerates interleavings and reports SUT-assertion
-failures; it records no data-race failures.
+ is found by exploring both acquisition orders and reported with a non-trivial schedule, both deterministic
+ across same-seed runs. `TestDSTExploreRaceReplay` covers a race first observed under replay-promoted
+ access forces and replays the returned schedule+force token in a fresh process. A non-`-race` build still
+ enumerates interleavings and reports SUT-assertion failures; it records no data-race failures.
 
 ### Soundness argument (load-bearing collapse-check)
 

@@ -54,6 +54,7 @@ func dstYieldAccess(addr uintptr, write bool, filter bool, pc uintptr) {
 	}
 	seq := dstEnsureSeq(gp)
 	gp.dstAccCount++
+	pc = dstAccessPCKey(pc)
 	auto := filter && raceenabled
 	forced := dstAccessForced(seq, gp.dstAccCount, pc)
 	if auto && !forced && !dstAccessShouldYield(gp, seq, addr, write) {
@@ -176,7 +177,7 @@ var (
 // Access log buffers (shared-address filtering, increment 6). Unlike the per-decision
 // trace (which records the access of the goroutine CHOSEN at each scheduling
 // decision), the access log records EVERY instrumented access in execution order —
-// (accessing goroutine dstSeq, addr, hook PC, hook ordinal, isWrite, the
+// (accessing goroutine dstSeq, addr, hook PC key, hook ordinal, isWrite, the
 // dstScheduleStep it occurred under) — decoupled from whether the access yielded.
 // This decoupling is what lets the runtime FILTER: a single-owner access can "record
 // but not yield" (design.md D1) while the brain still sees it for the dependency
@@ -307,6 +308,22 @@ func dstAccessHBBefore(curProc, priorProc int, priorEpoch uint32) bool {
 
 func dstAccessMaybeShared(gp *g, addr uintptr) bool {
 	return addr != 0 && (addr < gp.stack.lo || addr >= gp.stack.hi)
+}
+
+func dstAccessPCKey(pc uintptr) uintptr {
+	f := findfunc(pc)
+	if !f.valid() {
+		return pc
+	}
+	h := uint64(1469598103934665603)
+	name := funcname(f)
+	for i := 0; i < len(name); i++ {
+		h ^= uint64(name[i])
+		h *= 1099511628211
+	}
+	h ^= uint64(pc - f.entry())
+	h *= 1099511628211
+	return uintptr(h)
 }
 
 func dstAccessForced(seq, count uint64, pc uintptr) bool {
@@ -599,7 +616,7 @@ func dstSetSchedule(prefix []uint64) { dstSchedulePrefix = prefix }
 
 // dstSetAccessForce installs replay watchpoints for filtered access-log entries the
 // brain has proven need a real yield boundary. Each triple is (dstSeq, per-g hook
-// ordinal, hook PC). The brain owns the slices and must not mutate them during the Run.
+// ordinal, hook PC key). The brain owns the slices and must not mutate them during the Run.
 //
 //go:linkname dstSetAccessForce
 func dstSetAccessForce(seq, count []uint64, pc []uintptr) {
@@ -661,7 +678,7 @@ func dstEdgeAtFP(i int) (from, to uint64, step, acc int) {
 func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
 
 // dstAccLogLenFP reports the access-log entry count recorded by the last run;
-// dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, hook PC, hook ordinal, isWrite, the
+// dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, hook PC key, hook ordinal, isWrite, the
 // dstScheduleStep it occurred under). The brain sources DPOR's dependency/HB relation
 // from this log (decoupled from the decision trace) so single-owner accesses can be
 // filtered to non-yields without losing the dependency. dstAccLogOverflowFP reports a

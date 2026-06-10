@@ -4,6 +4,8 @@
 
 package simulation
 
+import "sort"
+
 // Level-2 systematic interleaving exploration. Explore drives repeated bubble
 // re-executions of a SUT, each following an explicit scheduling-decision prefix
 // (the scheduled strategy, runtime/dst_explore.go), and enumerates the sound
@@ -26,14 +28,29 @@ const (
 	DPOR
 )
 
+// AccessForce identifies one auto-instrumented access hook that must yield during
+// replay. It is part of a Failure's replay token for races discovered while the
+// shared-address filter is still promoting inline accesses. The PC key is relative to
+// the containing function, not an absolute code address, so it survives fresh-process
+// replay of the same binary.
+type AccessForce struct {
+	// Seq is the accessing goroutine's stable per-bubble index.
+	Seq uint64
+	// Count is that goroutine's hook ordinal.
+	Count uint64
+	// PCKey is a stable key for the hook call site: function name hash plus PC offset.
+	PCKey uintptr
+}
+
 // Failure records an interleaving under which the SUT reported a bug.
 type Failure struct {
 	// Schedule is the decision prefix — the stable per-bubble goroutine indices
-	// (dstSeq, not goid) chosen in decision order. Assertion failures reproduce from
-	// this prefix. Race failures normally do too, but a race first observed before
-	// access-force convergence may also require internal promotion state that is not yet
-	// exposed by the public replay surface.
+	// (dstSeq, not goid) chosen in decision order.
 	Schedule []uint64
+	// AccessForces are the forced access-yield watchpoints active when this failure was
+	// observed. Replaying a race first found before promotion convergence requires these
+	// in addition to Schedule, because TSan dedups race reports process-wide.
+	AccessForces []AccessForce
 	// Race is true iff the -race detector reported a NEW data race during this
 	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
 	// (sut returned true). In a non-race build Race is always false. The detector
@@ -48,7 +65,7 @@ type ExploreResult struct {
 	Schedules int
 	// Failures lists every explored interleaving that exhibited a bug — the SUT
 	// returned true (an assertion failure) OR the -race detector reported a new data
-	// race (Failure.Race; see D5) — each with its observing schedule.
+	// race (Failure.Race; see D5) — each with its replay metadata.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
@@ -87,6 +104,19 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 	return exhaustiveExplore(seed, sut)
 }
 
+// Replay executes sut once under failure's recorded schedule and access-force set.
+// It returns the SUT assertion verdict and whether the race detector reported a new
+// race during this replay. For race failures, run Replay in a fresh process if the
+// same process already observed that race, because TSan dedups reports by signature.
+func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) {
+	if !dstBuilt() {
+		panic("testing/simulation: Replay requires building with -tags dst")
+	}
+	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges, exploreMaxAccesses)
+	failed, raced, _ = runOnce(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut)
+	return failed, raced
+}
+
 // exploreTrace is one scheduled run's recorded decision trace, copied out of the
 // runtime's per-bubble buffers (which the next run overwrites).
 type exploreTrace struct {
@@ -97,7 +127,7 @@ type exploreTrace struct {
 	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
 	// per-decision addrs. accStep[k] is the dstScheduleStep the access occurred under:
 	// an access with step s was performed by procs[s-1] during the interval after
-	// decision s-1, so its reversal anchors at decision s-1. accPC+accCount identify a
+	// decision s-1, so its reversal anchors at decision s-1. accPC (a stable PC key) + accCount identify a
 	// filtered hook call precisely enough to force it to yield on replay if a later
 	// conflict proves that interval needed a split.
 	accSeq   []uint64
@@ -121,6 +151,35 @@ type accessForce struct {
 	seq   uint64
 	count uint64
 	pc    uintptr
+}
+
+func accessForceMap(forces []AccessForce) map[accessForce]bool {
+	m := make(map[accessForce]bool, len(forces))
+	for _, f := range forces {
+		m[accessForce{seq: f.Seq, count: f.Count, pc: f.PCKey}] = true
+	}
+	return m
+}
+
+func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
+	out := make([]AccessForce, 0, len(forces))
+	for f := range forces {
+		out = append(out, AccessForce{Seq: f.seq, Count: f.count, PCKey: f.pc})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Seq != out[j].Seq {
+			return out[i].Seq < out[j].Seq
+		}
+		if out[i].Count != out[j].Count {
+			return out[i].Count < out[j].Count
+		}
+		return out[i].PCKey < out[j].PCKey
+	})
+	return out
+}
+
+func newFailure(prefix []uint64, raced bool, forces map[accessForce]bool) Failure {
+	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced}
 }
 
 func installAccessForces(forces map[accessForce]bool) {
@@ -209,7 +268,7 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 		}
 		// Assertion failures from an obsolete force set are not replayable under the next
 		// pass. Race failures are process-global TSan reports and may be deduped before the
-		// converged pass, so keep the first observing schedule.
+		// converged pass, so keep the first observing replay token.
 		for _, f := range res.Failures {
 			if f.Race {
 				carriedRace = append(carriedRace, f)
@@ -236,7 +295,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 			res.Overflow = true
 		}
 		if failed || raced {
-			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
+			res.Failures = append(res.Failures, newFailure(prefix, raced, forces))
 		}
 		if promoteAccessForces(tr, forces) {
 			return res, true
@@ -410,7 +469,7 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 		}
 		// Assertion failures from an obsolete force set are not replayable under the next
 		// pass. Race failures are process-global TSan reports and may be deduped before the
-		// converged pass, so keep the first observing schedule.
+		// converged pass, so keep the first observing replay token.
 		for _, f := range res.Failures {
 			if f.Race {
 				carriedRace = append(carriedRace, f)
@@ -435,7 +494,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) 
 			res.Overflow = true
 		}
 		if failed || raced {
-			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
+			res.Failures = append(res.Failures, newFailure(prefix, raced, forces))
 		}
 		if promoteAccessForces(tr, forces) {
 			return res, true
