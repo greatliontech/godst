@@ -11,10 +11,10 @@
 // scheduled, select poll order, map iteration order, the math/rand and
 // math/rand/v2 top-level functions, crypto/rand, synctest timer ordering, and
 // the process identity a program observes (os.Getpid/Getppid/Hostname,
-// os.Getuid/Getgid/Geteuid/Getegid, os/user.Current, runtime.NumCPU). It does not
-// make wall-clock time, real network/file I/O, or cgo deterministic; programs
-// under test must confine themselves to goroutines, channels, sync primitives,
-// and time (real I/O is modeled in-memory).
+// os.Getuid/Getgid/Geteuid/Getegid, os/user.Current, runtime.NumCPU), and TCP
+// net.Dial/net.Listen through the in-memory deterministic network. It does not
+// make wall-clock time, real file I/O, unsupported network kinds, or cgo
+// deterministic; programs under test model those surfaces in-memory or avoid them.
 //
 // The determinism boundary is Run itself: these are virtualized only inside a
 // Run. Nondeterminism a program captures *before* Run — e.g. reading time.Now or
@@ -39,17 +39,15 @@
 //     simulation exists for, and it holds under -race (it is driven by a
 //     per-goroutine deterministic RNG and single-threaded execution, neither of
 //     which the race detector perturbs).
-//   - GC set-level (unconditional). The GC count and the total set of objects
-//     whose finalizers/weak refs are discovered are deterministic, including under
-//     -race (the trigger fires the right number of times with the right total).
+//   - GC discovery (unconditional). The GC count, the total set of objects whose
+//     finalizers/weak refs are discovered, and which GC cycle discovers them are
+//     deterministic, including under -race (the trigger fires from per-object
+//     allocated bytes rather than span-granular heap layout).
 //
-// Not in the contract: *which* GC cycle discovers a given object, and the
-// byte-level heap MemStats fields (HeapAlloc/HeapInuse/HeapReleased/HeapIdle).
-// These are sub-observable noise of the allocator's span-granular GC trigger —
-// stable in a fixed normal build but perturbed by ±span under -race/-msan or a
-// change in binary composition. A program must not assert on them; one that only
-// relies on scheduling/values/replay and set-level GC (the usual case) is fully
-// deterministic. Size memory behavior by NumGC and Options.MemoryLimit.
+// Not in the contract: byte-level heap MemStats fields
+// (HeapAlloc/HeapInuse/HeapReleased/HeapIdle). These remain sub-observable noise
+// of allocator span layout and scavenging. A program must not assert on them; size
+// memory behavior by NumGC and Options.MemoryLimit.
 //
 // # Build constraint
 //
@@ -112,8 +110,17 @@ func dstEdgeLenFP() int
 //go:linkname dstEdgeAtFP runtime.dstEdgeAtFP
 func dstEdgeAtFP(i int) (from, to uint64, step, acc int)
 
+//go:linkname dstEdgeOrderFP runtime.dstEdgeOrderFP
+func dstEdgeOrderFP(i int) int
+
 //go:linkname dstEdgeOverflowFP runtime.dstEdgeOverflowFP
 func dstEdgeOverflowFP() bool
+
+//go:linkname dstSyncEventLenFP runtime.dstSyncEventLenFP
+func dstSyncEventLenFP() int
+
+//go:linkname dstSyncEventAtFP runtime.dstSyncEventAtFP
+func dstSyncEventAtFP(i int) (kind uint8, id, aux uintptr, seq uint64, step, acc, order int)
 
 //go:linkname dstAccLogLenFP runtime.dstAccLogLenFP
 func dstAccLogLenFP() int

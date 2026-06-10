@@ -29,6 +29,16 @@ func internal_sync_runtime_dstSyncAcquire(id unsafe.Pointer) {
 	dstSyncAcquire(id)
 }
 
+//go:linkname internal_sync_runtime_dstRecordSyncRelease internal/sync.runtime_dstRecordSyncRelease
+func internal_sync_runtime_dstRecordSyncRelease(id unsafe.Pointer) {
+	dstRecordSyncRelease(id)
+}
+
+//go:linkname internal_sync_runtime_dstRecordSyncAcquire internal/sync.runtime_dstRecordSyncAcquire
+func internal_sync_runtime_dstRecordSyncAcquire(id unsafe.Pointer) {
+	dstRecordSyncAcquire(id)
+}
+
 // sync_runtime_dstSyncAcquire is the same bridge for package sync's RWMutex reader,
 // writer-release, and reader-release paths, which must conflict on the RWMutex's
 // embedded writer mutex identity.

@@ -7,6 +7,7 @@ package simulation
 import (
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -173,6 +174,68 @@ func TestExploreClocksOrderSameStepEdgesAgainstAccesses(t *testing.T) {
 	}
 }
 
+func TestExploreClocksModelSyncReleaseAcquire(t *testing.T) {
+	tr := exploreTrace{
+		accSeq:    []uint64{1, 2},
+		accAddr:   []uintptr{0x1000, 0x1000},
+		accWrite:  []bool{true, false},
+		accStep:   []int{1, 3},
+		syncKind:  []uint8{syncEventRelease, syncEventAcquire},
+		syncID:    []uintptr{0x2000, 0x2000},
+		syncSeq:   []uint64{1, 2},
+		syncStep:  []int{2, 3},
+		syncAcc:   []int{1, 1},
+		syncOrd:   []int{1, 2},
+		edgeOrder: nil,
+	}
+	clk, pidx := dporClocks(tr)
+	if dporConcurrent(clk, pidx, tr, 0, 1) {
+		t.Fatalf("release/acquire HB did not order protected accesses: %#v", clk)
+	}
+}
+
+func TestExploreClocksUseReleaseSnapshot(t *testing.T) {
+	tr := exploreTrace{
+		accSeq:   []uint64{1, 1, 2},
+		accAddr:  []uintptr{0x1000, 0x2000, 0x2000},
+		accWrite: []bool{true, true, false},
+		accStep:  []int{1, 3, 5},
+		syncKind: []uint8{syncEventRelease, syncEventAcquire},
+		syncID:   []uintptr{0x3000, 0x3000},
+		syncSeq:  []uint64{1, 2},
+		syncStep: []int{2, 4},
+		syncAcc:  []int{1, 2},
+		syncOrd:  []int{1, 2},
+	}
+	clk, pidx := dporClocks(tr)
+	if dporConcurrent(clk, pidx, tr, 0, 2) {
+		t.Fatalf("release snapshot did not carry pre-release access to acquire: %#v", clk)
+	}
+	if !dporConcurrent(clk, pidx, tr, 1, 2) {
+		t.Fatalf("acquire incorrectly observed releaser's post-release access: %#v", clk)
+	}
+}
+
+func TestExploreClocksDistinguishSyncObjectAux(t *testing.T) {
+	tr := exploreTrace{
+		accSeq:   []uint64{1, 2},
+		accAddr:  []uintptr{0x1000, 0x1000},
+		accWrite: []bool{true, false},
+		accStep:  []int{1, 3},
+		syncKind: []uint8{syncEventRelease, syncEventAcquire},
+		syncID:   []uintptr{0x2000, 0x2000},
+		syncAux:  []uintptr{2, 1},
+		syncSeq:  []uint64{1, 2},
+		syncStep: []int{2, 3},
+		syncAcc:  []int{1, 1},
+		syncOrd:  []int{1, 2},
+	}
+	clk, pidx := dporClocks(tr)
+	if !dporConcurrent(clk, pidx, tr, 0, 1) {
+		t.Fatalf("sync events with the same id but different aux were incorrectly ordered: %#v", clk)
+	}
+}
+
 func TestExploreRecordsCreateHBEdge(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -195,6 +258,234 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 		}
 	}
 	t.Fatalf("goroutine creation did not record a parent->child HB edge before child wake: steps=%v acc=%v from=%v to=%v", tr.edgeStep, tr.edgeAcc, tr.edgeFrom, tr.edgeTo)
+}
+
+func TestExploreRecordsBufferedChannelHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
+	}
+	x := new(int)
+	addr := uintptr(unsafe.Pointer(x))
+	dstExploreInit(128, 512, 128, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan struct{}, 1)
+		var wg sync.WaitGroup
+		dstAccessYield(unsafe.Pointer(x), true)
+		*x = 1
+		ch <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ch
+			dstAccessYield(unsafe.Pointer(x), false)
+			_ = *x
+		}()
+		wg.Wait()
+		return false
+	})
+	release, acquire := false, false
+	for _, k := range tr.syncKind {
+		release = release || k == syncEventRelease
+		acquire = acquire || k == syncEventAcquire
+	}
+	if !release || !acquire {
+		t.Fatalf("buffered channel did not record sync release/acquire events: kind=%v", tr.syncKind)
+	}
+	write, read := -1, -1
+	for i := range tr.accSeq {
+		if tr.accAddr[i] != addr {
+			continue
+		}
+		if tr.accWrite[i] && write < 0 {
+			write = i
+		}
+		if !tr.accWrite[i] {
+			read = i
+		}
+	}
+	if write < 0 || read < 0 || tr.accSeq[write] == tr.accSeq[read] {
+		t.Fatalf("missing buffered-channel protected access pair: write=%d read=%d seq=%v addr=%#x log=%#v", write, read, tr.accSeq, addr, tr)
+	}
+	clk, pidx := dporClocks(tr)
+	if dporConcurrent(clk, pidx, tr, write, read) {
+		t.Fatalf("buffered channel send/receive HB did not order protected accesses: write=%d read=%d sync=%#v", write, read, tr.syncKind)
+	}
+}
+
+func TestExploreRecordsBufferedChannelZeroSizeSlotIDs(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
+	}
+	dstExploreInit(128, 512, 128, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan struct{}, 2)
+		ch <- struct{}{}
+		ch <- struct{}{}
+		<-ch
+		return false
+	})
+	releases := map[syncObjectKey]bool{}
+	for i, k := range tr.syncKind {
+		if k == syncEventRelease && tr.syncAux[i] != 0 {
+			releases[syncObjectKey{id: tr.syncID[i], aux: tr.syncAux[i]}] = true
+		}
+	}
+	if len(releases) < 2 {
+		t.Fatalf("zero-sized buffered channel slots were not distinct sync objects: releases=%v ids=%v aux=%v kind=%v", releases, tr.syncID, tr.syncAux, tr.syncKind)
+	}
+}
+
+func TestExploreRecordsFullBufferedChannelSenderRelease(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
+	}
+	x := new(int)
+	addr := uintptr(unsafe.Pointer(x))
+	sut := func() bool {
+		ch := make(chan int, 1)
+		ready := make(chan struct{})
+		ch <- 0
+		go func() {
+			dstAccessYield(unsafe.Pointer(x), true)
+			*x = 1
+			ready <- struct{}{}
+			ch <- 1
+		}()
+		<-ready
+		time.Sleep(time.Nanosecond)
+		if got := <-ch; got != 0 {
+			t.Fatalf("first receive got %d, want initial buffered value", got)
+		}
+		if got := <-ch; got != 1 {
+			t.Fatalf("second receive got %d, want blocked sender value", got)
+		}
+		return false
+	}
+	dstExploreInit(128, 512, 128, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+	senderSeq := uint64(0)
+	for i := range tr.accSeq {
+		if tr.accAddr[i] == addr && tr.accWrite[i] {
+			senderSeq = tr.accSeq[i]
+			break
+		}
+	}
+	if senderSeq == 0 {
+		t.Fatalf("missing sender access in trace: %#v", tr)
+	}
+	for i, k := range tr.syncKind {
+		if k != syncEventRelease || tr.syncSeq[i] != senderSeq || tr.syncAux[i] == 0 {
+			continue
+		}
+		step := tr.syncStep[i]
+		if step > 0 && step-1 < len(tr.procs) && tr.procs[step-1] != senderSeq {
+			return
+		}
+	}
+	t.Fatalf("full-buffer receive did not record blocked sender release from receiver step: sender=%d procs=%v syncSeq=%v syncStep=%v syncAux=%v kind=%v", senderSeq, tr.procs, tr.syncSeq, tr.syncStep, tr.syncAux, tr.syncKind)
+}
+
+func TestExploreRecordsSelectBufferedChannelHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
+	}
+	dstExploreInit(128, 512, 128, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan int, 1)
+		other := make(chan int)
+		select {
+		case ch <- 1:
+		case other <- 1:
+		}
+		select {
+		case <-ch:
+		case <-other:
+		}
+		return false
+	})
+	release := map[syncObjectKey]bool{}
+	for i, k := range tr.syncKind {
+		if tr.syncAux[i] == 0 {
+			continue
+		}
+		obj := syncObjectKey{id: tr.syncID[i], aux: tr.syncAux[i]}
+		if k == syncEventRelease {
+			release[obj] = true
+		}
+		if k == syncEventAcquire && release[obj] {
+			return
+		}
+	}
+	t.Fatalf("select buffered send/receive did not record matching release/acquire: id=%v aux=%v kind=%v", tr.syncID, tr.syncAux, tr.syncKind)
+}
+
+func TestExploreRecordsMutexHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("mutex HB events are emitted by dst-race sync hooks")
+	}
+	mu := new(sync.Mutex)
+	x := new(int)
+	addr := uintptr(unsafe.Pointer(x))
+	dstExploreInit(128, 512, 128, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		mu.Lock()
+		dstAccessYield(unsafe.Pointer(x), true)
+		*x = 1
+		mu.Unlock()
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			dstAccessYield(unsafe.Pointer(x), false)
+			_ = *x
+			mu.Unlock()
+		}()
+		wg.Wait()
+		return false
+	})
+	release, acquire := false, false
+	for _, k := range tr.syncKind {
+		release = release || k == syncEventRelease
+		acquire = acquire || k == syncEventAcquire
+	}
+	if !release || !acquire {
+		t.Fatalf("mutex did not record sync release/acquire events: kind=%v", tr.syncKind)
+	}
+	write, read := -1, -1
+	for i := range tr.accSeq {
+		if tr.accAddr[i] != addr {
+			continue
+		}
+		if tr.accWrite[i] && write < 0 {
+			write = i
+		}
+		if !tr.accWrite[i] {
+			read = i
+		}
+	}
+	if write < 0 || read < 0 || tr.accSeq[write] == tr.accSeq[read] {
+		t.Fatalf("missing mutex protected access pair: write=%d read=%d seq=%v addr=%#x log=%#v", write, read, tr.accSeq, addr, tr)
+	}
+	clk, pidx := dporClocks(tr)
+	if dporConcurrent(clk, pidx, tr, write, read) {
+		t.Fatalf("mutex Unlock/Lock HB did not order protected accesses: write=%d read=%d sync=%#v", write, read, tr.syncKind)
+	}
 }
 
 func TestExplorePostGoBoundaryNonRace(t *testing.T) {

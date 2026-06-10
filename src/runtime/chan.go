@@ -254,11 +254,15 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 
 	if c.qcount < c.dataqsiz {
 		// Space is available in the channel buffer. Enqueue the element to send.
-		qp := chanbuf(c, c.sendx)
+		slot := c.sendx
+		qp := chanbuf(c, slot)
 		if raceenabled {
-			racenotify(c, c.sendx, nil)
+			racenotify(c, slot, nil)
 		}
 		typedmemmove(c.elemtype, qp, ep)
+		if dstBuild && raceenabled {
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+		}
 		c.sendx++
 		if c.sendx == c.dataqsiz {
 			c.sendx = 0
@@ -649,9 +653,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	if c.qcount > 0 {
 		// Receive directly from queue
-		qp := chanbuf(c, c.recvx)
+		slot := c.recvx
+		qp := chanbuf(c, slot)
 		if raceenabled {
-			racenotify(c, c.recvx, nil)
+			racenotify(c, slot, nil)
+		}
+		if dstBuild && raceenabled {
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 		}
 		if ep != nil {
 			typedmemmove(c.elemtype, ep, qp)
@@ -755,10 +763,14 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		// head of the queue. Make the sender enqueue
 		// its item at the tail of the queue. Since the
 		// queue is full, those are both the same slot.
-		qp := chanbuf(c, c.recvx)
+		slot := c.recvx
+		qp := chanbuf(c, slot)
 		if raceenabled {
-			racenotify(c, c.recvx, nil)
-			racenotify(c, c.recvx, sg)
+			racenotify(c, slot, nil)
+			racenotify(c, slot, sg)
+		}
+		if dstBuild && raceenabled {
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 		}
 		// copy data from queue to receiver
 		if ep != nil {
@@ -766,6 +778,9 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		}
 		// copy data from sender to queue
 		typedmemmove(c.elemtype, qp, sg.elem.get())
+		if dstBuild && raceenabled {
+			dstRecordSyncEventForGID(dstSyncEventRelease, uintptr(unsafe.Pointer(c)), uintptr(slot)+1, sg.g)
+		}
 		c.recvx++
 		if c.recvx == c.dataqsiz {
 			c.recvx = 0

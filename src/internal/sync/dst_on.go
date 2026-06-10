@@ -25,6 +25,12 @@ const dstHookEnabled = true
 //go:linkname runtime_dstSyncAcquire
 func runtime_dstSyncAcquire(id unsafe.Pointer)
 
+//go:linkname runtime_dstRecordSyncRelease
+func runtime_dstRecordSyncRelease(id unsafe.Pointer)
+
+//go:linkname runtime_dstRecordSyncAcquire
+func runtime_dstRecordSyncAcquire(id unsafe.Pointer)
+
 // dstSyncAcquire announces mutex m's state decision to the DST scheduler. Lock calls it
 // before the fast-path CAS, TryLock before failed-state rejection, and Unlock before
 // clearing the lock bit, so contending goroutines record conflicts on the mutex
@@ -39,4 +45,12 @@ func runtime_dstSyncAcquire(id unsafe.Pointer)
 // runs a blocked goroutine (DST-L2-1) and skipping is always sound.
 func dstSyncAcquire(m *Mutex) {
 	runtime_dstSyncAcquire(unsafe.Pointer(m))
+}
+
+func dstSyncRelease(m *Mutex) {
+	runtime_dstRecordSyncRelease(unsafe.Pointer(m))
+}
+
+func dstSyncAcquireHB(m *Mutex) {
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(m))
 }

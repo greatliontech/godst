@@ -484,6 +484,9 @@ bufrecv:
 	}
 	recvOK = true
 	qp = chanbuf(c, c.recvx)
+	if dstBuild && raceenabled {
+		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
+	}
 	if cas.elem != nil {
 		typedmemmove(c.elemtype, cas.elem, qp)
 	}
@@ -508,7 +511,11 @@ bufsend:
 	if asanenabled {
 		asanread(cas.elem, c.elemtype.Size_)
 	}
-	typedmemmove(c.elemtype, chanbuf(c, c.sendx), cas.elem)
+	qp = chanbuf(c, c.sendx)
+	typedmemmove(c.elemtype, qp, cas.elem)
+	if dstBuild && raceenabled {
+		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
+	}
 	c.sendx++
 	if c.sendx == c.dataqsiz {
 		c.sendx = 0

@@ -27,10 +27,10 @@ concurrent path requires structuring the program so exactly one goroutine is run
 fragile discipline that does not survive real concurrency. DST moves that ordering from program
 discipline to **runtime enforcement**, so determinism holds with *many* runnable goroutines.
 
-What DST does **not** virtualize today: real network/file I/O and cgo. A program under test confines
-itself to goroutines, channels, sync primitives, and time, and models real I/O in-memory. Bringing I/O
-into the fork (an in-memory deterministic network, filesystem, and file/pipe I/O) is the main set of
-pending features — see the Roadmap.
+What DST does **not** virtualize today: real file I/O, unsupported network kinds, and cgo. TCP
+`net.Dial`/`net.Listen` are already modeled by the in-memory deterministic network below; other I/O is
+modeled in-memory by the program under test or avoided. Bringing the remaining I/O into the fork (an
+in-memory deterministic filesystem and file/pipe I/O) is the main pending feature set — see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
@@ -755,18 +755,23 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
 #### D2 — Happens-before tracking (the dependency relation)
 
 DPOR's dependency relation needs, for any two accesses, whether they are causally ordered. The runtime
-**records** the synchronization events it already owns — `goready`/`injectglist`/`netpollready` (the
-non-foreclosure choke points), channel send/recv, sema acquire/release (mutex), goroutine create/exit —
-   into the per-bubble transition log, and the DPOR engine **computes the vector clocks / HB relation
-   offline**, between Runs. Edges also record the access-log length at the moment they fired, so same-step
-   wake/create edges are ordered against inline filtered accesses in the same interval. Two conflicting
-   accesses are **dependent** iff neither clock dominates the other (concurrent); HB-ordered pairs are
-   pruned (their order is fixed and sound). Offline (not live hot-path clocks) because the runtime is a
-   pure recorder + schedule-follower under the stateless re-execution model — the scheduling decision
-   during a Run needs only the prefix, never HB; HB is needed only by the post-Run backtrack analysis. The
-   recorded events are the same ones the scheduler controls, so the HB is self-contained (no dependence on
-   TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful oracle, which the
-   conflict-set cross-check against `-race` reports validates. Timer-fire wakeups in synctest fake time are
+**records** the synchronization events it owns into the per-bubble transition log: ready/create edges
+(`goready`/goroutine creation, the non-foreclosure choke points) and, in `-tags dst -race` builds, explicit
+sync release/acquire events for real memory-model edges such as mutex `Unlock`→later successful
+`Lock`/`TryLock` and buffered channel slot send→receive. The DPOR engine **computes the vector clocks / HB
+relation offline**, between Runs.
+Ready edges and sync events also record the access-log length and a shared HB-event order at the moment
+they fired, so same-step events are ordered against inline filtered accesses in the same interval without
+conflating sync-object *decision conflicts* with synchronization HB. Sync events are replayed as object
+clocks, so an acquire observes the release-time snapshot rather than the releasing goroutine's later
+accesses. Buffered channel events key the object by channel plus ring slot, not by element address, so
+zero-sized element slots remain distinct HB objects. Two conflicting accesses are **dependent** iff neither clock dominates the other (concurrent);
+HB-ordered pairs are pruned (their order is fixed and sound). Offline (not live hot-path clocks) because
+the runtime is a pure recorder + schedule-follower under the stateless re-execution model — the scheduling
+decision during a Run needs only the prefix, never HB; HB is needed only by the post-Run backtrack analysis.
+The recorded events are the same ones the scheduler/sync primitives control, so the HB is self-contained
+(no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful
+oracle, which the conflict-set cross-check against `-race` reports validates. Timer-fire wakeups in synctest fake time are
    validated by `TestDSTExploreTimerHB`: two goroutines sleep until the same virtual time and then race on a
    shared variable; Exhaustive reaches both read outcomes (`timerhb exh=12`), and DPOR matches them while
    exhausted (`timerhb dpor=3`, two outcomes). So the currently-recorded timer wake edges do not over-order
@@ -904,17 +909,22 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    auto-instrumentation explosion is implemented in increment 6 and enforced by
    `TestDSTExploreAutoInstrument`.
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
-   records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
-   (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
-   so Random/PCT/non-dst are unaffected); the DPOR engine builds vector clocks **offline** from those
-   edges + program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to
-   *concurrent* conflicting pairs only. Mutex/channel-serialized conflicts are pruned. Measured on
-   `twoPairSUT` (two channel-ordered producer/consumer pairs interleaving freely): exhaustive 4032,
-   address-only DPOR 21, **HB-DPOR 4** — all 0 failures (`TestDSTExploreHBPrunes`, mutation-verified: the
-   `<=10` bound fails at 21 when the concurrency test is disabled). On pure-race SUTs (atomicity/counter,
-   no synchronized accesses) HB correctly finds the conflicts concurrent and changes nothing —
-   completeness preserved (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks)
-   keeps the runtime a pure recorder + schedule-follower. Foreclosure: additive recording.
+   records ready/create edges (readier happens-before readied) and, in `-tags dst -race` builds, explicit
+   sync release/acquire events into pre-sized per-bubble buffers under the scheduled strategy only
+   (allocation-free, gated so Random/PCT/non-dst/dst-without-race are unaffected); the DPOR engine builds vector clocks **offline** from those events +
+   program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to *concurrent*
+   conflicting pairs only. Mutex/channel-serialized conflicts are pruned, including non-waking edges such
+   as uncontended mutex `Unlock`→`Lock` and buffered channel slot send→receive. Measured on `twoPairSUT`
+   (two channel-ordered producer/consumer pairs interleaving freely): exhaustive 4032, address-only DPOR
+   21, **HB-DPOR 4** — all 0 failures (`TestDSTExploreHBPrunes`, mutation-verified: the `<=10` bound fails
+   at 21 when the concurrency test is disabled). Synthetic clock tests validate release/acquire object
+   clocks, release-time snapshots, and distinct channel-slot identities. `TestExploreRecordsBufferedChannelHB`,
+   `TestExploreRecordsBufferedChannelZeroSizeSlotIDs`, `TestExploreRecordsFullBufferedChannelSenderRelease`,
+   `TestExploreRecordsSelectBufferedChannelHB`, and `TestExploreRecordsMutexHB` validate the buffered-channel
+   and mutex runtime hook paths under `-tags dst -race`. On pure-race SUTs (atomicity/counter, no synchronized
+   accesses) HB correctly finds the conflicts concurrent and changes nothing — completeness preserved
+   (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks) keeps the runtime a pure
+   recorder + schedule-follower. Foreclosure: additive recording.
 3. **DPOR strategy** (D3; **VALIDATED [V]**). Iterative stateless DPOR over the schedule recorder
    (`dporExplore` in `testing/simulation/explore.go`): dependency = overlapping nonzero memory byte
    intervals or the same sync-object identity, ≥1 write, different stable index (`g.dstSeq`); backtrack

@@ -16,3 +16,7 @@ const dstHookEnabled = false
 // upstream in a non-dst build, a plain -race build, and a -tags dst build without
 // -race (DST-L2-4). See dst_on.go for the active form.
 func dstSyncAcquire(m *Mutex) {}
+
+func dstSyncRelease(m *Mutex) {}
+
+func dstSyncAcquireHB(m *Mutex) {}

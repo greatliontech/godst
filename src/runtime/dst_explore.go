@@ -193,8 +193,32 @@ var (
 	dstEdgeTo       []uint64
 	dstEdgeStep     []int32
 	dstEdgeAcc      []int32
+	dstEdgeOrder    []int32
 	dstEdgeN        int
 	dstEdgeOverflow bool
+	dstHBEventN     int32
+)
+
+const (
+	dstSyncEventRelease = 1
+	dstSyncEventAcquire = 2
+)
+
+// Sync happens-before event buffers. These are separate from dstSyncAcquire's
+// decision-conflict log: a mutex Lock and Unlock both conflict for DPOR, but only an
+// actual Unlock->later Lock (or buffered send->receive) is a memory-model HB edge.
+// The brain replays these as object clocks offline, preserving the release-time
+// snapshot instead of over-ordering with the releasing goroutine's later accesses.
+// Overflow only loses pruning, so it is conservative and not a coverage overflow.
+var (
+	dstSyncEventKind []uint8
+	dstSyncEventID   []uintptr
+	dstSyncEventAux  []uintptr
+	dstSyncEventSeq  []uint64
+	dstSyncEventStep []int32
+	dstSyncEventAcc  []int32
+	dstSyncEventOrd  []int32
+	dstSyncEventN    int
 )
 
 // Access log buffers (shared-address filtering, increment 6). Unlike the per-decision
@@ -492,10 +516,76 @@ func dstRecordReadyEdge(readier, readied *g) {
 		dstEdgeTo[dstEdgeN] = to
 		dstEdgeStep[dstEdgeN] = int32(dstScheduleStep)
 		dstEdgeAcc[dstEdgeN] = int32(dstAccLogN)
+		dstEdgeOrder[dstEdgeN] = dstHBEventN
+		dstHBEventN++
 		dstEdgeN++
 	} else {
 		dstEdgeOverflow = true
 	}
+}
+
+func dstRecordSyncEvent(kind uint8, id unsafe.Pointer) {
+	if id == nil {
+		return
+	}
+	dstRecordSyncEventID(kind, uintptr(id), 0)
+}
+
+func dstRecordSyncEventID(kind uint8, id, aux uintptr) {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || id == 0 {
+		return
+	}
+	gp := getg()
+	if gp == nil || gp != gp.m.curg {
+		return
+	}
+	dstRecordSyncEventForGID(kind, id, aux, gp)
+}
+
+func dstRecordSyncEventForG(kind uint8, id unsafe.Pointer, gp *g) {
+	if id == nil {
+		return
+	}
+	dstRecordSyncEventForGID(kind, uintptr(id), 0, gp)
+}
+
+func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
+	if !dstActive() || dstSchedKind != dstSchedScheduled {
+		return
+	}
+	if gp == nil || gp.bubble == nil || id == 0 {
+		return
+	}
+	seq := dstEnsureSeq(gp)
+	if dstSyncEventN < len(dstSyncEventKind) {
+		dstSyncEventKind[dstSyncEventN] = kind
+		dstSyncEventID[dstSyncEventN] = id
+		dstSyncEventAux[dstSyncEventN] = aux
+		dstSyncEventSeq[dstSyncEventN] = seq
+		dstSyncEventStep[dstSyncEventN] = int32(dstScheduleStep)
+		dstSyncEventAcc[dstSyncEventN] = int32(dstAccLogN)
+		dstSyncEventOrd[dstSyncEventN] = dstHBEventN
+		dstHBEventN++
+		dstSyncEventN++
+	}
+}
+
+//go:linkname dstRecordSyncRelease
+func dstRecordSyncRelease(id unsafe.Pointer) {
+	dstRecordSyncEvent(dstSyncEventRelease, id)
+}
+
+//go:linkname dstRecordSyncAcquire
+func dstRecordSyncAcquire(id unsafe.Pointer) {
+	dstRecordSyncEvent(dstSyncEventAcquire, id)
+}
+
+func dstRecordSyncReleaseID(id, aux uintptr) {
+	dstRecordSyncEventID(dstSyncEventRelease, id, aux)
+}
+
+func dstRecordSyncAcquireID(id, aux uintptr) {
+	dstRecordSyncEventID(dstSyncEventAcquire, id, aux)
 }
 
 // dstExploreInit pre-sizes the trace buffers for the exploration. Called by the
@@ -516,6 +606,14 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstEdgeTo = make([]uint64, maxEdges)
 	dstEdgeStep = make([]int32, maxEdges)
 	dstEdgeAcc = make([]int32, maxEdges)
+	dstEdgeOrder = make([]int32, maxEdges)
+	dstSyncEventKind = make([]uint8, maxEdges)
+	dstSyncEventID = make([]uintptr, maxEdges)
+	dstSyncEventAux = make([]uintptr, maxEdges)
+	dstSyncEventSeq = make([]uint64, maxEdges)
+	dstSyncEventStep = make([]int32, maxEdges)
+	dstSyncEventAcc = make([]int32, maxEdges)
+	dstSyncEventOrd = make([]int32, maxEdges)
 	dstAccLogSeq = make([]uint64, maxAccesses)
 	dstAccLogAddr = make([]uintptr, maxAccesses)
 	dstAccLogSize = make([]uintptr, maxAccesses)
@@ -549,6 +647,8 @@ func dstScheduleReset() {
 	dstSeqCtr = 0
 	dstEdgeN = 0
 	dstEdgeOverflow = false
+	dstHBEventN = 0
+	dstSyncEventN = 0
 	dstAccLogN = 0
 	dstAccLogOverflow = false
 	for i := range dstClock {
@@ -727,8 +827,19 @@ func dstEdgeAtFP(i int) (from, to uint64, step, acc int) {
 	return dstEdgeFrom[i], dstEdgeTo[i], int(dstEdgeStep[i]), int(dstEdgeAcc[i])
 }
 
+//go:linkname dstEdgeOrderFP
+func dstEdgeOrderFP(i int) int { return int(dstEdgeOrder[i]) }
+
 //go:linkname dstEdgeOverflowFP
 func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
+
+//go:linkname dstSyncEventLenFP
+func dstSyncEventLenFP() int { return dstSyncEventN }
+
+//go:linkname dstSyncEventAtFP
+func dstSyncEventAtFP(i int) (kind uint8, id, aux uintptr, seq uint64, step, acc, order int) {
+	return dstSyncEventKind[i], dstSyncEventID[i], dstSyncEventAux[i], dstSyncEventSeq[i], int(dstSyncEventStep[i]), int(dstSyncEventAcc[i]), int(dstSyncEventOrd[i])
+}
 
 // dstAccLogLenFP reports the access-log entry count recorded by the last run;
 // dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, size, hook PC key, hook ordinal, isWrite, the

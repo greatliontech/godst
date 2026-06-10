@@ -212,6 +212,18 @@ type exploreTrace struct {
 	edgeTo    []uint64
 	edgeStep  []int
 	edgeAcc   []int
+	edgeOrder []int
+	// Sync events are release/acquire operations on synchronization objects (mutex
+	// unlock/lock, buffered channel slot send/receive). They are consumed as object
+	// clocks so an acquire observes the release-time snapshot, not the releasing
+	// goroutine's later accesses.
+	syncKind  []uint8
+	syncID    []uintptr
+	syncAux   []uintptr
+	syncSeq   []uint64
+	syncStep  []int
+	syncAcc   []int
+	syncOrd   []int
 	aborted   bool // prefix named a non-enabled goroutine (a replay-determinism bug)
 	overflow  bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
 	budgetHit bool // run exceeded a caller-supplied per-run step budget
@@ -382,8 +394,21 @@ func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
 	tr.edgeTo = make([]uint64, m)
 	tr.edgeStep = make([]int, m)
 	tr.edgeAcc = make([]int, m)
+	tr.edgeOrder = make([]int, m)
 	for i := 0; i < m; i++ {
 		tr.edgeFrom[i], tr.edgeTo[i], tr.edgeStep[i], tr.edgeAcc[i] = dstEdgeAtFP(i)
+		tr.edgeOrder[i] = dstEdgeOrderFP(i)
+	}
+	s := dstSyncEventLenFP()
+	tr.syncKind = make([]uint8, s)
+	tr.syncID = make([]uintptr, s)
+	tr.syncAux = make([]uintptr, s)
+	tr.syncSeq = make([]uint64, s)
+	tr.syncStep = make([]int, s)
+	tr.syncAcc = make([]int, s)
+	tr.syncOrd = make([]int, s)
+	for i := 0; i < s; i++ {
+		tr.syncKind[i], tr.syncID[i], tr.syncAux[i], tr.syncSeq[i], tr.syncStep[i], tr.syncAcc[i], tr.syncOrd[i] = dstSyncEventAtFP(i)
 	}
 	return
 }
@@ -928,19 +953,106 @@ func addSourceBacktrack(fr *dporFrame, enabled []uint64, tr exploreTrace, clk []
 	// the DPOR-vs-Exhaustive equivalence checks validate it stays complete.)
 }
 
+const (
+	hbEventReady = iota + 1
+	hbEventSyncRelease
+	hbEventSyncAcquire
+)
+
+const (
+	syncEventRelease = 1
+	syncEventAcquire = 2
+)
+
+type hbEvent struct {
+	kind      uint8
+	order     int
+	step, acc int
+	from, to  uint64
+	seq       uint64
+	obj       syncObjectKey
+}
+
+type syncObjectKey struct {
+	id  uintptr
+	aux uintptr
+}
+
+func edgeOrderAt(tr exploreTrace, i int) int {
+	if i < len(tr.edgeOrder) {
+		return tr.edgeOrder[i]
+	}
+	return i
+}
+
+func syncOrderAt(tr exploreTrace, i int) int {
+	if i < len(tr.syncOrd) {
+		return tr.syncOrd[i]
+	}
+	return len(tr.edgeFrom) + i
+}
+
+func syncObjectAt(tr exploreTrace, i int) syncObjectKey {
+	obj := syncObjectKey{id: tr.syncID[i]}
+	if i < len(tr.syncAux) {
+		obj.aux = tr.syncAux[i]
+	}
+	return obj
+}
+
+func orderedHBEvents(tr exploreTrace) []hbEvent {
+	out := make([]hbEvent, 0, len(tr.edgeFrom)+len(tr.syncKind))
+	e, s := 0, 0
+	for e < len(tr.edgeFrom) || s < len(tr.syncKind) {
+		if s >= len(tr.syncKind) || (e < len(tr.edgeFrom) && edgeOrderAt(tr, e) <= syncOrderAt(tr, s)) {
+			out = append(out, hbEvent{kind: hbEventReady, order: edgeOrderAt(tr, e), step: tr.edgeStep[e], acc: tr.edgeAcc[e], from: tr.edgeFrom[e], to: tr.edgeTo[e]})
+			e++
+			continue
+		}
+		kind := uint8(hbEventSyncAcquire)
+		if tr.syncKind[s] == syncEventRelease {
+			kind = hbEventSyncRelease
+		}
+		out = append(out, hbEvent{kind: kind, order: syncOrderAt(tr, s), step: tr.syncStep[s], acc: tr.syncAcc[s], seq: tr.syncSeq[s], obj: syncObjectAt(tr, s)})
+		s++
+	}
+	return out
+}
+
+func maxHBStep(tr exploreTrace) int {
+	maxStep := 0
+	for _, s := range tr.accStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	for _, s := range tr.edgeStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	for _, s := range tr.syncStep {
+		if s > maxStep {
+			maxStep = s
+		}
+	}
+	return maxStep
+}
+
 // dporClocks computes a SYNC happens-before vector clock per ACCESS-LOG entry from
-// program order plus the recorded goready edges, so dporConcurrent can test whether
-// two accesses are causally ordered. clk[k] is access k's goroutine's clock snapshot
-// right after access k's program-order tick; pidx maps a goroutine's stable index
-// (dstSeq) to a vector position.
+// program order plus the recorded goready/create edges and sync release/acquire
+// events, so dporConcurrent can test whether two accesses are causally ordered.
+// clk[k] is access k's goroutine's clock snapshot right after access k's
+// program-order tick; pidx maps a goroutine's stable index (dstSeq) to a vector
+// position.
 //
 // Processing is in execution order, grouped by step (the access log is sorted by
-// accStep, which is non-decreasing in execution order): within each step s, edgeAcc
-// places each same-step goready/create edge before the first access whose log index is
-// >= edgeAcc. This is load-bearing for filtered inline accesses after a wake: the wake
-// edge must not make later same-step parent accesses happen-before the readied
+// accStep, which is non-decreasing in execution order): within each step s, each
+// HB event's access-log length places it before the first access whose log index is
+// >= that length. This is load-bearing for filtered inline accesses after a wake: a
+// wake edge must not make later same-step parent accesses happen-before the readied
 // goroutine. A step with no accesses (a coarse-point-only interval) still applies its
-// edges; step 0 accesses are modeled too, so replay-promotion can detect conflicts
+// events; step 0 accesses are modeled too, so replay-promotion can detect conflicts
 // before the first decision.
 func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	pidx = make(map[uint64]int)
@@ -956,60 +1068,69 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 		addProc(tr.edgeFrom[i])
 		addProc(tr.edgeTo[i])
 	}
+	for _, p := range tr.syncSeq {
+		addProc(p)
+	}
 	P := len(pidx)
 	cur := make([][]uint32, P)
 	for i := range cur {
 		cur[i] = make([]uint32, P)
 	}
-	flow := func(from, to int) { // to = elementwise-max(to, from)
+	mergeInto := func(dst, src []uint32) {
 		for k := 0; k < P; k++ {
-			if cur[from][k] > cur[to][k] {
-				cur[to][k] = cur[from][k]
+			if src[k] > dst[k] {
+				dst[k] = src[k]
 			}
 		}
 	}
-	applied := make([]bool, len(tr.edgeStep))
-	applyEdges := func(step, accLimit int) {
-		for e := range tr.edgeStep {
-			if !applied[e] && tr.edgeStep[e] == step && tr.edgeAcc[e] <= accLimit {
-				flow(pidx[tr.edgeFrom[e]], pidx[tr.edgeTo[e]])
-				applied[e] = true
+	events := orderedHBEvents(tr)
+	eventIdx := 0
+	objClk := map[syncObjectKey][]uint32{}
+	objectClock := func(obj syncObjectKey) []uint32 {
+		clk := objClk[obj]
+		if clk == nil {
+			clk = make([]uint32, P)
+			objClk[obj] = clk
+		}
+		return clk
+	}
+	applyEvents := func(step, accLimit int) {
+		for eventIdx < len(events) && (events[eventIdx].step < step || events[eventIdx].step == step && events[eventIdx].acc <= accLimit) {
+			ev := events[eventIdx]
+			switch ev.kind {
+			case hbEventReady:
+				mergeInto(cur[pidx[ev.to]], cur[pidx[ev.from]])
+			case hbEventSyncRelease:
+				mergeInto(objectClock(ev.obj), cur[pidx[ev.seq]])
+			case hbEventSyncAcquire:
+				mergeInto(cur[pidx[ev.seq]], objectClock(ev.obj))
 			}
+			eventIdx++
 		}
 	}
-	maxStep := 0
-	for _, s := range tr.accStep {
-		if s > maxStep {
-			maxStep = s
-		}
-	}
-	for _, s := range tr.edgeStep {
-		if s > maxStep {
-			maxStep = s
-		}
-	}
+	maxStep := maxHBStep(tr)
 	nLog := len(tr.accSeq)
 	clk = make([][]uint32, nLog)
 	li := 0
 	for s := 0; s <= maxStep; s++ {
-		applyEdges(s, li)
+		applyEvents(s, li)
 		for li < nLog && tr.accStep[li] == s {
-			applyEdges(s, li)
+			applyEvents(s, li)
 			pi := pidx[tr.accSeq[li]]
 			cur[pi][pi]++
 			clk[li] = append([]uint32(nil), cur[pi]...)
 			li++
-			applyEdges(s, li)
+			applyEvents(s, li)
 		}
-		applyEdges(s, li)
+		applyEvents(s, li)
 	}
 	return clk, pidx
 }
 
 // dporTraceClocks computes the TRACE happens-before over ACCESS-LOG entries — the
 // Mazurkiewicz partial order = the transitive closure of the DEPENDENCY relation in
-// trace order, plus program order and the recorded sync (goready) edges. Unlike
-// dporClocks (sync edges + program order only), it ALSO orders every pair of
+// trace order, plus program order and the recorded sync HB events. Unlike
+// dporClocks (sync HB + program order only), it ALSO orders every pair of
 // conflicting accesses (overlapping nonzero byte intervals, >=1 write) by their log order: a later
 // conflicting access causally depends on the earlier one in THIS execution. This is
 // the relation source-DPOR's notdep / weak-initials need — "which accesses can move
@@ -1032,6 +1153,9 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 		addProc(tr.edgeFrom[i])
 		addProc(tr.edgeTo[i])
 	}
+	for _, p := range tr.syncSeq {
+		addProc(p)
+	}
 	P := len(pidx)
 	cur := make([][]uint32, P)
 	for i := range cur {
@@ -1044,33 +1168,39 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			}
 		}
 	}
-	applied := make([]bool, len(tr.edgeStep))
-	applyEdges := func(step, accLimit int) {
-		for e := range tr.edgeStep {
-			if !applied[e] && tr.edgeStep[e] == step && tr.edgeAcc[e] <= accLimit {
-				mergeInto(cur[pidx[tr.edgeTo[e]]], cur[pidx[tr.edgeFrom[e]]])
-				applied[e] = true
+	events := orderedHBEvents(tr)
+	eventIdx := 0
+	objClk := map[syncObjectKey][]uint32{}
+	objectClock := func(obj syncObjectKey) []uint32 {
+		clk := objClk[obj]
+		if clk == nil {
+			clk = make([]uint32, P)
+			objClk[obj] = clk
+		}
+		return clk
+	}
+	applyEvents := func(step, accLimit int) {
+		for eventIdx < len(events) && (events[eventIdx].step < step || events[eventIdx].step == step && events[eventIdx].acc <= accLimit) {
+			ev := events[eventIdx]
+			switch ev.kind {
+			case hbEventReady:
+				mergeInto(cur[pidx[ev.to]], cur[pidx[ev.from]])
+			case hbEventSyncRelease:
+				mergeInto(objectClock(ev.obj), cur[pidx[ev.seq]])
+			case hbEventSyncAcquire:
+				mergeInto(cur[pidx[ev.seq]], objectClock(ev.obj))
 			}
+			eventIdx++
 		}
 	}
-	maxStep := 0
-	for _, s := range tr.accStep {
-		if s > maxStep {
-			maxStep = s
-		}
-	}
-	for _, s := range tr.edgeStep {
-		if s > maxStep {
-			maxStep = s
-		}
-	}
+	maxStep := maxHBStep(tr)
 	nLog := len(tr.accSeq)
 	clk = make([][]uint32, nLog)
 	li := 0
 	for s := 0; s <= maxStep; s++ {
-		applyEdges(s, li)
+		applyEvents(s, li)
 		for li < nLog && tr.accStep[li] == s {
-			applyEdges(s, li)
+			applyEvents(s, li)
 			pi := pidx[tr.accSeq[li]]
 			// Conflict edges: a later access to an overlapping interval with >=1 write causally
 			// depends on every earlier conflicting access — merge their clocks in, so e_i
@@ -1083,9 +1213,9 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			cur[pi][pi]++
 			clk[li] = append([]uint32(nil), cur[pi]...)
 			li++
-			applyEdges(s, li)
+			applyEvents(s, li)
 		}
-		applyEdges(s, li)
+		applyEvents(s, li)
 	}
 	return clk, pidx
 }

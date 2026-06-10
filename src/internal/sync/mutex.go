@@ -71,6 +71,9 @@ func (m *Mutex) Lock() {
 		if race.Enabled {
 			race.Acquire(unsafe.Pointer(m))
 		}
+		if dstHookEnabled {
+			dstSyncAcquireHB(m)
+		}
 		return
 	}
 	// Slow path (outlined so that the fast path can be inlined)
@@ -102,6 +105,9 @@ func (m *Mutex) TryLock() bool {
 
 	if race.Enabled {
 		race.Acquire(unsafe.Pointer(m))
+	}
+	if dstHookEnabled {
+		dstSyncAcquireHB(m)
 	}
 	return true
 }
@@ -193,6 +199,9 @@ func (m *Mutex) lockSlow() {
 	if race.Enabled {
 		race.Acquire(unsafe.Pointer(m))
 	}
+	if dstHookEnabled {
+		dstSyncAcquireHB(m)
+	}
 }
 
 // Unlock unlocks m.
@@ -211,6 +220,9 @@ func (m *Mutex) Unlock() {
 
 	// Fast path: drop lock bit.
 	new := atomic.AddInt32(&m.state, -mutexLocked)
+	if dstHookEnabled && (new+mutexLocked)&mutexLocked != 0 {
+		dstSyncRelease(m)
+	}
 	if new != 0 {
 		// Outlined slow path to allow inlining the fast path.
 		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.

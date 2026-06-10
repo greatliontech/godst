@@ -61,6 +61,8 @@ Status: sequence item 4 fixes the non-race post-`go` boundary, top-level SUT cal
 | L | DPOR HB only models ready/create edges, not uncontended mutex unlock→lock or buffered channel send→receive HB. | Correctness is conservative, but protected accesses can be over-explored and raise overflow risk. | `src/testing/simulation/explore.go` |
 | L | Public package docs are stale. | `testing/simulation` still says real network I/O is not deterministic and says GC per-cycle discovery is not in contract, while the design says network and GC per-cycle discovery are landed. | `src/testing/simulation/simulation.go`, `docs/dst/design.md` |
 
+Status: sequence item 5 records sync release/acquire HB events for mutex unlock→successful lock and buffered channel slot send→receive, keys buffered channel HB by channel+slot so zero-sized slots remain distinct, consumes events in offline DPOR object clocks, and refreshes public docs for landed network and GC per-cycle behavior.
+
 ## Close-Out
 
 When a sequence item is fixed, promote the durable rationale into the relevant spec section, code comment, or regression test. When all findings are fixed, filed narrower, or user-disputed, remove this issue from `docs/issues/README.md` and delete this file.
