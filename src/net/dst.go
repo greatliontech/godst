@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 package net
 
 import (
@@ -9,6 +11,8 @@ import (
 	"sync"
 	_ "unsafe" // for go:linkname
 )
+
+const dstNetEnabled = true
 
 // Under deterministic simulation testing (testing/simulation), net is virtualized
 // to a fully in-memory, deterministic network: net.Dial/Listen stop touching the

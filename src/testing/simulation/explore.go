@@ -4,8 +4,6 @@
 
 package simulation
 
-import "sort"
-
 // Level-2 systematic interleaving exploration. Explore drives repeated bubble
 // re-executions of a SUT, each following an explicit scheduling-decision prefix
 // (the scheduled strategy, runtime/dst_explore.go), and enumerates the sound
@@ -163,20 +161,30 @@ func accessForceMap(forces []AccessForce) map[accessForce]bool {
 	return m
 }
 
+func accessForceLess(a, b AccessForce) bool {
+	if a.Seq != b.Seq {
+		return a.Seq < b.Seq
+	}
+	if a.Count != b.Count {
+		return a.Count < b.Count
+	}
+	return a.PCKey < b.PCKey
+}
+
 func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
 	out := make([]AccessForce, 0, len(forces))
 	for f := range forces {
 		out = append(out, AccessForce{Seq: f.seq, Count: f.count, PCKey: f.pc})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Seq != out[j].Seq {
-			return out[i].Seq < out[j].Seq
+	for i := 1; i < len(out); i++ {
+		v := out[i]
+		j := i
+		for j > 0 && accessForceLess(v, out[j-1]) {
+			out[j] = out[j-1]
+			j--
 		}
-		if out[i].Count != out[j].Count {
-			return out[i].Count < out[j].Count
-		}
-		return out[i].PCKey < out[j].PCKey
-	})
+		out[j] = v
+	}
 	return out
 }
 

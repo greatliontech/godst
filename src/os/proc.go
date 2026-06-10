@@ -29,8 +29,10 @@ func runtime_args() []string // in package runtime
 //
 // On Windows, it returns -1.
 func Getuid() int {
-	if uid, ok := dstSimGetuid(); ok {
-		return uid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if uid, ok := dstSimGetuid(); ok {
+			return uid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Getuid()
 }
@@ -39,8 +41,10 @@ func Getuid() int {
 //
 // On Windows, it returns -1.
 func Geteuid() int {
-	if euid, ok := dstSimGeteuid(); ok {
-		return euid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if euid, ok := dstSimGeteuid(); ok {
+			return euid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Geteuid()
 }
@@ -49,8 +53,10 @@ func Geteuid() int {
 //
 // On Windows, it returns -1.
 func Getgid() int {
-	if gid, ok := dstSimGetgid(); ok {
-		return gid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if gid, ok := dstSimGetgid(); ok {
+			return gid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Getgid()
 }
@@ -59,8 +65,10 @@ func Getgid() int {
 //
 // On Windows, it returns -1.
 func Getegid() int {
-	if egid, ok := dstSimGetegid(); ok {
-		return egid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if egid, ok := dstSimGetegid(); ok {
+			return egid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Getegid()
 }

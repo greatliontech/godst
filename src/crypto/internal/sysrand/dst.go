@@ -2,9 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 package sysrand
 
 import _ "unsafe" // for go:linkname
+
+const dstReadRandomEnabled = true
 
 // dstReadRandom is the runtime's deterministic-simulation entropy source. Under
 // deterministic simulation testing (testing/simulation), it fills b from the

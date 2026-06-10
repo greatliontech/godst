@@ -237,16 +237,20 @@ type Signal interface {
 
 // Getpid returns the process id of the caller.
 func Getpid() int {
-	if pid, ok := dstSimGetpid(); ok {
-		return pid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if pid, ok := dstSimGetpid(); ok {
+			return pid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Getpid()
 }
 
 // Getppid returns the process id of the caller's parent.
 func Getppid() int {
-	if ppid, ok := dstSimGetppid(); ok {
-		return ppid // deterministic simulation: see os/dst.go
+	if dstSimEnabled {
+		if ppid, ok := dstSimGetppid(); ok {
+			return ppid // deterministic simulation: see os/dst.go
+		}
 	}
 	return syscall.Getppid()
 }

@@ -2,9 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 package os
 
 import _ "unsafe" // for go:linkname
+
+const dstSimEnabled = true
 
 // Under deterministic simulation testing (testing/simulation), the process
 // identity functions return a simulated identity so a program under test

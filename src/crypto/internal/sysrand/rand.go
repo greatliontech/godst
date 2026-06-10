@@ -35,7 +35,7 @@ var testingOnlyFailRead bool
 // Note that Read is not affected by [testing/cryptotest.SetGlobalRand], and it
 // should not be used directly by algorithm implementations.
 func Read(b []byte) {
-	if dstReadRandom(b) {
+	if dstReadRandomEnabled && dstReadRandom(b) {
 		// Deterministic simulation testing: filled from the run's seeded RNG. See
 		// crypto/internal/sysrand/dst.go. No-op (returns false) outside a run.
 		return
