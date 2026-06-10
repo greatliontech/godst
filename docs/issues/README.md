@@ -18,4 +18,6 @@ I/O into the bubble and then layers fault injection on top.
 
 ## Deferrals
 
-No active deferrals.
+| Issue | Lands | Summary |
+|-------|-------|---------|
+| [dst-audit-hardening](dst-audit-hardening.md) | before `dst-disk` | Harden the audited DST delta before new features: production/build hygiene, network contract preservation, finalizer/cleanup isolation, Level-2 exploration correctness/reporting, HB optimization, and stale public docs. |
