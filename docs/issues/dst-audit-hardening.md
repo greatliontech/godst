@@ -52,6 +52,8 @@ Do not start new DST feature work until these findings are either fixed, filed i
 | M | Multiple new TSan reports in one explored schedule collapse into one `Failure{Race:true}`. | A schedule that increments `RaceErrors` by more than one yields one failure even though the spec says each distinct race yields one race failure. | `src/testing/simulation/explore.go` |
 | L | Public `Explore` has no schedule/step budget options. | Users cannot request bounded exploration with explicit budget-hit reporting, though trace overflow is reported. | `src/testing/simulation/explore.go` |
 
+Status: sequence item 4 fixes the non-race post-`go` boundary, top-level SUT callback panic metadata, multi-race reporting, and public schedule/step budgets. SUT-created child-goroutine panic conversion is split to `docs/issues/dst-explore-child-panic-failure-reporting.md`, and synctest-deadlock conversion is split to `docs/issues/dst-explore-deadlock-failure-reporting.md`, because both require runtime/synctest-layer handling beyond callback-local recovery.
+
 ### 5. HB pruning optimization and docs
 
 | Severity | Finding | Failure mode | Files |

@@ -30,6 +30,7 @@ func init() {
 	register("DSTExploreSweep", DSTExploreSweep)
 	register("DSTExploreRaceOracle", DSTExploreRaceOracle)
 	register("DSTExploreRaceReplay", DSTExploreRaceReplay)
+	register("DSTExploreBudgetPromotion", DSTExploreBudgetPromotion)
 	register("DSTExploreAuto", DSTExploreAuto)
 	register("DSTExploreSyncAuto", DSTExploreSyncAuto)
 	register("DSTExploreTimerHB", DSTExploreTimerHB)
@@ -60,6 +61,9 @@ func dstAccessYieldFP() uint64
 
 //go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
 func dstAccessYieldReset()
+
+//go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
+func dstSetPostGoYield(enabled bool) bool
 
 func dstSeedEnv() uint64 {
 	s, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
@@ -281,6 +285,22 @@ func raceCondSUT() bool {
 	return false
 }
 
+// raceMultiSUT has two independent unsynchronized write-write races. They manifest
+// in the same explored schedule, so Explore must append one Race failure for each
+// new RaceErrors increment, not collapse the whole schedule to one race failure.
+func raceMultiSUT() bool {
+	var x, y int
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() { defer wg.Done(); x = 1 }()
+	go func() { defer wg.Done(); x = 2 }()
+	go func() { defer wg.Done(); y = 1 }()
+	go func() { defer wg.Done(); y = 2 }()
+	wg.Wait()
+	_, _ = x, y
+	return false
+}
+
 // DSTExploreRaceOracle runs a race SUT (DSTRACE=uncond|cond, default uncond) under
 // Explore and prints "raceoracle schedules=<n> races=<m> exhausted=<bool>
 // firstrace=[g,g,...]". races counts the Failures the -race oracle flagged
@@ -289,8 +309,11 @@ func raceCondSUT() bool {
 // -race build; in a non-race build races=0.
 func DSTExploreRaceOracle() {
 	sut := raceOracleSUT
-	if os.Getenv("DSTRACE") == "cond" {
+	switch os.Getenv("DSTRACE") {
+	case "cond":
 		sut = raceCondSUT
+	case "multi":
+		sut = raceMultiSUT
 	}
 	res := simulation.Explore(dstSeedEnv(), simulation.DPOR, sut)
 	races := 0
@@ -423,6 +446,24 @@ func DSTExploreRaceReplay() {
 	os.Stdout.WriteString("racereplay races=1 schedule=" + encodeSchedule(failure.Schedule) +
 		" forces=" + encodeAccessForces(failure.AccessForces) +
 		" forcecount=" + strconv.Itoa(len(failure.AccessForces)) + "\n")
+}
+
+var budgetPromotionRuns int
+
+// DSTExploreBudgetPromotion verifies MaxSchedules is a public ExploreWith-call
+// budget, not a per-access-force-promotion-pass budget. unmodifiedRWRSUT exercises
+// replay-promoted access forces under -tags dst -race; with MaxSchedules=1, Explore
+// must stop after the first actual SUT run even if that run discovers a promotion.
+func DSTExploreBudgetPromotion() {
+	budgetPromotionRuns = 0
+	res := simulation.ExploreWith(dstSeedEnv(), simulation.ExploreOptions{Mode: simulation.DPOR, MaxSchedules: 1}, func() bool {
+		budgetPromotionRuns++
+		return unmodifiedRWRSUT()
+	})
+	os.Stdout.WriteString("budgetpromotion schedules=" + strconv.Itoa(res.Schedules) +
+		" runs=" + strconv.Itoa(budgetPromotionRuns) +
+		" budget=" + strconv.FormatBool(res.BudgetHit) +
+		" exhausted=" + strconv.FormatBool(res.Exhausted) + "\n")
 }
 
 // unmodifiedRMWSUT is a plain, UNINSTRUMENTED SUT: two goroutines do an
@@ -1624,6 +1665,8 @@ type sweepStats struct {
 // Exhaustive's, either mode failed to cleanly exhaust, or DPOR explored MORE
 // schedules than Exhaustive.
 func sweepCheck(st *sweepStats, seed uint64, label string, sut func() bool) {
+	oldPostGo := dstSetPostGoYield(false)
+	defer dstSetPostGoYield(oldPostGo)
 	st.checks++
 	sweepSeen = map[string]bool{}
 	exhRes := simulation.Explore(seed, simulation.Exhaustive, sut)

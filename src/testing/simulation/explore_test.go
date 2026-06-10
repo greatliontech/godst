@@ -19,6 +19,9 @@ func dstAccessYieldFP() uint64
 //go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
 func dstAccessYieldReset()
 
+//go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
+func dstSetPostGoYield(enabled bool) bool
+
 func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -192,4 +195,133 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 		}
 	}
 	t.Fatalf("goroutine creation did not record a parent->child HB edge before child wake: steps=%v acc=%v from=%v to=%v", tr.edgeStep, tr.edgeAcc, tr.edgeFrom, tr.edgeTo)
+}
+
+func TestExplorePostGoBoundaryNonRace(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		t.Skip("non-race post-go boundary regression")
+	}
+	sut := func() bool {
+		x := 0
+		read := -1
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			read = x
+		}()
+		x = 1
+		wg.Wait()
+		return read == 0
+	}
+	res := Explore(1, Exhaustive, sut)
+	if !res.Exhausted || res.Overflow || res.BudgetHit {
+		t.Fatalf("post-go SUT did not cleanly exhaust: exhausted=%v overflow=%v budget=%v", res.Exhausted, res.Overflow, res.BudgetHit)
+	}
+	if len(res.Failures) == 0 {
+		t.Fatalf("Explore missed child-before-parent-write after go statement: schedules=%d", res.Schedules)
+	}
+	failed, raced := Replay(1, res.Failures[0], sut)
+	if !failed || raced {
+		t.Fatalf("post-go failure did not replay as assertion failure: failed=%v raced=%v failure=%#v", failed, raced, res.Failures[0])
+	}
+}
+
+func TestExplorePostGoBoundaryCanBeDisabled(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		t.Skip("non-race post-go boundary regression")
+	}
+	old := dstSetPostGoYield(false)
+	defer dstSetPostGoYield(old)
+	res := Explore(1, Exhaustive, func() bool {
+		x := 0
+		read := -1
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			read = x
+		}()
+		x = 1
+		wg.Wait()
+		return read == 0
+	})
+	if len(res.Failures) != 0 {
+		t.Fatalf("disabled post-go boundary still explored child-before-parent write: %#v", res.Failures)
+	}
+}
+
+type emptyPanicError struct{}
+
+func (emptyPanicError) Error() string { return "" }
+
+func TestExploreReportsPanicFailure(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool { panic("boom") }
+	res := Explore(1, DPOR, sut)
+	if len(res.Failures) != 1 || res.Failures[0].Panic != "boom" || res.Failures[0].Race {
+		t.Fatalf("panic was not reported as a replayable failure: %#v", res.Failures)
+	}
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		Replay(1, res.Failures[0], sut)
+	}()
+	if !panicked {
+		t.Fatalf("Replay of panic failure did not panic")
+	}
+	res = Explore(1, DPOR, func() bool { panic(emptyPanicError{}) })
+	if len(res.Failures) != 1 || res.Failures[0].Panic == "" || res.Failures[0].Race {
+		t.Fatalf("empty-message error panic was not reported as a replayable failure: %#v", res.Failures)
+	}
+}
+
+func budgetedExploreSUT() bool {
+	var x int
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		dstAccessYield(unsafe.Pointer(&x), true)
+		x = 1
+	}()
+	go func() {
+		defer wg.Done()
+		dstAccessYield(unsafe.Pointer(&x), true)
+		x = 2
+	}()
+	wg.Wait()
+	return false
+}
+
+func TestExploreWithScheduleBudgetReportsIncomplete(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 1}, budgetedExploreSUT)
+	if res.Schedules != 1 || !res.BudgetHit || res.Exhausted || res.Overflow {
+		t.Fatalf("schedule budget not reported distinctly: schedules=%d exhausted=%v overflow=%v budget=%v", res.Schedules, res.Exhausted, res.Overflow, res.BudgetHit)
+	}
+}
+
+func TestExploreWithStepBudgetReportsIncomplete(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSteps: 1}, budgetedExploreSUT)
+	if !res.BudgetHit || res.Exhausted || res.Overflow {
+		t.Fatalf("step budget not reported distinctly: schedules=%d exhausted=%v overflow=%v budget=%v", res.Schedules, res.Exhausted, res.Overflow, res.BudgetHit)
+	}
 }

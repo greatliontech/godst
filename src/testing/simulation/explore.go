@@ -51,19 +51,24 @@ type Failure struct {
 	AccessForces []AccessForce
 	// Race is true iff the -race detector reported a NEW data race during this
 	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
-	// (sut returned true). In a non-race build Race is always false. The detector
-	// dedups by signature, so each distinct race yields exactly one Race failure: the
-	// first schedule that exhibits it.
+	// (sut returned true) or a SUT callback panic (Panic != ""). In a non-race build
+	// Race is always false. The detector dedups by signature, so each distinct race
+	// yields exactly one Race failure: the first schedule that exhibits it.
 	Race bool
+	// Panic is non-empty iff the SUT callback panicked while executing this schedule.
+	// The Schedule and AccessForces replay the same interleaving; Replay panics again
+	// for panic failures.
+	Panic string
 }
 
 // ExploreResult reports an Explore run.
 type ExploreResult struct {
 	// Schedules is the number of interleavings actually explored.
 	Schedules int
-	// Failures lists every explored interleaving that exhibited a bug — the SUT
-	// returned true (an assertion failure) OR the -race detector reported a new data
-	// race (Failure.Race; see D5) — each with its replay metadata.
+	// Failures lists every explored interleaving that exhibited a bug: the SUT callback
+	// returned true (an assertion failure), panicked (Failure.Panic), or the -race
+	// detector reported a new data race (Failure.Race; see D5), each with its replay
+	// metadata.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
@@ -71,6 +76,33 @@ type ExploreResult struct {
 	// Overflow is true iff some run exceeded the per-bubble trace, edge, or access-log
 	// budget; coverage is then INCOMPLETE (reported, never silently capped).
 	Overflow bool
+	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
+	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
+	BudgetHit bool
+}
+
+// ExploreOptions configures ExploreWith. The zero value is exhaustive exploration
+// with the implementation's internal trace budgets and no caller-imposed cap.
+type ExploreOptions struct {
+	// Mode selects the exploration algorithm: Exhaustive or DPOR. The zero value is
+	// Exhaustive, matching Explore's explicit mode argument.
+	Mode ExploreMode
+	// MaxSchedules, if > 0, stops after exploring this many schedules and reports
+	// BudgetHit unless the interleaving space is exhausted exactly at that boundary.
+	MaxSchedules int
+	// MaxSteps, if > 0, bounds the scheduling decisions recorded in any one run.
+	// Hitting it reports BudgetHit rather than silently treating the truncated trace
+	// as exhausted.
+	MaxSteps int
+}
+
+type exploreConfig struct {
+	maxDecisions    int
+	maxEnabledTotal int
+	maxEdges        int
+	maxAccesses     int
+	maxSchedules    int
+	maxSteps        int
 }
 
 // Per-bubble trace budget. An over-budget run sets ExploreResult.Overflow and the
@@ -82,6 +114,32 @@ const (
 	exploreMaxAccesses     = 1 << 16
 )
 
+func defaultExploreConfig() exploreConfig {
+	return exploreConfig{
+		maxDecisions:    exploreMaxDecisions,
+		maxEnabledTotal: exploreMaxEnabledTotal,
+		maxEdges:        exploreMaxEdges,
+		maxAccesses:     exploreMaxAccesses,
+	}
+}
+
+func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
+	cfg := defaultExploreConfig()
+	cfg.maxSchedules = opts.MaxSchedules
+	cfg.maxSteps = opts.MaxSteps
+	if opts.MaxSteps > 0 {
+		cfg.maxDecisions = opts.MaxSteps
+		// Keep enough enabled-set room for ordinary tests while still letting a
+		// pathological fan-out hit the same explicit step budget instead of an
+		// unreported internal cap.
+		cfg.maxEnabledTotal = opts.MaxSteps * 64
+		if cfg.maxEnabledTotal < opts.MaxSteps {
+			cfg.maxEnabledTotal = opts.MaxSteps
+		}
+	}
+	return cfg
+}
+
 // Explore systematically explores the sound interleavings of sut under seed. sut
 // returns true iff THIS interleaving exhibited a bug (a failed assertion); Explore
 // records every such schedule. The seed fixes the program's data randomness
@@ -92,14 +150,21 @@ const (
 // Exhaustive enumerates the whole decision tree. DPOR explores one interleaving
 // per Mazurkiewicz equivalence class, finding the same bugs with far fewer runs.
 func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
+	return ExploreWith(seed, ExploreOptions{Mode: mode}, sut)
+}
+
+// ExploreWith is Explore with caller-supplied exploration budgets. Budgeted runs
+// report BudgetHit and never report Exhausted for truncated coverage.
+func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResult {
 	if !dstBuilt() {
 		panic("testing/simulation: Explore requires building with -tags dst")
 	}
-	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges, exploreMaxAccesses)
-	if mode == DPOR {
-		return dporExplore(seed, sut)
+	cfg := exploreConfigFromOptions(opts)
+	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
+	if opts.Mode == DPOR {
+		return dporExplore(seed, sut, cfg)
 	}
-	return exhaustiveExplore(seed, sut)
+	return exhaustiveExplore(seed, sut, cfg)
 }
 
 // Replay executes sut once under failure's recorded schedule and access-force set.
@@ -110,9 +175,13 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	if !dstBuilt() {
 		panic("testing/simulation: Replay requires building with -tags dst")
 	}
-	dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges, exploreMaxAccesses)
-	failed, raced, _ = runOnce(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut)
-	return failed, raced
+	cfg := defaultExploreConfig()
+	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
+	r := runOnceResult(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg)
+	if r.panic != "" {
+		panic(r.panic)
+	}
+	return r.failed, r.raceCount > 0
 }
 
 // exploreTrace is one scheduled run's recorded decision trace, copied out of the
@@ -139,12 +208,13 @@ type exploreTrace struct {
 	// Happens-before edges (goready/create: edgeFrom happens-before edgeTo's resumption).
 	// edgeStep is the dstScheduleStep when the edge fired; edgeAcc is the access-log
 	// length at that moment, which orders same-step edges against inline filtered accesses.
-	edgeFrom []uint64
-	edgeTo   []uint64
-	edgeStep []int
-	edgeAcc  []int
-	aborted  bool // prefix named a non-enabled goroutine (a replay-determinism bug)
-	overflow bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
+	edgeFrom  []uint64
+	edgeTo    []uint64
+	edgeStep  []int
+	edgeAcc   []int
+	aborted   bool // prefix named a non-enabled goroutine (a replay-determinism bug)
+	overflow  bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
+	budgetHit bool // run exceeded a caller-supplied per-run step budget
 }
 
 type accessForce struct {
@@ -188,8 +258,8 @@ func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
 	return out
 }
 
-func newFailure(prefix []uint64, raced bool, forces map[accessForce]bool) Failure {
-	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced}
+func newFailure(prefix []uint64, raced bool, panicMsg string, forces map[accessForce]bool) Failure {
+	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg}
 }
 
 func installAccessForces(forces map[accessForce]bool) {
@@ -211,27 +281,82 @@ func installAccessForces(forces map[accessForce]bool) {
 // runOnce runs sut once under the scheduled strategy following prefix, with the
 // current forced access-yield watchpoints installed, and copies out the recorded
 // trace. failed is sut's verdict for this interleaving; raced is true iff the -race
-// detector reported a NEW data race during this run (D5 oracle; always false in a
-// non-race build — dstRaceErrors returns 0).
+// detector reported at least one NEW data race during this run (D5 oracle; always
+// false in a non-race build — dstRaceErrors returns 0). It is kept for white-box
+// tests; Explore uses runOnceResult so it can report panic failures and multiple
+// new races separately.
 func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool) (failed, raced bool, tr exploreTrace) {
+	r := runOnceResult(seed, prefix, forces, sut, defaultExploreConfig())
+	if r.panic != "" {
+		panic(r.panic)
+	}
+	return r.failed, r.raceCount > 0, r.tr
+}
+
+type runResult struct {
+	failed    bool
+	raceCount int
+	panic     string
+	tr        exploreTrace
+}
+
+func panicString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		if x == "" {
+			return "empty panic"
+		}
+		return x
+	case error:
+		if x.Error() == "" {
+			return "empty panic"
+		}
+		return x.Error()
+	default:
+		return "non-string panic"
+	}
+}
+
+func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
 	racesBefore := dstRaceErrors()
 	installAccessForces(forces)
+	var failed bool
+	defer func() {
+		out.failed = failed
+		out.raceCount = dstRaceErrors() - racesBefore
+		if out.raceCount < 0 {
+			out.raceCount = 0
+		}
+		out.tr = copyExploreTrace(cfg.maxSteps > 0)
+		if out.tr.aborted && out.panic == "" {
+			panic("testing/simulation: internal error: schedule prefix diverged on replay " +
+				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
+		}
+	}()
 	run(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
+		defer func() {
+			if v := recover(); v != nil && out.panic == "" {
+				out.panic = panicString(v)
+			}
+		}()
 		failed = sut()
 	})
-	raced = dstRaceErrors() > racesBefore
-	tr.overflow = dstTraceOverflowFP() || dstEdgeOverflowFP()
+	return out
+}
+
+func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
+	traceOverflow := dstTraceOverflowFP()
+	tr.budgetHit = stepBudget && traceOverflow
+	tr.overflow = (traceOverflow && !tr.budgetHit) || dstEdgeOverflowFP()
 	tr.aborted = dstScheduleAbortedFP()
 	if tr.aborted {
 		// The prefix named a goroutine not enabled at its decision: this replay
 		// diverged from the run that produced the prefix. Since every prefix is
 		// derived from a recorded trace, that is a replay-determinism (DST-L2-2)
-		// violation that must never happen — surface it loudly rather than silently
-		// dropping the subtree, which would make ExploreResult.Exhausted a false
-		// positive (silent incompleteness). A panic here is a hard assertion on the
-		// determinism contract, not a tolerable budget condition like Overflow.
-		panic("testing/simulation: internal error: schedule prefix diverged on replay " +
-			"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
+		// violation that must never happen; runOnceResult surfaces it loudly after
+		// copying the trace.
 	}
 	tr.overflow = tr.overflow || dstAccLogOverflowFP()
 	n := dstTraceLenFP()
@@ -266,12 +391,27 @@ func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func
 // exhaustiveExplore enumerates every distinct interleaving by DFS over the
 // scheduling-decision tree: each run reveals its decisions, and every not-taken
 // enabled goroutine at every free decision is queued as a child prefix.
-func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
+func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
+	totalSchedules := 0
 	for {
-		res, grew := exhaustiveExplorePass(seed, sut, forces)
+		passCfg, ok := explorePassConfig(cfg, totalSchedules)
+		if !ok {
+			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true}
+		}
+		res, grew := exhaustiveExplorePass(seed, sut, forces, passCfg)
+		totalSchedules += res.Schedules
+		res.Schedules = totalSchedules
 		if !grew {
+			if len(carriedRace) != 0 {
+				res.Failures = append(carriedRace, res.Failures...)
+			}
+			return res
+		}
+		if cfg.maxSchedules > 0 && totalSchedules >= cfg.maxSchedules {
+			res.BudgetHit = true
+			res.Exhausted = false
 			if len(carriedRace) != 0 {
 				res.Failures = append(carriedRace, res.Failures...)
 			}
@@ -288,11 +428,27 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 	}
 }
 
-func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) (ExploreResult, bool) {
+func explorePassConfig(cfg exploreConfig, schedules int) (exploreConfig, bool) {
+	if cfg.maxSchedules <= 0 {
+		return cfg, true
+	}
+	remaining := cfg.maxSchedules - schedules
+	if remaining <= 0 {
+		return cfg, false
+	}
+	cfg.maxSchedules = remaining
+	return cfg, true
+}
+
+func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	var res ExploreResult
 	visited := map[string]bool{}
 	stack := [][]uint64{nil}
 	for len(stack) > 0 {
+		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
+			res.BudgetHit = true
+			break
+		}
 		prefix := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		if k := encodePrefix(prefix); visited[k] {
@@ -300,13 +456,18 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 		} else {
 			visited[k] = true
 		}
-		failed, raced, tr := runOnce(seed, prefix, forces, sut)
+		r := runOnceResult(seed, prefix, forces, sut, cfg)
+		tr := r.tr
 		res.Schedules++
+		if tr.budgetHit {
+			res.BudgetHit = true
+		}
 		if tr.overflow {
 			res.Overflow = true
 		}
-		if failed || raced {
-			res.Failures = append(res.Failures, newFailure(prefix, raced, forces))
+		appendRunFailures(&res, prefix, forces, r)
+		if tr.budgetHit {
+			continue
 		}
 		if promoteAccessForces(tr, forces) {
 			return res, true
@@ -323,8 +484,20 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 			}
 		}
 	}
-	res.Exhausted = !res.Overflow
+	res.Exhausted = !res.Overflow && !res.BudgetHit
 	return res, false
+}
+
+func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult) {
+	if r.failed {
+		res.Failures = append(res.Failures, newFailure(prefix, false, "", forces))
+	}
+	for i := 0; i < r.raceCount; i++ {
+		res.Failures = append(res.Failures, newFailure(prefix, true, "", forces))
+	}
+	if r.panic != "" {
+		res.Failures = append(res.Failures, newFailure(prefix, false, r.panic, forces))
+	}
 }
 
 func accessHasPriorConflictingInInterval(tr exploreTrace, conflicting []bool, k int) bool {
@@ -377,7 +550,7 @@ func accessConflict(tr exploreTrace, i, j int) bool {
 // a boundary inside its inline interval. When the completed trace demonstrates that,
 // promote the exact hook call to a forced yield and restart the exploration pass.
 func promoteAccessForces(tr exploreTrace, forces map[accessForce]bool) bool {
-	if tr.overflow {
+	if tr.overflow || tr.budgetHit {
 		return false
 	}
 	clk, pidx := dporClocks(tr)
@@ -498,12 +671,27 @@ type dporFrame struct {
 // creation prefixes. Race-enabled DPOR therefore uses conservative all-enabled
 // backtracking at each observed conflict anchor and disables sleep sets; the non-race
 // sweep keeps the full source-DPOR + sleep-set algorithm and its optimality guard.
-func dporExplore(seed uint64, sut func() bool) ExploreResult {
+func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
+	totalSchedules := 0
 	for {
-		res, grew := dporExplorePass(seed, sut, forces)
+		passCfg, ok := explorePassConfig(cfg, totalSchedules)
+		if !ok {
+			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true}
+		}
+		res, grew := dporExplorePass(seed, sut, forces, passCfg)
+		totalSchedules += res.Schedules
+		res.Schedules = totalSchedules
 		if !grew {
+			if len(carriedRace) != 0 {
+				res.Failures = append(carriedRace, res.Failures...)
+			}
+			return res
+		}
+		if cfg.maxSchedules > 0 && totalSchedules >= cfg.maxSchedules {
+			res.BudgetHit = true
+			res.Exhausted = false
 			if len(carriedRace) != 0 {
 				res.Failures = append(carriedRace, res.Failures...)
 			}
@@ -520,29 +708,38 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 	}
 }
 
-func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) (ExploreResult, bool) {
+func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	var res ExploreResult
 	var stack []*dporFrame
 	raceEnabled := dstRaceEnabledFP()
 	useSleep := !raceEnabled
 	for {
+		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
+			res.BudgetHit = true
+			break
+		}
 		prefix := make([]uint64, len(stack))
 		for i, fr := range stack {
 			prefix[i] = fr.proc
 		}
-		failed, raced, tr := runOnce(seed, prefix, forces, sut)
+		r := runOnceResult(seed, prefix, forces, sut, cfg)
+		tr := r.tr
 		res.Schedules++
+		if tr.budgetHit {
+			res.BudgetHit = true
+		}
 		if tr.overflow {
 			res.Overflow = true
 		}
-		if failed || raced {
-			res.Failures = append(res.Failures, newFailure(prefix, raced, forces))
+		appendRunFailures(&res, prefix, forces, r)
+		if tr.budgetHit {
+			break
 		}
 		if promoteAccessForces(tr, forces) {
 			return res, true
 		}
-		// runOnce panics on a divergent (aborted) replay, so the trace here is always
-		// a faithful replay of the followed prefix.
+		// runOnceResult panics on a divergent (aborted) replay, so the trace here is
+		// always a faithful replay of the followed prefix.
 		n := len(tr.procs)
 		// Per-decision interval access-set: decision d's transition is the SET of
 		// accesses performed in its interval — the access-log entries with
@@ -644,7 +841,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) 
 			break
 		}
 	}
-	res.Exhausted = !res.Overflow
+	res.Exhausted = !res.Overflow && !res.BudgetHit
 	return res, false
 }
 

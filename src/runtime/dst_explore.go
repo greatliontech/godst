@@ -138,6 +138,19 @@ var (
 	dstScheduleAborted bool
 )
 
+// dstPostGoYield enables the scheduled-strategy boundary immediately after a go
+// statement. It is on for public Explore. The manual DPOR-brain sweep disables it
+// through dstSetPostGoYield so its exhaustive baseline remains the explicitly
+// annotated transition set it is designed to validate.
+var dstPostGoYield = true
+
+//go:linkname dstSetPostGoYield
+func dstSetPostGoYield(enabled bool) bool {
+	old := dstPostGoYield
+	dstPostGoYield = enabled
+	return old
+}
+
 // dstSeqCtr assigns stable per-bubble goroutine indices for the scheduled
 // strategy. goid is a process-global monotonic counter, so the SAME logical
 // goroutine gets a DIFFERENT goid in each bubble re-execution — useless as a

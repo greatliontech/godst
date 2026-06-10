@@ -1266,6 +1266,12 @@ func TestDSTExploreRaceOracle(t *testing.T) {
 			t.Fatalf("race oracle (%s) nondeterministic: first-race schedule %q vs %q", mode, a, b)
 		}
 	}
+	out := runBuiltTestProg(t, exe, "DSTExploreRaceOracle", "DSTSEED=1", "DSTRACE=multi")
+	if races, err := strconv.Atoi(exploreField(t, out, "races")); err != nil {
+		t.Fatalf("bad races field in %q: %v", out, err)
+	} else if races < 2 {
+		t.Fatalf("multi-race oracle collapsed distinct TSan reports into %d race failure(s), want at least 2:\n%s", races, out)
+	}
 }
 
 // TestDSTExploreRaceReplay verifies a race failure first observed under replay-promoted
@@ -1301,6 +1307,11 @@ func TestDSTExploreRaceReplay(t *testing.T) {
 	replay := runBuiltTestProg(t, exe, "DSTExploreRaceReplay", "DSTSEED=1", "DSTREPLAY=1", "DSTSCHEDULE="+schedule, "DSTFORCES="+forces)
 	if exploreField(t, replay, "raced") != "true" {
 		t.Fatalf("race failure replay did not reproduce the race:\nexplore=%s\nreplay=%s", out, replay)
+	}
+	budget := runBuiltTestProg(t, exe, "DSTExploreBudgetPromotion", "DSTSEED=1")
+	if exploreField(t, budget, "schedules") != "1" || exploreField(t, budget, "runs") != "1" ||
+		exploreField(t, budget, "budget") != "true" || exploreField(t, budget, "exhausted") != "false" {
+		t.Fatalf("ExploreWith MaxSchedules did not cap the whole promotion loop:\n%s", budget)
 	}
 }
 

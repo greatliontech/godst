@@ -5348,11 +5348,11 @@ func newproc(fn *funcval) {
 			wakep()
 		}
 	})
-	if dstActive() && dstSchedKind == dstSchedScheduled && raceenabled {
+	if dstActive() && dstSchedKind == dstSchedScheduled && dstPostGoYield {
 		// Goroutine creation is a real scheduling boundary: after a go statement, the
-		// child may run before the parent continues. This boundary is load-bearing once
-		// dst-race access filtering can record the parent's following first access inline.
-		// Non-race manual validation keeps its hand-controlled explicit access hooks.
+		// child may run before the parent continues. This boundary is load-bearing for
+		// assertion-only non-race SUTs, and once dst-race access filtering can record
+		// the parent's following first access inline.
 		dstYieldPoint()
 	}
 }
