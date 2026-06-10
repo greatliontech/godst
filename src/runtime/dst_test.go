@@ -813,6 +813,17 @@ func TestDSTNet(t *testing.T) {
 	}
 }
 
+// TestDSTNetSemantics verifies the DST network shim preserves public net semantics
+// at the TCP surface it intercepts and rejects unsupported network kinds rather
+// than modeling them as impossible TCP-like streams.
+func TestDSTNetSemantics(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTNetSemantics", "DSTSEED=42"))
+	const want = "canceled=true deadline=true nilpanic=true udpreject=true udpdialreject=true zeroports=true invalidport=true localhost=true dnsreject=true servicereject=true familyreject=true wildcardfamilyreject=true tcp6wildcardreject=true tcp6local=true tcp4unspecified=true"
+	if out != want {
+		t.Fatalf("DST net semantics mismatch:\n got=%q\nwant=%q", out, want)
+	}
+}
+
 // TestDSTSchedSystemIsolation verifies the system-goroutine-isolation invariant
 // that keeps the schedule deterministic regardless of timing-/composition-varying
 // runtime-infrastructure scheduling: under DST the scheduling RNG advances exactly

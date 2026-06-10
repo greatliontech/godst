@@ -7,7 +7,9 @@
 package net
 
 import (
+	"context"
 	"errors"
+	"strconv"
 	"sync"
 	_ "unsafe" // for go:linkname
 )
@@ -38,41 +40,106 @@ func dstNetEpoch() uint64
 // keyed by address. Keyed by the run epoch (dstNetEpoch) so a new run starts with
 // an empty registry, with no explicit teardown hook.
 var dstNet struct {
-	mu        sync.Mutex
-	epoch     uint64
-	listeners map[string]*dstListener
-	nextPort  int // deterministic ephemeral local port for dialers
+	mu             sync.Mutex
+	epoch          uint64
+	listeners      map[string]*dstListener
+	nextPort       int // deterministic ephemeral local port for dialers
+	nextListenPort int // deterministic ephemeral port for listeners bound to :0
 }
+
+const (
+	dstDialEphemeralStart   = 40000
+	dstListenEphemeralStart = 10000
+)
 
 // dstNetRoll resets the registry when the run epoch advances. Caller holds the mu.
 func dstNetRoll() {
 	if e := dstNetEpoch(); e != dstNet.epoch || dstNet.listeners == nil {
 		dstNet.epoch = e
 		dstNet.listeners = make(map[string]*dstListener)
-		dstNet.nextPort = 40000
+		dstNet.nextPort = dstDialEphemeralStart
+		dstNet.nextListenPort = dstListenEphemeralStart
 	}
 }
 
-// dstAtoiPort parses a decimal port string (already validated by SplitHostPort).
-func dstAtoiPort(s string) int {
-	n := 0
-	for i := 0; i < len(s); i++ {
-		n = n*10 + int(s[i]-'0')
+func dstTCPNetwork(network string) bool {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		return true
 	}
-	return n
+	return false
 }
 
-// dstHostIP maps a host string to an IP for a simulated address; a wildcard or
-// empty host becomes the simulated loopback.
-func dstHostIP(host string) IP {
+func dstUnsupportedNetwork(op, network string) error {
+	return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: UnknownNetworkError(network)}
+}
+
+func dstParsePort(op, network, port string) (int, error) {
+	portnum, needsLookup := parsePort(port)
+	if needsLookup || portnum < 0 || portnum > 65535 {
+		return 0, &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: &AddrError{Err: "invalid port", Addr: port}}
+	}
+	return portnum, nil
+}
+
+// dstHostIP maps the host strings DST models without doing DNS. Wildcards and
+// localhost become simulated loopback; arbitrary DNS names are rejected until DNS
+// virtualization lands.
+func dstHostIP(network, host string) (IP, bool) {
 	switch host {
-	case "", "0.0.0.0", "::", "[::]":
-		return IPv4(127, 0, 0, 1)
+	case "":
+		if network == "tcp6" {
+			return IPv6loopback, true
+		}
+		return IPv4(127, 0, 0, 1), true
+	case "0.0.0.0":
+		return IPv4(127, 0, 0, 1), true
+	case "::", "[::]":
+		if network == "tcp4" {
+			return IPv4(127, 0, 0, 1), true
+		}
+		return IPv6loopback, true
+	case "localhost":
+		if network == "tcp6" {
+			return IPv6loopback, true
+		}
+		return IPv4(127, 0, 0, 1), true
 	}
 	if ip := ParseIP(host); ip != nil {
-		return ip
+		return ip, true
 	}
-	return IPv4(127, 0, 0, 1) // unresolved name → loopback (DNS is a later increment)
+	return nil, false
+}
+
+func dstResolveHost(op, network, host string) (IP, error) {
+	ip, ok := dstHostIP(network, host)
+	if !ok {
+		return nil, &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: &AddrError{Err: "DNS lookup unsupported under deterministic simulation", Addr: host}}
+	}
+	switch network {
+	case "tcp4":
+		if ip.To4() == nil {
+			return nil, &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: &AddrError{Err: errNoSuitableAddress.Error(), Addr: host}}
+		}
+	case "tcp6":
+		if ip.To4() != nil || ip.To16() == nil {
+			return nil, &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: &AddrError{Err: errNoSuitableAddress.Error(), Addr: host}}
+		}
+	}
+	return ip, nil
+}
+
+func dstAddrFamily(network string, ip IP) string {
+	switch network {
+	case "tcp4":
+		return "tcp4"
+	case "tcp6":
+		return "tcp6"
+	}
+	if ip.To4() != nil {
+		return "tcp4"
+	}
+	return "tcp6"
 }
 
 // dstWildcard reports whether host means "any address".
@@ -82,6 +149,51 @@ func dstWildcard(host string) bool {
 		return true
 	}
 	return false
+}
+
+func dstListenerKey(network string, ip IP, port int, wildcard bool) string {
+	family := dstAddrFamily(network, ip)
+	if wildcard {
+		return family + "/:" + strconv.Itoa(port)
+	}
+	return family + "/" + ip.String() + ":" + strconv.Itoa(port)
+}
+
+func dstKeyHasPort(key string, port int) bool {
+	suffix := ":" + strconv.Itoa(port)
+	return len(key) >= len(suffix) && key[len(key)-len(suffix):] == suffix
+}
+
+func dstKeyHasPrefix(key, prefix string) bool {
+	return len(key) >= len(prefix) && key[:len(prefix)] == prefix
+}
+
+func dstListenerConflict(network string, ip IP, key string, port int, wildcard bool) bool {
+	if _, dup := dstNet.listeners[key]; dup {
+		return true
+	}
+	familyPrefix := dstAddrFamily(network, ip) + "/"
+	if wildcard {
+		for k := range dstNet.listeners {
+			if dstKeyHasPrefix(k, familyPrefix) && dstKeyHasPort(k, port) {
+				return true
+			}
+		}
+		return false
+	}
+	_, dup := dstNet.listeners[familyPrefix+":"+strconv.Itoa(port)]
+	return dup
+}
+
+func dstAllocateListenPort(network string, ip IP, wildcard bool) (port int, key string, err error) {
+	for p := dstNet.nextListenPort; p <= 65535; p++ {
+		k := dstListenerKey(network, ip, p, wildcard)
+		if !dstListenerConflict(network, ip, k, p, wildcard) {
+			dstNet.nextListenPort = p + 1
+			return p, k, nil
+		}
+	}
+	return 0, "", errors.New("no free ports")
 }
 
 // dstConn is a simulated connection: a net.Pipe endpoint (Read/Write/Close/
@@ -130,20 +242,37 @@ func (l *dstListener) Addr() Addr { return l.addr }
 
 // dstListen is net.Listen under DST: register a simulated listener.
 func dstListen(network, address string) (Listener, error) {
+	if !dstTCPNetwork(network) {
+		return nil, dstUnsupportedNetwork("listen", network)
+	}
 	host, port, err := SplitHostPort(address)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
 	}
-	key := host + ":" + port
-	if dstWildcard(host) {
-		key = ":" + port
+	portnum, err := dstParsePort("listen", network, port)
+	if err != nil {
+		return nil, err
 	}
-	addr := &TCPAddr{IP: dstHostIP(host), Port: dstAtoiPort(port)}
+	ip, err := dstResolveHost("listen", network, host)
+	if err != nil {
+		return nil, err
+	}
+	wildcard := dstWildcard(host)
 
 	dstNet.mu.Lock()
 	defer dstNet.mu.Unlock()
 	dstNetRoll()
-	if _, dup := dstNet.listeners[key]; dup {
+	var key string
+	if portnum == 0 {
+		portnum, key, err = dstAllocateListenPort(network, ip, wildcard)
+		if err != nil {
+			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
+		}
+	} else {
+		key = dstListenerKey(network, ip, portnum, wildcard)
+	}
+	addr := &TCPAddr{IP: ip, Port: portnum}
+	if dstListenerConflict(network, ip, key, portnum, wildcard) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: errors.New("address already in use")}
 	}
 	l := &dstListener{
@@ -159,18 +288,32 @@ func dstListen(network, address string) (Listener, error) {
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
-func dstDial(network, address string) (Conn, error) {
+func dstDial(ctx context.Context, network, address string) (Conn, error) {
+	if !dstTCPNetwork(network) {
+		return nil, dstUnsupportedNetwork("dial", network)
+	}
 	host, port, err := SplitHostPort(address)
 	if err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: nil, Err: err}
 	}
-	serverAddr := &TCPAddr{IP: dstHostIP(host), Port: dstAtoiPort(port)}
+	portnum, err := dstParsePort("dial", network, port)
+	if err != nil {
+		return nil, err
+	}
+	ip, err := dstResolveHost("dial", network, host)
+	if err != nil {
+		return nil, err
+	}
+	serverAddr := &TCPAddr{IP: ip, Port: portnum}
+	if err := ctx.Err(); err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: mapErr(err)}
+	}
 
 	dstNet.mu.Lock()
 	dstNetRoll()
-	l := dstNet.listeners[host+":"+port]
+	l := dstNet.listeners[dstListenerKey(network, ip, portnum, false)]
 	if l == nil {
-		l = dstNet.listeners[":"+port] // a wildcard listener on this port
+		l = dstNet.listeners[dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
 	}
 	localPort := dstNet.nextPort
 	dstNet.nextPort++
@@ -179,12 +322,20 @@ func dstDial(network, address string) (Conn, error) {
 	if l == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: errors.New("connection refused")}
 	}
-	localAddr := &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: localPort}
+	localIP := IPv4(127, 0, 0, 1)
+	if dstAddrFamily(network, ip) == "tcp6" {
+		localIP = IPv6loopback
+	}
+	localAddr := &TCPAddr{IP: localIP, Port: localPort}
 
 	p1, p2 := Pipe()
 	dialer := &dstConn{Conn: p1, local: localAddr, remote: serverAddr}
 	server := &dstConn{Conn: p2, local: serverAddr, remote: localAddr}
 	select {
+	case <-ctx.Done():
+		p1.Close()
+		p2.Close()
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
 	case l.accept <- server:
 		return dialer, nil
 	case <-l.done:

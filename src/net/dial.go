@@ -524,11 +524,11 @@ func (d *Dialer) Dial(network, address string) (Conn, error) {
 // See func [Dial] for a description of the network and address
 // parameters.
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
-	if dstNetEnabled && dstActive() {
-		return dstDial(network, address) // deterministic simulation: see net/dst.go
-	}
 	ctx, cancel := d.dialCtx(ctx)
 	defer cancel()
+	if dstNetEnabled && dstActive() {
+		return dstDial(ctx, network, address) // deterministic simulation: see net/dst.go
+	}
 
 	// Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.
 	resolveCtx := ctx

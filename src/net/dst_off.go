@@ -6,10 +6,12 @@
 
 package net
 
+import "context"
+
 const dstNetEnabled = false
 
 func dstActive() bool { return false }
 
-func dstDial(network, address string) (Conn, error) { return nil, nil }
+func dstDial(ctx context.Context, network, address string) (Conn, error) { return nil, nil }
 
 func dstListen(network, address string) (Listener, error) { return nil, nil }

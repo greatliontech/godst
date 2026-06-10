@@ -5,8 +5,10 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"internal/synctest"
 	"math/rand/v2"
 	"net"
@@ -52,6 +54,7 @@ func init() {
 	register("DSTIdentityExtra", DSTIdentityExtra)
 	register("DSTCryptoRand", DSTCryptoRand)
 	register("DSTNet", DSTNet)
+	register("DSTNetSemantics", DSTNetSemantics)
 	register("DSTFinChain", DSTFinChain)
 	register("DSTMemLimit", DSTMemLimit)
 }
@@ -207,6 +210,166 @@ func DSTNet() {
 		return
 	}
 	os.Stdout.WriteString(a + "\n")
+}
+
+// DSTNetSemantics checks that the DST network shim preserves public net semantics
+// for the TCP surface it owns, and rejects protocol shapes it does not model.
+// Prints booleans for: canceled/deadline DialContext errors, nil DialContext
+// panics, unsupported UDP Listen/Dial errors, deterministic :0 listener ports,
+// invalid ports, localhost canonicalization, DNS/service-name rejection, and
+// tcp4/tcp6 address-family constraints.
+func DSTNetSemantics() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var canceled, deadline, nilPanic, udpRejected, udpDialRejected, zeroPorts, invalidPort, localhost, dnsRejected, serviceRejected, familyRejected, wildcardFamilyRejected, tcp6WildcardRejected, tcp6Local, tcp4Unspecified bool
+	simulation.Run(n, func() {
+		ln, err := net.Listen("tcp", "127.0.0.1:9100")
+		if err == nil {
+			defer ln.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			c, err := (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:9100")
+			if c != nil {
+				c.Close()
+			}
+			canceled = errors.Is(err, context.Canceled)
+
+			ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
+			defer cancel()
+			c, err = (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:9100")
+			if c != nil {
+				c.Close()
+			}
+			deadline = errors.Is(err, context.DeadlineExceeded)
+
+			func() {
+				defer func() { nilPanic = recover() != nil }()
+				c, _ := (&net.Dialer{}).DialContext(nil, "tcp", "127.0.0.1:9100")
+				if c != nil {
+					c.Close()
+				}
+			}()
+		}
+
+		if ln, err := net.Listen("udp", "127.0.0.1:9101"); err != nil {
+			udpRejected = true
+		} else {
+			ln.Close()
+		}
+		if c, err := net.Dial("udp", "127.0.0.1:9100"); err != nil {
+			udpDialRejected = true
+		} else {
+			c.Close()
+		}
+
+		l1, err1 := net.Listen("tcp", "127.0.0.1:0")
+		l2, err2 := net.Listen("tcp", "127.0.0.1:0")
+		if err1 == nil && err2 == nil {
+			p1 := l1.Addr().(*net.TCPAddr).Port
+			p2 := l2.Addr().(*net.TCPAddr).Port
+			zeroPorts = p1 == 10000 && p2 == 10001
+		}
+		if l1 != nil {
+			l1.Close()
+		}
+		if l2 != nil {
+			l2.Close()
+		}
+
+		if ln, err := net.Listen("tcp", "127.0.0.1:999999"); err != nil {
+			invalidPort = true
+		} else {
+			ln.Close()
+		}
+
+		lnLocal, err := net.Listen("tcp", "127.0.0.1:9102")
+		if err == nil {
+			defer lnLocal.Close()
+			c, err := net.Dial("tcp", "localhost:9102")
+			if err == nil {
+				localhost = true
+				c.Close()
+				if srv, err := lnLocal.Accept(); err == nil {
+					srv.Close()
+				}
+			}
+		}
+
+		if c, err := net.Dial("tcp", "definitely-not-localhost.invalid:9102"); err != nil {
+			dnsRejected = strings.Contains(err.Error(), "DNS lookup unsupported under deterministic simulation")
+		} else {
+			c.Close()
+		}
+		if ln, err := net.Listen("tcp", "127.0.0.1:http"); err != nil {
+			serviceRejected = true
+		} else {
+			ln.Close()
+		}
+
+		if c, err := net.Dial("tcp6", "127.0.0.1:9102"); err != nil {
+			familyRejected = true
+		} else {
+			c.Close()
+		}
+		if ln6, err := net.Listen("tcp6", "[::]:9103"); err == nil {
+			if c, err := net.Dial("tcp4", "127.0.0.1:9103"); err != nil {
+				wildcardFamilyRejected = true
+			} else {
+				c.Close()
+			}
+			ln6.Close()
+		}
+		if ln, err := net.Listen("tcp6", "0.0.0.0:9104"); err != nil {
+			tcp6WildcardRejected = true
+		} else {
+			ln.Close()
+		}
+		if ln6, err := net.Listen("tcp6", "[::1]:9105"); err == nil {
+			c, err := net.Dial("tcp6", "[::1]:9105")
+			if err == nil {
+				tcp6Local = c.LocalAddr().(*net.TCPAddr).IP.To4() == nil
+				c.Close()
+				if srv, err := ln6.Accept(); err == nil {
+					srv.Close()
+				}
+			}
+			ln6.Close()
+		}
+		if ln4, err := net.Listen("tcp4", "127.0.0.1:9106"); err == nil {
+			c, err := net.Dial("tcp4", "[::]:9106")
+			if err == nil {
+				tcp4Unspecified = true
+				c.Close()
+				if srv, err := ln4.Accept(); err == nil {
+					srv.Close()
+				}
+			}
+			ln4.Close()
+		}
+	})
+	simulation.Run(n, func() {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			zeroPorts = zeroPorts && ln.Addr().(*net.TCPAddr).Port == 10000
+			ln.Close()
+		} else {
+			zeroPorts = false
+		}
+	})
+	os.Stdout.WriteString("canceled=" + strconv.FormatBool(canceled) +
+		" deadline=" + strconv.FormatBool(deadline) +
+		" nilpanic=" + strconv.FormatBool(nilPanic) +
+		" udpreject=" + strconv.FormatBool(udpRejected) +
+		" udpdialreject=" + strconv.FormatBool(udpDialRejected) +
+		" zeroports=" + strconv.FormatBool(zeroPorts) +
+		" invalidport=" + strconv.FormatBool(invalidPort) +
+		" localhost=" + strconv.FormatBool(localhost) +
+		" dnsreject=" + strconv.FormatBool(dnsRejected) +
+		" servicereject=" + strconv.FormatBool(serviceRejected) +
+		" familyreject=" + strconv.FormatBool(familyRejected) +
+		" wildcardfamilyreject=" + strconv.FormatBool(wildcardFamilyRejected) +
+		" tcp6wildcardreject=" + strconv.FormatBool(tcp6WildcardRejected) +
+		" tcp6local=" + strconv.FormatBool(tcp6Local) +
+		" tcp4unspecified=" + strconv.FormatBool(tcp4Unspecified) + "\n")
 }
 
 // DSTIdentityExtra checks the rest of the process-identity surface beyond

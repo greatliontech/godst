@@ -183,13 +183,16 @@ This is a **contract change**: real network I/O moves from "out of scope, the pr
 in-memory" to **owned by the fork**, so unmodified networked code is reproducible under DST without
 being rewired through an injected transport.
 
-Under a run, `net.Dial`/`net.Listen` stop touching the OS and run on an in-process **address registry**:
-`Listen` registers a simulated listener; `Dial` looks it up and hands the dialer end of a new connection
-back while pushing the server end onto the listener's accept queue. A connection is a `net.Pipe`
-endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with the
-simulated local/remote `*net.TCPAddr`. The seam is the exported `Dial`/`DialContext`/`ListenConfig.Listen`
-(the `os.Getpid` altitude), gated on `dstActive()` so it compiles out without `-tags dst`; net's internal
-lookups stay real (the program does not exercise real sockets under DST).
+Under a run, TCP `net.Dial`/`net.Listen` stop touching the OS and run on an in-process **address
+registry**: `Listen` registers a simulated listener; `Dial` looks it up and hands the dialer end of a new
+connection back while pushing the server end onto the listener's accept queue. A connection is a
+`net.Pipe` endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with
+the simulated local/remote `*net.TCPAddr`. `DialContext` keeps the public context contract (nil panics,
+canceled/deadline contexts error), `:0` listeners receive deterministic nonzero ports, and listener
+lookup uses canonical simulated IPs (`localhost` maps to loopback). The seam is the exported
+`Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it
+compiles out without `-tags dst`; net's internal lookups stay real (the program does not exercise real
+sockets under DST).
 
 **Determinism is free.** Connection/accept/delivery order is just the goroutine schedule, which is
 already deterministic — no new seed, no new RNG. The registry is keyed by a per-run epoch (`dstNetEpoch`,
@@ -199,9 +202,11 @@ re-Listen the same address). This is the reliable, in-order **base** on which ne
 (partition/drop/reorder/latency) layer later as policies on the same registry+conns.
 
 **Caveat (fidelity).** `Dial` returns the `net.Conn` *interface*; code that type-asserts the concrete
-`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. DNS resolution, UDP
-(`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed synthetic set consistent with this
-addressing) are follow-on increments. FIPS/Boring-style configs are out of scope as elsewhere.
+`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. DNS resolution, service-name
+ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed synthetic set consistent with this
+addressing) are follow-on increments. Unsupported networks at the intercepted `Dial`/`Listen` seam fail
+under DST rather than being modeled as TCP-like streams or falling through to the real OS. FIPS/Boring-
+style configs are out of scope as elsewhere.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
