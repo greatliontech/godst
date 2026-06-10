@@ -56,8 +56,21 @@ func init() {
 	register("DSTNet", DSTNet)
 	register("DSTNetSemantics", DSTNetSemantics)
 	register("DSTFinChain", DSTFinChain)
+	register("DSTFinLongChain", DSTFinLongChain)
+	register("DSTCleanupLongChain", DSTCleanupLongChain)
+	register("DSTFinProfile", DSTFinProfile)
+	register("DSTCleanupProfile", DSTCleanupProfile)
+	register("DSTFinPreBubbleRelease", DSTFinPreBubbleRelease)
+	register("DSTCleanupPreBubbleRelease", DSTCleanupPreBubbleRelease)
+	register("DSTFinPreBubbleInFlight", DSTFinPreBubbleInFlight)
+	register("DSTCleanupPreBubbleInFlight", DSTCleanupPreBubbleInFlight)
+	register("DSTFinInFlightReleaseDuringRun", DSTFinInFlightReleaseDuringRun)
+	register("DSTCleanupInFlightReleaseDuringRun", DSTCleanupInFlightReleaseDuringRun)
 	register("DSTMemLimit", DSTMemLimit)
 }
+
+//go:linkname dstRuntimeActive runtime.dstActive
+func dstRuntimeActive() bool
 
 // dstMemSink keeps the most recent allocation live so the rest become garbage.
 var dstMemSink []byte
@@ -96,23 +109,48 @@ func DSTMemLimit() {
 // independence check (DSTPREBUBBLE).
 var dstPreBubbleSink [][]byte
 
-// dstMakeFinChain builds a 3-level finalizer chain in a dropped frame: c1's
-// finalizer keeps c2 alive, c2's keeps c3, and c3's finalizer touches a bubble
+// dstMakeFinChainLen builds a finalizer chain in a dropped frame: each
+// finalizer keeps the next object alive, and the tail finalizer touches a bubble
 // channel. Each object is reachable only through the previous object's pending
-// finalizer, so the chain resolves one GC per level. Three levels guarantee the
-// channel-touching tail (c3) is not reached by the ordinary Run-end teardown
-// (which drains ~2 levels) and would leak to the post-Run reap without the
-// Run-end fixpoint.
+// finalizer, so the chain resolves one GC per level.
 //
 //go:noinline
+func dstMakeFinChainLen(n int, ch chan int) {
+	var next *dstFinObj
+	for i := n - 1; i >= 0; i-- {
+		cur := &dstFinObj{}
+		if i == n-1 {
+			runtime.SetFinalizer(cur, func(p *dstFinObj) { ch <- 99 })
+		} else {
+			hold := next
+			runtime.SetFinalizer(cur, func(p *dstFinObj) { runtime.KeepAlive(hold) })
+		}
+		next = cur
+	}
+	runtime.KeepAlive(next)
+}
+
 func dstMakeFinChain(ch chan int) {
-	c3 := &dstFinObj{}
-	runtime.SetFinalizer(c3, func(p *dstFinObj) { ch <- 99 })
-	c2 := &dstFinObj{}
-	runtime.SetFinalizer(c2, func(p *dstFinObj) { runtime.KeepAlive(c3) })
-	c1 := &dstFinObj{}
-	runtime.SetFinalizer(c1, func(p *dstFinObj) { runtime.KeepAlive(c2) })
-	runtime.KeepAlive(c1)
+	dstMakeFinChainLen(3, ch)
+}
+
+//go:noinline
+func dstMakeFinStoreChainLen(n int, done, active *atomic.Bool) {
+	var next *dstFinObj
+	for i := n - 1; i >= 0; i-- {
+		cur := &dstFinObj{}
+		if i == n-1 {
+			runtime.SetFinalizer(cur, func(p *dstFinObj) {
+				active.Store(dstRuntimeActive())
+				done.Store(true)
+			})
+		} else {
+			hold := next
+			runtime.SetFinalizer(cur, func(p *dstFinObj) { runtime.KeepAlive(hold) })
+		}
+		next = cur
+	}
+	runtime.KeepAlive(next)
 }
 
 // DSTFinChain drops a finalizer chain whose tail touches a bubble channel and
@@ -130,6 +168,25 @@ func DSTFinChain() {
 		_ = ch
 	})
 	os.Stdout.WriteString("ok\n")
+}
+
+// DSTFinLongChain is DSTFinChain with a finite chain longer than the old run-end
+// round cap. It prints "ok" iff the tail resolves while dstActive is still true.
+var dstFinLongChainDone atomic.Bool
+var dstFinLongChainActive atomic.Bool
+
+func DSTFinLongChain() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	dstFinLongChainDone.Store(false)
+	dstFinLongChainActive.Store(false)
+	simulation.Run(n, func() {
+		dstMakeFinStoreChainLen(300, &dstFinLongChainDone, &dstFinLongChainActive)
+	})
+	if dstFinLongChainDone.Load() && dstFinLongChainActive.Load() {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("tail-missing\n")
+	}
 }
 
 // DSTProcessIdentity checks that os.Getpid/os.Hostname return the simulated
@@ -608,6 +665,15 @@ func dstMakeFinSender(ch chan int) {
 	runtime.SetFinalizer(o, func(p *dstFinObj) { ch <- 42 })
 }
 
+//go:noinline
+func dstMakeFinActiveSender(ch chan int, active *atomic.Bool) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		active.Store(dstRuntimeActive())
+		ch <- 42
+	})
+}
+
 // DSTFinChanOp checks that a finalizer doing a bubble channel op runs without
 // fatal inside simulation.Run (invariant DST-FIN-1): the finalizer must run on the
 // bubble-scoped drain goroutine (g.bubble == the bubble), not the async system
@@ -655,6 +721,38 @@ func DSTFinSpawn() {
 		got = <-ch
 	})
 	os.Stdout.WriteString("ok " + strconv.Itoa(got) + "\n")
+}
+
+// DSTFinProfile takes a goroutine profile from inside a finalizer running on the
+// DST drain. The drain is already a user goroutine, so it must not also be counted
+// through fingRunningFinalizer's synthetic profile adjustment. Prints "ok" iff
+// the profile count matches the number of populated records.
+func DSTFinProfile() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var ok bool
+	simulation.Run(n, func() {
+		ch := make(chan bool, 1)
+		o := &dstFinObj{}
+		runtime.SetFinalizer(o, func(p *dstFinObj) {
+			n, _ := runtime.GoroutineProfile(nil)
+			records := make([]runtime.StackRecord, n)
+			n, profOK := runtime.GoroutineProfile(records)
+			populated := 0
+			for i := 0; i < n && i < len(records); i++ {
+				if len(records[i].Stack()) != 0 {
+					populated++
+				}
+			}
+			ch <- profOK && populated == n
+		})
+		runtime.KeepAlive(o)
+		ok = <-ch
+	})
+	if ok {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("overcount\n")
+	}
 }
 
 // dstFinRunCount and dstFinRunSum accumulate the set of finalizers that ran, from
@@ -714,6 +812,50 @@ func dstMakeCleanupSender(ch chan int) {
 	runtime.AddCleanup(o, func(c chan int) { c <- 42 }, ch)
 }
 
+//go:noinline
+func dstMakeCleanupActiveSender(ch chan int, active *atomic.Bool) {
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(c chan int) {
+		active.Store(dstRuntimeActive())
+		c <- 42
+	}, ch)
+}
+
+//go:noinline
+func dstMakeCleanupChainLen(n int, ch chan int) {
+	var next *dstFinObj
+	for i := n - 1; i >= 0; i-- {
+		cur := &dstFinObj{}
+		if i == n-1 {
+			runtime.AddCleanup(cur, func(c chan int) { c <- 99 }, ch)
+		} else {
+			hold := next
+			runtime.AddCleanup(cur, func(p *dstFinObj) { runtime.KeepAlive(p) }, hold)
+		}
+		next = cur
+	}
+	runtime.KeepAlive(next)
+}
+
+//go:noinline
+func dstMakeCleanupStoreChainLen(n int, done, active *atomic.Bool) {
+	var next *dstFinObj
+	for i := n - 1; i >= 0; i-- {
+		cur := &dstFinObj{}
+		if i == n-1 {
+			runtime.AddCleanup(cur, func(b *atomic.Bool) {
+				active.Store(dstRuntimeActive())
+				b.Store(true)
+			}, done)
+		} else {
+			hold := next
+			runtime.AddCleanup(cur, func(p *dstFinObj) { runtime.KeepAlive(p) }, hold)
+		}
+		next = cur
+	}
+	runtime.KeepAlive(next)
+}
+
 // DSTCleanupChanOp is the cleanup analogue of DSTFinChanOp (invariant
 // DST-CLEANUP-1): a cleanup doing a bubble channel op must run on the bubble drain
 // (g.bubble == the bubble), not the async cleanup pool (g.bubble == nil, which
@@ -761,6 +903,55 @@ func DSTCleanupChanOpPriorG() {
 		got = <-ch
 	})
 	os.Stdout.WriteString("ok " + strconv.Itoa(got) + "\n")
+}
+
+// DSTCleanupLongChain is the cleanup analogue of DSTFinLongChain.
+var dstCleanupLongChainDone atomic.Bool
+var dstCleanupLongChainActive atomic.Bool
+
+func DSTCleanupLongChain() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	dstCleanupLongChainDone.Store(false)
+	dstCleanupLongChainActive.Store(false)
+	simulation.Run(n, func() {
+		dstMakeCleanupStoreChainLen(300, &dstCleanupLongChainDone, &dstCleanupLongChainActive)
+	})
+	if dstCleanupLongChainDone.Load() && dstCleanupLongChainActive.Load() {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("tail-missing\n")
+	}
+}
+
+// DSTCleanupProfile is the cleanup analogue of DSTFinProfile. A cleanup running
+// on synctestGCDrain must not be counted both as the drain goroutine and as a
+// synthetic running cleanup goroutine.
+func DSTCleanupProfile() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var ok bool
+	simulation.Run(n, func() {
+		ch := make(chan bool, 1)
+		o := &dstFinObj{}
+		runtime.AddCleanup(o, func(c chan bool) {
+			n, _ := runtime.GoroutineProfile(nil)
+			records := make([]runtime.StackRecord, n)
+			n, profOK := runtime.GoroutineProfile(records)
+			populated := 0
+			for i := 0; i < n && i < len(records); i++ {
+				if len(records[i].Stack()) != 0 {
+					populated++
+				}
+			}
+			c <- profOK && populated == n
+		}, ch)
+		runtime.KeepAlive(o)
+		ok = <-ch
+	})
+	if ok {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("overcount\n")
+	}
 }
 
 var dstCleanupRunCount atomic.Uint64
@@ -824,64 +1015,292 @@ func DSTCleanupRNGIsolation() {
 	}
 }
 
-// dstPreBubbleCleanupRan records whether the pre-bubble cleanup in
-// DSTCleanupPreBubble has run yet.
-var dstPreBubbleCleanupRan atomic.Bool
+// dstPreBubbleCleanupHead/Tail record whether the cleanup chain callbacks in
+// DSTCleanupPreBubble have run yet, and the Active flags record whether they
+// observed dstActive while running.
+var dstPreBubbleCleanupHead atomic.Bool
+var dstPreBubbleCleanupTail atomic.Bool
+var dstPreBubbleCleanupHeadActive atomic.Bool
+var dstPreBubbleCleanupActive atomic.Bool
 
 //go:noinline
-func dstMakePreBubbleCleanup() {
-	o := &dstFinObj{}
-	runtime.AddCleanup(o, func(int) { dstPreBubbleCleanupRan.Store(true) }, 0)
+func dstMakePreBubbleCleanupChain() {
+	tail := &dstFinObj{}
+	runtime.AddCleanup(tail, func(int) {
+		dstPreBubbleCleanupActive.Store(dstRuntimeActive())
+		dstPreBubbleCleanupTail.Store(true)
+	}, 0)
+	head := &dstFinObj{}
+	runtime.AddCleanup(head, func(p *dstFinObj) {
+		dstPreBubbleCleanupHeadActive.Store(dstRuntimeActive())
+		dstPreBubbleCleanupHead.Store(true)
+		runtime.KeepAlive(p)
+	}, tail)
+	runtime.KeepAlive(head)
 }
 
-// DSTCleanupPreBubble is the cleanup analogue of DSTFinPreBubble: the entry GC's
-// pre-bubble cleanups run bubble-less in dstActivate, not in-bubble at the first
-// quiescence. Prints "true"; without the dstActivate cleanup drain it is "false".
-//
-// dstForcePriorCleanupG first parks the cleanup goroutine (so it cannot itself run
-// the pre-bubble cleanup during dstActivate — a freshly-created, still-runnable
-// cleanup goroutine would, masking the dstActivate drain, just as fing being
-// parked is why the finalizer analogue is testable). Requires GOMAXPROCS=1 so the
-// park completes before the test object is created. The test object is then
-// created after, kept alive until dstActivate's entry GC discovers it.
+// DSTCleanupPreBubble checks that cleanups queued before a run do not execute in
+// that run's bubble. The head cleanup keeps the tail alive; the tail may run
+// before the run or after it, but neither callback may flip during the in-run
+// quiescence or observe dstActive. Prints "headStart tailStart headAfter
+// tailAfter headActive tailActive".
 func DSTCleanupPreBubble() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	dstForcePriorCleanupG()   // park the cleanup goroutine
-	dstMakePreBubbleCleanup() // test object, dead before simulation.Run's entry GC
-	var atStart bool
+	dstMakePreBubbleCleanupChain() // dead before simulation.Run's entry GC
+	var headStart, tailStart, headAfter, tailAfter, headActive, tailActive bool
 	simulation.Run(n, func() {
-		atStart = dstPreBubbleCleanupRan.Load()
+		headStart = dstPreBubbleCleanupHead.Load()
+		tailStart = dstPreBubbleCleanupTail.Load()
+		time.Sleep(time.Millisecond)
+		headAfter = dstPreBubbleCleanupHead.Load()
+		tailAfter = dstPreBubbleCleanupTail.Load()
+		headActive = dstPreBubbleCleanupHeadActive.Load()
+		tailActive = dstPreBubbleCleanupActive.Load()
 	})
-	os.Stdout.WriteString(strconv.FormatBool(atStart) + "\n")
+	os.Stdout.WriteString(strconv.FormatBool(headStart) + " " +
+		strconv.FormatBool(tailStart) + " " +
+		strconv.FormatBool(headAfter) + " " +
+		strconv.FormatBool(tailAfter) + " " +
+		strconv.FormatBool(headActive) + " " +
+		strconv.FormatBool(tailActive) + "\n")
 }
 
-// dstPreBubbleFinRan records whether the pre-bubble finalizer in DSTFinPreBubble
-// has run yet.
-var dstPreBubbleFinRan atomic.Bool
+var dstPreBubbleReleaseCh chan struct{}
+var dstPreBubbleFinReleaseCount atomic.Uint64
+var dstPreBubbleCleanupReleaseCount atomic.Uint64
 
 //go:noinline
-func dstMakePreBubbleFin() {
-	o := &dstFinObj{}
-	runtime.SetFinalizer(o, func(p *dstFinObj) { dstPreBubbleFinRan.Store(true) })
+func dstMakeBlockingPreBubbleFinalizers(n int) {
+	ch := dstPreBubbleReleaseCh
+	for i := 0; i < n; i++ {
+		o := &dstFinObj{}
+		runtime.SetFinalizer(o, func(p *dstFinObj) {
+			<-ch
+			dstPreBubbleFinReleaseCount.Add(1)
+		})
+	}
 }
 
-// DSTFinPreBubble checks that the entry GC's *pre-bubble* finalizers run
-// bubble-less in dstActivate, not in-bubble at the first quiescence (the M2 fix
-// in dst.go). A finalizable object is created and dropped before simulation.Run, so
-// dstActivate's entry GC discovers it dead. With the pre-bubble drain it runs
-// DURING dstActivate (before f starts), so f's first read sees the flag set;
-// without it, the finalizer would sit in finq (fing is gated under DST) and not
-// run until the first in-bubble quiescence, so f's first read would see it unset.
-// Runs with GOGC=off so no GC fires before simulation.Run (which would run the finalizer
-// early on the ungated fing). Prints "true".
+//go:noinline
+func dstMakeBlockingPreBubbleCleanups(n int) {
+	ch := dstPreBubbleReleaseCh
+	for i := 0; i < n; i++ {
+		o := &dstFinObj{}
+		runtime.AddCleanup(o, func(c chan struct{}) {
+			<-c
+			dstPreBubbleCleanupReleaseCount.Add(1)
+		}, ch)
+	}
+}
+
+func dstWaitAtomicCount(c *atomic.Uint64, want uint64) bool {
+	for i := 0; i < 1000; i++ {
+		if c.Load() == want {
+			return true
+		}
+		runtime.GC()
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+	}
+	return c.Load() == want
+}
+
+// DSTFinPreBubbleRelease checks that finalizers detached before dstActive are
+// released back to fing after dstDeactivate. The dstPreparing gate keeps these
+// callbacks from starting during activation, so reaching the count requires the
+// deferred blocks to be linked back after the run.
+func DSTFinPreBubbleRelease() {
+	const nfinalizers = 32
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	dstPreBubbleReleaseCh = make(chan struct{})
+	dstPreBubbleFinReleaseCount.Store(0)
+	dstMakeBlockingPreBubbleFinalizers(nfinalizers)
+	simulation.Run(n, func() {})
+	close(dstPreBubbleReleaseCh)
+	if dstWaitAtomicCount(&dstPreBubbleFinReleaseCount, nfinalizers) {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("count=" + strconv.FormatUint(dstPreBubbleFinReleaseCount.Load(), 10) + "\n")
+	}
+}
+
+// DSTCleanupPreBubbleRelease is the cleanup analogue of DSTFinPreBubbleRelease.
+func DSTCleanupPreBubbleRelease() {
+	const ncleanups = 32
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	dstPreBubbleReleaseCh = make(chan struct{})
+	dstPreBubbleCleanupReleaseCount.Store(0)
+	dstMakeBlockingPreBubbleCleanups(ncleanups)
+	simulation.Run(n, func() {})
+	close(dstPreBubbleReleaseCh)
+	if dstWaitAtomicCount(&dstPreBubbleCleanupReleaseCount, ncleanups) {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("count=" + strconv.FormatUint(dstPreBubbleCleanupReleaseCount.Load(), 10) + "\n")
+	}
+}
+
+// DSTFinPreBubbleInFlight checks that a finalizer already running on fing before
+// simulation.Run does not keep the run-end drain spinning on process-global
+// finqueued/finexecuted counts.
+func DSTFinPreBubbleInFlight() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		started <- struct{}{}
+		<-release
+	})
+	runtime.KeepAlive(o)
+	runtime.GC()
+	<-started
+	simulation.Run(n, func() {})
+	close(release)
+	os.Stdout.WriteString("ok\n")
+}
+
+// DSTCleanupPreBubbleInFlight is the cleanup analogue of
+// DSTFinPreBubbleInFlight.
+func DSTCleanupPreBubbleInFlight() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(c chan struct{}) {
+		started <- struct{}{}
+		<-c
+	}, release)
+	runtime.KeepAlive(o)
+	runtime.GC()
+	<-started
+	simulation.Run(n, func() {})
+	close(release)
+	os.Stdout.WriteString("ok\n")
+}
+
+// DSTFinInFlightReleaseDuringRun checks that an already-running async fing
+// callback released during a Run parks before dequeuing in-run work. Without the
+// worker-loop gate, fing can steal the in-run finalizer after release and fatal on
+// the bubble channel send.
+func DSTFinInFlightReleaseDuringRun() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		started <- struct{}{}
+		<-release
+	})
+	runtime.KeepAlive(o)
+	runtime.GC()
+	<-started
+	var got bool
+	simulation.Run(n, func() {
+		ch := make(chan int, 1)
+		var active atomic.Bool
+		dstMakeFinActiveSender(ch, &active)
+		runtime.GC()
+		close(release)
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+		select {
+		case v := <-ch:
+			got = v == 42 && active.Load()
+		default:
+		}
+	})
+	if got {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("miss\n")
+	}
+}
+
+// DSTCleanupInFlightReleaseDuringRun is the cleanup analogue of
+// DSTFinInFlightReleaseDuringRun.
+func DSTCleanupInFlightReleaseDuringRun() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(c chan struct{}) {
+		started <- struct{}{}
+		<-c
+	}, release)
+	runtime.KeepAlive(o)
+	runtime.GC()
+	<-started
+	var got bool
+	simulation.Run(n, func() {
+		ch := make(chan int, 1)
+		var active atomic.Bool
+		dstMakeCleanupActiveSender(ch, &active)
+		runtime.GC()
+		close(release)
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+		select {
+		case v := <-ch:
+			got = v == 42 && active.Load()
+		default:
+		}
+	})
+	if got {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("miss\n")
+	}
+}
+
+// dstPreBubbleFinHead/Tail record whether the finalizer chain callbacks in
+// DSTFinPreBubble have run yet, and the Active flags record whether they observed
+// dstActive while running.
+var dstPreBubbleFinHead atomic.Bool
+var dstPreBubbleFinTail atomic.Bool
+var dstPreBubbleFinHeadActive atomic.Bool
+var dstPreBubbleFinActive atomic.Bool
+
+//go:noinline
+func dstMakePreBubbleFinChain() {
+	tail := &dstFinObj{}
+	runtime.SetFinalizer(tail, func(p *dstFinObj) {
+		dstPreBubbleFinActive.Store(dstRuntimeActive())
+		dstPreBubbleFinTail.Store(true)
+	})
+	head := &dstFinObj{}
+	runtime.SetFinalizer(head, func(p *dstFinObj) {
+		dstPreBubbleFinHeadActive.Store(dstRuntimeActive())
+		dstPreBubbleFinHead.Store(true)
+		runtime.KeepAlive(tail)
+	})
+	runtime.KeepAlive(head)
+}
+
+// DSTFinPreBubble checks that finalizers queued before a run do not execute in
+// that run's bubble. The head finalizer keeps the tail alive; the tail may run
+// before the run or after it, but neither callback may flip during the in-run
+// quiescence or observe dstActive. Prints "headStart tailStart headAfter
+// tailAfter headActive tailActive".
 func DSTFinPreBubble() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	dstMakePreBubbleFin() // pre-bubble object: dead before simulation.Run's entry GC
-	var atStart bool
+	dstMakePreBubbleFinChain() // pre-bubble object: dead before simulation.Run's entry GC
+	var headStart, tailStart, headAfter, tailAfter, headActive, tailActive bool
 	simulation.Run(n, func() {
-		atStart = dstPreBubbleFinRan.Load() // M2: already true; without M2: false
+		headStart = dstPreBubbleFinHead.Load()
+		tailStart = dstPreBubbleFinTail.Load()
+		time.Sleep(time.Millisecond)
+		headAfter = dstPreBubbleFinHead.Load()
+		tailAfter = dstPreBubbleFinTail.Load()
+		headActive = dstPreBubbleFinHeadActive.Load()
+		tailActive = dstPreBubbleFinActive.Load()
 	})
-	os.Stdout.WriteString(strconv.FormatBool(atStart) + "\n")
+	os.Stdout.WriteString(strconv.FormatBool(headStart) + " " +
+		strconv.FormatBool(tailStart) + " " +
+		strconv.FormatBool(headAfter) + " " +
+		strconv.FormatBool(tailAfter) + " " +
+		strconv.FormatBool(headActive) + " " +
+		strconv.FormatBool(tailActive) + "\n")
 }
 
 // DSTWeakClearing checks that weak-pointer clearing is deterministic under DST

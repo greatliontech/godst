@@ -51,7 +51,17 @@ var (
 	finptrmask  [finBlockSize / goarch.PtrSize / 8]byte
 	finqueued   uint64 // monotonic count of queued finalizers
 	finexecuted uint64 // monotonic count of executed finalizers
+
+	// Finalizers queued before a DST run are process-level work, not part of the
+	// run's bubble. They are detached before dstActive is set, ignored by the
+	// in-bubble drain, and released back to fing after dstDeactivate.
+	dstDeferredFinq *finBlock
 )
+
+// Run-local finalizer queue accounting. finqueued/finexecuted are process-global
+// and include prior-run callbacks that may already be running on fing. While DST
+// is active, pending means queued-by-this-run but not yet executed-by-this-run.
+var dstFinqRunBaseQueued, dstFinqRunExecuted atomic.Uint64
 
 var allfin *finBlock // list of all blocks
 
@@ -193,6 +203,28 @@ func finalizercommit(gp *g, lock unsafe.Pointer) bool {
 	return true
 }
 
+func finalizercommitDSTBlocked(gp *g, lock unsafe.Pointer) bool {
+	unlock((*mutex)(lock))
+	// Leave a wake request behind: fing may be parked with pre-bubble work still
+	// held in its local runFinqBlocks frame, so no later queuefinalizer call is
+	// guaranteed to wake it after DST deactivates.
+	fingStatus.Or(fingWait | fingWake)
+	return true
+}
+
+func dstParkFingIfBlocked() bool {
+	if !dstCallbackWorkersBlocked() {
+		return false
+	}
+	lock(&finlock)
+	if !dstCallbackWorkersBlocked() {
+		unlock(&finlock)
+		return false
+	}
+	gopark(finalizercommitDSTBlocked, unsafe.Pointer(&finlock), waitReasonFinalizerWait, traceBlockSystemGoroutine, 1)
+	return true
+}
+
 func finReadQueueStats() (queued, executed uint64) {
 	lock(&finlock)
 	queued = finqueued
@@ -210,6 +242,10 @@ func runFinalizers() {
 
 	for {
 		lock(&finlock)
+		if dstCallbackWorkersBlocked() {
+			gopark(finalizercommitDSTBlocked, unsafe.Pointer(&finlock), waitReasonFinalizerWait, traceBlockSystemGoroutine, 1)
+			continue
+		}
 		fb := finq
 		finq = nil
 		if fb == nil {
@@ -230,6 +266,7 @@ func runFinalizers() {
 // DST bubble drain (dstDrainFinq), so a finalizer runs identically whichever
 // goroutine drives it.
 func runFinqBlocks(fb *finBlock) {
+	onFing := getg() == fing
 	var (
 		frame    unsafe.Pointer
 		framecap uintptr
@@ -241,6 +278,8 @@ func runFinqBlocks(fb *finBlock) {
 	for fb != nil {
 		n := fb.cnt
 		for i := n; i > 0; i-- {
+			for onFing && dstParkFingIfBlocked() {
+			}
 			f := &fb.fin[i-1]
 
 			var regs abi.RegArgs
@@ -291,9 +330,13 @@ func runFinqBlocks(fb *finBlock) {
 			default:
 				throw("bad type kind in finalizer")
 			}
-			fingStatus.Or(fingRunningFinalizer)
+			if onFing {
+				fingStatus.Or(fingRunningFinalizer)
+			}
 			reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
-			fingStatus.And(^fingRunningFinalizer)
+			if onFing {
+				fingStatus.And(^fingRunningFinalizer)
+			}
 
 			// Drop finalizer queue heap references
 			// before hiding them from markroot.
@@ -320,10 +363,63 @@ func runFinqBlocks(fb *finBlock) {
 // finexecuted are process-cumulative, but their equality is exact: they are equal
 // iff finq is empty and no finalizer is mid-run.
 func finPending() bool {
+	if dstActive() {
+		lock(&finlock)
+		queued := finqueued - dstFinqRunBaseQueued.Load()
+		unlock(&finlock)
+		return queued != dstFinqRunExecuted.Load()
+	}
 	lock(&finlock)
 	pending := finqueued != finexecuted
 	unlock(&finlock)
 	return pending
+}
+
+func dstResetFinqRunCounters() {
+	lock(&finlock)
+	dstFinqRunBaseQueued.Store(finqueued)
+	unlock(&finlock)
+	dstFinqRunExecuted.Store(0)
+}
+
+// dstDeferPreBubbleFinq detaches finalizers queued before a DST bubble starts so
+// they cannot run in the bubble drain. The detached blocks still count in
+// finqueued, but finPending subtracts them while dstActive so the run's fixpoint
+// only observes callbacks queued by the run itself.
+func dstDeferPreBubbleFinq() {
+	lock(&finlock)
+	fb := finq
+	finq = nil
+	if fb != nil {
+		last := fb
+		for last.next != nil {
+			last = last.next
+		}
+		last.next = dstDeferredFinq
+		dstDeferredFinq = fb
+	}
+	unlock(&finlock)
+}
+
+// dstReleaseDeferredFinq returns pre-bubble finalizers to the ordinary finalizer
+// goroutine after a DST run is deactivated. They never execute with dstActive set
+// and never enter the run's bubble drain.
+func dstReleaseDeferredFinq() {
+	lock(&finlock)
+	fb := dstDeferredFinq
+	dstDeferredFinq = nil
+	if fb != nil {
+		last := fb
+		for last.next != nil {
+			last = last.next
+		}
+		last.next = finq
+		finq = fb
+	}
+	unlock(&finlock)
+	if fb != nil {
+		fingStatus.Or(fingWake)
+	}
 }
 
 // dstDrainFinq runs every currently-queued finalizer on the calling goroutine,
@@ -341,7 +437,14 @@ func dstDrainFinq() {
 		if fb == nil {
 			return
 		}
+		n := uint64(0)
+		for b := fb; b != nil; b = b.next {
+			n += uint64(atomic.Load(&b.cnt))
+		}
 		runFinqBlocks(fb)
+		if dstActive() {
+			dstFinqRunExecuted.Add(int64(n))
+		}
 	}
 }
 

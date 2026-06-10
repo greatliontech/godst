@@ -33,6 +33,23 @@ var dstSeed atomic.Uint64
 // consumer can detect a new run and reset per-run in-memory state.
 var dstRunEpoch atomic.Uint64
 
+// dstPreparing is true during dstActivate's pre-active GC queue-detach pass.
+// It suppresses ordinary async finalizer/cleanup workers while dstActive is still
+// false, so process-level callbacks cannot start running and remain counted as
+// pending inside the upcoming run.
+var dstPreparing atomic.Bool
+
+// dstCallbackWorkersBlocked reports whether process-global finalizer/cleanup
+// workers must not dequeue more callback work. The workers may already exist (or
+// already be running a pre-bubble callback) before a Run starts, so the scheduler
+// wake gates are not sufficient by themselves: the worker loops also check this
+// before taking another callback block.
+//
+//go:nosplit
+func dstCallbackWorkersBlocked() bool {
+	return dstActive() || (dstBuild && dstPreparing.Load())
+}
+
 // dstNetEpoch returns the current run's epoch (0 outside a run). net keys its
 // simulated-network registry by it: a different epoch means a new run, so the
 // registry resets — keeping listeners from one run out of the next, with no
@@ -97,6 +114,21 @@ func dstActivate(seed uint64) {
 	// order just avoids the caller observing dstActive with an unrooted dstrand.
 	getg().dstrand = dstBubbleRoot(seed)
 	dstSchedRand = dstSchedRoot(seed)
+	// Queue process-level finalizers/cleanups before DST is active and detach them
+	// from the queues the bubble drain observes. They are not part of this run's
+	// deterministic universe: running them here could block Run entry or consume
+	// seeded DST state, and leaving them queued would let them run in the first
+	// bubble drain. They are released back to the ordinary async pools at
+	// dstDeactivate.
+	dstPreparing.Store(true)
+	for range 2 {
+		GC()
+		dstDeferPreBubbleFinq()
+		dstDeferPreBubbleCleanups()
+	}
+	dstPreparing.Store(false)
+	dstResetFinqRunCounters()
+	dstResetCleanupRunCounters()
 	dstSeed.Store(seed)
 	// Establish the per-bubble heap baseline: a full GC here (STW now that DST is
 	// active) collects pre-bubble garbage so gcController.heapMarked is the
@@ -106,23 +138,6 @@ func dstActivate(seed uint64) {
 	// baseline and breaking the relative computation. See docs/dst/design.md
 	// (Tier 2, per-bubble relative trigger).
 	GC()
-	// The entry GC queues finalizers for objects that died *before* this bubble
-	// (process-level garbage, e.g. transient stdlib objects). Run them now, on this
-	// still-bubble-less goroutine (getg().bubble == nil), so the bubble's finalizer
-	// drain does not run them in-bubble at the first quiescence: they are not part
-	// of any bubble's dead set, and their run-to-run-varying count (process heap
-	// history) would otherwise add nondeterministic entries to the first
-	// quiescence's finalizer run set. They cannot touch this bubble's channels
-	// (the bubble does not exist yet), so running them here is safe. After this,
-	// finq is empty and the bubble's finalizer state starts from a clean baseline.
-	//
-	// Cleanups (runtime.AddCleanup) get the same treatment: the entry GC's sweep
-	// flushed them, and draining them here (bubble-less) keeps pre-bubble and
-	// prior-Run cleanups out of this bubble's first-quiescence drain. The async
-	// cleanup pool is gated off under DST (proc.go), so this is the only thing that
-	// runs them before the bubble.
-	dstDrainFinq()
-	dstDrainCleanups()
 	dstHeapBase.Store(gcController.heapMarked)
 	dstFinqBase.Store(finqueued)
 }
@@ -461,6 +476,9 @@ func dstSetMemLimit(limit int64) { dstMemLimit = limit }
 //go:linkname dstDeactivate
 func dstDeactivate() {
 	dstSeed.Store(0)
+	dstReleaseDeferredFinq()
+	dstReleaseDeferredCleanups()
+	dstWakeBlockedCleanupWorkers()
 }
 
 // dstSetAsyncPreemptOff sets debug.asyncpreemptoff and returns its previous

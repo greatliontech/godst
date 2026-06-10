@@ -419,9 +419,9 @@ func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
 // successive GC cycles. An unbounded per-quiescence fixpoint would also loop
 // forever on a callback that re-registers itself (SetFinalizer/AddCleanup of the
 // object from its own callback). At *Run end*, where there is no later quiescence,
-// dstStopGCDrain instead loops this a bounded number of rounds to resolve chains
-// fully in-bubble (see dstRunEndDrainRounds); that is why this returns whether it
-// made progress.
+// dstStopGCDrain instead loops until no GC+drain progress remains, resolving
+// every finite chain fully in-bubble; that is why this returns whether it made
+// progress.
 //
 // The drain itself runs *all* currently-queued finalizers then cleanups
 // (dstDrainFinq/dstDrainCleanups loop until empty), absorbing any a callback
@@ -450,14 +450,6 @@ func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 	return true
 }
 
-// dstRunEndDrainRounds bounds the Run-end finalizer/cleanup fixpoint so a callback
-// that re-registers itself (SetFinalizer(p, fn) inside fn, or AddCleanup of p
-// from p's own cleanup) cannot spin the drain forever. Real finalizer/cleanup
-// chains are shallow, so the loop almost always converges in one or two rounds;
-// the cap only bounds the pathological self-resurrecting case, whose residual
-// callbacks fall through to the post-Run reap as they did before this fixpoint.
-const dstRunEndDrainRounds = 256
-
 // dstStopGCDrain runs a final drain and stops the drain goroutine at Run
 // end. Called by the driver after the run loop, when the bubble is quiescent,
 // with bubble.mu NOT held. No-op when the bubble has no DST drain.
@@ -478,9 +470,12 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 	// left pending (object B reachable only through object A's still-pending
 	// finalizer) would leak to the post-Run reap on the async fing/cleanup
 	// goroutine (g.bubble == nil) and a channel-touching tail would fatal. Loop
-	// until a GC discovers nothing new, so the whole chain runs in-bubble; bounded
-	// by dstRunEndDrainRounds against a self-re-registering callback.
-	for i := 0; i < dstRunEndDrainRounds; i++ {
+	// until a GC discovers nothing new, so every finite chain runs in-bubble. A
+	// callback that continually re-registers itself is a non-terminating callback
+	// workload, analogous to a user goroutine that never reaches a durable block;
+	// the run will not complete rather than leaking the residual to a bubble-less
+	// async goroutine.
+	for {
 		if !bubble.dstDrainAtQuiescence() {
 			break
 		}

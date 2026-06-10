@@ -3464,12 +3464,14 @@ top:
 	//
 	// Under DST the async finalizer goroutine fing must not run: its g.bubble is
 	// nil, so a finalizer doing a bubble channel op would fatal, and its async
-	// timing is nondeterministic. During a dst.Run, finq accumulates and is
-	// drained by the bubble-scoped drain at each synctest quiescence point
-	// (synctest.go), so finalizers run deterministically on a bubble goroutine
-	// (invariants DST-FIN-1, DST-FIN-2). After the run, dstActive is false again
-	// and fing resumes normally.
-	if !dstActive() && fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
+	// timing is nondeterministic. The short dstPreparing gate covers dstActivate's
+	// pre-active queue-detach pass too, so pre-bubble finalizers cannot start and
+	// remain counted as pending inside the upcoming run. During a dst.Run, finq
+	// accumulates and is drained by the bubble-scoped drain at each synctest
+	// quiescence point (synctest.go), so finalizers run deterministically on a
+	// bubble goroutine (invariants DST-FIN-1, DST-FIN-2). After the run, dstActive
+	// is false again and fing resumes normally.
+	if !dstCallbackWorkersBlocked() && fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
 		if gp := wakefing(); gp != nil {
 			ready(gp, 0, true)
 		}
@@ -3477,12 +3479,13 @@ top:
 
 	// Wake up one or more cleanup Gs.
 	//
-	// Gated under DST for the same reason as the finalizer G above: during a
-	// dst.Run, cleanups must run on the bubble-scoped drain at quiescence (with
-	// g.bubble set, deterministically), not on the async cleanup pool (g.bubble
-	// == nil, nondeterministic). Cleanups accumulate in gcCleanups and are drained
-	// by synctestGCDrain (invariants DST-CLEANUP-1, DST-CLEANUP-2).
-	if !dstActive() && gcCleanups.needsWake() {
+	// Gated under DST and dstPreparing for the same reason as the finalizer G
+	// above: during a dst.Run, cleanups must run on the bubble-scoped drain at
+	// quiescence (with g.bubble set, deterministically), not on the async cleanup
+	// pool (g.bubble == nil, nondeterministic). Cleanups accumulate in gcCleanups
+	// and are drained by synctestGCDrain (invariants DST-CLEANUP-1,
+	// DST-CLEANUP-2).
+	if !dstCallbackWorkersBlocked() && gcCleanups.needsWake() {
 		gcCleanups.wake()
 	}
 

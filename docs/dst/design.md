@@ -1417,13 +1417,14 @@ reachable only through object A's still-pending finalizer) would otherwise be di
 post-`Run` reap — run on the async `fing`/cleanup goroutine (`g.bubble == nil`) — and the tail's
 channel op would fatal. So `dstStopGCDrain` loops GC+drain until a GC discovers nothing new
 (`dstDrainAtQuiescence` returns whether it made progress), resolving the whole chain **in-bubble**
-before teardown. This is bounded (`dstRunEndDrainRounds`) so a self-re-registering callback
-(`SetFinalizer`/`AddCleanup` of the object from its own callback) cannot spin forever — at the cap the
-residual falls through to the reap as before, the pathological case, not a chain. It is sound because
-the SUT has exited (everything is dead, so running the full chain is correct) and changes no in-run
-quiescence behavior; the cleanup drain (Chunk C) is covered identically (the loop checks both
-`finPending` and `cleanupPending`). Regression: `DSTFinChain` (a 3-level chain with a channel-touching
-tail) fatals on the post-`Run` reap without the fixpoint, prints `ok` with it.
+before teardown. The loop has no finite round cap: every finite chain completes in the bubble; a callback
+that continually re-registers itself is a non-terminating callback workload (like a user goroutine that
+never durably blocks) and the run does not complete rather than leaking the residual to a bubble-less
+async goroutine. It is sound because the SUT has exited (everything is dead, so running the full chain is
+correct) and changes no in-run quiescence behavior; the cleanup drain (Chunk C) is covered identically
+(the loop checks both `finPending` and `cleanupPending`). Regressions: `DSTFinChain` (a 3-level chain with
+a channel-touching tail) fatals on the post-`Run` reap without the fixpoint; the long-chain tests
+(`DSTFinLongChain`, `DSTCleanupLongChain`) require a >256-level tail to run while `dstActive` is still true.
 
 #### D5 — Scavenger off (dimension 9)
 
@@ -1539,10 +1540,11 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
    gives it the bubble. Realizes the **discovery-cycle invariant** (set-at-quiescence). Depends on 1+2.
    Foreclosure check: the drain hooks to *quiescence*, so the mid-burst heap trigger (5) needs no change
    to it. **As built, two refinements:**
-   - *`fing` gated at the wake site, not in `queuefinalizer`.* `queuefinalizer` still sets `fingWake`
-     (harmless); the scheduler's wake of `fing` (`proc.go` `findRunnable`) is gated under `!dstActive()`,
-     so during a Run `finq` accumulates and only the drain drains it. Smaller change, and the gate is
-     byte-identical for non-DST.
+   - *`fing` gated at the wake/dequeue sites, not in `queuefinalizer`.* `queuefinalizer` still sets
+     `fingWake` (harmless); the scheduler's wake of `fing` (`proc.go` `findRunnable`) and `fing`'s own
+     dequeue loop are gated by `dstCallbackWorkersBlocked()` (`dstActive` or the pre-active
+     `dstPreparing` pass), so during a Run `finq` accumulates and only the drain drains it. The predicate
+     is byte-identical for non-DST because `dstBuild` folds false.
    - *Drain exit handshake.* The drain is a bubble goroutine and counts toward `bubble.total`, so it must
      exit before the `total != 1` deadlock check; `dstStopGCDrain` runs a final drain, sets `gcDrainExit`,
      and waits for the drain to die (invariant DST-FIN-3).
@@ -1550,18 +1552,28 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
    goroutine (`synctestGCDrain`), same quiescence wake, drains `gcCleanups` after `finq` via a factored
    `runCleanupBlock`/`dstDrainCleanups`; `cleanupPending` joins `finPending` in the wake decision; the
    quiescence GC's sweep already flushes per-P cleanup blocks (`mgcsweep.go`). Depends on 3. Foreclosure
-   check: none. **As built — the async pools are fully dormant during a Run (four gates under
-   `!dstActive()`):** the finalizer goroutine `fing` and the cleanup-pool goroutines must neither *run*
-   nor be *created* during a Run, because either would run a callback with `g.bubble == nil` (fatal on a
+   check: none. **As built — the async pools are fully dormant during activation and Run:** the finalizer
+   goroutine `fing` and the cleanup-pool goroutines must neither *run* nor be *created* during a Run,
+   because either would run a callback with `g.bubble == nil` (fatal on a
    bubble channel op) or, on creation via `go`, draw from the creating goroutine's DST RNG stream and
-   persist across Runs (breaking reproducible-in-isolation). So: gate the `fing` wake (`proc.go`,
-   tested by the finalizer channel-op test) and `createfing` (`mfinal.go`); gate the cleanup wake
-   (`proc.go`, tested by the *prior-goroutine* cleanup channel-op test) and `createGs` (`mcleanup.go`,
-   tested by the cleanup RNG-isolation test). The wake gate matters when an async goroutine pre-exists the
-   Run; the create gate when the first callback of its kind is inside the Run. Pre-bubble and prior-Run
-   finalizers/cleanups are drained bubble-less in `dstActivate`, so the async pools are never needed
-   during or around a Run. (`createfing` is the one gate not independently testable in the harness — fing
-   pre-exists from a stdlib import; same mechanism as the tested `createGs`.)
+   persist across Runs (breaking reproducible-in-isolation). So: gate the `fing` wake (`proc.go`) and
+   worker dequeue/callback loop (`mfinal.go`) with `dstCallbackWorkersBlocked()`; gate `createfing`
+   (`mfinal.go`) under `!dstActive()`; gate the cleanup wake (`proc.go`) and worker dequeue/callback loop
+   (`mcleanup.go`) with `dstCallbackWorkersBlocked()`; and gate `createGs` (`mcleanup.go`) under
+   `!dstActive()`. The wake/dequeue gates matter when an async goroutine pre-exists the Run; the create
+   gates when the first callback of its kind is inside the Run. Pre-bubble finalizers/
+   cleanups are excluded before `dstActive`: activation sets a short `dstPreparing` gate so ordinary async
+   callback workers cannot dequeue new work, performs two ordinary GC queue-detach passes before storing the seed,
+   detaches any queued process-level blocks from the queues the bubble drain observes, snapshots run-local
+   queued/executed baselines so detached queued work and prior-run
+   callbacks already executing on async workers cannot poison the run-end fixpoint, and releases detached
+   work back to the ordinary async pools after `dstDeactivate`. If an async worker is already inside a
+   pre-bubble callback when the run starts and that callback later returns, the worker parks before running
+   the next callback or dequeuing another block, then resumes after deactivation. If callbacks run before the
+   run, they observe `dstActive=false`; if they remain deferred, they cannot enter the run's first
+   quiescence drain.
+   (`createfing` is the one gate not independently testable in the harness — fing pre-exists from a stdlib
+   import; same mechanism as the tested `createGs`.)
 5. **Mid-burst heap trigger semantics** (dimension 11 finalizer interaction; **Chunk B — landed**).
    Heap-triggered GCs already fire (step 1); they **queue** finalizers without waking the drain — which
    falls out of the step-3 design directly: nothing wakes the drain except the quiescence hook, so a

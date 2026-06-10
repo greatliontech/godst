@@ -176,8 +176,9 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	// (newproc1) and persists across Runs (ng stays nonzero), so whether it is
 	// created during a Run would depend on process history — breaking the
 	// reproducible-in-isolation property. Under DST the bubble drain runs cleanups
-	// instead, so no async cleanup G is needed; pre-bubble and post-Run cleanups
-	// are drained bubble-less in dstActivate.
+	// instead, so no async cleanup G is needed. Pre-bubble cleanups are excluded
+	// before dstActive and released back to the ordinary async pool after
+	// dstDeactivate.
 	if !dstActive() && gcCleanups.needG() {
 		gcCleanups.createGs()
 	}
@@ -720,9 +721,22 @@ func maxCleanupGs() uint32 {
 // gcCleanups is the global cleanup queue.
 var gcCleanups cleanupQueue
 
+// Cleanups queued before a DST run are process-level work. Detach them before
+// dstActive and release them back to the ordinary cleanup pool after deactivation
+// so they cannot run on the run's bubble drain.
+var (
+	dstDeferredCleanups      lfstack
+	dstDeferredCleanupBlocks uint64 // cleanup blocks, for workUnits restoration
+)
+
+var dstCleanupRunBaseQueued, dstCleanupRunExecuted atomic.Uint64
+
 // runCleanups is the entrypoint for all cleanup-running goroutines.
 func runCleanups() {
 	for {
+		if gcCleanups.dstParkWorkerIfBlocked() {
+			continue
+		}
 		b := gcCleanups.dequeue()
 		runCleanupBlock(b)
 	}
@@ -739,8 +753,16 @@ func runCleanupBlock(b *cleanupBlock) {
 		racefingo()
 	}
 
-	gcCleanups.beginRunningCleanups()
+	onCleanupG := findfunc(getg().startpc).funcID == abi.FuncID_runCleanups
+	if onCleanupG {
+		gcCleanups.beginRunningCleanups()
+	}
 	for i := 0; i < int(b.n); i++ {
+		for onCleanupG && dstCallbackWorkersBlocked() {
+			gcCleanups.endRunningCleanups()
+			gcCleanups.dstParkWorkerIfBlocked()
+			gcCleanups.beginRunningCleanups()
+		}
 		c := b.cleanups[i]
 		b.cleanups[i] = cleanupFn{}
 
@@ -766,7 +788,9 @@ func runCleanupBlock(b *cleanupBlock) {
 			raceRestoreCtx(racectx)
 		}
 	}
-	gcCleanups.endRunningCleanups()
+	if onCleanupG {
+		gcCleanups.endRunningCleanups()
+	}
 	gcCleanups.executed.Add(int64(b.n))
 
 	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
@@ -783,14 +807,87 @@ func runCleanupBlock(b *cleanupBlock) {
 func dstDrainCleanups() {
 	for gcCleanups.tryTakeWork() {
 		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
+		n := uint64(b.n)
 		runCleanupBlock(b)
+		if dstActive() {
+			dstCleanupRunExecuted.Add(int64(n))
+		}
 	}
+}
+
+// dstDeferPreBubbleCleanups detaches cleanups queued before a DST bubble starts
+// so they cannot run in the bubble drain. The queued cleanup count remains in the
+// global stats; cleanupPending subtracts it while dstActive.
+func dstDeferPreBubbleCleanups() {
+	for gcCleanups.tryTakeWork() {
+		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
+		dstDeferredCleanupBlocks++
+		dstDeferredCleanups.push(&b.lfnode)
+	}
+}
+
+// dstReleaseDeferredCleanups returns pre-bubble cleanup blocks to the ordinary
+// cleanup pool after DST is deactivated.
+func dstReleaseDeferredCleanups() {
+	blocks := dstDeferredCleanupBlocks
+	for {
+		p := dstDeferredCleanups.pop()
+		if p == nil {
+			break
+		}
+		gcCleanups.full.push((*lfnode)(p))
+	}
+	if blocks != 0 {
+		gcCleanups.addWork(int(blocks))
+	}
+	dstDeferredCleanupBlocks = 0
+}
+
+func (q *cleanupQueue) dstParkWorkerIfBlocked() bool {
+	if !dstCallbackWorkersBlocked() {
+		return false
+	}
+	lock(&q.lock)
+	if !dstCallbackWorkersBlocked() {
+		unlock(&q.lock)
+		return false
+	}
+	q.asleep.Add(1)
+	q.sleeping.push(getg())
+	goparkunlock(&q.lock, waitReasonCleanupWait, traceBlockSystemGoroutine, 1)
+	return true
+}
+
+func dstWakeBlockedCleanupWorkers() {
+	q := &gcCleanups
+	lock(&q.lock)
+	wake := q.sleeping.size
+	if wake == 0 {
+		unlock(&q.lock)
+		return
+	}
+	q.asleep.Add(-wake)
+	var list gList
+	for range wake {
+		list.push(q.sleeping.pop())
+	}
+	unlock(&q.lock)
+	injectglist(&list)
+}
+
+func dstResetCleanupRunCounters() {
+	queued, _ := gcCleanups.readQueueStats()
+	dstCleanupRunBaseQueued.Store(queued)
+	dstCleanupRunExecuted.Store(0)
 }
 
 // cleanupPending reports whether any cleanups have been queued but not yet
 // executed. Used by the DST quiescence drain to decide whether to wake the drain.
 func cleanupPending() bool {
 	queued, executed := gcCleanups.readQueueStats()
+	if dstActive() {
+		return queued-dstCleanupRunBaseQueued.Load() != dstCleanupRunExecuted.Load()
+	}
 	return queued != executed
 }
 

@@ -438,19 +438,70 @@ func TestDSTFinalizerSpawn(t *testing.T) {
 	}
 }
 
-// TestDSTFinalizerPreBubbleDrainedBubbleless verifies the M2 fix: finalizers the
-// entry GC queues for pre-bubble objects run bubble-less in dstActivate, not
-// in-bubble at the first quiescence (where they would add a run-to-run-varying
-// count to the first quiescence's finalizer set, weakening DST-FIN-2). The
-// testprog drops a finalizable object before dst.Run and checks, as f's first
-// act, that its finalizer already ran. GOGC=off so no pre-Run GC runs it early on
-// the ungated fing. Expects "true"; without the pre-bubble drain it is "false".
-func TestDSTFinalizerPreBubbleDrainedBubbleless(t *testing.T) {
+// TestDSTFinalizerProfileNoOvercount verifies that a finalizer running on the DST
+// drain is counted exactly once by runtime.GoroutineProfile. The drain is a user
+// goroutine, so fingRunningFinalizer must not add a synthetic extra record for it.
+func TestDSTFinalizerProfileNoOvercount(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=100"}
+	out := runTestProgDST(t, "DSTFinProfile", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("goroutine profile overcounted DST drain finalizer (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTFinalizerPreBubbleDeferred verifies that finalizers queued before a run
+// stay out of that run's bubble drain. The testprog builds a pre-bubble chain;
+// the tail may resolve before the run or be deferred until after it, but its
+// state must not change during an in-run quiescence and it must never observe
+// dstActive.
+func TestDSTFinalizerPreBubbleDeferred(t *testing.T) {
 	env := []string{"DSTSEED=12345", "GOGC=off"}
 	out := runTestProgDST(t, "DSTFinPreBubble", env...)
-	if strings.TrimSpace(out) != "true" {
-		t.Fatalf("pre-bubble finalizer not drained in dstActivate (got %q, want \"true\"): "+
-			"the entry GC's pre-bubble finalizers are run in-bubble instead of bubble-less", out)
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) != 6 || f[0] != f[2] || f[1] != f[3] || f[4] != "false" || f[5] != "false" {
+		t.Fatalf("pre-bubble finalizer entered run or observed dstActive (got %q): want head/tail start==after and active=false", out)
+	}
+}
+
+// TestDSTFinalizerPreBubbleReleased verifies that pre-bubble finalizers detached
+// from the run are released back to normal finalizer processing after dstDeactivate.
+func TestDSTFinalizerPreBubbleReleased(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTFinPreBubbleRelease", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pre-bubble finalizers were not released after dstDeactivate (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTFinalizerPreBubbleInFlightIgnored verifies that a finalizer already
+// running on fing before Run does not poison the run's pending counts.
+func TestDSTFinalizerPreBubbleInFlightIgnored(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTFinPreBubbleInFlight", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pre-bubble in-flight finalizer blocked run-end drain (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTFinalizerInFlightWorkerDoesNotStealRunQueue verifies that a pre-run
+// fing callback released during Run parks before taking in-run work. The in-run
+// finalizer sends on a bubble channel, so async execution would fatal.
+func TestDSTFinalizerInFlightWorkerDoesNotStealRunQueue(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTFinInFlightReleaseDuringRun", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("in-flight finalizer worker stole in-run work or missed drain (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTFinalizerLongRunEndChain verifies that the Run-end fixpoint has no
+// finite round cap: a chain longer than the old cap still resolves in-bubble
+// before teardown, so the tail observes dstActive before Run returns.
+func TestDSTFinalizerLongRunEndChain(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=100"}
+	out := runTestProgDST(t, "DSTFinLongChain", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("long finalizer chain escaped run-end drain (got %q, want \"ok\")", out)
 	}
 }
 
@@ -510,16 +561,65 @@ func TestDSTCleanupRNGIsolation(t *testing.T) {
 	}
 }
 
-// TestDSTCleanupPreBubbleDrainedBubbleless verifies the cleanup half of the
-// dstActivate pre-bubble drain (parallel to TestDSTFinalizerPreBubbleDrained
-// Bubbleless): the entry GC's pre-bubble cleanups run bubble-less in dstActivate,
-// not in-bubble at the first quiescence. GOGC=off so no pre-Run GC runs them early
-// on the ungated async pool. Expects "true".
-func TestDSTCleanupPreBubbleDrainedBubbleless(t *testing.T) {
-	env := []string{"DSTSEED=12345", "GOGC=off", "GOMAXPROCS=1"}
+// TestDSTCleanupPreBubbleDeferred is the cleanup analogue of
+// TestDSTFinalizerPreBubbleDeferred: queued pre-bubble cleanups must not
+// execute in the run or observe dstActive.
+func TestDSTCleanupPreBubbleDeferred(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
 	out := runTestProgDST(t, "DSTCleanupPreBubble", env...)
-	if strings.TrimSpace(out) != "true" {
-		t.Fatalf("pre-bubble cleanup not drained in dstActivate (got %q, want \"true\")", out)
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) != 6 || f[0] != f[2] || f[1] != f[3] || f[4] != "false" || f[5] != "false" {
+		t.Fatalf("pre-bubble cleanup entered run or observed dstActive (got %q): want head/tail start==after and active=false", out)
+	}
+}
+
+// TestDSTCleanupPreBubbleReleased is the cleanup analogue of
+// TestDSTFinalizerPreBubbleReleased.
+func TestDSTCleanupPreBubbleReleased(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTCleanupPreBubbleRelease", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pre-bubble cleanups were not released after dstDeactivate (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTCleanupPreBubbleInFlightIgnored is the cleanup analogue of
+// TestDSTFinalizerPreBubbleInFlightIgnored.
+func TestDSTCleanupPreBubbleInFlightIgnored(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTCleanupPreBubbleInFlight", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pre-bubble in-flight cleanup blocked run-end drain (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTCleanupInFlightWorkerDoesNotStealRunQueue is the cleanup analogue of
+// TestDSTFinalizerInFlightWorkerDoesNotStealRunQueue.
+func TestDSTCleanupInFlightWorkerDoesNotStealRunQueue(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=off"}
+	out := runTestProgDST(t, "DSTCleanupInFlightReleaseDuringRun", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("in-flight cleanup worker stole in-run work or missed drain (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTCleanupLongRunEndChain is the cleanup analogue of
+// TestDSTFinalizerLongRunEndChain.
+func TestDSTCleanupLongRunEndChain(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=100"}
+	out := runTestProgDST(t, "DSTCleanupLongChain", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("long cleanup chain escaped run-end drain (got %q, want \"ok\")", out)
+	}
+}
+
+// TestDSTCleanupProfileNoOvercount is the cleanup analogue of
+// TestDSTFinalizerProfileNoOvercount.
+func TestDSTCleanupProfileNoOvercount(t *testing.T) {
+	env := []string{"DSTSEED=12345", "GOGC=100"}
+	out := runTestProgDST(t, "DSTCleanupProfile", env...)
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("goroutine profile overcounted DST drain cleanup (got %q, want \"ok\")", out)
 	}
 }
 
