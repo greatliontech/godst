@@ -138,6 +138,12 @@ var (
 	dstScheduleAborted bool
 )
 
+var (
+	dstExplorePanicValue any
+	dstExplorePanicSet   bool
+	dstExploreDeadlock   string
+)
+
 // dstPostGoYield enables the scheduled-strategy boundary immediately after a go
 // statement. It is on for public Explore. The manual DPOR-brain sweep disables it
 // through dstSetPostGoYield so its exhaustive baseline remains the explicitly
@@ -570,6 +576,39 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	}
 }
 
+func dstExploreRecordUncaughtPanic(v any) bool {
+	if !dstActive() || dstSchedKind != dstSchedScheduled {
+		return false
+	}
+	gp := getg()
+	if gp == nil || gp.bubble == nil || gp == gp.bubble.root || gp == gp.bubble.gcDrain {
+		return false
+	}
+	if !dstExplorePanicSet {
+		dstExplorePanicValue = v
+		dstExplorePanicSet = true
+	}
+	return true
+}
+
+func dstExploreDropPanicDefers(gp *g) {
+	for p := gp._panic; p != nil; p = p.link {
+		if !p.goexit {
+			runningPanicDefers.Add(-1)
+		}
+	}
+}
+
+func dstExploreRecordDeadlock(reason string, bubble *synctestBubble) bool {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || bubble == nil {
+		return false
+	}
+	if dstExploreDeadlock == "" {
+		dstExploreDeadlock = reason
+	}
+	return true
+}
+
 //go:linkname dstRecordSyncRelease
 func dstRecordSyncRelease(id unsafe.Pointer) {
 	dstRecordSyncEvent(dstSyncEventRelease, id)
@@ -641,6 +680,9 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 func dstScheduleReset() {
 	dstScheduleStep = 0
 	dstScheduleAborted = false
+	dstExplorePanicValue = nil
+	dstExplorePanicSet = false
+	dstExploreDeadlock = ""
 	dstTraceN = 0
 	dstTraceFlatN = 0
 	dstTraceOverflow = false
@@ -813,6 +855,15 @@ func dstTraceEnabledFP(i int) []uint64 {
 //
 //go:linkname dstTraceOverflowFP
 func dstTraceOverflowFP() bool { return dstTraceOverflow }
+
+//go:linkname dstExplorePanicFP
+func dstExplorePanicFP() (any, bool) { return dstExplorePanicValue, dstExplorePanicSet }
+
+//go:linkname dstExploreDeadlockFP
+func dstExploreDeadlockFP() string { return dstExploreDeadlock }
+
+//go:linkname dstRunningPanicDefersFP
+func dstRunningPanicDefersFP() uint32 { return runningPanicDefers.Load() }
 
 // dstEdgeLenFP reports the happens-before edge count recorded by the last run, and
 // dstEdgeAtFP reports edge i as (readier index, readied index, the dstScheduleStep

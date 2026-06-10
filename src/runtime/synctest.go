@@ -325,6 +325,9 @@ func synctestRun(f func()) {
 		} else {
 			reason = "deadlock: all goroutines in bubble are blocked"
 		}
+		if dstExploreRecordDeadlock(reason, bubble) {
+			return
+		}
 		panic(synctestDeadlockError{reason: reason, bubble: bubble})
 	}
 	if gp.timer != nil && gp.timer.isFake {

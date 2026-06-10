@@ -23,6 +23,9 @@ func dstAccessYieldReset()
 //go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
 func dstSetPostGoYield(enabled bool) bool
 
+//go:linkname dstRunningPanicDefersFP runtime.dstRunningPanicDefersFP
+func dstRunningPanicDefersFP() uint32
+
 func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -558,7 +561,7 @@ func TestExploreReportsPanicFailure(t *testing.T) {
 	}
 	sut := func() bool { panic("boom") }
 	res := Explore(1, DPOR, sut)
-	if len(res.Failures) != 1 || res.Failures[0].Panic != "boom" || res.Failures[0].Race {
+	if len(res.Failures) != 1 || res.Failures[0].Panic != "boom" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
 		t.Fatalf("panic was not reported as a replayable failure: %#v", res.Failures)
 	}
 	panicked := false
@@ -574,8 +577,96 @@ func TestExploreReportsPanicFailure(t *testing.T) {
 		t.Fatalf("Replay of panic failure did not panic")
 	}
 	res = Explore(1, DPOR, func() bool { panic(emptyPanicError{}) })
-	if len(res.Failures) != 1 || res.Failures[0].Panic == "" || res.Failures[0].Race {
+	if len(res.Failures) != 1 || res.Failures[0].Panic == "" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
 		t.Fatalf("empty-message error panic was not reported as a replayable failure: %#v", res.Failures)
+	}
+}
+
+func TestExploreReportsChildPanicFailure(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			panic("child boom")
+		}()
+		wg.Wait()
+		return false
+	}
+	res := Explore(1, DPOR, sut)
+	if len(res.Failures) != 1 || res.Failures[0].Panic != "child boom" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
+		t.Fatalf("child panic was not reported as a replayable failure: %#v", res.Failures)
+	}
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		Replay(1, res.Failures[0], sut)
+	}()
+	if !panicked {
+		t.Fatalf("Replay of child panic failure did not panic")
+	}
+}
+
+func TestExploreReportsNestedChildPanicClearsPanicDefers(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	before := dstRunningPanicDefersFP()
+	sut := func() bool {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { panic("inner") }()
+			panic("outer")
+		}()
+		wg.Wait()
+		return false
+	}
+	res := Explore(1, DPOR, sut)
+	if len(res.Failures) != 1 || res.Failures[0].Panic != "inner" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
+		t.Fatalf("nested child panic was not reported as a replayable failure: %#v", res.Failures)
+	}
+	if got := dstRunningPanicDefersFP(); got != before {
+		t.Fatalf("nested child panic leaked runningPanicDefers: before=%d after=%d", before, got)
+	}
+}
+
+func TestExploreReportsDeadlockFailure(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		ch := make(chan struct{})
+		<-ch
+		return false
+	}
+	res := Explore(1, Exhaustive, sut)
+	if len(res.Failures) != 1 || res.Failures[0].Deadlock == "" || res.Failures[0].Panic != "" || res.Failures[0].Race {
+		t.Fatalf("deadlock was not reported as a replayable failure: exhausted=%v overflow=%v failures=%#v", res.Exhausted, res.Overflow, res.Failures)
+	}
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		Replay(1, res.Failures[0], sut)
+	}()
+	if !panicked {
+		t.Fatalf("Replay of deadlock failure did not panic")
+	}
+	clean := Explore(1, Exhaustive, func() bool { return false })
+	if !clean.Exhausted || clean.Overflow || clean.BudgetHit || len(clean.Failures) != 0 {
+		t.Fatalf("deadlocked bubble state affected later Explore run: %#v", clean)
 	}
 }
 

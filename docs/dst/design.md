@@ -812,11 +812,12 @@ The driver lives above the seam, orchestrating repeated Runs:
   schedules, until the worklist is empty (the pruned interleaving space is **exhausted**) or a budget is
   hit. `simulation.ExploreWith(seed, ExploreOptions{Mode, MaxSchedules, MaxSteps}, f)` is the budgeted
   form. `ExploreResult` carries schedules/exhausted/overflow/budget-hit + every found failure (a `-race`
-  report, a SUT assertion, or a directly recovered top-level SUT callback panic) with replay metadata: the
-  observing schedule plus any forced access-yield watchpoints active when the failure was observed. Panics
-  from SUT-created child goroutines and synctest deadlock recovery require runtime/synctest-layer handling
-  and are tracked separately in `docs/issues/dst-explore-child-panic-failure-reporting.md` and
-  `docs/issues/dst-explore-deadlock-failure-reporting.md`.
+  report, a SUT assertion, a SUT panic, or a synctest deadlock) with replay metadata: the observing schedule
+  plus any forced access-yield watchpoints active when the failure was observed. Top-level SUT callback
+  panics are recovered in the Explore driver; unrecovered panics from SUT-created bubble goroutines are
+  recorded by the runtime after the panicking goroutine's defers run, then that goroutine exits. Scheduled
+  synctest deadlocks are recorded as `Failure.Deadlock` inside `synctestRun` before it returns, avoiding the
+  unsafe outer-recover path while leaving the blocked goroutines isolated in their deadlocked bubble.
 - `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
   `RunWith(seed, Options{Strategy: DPOR, Schedule: s}, f)` replays one schedule for reproduction/debug.
 - **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
@@ -938,13 +939,13 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 4. **`Explore` outer loop + API** (D4; **VALIDATED [V]**). `simulation.Explore(seed, mode, sut)` drives
    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
    DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`
-   (exhausted vs budget-hit distinct — no silent cap), top-level SUT callback panics as `Failure.Panic`,
-   and one `Failure.Race` per new `RaceErrors` increment. The scheduled post-`go` boundary is active in
-   non-race builds too, so assertion-only child-before-parent-continuation failures are not silently
-   skipped. SUT-created child-goroutine panic conversion and synctest deadlock failure conversion are filed
-   in `docs/issues/dst-explore-child-panic-failure-reporting.md` and
-   `docs/issues/dst-explore-deadlock-failure-reporting.md` because they require runtime/synctest-layer
-   handling. *(After 4: increment 2's HB pruning + increment 6's filtering
+   (exhausted vs budget-hit distinct — no silent cap), top-level and child-goroutine SUT panics as
+   `Failure.Panic`, synctest deadlocks as `Failure.Deadlock`, and one `Failure.Race` per new `RaceErrors`
+   increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
+   child-before-parent-continuation failures are not silently skipped. Child-goroutine panics are recorded in
+   the runtime after ordinary defers; scheduled deadlocks are converted inside `synctestRun` before `Run`
+   returns.
+   *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 
 **As built so far (this session) — the substrate + brain are proven on the manual hook:** the stable

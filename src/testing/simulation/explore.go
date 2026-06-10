@@ -51,24 +51,28 @@ type Failure struct {
 	AccessForces []AccessForce
 	// Race is true iff the -race detector reported a NEW data race during this
 	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
-	// (sut returned true) or a SUT callback panic (Panic != ""). In a non-race build
-	// Race is always false. The detector dedups by signature, so each distinct race
-	// yields exactly one Race failure: the first schedule that exhibits it.
+	// (sut returned true), a SUT panic (Panic != ""), or a synctest deadlock
+	// (Deadlock != ""). In a non-race build Race is always false. The detector
+	// dedups by signature, so each distinct race yields exactly one Race failure:
+	// the first schedule that exhibits it.
 	Race bool
-	// Panic is non-empty iff the SUT callback panicked while executing this schedule.
-	// The Schedule and AccessForces replay the same interleaving; Replay panics again
-	// for panic failures.
+	// Panic is non-empty iff the SUT panicked while executing this schedule, including
+	// from a SUT-created child goroutine. The Schedule and AccessForces replay the
+	// same interleaving; Replay panics again for panic failures.
 	Panic string
+	// Deadlock is non-empty iff the schedule ended with a synctest deadlock. Replay
+	// panics with the same deadlock marker for deadlock failures.
+	Deadlock string
 }
 
 // ExploreResult reports an Explore run.
 type ExploreResult struct {
 	// Schedules is the number of interleavings actually explored.
 	Schedules int
-	// Failures lists every explored interleaving that exhibited a bug: the SUT callback
-	// returned true (an assertion failure), panicked (Failure.Panic), or the -race
-	// detector reported a new data race (Failure.Race; see D5), each with its replay
-	// metadata.
+	// Failures lists every explored interleaving that exhibited a bug: the SUT returned
+	// true (an assertion failure), panicked (Failure.Panic), deadlocked
+	// (Failure.Deadlock), or the -race detector reported a new data race
+	// (Failure.Race; see D5), each with its replay metadata.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
@@ -181,6 +185,9 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	if r.panic != "" {
 		panic(r.panic)
 	}
+	if r.deadlock != "" {
+		panic(r.deadlock)
+	}
 	return r.failed, r.raceCount > 0
 }
 
@@ -270,8 +277,8 @@ func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
 	return out
 }
 
-func newFailure(prefix []uint64, raced bool, panicMsg string, forces map[accessForce]bool) Failure {
-	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg}
+func newFailure(prefix []uint64, raced bool, panicMsg, deadlockMsg string, forces map[accessForce]bool) Failure {
+	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg, Deadlock: deadlockMsg}
 }
 
 func installAccessForces(forces map[accessForce]bool) {
@@ -302,6 +309,9 @@ func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func
 	if r.panic != "" {
 		panic(r.panic)
 	}
+	if r.deadlock != "" {
+		panic(r.deadlock)
+	}
 	return r.failed, r.raceCount > 0, r.tr
 }
 
@@ -309,6 +319,7 @@ type runResult struct {
 	failed    bool
 	raceCount int
 	panic     string
+	deadlock  string
 	tr        exploreTrace
 }
 
@@ -342,6 +353,12 @@ func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, su
 			out.raceCount = 0
 		}
 		out.tr = copyExploreTrace(cfg.maxSteps > 0)
+		if out.panic == "" {
+			if v, ok := dstExplorePanicFP(); ok {
+				out.panic = panicString(v)
+			}
+		}
+		out.deadlock = dstExploreDeadlockFP()
 		if out.tr.aborted && out.panic == "" {
 			panic("testing/simulation: internal error: schedule prefix diverged on replay " +
 				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
@@ -515,13 +532,16 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 
 func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult) {
 	if r.failed {
-		res.Failures = append(res.Failures, newFailure(prefix, false, "", forces))
+		res.Failures = append(res.Failures, newFailure(prefix, false, "", "", forces))
 	}
 	for i := 0; i < r.raceCount; i++ {
-		res.Failures = append(res.Failures, newFailure(prefix, true, "", forces))
+		res.Failures = append(res.Failures, newFailure(prefix, true, "", "", forces))
 	}
 	if r.panic != "" {
-		res.Failures = append(res.Failures, newFailure(prefix, false, r.panic, forces))
+		res.Failures = append(res.Failures, newFailure(prefix, false, r.panic, "", forces))
+	}
+	if r.deadlock != "" {
+		res.Failures = append(res.Failures, newFailure(prefix, false, "", r.deadlock, forces))
 	}
 }
 
