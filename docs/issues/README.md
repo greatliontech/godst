@@ -20,5 +20,4 @@ I/O into the bubble and then layers fault injection on top.
 
 | Issue | Lands | Summary |
 |-------|-------|---------|
-| [dst-l2-range-access-filtering](dst-l2-range-access-filtering.md) | when dst-race range/composite access hooks participate in shared-address filtering | Range/composite race hooks currently give DST only the base address, so overlapping range-vs-field accesses can have different conflict identities and be filtered as independent. |
 | [dst-l2-timer-hb-edge](dst-l2-timer-hb-edge.md) | when timer-based interleavings are explored | Re-validate Level-2 DPOR's happens-before pruning against timer-fire `goready` edges: a `time.Sleep` wake records an edge that is "spurious" in memory-model terms and could over-order a timer-gated race (a silent completeness risk). Defensible under DST's fake clock and no failing case found, but unverified — add a timer-gated completeness SUT, drop the timer edge from the HB set if it over-orders. |

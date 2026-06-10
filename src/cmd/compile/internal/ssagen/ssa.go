@@ -168,6 +168,7 @@ func InitConfig() {
 	ir.Syms.Racewrite = typecheck.LookupRuntimeFunc("racewrite")
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
 	ir.Syms.DstAccessYield = typecheck.LookupRuntimeFunc("dstAccessYield")
+	ir.Syms.DstAccessYieldRange = typecheck.LookupRuntimeFunc("dstAccessYieldRange")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
@@ -1571,11 +1572,13 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	}
 
 	args := []*ssa.Value{addr}
+	var width *ssa.Value
 	if addr2 != nil {
 		args = append(args, addr2)
 	}
 	if needWidth {
-		args = append(args, s.constInt(types.Types[types.TUINTPTR], w))
+		width = s.constInt(types.Types[types.TUINTPTR], w)
+		args = append(args, width)
 	}
 
 	// DST Level-2 (dst-race mode): immediately before the race hook, emit a
@@ -1589,7 +1592,11 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	// sound). Not emitted for the MSan-only move kind (race uses read/write only). The
 	// runtime's own safe-point guard (bubble G, no runtime lock) handles the rest.
 	if base.Debug.DstRace != 0 && base.Flag.Race && kind != instrumentMove && s.curfn.Pragma&ir.Nosplit == 0 {
-		s.rtcall(ir.Syms.DstAccessYield, true, nil, addr, s.constBool(kind == instrumentWrite))
+		if needWidth {
+			s.rtcall(ir.Syms.DstAccessYieldRange, true, nil, addr, width, s.constBool(kind == instrumentWrite))
+		} else {
+			s.rtcall(ir.Syms.DstAccessYield, true, nil, addr, s.constBool(kind == instrumentWrite))
+		}
 	}
 	s.rtcall(fn, true, nil, args...)
 }

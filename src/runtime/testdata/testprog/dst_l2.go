@@ -503,6 +503,31 @@ func unmodifiedRWRSUT() bool {
 	return false
 }
 
+type autoRangePair struct {
+	A int
+	B int
+}
+
+var autoRangeFieldOutcomes = map[string]bool{}
+
+func unmodifiedRangeFieldSUT() bool {
+	var p autoRangePair
+	read := -1
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		p = autoRangePair{A: 1, B: 1}
+	}()
+	go func() {
+		defer wg.Done()
+		read = p.B
+	}()
+	wg.Wait()
+	autoRangeFieldOutcomes[strconv.Itoa(read)] = true
+	return false
+}
+
 var filteredManualRWROutcomes = map[string]bool{}
 var filteredManualRWRX int
 var filteredManualRWRRead [2]int
@@ -590,6 +615,9 @@ func unmodifiedWakeThenWriteSUT() bool {
 //     dense auto-instrumentation exercises filtered inline accesses that may be
 //     promoted to replay yield points — a case the manual-hook family sweep does not
 //     reach.
+//   - rangeComplete/rangeOutcomes guard range/composite access identity: a struct
+//     assignment's racewriterange interval must conflict with a scalar field read
+//     inside that interval, not only with the composite base address.
 //
 // Meaningful only in a -tags dst -race build (else no auto-instrumentation).
 func DSTExploreAuto() {
@@ -637,6 +665,7 @@ func DSTExploreAuto() {
 	exh, dpor, exhSet, dporSet := runCompare(autoOutcomes, unmodifiedRMWSUT)
 	noiseExh, noiseDpor, noiseExhSet, noiseDporSet := runCompare(autoNoiseOutcomes, unmodifiedPrivateNoiseRMWSUT)
 	rwrExh, rwrDpor, rwrExhSet, rwrDporSet := runStringCompare(autoRWROutcomes, unmodifiedRWRSUT)
+	rangeExh, rangeDpor, rangeExhSet, rangeDporSet := runStringCompare(autoRangeFieldOutcomes, unmodifiedRangeFieldSUT)
 	manualRWRExh, manualRWRDpor, manualRWRExhSet, manualRWRDporSet := runStringCompare(filteredManualRWROutcomes, filteredManualRWRSUT)
 	createExh, createDpor, createExhSet, createDporSet := runCompare(autoCreateOutcomes, unmodifiedCreateThenWriteSUT)
 	wakeExh, wakeDpor, wakeExhSet, wakeDporSet := runCompare(autoWakeOutcomes, unmodifiedWakeThenWriteSUT)
@@ -662,6 +691,10 @@ func DSTExploreAuto() {
 		" rwrDpor=" + strconv.Itoa(rwrDpor.Schedules) +
 		" rwrOutcomes=" + strconv.Itoa(len(rwrExhSet)) +
 		" rwrComplete=" + strconv.FormatBool(sameSet(rwrExhSet, rwrDporSet)) +
+		" rangeExh=" + strconv.Itoa(rangeExh.Schedules) +
+		" rangeDpor=" + strconv.Itoa(rangeDpor.Schedules) +
+		" rangeOutcomes=" + strconv.Itoa(len(rangeExhSet)) +
+		" rangeComplete=" + strconv.FormatBool(sameSet(rangeExhSet, rangeDporSet)) +
 		" manualRWRExh=" + strconv.Itoa(manualRWRExh.Schedules) +
 		" manualRWRDpor=" + strconv.Itoa(manualRWRDpor.Schedules) +
 		" manualRWROutcomes=" + strconv.Itoa(len(manualRWRExhSet)) +

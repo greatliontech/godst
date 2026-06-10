@@ -5430,6 +5430,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// first candidacy and the access is set per dstAccessYield. See dst_explore.go.
 		newg.dstSeq = 0
 		newg.dstAccAddr = 0
+		newg.dstAccSize = 0
 		newg.dstAccWrite = false
 		newg.dstAccPC = 0
 		newg.dstAccCount = 0

@@ -32,7 +32,7 @@ var dstAccessYieldPoints uint64
 const dstFilterMaxClockProcs = 1024
 
 // dstYieldAccess is the shared core of every Level-2 transition-boundary hook: it
-// records the transition (addr, write) for DPOR's dependency relation and yields,
+// records the transition (addr, size, write) for DPOR's dependency relation and yields,
 // subject to the safe-point guard and the dst-race shared-address filter. The guard
 // (DST-L2-1) lives here, in ONE place, so it cannot drift across the hooks: yield
 // only on a bubble (SUT) goroutine running on its own stack with no runtime lock
@@ -40,7 +40,7 @@ const dstFilterMaxClockProcs = 1024
 // only forgoes an interleaving). goyield requeues the current G and reschedules
 // through dstFindRunnable, so the seam never runs a blocked G; soundness is
 // inherited from Seq 5 unchanged.
-func dstYieldAccess(addr uintptr, write bool, filter bool, pc uintptr) {
+func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	gp := getg()
 	// Access-granularity yielding is a Level-2 (scheduled-strategy) mechanism. Under
 	// the Seq-5 Random/PCT strategies the interleaving atoms are the coarse cooperative
@@ -57,11 +57,12 @@ func dstYieldAccess(addr uintptr, write bool, filter bool, pc uintptr) {
 	pc = dstAccessPCKey(pc)
 	auto := filter && raceenabled
 	forced := dstAccessForced(seq, gp.dstAccCount, pc)
-	if auto && !forced && !dstAccessShouldYield(gp, seq, addr, write) {
-		dstCommitAccess(gp, seq, addr, write, pc, gp.dstAccCount, auto, dstScheduleStep)
+	if auto && !forced && !dstAccessShouldYield(gp, seq, addr, size, write) {
+		dstCommitAccess(gp, seq, addr, size, write, pc, gp.dstAccCount, auto, dstScheduleStep)
 		return
 	}
 	gp.dstAccAddr = addr
+	gp.dstAccSize = size
 	gp.dstAccWrite = write
 	gp.dstAccPC = pc
 	gp.dstAccPend = true
@@ -79,7 +80,16 @@ func dstYieldAccess(addr uintptr, write bool, filter bool, pc uintptr) {
 //
 //go:linkname dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool) {
-	dstYieldAccess(uintptr(addr), write, true, sys.GetCallerPC())
+	dstYieldAccess(uintptr(addr), 1, write, true, sys.GetCallerPC())
+}
+
+// dstAccessYieldRange is the range/composite form of dstAccessYield. The compiler
+// emits it before race{read,write}range hooks under -tags dst -race so DST uses the
+// same byte interval the unchanged TSan oracle observes.
+//
+//go:linkname dstAccessYieldRange
+func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
+	dstYieldAccess(uintptr(addr), size, write, true, sys.GetCallerPC())
 }
 
 // dstSyncAcquire is the Level-2 transition boundary for a synchronization object
@@ -95,7 +105,7 @@ func dstAccessYield(addr unsafe.Pointer, write bool) {
 //
 //go:linkname dstSyncAcquire
 func dstSyncAcquire(id unsafe.Pointer) {
-	dstYieldAccess(uintptr(id), true, false, sys.GetCallerPC())
+	dstYieldAccess(uintptr(id), 1, true, false, sys.GetCallerPC())
 }
 
 // dstYieldPoint is a cooperative yield with no specific memory access recorded — a
@@ -103,7 +113,7 @@ func dstSyncAcquire(id unsafe.Pointer) {
 //
 //go:linkname dstYieldPoint
 func dstYieldPoint() {
-	dstYieldAccess(0, false, false, sys.GetCallerPC())
+	dstYieldAccess(0, 0, false, false, sys.GetCallerPC())
 }
 
 //go:linkname dstAccessYieldFP
@@ -177,7 +187,7 @@ var (
 // Access log buffers (shared-address filtering, increment 6). Unlike the per-decision
 // trace (which records the access of the goroutine CHOSEN at each scheduling
 // decision), the access log records EVERY instrumented access in execution order —
-// (accessing goroutine dstSeq, addr, hook PC key, hook ordinal, isWrite, the
+// (accessing goroutine dstSeq, addr, size, hook PC key, hook ordinal, isWrite, the
 // dstScheduleStep it occurred under) — decoupled from whether the access yielded.
 // This decoupling is what lets the runtime FILTER: a single-owner access can "record
 // but not yield" (design.md D1) while the brain still sees it for the dependency
@@ -188,6 +198,7 @@ var (
 var (
 	dstAccLogSeq      []uint64
 	dstAccLogAddr     []uintptr
+	dstAccLogSize     []uintptr
 	dstAccLogPC       []uintptr
 	dstAccLogCount    []uint64
 	dstAccLogWrite    []bool
@@ -214,6 +225,7 @@ var (
 
 	dstAccessTab        []int32 // hash bucket -> 1-based entry index
 	dstAccessEntryAddr  []uintptr
+	dstAccessEntrySize  []uintptr
 	dstAccessEntryProc  []int32
 	dstAccessNext       []int32
 	dstAccessReadEpoch  []uint32
@@ -265,22 +277,22 @@ func dstClockMerge(dst, src int) {
 	}
 }
 
-func dstAccessBucket(addr uintptr) int {
+func dstAccessBucket(addr, size uintptr) int {
 	if len(dstAccessTab) == 0 {
 		dstFilterConservative = true
 		return -1
 	}
-	h := (addr >> 3) ^ (addr >> 17)
+	h := (addr >> 3) ^ (addr >> 17) ^ (size << 7) ^ (size >> 11)
 	return int(h % uintptr(len(dstAccessTab)))
 }
 
-func dstFindAccessEntry(addr uintptr, proc int, create bool) int {
-	b := dstAccessBucket(addr)
+func dstFindAccessEntry(addr, size uintptr, proc int, create bool) int {
+	b := dstAccessBucket(addr, size)
 	if b < 0 {
 		return -1
 	}
 	for e := int(dstAccessTab[b]) - 1; e >= 0; e = int(dstAccessNext[e]) - 1 {
-		if dstAccessEntryAddr[e] == addr && int(dstAccessEntryProc[e]) == proc {
+		if dstAccessEntryAddr[e] == addr && dstAccessEntrySize[e] == size && int(dstAccessEntryProc[e]) == proc {
 			return e
 		}
 	}
@@ -294,6 +306,7 @@ func dstFindAccessEntry(addr uintptr, proc int, create bool) int {
 	e := dstAccessEntryN
 	dstAccessEntryN++
 	dstAccessEntryAddr[e] = addr
+	dstAccessEntrySize[e] = size
 	dstAccessEntryProc[e] = int32(proc)
 	dstAccessReadEpoch[e] = 0
 	dstAccessWriteEpoch[e] = 0
@@ -306,8 +319,32 @@ func dstAccessHBBefore(curProc, priorProc int, priorEpoch uint32) bool {
 	return priorEpoch == 0 || dstClockAt(curProc, priorProc) >= priorEpoch
 }
 
-func dstAccessMaybeShared(gp *g, addr uintptr) bool {
-	return addr != 0 && (addr < gp.stack.lo || addr >= gp.stack.hi)
+func dstAccessRangeEnd(addr, size uintptr) uintptr {
+	if size == 0 {
+		size = 1
+	}
+	end := addr + size
+	if end < addr {
+		return ^uintptr(0)
+	}
+	return end
+}
+
+func dstAccessOverlap(addr, size, otherAddr, otherSize uintptr) bool {
+	if addr == 0 || otherAddr == 0 {
+		return false
+	}
+	end := dstAccessRangeEnd(addr, size)
+	otherEnd := dstAccessRangeEnd(otherAddr, otherSize)
+	return addr < otherEnd && otherAddr < end
+}
+
+func dstAccessMaybeShared(gp *g, addr, size uintptr) bool {
+	if addr == 0 {
+		return false
+	}
+	end := dstAccessRangeEnd(addr, size)
+	return addr < gp.stack.lo || end > gp.stack.hi
 }
 
 func dstAccessPCKey(pc uintptr) uintptr {
@@ -335,11 +372,11 @@ func dstAccessForced(seq, count uint64, pc uintptr) bool {
 	return false
 }
 
-func dstAccessShouldYield(gp *g, seq uint64, addr uintptr, write bool) bool {
+func dstAccessShouldYield(gp *g, seq uint64, addr, size uintptr, write bool) bool {
 	if addr == 0 || dstFilterConservative {
 		return true
 	}
-	if !dstAccessMaybeShared(gp, addr) {
+	if !dstAccessMaybeShared(gp, addr, size) {
 		return false
 	}
 	proc := dstClockIdx(seq)
@@ -351,12 +388,8 @@ func dstAccessShouldYield(gp *g, seq uint64, addr uintptr, write bool) bool {
 		dstFilterConservative = true
 		return true
 	}
-	b := dstAccessBucket(addr)
-	if b < 0 {
-		return true
-	}
-	for e := int(dstAccessTab[b]) - 1; e >= 0; e = int(dstAccessNext[e]) - 1 {
-		if dstAccessEntryAddr[e] != addr {
+	for e := 0; e < dstAccessEntryN; e++ {
+		if !dstAccessOverlap(addr, size, dstAccessEntryAddr[e], dstAccessEntrySize[e]) {
 			continue
 		}
 		priorProc := int(dstAccessEntryProc[e])
@@ -373,16 +406,17 @@ func dstAccessShouldYield(gp *g, seq uint64, addr uintptr, write bool) bool {
 	return false
 }
 
-func dstCommitAccess(gp *g, seq uint64, addr uintptr, write bool, pc uintptr, count uint64, auto bool, step int) {
-	if auto && !dstAccessMaybeShared(gp, addr) {
+func dstCommitAccess(gp *g, seq uint64, addr, size uintptr, write bool, pc uintptr, count uint64, auto bool, step int) {
+	if auto && !dstAccessMaybeShared(gp, addr, size) {
 		addr = 0
+		size = 0
 		write = false
 	}
 	proc := dstClockIdx(seq)
 	if proc >= 0 {
 		epoch := dstClockTick(proc)
 		if addr != 0 {
-			entry := dstFindAccessEntry(addr, proc, true)
+			entry := dstFindAccessEntry(addr, size, proc, true)
 			if entry >= 0 {
 				if write {
 					dstAccessWriteEpoch[entry] = epoch
@@ -394,10 +428,10 @@ func dstCommitAccess(gp *g, seq uint64, addr uintptr, write bool, pc uintptr, co
 	} else {
 		dstFilterConservative = true
 	}
-	dstRecordAccess(seq, addr, write, pc, count, step)
+	dstRecordAccess(seq, addr, size, write, pc, count, step)
 }
 
-// dstRecordAccess appends one access to the log in COMMIT order: (seq, addr, pc,
+// dstRecordAccess appends one access to the log in COMMIT order: (seq, addr, size, pc,
 // count, write, step), where step is the dstScheduleStep the access commits under (so
 // an access with step s was committed by the goroutine chosen at decision s-1, and its
 // reversal anchors at decision s-1). Logging in COMMIT order, not announce order, is
@@ -409,10 +443,11 @@ func dstCommitAccess(gp *g, seq uint64, addr uintptr, write bool, pc uintptr, co
 // filtered) access commits inline with no reschedule, so announce order == commit
 // order and it is logged at dstAccessYield (step = dstScheduleStep). Allocation-free;
 // the dstScheduledSelect caller runs under sched.lock, so this must not allocate.
-func dstRecordAccess(seq uint64, addr uintptr, write bool, pc uintptr, count uint64, step int) {
+func dstRecordAccess(seq uint64, addr, size uintptr, write bool, pc uintptr, count uint64, step int) {
 	if dstAccLogN < len(dstAccLogSeq) {
 		dstAccLogSeq[dstAccLogN] = seq
 		dstAccLogAddr[dstAccLogN] = addr
+		dstAccLogSize[dstAccLogN] = size
 		dstAccLogPC[dstAccLogN] = pc
 		dstAccLogCount[dstAccLogN] = count
 		dstAccLogWrite[dstAccLogN] = write
@@ -470,6 +505,7 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstEdgeAcc = make([]int32, maxEdges)
 	dstAccLogSeq = make([]uint64, maxAccesses)
 	dstAccLogAddr = make([]uintptr, maxAccesses)
+	dstAccLogSize = make([]uintptr, maxAccesses)
 	dstAccLogPC = make([]uintptr, maxAccesses)
 	dstAccLogCount = make([]uint64, maxAccesses)
 	dstAccLogWrite = make([]bool, maxAccesses)
@@ -481,6 +517,7 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstClock = make([]uint32, dstClockProcs*dstClockProcs)
 	dstAccessTab = make([]int32, maxAccesses*2+1)
 	dstAccessEntryAddr = make([]uintptr, maxAccesses)
+	dstAccessEntrySize = make([]uintptr, maxAccesses)
 	dstAccessEntryProc = make([]int32, maxAccesses)
 	dstAccessNext = make([]int32, maxAccesses)
 	dstAccessReadEpoch = make([]uint32, maxAccesses)
@@ -556,16 +593,18 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		// Logging here (not at the announce) gives the order the memory operations
 		// actually take effect.
 		addr, pc, count := uintptr(0), uintptr(0), uint64(0)
+		size := uintptr(0)
 		write := false
 		auto := false
 		if chosen.dstAccPend {
 			addr = chosen.dstAccAddr
+			size = chosen.dstAccSize
 			write = chosen.dstAccWrite
 			pc = chosen.dstAccPC
 			count = chosen.dstAccCount
 			auto = chosen.dstAccAuto
 		}
-		dstCommitAccess(chosen, chosen.dstSeq, addr, write, pc, count, auto, dstScheduleStep+1)
+		dstCommitAccess(chosen, chosen.dstSeq, addr, size, write, pc, count, auto, dstScheduleStep+1)
 		// Consume the pending access: the transition about to run performs it
 		// exactly once. Without this, a goroutine that next blocks at a *coarse*
 		// point (channel/WaitGroup) rather than at another dstAccessYield would carry
@@ -573,6 +612,7 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		// dependency relation (extra DPOR exploration; still sound, never a missed
 		// class). The goroutine sets a fresh dstAccAddr at its next dstAccessYield.
 		chosen.dstAccAddr = 0
+		chosen.dstAccSize = 0
 		chosen.dstAccWrite = false
 		chosen.dstAccPC = 0
 		chosen.dstAccPend = false
@@ -678,7 +718,7 @@ func dstEdgeAtFP(i int) (from, to uint64, step, acc int) {
 func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
 
 // dstAccLogLenFP reports the access-log entry count recorded by the last run;
-// dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, hook PC key, hook ordinal, isWrite, the
+// dstAccLogAtFP reports entry i as (accessing goroutine dstSeq, addr, size, hook PC key, hook ordinal, isWrite, the
 // dstScheduleStep it occurred under). The brain sources DPOR's dependency/HB relation
 // from this log (decoupled from the decision trace) so single-owner accesses can be
 // filtered to non-yields without losing the dependency. dstAccLogOverflowFP reports a
@@ -688,8 +728,8 @@ func dstEdgeOverflowFP() bool { return dstEdgeOverflow }
 func dstAccLogLenFP() int { return dstAccLogN }
 
 //go:linkname dstAccLogAtFP
-func dstAccLogAtFP(i int) (seq uint64, addr uintptr, pc uintptr, count uint64, write bool, step int) {
-	return dstAccLogSeq[i], dstAccLogAddr[i], dstAccLogPC[i], dstAccLogCount[i], dstAccLogWrite[i], int(dstAccLogStep[i])
+func dstAccLogAtFP(i int) (seq uint64, addr uintptr, size uintptr, pc uintptr, count uint64, write bool, step int) {
+	return dstAccLogSeq[i], dstAccLogAddr[i], dstAccLogSize[i], dstAccLogPC[i], dstAccLogCount[i], dstAccLogWrite[i], int(dstAccLogStep[i])
 }
 
 //go:linkname dstAccLogOverflowFP

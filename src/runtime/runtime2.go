@@ -511,6 +511,7 @@ type g struct {
 	dstPrio      int64   // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	dstSeq       uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
 	dstAccAddr   uintptr // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR; unused otherwise
+	dstAccSize   uintptr // DST pending memory-access size in bytes; paired with dstAccAddr for interval-overlap dependencies
 	dstAccWrite  bool    // DST pending access is a write (vs read); paired with dstAccAddr
 	dstAccPC     uintptr // DST pending access hook call-site PC; paired with dstAccAddr
 	dstAccCount  uint64  // DST per-bubble access ordinal for forced replay yield points; unused otherwise

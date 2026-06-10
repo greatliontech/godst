@@ -119,7 +119,7 @@ func dstEdgeOverflowFP() bool
 func dstAccLogLenFP() int
 
 //go:linkname dstAccLogAtFP runtime.dstAccLogAtFP
-func dstAccLogAtFP(i int) (seq uint64, addr uintptr, pc uintptr, count uint64, write bool, step int)
+func dstAccLogAtFP(i int) (seq uint64, addr uintptr, size uintptr, pc uintptr, count uint64, write bool, step int)
 
 //go:linkname dstAccLogOverflowFP runtime.dstAccLogOverflowFP
 func dstAccLogOverflowFP() bool

@@ -127,11 +127,13 @@ type exploreTrace struct {
 	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
 	// per-decision addrs. accStep[k] is the dstScheduleStep the access occurred under:
 	// an access with step s was performed by procs[s-1] during the interval after
-	// decision s-1, so its reversal anchors at decision s-1. accPC (a stable PC key) + accCount identify a
+	// decision s-1, so its reversal anchors at decision s-1. accAddr+accSize is the
+	// byte interval used for range-aware conflict checks. accPC (a stable PC key) + accCount identify a
 	// filtered hook call precisely enough to force it to yield on replay if a later
 	// conflict proves that interval needed a split.
 	accSeq   []uint64
 	accAddr  []uintptr
+	accSize  []uintptr
 	accPC    []uintptr
 	accCount []uint64
 	accWrite []bool
@@ -234,12 +236,13 @@ func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func
 	a := dstAccLogLenFP()
 	tr.accSeq = make([]uint64, a)
 	tr.accAddr = make([]uintptr, a)
+	tr.accSize = make([]uintptr, a)
 	tr.accPC = make([]uintptr, a)
 	tr.accCount = make([]uint64, a)
 	tr.accWrite = make([]bool, a)
 	tr.accStep = make([]int, a)
 	for i := 0; i < a; i++ {
-		tr.accSeq[i], tr.accAddr[i], tr.accPC[i], tr.accCount[i], tr.accWrite[i], tr.accStep[i] = dstAccLogAtFP(i)
+		tr.accSeq[i], tr.accAddr[i], tr.accSize[i], tr.accPC[i], tr.accCount[i], tr.accWrite[i], tr.accStep[i] = dstAccLogAtFP(i)
 	}
 	m := dstEdgeLenFP()
 	tr.edgeFrom = make([]uint64, m)
@@ -329,6 +332,38 @@ func accessNeedsReplayBoundary(tr exploreTrace, conflicting []bool, k int) bool 
 	return tr.accStep[k] == 0 || accessHasPriorConflictingInInterval(tr, conflicting, k)
 }
 
+func accessSize(tr exploreTrace, k int) uintptr {
+	if k < len(tr.accSize) && tr.accSize[k] != 0 {
+		return tr.accSize[k]
+	}
+	return 1
+}
+
+func accessRangeEnd(addr, size uintptr) uintptr {
+	if size == 0 {
+		size = 1
+	}
+	end := addr + size
+	if end < addr {
+		return ^uintptr(0)
+	}
+	return end
+}
+
+func accessOverlap(addr, size, otherAddr, otherSize uintptr) bool {
+	if addr == 0 || otherAddr == 0 {
+		return false
+	}
+	end := accessRangeEnd(addr, size)
+	otherEnd := accessRangeEnd(otherAddr, otherSize)
+	return addr < otherEnd && otherAddr < end
+}
+
+func accessConflict(tr exploreTrace, i, j int) bool {
+	return accessOverlap(tr.accAddr[i], accessSize(tr, i), tr.accAddr[j], accessSize(tr, j)) &&
+		(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j]
+}
+
 // promoteAccessForces closes the gap a live prior-conflict filter cannot see: a
 // filtered access that was safe with respect to prior accesses may later prove to need
 // a boundary inside its inline interval. When the completed trace demonstrates that,
@@ -341,9 +376,7 @@ func promoteAccessForces(tr exploreTrace, forces map[accessForce]bool) bool {
 	conflicting := make([]bool, len(tr.accSeq))
 	for j := 0; j < len(tr.accSeq); j++ {
 		for i := j - 1; i >= 0; i-- {
-			if tr.accAddr[i] != 0 && tr.accAddr[i] == tr.accAddr[j] &&
-				(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j] &&
-				dporConcurrent(clk, pidx, tr, i, j) {
+			if accessConflict(tr, i, j) && dporConcurrent(clk, pidx, tr, i, j) {
 				conflicting[i] = true
 				conflicting[j] = true
 			}
@@ -363,10 +396,11 @@ func promoteAccessForces(tr exploreTrace, forces map[accessForce]bool) bool {
 	return grew
 }
 
-// dporTrans is one access's sleep-set pruning identity: its run-local address
-// (0 = no conflict identity) and whether it is a write.
+// dporTrans is one access's sleep-set pruning identity: its run-local byte interval
+// (addr==0 means no conflict identity) and whether it is a write.
 type dporTrans struct {
 	addr  uintptr
+	size  uintptr
 	write bool
 }
 
@@ -415,12 +449,12 @@ type dporFrame struct {
 // dporExplore is iterative stateless SOURCE-DPOR with SLEEP SETS (Abdulla, Aronis,
 // Jonsson & Sagonas, "Optimal Dynamic Partial Order Reduction", POPL 2014). It
 // explores (at most) one interleaving per Mazurkiewicz equivalence class. Two
-// transitions are *dependent* iff they record the same nonzero conflict identity
-// with at least one write, by different goroutines — where the identity is a shared
-// memory address (dstAccessYield) OR a synchronization object's identity
-// (dstSyncAcquire, recording mutex/channel state decisions as write-conflicts so their
-// order is a dependency; see runtime/dst_explore.go and design.md
-// "Completeness boundary"). Each run re-executes from the start following the stack's
+// transitions are *dependent* iff they record overlapping nonzero memory byte
+// intervals (dstAccessYield/dstAccessYieldRange) or the same synchronization object's
+// identity, with at least one write, by different goroutines (dstSyncAcquire records
+// mutex/channel state decisions as write-conflicts so their order is a dependency;
+// see runtime/dst_explore.go and design.md "Completeness boundary"). Each run
+// re-executes from the start following the stack's
 // chosen prefix.
 //
 // Two cooperating mechanisms remove the redundant re-exploration that a plain
@@ -444,7 +478,7 @@ type dporFrame struct {
 // Independence for sleep is deliberately coarser than the dependency relation because
 // sleep transitions cross stateless re-executions and raw addresses are run-local; a
 // nonzero access with a write wakes any nonzero sleeper. The race relation itself uses
-// per-run addresses plus the happens-before clocks (dporConcurrent), so mutex/channel-
+// per-run intervals plus the happens-before clocks (dporConcurrent), so mutex/channel-
 // SERIALIZED conflicts are pruned while a free sync-decision order is explored both ways.
 // addr==0 transitions (goroutine creation, WaitGroup wakeups, the isolated gcDrain
 // goroutine) record no conflict identity and are independent of everything — they
@@ -510,7 +544,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) 
 		intervalSet := make([][]dporTrans, n)
 		for k := range tr.accSeq {
 			if d := tr.accStep[k] - 1; d >= 0 && d < n {
-				intervalSet[d] = append(intervalSet[d], dporTrans{addr: tr.accAddr[k], write: tr.accWrite[k]})
+				intervalSet[d] = append(intervalSet[d], dporTrans{addr: tr.accAddr[k], size: accessSize(tr, k), write: tr.accWrite[k]})
 			}
 		}
 		// Extend the stack with the decisions this run newly revealed. Each new frame
@@ -557,8 +591,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) 
 		nLog := len(tr.accSeq)
 		for j := 0; j < nLog; j++ {
 			for i := j - 1; i >= 0; i-- {
-				if tr.accAddr[i] != 0 && tr.accAddr[i] == tr.accAddr[j] &&
-					(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j] {
+				if accessConflict(tr, i, j) {
 					if dporConcurrent(clk, pidx, tr, i, j) {
 						if d := tr.accStep[i] - 1; d >= 0 && d < n {
 							if raceEnabled {
@@ -772,7 +805,7 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 // Mazurkiewicz partial order = the transitive closure of the DEPENDENCY relation in
 // trace order, plus program order and the recorded sync (goready) edges. Unlike
 // dporClocks (sync edges + program order only), it ALSO orders every pair of
-// conflicting accesses (same nonzero address, >=1 write) by their log order: a later
+// conflicting accesses (overlapping nonzero byte intervals, >=1 write) by their log order: a later
 // conflicting access causally depends on the earlier one in THIS execution. This is
 // the relation source-DPOR's notdep / weak-initials need — "which accesses can move
 // before e_i" = those NOT trace-happening-after e_i — so that an independent access
@@ -834,11 +867,11 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 		for li < nLog && tr.accStep[li] == s {
 			applyEdges(s, li)
 			pi := pidx[tr.accSeq[li]]
-			// Conflict edges: a later access to the same address with >=1 write causally
+			// Conflict edges: a later access to an overlapping interval with >=1 write causally
 			// depends on every earlier conflicting access — merge their clocks in, so e_i
 			// trace-happens-before every later conflicting access.
 			for m := 0; m < li; m++ {
-				if tr.accAddr[m] != 0 && tr.accAddr[m] == tr.accAddr[li] && (tr.accWrite[m] || tr.accWrite[li]) {
+				if accessConflict(tr, m, li) {
 					mergeInto(cur[pi], clk[m])
 				}
 			}

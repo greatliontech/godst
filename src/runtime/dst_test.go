@@ -1196,6 +1196,8 @@ func TestDSTExploreRaceReplay(t *testing.T) {
 //     even though the parent write has no prior conflicting access in that run.
 //   - wakeComplete/outcomes is the same guard for a child made runnable by close(ch):
 //     after the close wakes it, the child may run before the parent's following write.
+//   - rangeComplete/outcomes guard range/composite access filtering: a range write at
+//     a struct base must conflict with a scalar read of a field inside the struct.
 //
 // Built explicitly WITH -race (auto-instrumentation is gated on -tags dst + -race).
 // Skipped where the race detector is unavailable.
@@ -1251,6 +1253,14 @@ func TestDSTExploreAutoInstrument(t *testing.T) {
 		t.Fatalf("bad rwrOutcomes field in %q: %v", out, err)
 	} else if n != 4 {
 		t.Fatalf("filtered R/W/R outcome set changed: outcomes=%d, want 4:\n%s", n, out)
+	}
+	if exploreField(t, out, "rangeComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a range-vs-field class (range access identity bug):\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "rangeOutcomes")); err != nil {
+		t.Fatalf("bad rangeOutcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("range-vs-field outcome set changed: outcomes=%d, want 2:\n%s", n, out)
 	}
 	if exploreField(t, out, "manualRWRComplete") != "true" {
 		t.Fatalf("source-DPOR dropped a filtered manual R/W/R class (weak-initial prologue bug):\n%s", out)

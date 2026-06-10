@@ -96,6 +96,53 @@ func TestExploreClocksModelStepZeroAccesses(t *testing.T) {
 	}
 }
 
+func TestExploreRangeOverlapConflicts(t *testing.T) {
+	tr := exploreTrace{
+		accSeq:   []uint64{1, 2},
+		accAddr:  []uintptr{0x1000, 0x1008},
+		accSize:  []uintptr{16, 1},
+		accPC:    []uintptr{1, 2},
+		accCount: []uint64{1, 1},
+		accWrite: []bool{true, false},
+		accStep:  []int{0, 0},
+	}
+	clk, pidx := dporClocks(tr)
+	if !dporConcurrent(clk, pidx, tr, 0, 1) {
+		t.Fatalf("sync clocks should leave overlapping accesses concurrent: %#v", clk)
+	}
+	traceClk, tracePidx := dporTraceClocks(tr)
+	if dporConcurrent(traceClk, tracePidx, tr, 0, 1) {
+		t.Fatalf("trace clocks did not order overlapping range/scalar conflict: %#v", traceClk)
+	}
+	forces := map[accessForce]bool{}
+	if !promoteAccessForces(tr, forces) {
+		t.Fatalf("overlapping range/scalar conflict did not promote replay boundaries")
+	}
+	if len(forces) != 2 {
+		t.Fatalf("overlapping conflict promoted %d forces, want 2: %#v", len(forces), forces)
+	}
+}
+
+func TestExploreRangeAdjacentDoesNotConflict(t *testing.T) {
+	tr := exploreTrace{
+		accSeq:   []uint64{1, 2},
+		accAddr:  []uintptr{0x1000, 0x1010},
+		accSize:  []uintptr{16, 1},
+		accPC:    []uintptr{1, 2},
+		accCount: []uint64{1, 1},
+		accWrite: []bool{true, false},
+		accStep:  []int{0, 0},
+	}
+	traceClk, tracePidx := dporTraceClocks(tr)
+	if !dporConcurrent(traceClk, tracePidx, tr, 0, 1) {
+		t.Fatalf("adjacent range/scalar accesses should remain independent: %#v", traceClk)
+	}
+	forces := map[accessForce]bool{}
+	if promoteAccessForces(tr, forces) {
+		t.Fatalf("adjacent range/scalar accesses promoted replay boundaries: %#v", forces)
+	}
+}
+
 func TestExploreClocksOrderSameStepEdgesAgainstAccesses(t *testing.T) {
 	tr := exploreTrace{
 		accSeq:   []uint64{1, 2},

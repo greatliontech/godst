@@ -657,8 +657,8 @@ mutex is sound and is exactly the interleaving Gap A needs.
 - **DST-L2-3 (entailed: DPOR completeness).** The explored set contains at least one execution from every
   Mazurkiewicz trace-equivalence class reachable by the SUT — equivalently, for every pair of *dependent*
   co-enabled transitions, both orderings are explored, and only provably-equivalent (independent)
-  reorderings are pruned. Two transitions are *dependent* iff they record the same nonzero conflict
-  identity — a shared memory address (`dstAccessYield`) **or** a synchronization object's identity
+  reorderings are pruned. Two transitions are *dependent* iff they record overlapping nonzero memory byte
+  intervals (`dstAccessYield`/`dstAccessYieldRange`) **or** the same synchronization object's identity
   (`dstSyncAcquire`) — with ≥1 write, by different goroutines, and are not happens-before-ordered.
   (Synchronization object decision order is a dependency: omitting it drops a class — see "Completeness
   boundary".) *violation:* a non-equivalent interleaving — hence a reachable bug — is omitted, so
@@ -702,9 +702,10 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   cannot host a splittable yield (`goyield` calls `mcall`). The yield is therefore a **Go-level hook**.
 - **Auto-instrumentation: a dst-race compiler mode (DECIDED — Option 1, "separate yield call, oracle
   untouched").** Under `-tags dst` **and** `-race`, the compiler's instrument pass
-  (`cmd/compile/internal/ssagen` `instrument2`) emits an **additional** call `runtime.dstAccessYield(addr,
-  isWrite)` immediately **before** each existing `race{read,write,readrange,writerange}` hook — it does
-  **not** replace or reroute the race hook. `dstAccessYield` records the access (addr, isWrite — D3) and
+  (`cmd/compile/internal/ssagen` `instrument2`) emits an **additional** call immediately **before** each
+  existing race hook: `runtime.dstAccessYield(addr, isWrite)` before scalar `race{read,write}`, and
+  `runtime.dstAccessYieldRange(addr, size, isWrite)` before composite `race{read,write}range`. It does
+  **not** replace or reroute the race hook. The DST hook records the access byte interval and write bit and
   makes the guarded yield decision; the unchanged race hook then records in TSan exactly as upstream,
   reading its own return address off `(SP)`, so **report PC attribution and detection behavior are
   byte-identical to a stock `-race` build**. The mode is gated by a compiler flag `cmd/go` sets when both
@@ -727,14 +728,14 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
 - **The safe-point guard** (DST-L2-1): yield only when `dstActive() && g.bubble != nil && g == g.m.curg
   && g.m.locks == 0 && !g.dstInRaceHook` (the last a reentrancy guard). Any failure → record the access
   but do not yield (sound; reduces completeness only).
-- **Shared-address filtering (tractability + faithfulness).** A yield is meaningful only at an address
+- **Shared-address filtering (tractability + faithfulness).** A yield is meaningful only at a byte interval
   ≥2 goroutines access — a private/stack/single-owner access is independent (Mazurkiewicz), and yielding
   there explores nothing new while multiplying transitions. An access is a transition iff it *conflicts*
-  with a prior access by a different goroutine (same address, ≥1 write) that is **not** happens-before-
-  ordered before it (D2). Single-owner and HB-ordered accesses record but do not yield. This is the
+  with a prior access by a different goroutine (overlapping byte intervals, ≥1 write) that is **not**
+  happens-before-ordered before it (D2). Single-owner and HB-ordered accesses record but do not yield. This is the
   primary control on the access-granularity explosion; its magnitude is measured in increment 1. **[V]**
-  Runtime implementation: under `-tags dst -race`, `dstAccessYield` maintains a preallocated live HB clock
-  and a per-address / per-goroutine epoch table. A memory access that has no prior concurrent conflicting
+  Runtime implementation: under `-tags dst -race`, the DST access hooks maintain a preallocated live HB clock
+  and a per-interval / per-goroutine epoch table. A memory access that has no prior concurrent conflicting
   access records into the per-bubble access log inline and does not call `goyield`; a conflicting access
   still yields and is logged when the goroutine is resumed, preserving commit order. Because a prior-only
   filter cannot know that a later access will need a split inside the same inline interval, the brain
@@ -853,15 +854,16 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 
 1. **Access-yield + transition-record substrate.** Runtime `dstYieldPoint`/`dstAccessYield` + the
    safe-point guard + a per-bubble **transition recorder** (an ordered event log: scheduling decisions
-   with the enabled goid set, accesses with goid/addr/isWrite/step, and sync events for offline HB —
+   with the enabled goid set, accesses with goid/addr/size/isWrite/step, and sync events for offline HB —
    D2). **Manual-hook half: VALIDATED [V]** — mutex-counter soundness probe reaches exactly `G·K` at
    access granularity incl. yields while holding a user lock (DST-L2-1; 200/200 over 50 seeds, normal and
    `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
    per-run yield magnitude measured before filtering. **Compiler half
    (Option 1): IMPLEMENTED [V]** — `cmd/compile` `instrument2` (ssagen) emits an additional
-   `runtime.dstAccessYield(addr, isWrite)` immediately before each `race{read,write,readrange,writerange}`
-   hook, gated by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race`
-   are both present; the race hook itself is untouched (oracle byte-identical), the yield is skipped in
+   `runtime.dstAccessYield(addr, isWrite)` immediately before scalar `race{read,write}` hooks and
+   `runtime.dstAccessYieldRange(addr, size, isWrite)` before composite `race{read,write}range` hooks, gated
+   by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race` are both
+   present; the race hook itself is untouched (oracle byte-identical), the yield is skipped in
    `//go:nosplit` functions (`goyield` is splittable; skipping is sound), and with the flag off the pass
    emits plain `race*` exactly as upstream (DST-L2-4 — verified absent in non-dst and dst-without-race
    builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
@@ -901,9 +903,10 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    completeness preserved (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks)
    keeps the runtime a pure recorder + schedule-follower. Foreclosure: additive recording.
 3. **DPOR strategy** (D3; **VALIDATED [V]**). Iterative stateless DPOR over the schedule recorder
-   (`dporExplore` in `testing/simulation/explore.go`): dependency = same nonzero address, ≥1 write,
-   different stable index (`g.dstSeq`); backtrack points added at ancestor decisions; deterministic
-   backtrack pick. Measured against the Exhaustive baseline: **sound** (mutex-counter 0 failures over the
+   (`dporExplore` in `testing/simulation/explore.go`): dependency = overlapping nonzero memory byte
+   intervals or the same sync-object identity, ≥1 write, different stable index (`g.dstSeq`); backtrack
+   points added at ancestor decisions; deterministic backtrack pick. Measured against the Exhaustive
+   baseline: **sound** (mutex-counter 0 failures over the
    whole space — `TestDSTExploreFindsAtomicityViolation`), **complete** (counter race: DPOR and
    Exhaustive reach the *identical* outcome set — DST-L2-3, `TestDSTExploreComplete`: 2-goroutine
    `{1,2}` committed; 3-goroutine `{1,2,3}` measured in bring-up), **deterministic + seed-independent**,
@@ -999,7 +1002,7 @@ relation.
       re-executions, but raw access addresses are run-local (the same logical object can receive a
       different numeric address after explorer-side allocations). So `addr=0` transitions and read/read
       pairs commute; any nonzero pair with at least one write wakes the sleeper. The race gate still uses
-      per-run address equality + HB. This can only under-prune, never keep a dependent transition asleep
+      per-run interval overlap + HB. This can only under-prune, never keep a dependent transition asleep
       and drop a class.
    3. **Adversarial review** (incompleteness failure mode + determinism/soundness) — run per the
       Adversarial loop on the change set.
@@ -1033,7 +1036,8 @@ relation.
    `TestDSTExploreAutoInstrument` validates filtered auto-instrumented RMWs by checking DPOR==Exhaustive,
    preserving the known `{1,2}` outcome set, and keeping Exhaustive tractable (plain RMW: 19,448 before
    filtering → 49 after; private-noise RMW: 49 after, outcome set preserved). It also checks filtered
-   R/W/R shapes with four outcomes (`rwrExh=1580`, `rwrDpor=51`, `manualRWRExh=159`, `manualRWRDpor=6`)
+   R/W/R shapes with four outcomes (`rwrExh=1580`, `rwrDpor=51`, `manualRWRExh=159`, `manualRWRDpor=6`),
+   range-vs-field identity (`rangeExh=24`, `rangeDpor=2`, two outcomes),
    and post-`go` / post-wake parent-write shapes (`createExh=4`, `createDpor=2`, `wakeExh=25`,
    `wakeDpor=10`) so first accesses after goroutine creation or `goready` wake-up do not hide
    child-before-parent classes.
