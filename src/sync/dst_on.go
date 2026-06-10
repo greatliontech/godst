@@ -17,7 +17,7 @@ const dstHookEnabled = true
 func runtime_dstSyncAcquire(id unsafe.Pointer)
 
 func dstSyncAcquireRWMutex(rw *RWMutex) {
-	// Use the writer mutex's internal identity so reader-vs-writer acquisition order
-	// conflicts with the existing rw.w.Lock/TryLock hook.
+	// Use the writer mutex's internal identity so reader-vs-writer decisions conflict
+	// with the existing rw.w Lock/TryLock/Unlock hooks.
 	runtime_dstSyncAcquire(unsafe.Pointer(&rw.w.mu))
 }

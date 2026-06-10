@@ -732,21 +732,34 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   there explores nothing new while multiplying transitions. An access is a transition iff it *conflicts*
   with a prior access by a different goroutine (same address, ≥1 write) that is **not** happens-before-
   ordered before it (D2). Single-owner and HB-ordered accesses record but do not yield. This is the
-  primary control on the access-granularity explosion; its magnitude is measured in increment 1.
+  primary control on the access-granularity explosion; its magnitude is measured in increment 1. **[V]**
+  Runtime implementation: under `-tags dst -race`, `dstAccessYield` maintains a preallocated live HB clock
+  and a per-address / per-goroutine epoch table. A memory access that has no prior concurrent conflicting
+  access records into the per-bubble access log inline and does not call `goyield`; a conflicting access
+  still yields and is logged when the goroutine is resumed, preserving commit order. Because a prior-only
+  filter cannot know that a later access will need a split inside the same inline interval, the brain
+  promotes observed unsafe inline accesses to forced replay yield points keyed by `(dstSeq, hook ordinal,
+  hook PC)` and restarts the pass until no new promotion is needed. Auto-instrumented accesses to the
+  current goroutine's stack log as `addr=0` (private; no conflict identity), while explicit manual/sync
+  identities keep their addresses. If the bounded live filter state overflows, the runtime conservatively
+  yields every later access (less pruning, never a dropped class). Non-race manual hooks remain explicit
+  transition boundaries for the hand-controlled DPOR brain-validation corpus.
 
 #### D2 — Happens-before tracking (the dependency relation)
 
 DPOR's dependency relation needs, for any two accesses, whether they are causally ordered. The runtime
 **records** the synchronization events it already owns — `goready`/`injectglist`/`netpollready` (the
 non-foreclosure choke points), channel send/recv, sema acquire/release (mutex), goroutine create/exit —
-into the per-bubble transition log, and the DPOR engine **computes the vector clocks / HB relation
-offline**, between Runs. Two conflicting accesses are **dependent** iff neither clock dominates the other
-(concurrent); HB-ordered pairs are pruned (their order is fixed and sound). Offline (not live hot-path
-clocks) because the runtime is a pure recorder + schedule-follower under the stateless re-execution
-model — the scheduling decision during a Run needs only the prefix, never HB; HB is needed only by the
-post-Run backtrack analysis. The recorded events are the same ones the scheduler controls, so the HB is
-self-contained (no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain
-the faithful oracle, which the conflict-set cross-check against `-race` reports validates.
+   into the per-bubble transition log, and the DPOR engine **computes the vector clocks / HB relation
+   offline**, between Runs. Edges also record the access-log length at the moment they fired, so same-step
+   wake/create edges are ordered against inline filtered accesses in the same interval. Two conflicting
+   accesses are **dependent** iff neither clock dominates the other (concurrent); HB-ordered pairs are
+   pruned (their order is fixed and sound). Offline (not live hot-path clocks) because the runtime is a
+   pure recorder + schedule-follower under the stateless re-execution model — the scheduling decision
+   during a Run needs only the prefix, never HB; HB is needed only by the post-Run backtrack analysis. The
+   recorded events are the same ones the scheduler controls, so the HB is self-contained (no dependence on
+   TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful oracle, which the
+   conflict-set cross-check against `-race` reports validates.
 
 #### D3 — Stateless DPOR as a `dstSchedSelect` strategy
 
@@ -782,7 +795,9 @@ The driver lives above the seam, orchestrating repeated Runs:
   schedule, execute `f` under it, analyze the trace, push new schedules, until the worklist is empty
   (the pruned interleaving space is **exhausted**) or an `opts` budget (max schedules / max steps) is
   hit. `Report` carries pass/exhausted/budget-hit + every found failure (a `-race` report or a SUT
-  panic/assertion) with the exact schedule to reproduce it.
+  panic/assertion) with the observing schedule. Assertion failures reproduce from that schedule; a race
+  first observed before access-force convergence may also require promotion state not yet exposed by the
+  public replay surface.
 - `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
   `RunWith(seed, Options{Strategy: DPOR, Schedule: s}, f)` replays one schedule for reproduction/debug.
 - **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
@@ -794,19 +809,22 @@ The driver lives above the seam, orchestrating repeated Runs:
 Each explored interleaving runs under `-race`. The HB detector fires for an unsynchronized access pair
 even at `GOMAXPROCS=1` serial execution (it is clock-based, not timing-based), and the report is a
 deterministic function of the seed/schedule (same seed → 100/100 identical normalized report; even a
-*conditional* race's detect/no-detect verdict is stable per seed, 0/30 vs 30/30 — no flicker). **[V]** So
-a race found in any explored schedule is reproducible forever by that schedule. Atomicity violations
-(invisible to `-race`) are caught by the SUT's own assertions in the same explored interleaving.
+   *conditional* race's detect/no-detect verdict is stable per seed, 0/30 vs 30/30 — no flicker). **[V]** So
+   a race found in an explored interleaving is a stable observation; exact public replay from only the
+   schedule is subject to the access-force caveat below. Atomicity violations (invisible to `-race`) are
+   caught by the SUT's own assertions in the same explored interleaving.
 
 Wired into `Explore`: `runOnce` reads `runtime.RaceErrors()` (via the build-tagged
 `dstRaceErrors` — real under `-race`, 0 otherwise) before and after each scheduled Run; a NEW race makes
 the schedule a `Failure` with `Race=true`. The detector dedups by signature, so each distinct race yields
-exactly one `Race` failure — the first schedule that exhibits it, a deterministic reproducer. Enforced by
-`TestDSTExploreRaceOracle`: an unconditional write-write race is reported (the oracle fires under
-`simulation.Run`), and an *interleaving-conditional* race — manifesting only when the reader acquires a
-mutex first (`raceCondSUT`) — is found by exploring both acquisition orders and reported with a
-non-trivial reproducing schedule, both deterministic across same-seed runs. A non-`-race` build still
-enumerates interleavings and reports SUT-assertion failures; it records no data-race failures.
+exactly one `Race` failure — the first schedule that exhibits it. If that first report occurs before
+access-force convergence, exact public replay also needs the internal force set (tracked deferral); the
+race is still surfaced rather than lost to TSan dedup. Enforced by `TestDSTExploreRaceOracle`: an
+unconditional write-write race is reported (the oracle fires under `simulation.Run`), and an
+*interleaving-conditional* race — manifesting only when the reader acquires a mutex first (`raceCondSUT`) —
+is found by exploring both acquisition orders and reported with a non-trivial schedule, both deterministic
+across same-seed runs. A non-`-race` build still enumerates interleavings and reports SUT-assertion
+failures; it records no data-race failures.
 
 ### Soundness argument (load-bearing collapse-check)
 
@@ -838,7 +856,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    D2). **Manual-hook half: VALIDATED [V]** — mutex-counter soundness probe reaches exactly `G·K` at
    access granularity incl. yields while holding a user lock (DST-L2-1; 200/200 over 50 seeds, normal and
    `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
-   per-run yield magnitude measured (every access yields → filtering is increment 6). **Compiler half
+   per-run yield magnitude measured before filtering. **Compiler half
    (Option 1): IMPLEMENTED [V]** — `cmd/compile` `instrument2` (ssagen) emits an additional
    `runtime.dstAccessYield(addr, isWrite)` immediately before each `race{read,write,readrange,writerange}`
    hook, gated by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race`
@@ -867,7 +885,8 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    `sync.RWMutex.RLock`/`TryRLock`/`RUnlock`/`Unlock`, blocking and non-blocking `chansend`/`chanrecv`,
    `closechan`, blocking and non-blocking `selectgo` channel send/recv paths, and `sync.Once`'s first
    execution path (transitively through its internal `Mutex`). Shared-address filtering for the
-   auto-instrumentation explosion remains a follow-up (increment 6).
+   auto-instrumentation explosion is implemented in increment 6 and enforced by
+   `TestDSTExploreAutoInstrument`.
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
    records `goready` edges (readier happens-before readied) into a pre-sized per-bubble buffer
    (`dstRecordReadyEdge`, hooked at `goready` under the scheduled strategy only — allocation-free, gated
@@ -900,9 +919,9 @@ per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is pro
 across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
 (`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for
 memory accesses, `dstSyncAcquire` for synchronization object decisions — D1), and the Exhaustive + DPOR
-engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). Still
-inflated by `gcDrain`/`WaitGroup`/coarse-point decisions in the trace (increment 6 filtering + increment 2
-HB pruning address this); soundness + completeness for SUTs whose accesses and sync-object decisions are recorded
+engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). The remaining
+trace entries are real conflict/coarse decisions after increment 6 filtering; soundness + completeness for
+SUTs whose accesses and sync-object decisions are recorded
 is independent of that inflation, and enforced over a generated family by `TestDSTExploreSweep`.
 
 **Completeness boundary (addr=0 transitions).** DPOR's dependency relation pairs transitions that record
@@ -997,21 +1016,35 @@ relation.
    does (a read-modify-write whose read and write both yield), and `TestDSTExploreAutoInstrument` validates
    that skipping there stays complete (DPOR outcome set == Exhaustive). (An earlier draft wrongly asserted
    this path unreachable and panicked; auto-instrumentation showed it is reachable.)
-6. **Infrastructure isolation + shared-address filtering** (D1, using D2). *gcDrain isolation* —
+6. **Infrastructure isolation + shared-address filtering** (D1, using D2) — **VALIDATED [V].** *gcDrain isolation* —
    **VALIDATED [V]**: the bubble's finalizer-drain goroutine is scheduled RNG-free as infrastructure
    under the scheduled strategy (`firstSystemG`), so it leaves the recorded schedule/DPOR search; cut the
    exhaustive count ~9× (e.g. counter exhaustive 180→20) with no change to DPOR (it already pruned
    gcDrain as addr=0) and no effect on Random/PCT (`TestDSTSchedSystemIsolation` green). *Shared-address
-   filtering proper* (only contended addresses are transitions) is **deferred to the dst-race compiler
-   phase** (increment 1): with manual hooks the SUT author annotates only shared accesses, so there is
-   nothing to filter yet; once the compiler auto-inserts a hook at *every* access, single-owner/stack
-   accesses must be filtered to non-transitions. Foreclosure: narrows transitions; fewer yields is always
-   sound.
+   filtering proper* (only contended, non-HB-ordered addresses are transitions) is now implemented for the
+   dst-race auto-instrumented stream at the runtime hook: all accesses are logged, but single-owner/
+   HB-ordered accesses do not yield. The live filter uses bounded preallocated clocks/tables and falls back
+   to yield-every-access on overflow, so overflow can only under-prune. The brain promotes any observed
+   conflicting inline access that needs a missing boundary to a forced yield on replay; race-enabled DPOR
+   uses conservative conflict-anchor backtracking while disabling sleep sets, and the non-race sweep keeps
+   full source-DPOR sleep-set pruning. Non-race manual hooks remain explicit transitions, so `TestDSTExploreSweep` continues to
+   validate the hand-controlled DPOR brain (`mismatches=0`). Validation:
+   `TestDSTExploreAutoInstrument` validates filtered auto-instrumented RMWs by checking DPOR==Exhaustive,
+   preserving the known `{1,2}` outcome set, and keeping Exhaustive tractable (plain RMW: 19,448 before
+   filtering → 49 after; private-noise RMW: 49 after, outcome set preserved). It also checks filtered
+   R/W/R shapes with four outcomes (`rwrExh=1580`, `rwrDpor=51`, `manualRWRExh=159`, `manualRWRDpor=6`)
+   and post-`go` / post-wake parent-write shapes (`createExh=4`, `createDpor=2`, `wakeExh=25`,
+   `wakeDpor=10`) so first accesses after goroutine creation or `goready` wake-up do not hide
+   child-before-parent classes.
+   Foreclosure: narrows
+   transitions; fewer yields is sound because skipped accesses are logged and only independent accesses are
+   filtered.
 
 ### Open questions (resolved by measurement during the build, not pre-judged)
 
-- **Explosion magnitude.** How many per-run yield points a realistic SUT generates, and how aggressively
-  shared-address filtering (6) must prune — measured in increment 1 before the compiler work commits.
+- **Explosion magnitude (RESOLVED).** Shared-address filtering reduces the auto-instrumented RMW exhaustive
+  count from the measured ~19,448 baseline to 49 while preserving outcomes; a private-noise RMW is also
+  49. `TestDSTExploreAutoInstrument` enforces both tractability (`<1000`) and outcome preservation.
 - **HB source (DECIDED).** DST-side, computed **offline** from recorded sync events (not live hot-path
   clocks, not TSan's C-internal clocks) — it must match `-race`'s own HB, cross-checked against `-race`
   reports.

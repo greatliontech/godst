@@ -5331,6 +5331,12 @@ func newproc(fn *funcval) {
 	pc := sys.GetCallerPC()
 	systemstack(func() {
 		newg := newproc1(fn, gp, pc, false, waitReasonZero)
+		if dstActive() && dstSchedKind == dstSchedScheduled {
+			// A go statement happens-before the child goroutine starts. Record it before
+			// the child is runnable so initialization before creation is not modeled as a
+			// concurrent conflict with the child's first accesses.
+			dstRecordReadyEdge(gp, newg)
+		}
 
 		pp := getg().m.p.ptr()
 		runqput(pp, newg, true)
@@ -5339,6 +5345,13 @@ func newproc(fn *funcval) {
 			wakep()
 		}
 	})
+	if dstActive() && dstSchedKind == dstSchedScheduled && raceenabled {
+		// Goroutine creation is a real scheduling boundary: after a go statement, the
+		// child may run before the parent continues. This boundary is load-bearing once
+		// dst-race access filtering can record the parent's following first access inline.
+		// Non-race manual validation keeps its hand-controlled explicit access hooks.
+		dstYieldPoint()
+	}
 }
 
 // Create a new g in state _Grunnable (or _Gwaiting if parked is true), starting at fn.
@@ -5418,6 +5431,10 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.dstSeq = 0
 		newg.dstAccAddr = 0
 		newg.dstAccWrite = false
+		newg.dstAccPC = 0
+		newg.dstAccCount = 0
+		newg.dstAccPend = false
+		newg.dstAccAuto = false
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
 			// PCT: give the new goroutine a random base priority from the scheduling
 			// RNG (a scheduling property, not part of the per-g logical stream). The

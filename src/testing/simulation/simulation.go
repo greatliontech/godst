@@ -88,6 +88,9 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int)
 //go:linkname dstSetSchedule runtime.dstSetSchedule
 func dstSetSchedule(prefix []uint64)
 
+//go:linkname dstSetAccessForce runtime.dstSetAccessForce
+func dstSetAccessForce(seq, count []uint64, pc []uintptr)
+
 //go:linkname dstTraceLenFP runtime.dstTraceLenFP
 func dstTraceLenFP() int
 
@@ -107,7 +110,7 @@ func dstTraceOverflowFP() bool
 func dstEdgeLenFP() int
 
 //go:linkname dstEdgeAtFP runtime.dstEdgeAtFP
-func dstEdgeAtFP(i int) (from, to uint64, step int)
+func dstEdgeAtFP(i int) (from, to uint64, step, acc int)
 
 //go:linkname dstEdgeOverflowFP runtime.dstEdgeOverflowFP
 func dstEdgeOverflowFP() bool
@@ -116,10 +119,13 @@ func dstEdgeOverflowFP() bool
 func dstAccLogLenFP() int
 
 //go:linkname dstAccLogAtFP runtime.dstAccLogAtFP
-func dstAccLogAtFP(i int) (seq uint64, addr uintptr, write bool, step int)
+func dstAccLogAtFP(i int) (seq uint64, addr uintptr, pc uintptr, count uint64, write bool, step int)
 
 //go:linkname dstAccLogOverflowFP runtime.dstAccLogOverflowFP
 func dstAccLogOverflowFP() bool
+
+//go:linkname dstRaceEnabledFP runtime.dstRaceEnabledFP
+func dstRaceEnabledFP() bool
 
 //go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool

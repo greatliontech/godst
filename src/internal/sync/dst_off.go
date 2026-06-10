@@ -6,13 +6,13 @@
 
 package sync
 
-// dstHookEnabled is false outside a -tags dst -race build, so Mutex.Lock's
-// `if dstHookEnabled { dstSyncAcquire(m) }` is dead-code-eliminated and Lock is
+// dstHookEnabled is false outside a -tags dst -race build, so Mutex methods'
+// `if dstHookEnabled { dstSyncAcquire(m) }` calls are dead-code-eliminated and are
 // byte-identical to upstream (DST-L2-4). See dst_on.go for the active build.
 const dstHookEnabled = false
 
 // dstSyncAcquire is a no-op outside a -tags dst -race build: the DST Level-2
-// sync-acquisition auto-hook compiles to nothing, so Mutex.Lock is byte-identical to
+// sync-decision auto-hook compiles to nothing, so Mutex methods are byte-identical to
 // upstream in a non-dst build, a plain -race build, and a -tags dst build without
 // -race (DST-L2-4). See dst_on.go for the active form.
 func dstSyncAcquire(m *Mutex) {}

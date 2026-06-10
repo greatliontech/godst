@@ -26,18 +26,19 @@ const (
 	DPOR
 )
 
-// Failure records an interleaving under which the SUT reported a bug, with the
-// schedule prefix that reproduces it deterministically.
+// Failure records an interleaving under which the SUT reported a bug.
 type Failure struct {
 	// Schedule is the decision prefix — the stable per-bubble goroutine indices
-	// (dstSeq, not goid) chosen in decision order — that reproduces this failure
-	// when fed back as the scheduled strategy's prefix.
+	// (dstSeq, not goid) chosen in decision order. Assertion failures reproduce from
+	// this prefix. Race failures normally do too, but a race first observed before
+	// access-force convergence may also require internal promotion state that is not yet
+	// exposed by the public replay surface.
 	Schedule []uint64
 	// Race is true iff the -race detector reported a NEW data race during this
 	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
 	// (sut returned true). In a non-race build Race is always false. The detector
-	// dedups by signature, so each distinct race yields exactly one Race failure —
-	// the first schedule that exhibits it, a deterministic reproducer.
+	// dedups by signature, so each distinct race yields exactly one Race failure: the
+	// first schedule that exhibits it.
 	Race bool
 }
 
@@ -47,7 +48,7 @@ type ExploreResult struct {
 	Schedules int
 	// Failures lists every explored interleaving that exhibited a bug — the SUT
 	// returned true (an assertion failure) OR the -race detector reported a new data
-	// race (Failure.Race; see D5) — each with its reproducing schedule.
+	// race (Failure.Race; see D5) — each with its observing schedule.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
 	// is false when Overflow truncated coverage.
@@ -94,30 +95,58 @@ type exploreTrace struct {
 	// Access log: EVERY instrumented access in execution order, decoupled from the
 	// decision trace (a single-owner access records here without yielding, so it is
 	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
-	// per-decision addrs, so a conflicting pair whose first access was single-owner (so
-	// did not yield) is still reversed. accStep[k] is the dstScheduleStep the access
-	// occurred under: an access with step s was performed by procs[s-1] (the goroutine
-	// chosen at decision s-1) during the interval after decision s-1, so its reversal
-	// anchors at decision s-1. accSeq[k] therefore equals procs[accStep[k]-1].
+	// per-decision addrs. accStep[k] is the dstScheduleStep the access occurred under:
+	// an access with step s was performed by procs[s-1] during the interval after
+	// decision s-1, so its reversal anchors at decision s-1. accPC+accCount identify a
+	// filtered hook call precisely enough to force it to yield on replay if a later
+	// conflict proves that interval needed a split.
 	accSeq   []uint64
 	accAddr  []uintptr
+	accPC    []uintptr
+	accCount []uint64
 	accWrite []bool
 	accStep  []int
-	// Happens-before edges (goready: edgeFrom happens-before edgeTo's resumption),
-	// edgeStep = the dstScheduleStep when the goready fired.
+	// Happens-before edges (goready/create: edgeFrom happens-before edgeTo's resumption).
+	// edgeStep is the dstScheduleStep when the edge fired; edgeAcc is the access-log
+	// length at that moment, which orders same-step edges against inline filtered accesses.
 	edgeFrom []uint64
 	edgeTo   []uint64
 	edgeStep []int
+	edgeAcc  []int
 	aborted  bool // prefix named a non-enabled goroutine (a replay-determinism bug)
 	overflow bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
 }
 
-// runOnce runs sut once under the scheduled strategy following prefix, and copies
-// out the recorded trace. failed is sut's verdict for this interleaving; raced is
-// true iff the -race detector reported a NEW data race during this run (D5 oracle;
-// always false in a non-race build — dstRaceErrors returns 0).
-func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed, raced bool, tr exploreTrace) {
+type accessForce struct {
+	seq   uint64
+	count uint64
+	pc    uintptr
+}
+
+func installAccessForces(forces map[accessForce]bool) {
+	if len(forces) == 0 {
+		dstSetAccessForce(nil, nil, nil)
+		return
+	}
+	seq := make([]uint64, 0, len(forces))
+	count := make([]uint64, 0, len(forces))
+	pc := make([]uintptr, 0, len(forces))
+	for f := range forces {
+		seq = append(seq, f.seq)
+		count = append(count, f.count)
+		pc = append(pc, f.pc)
+	}
+	dstSetAccessForce(seq, count, pc)
+}
+
+// runOnce runs sut once under the scheduled strategy following prefix, with the
+// current forced access-yield watchpoints installed, and copies out the recorded
+// trace. failed is sut's verdict for this interleaving; raced is true iff the -race
+// detector reported a NEW data race during this run (D5 oracle; always false in a
+// non-race build — dstRaceErrors returns 0).
+func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool) (failed, raced bool, tr exploreTrace) {
 	racesBefore := dstRaceErrors()
+	installAccessForces(forces)
 	run(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
 		failed = sut()
 	})
@@ -146,17 +175,20 @@ func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed, raced bool,
 	a := dstAccLogLenFP()
 	tr.accSeq = make([]uint64, a)
 	tr.accAddr = make([]uintptr, a)
+	tr.accPC = make([]uintptr, a)
+	tr.accCount = make([]uint64, a)
 	tr.accWrite = make([]bool, a)
 	tr.accStep = make([]int, a)
 	for i := 0; i < a; i++ {
-		tr.accSeq[i], tr.accAddr[i], tr.accWrite[i], tr.accStep[i] = dstAccLogAtFP(i)
+		tr.accSeq[i], tr.accAddr[i], tr.accPC[i], tr.accCount[i], tr.accWrite[i], tr.accStep[i] = dstAccLogAtFP(i)
 	}
 	m := dstEdgeLenFP()
 	tr.edgeFrom = make([]uint64, m)
 	tr.edgeTo = make([]uint64, m)
 	tr.edgeStep = make([]int, m)
+	tr.edgeAcc = make([]int, m)
 	for i := 0; i < m; i++ {
-		tr.edgeFrom[i], tr.edgeTo[i], tr.edgeStep[i] = dstEdgeAtFP(i)
+		tr.edgeFrom[i], tr.edgeTo[i], tr.edgeStep[i], tr.edgeAcc[i] = dstEdgeAtFP(i)
 	}
 	return
 }
@@ -165,6 +197,28 @@ func runOnce(seed uint64, prefix []uint64, sut func() bool) (failed, raced bool,
 // scheduling-decision tree: each run reveals its decisions, and every not-taken
 // enabled goroutine at every free decision is queued as a child prefix.
 func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
+	forces := map[accessForce]bool{}
+	var carriedRace []Failure
+	for {
+		res, grew := exhaustiveExplorePass(seed, sut, forces)
+		if !grew {
+			if len(carriedRace) != 0 {
+				res.Failures = append(carriedRace, res.Failures...)
+			}
+			return res
+		}
+		// Assertion failures from an obsolete force set are not replayable under the next
+		// pass. Race failures are process-global TSan reports and may be deduped before the
+		// converged pass, so keep the first observing schedule.
+		for _, f := range res.Failures {
+			if f.Race {
+				carriedRace = append(carriedRace, f)
+			}
+		}
+	}
+}
+
+func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) (ExploreResult, bool) {
 	var res ExploreResult
 	visited := map[string]bool{}
 	stack := [][]uint64{nil}
@@ -176,13 +230,16 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 		} else {
 			visited[k] = true
 		}
-		failed, raced, tr := runOnce(seed, prefix, sut)
+		failed, raced, tr := runOnce(seed, prefix, forces, sut)
 		res.Schedules++
 		if tr.overflow {
 			res.Overflow = true
 		}
 		if failed || raced {
 			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
+		}
+		if promoteAccessForces(tr, forces) {
+			return res, true
 		}
 		for i := len(prefix); i < len(tr.procs); i++ {
 			for _, g := range tr.enabled[i] {
@@ -197,7 +254,54 @@ func exhaustiveExplore(seed uint64, sut func() bool) ExploreResult {
 		}
 	}
 	res.Exhausted = !res.Overflow
-	return res
+	return res, false
+}
+
+func accessHasPriorConflictingInInterval(tr exploreTrace, conflicting []bool, k int) bool {
+	for i := k - 1; i >= 0 && tr.accStep[i] == tr.accStep[k]; i-- {
+		if tr.accSeq[i] == tr.accSeq[k] && conflicting[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func accessNeedsReplayBoundary(tr exploreTrace, conflicting []bool, k int) bool {
+	return tr.accStep[k] == 0 || accessHasPriorConflictingInInterval(tr, conflicting, k)
+}
+
+// promoteAccessForces closes the gap a live prior-conflict filter cannot see: a
+// filtered access that was safe with respect to prior accesses may later prove to need
+// a boundary inside its inline interval. When the completed trace demonstrates that,
+// promote the exact hook call to a forced yield and restart the exploration pass.
+func promoteAccessForces(tr exploreTrace, forces map[accessForce]bool) bool {
+	if tr.overflow {
+		return false
+	}
+	clk, pidx := dporClocks(tr)
+	conflicting := make([]bool, len(tr.accSeq))
+	for j := 0; j < len(tr.accSeq); j++ {
+		for i := j - 1; i >= 0; i-- {
+			if tr.accAddr[i] != 0 && tr.accAddr[i] == tr.accAddr[j] &&
+				(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j] &&
+				dporConcurrent(clk, pidx, tr, i, j) {
+				conflicting[i] = true
+				conflicting[j] = true
+			}
+		}
+	}
+	grew := false
+	for k := range tr.accSeq {
+		if tr.accCount[k] == 0 || !conflicting[k] || !accessNeedsReplayBoundary(tr, conflicting, k) {
+			continue
+		}
+		f := accessForce{seq: tr.accSeq[k], count: tr.accCount[k], pc: tr.accPC[k]}
+		if !forces[f] {
+			forces[f] = true
+			grew = true
+		}
+	}
+	return grew
 }
 
 // dporTrans is one access's sleep-set pruning identity: its run-local address
@@ -255,8 +359,8 @@ type dporFrame struct {
 // transitions are *dependent* iff they record the same nonzero conflict identity
 // with at least one write, by different goroutines — where the identity is a shared
 // memory address (dstAccessYield) OR a synchronization object's identity
-// (dstSyncAcquire, recording a mutex/channel acquisition as a write-conflict so its
-// acquisition ORDER is a dependency; see runtime/dst_explore.go and design.md
+// (dstSyncAcquire, recording mutex/channel state decisions as write-conflicts so their
+// order is a dependency; see runtime/dst_explore.go and design.md
 // "Completeness boundary"). Each run re-executes from the start following the stack's
 // chosen prefix.
 //
@@ -282,26 +386,59 @@ type dporFrame struct {
 // sleep transitions cross stateless re-executions and raw addresses are run-local; a
 // nonzero access with a write wakes any nonzero sleeper. The race relation itself uses
 // per-run addresses plus the happens-before clocks (dporConcurrent), so mutex/channel-
-// SERIALIZED conflicts are pruned while a free acquisition ORDER is explored both ways.
+// SERIALIZED conflicts are pruned while a free sync-decision order is explored both ways.
 // addr==0 transitions (goroutine creation, WaitGroup wakeups, the isolated gcDrain
 // goroutine) record no conflict identity and are independent of everything — they
-// carry no outcome-determining order choice a recorded access/acquisition does not
+// carry no outcome-determining order choice a recorded access/sync decision does not
 // already capture. See design.md "Completeness boundary (addr=0 transitions)".
+//
+// Under race-enabled auto-instrumentation, filtered intervals and replay-promoted
+// accesses can make the minimal source-set calculation too narrow around goroutine
+// creation prefixes. Race-enabled DPOR therefore uses conservative all-enabled
+// backtracking at each observed conflict anchor and disables sleep sets; the non-race
+// sweep keeps the full source-DPOR + sleep-set algorithm and its optimality guard.
 func dporExplore(seed uint64, sut func() bool) ExploreResult {
+	forces := map[accessForce]bool{}
+	var carriedRace []Failure
+	for {
+		res, grew := dporExplorePass(seed, sut, forces)
+		if !grew {
+			if len(carriedRace) != 0 {
+				res.Failures = append(carriedRace, res.Failures...)
+			}
+			return res
+		}
+		// Assertion failures from an obsolete force set are not replayable under the next
+		// pass. Race failures are process-global TSan reports and may be deduped before the
+		// converged pass, so keep the first observing schedule.
+		for _, f := range res.Failures {
+			if f.Race {
+				carriedRace = append(carriedRace, f)
+			}
+		}
+	}
+}
+
+func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool) (ExploreResult, bool) {
 	var res ExploreResult
 	var stack []*dporFrame
+	raceEnabled := dstRaceEnabledFP()
+	useSleep := !raceEnabled
 	for {
 		prefix := make([]uint64, len(stack))
 		for i, fr := range stack {
 			prefix[i] = fr.proc
 		}
-		failed, raced, tr := runOnce(seed, prefix, sut)
+		failed, raced, tr := runOnce(seed, prefix, forces, sut)
 		res.Schedules++
 		if tr.overflow {
 			res.Overflow = true
 		}
 		if failed || raced {
 			res.Failures = append(res.Failures, Failure{Schedule: clonePrefix(prefix), Race: raced})
+		}
+		if promoteAccessForces(tr, forces) {
+			return res, true
 		}
 		// runOnce panics on a divergent (aborted) replay, so the trace here is always
 		// a faithful replay of the followed prefix.
@@ -324,7 +461,7 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 		// set stored with it stays valid down the frames it sleeps through.
 		for d := len(stack); d < n; d++ {
 			sleep := map[uint64][]dporTrans{}
-			if d > 0 {
+			if useSleep && d > 0 {
 				par := stack[d-1]
 				pt := intervalSet[d-1]
 				for q, qt := range par.sleep {
@@ -365,7 +502,13 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 					(tr.accWrite[i] || tr.accWrite[j]) && tr.accSeq[i] != tr.accSeq[j] {
 					if dporConcurrent(clk, pidx, tr, i, j) {
 						if d := tr.accStep[i] - 1; d >= 0 && d < n {
-							addSourceBacktrack(stack[d], tr.enabled[d], tr, traceClk, tracePidx, i, j)
+							if raceEnabled {
+								for _, g := range tr.enabled[d] {
+									stack[d].backtrack[g] = true
+								}
+							} else {
+								addSourceBacktrack(stack[d], tr.enabled[d], tr, traceClk, tracePidx, i, j)
+							}
 						}
 					}
 				}
@@ -384,7 +527,7 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 			top.doneTrans[top.proc] = intervalSet[d]
 			for _, g := range top.enabled {
 				if top.backtrack[g] && !top.done[g] {
-					if _, asleep := top.sleep[g]; asleep {
+					if _, asleep := top.sleep[g]; useSleep && asleep {
 						continue
 					}
 					top.proc = g
@@ -402,7 +545,7 @@ func dporExplore(seed uint64, sut func() bool) ExploreResult {
 		}
 	}
 	res.Exhausted = !res.Overflow
-	return res
+	return res, false
 }
 
 // dporHB reports whether access a happens-before access b (a → b) per the vector
@@ -495,12 +638,13 @@ func addSourceBacktrack(fr *dporFrame, enabled []uint64, tr exploreTrace, clk []
 // (dstSeq) to a vector position.
 //
 // Processing is in execution order, grouped by step (the access log is sorted by
-// accStep, which is non-decreasing in execution order): for each step s, tick and
-// snapshot every access in interval s (accStep == s), then apply every goready edge
-// observed during interval s (edgeStep == s), flowing the readier's current clock into
-// the readied's so its later accesses inherit the happens-before. A step with no
-// accesses (a coarse-point-only interval) still applies its edges. Edges at step 0
-// (before the first decision) flow zero clocks and are no-ops.
+// accStep, which is non-decreasing in execution order): within each step s, edgeAcc
+// places each same-step goready/create edge before the first access whose log index is
+// >= edgeAcc. This is load-bearing for filtered inline accesses after a wake: the wake
+// edge must not make later same-step parent accesses happen-before the readied
+// goroutine. A step with no accesses (a coarse-point-only interval) still applies its
+// edges; step 0 accesses are modeled too, so replay-promotion can detect conflicts
+// before the first decision.
 func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	pidx = make(map[uint64]int)
 	addProc := func(p uint64) {
@@ -527,10 +671,12 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			}
 		}
 	}
-	applyEdges := func(step int) {
+	applied := make([]bool, len(tr.edgeStep))
+	applyEdges := func(step, accLimit int) {
 		for e := range tr.edgeStep {
-			if tr.edgeStep[e] == step {
+			if !applied[e] && tr.edgeStep[e] == step && tr.edgeAcc[e] <= accLimit {
 				flow(pidx[tr.edgeFrom[e]], pidx[tr.edgeTo[e]])
+				applied[e] = true
 			}
 		}
 	}
@@ -547,16 +693,18 @@ func dporClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	}
 	nLog := len(tr.accSeq)
 	clk = make([][]uint32, nLog)
-	applyEdges(0) // pre-first-decision edges (zero clocks; no-op, applied for faithfulness)
 	li := 0
-	for s := 1; s <= maxStep; s++ {
+	for s := 0; s <= maxStep; s++ {
+		applyEdges(s, li)
 		for li < nLog && tr.accStep[li] == s {
+			applyEdges(s, li)
 			pi := pidx[tr.accSeq[li]]
 			cur[pi][pi]++
 			clk[li] = append([]uint32(nil), cur[pi]...)
 			li++
+			applyEdges(s, li)
 		}
-		applyEdges(s)
+		applyEdges(s, li)
 	}
 	return clk, pidx
 }
@@ -599,10 +747,12 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			}
 		}
 	}
-	applyEdges := func(step int) {
+	applied := make([]bool, len(tr.edgeStep))
+	applyEdges := func(step, accLimit int) {
 		for e := range tr.edgeStep {
-			if tr.edgeStep[e] == step {
+			if !applied[e] && tr.edgeStep[e] == step && tr.edgeAcc[e] <= accLimit {
 				mergeInto(cur[pidx[tr.edgeTo[e]]], cur[pidx[tr.edgeFrom[e]]])
+				applied[e] = true
 			}
 		}
 	}
@@ -619,10 +769,11 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	}
 	nLog := len(tr.accSeq)
 	clk = make([][]uint32, nLog)
-	applyEdges(0)
 	li := 0
-	for s := 1; s <= maxStep; s++ {
+	for s := 0; s <= maxStep; s++ {
+		applyEdges(s, li)
 		for li < nLog && tr.accStep[li] == s {
+			applyEdges(s, li)
 			pi := pidx[tr.accSeq[li]]
 			// Conflict edges: a later access to the same address with >=1 write causally
 			// depends on every earlier conflicting access — merge their clocks in, so e_i
@@ -635,8 +786,9 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			cur[pi][pi]++
 			clk[li] = append([]uint32(nil), cur[pi]...)
 			li++
+			applyEdges(s, li)
 		}
-		applyEdges(s)
+		applyEdges(s, li)
 	}
 	return clk, pidx
 }

@@ -43,12 +43,10 @@ func dstYieldPoint()
 //go:linkname dstAccessYield runtime.dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool)
 
-// dstSyncAcquire announces a synchronization-object acquisition (mutex Lock,
-// channel rendezvous) as a write-conflict on the object's identity and yields
-// BEFORE the blocking op, so the acquisition ORDER is a DPOR transition (the order
-// in which contending goroutines acquire is a real scheduling choice that can
-// change the outcome). Placed manually here; the dst-race compiler/runtime phase
-// wires real sync primitives to it automatically.
+// dstSyncAcquire announces a synchronization-object decision as a write-conflict on
+// the object's identity and yields BEFORE the state decision/transition, so that
+// decision order is a DPOR transition. Placed manually here; the dst-race compiler/
+// runtime phase wires real sync primitives to it automatically.
 //
 //go:linkname dstSyncAcquire runtime.dstSyncAcquire
 func dstSyncAcquire(id unsafe.Pointer)
@@ -247,9 +245,9 @@ func raceOracleSUT() bool {
 // writer has not run yet (done==0, i.e. the reader acquired first), reads x OUTSIDE
 // any lock — racing the writer's later x=1. When the writer acquires first the reader
 // sees done==1 and never touches x: no race. So a coarse scheduler that happens to run
-// the writer first misses the race entirely; the explorer, which explores both
-// acquisition orders (dstSyncAcquire on the mutex — the sync-acquisition-order
-// machinery), reaches the reader-first schedule and the -race oracle reports it. No
+// the writer first misses the race entirely; the explorer, which explores both mutex
+// acquisition orders (dstSyncAcquire on the mutex — the sync-decision machinery),
+// reaches the reader-first schedule and the -race oracle reports it. No
 // SUT assertion: the race is the finding.
 func raceCondSUT() bool {
 	var x, done int
@@ -344,39 +342,194 @@ func unmodifiedRMWSUT() bool {
 	return c != 2
 }
 
+var autoNoiseOutcomes = map[int]bool{}
+
+func unmodifiedPrivateNoiseRMWSUT() bool {
+	c := 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		id := i
+		go func() {
+			defer wg.Done()
+			private := make([]int, 8)
+			for k := range private {
+				private[k] = id + k
+				private[k]++
+			}
+			t := c
+			for k := range private {
+				private[k] += t
+			}
+			c = t + 1
+		}()
+	}
+	wg.Wait()
+	autoNoiseOutcomes[c] = true
+	return c != 2
+}
+
+var autoRWROutcomes = map[string]bool{}
+
+func unmodifiedRWRSUT() bool {
+	x := 0
+	read := [2]int{-1, -1}
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		read[0] = x
+	}()
+	go func() {
+		defer wg.Done()
+		x = 1
+	}()
+	go func() {
+		defer wg.Done()
+		read[1] = x
+	}()
+	wg.Wait()
+	autoRWROutcomes[strconv.Itoa(read[0])+","+strconv.Itoa(read[1])] = true
+	return false
+}
+
+var filteredManualRWROutcomes = map[string]bool{}
+var filteredManualRWRX int
+var filteredManualRWRRead [2]int
+var filteredManualRWRWG sync.WaitGroup
+
+//go:norace
+func filteredManualRWRRead0() {
+	defer filteredManualRWRWG.Done()
+	dstAccessYield(unsafe.Pointer(&filteredManualRWRX), false)
+	filteredManualRWRRead[0] = filteredManualRWRX
+}
+
+//go:norace
+func filteredManualRWRWrite() {
+	defer filteredManualRWRWG.Done()
+	dstAccessYield(unsafe.Pointer(&filteredManualRWRX), true)
+	filteredManualRWRX = 1
+}
+
+//go:norace
+func filteredManualRWRRead1() {
+	defer filteredManualRWRWG.Done()
+	dstAccessYield(unsafe.Pointer(&filteredManualRWRX), false)
+	filteredManualRWRRead[1] = filteredManualRWRX
+}
+
+func filteredManualRWRSUT() bool {
+	filteredManualRWRX = 0
+	filteredManualRWRRead = [2]int{-1, -1}
+	filteredManualRWRWG.Add(3)
+	go filteredManualRWRRead0()
+	go filteredManualRWRWrite()
+	go filteredManualRWRRead1()
+	filteredManualRWRWG.Wait()
+	filteredManualRWROutcomes[strconv.Itoa(filteredManualRWRRead[0])+","+strconv.Itoa(filteredManualRWRRead[1])] = true
+	return false
+}
+
+var autoCreateOutcomes = map[int]bool{}
+var autoWakeOutcomes = map[int]bool{}
+
+func unmodifiedCreateThenWriteSUT() bool {
+	x := 0
+	read := -1
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		read = x
+	}()
+	x = 1
+	wg.Wait()
+	autoCreateOutcomes[read] = true
+	return false
+}
+
+func unmodifiedWakeThenWriteSUT() bool {
+	x := 0
+	read := -1
+	ch := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ch
+		read = x
+	}()
+	close(ch)
+	x = 1
+	wg.Wait()
+	autoWakeOutcomes[read] = true
+	return false
+}
+
 // DSTExploreAuto runs unmodifiedRMWSUT under BOTH Exhaustive and DPOR and prints
-// "auto exh=<n> dpor=<m> assertfail=<a> racefail=<r> complete=<bool>". It is the
-// increment-1 acceptance AND a guard for the source-DPOR fallback:
+// "auto exh=<n> dpor=<m> outcomes=<k> assertfail=<a> racefail=<r> complete=<bool>".
+// It also runs a private-noise RMW and prints "noiseExh/noiseDpor/noiseOutcomes/
+// noiseComplete". It is the increment-1 acceptance and a guard for filtered
+// access replay promotion:
 //   - assertfail counts non-race DPOR Failures (the lost update — reachable ONLY
 //     because auto-instrumentation made the RMW accesses interleavable, with NO manual
 //     hooks: the headline proof that the compiler feeds the explorer). racefail counts
 //     -race-oracle Failures on the same auto-instrumented accesses.
 //   - complete is DPOR's reachable-outcome set == Exhaustive's. unmodifiedRMWSUT's
-//     dense auto-instrumentation triggers addSourceBacktrack's no-enabled-weak-initial
-//     path, so this equality validates that skipping there is complete (DST-L2-3) — a
-//     case the manual-hook family sweep does not reach.
+//     dense auto-instrumentation exercises filtered inline accesses that may be
+//     promoted to replay yield points — a case the manual-hook family sweep does not
+//     reach.
 //
 // Meaningful only in a -tags dst -race build (else no auto-instrumentation).
 func DSTExploreAuto() {
 	seed := dstSeedEnv()
+	runCompare := func(outcomes map[int]bool, sut func() bool) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
+		for k := range outcomes {
+			delete(outcomes, k)
+		}
+		dpor = simulation.Explore(seed, simulation.DPOR, sut)
+		dporSet = map[string]bool{}
+		for v := range outcomes {
+			dporSet[strconv.Itoa(v)] = true
+		}
+		for k := range outcomes {
+			delete(outcomes, k)
+		}
+		exh = simulation.Explore(seed, simulation.Exhaustive, sut)
+		exhSet = map[string]bool{}
+		for v := range outcomes {
+			exhSet[strconv.Itoa(v)] = true
+		}
+		return exh, dpor, exhSet, dporSet
+	}
+	runStringCompare := func(outcomes map[string]bool, sut func() bool) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
+		for k := range outcomes {
+			delete(outcomes, k)
+		}
+		dpor = simulation.Explore(seed, simulation.DPOR, sut)
+		dporSet = map[string]bool{}
+		for v := range outcomes {
+			dporSet[v] = true
+		}
+		for k := range outcomes {
+			delete(outcomes, k)
+		}
+		exh = simulation.Explore(seed, simulation.Exhaustive, sut)
+		exhSet = map[string]bool{}
+		for v := range outcomes {
+			exhSet[v] = true
+		}
+		return exh, dpor, exhSet, dporSet
+	}
 	// DPOR first, so its -race-oracle count (racefail) is not pre-empted by the race
 	// detector's dedup during the Exhaustive pass over the same racy SUT.
-	for k := range autoOutcomes {
-		delete(autoOutcomes, k)
-	}
-	dpor := simulation.Explore(seed, simulation.DPOR, unmodifiedRMWSUT)
-	dporSet := map[string]bool{}
-	for v := range autoOutcomes {
-		dporSet[strconv.Itoa(v)] = true
-	}
-	for k := range autoOutcomes {
-		delete(autoOutcomes, k)
-	}
-	exh := simulation.Explore(seed, simulation.Exhaustive, unmodifiedRMWSUT)
-	exhSet := map[string]bool{}
-	for v := range autoOutcomes {
-		exhSet[strconv.Itoa(v)] = true
-	}
+	exh, dpor, exhSet, dporSet := runCompare(autoOutcomes, unmodifiedRMWSUT)
+	noiseExh, noiseDpor, noiseExhSet, noiseDporSet := runCompare(autoNoiseOutcomes, unmodifiedPrivateNoiseRMWSUT)
+	rwrExh, rwrDpor, rwrExhSet, rwrDporSet := runStringCompare(autoRWROutcomes, unmodifiedRWRSUT)
+	manualRWRExh, manualRWRDpor, manualRWRExhSet, manualRWRDporSet := runStringCompare(filteredManualRWROutcomes, filteredManualRWRSUT)
+	createExh, createDpor, createExhSet, createDporSet := runCompare(autoCreateOutcomes, unmodifiedCreateThenWriteSUT)
+	wakeExh, wakeDpor, wakeExhSet, wakeDporSet := runCompare(autoWakeOutcomes, unmodifiedWakeThenWriteSUT)
 	assertfail, racefail := 0, 0
 	for _, f := range dpor.Failures {
 		if f.Race {
@@ -387,9 +540,30 @@ func DSTExploreAuto() {
 	}
 	os.Stdout.WriteString("auto exh=" + strconv.Itoa(exh.Schedules) +
 		" dpor=" + strconv.Itoa(dpor.Schedules) +
+		" outcomes=" + strconv.Itoa(len(exhSet)) +
 		" assertfail=" + strconv.Itoa(assertfail) +
 		" racefail=" + strconv.Itoa(racefail) +
-		" complete=" + strconv.FormatBool(sameSet(exhSet, dporSet)) + "\n")
+		" complete=" + strconv.FormatBool(sameSet(exhSet, dporSet)) +
+		" noiseExh=" + strconv.Itoa(noiseExh.Schedules) +
+		" noiseDpor=" + strconv.Itoa(noiseDpor.Schedules) +
+		" noiseOutcomes=" + strconv.Itoa(len(noiseExhSet)) +
+		" noiseComplete=" + strconv.FormatBool(sameSet(noiseExhSet, noiseDporSet)) +
+		" rwrExh=" + strconv.Itoa(rwrExh.Schedules) +
+		" rwrDpor=" + strconv.Itoa(rwrDpor.Schedules) +
+		" rwrOutcomes=" + strconv.Itoa(len(rwrExhSet)) +
+		" rwrComplete=" + strconv.FormatBool(sameSet(rwrExhSet, rwrDporSet)) +
+		" manualRWRExh=" + strconv.Itoa(manualRWRExh.Schedules) +
+		" manualRWRDpor=" + strconv.Itoa(manualRWRDpor.Schedules) +
+		" manualRWROutcomes=" + strconv.Itoa(len(manualRWRExhSet)) +
+		" manualRWRComplete=" + strconv.FormatBool(sameSet(manualRWRExhSet, manualRWRDporSet)) +
+		" createExh=" + strconv.Itoa(createExh.Schedules) +
+		" createDpor=" + strconv.Itoa(createDpor.Schedules) +
+		" createOutcomes=" + strconv.Itoa(len(createExhSet)) +
+		" createComplete=" + strconv.FormatBool(sameSet(createExhSet, createDporSet)) +
+		" wakeExh=" + strconv.Itoa(wakeExh.Schedules) +
+		" wakeDpor=" + strconv.Itoa(wakeDpor.Schedules) +
+		" wakeOutcomes=" + strconv.Itoa(len(wakeExhSet)) +
+		" wakeComplete=" + strconv.FormatBool(sameSet(wakeExhSet, wakeDporSet)) + "\n")
 }
 
 // dstOutcomes collects the distinct final values multiOutcomeSUT produces across

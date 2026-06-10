@@ -954,9 +954,11 @@ func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
 }
 
 // TestDSTExploreComplete verifies DPOR is COMPLETE — it reaches the identical set
-// of reachable outcomes as exhaustive enumeration, while exploring strictly fewer
+// of reachable outcomes as exhaustive enumeration, while exploring no more
 // interleavings. If DPOR's outcome set were a subset, it would be silently missing
-// reachable states (bugs). See docs/dst/design.md (Level 2, DST-L2-3).
+// reachable states (bugs). See docs/dst/design.md (Level 2, DST-L2-3). The larger
+// generated sweep below carries the strict reduction/optimality guard; this tiny SUT's
+// exhaustive tree becomes minimal once shared-address filtering removes private steps.
 func TestDSTExploreComplete(t *testing.T) {
 	exh := runTestProgDSTNoRace(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=exhaustive")
 	dpor := runTestProgDSTNoRace(t, "DSTExploreOutcomes", "DSTSEED=1", "DSTMODE=dpor")
@@ -965,8 +967,8 @@ func TestDSTExploreComplete(t *testing.T) {
 		t.Fatalf("DPOR is incomplete: reaches outcomes %q but exhaustive reaches %q", dporSet, exhSet)
 	}
 	exhN, dporN := exploreSchedules(t, exh), exploreSchedules(t, dpor)
-	if dporN >= exhN {
-		t.Fatalf("DPOR did not reduce the interleaving count: dpor=%d, exhaustive=%d", dporN, exhN)
+	if dporN > exhN {
+		t.Fatalf("DPOR explored more interleavings than exhaustive: dpor=%d, exhaustive=%d", dporN, exhN)
 	}
 }
 
@@ -1113,9 +1115,9 @@ func TestDSTExploreRaceOracle(t *testing.T) {
 	// uncond: an unconditional write-write race — the oracle must fire (proves -race
 	// works as the oracle under simulation.Run's GOMAXPROCS=1 serial execution).
 	// cond: an INTERLEAVING-CONDITIONAL race manifesting only when the reader acquires
-	// the mutex first — the explorer must reach that schedule (via the
-	// sync-acquisition-order machinery) for the oracle to see it; a coarse scheduler
-	// would miss it on the other acquisition order.
+	// the mutex first — the explorer must reach that schedule (via the sync-decision
+	// machinery) for the oracle to see it; a coarse scheduler would miss it on the other
+	// acquisition order.
 	for _, mode := range []string{"uncond", "cond"} {
 		out := runBuiltTestProg(t, exe, "DSTExploreRaceOracle", "DSTSEED=1", "DSTRACE="+mode)
 		if races, err := strconv.Atoi(exploreField(t, out, "races")); err != nil {
@@ -1143,10 +1145,21 @@ func TestDSTExploreRaceOracle(t *testing.T) {
 //   - assertfail >= 1: Explore found the lost-update interleaving with no hand
 //     annotation (auto-instrumentation feeds the explorer end-to-end).
 //   - complete == true: DPOR's reachable-outcome set equals brute-force Exhaustive's.
-//     The dense auto-instrumentation triggers source-DPOR's no-enabled-weak-initial
-//     path (addSourceBacktrack), which the hand-annotated family sweep never reaches;
-//     this equality is the guard that SKIPPING there is complete (DST-L2-3) rather
-//     than the panic an earlier draft wrongly asserted.
+//     The dense auto-instrumentation exercises replay-promoted filtered accesses and
+//     race-enabled conservative conflict backtracking, which the non-race family sweep
+//     does not reach.
+//   - exh/noiseExh stay tractable: shared-address filtering removed private and
+//     HB-ordered access yields from the auto-instrumented transition set. The plain
+//     RMW was measured at ~19k exhaustive schedules before filtering.
+//   - manualRWRComplete/outcomes guard the source-DPOR weak-initial prologue case
+//     exposed by filtering: a zero-address scheduling prologue must not mask the real
+//     next access. This SUT uses //go:norace helpers so the -race binary has the
+//     runtime filter active while keeping the access stream hand-controlled.
+//   - createComplete/outcomes guard the post-go first-access case: a parent write
+//     immediately after creating a child must still allow the child-before-write order
+//     even though the parent write has no prior conflicting access in that run.
+//   - wakeComplete/outcomes is the same guard for a child made runnable by close(ch):
+//     after the close wakes it, the child may run before the parent's following write.
 //
 // Built explicitly WITH -race (auto-instrumentation is gated on -tags dst + -race).
 // Skipped where the race detector is unavailable.
@@ -1171,6 +1184,61 @@ func TestDSTExploreAutoInstrument(t *testing.T) {
 	if exploreField(t, out, "complete") != "true" {
 		t.Fatalf("source-DPOR dropped a class on the auto-instrumented SUT (the "+
 			"no-enabled-weak-initial fallback is not complete — DST-L2-3):\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "outcomes")); err != nil {
+		t.Fatalf("bad outcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("shared-address filtering changed the RMW outcome set: outcomes=%d, want 2:\n%s", n, out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "exh")); err != nil {
+		t.Fatalf("bad exh field in %q: %v", out, err)
+	} else if n >= 1000 {
+		t.Fatalf("shared-address filtering did not control the RMW exhaustive explosion: exh=%d, want <1000:\n%s", n, out)
+	}
+	if exploreField(t, out, "noiseComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a class on the private-noise auto-instrumented SUT:\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "noiseOutcomes")); err != nil {
+		t.Fatalf("bad noiseOutcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("shared-address filtering changed the private-noise RMW outcome set: outcomes=%d, want 2:\n%s", n, out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "noiseExh")); err != nil {
+		t.Fatalf("bad noiseExh field in %q: %v", out, err)
+	} else if n >= 1000 {
+		t.Fatalf("shared-address filtering did not control the private-noise exhaustive explosion: noiseExh=%d, want <1000:\n%s", n, out)
+	}
+	if exploreField(t, out, "rwrComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a filtered R/W/R class (weak-initial prologue bug):\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "rwrOutcomes")); err != nil {
+		t.Fatalf("bad rwrOutcomes field in %q: %v", out, err)
+	} else if n != 4 {
+		t.Fatalf("filtered R/W/R outcome set changed: outcomes=%d, want 4:\n%s", n, out)
+	}
+	if exploreField(t, out, "manualRWRComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a filtered manual R/W/R class (weak-initial prologue bug):\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "manualRWROutcomes")); err != nil {
+		t.Fatalf("bad manualRWROutcomes field in %q: %v", out, err)
+	} else if n != 4 {
+		t.Fatalf("filtered manual R/W/R outcome set changed: outcomes=%d, want 4:\n%s", n, out)
+	}
+	if exploreField(t, out, "createComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a post-go first-access class:\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "createOutcomes")); err != nil {
+		t.Fatalf("bad createOutcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("post-go first-access outcome set changed: outcomes=%d, want 2:\n%s", n, out)
+	}
+	if exploreField(t, out, "wakeComplete") != "true" {
+		t.Fatalf("source-DPOR dropped a post-wake continuation class:\n%s", out)
+	}
+	if n, err := strconv.Atoi(exploreField(t, out, "wakeOutcomes")); err != nil {
+		t.Fatalf("bad wakeOutcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("post-wake continuation outcome set changed: outcomes=%d, want 2:\n%s", n, out)
 	}
 }
 
