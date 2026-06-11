@@ -38,6 +38,8 @@ func init() {
 	register("DSTRunOverlapGuard", DSTRunOverlapGuard)
 	register("DSTRunGOMAXPROCSPinned", DSTRunGOMAXPROCSPinned)
 	register("DSTPoolAcrossRuns", DSTPoolAcrossRuns)
+	register("DSTPooledFinalizerRunEnd", DSTPooledFinalizerRunEnd)
+	register("DSTPooledCleanupRunEnd", DSTPooledCleanupRunEnd)
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
 	register("DSTGCPerCycle", DSTGCPerCycle)
@@ -162,7 +164,7 @@ func dstMakeFinStoreChainLen(n int, done, active *atomic.Bool) {
 // DSTFinChain drops a finalizer chain whose tail touches a bubble channel and
 // then returns immediately (no in-run quiescence to resolve it), exercising the
 // Run-end fixpoint drain (design.md D4: Run-end fixpoint). Without the
-// fixpoint, the tail's finalizer runs on the post-Run reap's async fing
+// fixpoint, the tail's finalizer runs on post-teardown async fing
 // (g.bubble == nil) and its send fatals "send on synctest channel from outside
 // bubble"; with it, the whole chain runs in-bubble. Prints "ok" iff the run
 // completes without a fatal.
@@ -799,8 +801,8 @@ func DSTFinRunSet() {
 		// Snapshot the counters INSIDE the bubble, after an intervening quiescence
 		// (time.Sleep blocks on a fake timer, forcing the drain to run). This makes
 		// the assertion require the in-bubble drain: reading after simulation.Run returns
-		// would let the post-Run reap (runtime.GC()×2 after dstDeactivate) run any
-		// missed finalizers on fing and launder the count.
+		// would let the Run-end closeout drain run any missed finalizers and launder
+		// the count.
 		time.Sleep(time.Millisecond)
 		gotCount = dstFinRunCount.Load()
 		gotSum = dstFinRunSum.Load()
@@ -966,7 +968,8 @@ var dstCleanupRunSum atomic.Uint64
 // DSTCleanupRunSet is the cleanup analogue of DSTFinRunSet (invariant
 // DST-CLEANUP-2): the set of cleanups run by the in-bubble drain is deterministic
 // and they actually run. Counters are read inside f after an intervening
-// quiescence so the post-Run reap cannot launder the count. Prints "count sumHex".
+// quiescence so the Run-end closeout drain cannot launder the count. Prints
+// "count sumHex".
 func DSTCleanupRunSet() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var gotCount, gotSum uint64
@@ -1368,6 +1371,106 @@ func DSTGCOffBound() {
 }
 
 var dstChanPool = sync.Pool{New: func() any { return make(chan int, 1) }}
+
+var dstPooledFinalizerPool sync.Pool
+var dstPooledCleanupPool sync.Pool
+
+type dstPooledCallback struct {
+	ch     chan int
+	active *atomic.Bool
+	done   *atomic.Bool
+}
+
+//go:noinline
+func dstPutPooledFinalizer(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		cb.active.Store(dstRuntimeActive())
+		cb.ch <- 1
+		cb.done.Store(true)
+	})
+	dstPooledFinalizerPool.Put(o)
+}
+
+//go:noinline
+func dstPutPooledFinalizerThenPut(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		dstPutPooledFinalizer(cb)
+	})
+	dstPooledFinalizerPool.Put(o)
+}
+
+//go:noinline
+func dstPutPooledCleanup(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(cb dstPooledCallback) {
+		cb.active.Store(dstRuntimeActive())
+		cb.ch <- 1
+		cb.done.Store(true)
+	}, cb)
+	dstPooledCleanupPool.Put(o)
+}
+
+//go:noinline
+func dstPutPooledCleanupThenPut(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(cb dstPooledCallback) {
+		dstPutPooledCleanup(cb)
+	}, cb)
+	dstPooledCleanupPool.Put(o)
+}
+
+//go:noinline
+func dstPutPooledFinalizerFromFinalizer(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(p *dstFinObj) {
+		dstPutPooledFinalizerThenPut(cb)
+	})
+}
+
+//go:noinline
+func dstPutPooledCleanupFromCleanup(cb dstPooledCallback) {
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(cb dstPooledCallback) {
+		dstPutPooledCleanupThenPut(cb)
+	}, cb)
+}
+
+// DSTPooledFinalizerRunEnd has a run-end finalizer put a pooled finalizer that
+// itself puts another pooled finalizer. The tail finalizer touches a bubble
+// channel, so dstStopGCDrain must reset its two-generation pool-reap window after
+// the intermediate pooled callback runs.
+func DSTPooledFinalizerRunEnd() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var active, done atomic.Bool
+	simulation.Run(n, func() {
+		ch := make(chan int, 1)
+		dstPutPooledFinalizerFromFinalizer(dstPooledCallback{ch: ch, active: &active, done: &done})
+	})
+	if done.Load() && active.Load() {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("done=" + strconv.FormatBool(done.Load()) +
+			" active=" + strconv.FormatBool(active.Load()) + "\n")
+	}
+}
+
+// DSTPooledCleanupRunEnd is the cleanup analogue of DSTPooledFinalizerRunEnd.
+func DSTPooledCleanupRunEnd() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var active, done atomic.Bool
+	simulation.Run(n, func() {
+		ch := make(chan int, 1)
+		dstPutPooledCleanupFromCleanup(dstPooledCallback{ch: ch, active: &active, done: &done})
+	})
+	if done.Load() && active.Load() {
+		os.Stdout.WriteString("ok\n")
+	} else {
+		os.Stdout.WriteString("done=" + strconv.FormatBool(done.Load()) +
+			" active=" + strconv.FormatBool(active.Load()) + "\n")
+	}
+}
 
 // DSTPoolAcrossRuns exercises a sync.Pool of channels reused across two simulation.Run
 // calls — a pattern (a pool of channels reused across runs) that fatals under plain

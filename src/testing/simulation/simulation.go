@@ -279,13 +279,15 @@ func leaveSimulation() {
 // is virtual (testing/synctest semantics): it advances only when every goroutine
 // started within f is durably blocked.
 //
-// Run runs two GC cycles when it returns. These do not affect the determinism of
-// the run itself; they evict sync.Pool entries that outlive the bubble. A channel
-// placed in a sync.Pool inside f is stamped with f's bubble, and reusing it in a
-// later Run would fatal ("channel from outside bubble"); the two cycles clear the
-// Pool victim cache so each Run starts from a clean pool. This is a cross-Run
-// pool-lifetime concern, distinct from the in-run memory bounding that the
-// deterministic in-run GC provides.
+// Run drains two quiet sync.Pool generations before it returns. This does not
+// affect the determinism of the run itself; it evicts Pool entries that outlive
+// the bubble. A channel placed in a sync.Pool inside f is stamped with f's bubble,
+// and reusing it in a later Run would fatal ("channel from outside bubble"); the
+// two generations clear the Pool victim cache so each Run starts from a clean
+// pool. The drain happens before the bubble is torn down, so finalizers or
+// cleanups made reachable only by Pool eviction still run with the bubble active.
+// This is a cross-Run pool-lifetime concern, distinct from the in-run memory
+// bounding that the deterministic in-run GC provides.
 //
 // Run, RunWith, Explore, ExploreWith, and Replay are process-global simulation
 // operations: they must not overlap in one process, and must not be called from
@@ -371,13 +373,6 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
 		dstClearSimEnv()
 		dstSetMemLimit(0)
-		// Evict sync.Pool entries that outlive the bubble (a pooled channel is
-		// stamped with this bubble; reusing it in the next Run fatals). Two cycles
-		// clear the Pool victim cache. This is a cross-Run pool-lifetime fix,
-		// distinct from in-run memory bounding (which the deterministic in-run GC
-		// handles). dstDeactivate ran first, so these are ordinary GC cycles.
-		runtime.GC()
-		runtime.GC()
 		dstSetAsyncPreemptOff(oldPreempt)
 		runtime.GOMAXPROCS(oldProcs)
 	}()

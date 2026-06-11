@@ -252,6 +252,28 @@ func TestDSTPoolReapedAcrossRuns(t *testing.T) {
 	}
 }
 
+// TestDSTPooledFinalizerRunEndInBubble verifies that the run-end sync.Pool reap
+// is part of the in-bubble drain. The testprog has one run-end finalizer perform
+// a Pool.Put of a finalizer object whose callback does another Pool.Put; the
+// post-callback pool generation window must reset so the channel-touching tail
+// still runs inside the bubble. Use the non-race builder because race-mode
+// sync.Pool.Put may randomly drop values, bypassing the pool-generation path.
+func TestDSTPooledFinalizerRunEndInBubble(t *testing.T) {
+	out := runTestProgDSTNoRace(t, "DSTPooledFinalizerRunEnd", "DSTSEED=1", "GOGC=off")
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pooled finalizer escaped in-bubble run-end drain (got %q, want %q)", out, "ok\n")
+	}
+}
+
+// TestDSTPooledCleanupRunEndInBubble is the cleanup analogue of
+// TestDSTPooledFinalizerRunEndInBubble.
+func TestDSTPooledCleanupRunEndInBubble(t *testing.T) {
+	out := runTestProgDSTNoRace(t, "DSTPooledCleanupRunEnd", "DSTSEED=1", "GOGC=off")
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("pooled cleanup escaped in-bubble run-end drain (got %q, want %q)", out, "ok\n")
+	}
+}
+
 // TestDSTGCAllocBoundDeterministic verifies the two Chunk A guarantees for an
 // alloc-heavy, non-blocking SUT (design dimension 11): GC is enabled in-run and
 // bounds memory, and its observable effect is deterministic. The testprog churns
@@ -979,7 +1001,7 @@ func TestDSTSchedSystemIsolation(t *testing.T) {
 
 // TestDSTFinalizerChainNoLeak verifies the Run-end fixpoint drain resolves a
 // finalizer chain whose tail touches a bubble channel fully in-bubble, so it does
-// not leak to the post-Run reap and fatal (design.md D4: Run-end fixpoint).
+// not leak to post-teardown async processing and fatal (design.md D4: Run-end fixpoint).
 // Mutation check: reverting the dstStopGCDrain fixpoint to a single drain makes
 // the testprog fatal instead of printing "ok".
 func TestDSTFinalizerChainNoLeak(t *testing.T) {

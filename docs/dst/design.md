@@ -1435,9 +1435,9 @@ re-block before virtual time advances.
 **Run-end fixpoint (resolves the chain-tail hazard).** The single-GC-per-quiescence rule is right
 *during* the run (it matches production chain resolution), but at `Run` **end** there is no later
 quiescence, so a chain whose **tail** touches a bubble channel and is dropped near the end (object B
-reachable only through object A's still-pending finalizer) would otherwise be discovered only by the
-post-`Run` reap — run on the async `fing`/cleanup goroutine (`g.bubble == nil`) — and the tail's
-channel op would fatal. So `dstStopGCDrain` loops GC+drain until a GC discovers nothing new
+reachable only through object A's still-pending finalizer) would otherwise be left for post-teardown
+async `fing`/cleanup processing (`g.bubble == nil`), and the tail's channel op would fatal. So
+`dstStopGCDrain` loops GC+drain until a GC discovers nothing new
 (`dstDrainAtQuiescence` returns whether it made progress), resolving the whole chain **in-bubble**
 before teardown. The loop has no finite round cap: every finite chain completes in the bubble; a callback
 that continually re-registers itself is a non-terminating callback workload (like a user goroutine that
@@ -1445,7 +1445,7 @@ never durably blocks) and the run does not complete rather than leaking the resi
 async goroutine. It is sound because the SUT has exited (everything is dead, so running the full chain is
 correct) and changes no in-run quiescence behavior; the cleanup drain (Chunk C) is covered identically
 (the loop checks both `finPending` and `cleanupPending`). Regressions: `DSTFinChain` (a 3-level chain with
-a channel-touching tail) fatals on the post-`Run` reap without the fixpoint; the long-chain tests
+a channel-touching tail) fatals after teardown without the fixpoint; the long-chain tests
 (`DSTFinLongChain`, `DSTCleanupLongChain`) require a >256-level tail to run while `dstActive` is still true.
 
 #### D5 — Scavenger off (dimension 9)
@@ -1531,10 +1531,11 @@ In-run GC (Tier 1/2) bounds **intra-Run** memory but does **not** subsume the Ti
 victim cache → two GCs to fully clear). The cross-Run hazard is: `f` does its final `Put(ch)` (ch
 stamped with Run 1's bubble) and returns; **no GC fires between that `Put` and Run 2's `Get`**, so the
 stale-bubble channel survives and Run 2's `Get` fatals. In-run GC, by definition, stops at `f`'s end.
-So Tier 2 **retains** an end-of-`Run` reap (the current `runtime.GC()×2`, sized for the 2-generation
-cache) — or, equivalently, one forced GC at the `Run` boundary — as a *pool-lifetime* mechanism
-distinct from in-run memory bounding. Only a change to pool *lifetime* across bubbles (out of scope
-here) would remove it. **[R]**
+So Tier 2 **retains** an end-of-`Run` reap (two quiet pool generations, sized for the 2-generation
+cache) as a *pool-lifetime* mechanism distinct from in-run memory bounding. The reap is folded into
+the in-bubble run-end fixpoint before `dstDeactivate`, so objects made unreachable only by Pool
+eviction have their finalizers/cleanups drained with the bubble still active. Only a change to pool
+*lifetime* across bubbles (out of scope here) would remove it. **[R]**
 
 #### Increment sequence (each useful; none forecloses another)
 

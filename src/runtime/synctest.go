@@ -434,8 +434,7 @@ func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
 // goroutine is receiving on) to run and re-block, before virtual time advances.
 // It reports whether it drained a level (the GC discovered dead finalizable/
 // cleanup-bearing objects and ran their callbacks); false means the GC found
-// nothing, which the Run-end fixpoint uses to detect that a finalizer/cleanup
-// chain is fully resolved.
+// no callback work.
 func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 	if bubble.gcDrain == nil {
 		return false
@@ -466,20 +465,29 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 		return
 	}
 	// Run finalizers/cleanups made dead by the run finishing (e.g. bubble.main's
-	// locals), draining finalizer/cleanup *chains* to a fixpoint. Unlike a
-	// quiescence point during the run — where exactly one GC runs, so a chain
-	// resolves one level per quiescence as in production (DST-FIN-2) — at Run end
-	// the SUT has exited and there is no later quiescence, so a chained callback
-	// left pending (object B reachable only through object A's still-pending
-	// finalizer) would leak to the post-Run reap on the async fing/cleanup
-	// goroutine (g.bubble == nil) and a channel-touching tail would fatal. Loop
-	// until a GC discovers nothing new, so every finite chain runs in-bubble. A
-	// callback that continually re-registers itself is a non-terminating callback
-	// workload, analogous to a user goroutine that never reaches a durable block;
-	// the run will not complete rather than leaking the residual to a bubble-less
-	// async goroutine.
+	// locals), draining finalizer/cleanup *chains* and the sync.Pool victim-cache
+	// generations to a fixpoint. Unlike a quiescence point during the run — where
+	// exactly one GC runs, so a chain resolves one level per quiescence as in
+	// production (DST-FIN-2) — at Run end the SUT has exited and there is no later
+	// quiescence. A chained callback left pending (object B reachable only through
+	// object A's still-pending finalizer), or a callback object reachable only
+	// through a final Pool.Put, would otherwise leak to the async fing/cleanup
+	// goroutine after teardown (g.bubble == nil) and a channel-touching tail would
+	// fatal. Loop until callbacks stop appearing and two quiet pool generations
+	// have elapsed, so every finite chain and final pool entry runs or dies
+	// in-bubble. A callback that continually re-registers itself is a
+	// non-terminating callback workload, analogous to a user goroutine that never
+	// reaches a durable block; the run will not complete rather than leaking the
+	// residual to a bubble-less async goroutine.
+	const poolReapGenerations = 2
+	poolReap := poolReapGenerations
 	for {
-		if !bubble.dstDrainAtQuiescence() {
+		if bubble.dstDrainAtQuiescence() {
+			poolReap = poolReapGenerations
+			continue
+		}
+		poolReap--
+		if poolReap == 0 {
 			break
 		}
 	}
