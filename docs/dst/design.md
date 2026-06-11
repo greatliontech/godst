@@ -418,6 +418,13 @@ the fixed seams, so later steps add, never rewrite.
   `net.Interfaces` are follow-ons; public DNS and service-name lookups fail under DST rather than touching
   host resolver state.
 
+- **Level 2 — access-granularity interleaving + DPOR. LANDED.** The `-race` access hooks double as DST
+  scheduling decision points (`-tags dst -race` builds), explored systematically via source-DPOR (sleep
+  sets + weak-initial backtracks) with the HB race detector as deterministic oracle, exposed as
+  `Explore`/`ExploreWith`/`Replay`. Increments D1–D5 implemented and validated (see the "Level 2" design
+  section below; enforcement: the 290-program sweep `TestDSTExploreSweep`, `TestDSTExploreComplete`,
+  the race-oracle and replay tests, and build-mode inertness `TestDSTAccessYieldBuildModeInert`).
+
 ### Pending features
 
 These bring the remaining real I/O into the bubble and then layer fault injection on top. Each is
@@ -430,12 +437,6 @@ virtualized in-memory and deterministic, riding the existing scheduling/time det
 - **Fault orchestration** — compose scheduling, network, disk, and crash/restart faults under one seed,
   with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound); the
   scheduling- and network/disk-fault targets share one *victim-designation* contract designed here.
-- **Level 2 — access-granularity interleaving + DPOR** — make the `-race` access hooks double as DST
-  scheduling decision points, so the simulation explores interleavings at memory-access granularity,
-  pruned by DPOR, with the HB race detector as oracle. Closes Gap A (the interleaving-granularity half of
-  the Completeness caveat) completely. Designed in full above ("Level 2 — …"); a scheduling-completeness
-  axis, orthogonal to the I/O features.
-
 Ordering: the landed runtime substrate is a precondition for all; the I/O features (network → disk →
 io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
 once there is something to fault. Level 2 extends the scheduling axis itself and depends only on the
@@ -583,7 +584,7 @@ just incomplete).
 
 ## Level 2 — access-granularity interleaving + DPOR (systematic concurrency testing)
 
-Status: **design**. This is the completeness extension the Completeness caveat names ("Completeness can
+Status: **implemented and validated** (increments D1–D5; see Landed). This is the completeness extension the Completeness caveat names ("Completeness can
 be increased additively by injecting cooperative preemption points … still deterministically — see Seq
 5"), carried to its full form: make the `-race` detector's memory-access instrumentation points double
 as DST scheduling decision points, so the simulation explores interleavings at **memory-access
@@ -747,9 +748,11 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
 - **The yield primitive.** `goyield`-shaped: requeue the current G on the local runq and `schedule()` →
   `findRunnable` → `dstFindRunnable` (the existing seam). The current G stays runnable, so the seam never
   runs a blocked G — soundness is inherited from Seq 5 unchanged.
-- **The safe-point guard** (DST-L2-1): yield only when `dstActive() && g.bubble != nil && g == g.m.curg
-  && g.m.locks == 0 && !g.dstInRaceHook` (the last a reentrancy guard). Any failure → record the access
-  but do not yield (sound; reduces completeness only).
+- **The safe-point guard** (DST-L2-1): yield only when `dstActive() && dstSchedKind == dstSchedScheduled
+  && g.bubble != nil && g == g.m.curg && g.m.locks == 0` — the strategy condition confines access
+  yields to Explore's scheduled strategy, so Random/PCT runs are byte-for-byte unaffected. (No separate
+  reentrancy guard is needed: the hook calls only uninstrumented runtime code, so it cannot re-enter
+  itself.) Any failure → record the access but do not yield (sound; reduces completeness only).
 - **Shared-address filtering (tractability + faithfulness).** A yield is meaningful only at a byte interval
   ≥2 goroutines access — a private/stack/single-owner access is independent (Mazurkiewicz), and yielding
   there explores nothing new while multiplying transitions. An access is a transition iff it *conflicts*
@@ -1128,9 +1131,10 @@ relation.
 ## Open questions
 
 - **GC under DST** is its own design problem with a full scope of its own — see
-  "Deterministic GC for DST" below. Current state (Tier 0): `simulation.Run` disables GC during a run and
-  reaps `sync.Pool`s on return (a stopgap). The full scope and tiers are written up so the depth of
-  fix is a deliberate choice, not a default.
+  "Deterministic GC for DST" below. Current state (Tier 2, landed): GC stays enabled in-run with the
+  deterministic per-object trigger, STW mark + synchronous sweep, and the bubble-scoped finalizer &
+  cleanup drain; the cross-Run `sync.Pool` reap is folded into the in-bubble run-end fixpoint. The
+  full scope and tiers are written up so the depth of fix is a deliberate choice, not a default.
 - **Upstreamability**: whether the runtime knobs are kept as a fork patch or shaped to be proposable
   upstream (the `randomizeScheduler`-as-knob framing is the most upstream-friendly).
 
@@ -1218,7 +1222,7 @@ quiescence-only MVP leaves.
 
 ### Tiers (choose deliberately)
 
-- **Tier 0 — current.** GC off during a run + `sync.Pool` reap on `simulation.Run` return. *Unsound*: no
+- **Tier 0 — superseded (was the stopgap).** GC off during a run + `sync.Pool` reap on `simulation.Run` return. *Unsound*: no
   in-run finalizers, unbounded intra-run memory, relies on a Pool-victim-cache implementation detail.
   A working stopgap, not a design.
 - **Tier 1 — quiescence GC.** Force GC at synctest quiescence points; leave `fing` async. Deterministic
@@ -1231,7 +1235,7 @@ quiescence-only MVP leaves.
   does not fire after `f`'s final `Put`, so the pooled object survives to the next Run regardless. The
   reap (or an equivalent forced end-of-Run GC) stays until something else evicts cross-Run pool state.
   See "Interaction with the Tier-0 pool reap" below.
-- **Tier 2 — general deterministic GC.** Deterministic **heap-ratio-triggered STW GC** that can fire
+- **Tier 2 — current (landed).** Deterministic **heap-ratio-triggered STW GC** that can fire
   mid-execution (dimensions 1, 2, 11) + **synchronous, bubble-aware, deterministic finalizer & cleanup
   drain** (3–6) + synchronous sweep (8) + scavenger off (9) + deterministic assists (10). Works for any
   SUT. This is a substantial, GC-internals-deep change and the riskiest in the whole DST effort; it can
@@ -1654,11 +1658,10 @@ below is not adopted; with it adopted, the drain may run **per-GC** and discover
 deterministic.
 
 **As built (Chunk B), discovery is per-cycle but the drain still runs at quiescence — these are
-separate axes.** A.5's relative trigger (adopted) makes *discovery* per-cycle deterministic in a fixed
-normal build: which GC cycle queues a given object is a function of the seed. (That per-cycle
-byte-exactness is **not in the contract** and is not tested — it is sub-observable byte-trigger noise,
-perturbed by -race or binary composition; the hardening that downgraded the discovery test to set-level
-removed the `dstFinqSeq` per-cycle probe. See the layered-contract section below.) That is independent
+separate axes.** A.5's relative trigger (adopted) makes *discovery* per-cycle deterministic: which GC
+cycle queues a given object is a function of the seed, **in the contract** since Phase 2a (the
+per-object trigger made it robust to -race and binary composition) and enforced by
+`TestDSTGCPerCycleDiscoveryDeterministic` — see the layered-contract section below. That is independent
 of *when the queued finalizers run*. Chunk B runs them on the drain
 **at quiescence**, not per-GC, deliberately: a per-GC (mid-burst) drain would execute user finalizers
 while SUT goroutines are mid-execution (between cooperative yields), interleaving finalizer side effects
@@ -1709,9 +1712,10 @@ memory-pressure-adaptive one wants the GOGC-scaled-with-entry-GC version. Either
 GOGC collapse (fixed = a floor; scaled = the real ratio); neither is *finer* than production.
 
 **Decision for the build (supersedes the prior plan):** adopt the per-bubble relative trigger as the DST
-heap trigger, so finalizer/weak **discovery is per-cycle deterministic** and **Chunk B's drain runs
-per-GC** (simpler, more production-faithful than quiescence-only). DST-GC-1 and D4 tighten from
-set-at-quiescence to **per-cycle discovery determinism**.
+heap trigger, so finalizer/weak **discovery is per-cycle deterministic**. Discovery and callback
+*execution* are separate axes (see "As built (Chunk B)" above): discovery tightens to per-cycle, while
+the drain continues to run at quiescence, where callbacks execute in isolation against a quiescent
+bubble. DST-GC-1 and D4 tighten from set-at-quiescence to **per-cycle discovery determinism**.
 
 **A.5 — IMPLEMENTED (GOGC-scaled, full-faithful).** Landed as the GOGC-scaled-with-entry-GC version
 (the production-faithful option, user-chosen):
@@ -1863,5 +1867,6 @@ decides the drain's shape):
    violation — the heap trajectory must stay GOGC-plausible), tighten DST-GC-1 and the D4 discovery
    invariant to per-cycle determinism, and Chunk B's drain may run per-GC (simpler, more faithful to
    production timing). If not achievable cost-proportionately, the set-at-quiescence design stands and
-   the drain is quiescence-only. **This is a Spec-first / collapse-check decision: the chosen trigger
+   the drain is quiescence-only. *(Outcome: per-cycle discovery adopted; the quiescence drain was
+   retained — see "Decision for the build" and "As built (Chunk B)" above.)* **This is a Spec-first / collapse-check decision: the chosen trigger
    must remain a faithful GOGC collapse, neither finer nor coarser.**

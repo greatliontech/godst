@@ -515,8 +515,9 @@ type dstFinObj struct{ b [256]byte }
 // observable (the GC count and the total set of finalizers discovered), which is
 // the DST contract (DST-GC-1): deterministic in normal AND -race builds (the
 // trigger fires the right number of times with the right total). Which GC *cycle*
-// discovers a given object is sub-observable byte-trigger noise, not part of the
-// contract — the simulation neither claims nor tests it (design.md D1).
+// discovers a given object is ALSO contractual since the per-object trigger
+// landed (per-cycle discovery determinism, design.md D1); that finer observable
+// is exercised by DSTGCPerCycle / TestDSTGCPerCycleDiscoveryDeterministic.
 func DSTGCFinDiscovery() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	var ngc uint32

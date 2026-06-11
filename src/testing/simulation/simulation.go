@@ -45,9 +45,11 @@
 //     allocated bytes rather than span-granular heap layout).
 //
 // Not in the contract: byte-level heap MemStats fields
-// (HeapAlloc/HeapInuse/HeapReleased/HeapIdle). These remain sub-observable noise
-// of allocator span layout and scavenging. A program must not assert on them; size
-// memory behavior by NumGC and Options.MemoryLimit.
+// (HeapAlloc/HeapInuse/HeapReleased/HeapIdle, Sys and the per-subsystem *Sys
+// fields). These remain sub-observable noise of allocator span layout and
+// scavenging, and NumGC driven by an environment GOMEMLIMIT is likewise out of
+// contract. A program must not assert on them; size memory behavior by NumGC
+// and Options.MemoryLimit.
 //
 // # Build constraint
 //
@@ -286,9 +288,10 @@ func leaveSimulation() {
 // goroutine schedule, and the GC count are a function of the seed (the world is
 // stopped during mark, so no concurrent mark worker interleaves with the
 // simulated goroutines and no wall-clock-timed floating garbage perturbs the GC
-// count). The exact heap byte at which a GC triggers carries accounting noise
-// (from process heap layout) that is not part of the observable determinism
-// guarantee; see the package design notes on finalizer discovery. Within Run, time
+// count). The GC trigger fires from per-object allocated bytes, so the GC count
+// and which cycle discovers a finalizer or weak reference are part of the
+// determinism contract (see the package overview); only byte-level heap MemStats
+// remain sub-observable allocator noise. Within Run, time
 // is virtual (testing/synctest semantics): it advances only when every goroutine
 // started within f is durably blocked.
 //
