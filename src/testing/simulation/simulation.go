@@ -300,6 +300,10 @@ func leaveSimulation() {
 // runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the simulation are
 // ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
 //
+// If f exits by calling runtime.Goexit, as when it calls t.Fatal on an enclosing
+// *testing.T, Run restores the simulation state and then exits its caller with
+// runtime.Goexit.
+//
 // A goroutine in f that never blocks and never makes a function call (e.g. a
 // bare for{}) will not be preempted and will stall the simulation; real code
 // rarely does this.
@@ -370,12 +374,12 @@ func RunWith(seed uint64, opts Options, f func()) {
 func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, prefix, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, prefix, true, f)
 }
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, propagateGoexit bool, f func()) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
@@ -393,5 +397,16 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetAsyncPreemptOff(oldPreempt)
 		runtime.GOMAXPROCS(oldProcs)
 	}()
-	synctest.Run(f)
+	if propagateGoexit {
+		returned := false
+		synctest.Run(func() {
+			f()
+			returned = true
+		})
+		if !returned {
+			runtime.Goexit()
+		}
+	} else {
+		synctest.Run(f)
+	}
 }

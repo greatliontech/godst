@@ -5,6 +5,8 @@
 package simulation
 
 import (
+	"internal/testenv"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -236,6 +238,38 @@ func TestRunWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 				t.Fatalf("RunWith left simulation active after rejecting %s", tt.name)
 			}
 		})
+	}
+}
+
+func TestRunFatalExitsCaller(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	const helperEnv = "GO_WANT_SIMULATION_FATAL_HELPER=1"
+	if os.Getenv("GO_WANT_SIMULATION_FATAL_HELPER") == "1" {
+		Run(1, func() {
+			t.Fatal("fatal inside simulation")
+		})
+		t.Fatal("simulation.Run returned after Fatal")
+		return
+	}
+
+	testenv.MustHaveExec(t)
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestRunFatalExitsCaller$", "-test.count=1")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, helperEnv)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("helper test passed unexpectedly:\n%s", out)
+	}
+	if !strings.Contains(string(out), "fatal inside simulation") {
+		t.Fatalf("helper output missing simulation fatal:\n%s", out)
+	}
+	if strings.Contains(string(out), "panic:") {
+		t.Fatalf("simulation.Run aborted by panic, want testing Goexit:\n%s", out)
+	}
+	if strings.Contains(string(out), "simulation.Run returned after Fatal") {
+		t.Fatalf("simulation.Run returned after Fatal:\n%s", out)
 	}
 }
 
