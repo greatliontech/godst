@@ -25,6 +25,215 @@ func isDSTUnsupportedNetOption(err error, option string) bool {
 	return errors.As(err, &opErr) && strings.Contains(opErr.Err.Error(), option+" unsupported under deterministic simulation")
 }
 
+func isDSTUnsupportedDNSLookup(err error) bool {
+	var dnsErr *DNSError
+	return errors.As(err, &dnsErr) && dnsErr.Err == "DNS lookup unsupported under deterministic simulation"
+}
+
+func isDSTUnsupportedServiceLookup(err error) bool {
+	var dnsErr *DNSError
+	return errors.As(err, &dnsErr) && strings.Contains(dnsErr.Err, "service lookup unsupported under deterministic simulation")
+}
+
+func TestDSTResolverAPIsDoNotTouchHost(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	ctx := context.Background()
+	r := &Resolver{PreferGo: true, Dial: func(context.Context, string, string) (Conn, error) {
+		t.Fatal("resolver Dial called under DST")
+		return nil, nil
+	}}
+	originalDefault := DefaultResolver
+	DefaultResolver = r
+	defer func() { DefaultResolver = originalDefault }()
+
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "LookupHost",
+			call: func() error {
+				_, err := LookupHost("example.com")
+				return err
+			},
+		},
+		{
+			name: "Resolver.LookupHost",
+			call: func() error {
+				_, err := r.LookupHost(ctx, "example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupIP",
+			call: func() error {
+				_, err := LookupIP("example.com")
+				return err
+			},
+		},
+		{
+			name: "Resolver.LookupIPAddr",
+			call: func() error {
+				_, err := r.LookupIPAddr(ctx, "example.com")
+				return err
+			},
+		},
+		{
+			name: "Resolver.LookupIP",
+			call: func() error {
+				_, err := r.LookupIP(ctx, "ip", "example.com")
+				return err
+			},
+		},
+		{
+			name: "Resolver.LookupNetIP",
+			call: func() error {
+				_, err := r.LookupNetIP(ctx, "ip", "example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupCNAME",
+			call: func() error {
+				_, err := LookupCNAME("example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupSRV",
+			call: func() error {
+				_, _, err := LookupSRV("xmpp-server", "tcp", "example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupMX",
+			call: func() error {
+				_, err := LookupMX("example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupNS",
+			call: func() error {
+				_, err := LookupNS("example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupTXT",
+			call: func() error {
+				_, err := LookupTXT("example.com")
+				return err
+			},
+		},
+		{
+			name: "LookupAddr",
+			call: func() error {
+				_, err := LookupAddr("192.0.2.1")
+				return err
+			},
+		},
+	}
+
+	simulation.Run(1, func() {
+		for _, tt := range cases {
+			if err := tt.call(); !isDSTUnsupportedDNSLookup(err) {
+				t.Fatalf("%s under DST error = %v, want deterministic unsupported-DNS error", tt.name, err)
+			}
+		}
+
+		if _, err := LookupPort("tcp", "http"); !isDSTUnsupportedServiceLookup(err) {
+			t.Fatalf("LookupPort under DST error = %v, want deterministic unsupported-service error", err)
+		}
+	})
+}
+
+func TestDSTResolverAPIsKeepNoIOFastPaths(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	ctx := context.Background()
+
+	simulation.Run(1, func() {
+		addrs, err := LookupHost("192.0.2.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(addrs) != 1 || addrs[0] != "192.0.2.1" {
+			t.Fatalf("LookupHost literal = %v, want [192.0.2.1]", addrs)
+		}
+
+		ipAddrs, err := DefaultResolver.LookupIPAddr(ctx, "2001:db8::1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ipAddrs) != 1 || !ipAddrs[0].IP.Equal(ParseIP("2001:db8::1")) {
+			t.Fatalf("LookupIPAddr literal = %v, want 2001:db8::1", ipAddrs)
+		}
+
+		port, err := LookupPort("tcp", "443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if port != 443 {
+			t.Fatalf("LookupPort numeric = %d, want 443", port)
+		}
+
+		if _, err := LookupAddr("not-an-ip"); err == nil || isDSTUnsupportedDNSLookup(err) {
+			t.Fatalf("LookupAddr invalid address error = %v, want validation error", err)
+		}
+
+		invalidName := "!!!.###.bogus..domain."
+		invalidNameCases := []struct {
+			name    string
+			wantErr string
+			call    func() error
+		}{
+			{
+				name:    "LookupSRV",
+				wantErr: "_xmpp-server._tcp." + invalidName,
+				call: func() error {
+					_, _, err := LookupSRV("xmpp-server", "tcp", invalidName)
+					return err
+				},
+			},
+			{
+				name:    "LookupMX",
+				wantErr: invalidName,
+				call: func() error {
+					_, err := LookupMX(invalidName)
+					return err
+				},
+			},
+			{
+				name:    "LookupNS",
+				wantErr: invalidName,
+				call: func() error {
+					_, err := LookupNS(invalidName)
+					return err
+				},
+			},
+			{
+				name:    "LookupTXT",
+				wantErr: invalidName,
+				call: func() error {
+					_, err := LookupTXT(invalidName)
+					return err
+				},
+			},
+		}
+		for _, tt := range invalidNameCases {
+			var dnsErr *DNSError
+			if err := tt.call(); !errors.As(err, &dnsErr) || dnsErr.Err != errNoSuchHost.Error() || dnsErr.Name != tt.wantErr {
+				t.Fatalf("%s invalid name error = %v, want no-such-host validation error for %q", tt.name, err, tt.wantErr)
+			}
+		}
+	})
+}
+
 func TestDSTNetTypedAndPacketAPIsDoNotTouchHost(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")

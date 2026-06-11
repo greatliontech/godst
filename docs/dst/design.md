@@ -209,9 +209,11 @@ re-Listen the same address). This is the reliable, in-order **base** on which ne
 configuration fail under DST rather than being silently ignored, because they require raw socket semantics
 the base model does not provide. Explicitly disabling MPTCP is accepted because the base model is ordinary
 TCP. DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed
-synthetic set consistent with this addressing) are follow-on increments. Unsupported networks at the
-intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or falling
-through to the real OS. FIPS/Boring-style configs are out of scope as elsewhere.
+synthetic set consistent with this addressing) are follow-on increments. Public DNS resolver APIs and
+service-name port lookups fail under DST rather than touching the host resolver, while literal-IP,
+numeric-port, and pre-I/O validation fast paths keep their normal no-I/O behavior. Unsupported networks
+at the intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or
+falling through to the real OS. FIPS/Boring-style configs are out of scope as elsewhere.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -407,7 +409,9 @@ the fixed seams, so later steps add, never rewrite.
   itself. Determinism rides the scheduler (no new seed plumbing); the registry is keyed by a per-run
   epoch so it resets between runs. The reliable, in-order base for network faults. See the "In-memory
   deterministic network" section above; tested by `TestDSTNet`. Caveat: only the `net.Conn` interface — code type-asserting
-  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/UDP/Unix/`net.Interfaces` are follow-ons.
+  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/service-name ports/UDP/Unix/
+  `net.Interfaces` are follow-ons; public DNS and service-name lookups fail under DST rather than touching
+  host resolver state.
 
 ### Pending features
 

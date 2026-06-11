@@ -85,6 +85,14 @@ func dstUnsupportedNetOption(op, network string, source, addr Addr, option strin
 	return &OpError{Op: op, Net: network, Source: source, Addr: addr, Err: errors.New(option + " unsupported under deterministic simulation")}
 }
 
+func dstUnsupportedDNSLookup(name string) error {
+	return &DNSError{Err: "DNS lookup unsupported under deterministic simulation", Name: name}
+}
+
+func dstUnsupportedServiceLookup(network, service string) error {
+	return &DNSError{Err: "service lookup unsupported under deterministic simulation", Name: network + "/" + service}
+}
+
 func dstTCPAddrFamily(ip IP) string {
 	if ip.To4() != nil {
 		return "tcp4"

@@ -17,3 +17,7 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, err
 func dstListen(lc *ListenConfig, network, address string) (Listener, error) { return nil, nil }
 
 func dstUnsupportedNetAPI(op, network string, source, addr Addr) error { return nil }
+
+func dstUnsupportedDNSLookup(name string) error { return nil }
+
+func dstUnsupportedServiceLookup(network, service string) error { return nil }
