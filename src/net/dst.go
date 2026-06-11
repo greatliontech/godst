@@ -11,6 +11,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"syscall"
 	_ "unsafe" // for go:linkname
 )
 
@@ -357,7 +358,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	}
 	addr := &TCPAddr{IP: ip, Port: portnum}
 	if dstListenerConflict(network, ip, key, portnum, wildcard) {
-		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: errors.New("address already in use")}
+		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
 	}
 	l := &dstListener{
 		network: network,
@@ -417,7 +418,7 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, err
 	dstNet.mu.Unlock()
 
 	if l == nil {
-		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: errors.New("connection refused")}
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	}
 	localIP := IPv4(127, 0, 0, 1)
 	if dstAddrFamily(network, ip) == "tcp6" {
@@ -444,6 +445,6 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, err
 	case <-l.done:
 		p1.Close()
 		p2.Close()
-		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: errors.New("connection refused")}
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	}
 }

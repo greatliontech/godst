@@ -364,6 +364,34 @@ func TestDSTNetExplicitMPTCPDisableUsesBaseTCP(t *testing.T) {
 	})
 }
 
+func TestDSTNetErrorIdentity(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		c, err := Dial("tcp", "127.0.0.1:1")
+		if c != nil {
+			c.Close()
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("refused Dial error = %v, want errors.Is ECONNREFUSED", err)
+		}
+
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		dup, err := Listen("tcp", ln.Addr().String())
+		if dup != nil {
+			dup.Close()
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("duplicate Listen error = %v, want errors.Is EADDRINUSE", err)
+		}
+	})
+}
+
 func TestDSTNetRejectsUnsupportedOptions(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")

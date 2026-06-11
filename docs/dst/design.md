@@ -189,8 +189,9 @@ connection back while pushing the server end onto the listener's accept queue. A
 `net.Pipe` endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with
 the simulated local/remote `*net.TCPAddr`. `DialContext` keeps the public context contract (nil panics,
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set,
-`:0` listeners receive deterministic nonzero ports, and listener lookup uses canonical simulated IPs
-(`localhost` maps to loopback). The seam is the exported
+`:0` listeners receive deterministic nonzero ports, listener lookup uses canonical simulated IPs
+(`localhost` maps to loopback), and refused connects / duplicate listens preserve standard syscall error
+identities for `errors.Is`. The seam is the exported
 `Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it
 compiles out without `-tags dst`; net's internal lookups stay real (the program does not exercise real
 sockets under DST).
