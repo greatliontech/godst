@@ -16,10 +16,10 @@
 // make wall-clock time, real file I/O, unsupported network kinds, or cgo
 // deterministic; programs under test model those surfaces in-memory or avoid them.
 //
-// The determinism boundary is Run itself: these are virtualized only inside a
-// Run. Nondeterminism a program captures *before* Run — e.g. reading time.Now or
-// a real pid in an init function and stashing it in a package variable — is
-// outside the contract; acquire such values inside Run.
+// The determinism boundary is Run/Test itself: these are virtualized only inside
+// a simulation. Nondeterminism a program captures *before* simulation — e.g.
+// reading time.Now or a real pid in an init function and stashing it in a package
+// variable — is outside the contract; acquire such values inside the simulation.
 //
 // It finds logical concurrency bugs — ordering, atomicity, deadlock, lost
 // wakeup, stale read. It runs single-threaded and does not reproduce data races
@@ -51,15 +51,17 @@
 //
 // # Build constraint
 //
-// Run and RunWith require building with -tags dst, which fixes the process-global
-// map hash key (a precondition for deterministic map iteration order that cannot
-// be set at runtime). They panic if the binary was not built with that tag.
+// Run, RunWith, Test, and TestWith require building with -tags dst, which fixes
+// the process-global map hash key (a precondition for deterministic map iteration
+// order that cannot be set at runtime). They panic if the binary was not built
+// with that tag.
 package simulation
 
 import (
 	"internal/synctest"
 	"runtime"
 	"sync/atomic"
+	"testing"
 	_ "unsafe" // for go:linkname
 )
 
@@ -153,6 +155,9 @@ func dstClearSimEnv()
 //go:linkname dstSetMemLimit runtime.dstSetMemLimit
 func dstSetMemLimit(limit int64)
 
+//go:linkname testingSimulationTest testing/simulation.testingSimulationTest
+func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
+
 // Strategy selects how RunWith explores goroutine interleavings. All strategies
 // are sound (they only reorder goroutines that are simultaneously runnable, a
 // real degree of freedom) and deterministic (a function of the seed); they differ
@@ -182,7 +187,8 @@ const (
 	kindScheduled // follow an explicit schedule prefix; used by Explore (see explore.go)
 )
 
-// Options configures RunWith. The zero Options is equivalent to Run (Random).
+// Options configures RunWith and TestWith. The zero Options is equivalent to
+// Run or Test (Random).
 type Options struct {
 	// Strategy is the interleaving-exploration strategy (default Random).
 	Strategy Strategy
@@ -192,32 +198,34 @@ type Options struct {
 	// per-seed hit probability. A value <= 0 selects the default; positive values
 	// must fit in the runtime scheduler's int32 strategy field.
 	Depth int
-	// Steps is the PCT estimate of the number of scheduling decisions in a run;
+	// Steps is the PCT estimate of the number of scheduling decisions in a simulation;
 	// the priority-change points are placed uniformly in [1,Steps]. Ignored unless
 	// Strategy==PCT. Default 1000; a rough over-estimate is fine. A value <= 0
 	// selects the default; positive values must fit in the runtime scheduler's
 	// int32 strategy field.
 	Steps int
 
-	// Hostname and PID are the simulated process identity: within Run, os.Hostname
-	// and os.Getpid return these instead of the real machine's values (which vary
-	// per run and per host, and would leak nondeterminism into any program under
-	// test that reads them). Both Run and RunWith fix them — to "sim" and 1 by
-	// default — so even plain Run is reproducible for a SUT that reads pid/hostname.
+	// Hostname and PID are the simulated process identity: within a simulation,
+	// os.Hostname and os.Getpid return these instead of the real machine's values
+	// (which vary per run and per host, and would leak nondeterminism into any
+	// program under test that reads them). Run, RunWith, Test, and TestWith fix
+	// them — to "sim" and 1 by default — so even plain Run or Test is reproducible
+	// for a SUT that reads pid/hostname.
 	//
-	// The rest of the process-identity surface is fixed to deterministic constants
-	// during a run (not configurable): os.Getppid is 1; os.Getuid/Geteuid are 7777
-	// and os.Getgid/Getegid are 7777; os/user.Current reports user "sim" (uid/gid
-	// 7777, home "/home/sim"). crypto/rand is seeded from the run's deterministic
-	// RNG, so UUIDs/nonces/tokens/keys replay too — outside a run crypto/rand is
-	// unaffected and remains the real OS source. (crypto/rand is deterministic in
-	// the standard configuration only; FIPS mode keeps a process-global SP 800-90A
+	// The rest of the process-identity surface is fixed to deterministic
+	// constants during a simulation (not configurable): os.Getppid is 1;
+	// os.Getuid/Geteuid are 7777 and os.Getgid/Getegid are 7777; os/user.Current
+	// reports user "sim" (uid/gid 7777, home "/home/sim"). crypto/rand is seeded
+	// from the simulation's deterministic RNG, so UUIDs/nonces/tokens/keys replay
+	// too — outside a simulation crypto/rand is unaffected and remains the real OS
+	// source. (crypto/rand is deterministic in the standard configuration only;
+	// FIPS mode keeps a process-global SP 800-90A
 	// DRBG and BoringCrypto its own generator, neither of which is a simulation
 	// configuration.)
 	Hostname string
 	PID      int
 
-	// NumCPU is the simulated runtime.NumCPU() within Run (default 8; any value
+	// NumCPU is the simulated runtime.NumCPU() within a simulation (default 8; any value
 	// <= 0 selects the default). GOMAXPROCS is independently forced to 1 for
 	// determinism, but NumCPU is reported separately, so a SUT that sizes worker
 	// pools or shards by NumCPU still creates real concurrency for the simulation
@@ -294,11 +302,11 @@ func leaveSimulation() {
 // This is a cross-Run pool-lifetime concern, distinct from the in-run memory
 // bounding that the deterministic in-run GC provides.
 //
-// Run, RunWith, Explore, ExploreWith, and Replay are process-global simulation
-// operations: they must not overlap in one process, and must not be called from
-// within a synctest bubble. Attempts to change GOMAXPROCS with
-// runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the simulation are
-// ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
+// Run, RunWith, Test, TestWith, Explore, ExploreWith, and Replay are
+// process-global simulation operations: they must not overlap in one process,
+// and must not be called from within a synctest bubble. Attempts to change
+// GOMAXPROCS with runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the
+// simulation are ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
 //
 // If f exits by calling runtime.Goexit, as when it calls t.Fatal on an enclosing
 // *testing.T, Run restores the simulation state and then exits its caller with
@@ -309,6 +317,13 @@ func leaveSimulation() {
 // rarely does this.
 func Run(seed uint64, f func()) {
 	RunWith(seed, Options{}, f)
+}
+
+// Test runs f inside a deterministic simulation seeded by seed, passing f a
+// bubble-scoped *testing.T like [testing/synctest.Test]. It is equivalent to
+// TestWith(t, seed, Options{}, f).
+func Test(t *testing.T, seed uint64, f func(*testing.T)) {
+	TestWith(t, seed, Options{}, f)
 }
 
 // RunWith is Run with an explicit exploration Strategy (Random or PCT). Use it to
@@ -327,8 +342,29 @@ func Run(seed uint64, f func()) {
 //		})
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
-	kind := kindRandom
-	var depth, steps int32
+	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, f)
+}
+
+// TestWith is Test with explicit RunWith-style options. The *testing.T passed to
+// f has the same synctest properties as the one passed by [testing/synctest.Test]:
+// cleanup functions and t.Context run inside the bubble, and T.Run, T.Parallel,
+// and T.Deadline must not be called.
+func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
+	kind, depth, steps, hostname, pid, numcpu := runOptions("TestWith", opts)
+	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
+	defer leaveSimulation()
+	var ok bool
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, true, func() {
+		ok = testingSimulationTest(t, f)
+	})
+	if !ok {
+		t.FailNow()
+	}
+}
+
+func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostname string, pid, numcpu int) {
+	kind = kindRandom
 	switch opts.Strategy {
 	case Random:
 	case PCT:
@@ -336,35 +372,35 @@ func RunWith(seed uint64, opts Options, f func()) {
 		depth, steps = 3, 1000 // defaults
 		if opts.Depth > 0 {
 			if opts.Depth > maxStrategyParam {
-				panic("testing/simulation: RunWith PCT Depth overflows runtime strategy field")
+				panic("testing/simulation: " + api + " PCT Depth overflows runtime strategy field")
 			}
 			depth = int32(opts.Depth)
 		}
 		if opts.Steps > 0 {
 			if opts.Steps > maxStrategyParam {
-				panic("testing/simulation: RunWith PCT Steps overflows runtime strategy field")
+				panic("testing/simulation: " + api + " PCT Steps overflows runtime strategy field")
 			}
 			steps = int32(opts.Steps)
 		}
 	default:
-		panic("testing/simulation: RunWith unknown Strategy")
+		panic("testing/simulation: " + api + " unknown Strategy")
 	}
-	hostname := opts.Hostname
+	hostname = opts.Hostname
 	if hostname == "" {
 		hostname = defaultHostname
 	}
-	pid := opts.PID
+	pid = opts.PID
 	if pid == 0 {
 		pid = defaultPID
 	}
-	numcpu := opts.NumCPU
+	numcpu = opts.NumCPU
 	if numcpu <= 0 {
 		// <= 0, not == 0: a negative NumCPU must not fall through to the real host
 		// count (the runtime gate is dstSimNumCPU > 0), which would silently leak a
 		// per-host value into the run. Both 0 and negative mean "use the default".
 		numcpu = defaultNumCPU
 	}
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, f)
+	return kind, depth, steps, hostname, pid, numcpu
 }
 
 // run sets the determinism preconditions, activates DST, and runs f in a synctest

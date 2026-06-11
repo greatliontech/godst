@@ -87,10 +87,10 @@ DST is enabled and seeded through a **public API**, not GODEBUG. The original `G
 knob has been **removed**.
 
 The public API lives at **`testing/simulation`**, a sibling of the `testing/synctest` it builds on:
-the user surface is a thin, dependency-light wrapper (`runtime` + `internal/synctest` only), while the
-determinism *mechanism* lives in `runtime` and is reached via `//go:linkname`. This mirrors how
-`testing/synctest` is the public face of an `internal/synctest` mechanism — the public name is a
-testing construct, not a `runtime` sub-package.
+the user surface is a thin wrapper over `runtime`, `internal/synctest`, and the `testing` package's
+synctest child-`T` bridge, while the determinism *mechanism* lives in `runtime` and is reached via
+`//go:linkname`. This mirrors how `testing/synctest` is the public face of an `internal/synctest`
+mechanism — the public name is a testing construct, not a `runtime` sub-package.
 
 - **`simulation.Run(seed uint64, f func())`** is the entry point. It **enforces the determinism
   preconditions itself** — they are not user knobs that can be forgotten: it sets `GOMAXPROCS(1)`,
@@ -98,6 +98,11 @@ testing construct, not a `runtime` sub-package.
   the seed), and restores everything on return (including on panic). `Run` is bubble-scoped: each
   call is an independent, order-immune deterministic universe (the per-g tree re-roots per bubble in
   `synctestRun` via `dstBubbleRoot`), so a failing test reproduces identically in isolation.
+- **`simulation.Test(t *testing.T, seed uint64, f func(*testing.T))`** is the `testing`-oriented
+  entry point. It has the same deterministic envelope as `Run`, but gives `f` a bubble-scoped child
+  `*testing.T` with the same control semantics as `testing/synctest.Test`: `t.Fatal`/`FailNow`
+  aborts the caller, `t.Cleanup` and `t.Context` run inside the bubble, and testing durations are
+  finalized outside the bubble. `TestWith` is the `Options`-taking form, matching `RunWith`.
 - **Runtime core** (`runtime/dst.go`): `dstSeed atomic.Uint64` (0 = off) is the live flag the hot
   paths and sysmon read; `dstActive()` is the hot-path check; `dstActivate(seed)` roots the caller's
   per-g stream then sets the flag; `dstSetAsyncPreemptOff`, `dstDeactivate`, `dstBuilt` support `Run`.
@@ -123,7 +128,7 @@ reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by 
 real concurrency for the schedule to explore). The rest are fixed deterministic constants documented
 on `Options`: `ppid=1`, `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the
 simulated identity is observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
-Both `Run` and `RunWith` fix the identity, so even plain `Run` is reproducible here. This
+`Run`, `RunWith`, `Test`, and `TestWith` fix the identity, so even plain `Run` or `Test` is reproducible here. This
 and the crypto/rand seam below are the only places the fork patches packages other than
 `runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
 The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.

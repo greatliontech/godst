@@ -273,6 +273,125 @@ func TestRunFatalExitsCaller(t *testing.T) {
 	}
 }
 
+func TestTestFatalExitsCaller(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	const helperEnv = "GO_WANT_SIMULATION_TEST_FATAL_HELPER=1"
+	if os.Getenv("GO_WANT_SIMULATION_TEST_FATAL_HELPER") == "1" {
+		Test(t, 1, func(t *testing.T) {
+			t.Fatal("fatal inside simulation test")
+		})
+		t.Fatal("simulation.Test returned after Fatal")
+		return
+	}
+
+	testenv.MustHaveExec(t)
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestTestFatalExitsCaller$", "-test.count=1")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, helperEnv)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("helper test passed unexpectedly:\n%s", out)
+	}
+	if !strings.Contains(string(out), "fatal inside simulation test") {
+		t.Fatalf("helper output missing simulation Test fatal:\n%s", out)
+	}
+	if strings.Contains(string(out), "panic:") {
+		t.Fatalf("simulation.Test aborted by panic, want testing Goexit:\n%s", out)
+	}
+	if strings.Contains(string(out), "simulation.Test returned after Fatal") {
+		t.Fatalf("simulation.Test returned after Fatal:\n%s", out)
+	}
+}
+
+func TestTestProvidesBubbleScopedT(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	cleanupDone := make(chan struct{}, 1)
+	contextDone := make(chan struct{}, 1)
+	Test(t, 1, func(t *testing.T) {
+		cleanupCh := make(chan struct{})
+		t.Cleanup(func() {
+			close(cleanupCh)
+		})
+		go func() {
+			<-cleanupCh
+			cleanupDone <- struct{}{}
+		}()
+		go func() {
+			<-t.Context().Done()
+			contextDone <- struct{}{}
+		}()
+	})
+	select {
+	case <-cleanupDone:
+	default:
+		t.Fatalf("simulation.Test cleanup did not run inside the bubble")
+	}
+	select {
+	case <-contextDone:
+	default:
+		t.Fatalf("simulation.Test context was not canceled before returning")
+	}
+}
+
+func TestTestWithOptions(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	TestWith(t, 1, Options{Hostname: "sim-test", PID: 123, NumCPU: 2}, func(t *testing.T) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hostname != "sim-test" {
+			t.Fatalf("os.Hostname() = %q, want sim-test", hostname)
+		}
+		if pid := os.Getpid(); pid != 123 {
+			t.Fatalf("os.Getpid() = %d, want 123", pid)
+		}
+		if numCPU := runtime.NumCPU(); numCPU != 2 {
+			t.Fatalf("runtime.NumCPU() = %d, want 2", numCPU)
+		}
+	})
+}
+
+func TestTestWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts Options
+		want string
+	}{
+		{
+			name: "unknown strategy",
+			opts: Options{Strategy: Strategy(99)},
+			want: "TestWith unknown Strategy",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			var got string
+			func() {
+				defer func() {
+					got = panicString(recover())
+				}()
+				TestWith(t, 1, tt.opts, func(*testing.T) { called = true })
+			}()
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("TestWith panic = %q, want substring %q", got, tt.want)
+			}
+			if called {
+				t.Fatalf("TestWith called the SUT after rejecting %s", tt.name)
+			}
+			if runActive.Load() {
+				t.Fatalf("TestWith left simulation active after rejecting %s", tt.name)
+			}
+		})
+	}
+}
+
 func TestExploreClocksModelStepZeroAccesses(t *testing.T) {
 	tr := exploreTrace{
 		accSeq:   []uint64{1, 2},

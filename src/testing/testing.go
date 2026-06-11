@@ -2156,6 +2156,14 @@ func testingSynctestTest(t *T, f func(*T)) (ok bool) {
 	return !t2.failed
 }
 
+// testingSimulationTest runs f within a simulation-backed synctest bubble.
+// It is called by simulation.Test, from within an already-created bubble.
+//
+//go:linkname testingSimulationTest testing/simulation.testingSimulationTest
+func testingSimulationTest(t *T, f func(*T)) (ok bool) {
+	return testingSynctestTest(t, f)
+}
+
 // Deadline reports the time at which the test binary will have
 // exceeded the timeout specified by the -timeout flag.
 //
