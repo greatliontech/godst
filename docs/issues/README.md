@@ -20,3 +20,4 @@ I/O into the bubble and then layers fault injection on top.
 
 | Issue | Lands | Summary |
 |-------|-------|---------|
+| [dst-audit-hardening](dst-audit-hardening.md) | before new DST features | Bottom-up hardening and optimization findings from the full `go1.26.4..HEAD` DST audit. |
