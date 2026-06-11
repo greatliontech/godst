@@ -56,6 +56,15 @@ var (
 	// run's bubble. They are detached before dstActive is set, ignored by the
 	// in-bubble drain, and released back to fing after dstDeactivate.
 	dstDeferredFinq *finBlock
+
+	// dstDrainingFinq is the chain the DST bubble drain is currently running
+	// (runFinqBlocks publishes it block-by-block on the drain path). Non-nil
+	// only while the drain is mid-chain, so a callback panic or Goexit — which
+	// abandons the drain's frame — leaves the unrun remainder discoverable for
+	// dstDiscardQueuedFinq instead of leaking it. Protected by the single-P
+	// cooperative schedule: only the drain writes it, and the driver reads it
+	// only after the drain has died.
+	dstDrainingFinq *finBlock
 )
 
 // Run-local finalizer queue accounting. finqueued/finexecuted are process-global
@@ -266,7 +275,23 @@ func runFinalizers() {
 // DST bubble drain (dstDrainFinq), so a finalizer runs identically whichever
 // goroutine drives it.
 func runFinqBlocks(fb *finBlock) {
-	onFing := getg() == fing
+	gp := getg()
+	onFing := gp == fing
+	// On the DST bubble drain, publish the chain being run (dstDrainingFinq) so
+	// a callback panic or Goexit — which abandons this frame — leaves the unrun
+	// remainder discoverable for the teardown discard (dstDiscardQueuedFinq).
+	// The ledger is kept per-entry on this path (the block-end add below is
+	// skipped) so a mid-block death leaves finqueued == finexecuted+discarded
+	// exact.
+	//
+	// Invariant the publish window relies on: drain death originates only
+	// inside the callback's reflectcall, where dstDrainingFinq points at the
+	// current (not yet freed) block. After the last entry of a block runs, the
+	// block is freed while the pointer still references it — that window is
+	// straight-line code (no park, no recoverable panic), so the discard, which
+	// runs only after the drain has died, can never observe it. Do not add a
+	// park or preemption point between the free below and the next publish.
+	onDrain := gp.bubble != nil && gp == gp.bubble.gcDrain
 	var (
 		frame    unsafe.Pointer
 		framecap uintptr
@@ -276,6 +301,9 @@ func runFinqBlocks(fb *finBlock) {
 		racefingo()
 	}
 	for fb != nil {
+		if onDrain {
+			dstDrainingFinq = fb
+		}
 		n := fb.cnt
 		for i := n; i > 0; i-- {
 			for onFing && dstParkFingIfBlocked() {
@@ -346,14 +374,27 @@ func runFinqBlocks(fb *finBlock) {
 			f.arg = nil
 			f.ot = nil
 			atomic.Store(&fb.cnt, i-1)
+			if onDrain {
+				lock(&finlock)
+				finexecuted++
+				unlock(&finlock)
+				if dstActive() {
+					dstFinqRunExecuted.Add(1)
+				}
+			}
 		}
 		next := fb.next
 		lock(&finlock)
-		finexecuted += uint64(n)
+		if !onDrain {
+			finexecuted += uint64(n)
+		}
 		fb.next = finc
 		finc = fb
 		unlock(&finlock)
 		fb = next
+	}
+	if onDrain {
+		dstDrainingFinq = nil
 	}
 }
 
@@ -437,15 +478,67 @@ func dstDrainFinq() {
 		if fb == nil {
 			return
 		}
-		n := uint64(0)
-		for b := fb; b != nil; b = b.next {
-			n += uint64(atomic.Load(&b.cnt))
-		}
+		// Ledger (finexecuted and dstFinqRunExecuted) is kept per-entry inside
+		// runFinqBlocks on the drain path, so a callback panic or Goexit cannot
+		// lose a block's worth of accounting.
 		runFinqBlocks(fb)
-		if dstActive() {
-			dstFinqRunExecuted.Add(int64(n))
-		}
 	}
+}
+
+// dstDiscardQueuedFinq discards every finalizer queued by the run — finq plus
+// the unrun remainder of a chain a dying drain abandoned (dstDrainingFinq) —
+// without running them. Used at teardown after the drain died (gcDrainDied):
+// nothing in-bubble can run them anymore, and releasing them to fing would run
+// bubble-stamped callbacks on a bubble-less goroutine, which fatals on a bubble
+// channel op (invariant DST-FIN-1). Finalizers are best-effort by the
+// SetFinalizer contract; the discard is deterministic. Entries are accounted as
+// executed so the queue ledger stays exact, and the blocks are returned to the
+// free cache so markroot stops pinning their arguments.
+func dstDiscardQueuedFinq() {
+	lock(&finlock)
+	fb := finq
+	finq = nil
+	if dstDrainingFinq != nil {
+		if fb != nil {
+			last := dstDrainingFinq
+			for last.next != nil {
+				last = last.next
+			}
+			last.next = fb
+		}
+		fb = dstDrainingFinq
+		dstDrainingFinq = nil
+	}
+	n := dstDiscardFinChainLocked(fb)
+	unlock(&finlock)
+	if n != 0 && dstActive() {
+		dstFinqRunExecuted.Add(int64(n))
+	}
+}
+
+// dstDiscardFinChainLocked nils the entries of every block in the chain,
+// accounts them as executed in the process-global ledger, and returns the
+// blocks to the free cache. Caller holds finlock. Returns the number of
+// entries discarded.
+func dstDiscardFinChainLocked(fb *finBlock) uint64 {
+	var n uint64
+	for fb != nil {
+		next := fb.next
+		cnt := atomic.Load(&fb.cnt)
+		for i := cnt; i > 0; i-- {
+			f := &fb.fin[i-1]
+			f.fn = nil
+			f.arg = nil
+			f.ot = nil
+		}
+		n += uint64(cnt)
+		atomic.Store(&fb.cnt, 0)
+		fb.next = finc
+		finc = fb
+		fb = next
+	}
+	finexecuted += n
+	return n
 }
 
 func isGoPointerWithoutSpan(p unsafe.Pointer) bool {

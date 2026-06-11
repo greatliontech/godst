@@ -481,6 +481,101 @@ func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTFinalizerBlockedDrainQuiescence verifies the drain wake guard:
+// when a finalizer blocks on a bubble channel, the drain is parked inside the
+// channel wait, and a later quiescence with finalizer work still pending must
+// not goready it there.
+//
+// Teeth: with the dstDrainParked check removed from dstDrainAtQuiescence, the
+// driver's wake corrupts the channel wait queue and the run dies with "fatal
+// error: runtime: sudog with non-nil elem" instead of printing "done".
+func TestDSTFinalizerBlockedDrainQuiescence(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinBlockedDrain", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("blocked-drain quiescence failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTFinalizerGoexitDrain verifies drain-death handling: a
+// finalizer that calls runtime.Goexit kills the drain; the driver must never
+// wake the dead g again, and callbacks queued after the death — including
+// bubble-channel-touching ones — are deterministically discarded in-run.
+//
+// Teeth: without the gdestroy clear, the next quiescence wake dies with "fatal
+// error: bad g->status in ready"; without the teardown discard, the queued
+// bubble-channel finalizer leaks to fing after deactivation and fatals with
+// "send on synctest channel from outside bubble".
+func TestDSTFinalizerGoexitDrain(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinGoexitDrain", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("Goexit drain death failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTFinalizerGoexitLedger verifies the finalizer queue ledger stays exact
+// when the drain dies mid-block: already-run entries are accounted per-entry in
+// runFinqBlocks, the unrun remainder by the teardown discard, so queued ==
+// executed.
+//
+// Teeth: with per-entry accounting reverted to the block-end add (which a
+// mid-block death skips), the already-run entries are never counted —
+// finPending() never clears, the Run-end fixpoint cannot terminate, and the
+// in-run ledger delta check reports a mismatch.
+func TestDSTFinalizerGoexitLedger(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinGoexitLedger", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("mid-block drain-death ledger failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTFinalizerStuckDrainRunEnd verifies that a drain still blocked inside a
+// finalizer at Run end is reported as the deterministic synctest deadlock — the
+// driver must not goready it out of the finalizer's channel wait.
+//
+// Teeth: with the stop-site dstDrainParked guard removed, the exit wake
+// corrupts the channel wait queue and the output is the "sudog with non-nil
+// elem" fatal instead of the deadlock panic.
+func TestDSTFinalizerStuckDrainRunEnd(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinStuckDrainRunEnd", "DSTSEED=12345")
+	if !strings.Contains(out, "deadlock: main bubble goroutine has exited but blocked goroutines remain") {
+		t.Fatalf("stuck drain at Run end not reported as deadlock:\n%s", out)
+	}
+	if strings.Contains(out, "sudog") || strings.Contains(out, "unreachable") {
+		t.Fatalf("stuck drain at Run end corrupted state or returned:\n%s", out)
+	}
+}
+
+// TestDSTFinalizerAbandonedChainReuse verifies that a chain abandoned by a
+// drain that never died (run 1 ends in a recorded/recovered deadlock with the
+// drain parked inside a finalizer forever) is freed at the next activation and
+// never spliced into a later run's discard ledger.
+//
+// Teeth: without dstDiscardAbandonedDrainChains at activation, run 2's
+// drain-death discard splices run 1's stale chain into run 2's run-local
+// executed counter, finPending() never clears, and run 2's end-of-run fixpoint
+// hangs - the test times out instead of printing "done".
+func TestDSTFinalizerAbandonedChainReuse(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinAbandonedChainReuse", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("abandoned drain chain reuse failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTFinalizerStuckDrainResidue verifies that when the drain is stuck
+// forever inside a finalizer at Run end, callbacks the run queued but the
+// drain never reached are discarded before deactivation - not leaked to the
+// bubble-less async workers.
+//
+// Teeth: without the discard at the stuck-drain Run-end branch, fing runs the
+// leaked bubble-channel finalizer after the Run and the testprog fatals with
+// "send on synctest channel from outside bubble" instead of printing "done".
+func TestDSTFinalizerStuckDrainResidue(t *testing.T) {
+	out := runTestProgDST(t, "DSTFinStuckDrainResidue", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("stuck-drain residue discard failed (got %q, want \"done\")", out)
+	}
+}
+
 // TestDSTFinalizerBubbleChannelOp verifies invariant DST-FIN-1: a finalizer that
 // does a bubble channel op runs without fatal inside dst.Run, because the
 // bubble-scoped drain goroutine (g.bubble == the bubble) runs it, not the async

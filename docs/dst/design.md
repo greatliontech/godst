@@ -1393,7 +1393,17 @@ Why this is the faithful collapse, dimension by dimension:
   heap trigger → nested STW GC → more finq; the drain loops `for finq != nil` so it absorbs its own
   garbage and terminates when allocation stops producing it. A finalizer that **blocks** on a bubble
   channel parks the drain goroutine; another bubble goroutine wakes it — deterministic, and faithful
-  (production's `fing` blocks too, just stalling all later finalizers). A finalizer that **spawns** a
+  (production's `fing` blocks too, just stalling all later finalizers). The driver's quiescence wake is
+  **wait-reason-checked** (`dstDrainParked`): it goreadys the drain only when the drain is parked at its
+  own drain park, never while it is blocked inside a callback (waking a g parked in a channel wait
+  corrupts that wait's sudog queue); a pending-work quiescence that finds the drain callback-blocked
+  skips the wake — sound, because the drain loops until the queues are empty when the callback's wait
+  completes. A drain still callback-blocked at Run end is reported by the `total != 1` deadlock check. A
+  callback that **panics** (recorded by Explore) or calls **runtime.Goexit** kills the drain: the death
+  clears the driver's reference (a dead g must never be woken) and every callback the run queued or
+  later discovers is **deterministically discarded** at quiescence and at Run-end teardown
+  (`dstDiscardQueuedFinq`/`dstDiscardQueuedCleanups`, accounted so the queue ledger stays exact) — never
+  leaked to the bubble-less async workers (DST-FIN-1/DST-CLEANUP-1). A finalizer that **spawns** a
   goroutine: the child inherits `g.bubble` via `newproc1` (normal goroutines inherit; only system
   goroutines skip it at `proc.go:5390`), so it is bubble-accounted and deterministically scheduled.
   **[R]/[C]**

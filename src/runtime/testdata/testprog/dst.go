@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/user"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,12 @@ func init() {
 	register("DSTFinChanOp", DSTFinChanOp)
 	register("DSTFinRunSet", DSTFinRunSet)
 	register("DSTFinSpawn", DSTFinSpawn)
+	register("DSTFinBlockedDrain", DSTFinBlockedDrain)
+	register("DSTFinGoexitDrain", DSTFinGoexitDrain)
+	register("DSTFinGoexitLedger", DSTFinGoexitLedger)
+	register("DSTFinStuckDrainRunEnd", DSTFinStuckDrainRunEnd)
+	register("DSTFinAbandonedChainReuse", DSTFinAbandonedChainReuse)
+	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -730,6 +737,273 @@ func DSTFinSpawn() {
 		got = <-ch
 	})
 	os.Stdout.WriteString("ok " + strconv.Itoa(got) + "\n")
+}
+
+// dstMakeFinBlocked allocates two finalizable objects: one whose finalizer
+// blocks receiving a value from ch, and one with a plain finalizer. The
+// receive targets a value (non-nil sudog elem), so a spurious driver wake of
+// the blocked drain is loud: releaseSudog throws "sudog with non-nil elem"
+// instead of silently completing the receive with a zero value.
+//
+//go:noinline
+func dstMakeFinBlocked(ch chan int, ranA, ranB *atomic.Bool) {
+	a := &dstFinObj{}
+	runtime.SetFinalizer(a, func(*dstFinObj) {
+		v := <-ch
+		ranA.Store(v == 1)
+	})
+	b := &dstFinObj{}
+	runtime.SetFinalizer(b, func(*dstFinObj) {
+		ranB.Store(true)
+	})
+}
+
+// DSTFinBlockedDrain exercises the drain wake guard: a finalizer that
+// blocks on a bubble channel parks the drain goroutine inside the channel wait,
+// and a later quiescence with finalizer work still pending must NOT goready the
+// drain there — it is woken by the goroutine that sends on the channel (design
+// D4), never by the driver. Before the guard, the driver's wake corrupted the
+// channel wait queue ("fatal error: runtime: sudog with non-nil elem"). Prints
+// "done" when both finalizers ran and the Run completed.
+func DSTFinBlockedDrain() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var ranA, ranB atomic.Bool
+	simulation.Run(n, func() {
+		ch := make(chan int)
+		dstMakeFinBlocked(ch, &ranA, &ranB)
+		runtime.GC() // queue both finalizers
+		go func() {
+			time.Sleep(2 * time.Millisecond)
+			ch <- 1 // completes the blocked finalizer; the drain then loops and finishes
+		}()
+		// Quiescence 1 (this sleep): the drain is woken and blocks on ch inside
+		// the blocking finalizer.
+		time.Sleep(time.Millisecond)
+		// Quiescence 2: finalizer work is still pending (the blocked one is
+		// mid-run) and the drain is parked in the channel wait — the driver
+		// must skip the wake.
+		time.Sleep(time.Millisecond)
+		// t+2ms: the send ran; the drain finished the rest of the queue.
+		time.Sleep(time.Millisecond)
+	})
+	if !ranA.Load() || !ranB.Load() {
+		os.Stdout.WriteString("missing finalizers\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// dstMakeFinGoexit allocates a finalizable object whose finalizer calls
+// runtime.Goexit, killing the drain goroutine.
+//
+//go:noinline
+func dstMakeFinGoexit() {
+	a := &dstFinObj{}
+	runtime.SetFinalizer(a, func(*dstFinObj) {
+		runtime.Goexit()
+	})
+}
+
+// dstMakeFinChanTouch allocates a finalizable object whose finalizer sends on a
+// bubble channel.
+//
+//go:noinline
+func dstMakeFinChanTouch(ch chan struct{}) {
+	b := &dstFinObj{}
+	runtime.SetFinalizer(b, func(*dstFinObj) {
+		ch <- struct{}{}
+	})
+}
+
+// DSTFinGoexitDrain exercises drain death by runtime.Goexit: the
+// dying drain must be cleared so it is never goready'd again, and callbacks
+// queued afterward — including bubble-channel-touching ones — must be
+// deterministically discarded in-run rather than leaked to bubble-less async
+// workers after deactivation. Before the fix, the next quiescence wake hit a
+// dead g ("fatal error: bad g->status in ready"). Prints "done".
+func DSTFinGoexitDrain() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(n, func() {
+		dstMakeFinGoexit()
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: the finalizer Goexits the drain
+		// The drain is dead. A later callback-bearing object that touches a
+		// bubble channel must be discarded, not run on fing after the Run.
+		ch := make(chan struct{}, 1)
+		dstMakeFinChanTouch(ch)
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence with a dead drain: discard, don't wake
+	})
+	// Settle outside the run: if the bubble-channel finalizer leaked past
+	// deactivation instead of being discarded, fing runs it here and fatals
+	// ("send on synctest channel from outside bubble") before "done" prints.
+	for range 3 {
+		runtime.GC()
+	}
+	time.Sleep(200 * time.Millisecond)
+	os.Stdout.WriteString("done\n")
+}
+
+// dstFinReadLedger returns the process-cumulative finalizer queued/executed
+// counters. Read inside the bubble, where no async finalizer activity exists,
+// so deltas around an in-run scenario are deterministic.
+func dstFinReadLedger() (queued, executed uint64) {
+	samples := []metrics.Sample{
+		{Name: "/gc/finalizers/queued:finalizers"},
+		{Name: "/gc/finalizers/executed:finalizers"},
+	}
+	metrics.Read(samples)
+	return samples[0].Value.Uint64(), samples[1].Value.Uint64()
+}
+
+// dstMakeFinGoexitBatch allocates count finalizable objects in one batch (one
+// GC cycle, one finBlock): the FIRST allocated gets a finalizer that calls
+// runtime.Goexit, the rest are plain. Sequential allocation of same-sized
+// objects fills a span in address order, and finalizer discovery walks specials
+// in address order, so the Goexit entry sits first in the block — and
+// runFinqBlocks runs entries last-to-first, so the plain finalizers run BEFORE
+// the Goexit one. That ordering gives the ledger test its teeth: entries
+// already run when the drain dies must already be accounted (per-entry), or
+// queued != executed forever.
+//
+//go:noinline
+func dstMakeFinGoexitBatch(count int, ran *atomic.Int64) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(*dstFinObj) {
+		runtime.Goexit()
+	})
+	for i := 1; i < count; i++ {
+		p := &dstFinObj{}
+		runtime.SetFinalizer(p, func(*dstFinObj) {
+			ran.Add(1)
+		})
+	}
+}
+
+// DSTFinGoexitLedger verifies the drain's finalizer queue ledger stays exact
+// across a mid-block drain death: several plain finalizers run, then one calls
+// runtime.Goexit, killing the drain with the block partially run. The
+// already-run entries must be accounted per-entry and the unrun remainder
+// accounted by the discard, so queued == executed afterwards — otherwise
+// finPending() never clears and the Run-end fixpoint cannot terminate. Prints
+// "done" plus the in-run ledger deltas.
+func DSTFinGoexitLedger() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	const batch = 8
+	var ran atomic.Int64
+	var dq, de uint64
+	simulation.Run(n, func() {
+		q0, e0 := dstFinReadLedger()
+		dstMakeFinGoexitBatch(batch, &ran)
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: plain finalizers run, then Goexit kills the drain
+		time.Sleep(time.Millisecond) // quiescence: dead drain — remainder discarded, ledger closed
+		q1, e1 := dstFinReadLedger()
+		dq, de = q1-q0, e1-e0
+	})
+	if dq != batch || de != batch {
+		os.Stdout.WriteString("ledger mismatch: queued " + strconv.FormatUint(dq, 10) +
+			" executed " + strconv.FormatUint(de, 10) + " ran " + strconv.FormatInt(ran.Load(), 10) + "\n")
+		return
+	}
+	if ran.Load() != batch-1 {
+		// The scenario's teeth require the plain finalizers to run BEFORE the
+		// Goexit one (mid-block death with already-run entries). The ledger
+		// check alone is order-independent; if the allocation/discovery order
+		// assumption in dstMakeFinGoexitBatch ever drifts, fail loudly here
+		// instead of letting the test go vacuous.
+		os.Stdout.WriteString("order drift: ran " + strconv.FormatInt(ran.Load(), 10) +
+			", want " + strconv.Itoa(batch-1) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTFinAbandonedChainReuse: run 1 ends with the drain parked forever inside a
+// blocking finalizer (recovered deadlock panic), abandoning its published
+// draining finalizer chain without dying. Run 2 then kills the drain from a
+// CLEANUP with no finalizer work queued — the one death shape where the stale
+// finalizer-chain pointer is never republished first — and the drain-death
+// discard must not splice run 1's abandoned chain into run 2's ledger: that
+// would leave finPending() true forever and hang run 2's end-of-run fixpoint.
+// Prints "done".
+func DSTFinAbandonedChainReuse() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	func() {
+		defer func() { recover() }() // the deterministic synctest deadlock panic
+		simulation.Run(n, func() {
+			ch := make(chan int)
+			var sink atomic.Bool
+			dstMakeFinBlocked(ch, &sink, &sink) // nothing ever sends on ch
+			runtime.GC()
+			time.Sleep(time.Millisecond) // the drain blocks in the finalizer forever
+		})
+	}()
+	simulation.Run(n+1, func() {
+		dstMakeCleanupGoexit()
+		runtime.GC()
+		time.Sleep(time.Millisecond) // cleanup Goexit → discard; must not touch run 1's chain
+	})
+	os.Stdout.WriteString("done\n")
+}
+
+// dstMakeCleanupGoexit allocates an object whose cleanup calls runtime.Goexit,
+// killing the drain goroutine from the cleanup (not finalizer) phase — the one
+// death shape where dstDrainFinq found no work first and so never republished
+// the (possibly stale) finalizer-chain pointer.
+//
+//go:noinline
+func dstMakeCleanupGoexit() {
+	o := &dstFinObj{}
+	runtime.AddCleanup(o, func(int) { runtime.Goexit() }, 0)
+}
+
+// DSTFinStuckDrainRunEnd: a finalizer blocks forever on a bubble channel, so
+// the drain is still parked inside the channel wait at Run end. The driver
+// must NOT goready it there (that corrupts the channel wait queue); it leaves
+// the drain parked and the total != 1 check reports the blocked bubble as a
+// deterministic deadlock panic instead.
+func DSTFinStuckDrainRunEnd() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(n, func() {
+		ch := make(chan int)
+		var sink atomic.Bool
+		dstMakeFinBlocked(ch, &sink, &sink) // nothing ever sends on ch
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: the drain blocks in the finalizer forever
+	})
+	os.Stdout.WriteString("unreachable: Run returned with a stuck drain\n")
+}
+
+// DSTFinStuckDrainResidue: the drain is stuck forever inside a blocking
+// finalizer at Run end, and the run has ALSO queued a bubble-channel-touching
+// finalizer the stuck drain never reached. The Run-end path must discard that
+// residue before deactivation reopens the async workers' gates — otherwise
+// fing runs the bubble-stamped finalizer after the Run and fatals. Expects the
+// deterministic deadlock panic from the stuck drain, then prints "done".
+func DSTFinStuckDrainResidue() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	func() {
+		defer func() { recover() }() // the deterministic synctest deadlock panic
+		simulation.Run(n, func() {
+			ch := make(chan int)
+			var sink atomic.Bool
+			dstMakeFinBlocked(ch, &sink, &sink) // nothing ever sends on ch
+			runtime.GC()
+			time.Sleep(time.Millisecond) // the drain blocks in the finalizer forever
+			// Queue a bubble-channel finalizer the stuck drain will never run.
+			ch2 := make(chan struct{}, 1)
+			dstMakeFinChanTouch(ch2)
+			runtime.GC()
+			time.Sleep(time.Millisecond)
+		})
+	}()
+	// Settle: a leaked bubble-stamped finalizer would fatal on fing here.
+	for range 3 {
+		runtime.GC()
+	}
+	time.Sleep(200 * time.Millisecond)
+	os.Stdout.WriteString("done\n")
 }
 
 // DSTFinProfile takes a goroutine profile from inside a finalizer running on the

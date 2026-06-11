@@ -808,11 +808,58 @@ func dstDrainCleanups() {
 	for gcCleanups.tryTakeWork() {
 		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
 		n := uint64(b.n)
+		// Publish the block so a callback panic or Goexit — which abandons this
+		// frame before runCleanupBlock's end-of-block accounting and free —
+		// leaves it discoverable for dstDiscardQueuedCleanups instead of
+		// leaking it. Single-P: only the drain writes this, and the driver
+		// reads it only after the drain has died.
+		//
+		// Invariant the publish window relies on: drain death originates only
+		// inside the callback's c.call, where the block is not yet freed.
+		// Between runCleanupBlock freeing b and the clear below, the pointer
+		// references a freed block — that window is straight-line code (no
+		// park, no recoverable panic), so the discard, which runs only after
+		// the drain has died, can never observe it.
+		dstDrainingCleanup = b
 		runCleanupBlock(b)
+		dstDrainingCleanup = nil
 		if dstActive() {
 			dstCleanupRunExecuted.Add(int64(n))
 		}
 	}
+}
+
+// dstDrainingCleanup is the block dstDrainCleanups is currently running; see
+// the comment there.
+var dstDrainingCleanup *cleanupBlock
+
+// dstDiscardQueuedCleanups discards every cleanup queued by the run — the full
+// queue plus the block a dying drain abandoned mid-run — without running them.
+// The cleanup analog of dstDiscardQueuedFinq (invariant DST-CLEANUP-1); blocks
+// are accounted as executed and freed so the ledger stays exact and markroot
+// stops scanning them.
+func dstDiscardQueuedCleanups() {
+	if b := dstDrainingCleanup; b != nil {
+		dstDrainingCleanup = nil
+		dstDiscardCleanupBlock(b)
+	}
+	for gcCleanups.tryTakeWork() {
+		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
+		dstDiscardCleanupBlock(b)
+	}
+}
+
+func dstDiscardCleanupBlock(b *cleanupBlock) {
+	n := atomic.Load(&b.n)
+	for i := 0; i < int(n); i++ {
+		b.cleanups[i] = cleanupFn{}
+	}
+	gcCleanups.executed.Add(int64(n))
+	if dstActive() {
+		dstCleanupRunExecuted.Add(int64(n))
+	}
+	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
+	gcCleanups.free.push(&b.lfnode)
 }
 
 // dstDeferPreBubbleCleanups detaches cleanups queued before a DST bubble starts

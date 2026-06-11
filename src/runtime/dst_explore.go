@@ -676,6 +676,7 @@ func dstExploreRecordUncaughtPanic(v any) bool {
 		lock(&gp.bubble.mu)
 		if gp.bubble.gcDrain == gp {
 			gp.bubble.gcDrain = nil
+			gp.bubble.gcDrainDied = true
 		}
 		unlock(&gp.bubble.mu)
 	}

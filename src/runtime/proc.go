@@ -4559,6 +4559,22 @@ func gdestroy(gp *g) {
 	gp.param = nil
 	gp.labels = nil
 	gp.timer = nil
+	if bubble := gp.bubble; bubble != nil && bubble.gcDrain == gp {
+		// The DST GC-callback drain is dying. On the clean path the driver set
+		// gcDrainExit and waits for this death. Any other death (a callback
+		// panic recorded by Explore, or a callback calling runtime.Goexit) must
+		// clear the driver's reference — a later wake would goready a dead g —
+		// and mark the death so teardown discards queued callbacks instead of
+		// leaking them to bubble-less async workers (DST-FIN-1/DST-CLEANUP-1).
+		lock(&bubble.mu)
+		if bubble.gcDrain == gp {
+			bubble.gcDrain = nil
+			if !bubble.gcDrainExit {
+				bubble.gcDrainDied = true
+			}
+		}
+		unlock(&bubble.mu)
+	}
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0

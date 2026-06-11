@@ -127,6 +127,11 @@ func dstActivate(seed uint64) {
 		dstDeferPreBubbleCleanups()
 	}
 	dstPreparing.Store(false)
+	// Free callback chains a previous run's drain abandoned without dying (the
+	// drain left parked forever inside a callback at a recorded deadlock, or a
+	// Run deadlock panic was recovered). A later run's discard must never
+	// splice a dead run's blocks into its own ledger.
+	dstDiscardAbandonedDrainChains()
 	dstResetFinqRunCounters()
 	dstResetCleanupRunCounters()
 	dstSeed.Store(seed)

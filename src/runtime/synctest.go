@@ -44,9 +44,15 @@ type synctestBubble struct {
 	// with g.bubble set, deterministically scheduled (see dstDrainAtQuiescence).
 	// nil when DST is not active for this bubble. gcDrainExit, set under
 	// bubble.mu before the final wake, tells gcDrain to exit so it does not
-	// outlive the Run and trip the total != 1 deadlock check.
+	// outlive the Run and trip the total != 1 deadlock check. gcDrainDied, set
+	// under bubble.mu when the drain dies without the exit handshake (a
+	// callback panic recorded by Explore, or a callback calling runtime.Goexit),
+	// tells the driver to deterministically discard queued in-run callbacks
+	// instead of leaking them to bubble-less async workers after deactivation
+	// (invariants DST-FIN-1 / DST-CLEANUP-1).
 	gcDrain     *g
 	gcDrainExit bool
+	gcDrainDied bool
 }
 
 // changegstatus is called when the non-lock status of a g changes.
@@ -440,10 +446,29 @@ func synctestGCDrainCommit(gp *g, _ unsafe.Pointer) bool {
 // no callback work.
 func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 	if bubble.gcDrain == nil {
+		if bubble.gcDrainDied {
+			// The drain died without the exit handshake (callback panic recorded
+			// by Explore, or runtime.Goexit from a callback). Discard whatever the
+			// run has queued since: nothing in-bubble can run it, and leaking it
+			// past dstDeactivate would hand bubble-stamped callbacks to the async
+			// workers (g.bubble == nil), which fatals on a bubble channel op.
+			dstDiscardQueuedCallbacks()
+		}
 		return false
 	}
 	GC()
 	if !finPending() && !cleanupPending() {
+		return false
+	}
+	if !bubble.dstDrainParked() {
+		// The drain is blocked inside a callback (e.g. on a bubble channel —
+		// design D4 allows this; whatever bubble goroutine completes that wait
+		// wakes it, never the driver). Waking it here would goready a g parked
+		// in the callback's own wait and corrupt that wait's queue. Skipping is
+		// sound: when the callback completes, the drain loop runs
+		// dstDrainFinq/dstDrainCleanups again, which pick up everything queued
+		// meanwhile (DST-FIN-2 defers at most one level, exactly as a blocking
+		// callback already does).
 		return false
 	}
 	// Wake the drain to run the queued finalizers and cleanups, then park the root
@@ -455,6 +480,51 @@ func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 	return true
 }
 
+// dstDrainParked reports whether the drain goroutine is parked at its own
+// drain park — the only state in which the driver may goready it. Safe to read
+// from the driver at a quiescence point: the drain is durably blocked
+// (GOMAXPROCS=1, every other bubble goroutine is also blocked), so its status
+// and wait reason cannot change concurrently.
+func (bubble *synctestBubble) dstDrainParked() bool {
+	drain := bubble.gcDrain
+	if drain == nil {
+		return false
+	}
+	return readgstatus(drain)&^_Gscan == _Gwaiting && drain.waitreason == waitReasonSynctestGCDrain
+}
+
+// dstDiscardQueuedCallbacks discards the finalizers and cleanups queued by the
+// current run. Only called after the run's drain died (gcDrainDied); see
+// dstDiscardQueuedFinq and dstDiscardQueuedCleanups.
+func dstDiscardQueuedCallbacks() {
+	dstDiscardQueuedFinq()
+	dstDiscardQueuedCleanups()
+}
+
+// dstDiscardAbandonedDrainChains frees callback chains a previous run's drain
+// abandoned without dying — the drain was left parked forever inside a
+// callback's wait when a run ended in a recorded deadlock (Explore) or a
+// recovered deadlock panic (Run). Called from dstActivate before dstSeed is
+// stored (dstActive() false), so the discard touches only the process-global
+// executed ledger and never a run-local counter; a later run's
+// discard must never splice a dead run's blocks into its own ledger (that
+// would leave finPending true forever and hang the Run-end fixpoint). The
+// abandoned drain goroutine, still parked in a dead bubble's callback wait
+// that nothing can complete, never wakes, so its frame's stale block pointers
+// are inert.
+func dstDiscardAbandonedDrainChains() {
+	if fb := dstDrainingFinq; fb != nil {
+		dstDrainingFinq = nil
+		lock(&finlock)
+		dstDiscardFinChainLocked(fb)
+		unlock(&finlock)
+	}
+	if b := dstDrainingCleanup; b != nil {
+		dstDrainingCleanup = nil
+		dstDiscardCleanupBlock(b)
+	}
+}
+
 // dstStopGCDrain runs a final drain and stops the drain goroutine at Run
 // end. Called by the driver after the run loop, when the bubble is quiescent,
 // with bubble.mu NOT held. No-op when the bubble has no DST drain.
@@ -464,7 +534,7 @@ func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 // total != 1 deadlock check. So tell it to exit, wake it, and wait for it to die
 // (its exit decrements total) before the driver reads total (invariant DST-FIN-3).
 func (bubble *synctestBubble) dstStopGCDrain() {
-	if bubble.gcDrain == nil {
+	if bubble.gcDrain == nil && !bubble.gcDrainDied {
 		return
 	}
 	// Run finalizers/cleanups made dead by the run finishing (e.g. bubble.main's
@@ -486,7 +556,7 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 	poolReap := poolReapGenerations
 	for {
 		if bubble.gcDrain == nil {
-			return
+			break
 		}
 		if bubble.dstDrainAtQuiescence() {
 			poolReap = poolReapGenerations
@@ -496,6 +566,46 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 		if poolReap == 0 {
 			break
 		}
+	}
+	if bubble.gcDrain == nil {
+		if bubble.gcDrainDied {
+			// The drain died during the run or the fixpoint above (callback
+			// panic recorded by Explore, or runtime.Goexit from a callback).
+			// Discover-and-discard to a fixpoint: a discarded finalizer's
+			// nil'd argument can make another callback-bearing object dead,
+			// and pooled callback objects need two quiet pool generations —
+			// anything not discarded in-run would be discovered after
+			// deactivation and run on a bubble-less async worker (fatal on a
+			// bubble channel op, DST-FIN-1/DST-CLEANUP-1).
+			quiet := 0
+			for quiet < poolReapGenerations {
+				GC()
+				if finPending() || cleanupPending() {
+					dstDiscardQueuedCallbacks()
+					quiet = 0
+				} else {
+					quiet++
+				}
+			}
+		}
+		return
+	}
+	if !bubble.dstDrainParked() {
+		// The drain is stuck inside a callback at Run end, durably blocked on
+		// something no bubble goroutine will ever provide. Waking it here would
+		// corrupt the callback's wait queue (see dstDrainParked); leave it
+		// parked instead, so the total != 1 deadlock check below reports the
+		// blocked bubble deterministically.
+		//
+		// The run's queued callbacks — and the chain the stuck drain abandoned
+		// mid-run — can never run in-bubble anymore. Discard them now, before
+		// deactivation reopens the async workers' gates: a bubble-stamped
+		// callback running on a bubble-less goroutine fatals
+		// (DST-FIN-1/DST-CLEANUP-1). The stuck drain never wakes (its wait can
+		// never complete once the bubble is dead), so its frame's stale block
+		// pointers are inert.
+		dstDiscardQueuedCallbacks()
+		return
 	}
 	lock(&bubble.mu)
 	drain := bubble.gcDrain

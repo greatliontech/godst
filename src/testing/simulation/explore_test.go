@@ -1436,6 +1436,46 @@ func makeExploreCleanupPanic(msg string) {
 }
 
 //go:noinline
+func makeExploreFinalizerChanTouch(ch chan struct{}) {
+	o := &exploreCallbackPanicObj{}
+	runtime.SetFinalizer(o, func(*exploreCallbackPanicObj) { ch <- struct{}{} })
+	runtime.KeepAlive(o)
+}
+
+// TestExploreDrainPanicDiscardsResidualCallbacks verifies that after a
+// drain-callback panic is recorded as a Failure, callbacks queued later in the
+// run — including bubble-channel-touching ones — are deterministically
+// discarded at teardown. Before the fix they leaked past dstDeactivate to the
+// bubble-less async workers, which fataled the process ("send on synctest
+// channel from outside bubble") after Explore had already returned.
+func TestExploreDrainPanicDiscardsResidualCallbacks(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	want := "finalizer callback boom"
+	sut := func() bool {
+		makeExploreFinalizerPanic(want)
+		runtime.GC()
+		time.Sleep(time.Millisecond) // drain panics; recorded, drain dead
+		ch := make(chan struct{}, 1)
+		makeExploreFinalizerChanTouch(ch)
+		runtime.GC()
+		time.Sleep(time.Millisecond) // dead drain: the queued finalizer must be discarded
+		return false
+	}
+	res := Explore(1, DPOR, sut)
+	if len(res.Failures) != 1 || res.Failures[0].Panic != want {
+		t.Fatalf("drain panic not reported as the failure: %#v", res.Failures)
+	}
+	// Surface any leaked bubble-stamped callback now (it would fatal the
+	// process on the async workers) rather than after the test exits.
+	for range 3 {
+		runtime.GC()
+	}
+	time.Sleep(10 * time.Millisecond)
+}
+
+//go:noinline
 func makeExploreFinalizerSignalPanic(sig exploreCallbackSignal) {
 	o := &exploreCallbackPanicObj{}
 	runtime.SetFinalizer(o, func(*exploreCallbackPanicObj) {

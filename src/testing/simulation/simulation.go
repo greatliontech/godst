@@ -315,6 +315,12 @@ func leaveSimulation() {
 // *testing.T, Run restores the simulation state and then exits its caller with
 // runtime.Goexit.
 //
+// A finalizer or cleanup that panics crashes the process under Run (as in
+// production) and is recorded as a Failure by Explore. A finalizer or cleanup
+// that calls runtime.Goexit kills the simulation's drain goroutine: from that
+// point the run's queued and later-discovered finalizers and cleanups are
+// deterministically discarded rather than run.
+//
 // A goroutine in f that never blocks and never makes a function call (e.g. a
 // bare for{}) will not be preempted and will stall the simulation; real code
 // rarely does this.
