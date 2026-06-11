@@ -12,8 +12,8 @@ const dstNetEnabled = false
 
 func dstActive() bool { return false }
 
-func dstDial(ctx context.Context, network, address string) (Conn, error) { return nil, nil }
+func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) { return nil, nil }
 
-func dstListen(network, address string) (Listener, error) { return nil, nil }
+func dstListen(lc *ListenConfig, network, address string) (Listener, error) { return nil, nil }
 
 func dstUnsupportedNetAPI(op, network string, source, addr Addr) error { return nil }

@@ -527,7 +527,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 	ctx, cancel := d.dialCtx(ctx)
 	defer cancel()
 	if dstNetEnabled && dstActive() {
-		return dstDial(ctx, network, address) // deterministic simulation: see net/dst.go
+		return dstDial(ctx, d, network, address) // deterministic simulation: see net/dst.go
 	}
 
 	// Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.
@@ -876,7 +876,7 @@ func (lc *ListenConfig) SetMultipathTCP(use bool) {
 // it does not affect the returned Listener.
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {
 	if dstNetEnabled && dstActive() {
-		return dstListen(network, address) // deterministic simulation: see net/dst.go
+		return dstListen(lc, network, address) // deterministic simulation: see net/dst.go
 	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
 	if err != nil {

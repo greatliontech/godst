@@ -80,6 +80,80 @@ func dstUnsupportedNetAPI(op, network string, source, addr Addr) error {
 	return &OpError{Op: op, Net: network, Source: source, Addr: addr, Err: errors.New("network API unsupported under deterministic simulation")}
 }
 
+func dstUnsupportedNetOption(op, network string, source, addr Addr, option string) error {
+	return &OpError{Op: op, Net: network, Source: source, Addr: addr, Err: errors.New(option + " unsupported under deterministic simulation")}
+}
+
+func dstTCPAddrFamily(ip IP) string {
+	if ip.To4() != nil {
+		return "tcp4"
+	}
+	return "tcp6"
+}
+
+func dstResolveLocalTCPAddr(network string, remoteIP IP, local Addr) (*TCPAddr, error) {
+	if local == nil {
+		return nil, nil
+	}
+	addr, ok := local.(*TCPAddr)
+	if !ok {
+		return nil, &AddrError{Err: "mismatched local address type", Addr: local.String()}
+	}
+	if addr.Port < 0 || addr.Port > 65535 {
+		return nil, &AddrError{Err: "invalid port", Addr: addr.String()}
+	}
+	if addr.IP == nil || addr.IP.IsUnspecified() {
+		return &TCPAddr{IP: nil, Port: addr.Port, Zone: addr.Zone}, nil
+	}
+	if addr.IP.To4() == nil && addr.IP.To16() == nil {
+		return nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: addr.String()}
+	}
+	switch network {
+	case "tcp4":
+		if addr.IP.To4() == nil {
+			return nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: addr.String()}
+		}
+	case "tcp6":
+		if addr.IP.To4() != nil || addr.IP.To16() == nil {
+			return nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: addr.String()}
+		}
+	case "tcp":
+		if dstTCPAddrFamily(addr.IP) != dstTCPAddrFamily(remoteIP) {
+			return nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: addr.String()}
+		}
+	}
+	return &TCPAddr{IP: append(IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}, nil
+}
+
+func dstDialOptionsError(d *Dialer, network string, source, addr Addr) error {
+	if d.ControlContext != nil {
+		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.ControlContext")
+	}
+	if d.Control != nil {
+		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.Control")
+	}
+	if d.mptcpStatus == mptcpEnabledDial {
+		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.MultipathTCP")
+	}
+	if d.KeepAlive != 0 || d.KeepAliveConfig != (KeepAliveConfig{}) {
+		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.KeepAlive")
+	}
+	return nil
+}
+
+func dstListenOptionsError(lc *ListenConfig, network string, addr Addr) error {
+	if lc.Control != nil {
+		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.Control")
+	}
+	if lc.mptcpStatus == mptcpEnabledListen {
+		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.MultipathTCP")
+	}
+	if lc.KeepAlive != 0 || lc.KeepAliveConfig != (KeepAliveConfig{}) {
+		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.KeepAlive")
+	}
+	return nil
+}
+
 func dstParsePort(op, network, port string) (int, error) {
 	portnum, needsLookup := parsePort(port)
 	if needsLookup || portnum < 0 || portnum > 65535 {
@@ -247,7 +321,7 @@ func (l *dstListener) Close() error {
 func (l *dstListener) Addr() Addr { return l.addr }
 
 // dstListen is net.Listen under DST: register a simulated listener.
-func dstListen(network, address string) (Listener, error) {
+func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("listen", network)
 	}
@@ -264,6 +338,10 @@ func dstListen(network, address string) (Listener, error) {
 		return nil, err
 	}
 	wildcard := dstWildcard(host)
+	listenAddr := &TCPAddr{IP: ip, Port: portnum}
+	if err := dstListenOptionsError(lc, network, listenAddr); err != nil {
+		return nil, err
+	}
 
 	dstNet.mu.Lock()
 	defer dstNet.mu.Unlock()
@@ -294,7 +372,7 @@ func dstListen(network, address string) (Listener, error) {
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
-func dstDial(ctx context.Context, network, address string) (Conn, error) {
+func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) {
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("dial", network)
 	}
@@ -314,6 +392,13 @@ func dstDial(ctx context.Context, network, address string) (Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: mapErr(err)}
 	}
+	localTCPAddr, err := dstResolveLocalTCPAddr(network, ip, d.LocalAddr)
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: d.LocalAddr, Addr: serverAddr, Err: err}
+	}
+	if err := dstDialOptionsError(d, network, localTCPAddr.opAddr(), serverAddr); err != nil {
+		return nil, err
+	}
 
 	dstNet.mu.Lock()
 	dstNetRoll()
@@ -321,8 +406,14 @@ func dstDial(ctx context.Context, network, address string) (Conn, error) {
 	if l == nil {
 		l = dstNet.listeners[dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
 	}
-	localPort := dstNet.nextPort
-	dstNet.nextPort++
+	localPort := 0
+	if localTCPAddr != nil {
+		localPort = localTCPAddr.Port
+	}
+	if localPort == 0 {
+		localPort = dstNet.nextPort
+		dstNet.nextPort++
+	}
 	dstNet.mu.Unlock()
 
 	if l == nil {
@@ -332,7 +423,13 @@ func dstDial(ctx context.Context, network, address string) (Conn, error) {
 	if dstAddrFamily(network, ip) == "tcp6" {
 		localIP = IPv6loopback
 	}
+	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {
+		localIP = localTCPAddr.IP
+	}
 	localAddr := &TCPAddr{IP: localIP, Port: localPort}
+	if localTCPAddr != nil {
+		localAddr.Zone = localTCPAddr.Zone
+	}
 
 	p1, p2 := Pipe()
 	dialer := &dstConn{Conn: p1, local: localAddr, remote: serverAddr}

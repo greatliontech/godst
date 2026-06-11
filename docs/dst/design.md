@@ -188,8 +188,9 @@ registry**: `Listen` registers a simulated listener; `Dial` looks it up and hand
 connection back while pushing the server end onto the listener's accept queue. A connection is a
 `net.Pipe` endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with
 the simulated local/remote `*net.TCPAddr`. `DialContext` keeps the public context contract (nil panics,
-canceled/deadline contexts error), `:0` listeners receive deterministic nonzero ports, and listener
-lookup uses canonical simulated IPs (`localhost` maps to loopback). The seam is the exported
+canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set,
+`:0` listeners receive deterministic nonzero ports, and listener lookup uses canonical simulated IPs
+(`localhost` maps to loopback). The seam is the exported
 `Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it
 compiles out without `-tags dst`; net's internal lookups stay real (the program does not exercise real
 sockets under DST).
@@ -202,11 +203,14 @@ re-Listen the same address). This is the reliable, in-order **base** on which ne
 (partition/drop/reorder/latency) layer later as policies on the same registry+conns.
 
 **Caveat (fidelity).** `Dial` returns the `net.Conn` *interface*; code that type-asserts the concrete
-`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. DNS resolution, service-name
-ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed synthetic set consistent with this
-addressing) are follow-on increments. Unsupported networks at the intercepted `Dial`/`Listen` seam fail
-under DST rather than being modeled as TCP-like streams or falling through to the real OS. FIPS/Boring-
-style configs are out of scope as elsewhere.
+`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. `Dialer.Control`,
+`Dialer.ControlContext`, `ListenConfig.Control`, explicit MPTCP enable/use, and explicit keepalive
+configuration fail under DST rather than being silently ignored, because they require raw socket semantics
+the base model does not provide. Explicitly disabling MPTCP is accepted because the base model is ordinary
+TCP. DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed
+synthetic set consistent with this addressing) are follow-on increments. Unsupported networks at the
+intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or falling
+through to the real OS. FIPS/Boring-style configs are out of scope as elsewhere.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
