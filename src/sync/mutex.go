@@ -46,6 +46,10 @@ func (m *Mutex) Lock() {
 	m.mu.Lock()
 }
 
+func (m *Mutex) lockNoDstHB() {
+	m.mu.LockNoDstHB()
+}
+
 // TryLock tries to lock m and reports whether it succeeded.
 //
 // Note that while correct uses of TryLock do exist, they are rare,
@@ -53,6 +57,10 @@ func (m *Mutex) Lock() {
 // in a particular use of mutexes.
 func (m *Mutex) TryLock() bool {
 	return m.mu.TryLock()
+}
+
+func (m *Mutex) tryLockNoDstHB() bool {
+	return m.mu.TryLockNoDstHB()
 }
 
 // Unlock unlocks m.
@@ -63,4 +71,8 @@ func (m *Mutex) TryLock() bool {
 // arrange for another goroutine to unlock it.
 func (m *Mutex) Unlock() {
 	m.mu.Unlock()
+}
+
+func (m *Mutex) unlockNoDstHB() {
+	m.mu.UnlockNoDstHB()
 }

@@ -47,3 +47,13 @@ func internal_sync_runtime_dstRecordSyncAcquire(id unsafe.Pointer) {
 func sync_runtime_dstSyncAcquire(id unsafe.Pointer) {
 	dstSyncAcquire(id)
 }
+
+//go:linkname sync_runtime_dstRecordSyncRelease sync.runtime_dstRecordSyncRelease
+func sync_runtime_dstRecordSyncRelease(id unsafe.Pointer) {
+	dstRecordSyncRelease(id)
+}
+
+//go:linkname sync_runtime_dstRecordSyncAcquire sync.runtime_dstRecordSyncAcquire
+func sync_runtime_dstRecordSyncAcquire(id unsafe.Pointer) {
+	dstRecordSyncAcquire(id)
+}

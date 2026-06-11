@@ -892,7 +892,10 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    ops (`chan.go` `chansend`/`chanrecv` before `lock(&c.lock)`, `closechan` before the closed-state
    transition, identity = the `*hchan`) and mutex/RWMutex state decisions (`internal/sync.Mutex`
    `Lock`/`TryLock`/`Unlock`, identity = the mutex pointer; `sync.RWMutex` reader/writer admission and
-   release, identity = the embedded writer mutex) auto-announce a `dstSyncAcquire` write-conflict. An
+   release, identity = the embedded writer mutex) auto-announce a `dstSyncAcquire` write-conflict. RWMutex
+   suppresses the embedded writer mutex's DST happens-before events while executing RWMutex internals and
+   records public RWMutex HB separately on the same `readerSem`/`writerSem` identities used by the race
+   detector, so failed public `TryLock`/`TryRLock` decisions do not synchronize. An
    UNMODIFIED mutex/channel program's sync-object decision order is therefore explored with no hand
    annotation. The mutex hook is in `Lock` (NOT the `semacquire` slow path): `semacquire` is reached only by
    the *contended loser*, after the uncontended winner already took the fast-path CAS, so it is too late to
@@ -904,7 +907,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    byte-identical — DST-L2-4), and confined to the scheduled strategy by the runtime guard. Acceptance:
    `TestDSTExploreSyncAutoInstrument` — unmodified mutex/channel/RWMutex/select/close/Once SUTs each reach
    BOTH sync-decision outcomes under DPOR (vs 1 with the corresponding hook neutered). *Coverage:* this
-   covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (transitively via `rw.w.Lock()`),
+   covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (decision transitively via `rw.w`),
    `sync.RWMutex.RLock`/`TryRLock`/`RUnlock`/`Unlock`, blocking and non-blocking `chansend`/`chanrecv`,
    `closechan`, blocking and non-blocking `selectgo` channel send/recv paths, and `sync.Once`'s first
    execution path (transitively through its internal `Mutex`). Shared-address filtering for the

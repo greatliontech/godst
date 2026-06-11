@@ -9,3 +9,11 @@ package sync
 const dstHookEnabled = false
 
 func dstSyncAcquireRWMutex(rw *RWMutex) {}
+
+func dstSyncReleaseRWMutexUnlock(rw *RWMutex) {}
+
+func dstSyncReleaseRWMutexRUnlock(rw *RWMutex) {}
+
+func dstSyncAcquireHBRWMutexLock(rw *RWMutex) {}
+
+func dstSyncAcquireHBRWMutexRLock(rw *RWMutex) {}

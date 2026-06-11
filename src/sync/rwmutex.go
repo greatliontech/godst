@@ -80,6 +80,9 @@ func (rw *RWMutex) RLock() {
 		race.Enable()
 		race.Acquire(unsafe.Pointer(&rw.readerSem))
 	}
+	if dstHookEnabled {
+		dstSyncAcquireHBRWMutexRLock(rw)
+	}
 }
 
 // TryRLock tries to lock rw for reading and reports whether it succeeded.
@@ -108,6 +111,9 @@ func (rw *RWMutex) TryRLock() bool {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(&rw.readerSem))
 			}
+			if dstHookEnabled {
+				dstSyncAcquireHBRWMutexRLock(rw)
+			}
 			return true
 		}
 	}
@@ -122,6 +128,9 @@ func (rw *RWMutex) RUnlock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		race.Disable()
+	}
+	if dstHookEnabled {
+		dstSyncReleaseRWMutexRUnlock(rw)
 	}
 	if dstHookEnabled {
 		dstSyncAcquireRWMutex(rw)
@@ -156,7 +165,7 @@ func (rw *RWMutex) Lock() {
 		race.Disable()
 	}
 	// First, resolve competition with other writers.
-	rw.w.Lock()
+	rw.w.lockNoDstHB()
 	// Announce to readers there is a pending writer.
 	r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders
 	// Wait for active readers.
@@ -167,6 +176,9 @@ func (rw *RWMutex) Lock() {
 		race.Enable()
 		race.Acquire(unsafe.Pointer(&rw.readerSem))
 		race.Acquire(unsafe.Pointer(&rw.writerSem))
+	}
+	if dstHookEnabled {
+		dstSyncAcquireHBRWMutexLock(rw)
 	}
 }
 
@@ -180,14 +192,14 @@ func (rw *RWMutex) TryLock() bool {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
 	}
-	if !rw.w.TryLock() {
+	if !rw.w.tryLockNoDstHB() {
 		if race.Enabled {
 			race.Enable()
 		}
 		return false
 	}
 	if !rw.readerCount.CompareAndSwap(0, -rwmutexMaxReaders) {
-		rw.w.Unlock()
+		rw.w.unlockNoDstHB()
 		if race.Enabled {
 			race.Enable()
 		}
@@ -197,6 +209,9 @@ func (rw *RWMutex) TryLock() bool {
 		race.Enable()
 		race.Acquire(unsafe.Pointer(&rw.readerSem))
 		race.Acquire(unsafe.Pointer(&rw.writerSem))
+	}
+	if dstHookEnabled {
+		dstSyncAcquireHBRWMutexLock(rw)
 	}
 	return true
 }
@@ -214,6 +229,9 @@ func (rw *RWMutex) Unlock() {
 		race.Disable()
 	}
 	if dstHookEnabled {
+		dstSyncReleaseRWMutexUnlock(rw)
+	}
+	if dstHookEnabled {
 		dstSyncAcquireRWMutex(rw)
 	}
 
@@ -228,7 +246,7 @@ func (rw *RWMutex) Unlock() {
 		runtime_Semrelease(&rw.readerSem, false, 0)
 	}
 	// Allow other writers to proceed.
-	rw.w.Unlock()
+	rw.w.unlockNoDstHB()
 	if race.Enabled {
 		race.Enable()
 	}

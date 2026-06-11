@@ -16,8 +16,31 @@ const dstHookEnabled = true
 //go:linkname runtime_dstSyncAcquire
 func runtime_dstSyncAcquire(id unsafe.Pointer)
 
+//go:linkname runtime_dstRecordSyncRelease
+func runtime_dstRecordSyncRelease(id unsafe.Pointer)
+
+//go:linkname runtime_dstRecordSyncAcquire
+func runtime_dstRecordSyncAcquire(id unsafe.Pointer)
+
 func dstSyncAcquireRWMutex(rw *RWMutex) {
 	// Use the writer mutex's internal identity so reader-vs-writer decisions conflict
 	// with the existing rw.w Lock/TryLock/Unlock hooks.
 	runtime_dstSyncAcquire(unsafe.Pointer(&rw.w.mu))
+}
+
+func dstSyncReleaseRWMutexUnlock(rw *RWMutex) {
+	runtime_dstRecordSyncRelease(unsafe.Pointer(&rw.readerSem))
+}
+
+func dstSyncReleaseRWMutexRUnlock(rw *RWMutex) {
+	runtime_dstRecordSyncRelease(unsafe.Pointer(&rw.writerSem))
+}
+
+func dstSyncAcquireHBRWMutexLock(rw *RWMutex) {
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(&rw.readerSem))
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(&rw.writerSem))
+}
+
+func dstSyncAcquireHBRWMutexRLock(rw *RWMutex) {
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(&rw.readerSem))
 }

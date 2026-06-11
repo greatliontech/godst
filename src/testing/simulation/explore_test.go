@@ -594,6 +594,250 @@ func TestExploreRecordsMutexHB(t *testing.T) {
 	}
 }
 
+func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("RWMutex HB events are emitted by dst-race sync hooks")
+	}
+	marker := new(int)
+	addr := uintptr(unsafe.Pointer(marker))
+	sut := func() bool {
+		var rw sync.RWMutex
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			rw.RLock()
+			runtime.Gosched()
+			rw.RUnlock()
+		}()
+		go func() {
+			defer wg.Done()
+			if !rw.TryLock() {
+				dstAccessYield(unsafe.Pointer(marker), false)
+				return
+			}
+			rw.Unlock()
+		}()
+		wg.Wait()
+		return false
+	}
+
+	dstExploreInit(256, 4096, 512, 512)
+	stack := [][]uint64{nil}
+	seen := map[string]bool{}
+	for len(stack) > 0 && len(seen) < 200 {
+		prefix := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		key := encodePrefix(prefix)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		_, _, tr := runOnce(1, prefix, map[accessForce]bool{}, sut)
+		read := -1
+		for i := range tr.accSeq {
+			if tr.accAddr[i] != addr {
+				continue
+			}
+			if !tr.accWrite[i] {
+				read = i
+			}
+		}
+		if read >= 0 {
+			seq := tr.accSeq[read]
+			for i, k := range tr.syncKind {
+				if tr.syncSeq[i] == seq {
+					t.Fatalf("failed public RWMutex.TryLock recorded DST HB event kind=%d id=%#x for goroutine %d: syncKind=%v syncSeq=%v syncID=%v", k, tr.syncID[i], seq, tr.syncKind, tr.syncSeq, tr.syncID)
+				}
+			}
+			return
+		}
+		for i := len(prefix); i < len(tr.procs); i++ {
+			for _, g := range tr.enabled[i] {
+				if g == tr.procs[i] {
+					continue
+				}
+				child := make([]uint64, i+1)
+				copy(child, tr.procs[:i])
+				child[i] = g
+				stack = append(stack, child)
+			}
+		}
+	}
+	t.Fatalf("failed to reach a trace with reader-caused failed RWMutex.TryLock after %d schedules", len(seen))
+}
+
+func TestExploreRecordsRWMutexHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("RWMutex HB events are emitted by dst-race sync hooks")
+	}
+	for _, tt := range []struct {
+		name string
+		sut  func(unsafe.Pointer) func() bool
+	}{
+		{
+			name: "UnlockToLock",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					var rw sync.RWMutex
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						rw.Lock()
+						dstAccessYield(marker, true)
+						runtime.Gosched()
+						rw.Unlock()
+					}()
+					go func() {
+						defer wg.Done()
+						rw.Lock()
+						dstAccessYield(marker, false)
+						rw.Unlock()
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "UnlockToTryLock",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					var rw sync.RWMutex
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						rw.Lock()
+						dstAccessYield(marker, true)
+						runtime.Gosched()
+						rw.Unlock()
+					}()
+					go func() {
+						defer wg.Done()
+						for {
+							if rw.TryLock() {
+								dstAccessYield(marker, false)
+								rw.Unlock()
+								return
+							}
+							runtime.Gosched()
+						}
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "UnlockToRLock",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					var rw sync.RWMutex
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						rw.Lock()
+						dstAccessYield(marker, true)
+						runtime.Gosched()
+						rw.Unlock()
+					}()
+					go func() {
+						defer wg.Done()
+						rw.RLock()
+						dstAccessYield(marker, false)
+						rw.RUnlock()
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "RUnlockToLock",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					var rw sync.RWMutex
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						rw.RLock()
+						dstAccessYield(marker, true)
+						runtime.Gosched()
+						rw.RUnlock()
+					}()
+					go func() {
+						defer wg.Done()
+						rw.Lock()
+						dstAccessYield(marker, false)
+						rw.Unlock()
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			marker := new(int)
+			addr := uintptr(unsafe.Pointer(marker))
+			sut := tt.sut(unsafe.Pointer(marker))
+			dstExploreInit(256, 4096, 512, 512)
+			stack := [][]uint64{nil}
+			seen := map[string]bool{}
+			for len(stack) > 0 && len(seen) < 200 {
+				prefix := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				key := encodePrefix(prefix)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				_, _, tr := runOnce(1, prefix, map[accessForce]bool{}, sut)
+				write, read := -1, -1
+				for i := range tr.accSeq {
+					if tr.accAddr[i] != addr {
+						continue
+					}
+					if tr.accWrite[i] {
+						write = i
+					} else {
+						read = i
+					}
+				}
+				if write >= 0 && read >= 0 && write < read && tr.accSeq[write] != tr.accSeq[read] {
+					clk, pidx := dporClocks(tr)
+					if dporConcurrent(clk, pidx, tr, write, read) {
+						t.Fatalf("RWMutex public HB did not order %s accesses: write=%d read=%d seq=%v syncKind=%v syncSeq=%v syncID=%v", tt.name, write, read, tr.accSeq, tr.syncKind, tr.syncSeq, tr.syncID)
+					}
+					return
+				}
+				for i := len(prefix); i < len(tr.procs); i++ {
+					for _, g := range tr.enabled[i] {
+						if g == tr.procs[i] {
+							continue
+						}
+						child := make([]uint64, i+1)
+						copy(child, tr.procs[:i])
+						child[i] = g
+						stack = append(stack, child)
+					}
+				}
+			}
+			t.Fatalf("failed to reach %s RWMutex HB trace after %d schedules", tt.name, len(seen))
+		})
+	}
+}
+
 func TestExplorePostGoBoundaryNonRace(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
