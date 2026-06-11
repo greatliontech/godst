@@ -543,6 +543,9 @@ rclose:
 	if raceenabled {
 		raceacquire(c.raceaddr())
 	}
+	if dstBuild && raceenabled {
+		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), 0)
+	}
 	goto retc
 
 send:

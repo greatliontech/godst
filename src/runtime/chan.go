@@ -458,6 +458,9 @@ func closechan(c *hchan) {
 		racewritepc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(closechan))
 		racerelease(c.raceaddr())
 	}
+	if dstBuild && raceenabled {
+		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), 0)
+	}
 
 	c.closed = 1
 
@@ -605,6 +608,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 			if raceenabled {
 				raceacquire(c.raceaddr())
 			}
+			if dstBuild && raceenabled {
+				dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), 0)
+			}
 			if ep != nil {
 				typedmemclr(c.elemtype, ep)
 			}
@@ -631,6 +637,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		if c.qcount == 0 {
 			if raceenabled {
 				raceacquire(c.raceaddr())
+			}
+			if dstBuild && raceenabled {
+				dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), 0)
 			}
 			unlock(&c.lock)
 			if ep != nil {
@@ -985,6 +994,13 @@ func racesync(c *hchan, sg *sudog) {
 	raceacquireg(sg.g, chanbuf(c, 0))
 	racereleaseg(sg.g, chanbuf(c, 0))
 	raceacquire(chanbuf(c, 0))
+	if dstBuild && raceenabled {
+		id := uintptr(unsafe.Pointer(c))
+		dstRecordSyncReleaseID(id, 0)
+		dstRecordSyncEventForGID(dstSyncEventAcquire, id, 0, sg.g)
+		dstRecordSyncEventForGID(dstSyncEventRelease, id, 0, sg.g)
+		dstRecordSyncAcquireID(id, 0)
+	}
 }
 
 // Notify the race detector of a send or receive involving buffer entry idx

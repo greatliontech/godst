@@ -537,6 +537,230 @@ func TestExploreRecordsSelectBufferedChannelHB(t *testing.T) {
 	t.Fatalf("select buffered send/receive did not record matching release/acquire: id=%v aux=%v kind=%v", tr.syncID, tr.syncAux, tr.syncKind)
 }
 
+func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("unbuffered channel HB events are emitted by dst-race sync hooks")
+	}
+	for _, tt := range []struct {
+		name string
+		sut  func(unsafe.Pointer) func() bool
+	}{
+		{
+			name: "SendToReceive",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						<-ch
+						dstAccessYield(marker, false)
+					}()
+					go func() {
+						defer wg.Done()
+						runtime.Gosched()
+						dstAccessYield(marker, true)
+						ch <- struct{}{}
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "ReceiveToSendComplete",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						ch <- struct{}{}
+						dstAccessYield(marker, false)
+					}()
+					go func() {
+						defer wg.Done()
+						runtime.Gosched()
+						dstAccessYield(marker, true)
+						<-ch
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "ParkedSenderToReceive",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						dstAccessYield(marker, true)
+						ch <- struct{}{}
+					}()
+					go func() {
+						defer wg.Done()
+						runtime.Gosched()
+						<-ch
+						dstAccessYield(marker, false)
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "ParkedReceiverToSendComplete",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						dstAccessYield(marker, true)
+						<-ch
+					}()
+					go func() {
+						defer wg.Done()
+						runtime.Gosched()
+						ch <- struct{}{}
+						dstAccessYield(marker, false)
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, _, readSeq := assertChannelHBTrace(t, tt.sut)
+			releases, acquires := 0, 0
+			readAcquire := false
+			for i, k := range tr.syncKind {
+				if tr.syncAux[i] != 0 {
+					continue
+				}
+				switch k {
+				case syncEventRelease:
+					releases++
+				case syncEventAcquire:
+					acquires++
+					readAcquire = readAcquire || tr.syncSeq[i] == readSeq
+				}
+			}
+			if releases < 2 || acquires < 2 {
+				t.Fatalf("unbuffered channel rendezvous did not record both racesync halves: releases=%d acquires=%d syncKind=%v syncAux=%v", releases, acquires, tr.syncKind, tr.syncAux)
+			}
+			if !readAcquire {
+				t.Fatalf("unbuffered channel rendezvous did not record acquire on parked goroutine %d: syncKind=%v syncSeq=%v syncAux=%v", readSeq, tr.syncKind, tr.syncSeq, tr.syncAux)
+			}
+		})
+	}
+}
+
+func TestExploreRecordsChannelCloseHB(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("channel close HB events are emitted by dst-race sync hooks")
+	}
+	for _, tt := range []struct {
+		name string
+		sut  func(unsafe.Pointer) func() bool
+	}{
+		{
+			name: "ReceiveAfterClose",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						dstAccessYield(marker, true)
+						close(ch)
+					}()
+					go func() {
+						defer wg.Done()
+						<-ch
+						dstAccessYield(marker, false)
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "SelectReceiveAfterClose",
+			sut: func(marker unsafe.Pointer) func() bool {
+				return func() bool {
+					ch := make(chan struct{})
+					other := make(chan struct{})
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						dstAccessYield(marker, true)
+						close(ch)
+					}()
+					go func() {
+						defer wg.Done()
+						select {
+						case <-ch:
+						case <-other:
+						}
+						dstAccessYield(marker, false)
+					}()
+					wg.Wait()
+					return false
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assertChannelHBTrace(t, tt.sut)
+		})
+	}
+}
+
+func assertChannelHBTrace(t *testing.T, sutForMarker func(unsafe.Pointer) func() bool) (exploreTrace, uint64, uint64) {
+	t.Helper()
+	marker := new(int)
+	addr := uintptr(unsafe.Pointer(marker))
+	sut := sutForMarker(unsafe.Pointer(marker))
+	dstExploreInit(256, 4096, 512, 512)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+	write, read := -1, -1
+	for i := range tr.accSeq {
+		if tr.accAddr[i] != addr {
+			continue
+		}
+		if tr.accWrite[i] {
+			write = i
+		} else {
+			read = i
+		}
+	}
+	if write < 0 || read < 0 || tr.accSeq[write] == tr.accSeq[read] || write > read {
+		t.Fatalf("missing ordered channel HB marker accesses: write=%d read=%d seq=%v addr=%#x log=%#v", write, read, tr.accSeq, addr, tr)
+	}
+	clk, pidx := dporClocks(tr)
+	if dporConcurrent(clk, pidx, tr, write, read) {
+		t.Fatalf("channel HB did not order marker accesses: write=%d read=%d syncKind=%v syncSeq=%v syncID=%v syncAux=%v", write, read, tr.syncKind, tr.syncSeq, tr.syncID, tr.syncAux)
+	}
+	return tr, tr.accSeq[write], tr.accSeq[read]
+}
+
 func TestExploreRecordsMutexHB(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")

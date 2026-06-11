@@ -758,8 +758,8 @@ DPOR's dependency relation needs, for any two accesses, whether they are causall
 **records** the synchronization events it owns into the per-bubble transition log: ready/create edges
 (`goready`/goroutine creation, the non-foreclosure choke points) and, in `-tags dst -race` builds, explicit
 sync release/acquire events for real memory-model edges such as mutex `Unlock`→later successful
-`Lock`/`TryLock` and buffered channel slot send→receive. The DPOR engine **computes the vector clocks / HB
-relation offline**, between Runs.
+`Lock`/`TryLock`, channel send→receive / unbuffered receive→send-completion, and
+close→closed-receive. The DPOR engine **computes the vector clocks / HB relation offline**, between Runs.
 Ready edges and sync events also record the access-log length and a shared HB-event order at the moment
 they fired, so same-step events are ordered against inline filtered accesses in the same interval without
 conflating sync-object *decision conflicts* with synchronization HB. Sync events are replayed as object
@@ -919,14 +919,16 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    (allocation-free, gated so Random/PCT/non-dst/dst-without-race are unaffected); the DPOR engine builds vector clocks **offline** from those events +
    program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to *concurrent*
    conflicting pairs only. Mutex/channel-serialized conflicts are pruned, including non-waking edges such
-   as uncontended mutex `Unlock`→`Lock` and buffered channel slot send→receive. Measured on `twoPairSUT`
+   as uncontended mutex `Unlock`→`Lock`, buffered channel slot send→receive, unbuffered rendezvous, and
+   close→closed-receive. Measured on `twoPairSUT`
    (two channel-ordered producer/consumer pairs interleaving freely): exhaustive 4032, address-only DPOR
    21, **HB-DPOR 4** — all 0 failures (`TestDSTExploreHBPrunes`, mutation-verified: the `<=10` bound fails
    at 21 when the concurrency test is disabled). Synthetic clock tests validate release/acquire object
    clocks, release-time snapshots, and distinct channel-slot identities. `TestExploreRecordsBufferedChannelHB`,
    `TestExploreRecordsBufferedChannelZeroSizeSlotIDs`, `TestExploreRecordsFullBufferedChannelSenderRelease`,
-   `TestExploreRecordsSelectBufferedChannelHB`, and `TestExploreRecordsMutexHB` validate the buffered-channel
-   and mutex runtime hook paths under `-tags dst -race`. On pure-race SUTs (atomicity/counter, no synchronized
+   `TestExploreRecordsSelectBufferedChannelHB`, `TestExploreRecordsUnbufferedChannelHB`,
+   `TestExploreRecordsChannelCloseHB`, and `TestExploreRecordsMutexHB` validate the channel and mutex runtime
+   hook paths under `-tags dst -race`. On pure-race SUTs (atomicity/counter, no synchronized
    accesses) HB correctly finds the conflicts concurrent and changes nothing — completeness preserved
    (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks) keeps the runtime a pure
    recorder + schedule-follower. Foreclosure: additive recording.
