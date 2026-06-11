@@ -57,8 +57,9 @@ type Failure struct {
 	// the first schedule that exhibits it.
 	Race bool
 	// Panic is non-empty iff the SUT panicked while executing this schedule, including
-	// from a SUT-created child goroutine. The Schedule and AccessForces replay the
-	// same interleaving; Replay panics again for panic failures.
+	// from a SUT-created child goroutine or finalizer/cleanup callback. The Schedule
+	// and AccessForces replay the same interleaving; Replay panics again for panic
+	// failures.
 	Panic string
 	// Deadlock is non-empty iff the schedule ended with a synctest deadlock. Replay
 	// panics with the same deadlock marker for deadlock failures.
@@ -376,7 +377,11 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
-				out.panic = panicString(v)
+				if pv, ok := dstExplorePanicFP(); ok {
+					out.panic = panicString(pv)
+				} else {
+					out.panic = panicString(v)
+				}
 			}
 		}()
 		failed = sut()

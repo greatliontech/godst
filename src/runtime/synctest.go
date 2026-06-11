@@ -482,6 +482,9 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 	const poolReapGenerations = 2
 	poolReap := poolReapGenerations
 	for {
+		if bubble.gcDrain == nil {
+			return
+		}
 		if bubble.dstDrainAtQuiescence() {
 			poolReap = poolReapGenerations
 			continue
@@ -492,9 +495,10 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 		}
 	}
 	lock(&bubble.mu)
+	drain := bubble.gcDrain
 	bubble.gcDrainExit = true
 	unlock(&bubble.mu)
-	goready(bubble.gcDrain, 0)
+	goready(drain, 0)
 	// Park the root until the drain has observed gcDrainExit and exited; its
 	// _Grunning->_Gdead transition decrements total and wakes the root.
 	gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)

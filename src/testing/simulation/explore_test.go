@@ -5,6 +5,7 @@
 package simulation
 
 import (
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -611,6 +612,47 @@ type emptyPanicError struct{}
 
 func (emptyPanicError) Error() string { return "" }
 
+type exploreCallbackPanicObj struct{ b byte }
+
+type exploreCallbackSignal struct {
+	ch  chan struct{}
+	msg string
+}
+
+//go:noinline
+func makeExploreFinalizerPanic(msg string) {
+	o := &exploreCallbackPanicObj{}
+	runtime.SetFinalizer(o, func(*exploreCallbackPanicObj) { panic(msg) })
+	runtime.KeepAlive(o)
+}
+
+//go:noinline
+func makeExploreCleanupPanic(msg string) {
+	o := &exploreCallbackPanicObj{}
+	runtime.AddCleanup(o, func(msg string) { panic(msg) }, msg)
+	runtime.KeepAlive(o)
+}
+
+//go:noinline
+func makeExploreFinalizerSignalPanic(sig exploreCallbackSignal) {
+	o := &exploreCallbackPanicObj{}
+	runtime.SetFinalizer(o, func(*exploreCallbackPanicObj) {
+		sig.ch <- struct{}{}
+		panic(sig.msg)
+	})
+	runtime.KeepAlive(o)
+}
+
+//go:noinline
+func makeExploreCleanupSignalPanic(sig exploreCallbackSignal) {
+	o := &exploreCallbackPanicObj{}
+	runtime.AddCleanup(o, func(sig exploreCallbackSignal) {
+		sig.ch <- struct{}{}
+		panic(sig.msg)
+	}, sig)
+	runtime.KeepAlive(o)
+}
+
 func TestExploreReportsPanicFailure(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -667,6 +709,71 @@ func TestExploreReportsChildPanicFailure(t *testing.T) {
 	}()
 	if !panicked {
 		t.Fatalf("Replay of child panic failure did not panic")
+	}
+}
+
+func TestExploreReportsDrainCallbackPanicFailure(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	for _, tt := range []struct {
+		name string
+		make func(string)
+	}{
+		{name: "finalizer", make: makeExploreFinalizerPanic},
+		{name: "cleanup", make: makeExploreCleanupPanic},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.name + " callback boom"
+			sut := func() bool {
+				tt.make(want)
+				time.Sleep(time.Millisecond)
+				return false
+			}
+			res := Explore(1, DPOR, sut)
+			if len(res.Failures) != 1 || res.Failures[0].Panic != want || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
+				t.Fatalf("%s panic was not reported as a replayable failure: %#v", tt.name, res.Failures)
+			}
+			panicked := false
+			func() {
+				defer func() {
+					if v := recover(); v != nil && panicString(v) == want {
+						panicked = true
+					}
+				}()
+				Replay(1, res.Failures[0], sut)
+			}()
+			if !panicked {
+				t.Fatalf("Replay of %s callback panic failure did not panic with %q", tt.name, want)
+			}
+		})
+	}
+}
+
+func TestExploreReportsDrainCallbackPanicBeforeLaterTopPanic(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	for _, tt := range []struct {
+		name string
+		make func(exploreCallbackSignal)
+	}{
+		{name: "finalizer", make: makeExploreFinalizerSignalPanic},
+		{name: "cleanup", make: makeExploreCleanupSignalPanic},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.name + " callback boom"
+			sut := func() bool {
+				ch := make(chan struct{})
+				tt.make(exploreCallbackSignal{ch: ch, msg: want})
+				<-ch
+				panic("top boom")
+			}
+			res := Explore(1, DPOR, sut)
+			if len(res.Failures) != 1 || res.Failures[0].Panic != want || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
+				t.Fatalf("%s callback panic was not preserved before later top panic: %#v", tt.name, res.Failures)
+			}
+		})
 	}
 }
 

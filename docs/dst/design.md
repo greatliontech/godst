@@ -814,8 +814,9 @@ The driver lives above the seam, orchestrating repeated Runs:
   form. `ExploreResult` carries schedules/exhausted/overflow/budget-hit + every found failure (a `-race`
   report, a SUT assertion, a SUT panic, or a synctest deadlock) with replay metadata: the observing schedule
   plus any forced access-yield watchpoints active when the failure was observed. Top-level SUT callback
-  panics are recovered in the Explore driver; unrecovered panics from SUT-created bubble goroutines are
-  recorded by the runtime after the panicking goroutine's defers run, then that goroutine exits. Scheduled
+  panics are recovered in the Explore driver; unrecovered panics from SUT-created bubble goroutines or
+  finalizer/cleanup callbacks on the DST drain are recorded by the runtime after the panicking goroutine's
+  defers run, then that goroutine exits. Scheduled
   synctest deadlocks are recorded as `Failure.Deadlock` inside `synctestRun` before it returns, avoiding the
   unsafe outer-recover path while leaving the blocked goroutines isolated in their deadlocked bubble.
 - `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
@@ -942,9 +943,9 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    (exhausted vs budget-hit distinct — no silent cap), top-level and child-goroutine SUT panics as
    `Failure.Panic`, synctest deadlocks as `Failure.Deadlock`, and one `Failure.Race` per new `RaceErrors`
    increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
-   child-before-parent-continuation failures are not silently skipped. Child-goroutine panics are recorded in
-   the runtime after ordinary defers; scheduled deadlocks are converted inside `synctestRun` before `Run`
-   returns.
+   child-before-parent-continuation failures are not silently skipped. Child-goroutine and drain-callback
+   panics are recorded in the runtime after ordinary defers; scheduled deadlocks are converted inside
+   `synctestRun` before `Run` returns.
    *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 

@@ -581,8 +581,15 @@ func dstExploreRecordUncaughtPanic(v any) bool {
 		return false
 	}
 	gp := getg()
-	if gp == nil || gp.bubble == nil || gp == gp.bubble.root || gp == gp.bubble.gcDrain {
+	if gp == nil || gp.bubble == nil || gp == gp.bubble.root {
 		return false
+	}
+	if gp == gp.bubble.gcDrain {
+		lock(&gp.bubble.mu)
+		if gp.bubble.gcDrain == gp {
+			gp.bubble.gcDrain = nil
+		}
+		unlock(&gp.bubble.mu)
 	}
 	if !dstExplorePanicSet {
 		dstExplorePanicValue = v
