@@ -29,7 +29,10 @@ import (
 // the per-run yield magnitude, read via dstAccessYieldFP.
 var dstAccessYieldPoints uint64
 
-const dstFilterMaxClockProcs = 1024
+const (
+	dstFilterMaxClockProcs  = 1024
+	dstFilterMaxSyncObjects = 1024
+)
 
 // dstYieldAccess is the shared core of every Level-2 transition-boundary hook: it
 // records the transition (addr, size, write) for DPOR's dependency relation and yields,
@@ -274,6 +277,10 @@ var (
 	dstAccessReadEpoch  []uint32
 	dstAccessWriteEpoch []uint32
 	dstAccessEntryN     int
+	dstSyncClockID      []uintptr
+	dstSyncClockAux     []uintptr
+	dstSyncClock        []uint32 // flat [sync-object][dstClockProcs]
+	dstSyncClockN       int
 
 	dstFilterConservative bool
 	dstForceSeq           []uint64
@@ -335,6 +342,68 @@ func dstClockMerge(dst, src int) {
 		if dstClock[baseSrc+i] > dstClock[baseDst+i] {
 			dstClock[baseDst+i] = dstClock[baseSrc+i]
 		}
+	}
+}
+
+func dstSyncClockEntry(id, aux uintptr, create bool) int {
+	for i := 0; i < dstSyncClockN; i++ {
+		if dstSyncClockID[i] == id && dstSyncClockAux[i] == aux {
+			return i
+		}
+	}
+	if !create {
+		return -1
+	}
+	if dstSyncClockN >= len(dstSyncClockID) {
+		dstFilterConservative = true
+		return -1
+	}
+	entry := dstSyncClockN
+	dstSyncClockN++
+	dstSyncClockID[entry] = id
+	dstSyncClockAux[entry] = aux
+	base := entry * dstClockProcs
+	for i := 0; i < dstClockProcs; i++ {
+		dstSyncClock[base+i] = 0
+	}
+	return entry
+}
+
+func dstSyncClockRelease(entry, proc int) {
+	baseObj := entry * dstClockProcs
+	baseProc := proc * dstClockProcs
+	for i := 0; i < dstClockProcs; i++ {
+		if dstClock[baseProc+i] > dstSyncClock[baseObj+i] {
+			dstSyncClock[baseObj+i] = dstClock[baseProc+i]
+		}
+	}
+}
+
+func dstSyncClockAcquire(proc, entry int) {
+	baseProc := proc * dstClockProcs
+	baseObj := entry * dstClockProcs
+	for i := 0; i < dstClockProcs; i++ {
+		if dstSyncClock[baseObj+i] > dstClock[baseProc+i] {
+			dstClock[baseProc+i] = dstSyncClock[baseObj+i]
+		}
+	}
+}
+
+func dstApplyLiveSyncEvent(kind uint8, id, aux uintptr, seq uint64) {
+	proc := dstClockIdx(seq)
+	if proc < 0 || dstClockProcs == 0 {
+		dstFilterConservative = true
+		return
+	}
+	entry := dstSyncClockEntry(id, aux, true)
+	if entry < 0 {
+		return
+	}
+	switch kind {
+	case dstSyncEventRelease:
+		dstSyncClockRelease(entry, proc)
+	case dstSyncEventAcquire:
+		dstSyncClockAcquire(proc, entry)
 	}
 }
 
@@ -581,6 +650,7 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 		return
 	}
 	seq := dstEnsureSeq(gp)
+	dstApplyLiveSyncEvent(kind, id, aux, seq)
 	if dstSyncEventN < len(dstSyncEventKind) {
 		dstSyncEventKind[dstSyncEventN] = kind
 		dstSyncEventID[dstSyncEventN] = id
@@ -697,6 +767,14 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstAccessNext = make([]int32, maxAccesses)
 	dstAccessReadEpoch = make([]uint32, maxAccesses)
 	dstAccessWriteEpoch = make([]uint32, maxAccesses)
+	syncClockObjects := maxEdges
+	if syncClockObjects > dstFilterMaxSyncObjects {
+		syncClockObjects = dstFilterMaxSyncObjects
+	}
+	dstSyncClockID = make([]uintptr, syncClockObjects)
+	dstSyncClockAux = make([]uintptr, syncClockObjects)
+	dstSyncClock = make([]uint32, syncClockObjects*dstClockProcs)
+	dstSyncClockN = 0
 }
 
 // dstScheduleReset prepares the scheduled-strategy state for a new bubble. Called
@@ -725,6 +803,10 @@ func dstScheduleReset() {
 		dstAccessTab[i] = 0
 	}
 	dstAccessEntryN = 0
+	for i := 0; i < dstSyncClockN*dstClockProcs; i++ {
+		dstSyncClock[i] = 0
+	}
+	dstSyncClockN = 0
 	dstFilterConservative = false
 }
 

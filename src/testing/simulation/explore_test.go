@@ -818,6 +818,87 @@ func TestExploreRecordsMutexHB(t *testing.T) {
 	}
 }
 
+func TestExploreLiveSyncHBFiltersProtectedAccesses(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("live sync HB filtering is active under dst-race access hooks")
+	}
+	for _, tt := range []struct {
+		name string
+		sut  func(unsafe.Pointer, bool) func() bool
+	}{
+		{
+			name: "Mutex",
+			sut: func(marker unsafe.Pointer, record bool) func() bool {
+				return func() bool {
+					var mu sync.Mutex
+					var wg sync.WaitGroup
+					wg.Add(2)
+					for g := 0; g < 2; g++ {
+						go func() {
+							defer wg.Done()
+							for i := 0; i < 3; i++ {
+								mu.Lock()
+								if record {
+									dstAccessYield(marker, true)
+								}
+								mu.Unlock()
+							}
+						}()
+					}
+					wg.Wait()
+					return false
+				}
+			},
+		},
+		{
+			name: "ChannelToken",
+			sut: func(marker unsafe.Pointer, record bool) func() bool {
+				return func() bool {
+					ch := make(chan struct{}, 1)
+					ch <- struct{}{}
+					var wg sync.WaitGroup
+					wg.Add(2)
+					for g := 0; g < 2; g++ {
+						go func() {
+							defer wg.Done()
+							for i := 0; i < 3; i++ {
+								<-ch
+								if record {
+									dstAccessYield(marker, true)
+								}
+								ch <- struct{}{}
+							}
+						}()
+					}
+					wg.Wait()
+					return false
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			marker := new(int)
+			count := func(record bool) uint64 {
+				dstAccessYieldReset()
+				dstExploreInit(512, 8192, 1024, 4096)
+				_, _, tr := runOnce(1, nil, map[accessForce]bool{}, tt.sut(unsafe.Pointer(marker), record))
+				if tr.overflow {
+					t.Fatalf("trace overflowed while measuring %s live HB filtering: %#v", tt.name, tr)
+				}
+				return dstAccessYieldFP()
+			}
+			baseline := count(false)
+			withMarker := count(true)
+			if withMarker != baseline {
+				t.Fatalf("%s HB-ordered marker accesses added live yield points: baseline=%d withMarker=%d", tt.name, baseline, withMarker)
+			}
+		})
+	}
+}
+
 func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")

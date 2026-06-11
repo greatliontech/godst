@@ -739,10 +739,11 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   with a prior access by a different goroutine (overlapping byte intervals, ≥1 write) that is **not**
   happens-before-ordered before it (D2). Single-owner and HB-ordered accesses record but do not yield. This is the
   primary control on the access-granularity explosion; its magnitude is measured in increment 1. **[V]**
-  Runtime implementation: under `-tags dst -race`, the DST access hooks maintain a preallocated live HB clock
-  and a per-interval / per-goroutine epoch table. A memory access that has no prior concurrent conflicting
-  access records into the per-bubble access log inline and does not call `goyield`; a conflicting access
-  still yields and is logged when the goroutine is resumed, preserving commit order. Because a prior-only
+  Runtime implementation: under `-tags dst -race`, the DST access hooks maintain a preallocated live HB clock,
+  live sync-object clocks for the same release/acquire events recorded offline, and a per-interval /
+  per-goroutine epoch table. A memory access that has no prior concurrent conflicting access records into
+  the per-bubble access log inline and does not call `goyield`; a conflicting access still yields and is
+  logged when the goroutine is resumed, preserving commit order. Because a prior-only
   filter cannot know that a later access will need a split inside the same inline interval, the brain
    promotes observed unsafe inline accesses to forced replay yield points keyed by `(dstSeq, hook ordinal,
    hook PC key)`, where the PC key is function-name + offset based rather than an absolute address, and
@@ -765,10 +766,10 @@ they fired, so same-step events are ordered against inline filtered accesses in 
 conflating sync-object *decision conflicts* with synchronization HB. Sync events are replayed as object
 clocks, so an acquire observes the release-time snapshot rather than the releasing goroutine's later
 accesses. Buffered channel events key the object by channel plus ring slot, not by element address, so
-zero-sized element slots remain distinct HB objects. Two conflicting accesses are **dependent** iff neither clock dominates the other (concurrent);
-HB-ordered pairs are pruned (their order is fixed and sound). Offline (not live hot-path clocks) because
-the runtime is a pure recorder + schedule-follower under the stateless re-execution model — the scheduling
-decision during a Run needs only the prefix, never HB; HB is needed only by the post-Run backtrack analysis.
+zero-sized element slots remain distinct HB objects. The full dependency relation is still computed
+offline between Runs: two conflicting accesses are **dependent** iff neither clock dominates the other
+(concurrent), and HB-ordered pairs are pruned (their order is fixed and sound). The bounded live clocks are
+only the conservative access-yield filter; DPOR source sets and replay decisions use the post-Run clocks.
 The recorded events are the same ones the scheduler/sync primitives control, so the HB is self-contained
 (no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful
 oracle, which the conflict-set cross-check against `-race` reports validates. Timer-fire wakeups in synctest fake time are
@@ -930,8 +931,9 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    `TestExploreRecordsChannelCloseHB`, and `TestExploreRecordsMutexHB` validate the channel and mutex runtime
    hook paths under `-tags dst -race`. On pure-race SUTs (atomicity/counter, no synchronized
    accesses) HB correctly finds the conflicts concurrent and changes nothing — completeness preserved
-   (`TestDSTExploreComplete` still green). Offline (not live hot-path clocks) keeps the runtime a pure
-   recorder + schedule-follower. Foreclosure: additive recording.
+   (`TestDSTExploreComplete` still green). Full DPOR HB remains offline; the live clocks only suppress
+   access yields using the same release/acquire semantics as the recorded sync events. Foreclosure: additive
+   recording.
 3. **DPOR strategy** (D3; **VALIDATED [V]**). Iterative stateless DPOR over the schedule recorder
    (`dporExplore` in `testing/simulation/explore.go`): dependency = overlapping nonzero memory byte
    intervals or the same sync-object identity, ≥1 write, different stable index (`g.dstSeq`); backtrack
