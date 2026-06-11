@@ -823,8 +823,9 @@ The driver lives above the seam, orchestrating repeated Runs:
   defers run, then that goroutine exits. Scheduled
   synctest deadlocks are recorded as `Failure.Deadlock` inside `synctestRun` before it returns, avoiding the
   unsafe outer-recover path while leaving the blocked goroutines isolated in their deadlocked bubble.
-- `Options.Strategy = DPOR` extends the existing enum (Random, PCT, DPOR). A single
-  `RunWith(seed, Options{Strategy: DPOR, Schedule: s}, f)` replays one schedule for reproduction/debug.
+- `simulation.Replay(seed, failure, f)` replays one schedule for reproduction/debug using a `Failure`'s
+  recorded schedule plus any forced access-yield watchpoints. `RunWith` remains the Random/PCT control
+  surface and rejects unknown strategies instead of silently falling back to Random.
 - **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
   much was covered — "exhausted" and "budget-hit" are distinct verdicts; the latter is never reported as
   the former.

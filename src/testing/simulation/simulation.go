@@ -172,6 +172,8 @@ const (
 	PCT
 )
 
+const maxStrategyParam = 1<<31 - 1
+
 // runtime strategy kinds (must match runtime/dst.go: dstSchedRandom, dstSchedPCT,
 // dstSchedScheduled).
 const (
@@ -187,11 +189,14 @@ type Options struct {
 	// Depth is the PCT target bug depth d: the number of ordering constraints a
 	// bug needs, i.e. the number of priority-change points used. Ignored unless
 	// Strategy==PCT. Default 3. Higher d targets deeper bugs but lowers the
-	// per-seed hit probability.
+	// per-seed hit probability. A value <= 0 selects the default; positive values
+	// must fit in the runtime scheduler's int32 strategy field.
 	Depth int
 	// Steps is the PCT estimate of the number of scheduling decisions in a run;
 	// the priority-change points are placed uniformly in [1,Steps]. Ignored unless
-	// Strategy==PCT. Default 1000; a rough over-estimate is fine.
+	// Strategy==PCT. Default 1000; a rough over-estimate is fine. A value <= 0
+	// selects the default; positive values must fit in the runtime scheduler's
+	// int32 strategy field.
 	Steps int
 
 	// Hostname and PID are the simulated process identity: within Run, os.Hostname
@@ -305,8 +310,10 @@ func Run(seed uint64, f func()) {
 // RunWith is Run with an explicit exploration Strategy (Random or PCT). Use it to
 // direct interleaving exploration — e.g. Strategy PCT to bias toward exposing
 // deep concurrency bugs — while keeping the same per-seed determinism and replay
-// guarantees as Run. The zero Options is exactly Run. It has the same
-// process-global non-overlap restriction as Run.
+// guarantees as Run. Unknown Strategy values, and PCT Depth/Steps values that do
+// not fit the runtime scheduler field, panic before the run starts. The zero
+// Options is exactly Run. It has the same process-global non-overlap restriction
+// as Run.
 //
 // Example: explore depth-3 bugs over a seed sweep.
 //
@@ -318,15 +325,25 @@ func Run(seed uint64, f func()) {
 func RunWith(seed uint64, opts Options, f func()) {
 	kind := kindRandom
 	var depth, steps int32
-	if opts.Strategy == PCT {
+	switch opts.Strategy {
+	case Random:
+	case PCT:
 		kind = kindPCT
 		depth, steps = 3, 1000 // defaults
 		if opts.Depth > 0 {
+			if opts.Depth > maxStrategyParam {
+				panic("testing/simulation: RunWith PCT Depth overflows runtime strategy field")
+			}
 			depth = int32(opts.Depth)
 		}
 		if opts.Steps > 0 {
+			if opts.Steps > maxStrategyParam {
+				panic("testing/simulation: RunWith PCT Steps overflows runtime strategy field")
+			}
 			steps = int32(opts.Steps)
 		}
+	default:
+		panic("testing/simulation: RunWith unknown Strategy")
 	}
 	hostname := opts.Hostname
 	if hostname == "" {

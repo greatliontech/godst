@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -180,6 +181,59 @@ func TestPublicExploreGuardsBeforeTraceInit(t *testing.T) {
 			})
 			if !tr.overflow {
 				t.Fatalf("%s mutated trace buffers before rejecting overlap", tt.name)
+			}
+		})
+	}
+}
+
+func TestRunWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
+	type testCase struct {
+		name string
+		opts Options
+		want string
+	}
+	cases := []testCase{
+		{
+			name: "unknown strategy",
+			opts: Options{Strategy: Strategy(99)},
+			want: "unknown Strategy",
+		},
+	}
+	if strconv.IntSize > 32 {
+		tooLarge := int(maxStrategyParam)
+		tooLarge++
+		cases = append(cases,
+			testCase{
+				name: "pct depth overflow",
+				opts: Options{Strategy: PCT, Depth: tooLarge},
+				want: "PCT Depth overflows",
+			},
+			testCase{
+				name: "pct steps overflow",
+				opts: Options{Strategy: PCT, Steps: tooLarge},
+				want: "PCT Steps overflows",
+			},
+		)
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			var got string
+			func() {
+				defer func() {
+					got = panicString(recover())
+				}()
+				RunWith(1, tt.opts, func() { called = true })
+			}()
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("RunWith panic = %q, want substring %q", got, tt.want)
+			}
+			if called {
+				t.Fatalf("RunWith called the SUT after rejecting %s", tt.name)
+			}
+			if runActive.Load() {
+				t.Fatalf("RunWith left simulation active after rejecting %s", tt.name)
 			}
 		})
 	}
