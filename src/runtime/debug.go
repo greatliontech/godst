@@ -78,6 +78,10 @@ func GOMAXPROCS(n int) int {
 		unlock(&sched.lock)
 		return ret
 	}
+	if dstActive() {
+		unlock(&sched.lock)
+		return ret
+	}
 	// Set early so we can wait for sysmon befor STW. See comment on
 	// computeMaxProcsLock.
 	sched.customGOMAXPROCS = true
@@ -115,6 +119,10 @@ func GOMAXPROCS(n int) int {
 // update if the caller is aware of a change to the total logical CPU count, CPU
 // affinity mask or cgroup quota.
 func SetDefaultGOMAXPROCS() {
+	if dstActive() {
+		return
+	}
+
 	// SetDefaultGOMAXPROCS conceptually means "[re]do what the runtime
 	// would do at startup if the GOMAXPROCS environment variable were
 	// unset." It still respects GODEBUG.
@@ -144,6 +152,14 @@ func SetDefaultGOMAXPROCS() {
 	unlock(&sched.lock)
 
 	startTheWorldGC(stw)
+}
+
+//go:linkname dstGOMAXPROCSAutoFP
+func dstGOMAXPROCSAutoFP() bool {
+	lock(&sched.lock)
+	auto := !sched.customGOMAXPROCS
+	unlock(&sched.lock)
+	return auto
 }
 
 // NumCPU returns the number of logical CPUs usable by the current process.

@@ -36,6 +36,7 @@ func init() {
 	register("DSTRunDeterminism", DSTRunDeterminism)
 	register("DSTRunNestedGuard", DSTRunNestedGuard)
 	register("DSTRunOverlapGuard", DSTRunOverlapGuard)
+	register("DSTRunGOMAXPROCSPinned", DSTRunGOMAXPROCSPinned)
 	register("DSTPoolAcrossRuns", DSTPoolAcrossRuns)
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
@@ -73,6 +74,9 @@ func init() {
 
 //go:linkname dstRuntimeActive runtime.dstActive
 func dstRuntimeActive() bool
+
+//go:linkname dstGOMAXPROCSAutoFP runtime.dstGOMAXPROCSAutoFP
+func dstGOMAXPROCSAutoFP() bool
 
 // dstMemSink keeps the most recent allocation live so the rest become garbage.
 var dstMemSink []byte
@@ -1477,6 +1481,26 @@ func DSTRunOverlapGuard() {
 	})
 	os.Stdout.WriteString("overlap=" + strconv.FormatBool(<-done) +
 		" active=" + strconv.FormatBool(active.Load()) + "\n")
+}
+
+func DSTRunGOMAXPROCSPinned() {
+	var oldSet, afterSet, afterDefault int
+	var autoAfterDefault bool
+	before := runtime.GOMAXPROCS(0)
+	simulation.Run(1, func() {
+		oldSet = runtime.GOMAXPROCS(2)
+		afterSet = runtime.GOMAXPROCS(0)
+		runtime.SetDefaultGOMAXPROCS()
+		afterDefault = runtime.GOMAXPROCS(0)
+		autoAfterDefault = dstGOMAXPROCSAutoFP()
+	})
+	after := runtime.GOMAXPROCS(0)
+	os.Stdout.WriteString("before=" + strconv.Itoa(before) +
+		" old=" + strconv.Itoa(oldSet) +
+		" afterSet=" + strconv.Itoa(afterSet) +
+		" afterDefault=" + strconv.Itoa(afterDefault) +
+		" auto=" + strconv.FormatBool(autoAfterDefault) +
+		" restored=" + strconv.Itoa(after) + "\n")
 }
 
 // dstSelectSeq drains four always-ready buffered channels via select, rounds

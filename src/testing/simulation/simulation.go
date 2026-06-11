@@ -289,7 +289,9 @@ func leaveSimulation() {
 //
 // Run, RunWith, Explore, ExploreWith, and Replay are process-global simulation
 // operations: they must not overlap in one process, and must not be called from
-// within a synctest bubble.
+// within a synctest bubble. Attempts to change GOMAXPROCS with
+// runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the simulation are
+// ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
 //
 // A goroutine in f that never blocks and never makes a function call (e.g. a
 // bare for{}) will not be preempted and will stall the simulation; real code

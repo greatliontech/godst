@@ -721,6 +721,14 @@ func TestDSTRunRejectsOverlappingTopLevelRuns(t *testing.T) {
 	}
 }
 
+func TestDSTRunKeepsGOMAXPROCSPinned(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTRunGOMAXPROCSPinned", "GOGC=off", "GOMAXPROCS=4"))
+	const want = "before=4 old=1 afterSet=1 afterDefault=1 auto=false restored=4"
+	if out != want {
+		t.Fatalf("GOMAXPROCS escaped DST Run:\n got=%q\nwant=%q", out, want)
+	}
+}
+
 // dstSchedSeeds is the seed spread the Seq-5 scheduling tests use for the
 // seed-variation and soundness sweeps.
 var dstSchedSeeds = []string{"1", "2", "3", "12345", "999", "777", "424242", "55"}
