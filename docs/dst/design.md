@@ -672,11 +672,14 @@ mutex is sound and is exactly the interleaving Gap A needs.
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
   every member (290 SUTs, mutation-tested: 23 fail with `dstSyncAcquire` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
-- **DST-L2-4 (clause-explicit: production untouched).** A non-`-tags dst` build, and a `-tags dst` build
-  *without* `-race`, are byte-identical to their upstream/Seq-5 equivalents. *violation:* a production or
-  plain-`-race` binary differs. *Encoding:* the compiler emits identical code when the dst-race mode is
-  off (the access hooks revert to the plain `race*` symbols); all runtime machinery is under
-  `dstBuild`/`dstActive` and dead-code-eliminated otherwise.
+- **DST-L2-4 (clause-explicit: production untouched).** Level-2 hooks are build-mode inert outside
+  `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield` or
+  `dstAccessYieldRange` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under
+  the scheduled strategy. Runtime structs may carry inert DST fields in this fork; byte-identical layout is
+  not the contract. *violation:* production, plain-`-race`, or `-tags dst` without `-race` emits or executes
+  Level-2 hooks, changing behavior or scheduling. *Encoding:* a build-mode objdump test proves user code
+  calls `runtime.dstAccessYield`/`runtime.dstAccessYieldRange` only when both `-tags dst` and `-race` are
+  present; runtime hooks are gated by `dstBuild`/`raceenabled` and `dstActive`/scheduled-strategy guards.
 
 ### Mechanism
 
@@ -886,8 +889,8 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race` are both
    present; the race hook itself is untouched (oracle byte-identical), the yield is skipped in
    `//go:nosplit` functions (`goyield` is splittable; skipping is sound), and with the flag off the pass
-   emits plain `race*` exactly as upstream (DST-L2-4 — verified absent in non-dst and dst-without-race
-   builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
+   emits plain `race*` with no DST access-yield call (DST-L2-4 — verified absent in non-dst and
+   dst-without-race builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
    (`TestDSTExploreAutoInstrument`: the lost update is found, DPOR outcome set == Exhaustive). Foreclosure:
    feeds the same seam. **Runtime sync-primitive hooks for `dstSyncAcquire`: IMPLEMENTED [V]** — channel
    ops (`chan.go` `chansend`/`chanrecv` before `lock(&c.lock)`, `closechan` before the closed-state
@@ -905,7 +908,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    rejection; `Unlock`/`RUnlock`/`closechan` announce before state transitions that can flip racing
    non-blocking decisions. Gated by the SAME `dstBuild && raceenabled` / `//go:build dst && race` condition
    as the memory auto-instrumentation (so non-dst, plain-`-race`, and dst-without-race builds are
-   byte-identical — DST-L2-4), and confined to the scheduled strategy by the runtime guard. Acceptance:
+   hook-inert — DST-L2-4), and confined to the scheduled strategy by the runtime guard. Acceptance:
    `TestDSTExploreSyncAutoInstrument` — unmodified mutex/channel/RWMutex/select/close/Once SUTs each reach
    BOTH sync-decision outcomes under DPOR (vs 1 with the corresponding hook neutered). *Coverage:* this
    covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (decision transitively via `rw.w`),
@@ -1575,7 +1578,7 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
      `fingWake` (harmless); the scheduler's wake of `fing` (`proc.go` `findRunnable`) and `fing`'s own
      dequeue loop are gated by `dstCallbackWorkersBlocked()` (`dstActive` or the pre-active
      `dstPreparing` pass), so during a Run `finq` accumulates and only the drain drains it. The predicate
-     is byte-identical for non-DST because `dstBuild` folds false.
+     is inert for non-DST because `dstBuild` folds false.
    - *Drain exit handshake.* The drain is a bubble goroutine and counts toward `bubble.total`, so it must
      exit before the `total != 1` deadlock check; `dstStopGCDrain` runs a final drain, sets `gcDrainExit`,
      and waits for the drain to die (invariant DST-FIN-3).
@@ -1785,8 +1788,8 @@ compositions — for both the floored and the GOGC-scaled regime (measured: 300/
 To give the per-object accumulation a single choke point, `-tags dst` routes every heap allocation
 through the `mallocgc` dispatcher (the compiler-emitted per-size-class fast paths are gated off,
 `sizeSpecializedMallocEnabled && !dstBuild`; they are off by default and already off under `-race`).
-Production builds are byte-identical — every piece is under `dstActive()`/`dstBuild`, dead-code-eliminated
-when off.
+Production behavior is unchanged — every piece is under `dstActive()`/`dstBuild`, dead-code-eliminated or
+inactive when off.
 
 **Residual (sub-observable, accepted).** The GOGC-scaled target's basis `heapMarked − base` carries a
 rare sub-object wobble from the process baseline captured in `dstHeapBase` at entry (a pre-bubble

@@ -7,8 +7,8 @@
 // DST Level-2 sync-decision auto-hook bridges into sync packages. Built ONLY under
 // -tags dst -race (this file's build tag) — the same gate as the memory-access
 // auto-instrumentation — so a non-dst build, a plain -race build, and a -tags dst
-// build WITHOUT -race carry none of this and are byte-identical to upstream/Seq-5
-// (DST-L2-4). The channel-side hook needs no such bridge: chan.go/select.go call
+// build WITHOUT -race carry none of this bridge and are hook-inert (DST-L2-4). The
+// channel-side hook needs no such bridge: chan.go/select.go call
 // runtime.dstSyncAcquire directly, guarded inline by the `dstBuild && raceenabled`
 // compile-time constants (const-folded to a no-op in every other build).
 

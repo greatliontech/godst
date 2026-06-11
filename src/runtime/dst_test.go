@@ -7,6 +7,7 @@ package runtime_test
 import (
 	"internal/platform"
 	"internal/testenv"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -226,6 +227,87 @@ func TestDSTMapHashKeyBuildInvariant(t *testing.T) {
 			"(the -tags dst global hash key is not build-invariant):\nnormal=%q\n  race=%q",
 			normalOut, raceOut)
 	}
+}
+
+// TestDSTAccessYieldBuildModeInert verifies the Level-2 build-mode boundary: user
+// code gets compiler-inserted runtime.dstAccessYield and runtime.dstAccessYieldRange
+// calls only when BOTH -tags dst and -race are present. Other build modes may carry
+// inert runtime DST state in this fork, but they must not emit Level-2 access-yield
+// hooks into user code.
+func TestDSTAccessYieldBuildModeInert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips build-mode objdump checks")
+	}
+	testenv.MustHaveGoBuild(t)
+	dir := t.TempDir()
+	src := []byte(`package main
+
+var scalarSink int
+var rangeSink [32]byte
+var rangeSource [32]byte
+
+//go:noinline
+func touch() {
+	scalarSink++
+	rangeSink = rangeSource
+}
+
+func main() {
+	touch()
+}
+`)
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), src, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	type dstAccessHooks struct {
+		scalar bool
+		range_ bool
+	}
+	dstAccessHookPresence := func(name string, flags ...string) dstAccessHooks {
+		t.Helper()
+		exe := filepath.Join(dir, name)
+		args := append([]string{"build", "-o", exe}, flags...)
+		args = append(args, "main.go")
+		cmd := exec.Command(testenv.GoToolPath(t), args...)
+		cmd.Dir = dir
+		cmd = testenv.CleanCmdEnv(cmd)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("building %s %v: %v\n%s", name, flags, err, out)
+		}
+
+		cmd = exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", "main.touch", exe)
+		cmd = testenv.CleanCmdEnv(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdumping %s: %v\n%s", name, err, out)
+		}
+		text := string(out)
+		return dstAccessHooks{
+			scalar: strings.Contains(text, "runtime.dstAccessYield(SB)"),
+			range_: strings.Contains(text, "runtime.dstAccessYieldRange(SB)"),
+		}
+	}
+	assertNoDSTAccessHooks := func(name string, flags ...string) {
+		t.Helper()
+		if got := dstAccessHookPresence(name, flags...); got.scalar || got.range_ {
+			t.Fatalf("%s build emitted DST access hooks: scalar=%v range=%v", name, got.scalar, got.range_)
+		}
+	}
+	assertDSTAccessHooks := func(name string, flags ...string) {
+		t.Helper()
+		if got := dstAccessHookPresence(name, flags...); !got.scalar || !got.range_ {
+			t.Fatalf("%s build emitted DST access hooks: scalar=%v range=%v", name, got.scalar, got.range_)
+		}
+	}
+
+	assertNoDSTAccessHooks("plain")
+	assertNoDSTAccessHooks("dst", "-tags=dst")
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	assertNoDSTAccessHooks("race", "-race")
+	assertDSTAccessHooks("dst_race", "-tags=dst", "-race")
 }
 
 // TestDSTSysmonNoPreempt verifies that under deterministic scheduling

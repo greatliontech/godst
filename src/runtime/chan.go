@@ -230,8 +230,8 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// acquire the channel is a DPOR transition (the manual chanChoiceSUT does the same
 	// by hand). The dstBuild && raceenabled compile-time constants gate it to a
 	// -tags dst -race build — the same gate as the memory-access auto-instrumentation
-	// and dead-code-eliminated otherwise, so non-dst, plain -race, and dst-without-race
-	// binaries are byte-identical (DST-L2-4). The announce is before c.lock is taken,
+	// and compile it away otherwise, so non-dst, plain -race, and dst-without-race
+	// builds are hook-inert (DST-L2-4). The announce is before c.lock is taken,
 	// so dstSyncAcquire's safe-point guard can yield without running a blocked G
 	// (DST-L2-1).
 	if dstBuild && raceenabled && block {

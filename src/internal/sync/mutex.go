@@ -73,7 +73,7 @@ func (m *Mutex) lock(hb bool) {
 	// DST Level-2: announce the impending acquisition on the mutex identity BEFORE the
 	// fast-path CAS, so the lock-acquisition order is a DPOR transition. The
 	// dstHookEnabled const folds this away outside a -tags dst -race build, so Lock is
-	// byte-identical to upstream (DST-L2-4); see dst_on.go/dst_off.go.
+	// hook-inert (DST-L2-4); see dst_on.go/dst_off.go.
 	if dstHookEnabled {
 		dstSyncAcquire(m)
 	}

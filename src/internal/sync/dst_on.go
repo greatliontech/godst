@@ -11,8 +11,8 @@ import "unsafe"
 // dstHookEnabled compile-time gates the Mutex sync-decision announces: true only in
 // this -tags dst -race build, false in dst_off.go. Mutex methods guard dstSyncAcquire
 // calls with `if dstHookEnabled`, so in any other build the calls are dead-code-
-// eliminated and the methods are byte-identical to upstream (DST-L2-4) — a guaranteed
-// const fold, not a dependence on the inliner erasing an empty stub.
+// eliminated and the methods are hook-inert (DST-L2-4) — a guaranteed const fold,
+// not a dependence on the inliner erasing an empty stub.
 const dstHookEnabled = true
 
 // runtime_dstSyncAcquire is the runtime's DST Level-2 sync-decision transition

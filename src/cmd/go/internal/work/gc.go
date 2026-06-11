@@ -129,8 +129,8 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 	// DST Level-2: under -tags dst AND -race, turn on the compiler's dst-race mode so
 	// it emits a dstAccessYield access-granularity yield before each -race hook (the
 	// access becomes a deterministic scheduling decision point). Gated on both so a
-	// plain -race build, and a -tags dst build without -race, are byte-identical to
-	// upstream (DST-L2-4). See docs/dst/design.md D1.
+	// plain -race build, and a -tags dst build without -race, remain hook-inert
+	// (DST-L2-4). See docs/dst/design.md D1.
 	if cfg.BuildRace {
 		for _, tag := range cfg.BuildContext.BuildTags {
 			if tag == "dst" {
