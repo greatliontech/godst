@@ -705,6 +705,22 @@ func TestDSTRunAPI(t *testing.T) {
 	}
 }
 
+func TestDSTRunRejectsNestedWithoutClearingOuterState(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTRunNestedGuard", "GOGC=off"))
+	const want = "nested=true active=true pid=1"
+	if out != want {
+		t.Fatalf("nested Run guard failed:\n got=%q\nwant=%q", out, want)
+	}
+}
+
+func TestDSTRunRejectsOverlappingTopLevelRuns(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTRunOverlapGuard", "GOGC=off"))
+	const want = "overlap=true active=true"
+	if out != want {
+		t.Fatalf("overlapping Run guard failed:\n got=%q\nwant=%q", out, want)
+	}
+}
+
 // dstSchedSeeds is the seed spread the Seq-5 scheduling tests use for the
 // seed-variation and soundness sweeps.
 var dstSchedSeeds = []string{"1", "2", "3", "12345", "999", "777", "424242", "55"}

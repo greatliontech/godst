@@ -5,6 +5,7 @@
 package simulation
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -79,6 +80,61 @@ func TestReplayInstallsAccessForces(t *testing.T) {
 	}
 	if got := dstAccessYieldFP(); got <= unforced {
 		t.Fatalf("Replay did not install the forced access yield: unforced=%d forced=%d", unforced, got)
+	}
+}
+
+func TestPublicExploreGuardsBeforeTraceInit(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	t.Cleanup(func() {
+		dstExploreInit(exploreMaxDecisions, exploreMaxEnabledTotal, exploreMaxEdges, exploreMaxAccesses)
+	})
+
+	for _, tt := range []struct {
+		name string
+		call func()
+	}{
+		{
+			name: "ExploreWith",
+			call: func() {
+				ExploreWith(1, ExploreOptions{MaxSchedules: 1}, func() bool { return false })
+			},
+		},
+		{
+			name: "Replay",
+			call: func() {
+				Replay(1, Failure{}, func() bool { return false })
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dstExploreInit(0, 0, 0, 0)
+			panicked := false
+			runActive.Store(true)
+			func() {
+				defer func() {
+					runActive.Store(false)
+					if v := recover(); v != nil {
+						panicked = strings.Contains(panicString(v), "called while another simulation operation is active")
+					}
+				}()
+				tt.call()
+			}()
+			if !panicked {
+				t.Fatalf("%s did not reject overlap", tt.name)
+			}
+
+			x := 0
+			_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+				dstAccessYield(unsafe.Pointer(&x), true)
+				x++
+				return false
+			})
+			if !tr.overflow {
+				t.Fatalf("%s mutated trace buffers before rejecting overlap", tt.name)
+			}
+		})
 	}
 }
 

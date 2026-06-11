@@ -149,7 +149,9 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 // records every such schedule. The seed fixes the program's data randomness
 // (select/map/math+crypto rand); the interleaving is controlled by Explore,
 // independent of the seed. Requires building with -tags dst (and -race to also use
-// the happens-before detector as an oracle within each interleaving).
+// the happens-before detector as an oracle within each interleaving). Explore is a
+// process-global simulation operation: it must not overlap any other simulation
+// operation in one process, and must not be called from within a synctest bubble.
 //
 // Exhaustive enumerates the whole decision tree. DPOR explores one interleaving
 // per Mazurkiewicz equivalence class, finding the same bugs with far fewer runs.
@@ -158,11 +160,11 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 }
 
 // ExploreWith is Explore with caller-supplied exploration budgets. Budgeted runs
-// report BudgetHit and never report Exhausted for truncated coverage.
+// report BudgetHit and never report Exhausted for truncated coverage. It has the
+// same process-global non-overlap restriction as Explore.
 func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResult {
-	if !dstBuilt() {
-		panic("testing/simulation: Explore requires building with -tags dst")
-	}
+	enterSimulation("Explore", "testing/simulation: Explore requires building with -tags dst")
+	defer leaveSimulation()
 	cfg := exploreConfigFromOptions(opts)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	if opts.Mode == DPOR {
@@ -175,13 +177,14 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 // It returns the SUT assertion verdict and whether the race detector reported a new
 // race during this replay. For race failures, run Replay in a fresh process if the
 // same process already observed that race, because TSan dedups reports by signature.
+// Replay is a process-global simulation operation and must not overlap any other
+// simulation operation in one process.
 func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) {
-	if !dstBuilt() {
-		panic("testing/simulation: Replay requires building with -tags dst")
-	}
+	enterSimulation("Replay", "testing/simulation: Replay requires building with -tags dst")
+	defer leaveSimulation()
 	cfg := defaultExploreConfig()
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
-	r := runOnceResult(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg)
+	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg)
 	if r.panic != "" {
 		panic(r.panic)
 	}
@@ -343,6 +346,12 @@ func panicString(v any) string {
 }
 
 func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
+	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
+	defer leaveSimulation()
+	return runOnceResultLocked(seed, prefix, forces, sut, cfg)
+}
+
+func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
 	racesBefore := dstRaceErrors()
 	installAccessForces(forces)
 	var failed bool
@@ -364,7 +373,7 @@ func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, su
 				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
 		}
 	}()
-	run(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
+	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
 				out.panic = panicString(v)
@@ -498,7 +507,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 		} else {
 			visited[k] = true
 		}
-		r := runOnceResult(seed, prefix, forces, sut, cfg)
+		r := runOnceResultLocked(seed, prefix, forces, sut, cfg)
 		tr := r.tr
 		res.Schedules++
 		if tr.budgetHit {
@@ -767,7 +776,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		for i, fr := range stack {
 			prefix[i] = fr.proc
 		}
-		r := runOnceResult(seed, prefix, forces, sut, cfg)
+		r := runOnceResultLocked(seed, prefix, forces, sut, cfg)
 		tr := r.tr
 		res.Schedules++
 		if tr.budgetHit {

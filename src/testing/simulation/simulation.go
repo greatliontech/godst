@@ -59,6 +59,7 @@ package simulation
 import (
 	"internal/synctest"
 	"runtime"
+	"sync/atomic"
 	_ "unsafe" // for go:linkname
 )
 
@@ -237,6 +238,27 @@ const (
 	defaultNumCPU   = 8
 )
 
+// runActive protects the process-global DST knobs that Run mutates. DST state is
+// not nestable: seed, scheduler strategy, simulated identity, memory limit,
+// async-preempt, and GOMAXPROCS are all process-wide for the duration of a run.
+var runActive atomic.Bool
+
+func enterSimulation(api, buildPanic string) {
+	if !dstBuilt() {
+		panic(buildPanic)
+	}
+	if synctest.IsInBubble() {
+		panic("testing/simulation: " + api + " called from within a synctest bubble")
+	}
+	if !runActive.CompareAndSwap(false, true) {
+		panic("testing/simulation: " + api + " called while another simulation operation is active")
+	}
+}
+
+func leaveSimulation() {
+	runActive.Store(false)
+}
+
 // Run runs f inside a deterministic simulation seeded by seed: with the same
 // seed, the scheduling of goroutines started within f and the runtime
 // randomness they observe replay identically.
@@ -265,7 +287,9 @@ const (
 // pool-lifetime concern, distinct from the in-run memory bounding that the
 // deterministic in-run GC provides.
 //
-// Run must not be called from within another Run or a synctest bubble.
+// Run, RunWith, Explore, ExploreWith, and Replay are process-global simulation
+// operations: they must not overlap in one process, and must not be called from
+// within a synctest bubble.
 //
 // A goroutine in f that never blocks and never makes a function call (e.g. a
 // bare for{}) will not be preempted and will stall the simulation; real code
@@ -277,7 +301,8 @@ func Run(seed uint64, f func()) {
 // RunWith is Run with an explicit exploration Strategy (Random or PCT). Use it to
 // direct interleaving exploration — e.g. Strategy PCT to bias toward exposing
 // deep concurrency bugs — while keeping the same per-seed determinism and replay
-// guarantees as Run. The zero Options is exactly Run.
+// guarantees as Run. The zero Options is exactly Run. It has the same
+// process-global non-overlap restriction as Run.
 //
 // Example: explore depth-3 bugs over a seed sweep.
 //
@@ -322,9 +347,14 @@ func RunWith(seed uint64, opts Options, f func()) {
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
 func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
-	if !dstBuilt() {
-		panic("testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
-	}
+	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
+	defer leaveSimulation()
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, prefix, f)
+}
+
+// runLocked runs one simulation after enterSimulation has reserved the
+// process-global DST state.
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)

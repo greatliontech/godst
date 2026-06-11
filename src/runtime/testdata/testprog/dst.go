@@ -34,6 +34,8 @@ func init() {
 	register("DSTBubbleReproNoise", DSTBubbleReproNoise)
 	register("DSTBubbleReproPlain", DSTBubbleReproPlain)
 	register("DSTRunDeterminism", DSTRunDeterminism)
+	register("DSTRunNestedGuard", DSTRunNestedGuard)
+	register("DSTRunOverlapGuard", DSTRunOverlapGuard)
 	register("DSTPoolAcrossRuns", DSTPoolAcrossRuns)
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
@@ -1412,6 +1414,69 @@ func DSTRunDeterminism() {
 	})
 	buf = append(buf, '\n')
 	os.Stdout.Write(buf)
+}
+
+func dstPanicText(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case error:
+		return x.Error()
+	default:
+		return "non-string panic"
+	}
+}
+
+func dstPanicContains(want string, f func()) (ok bool) {
+	defer func() {
+		if v := recover(); v != nil {
+			ok = strings.Contains(dstPanicText(v), want)
+		}
+	}()
+	f()
+	return false
+}
+
+// DSTRunNestedGuard verifies a nested Run is rejected before mutating the outer
+// run's global DST state. Without the preflight guard, the inner Run activates DST
+// and then synctest.Run panics; its defer deactivates DST while the outer bubble
+// continues.
+func DSTRunNestedGuard() {
+	var nestedOK, active bool
+	var pid int
+	simulation.Run(1, func() {
+		nestedOK = dstPanicContains("testing/simulation: Run called from within a synctest bubble", func() {
+			simulation.Run(2, func() {})
+		})
+		active = dstRuntimeActive()
+		pid = os.Getpid()
+	})
+	os.Stdout.WriteString("nested=" + strconv.FormatBool(nestedOK) +
+		" active=" + strconv.FormatBool(active) +
+		" pid=" + strconv.Itoa(pid) + "\n")
+}
+
+// DSTRunOverlapGuard verifies a second top-level Run cannot overlap an active
+// Run and corrupt its process-global DST state.
+func DSTRunOverlapGuard() {
+	started := make(chan struct{})
+	done := make(chan bool, 1)
+	var active atomic.Bool
+	go func() {
+		<-started
+		done <- dstPanicContains("testing/simulation: Run called while another simulation operation is active", func() {
+			simulation.Run(2, func() {})
+		})
+	}()
+	simulation.Run(1, func() {
+		close(started)
+		time.Sleep(time.Millisecond)
+		active.Store(dstRuntimeActive())
+	})
+	os.Stdout.WriteString("overlap=" + strconv.FormatBool(<-done) +
+		" active=" + strconv.FormatBool(active.Load()) + "\n")
 }
 
 // dstSelectSeq drains four always-ready buffered channels via select, rounds
