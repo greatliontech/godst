@@ -5428,17 +5428,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// trackingSeq cheaprand below so the child's seed depends only on
 		// logical ancestry, not on runtime-internal per-m draws.
 		newg.dstrand = dstrandUint64(callergp)
-		// Clear any stale per-bubble scheduled-strategy index and pending access from
-		// a prior bubble (g structs are pooled); the index is (re)assigned lazily at
-		// first candidacy and the access is set per dstAccessYield. See dst_explore.go.
-		newg.dstSeq = 0
-		newg.dstAccAddr = 0
-		newg.dstAccSize = 0
-		newg.dstAccWrite = false
-		newg.dstAccPC = 0
-		newg.dstAccCount = 0
-		newg.dstAccPend = false
-		newg.dstAccAuto = false
+		dstClearSchedState(newg)
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
 			// PCT: give the new goroutine a random base priority from the scheduling
 			// RNG (a scheduling property, not part of the per-g logical stream). The

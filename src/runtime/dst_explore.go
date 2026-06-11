@@ -289,6 +289,24 @@ func dstEnsureSeq(gp *g) uint64 {
 	return gp.dstSeq
 }
 
+// dstClearSchedState clears per-bubble scheduled-strategy identity and pending
+// access state from gp. Goroutine structs are reused across bubbles, and the
+// synctest root goroutine is reused directly by repeated Explore/Replay calls, so
+// this state must not survive past one scheduled bubble.
+func dstClearSchedState(gp *g) {
+	if gp == nil {
+		return
+	}
+	gp.dstSeq = 0
+	gp.dstAccAddr = 0
+	gp.dstAccSize = 0
+	gp.dstAccWrite = false
+	gp.dstAccPC = 0
+	gp.dstAccCount = 0
+	gp.dstAccPend = false
+	gp.dstAccAuto = false
+}
+
 func dstClockIdx(seq uint64) int {
 	if seq == 0 || seq > uint64(dstClockProcs) {
 		return -1
@@ -871,6 +889,9 @@ func dstExploreDeadlockFP() string { return dstExploreDeadlock }
 
 //go:linkname dstRunningPanicDefersFP
 func dstRunningPanicDefersFP() uint32 { return runningPanicDefers.Load() }
+
+//go:linkname dstCurrentSeqFP
+func dstCurrentSeqFP() uint64 { return getg().dstSeq }
 
 // dstEdgeLenFP reports the happens-before edge count recorded by the last run, and
 // dstEdgeAtFP reports edge i as (readier index, readied index, the dstScheduleStep

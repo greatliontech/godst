@@ -22,11 +22,33 @@ func dstAccessYieldFP() uint64
 //go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
 func dstAccessYieldReset()
 
+//go:linkname dstYieldPoint runtime.dstYieldPoint
+func dstYieldPoint()
+
 //go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
 func dstSetPostGoYield(enabled bool) bool
 
 //go:linkname dstRunningPanicDefersFP runtime.dstRunningPanicDefersFP
 func dstRunningPanicDefersFP() uint32
+
+//go:linkname dstCurrentSeqFP runtime.dstCurrentSeqFP
+func dstCurrentSeqFP() uint64
+
+func assertUniqueEnabledSeqs(t *testing.T, tr exploreTrace) {
+	t.Helper()
+	for i, enabled := range tr.enabled {
+		seen := map[uint64]bool{}
+		for _, seq := range enabled {
+			if seq == 0 {
+				t.Fatalf("decision %d has unassigned seq in enabled set %v", i, enabled)
+			}
+			if seen[seq] {
+				t.Fatalf("decision %d has duplicate seq %d in enabled set %v", i, seq, enabled)
+			}
+			seen[seq] = true
+		}
+	}
+}
 
 func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	if !dstBuilt() {
@@ -81,6 +103,30 @@ func TestReplayInstallsAccessForces(t *testing.T) {
 	}
 	if got := dstAccessYieldFP(); got <= unforced {
 		t.Fatalf("Replay did not install the forced access yield: unforced=%d forced=%d", unforced, got)
+	}
+}
+
+func TestExploreResetsScheduledIdentityAcrossRuns(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dstYieldPoint()
+		}()
+		time.Sleep(time.Millisecond)
+		wg.Wait()
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+		assertUniqueEnabledSeqs(t, tr)
+		if seq := dstCurrentSeqFP(); seq != 0 {
+			t.Fatalf("run %d left scheduled identity %d on the reused synctest root", i, seq)
+		}
 	}
 }
 

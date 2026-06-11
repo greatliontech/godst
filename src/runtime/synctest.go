@@ -201,6 +201,9 @@ func synctestRun(f func()) {
 
 	gp.bubble = bubble
 	defer func() {
+		if dstActive() && dstSchedKind == dstSchedScheduled {
+			dstClearSchedState(gp)
+		}
 		gp.bubble = nil
 	}()
 
