@@ -23,9 +23,11 @@ const dstNetEnabled = true
 // I/O, synctest-durable, deadlines on the fake clock), and connection/accept/
 // delivery order is just the goroutine schedule, which is already deterministic.
 //
-// Only the exported string Dial/Listen are intercepted (the os.Getpid altitude),
-// gated on dstActive(); net's internal lookups stay real. dstActive() is a
-// constant false in a non -tags dst build, so this all compiles out there.
+// The exported string Dial/Listen are intercepted (the os.Getpid altitude),
+// gated on dstActive(); typed and packet public entry points fail fast instead
+// of falling through to host sockets until those surfaces are modeled. net's
+// internal lookups stay real. dstActive() is a constant false in a non -tags dst
+// build, so this all compiles out there.
 //
 // This is the reliable, in-order base; network faults (partition/drop/reorder/
 // latency) layer on top of the same registry+conns later.
@@ -72,6 +74,10 @@ func dstTCPNetwork(network string) bool {
 
 func dstUnsupportedNetwork(op, network string) error {
 	return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: UnknownNetworkError(network)}
+}
+
+func dstUnsupportedNetAPI(op, network string, source, addr Addr) error {
+	return &OpError{Op: op, Net: network, Source: source, Addr: addr, Err: errors.New("network API unsupported under deterministic simulation")}
 }
 
 func dstParsePort(op, network, port string) (int, error) {

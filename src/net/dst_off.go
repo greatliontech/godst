@@ -15,3 +15,5 @@ func dstActive() bool { return false }
 func dstDial(ctx context.Context, network, address string) (Conn, error) { return nil, nil }
 
 func dstListen(network, address string) (Listener, error) { return nil, nil }
+
+func dstUnsupportedNetAPI(op, network string, source, addr Addr) error { return nil }

@@ -327,6 +327,9 @@ func dialTCP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *
 	if raddr == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("dial", network, laddr.opAddr(), raddr.opAddr())
+	}
 	sd := &sysDialer{network: network, address: raddr.String()}
 	var (
 		c   *TCPConn
@@ -455,6 +458,9 @@ func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {
 	}
 	if laddr == nil {
 		laddr = &TCPAddr{}
+	}
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("listen", network, nil, laddr.opAddr())
 	}
 	sl := &sysListener{network: network, address: laddr.String()}
 	var (

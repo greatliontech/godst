@@ -915,6 +915,9 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 // The ctx argument is used while resolving the address on which to listen;
 // it does not affect the returned PacketConn.
 func (lc *ListenConfig) ListenPacket(ctx context.Context, network, address string) (PacketConn, error) {
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("listen", network, nil, nil)
+	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}

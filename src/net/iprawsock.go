@@ -227,6 +227,9 @@ func dialIP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *I
 	if raddr == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("dial", network, laddr.opAddr(), raddr.opAddr())
+	}
 	sd := &sysDialer{network: network, address: raddr.String()}
 	if dialer != nil {
 		sd.Dialer = *dialer
@@ -248,6 +251,9 @@ func dialIP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *I
 func ListenIP(network string, laddr *IPAddr) (*IPConn, error) {
 	if laddr == nil {
 		laddr = &IPAddr{}
+	}
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("listen", network, nil, laddr.opAddr())
 	}
 	sl := &sysListener{network: network, address: laddr.String()}
 	c, err := sl.listenIP(context.Background(), laddr)
