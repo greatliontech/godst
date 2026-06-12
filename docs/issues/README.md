@@ -10,7 +10,7 @@ deletes the resolved entry.
 
 | Issue | Lands | Summary |
 |-------|-------|---------|
-| [dst-sync-stack-shape](dst-sync-stack-shape.md) | when `task test:inert-std` is required to gate green | Untagged trace/pprof stack-shape regression: the DST mutex hook refactor adds one inlined logical frame, shifting the fixed semaphore skip constants; `TestTraceStacks`, `TestBlockProfile`, `TestMutexProfile` fail untagged. |
+| [dst-hb-shadow-coverage](dst-hb-shadow-coverage.md) | when the dst-race HB recording paths (chan/select/atomic) are next modified | Channel/select/atomic HB records don't honor `raceignore` (mutex/RWMutex bridges do); contended-path mutex HB records lack event-stream enforcement. |
 
 ## Pending features
 

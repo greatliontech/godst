@@ -124,13 +124,17 @@ func (rw *RWMutex) TryRLock() bool {
 // It is a run-time error if rw is not locked for reading
 // on entry to RUnlock.
 func (rw *RWMutex) RUnlock() {
+	if dstHookEnabled {
+		// Mirror race.ReleaseMerge(&rw.writerSem) below: record the public RUnlock
+		// release while raceignore is still clear — the DST HB-record bridges honor
+		// raceignore exactly as the race detector does, so a record placed after
+		// race.Disable() would be suppressed.
+		dstSyncReleaseRWMutexRUnlock(rw)
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		race.Disable()
-	}
-	if dstHookEnabled {
-		dstSyncReleaseRWMutexRUnlock(rw)
 	}
 	if dstHookEnabled {
 		dstSyncAcquireRWMutex(rw)
@@ -164,8 +168,11 @@ func (rw *RWMutex) Lock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
 	}
-	// First, resolve competition with other writers.
-	rw.w.lockNoDstHB()
+	// First, resolve competition with other writers. (Under -tags dst -race the
+	// embedded mutex's HB records are suppressed here via raceignore — set by
+	// race.Disable above — mirroring the race detector; its decision announce
+	// still fires.)
+	rw.w.Lock()
 	// Announce to readers there is a pending writer.
 	r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders
 	// Wait for active readers.
@@ -192,14 +199,14 @@ func (rw *RWMutex) TryLock() bool {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
 	}
-	if !rw.w.tryLockNoDstHB() {
+	if !rw.w.TryLock() {
 		if race.Enabled {
 			race.Enable()
 		}
 		return false
 	}
 	if !rw.readerCount.CompareAndSwap(0, -rwmutexMaxReaders) {
-		rw.w.unlockNoDstHB()
+		rw.w.Unlock()
 		if race.Enabled {
 			race.Enable()
 		}
@@ -223,13 +230,15 @@ func (rw *RWMutex) TryLock() bool {
 // goroutine. One goroutine may [RWMutex.RLock] ([RWMutex.Lock]) a RWMutex and then
 // arrange for another goroutine to [RWMutex.RUnlock] ([RWMutex.Unlock]) it.
 func (rw *RWMutex) Unlock() {
+	if dstHookEnabled {
+		// Mirror race.Release(&rw.readerSem) below: record before race.Disable()
+		// (see RUnlock).
+		dstSyncReleaseRWMutexUnlock(rw)
+	}
 	if race.Enabled {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Release(unsafe.Pointer(&rw.readerSem))
 		race.Disable()
-	}
-	if dstHookEnabled {
-		dstSyncReleaseRWMutexUnlock(rw)
 	}
 	if dstHookEnabled {
 		dstSyncAcquireRWMutex(rw)
@@ -245,8 +254,8 @@ func (rw *RWMutex) Unlock() {
 	for i := 0; i < int(r); i++ {
 		runtime_Semrelease(&rw.readerSem, false, 0)
 	}
-	// Allow other writers to proceed.
-	rw.w.unlockNoDstHB()
+	// Allow other writers to proceed. (DST HB suppressed via raceignore, as in Lock.)
+	rw.w.Unlock()
 	if race.Enabled {
 		race.Enable()
 	}

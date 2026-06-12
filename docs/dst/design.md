@@ -304,10 +304,7 @@ twice; the Taskfile must stay pipeline-free, so each leg's `go test` exit code i
 code), and after ANY cmd/compile change run `task compiler` — it chains `go clean -cache` after the
 reinstall because this fork reports a release version string, so tool IDs come from the version,
 not the binary hash, and a reinstalled compiler does NOT invalidate cached objects (stale-compiler
-builds silently pass). Known red: `test:inert-std` currently fails
-`TestTraceStacks`/`TestBlockProfile`/`TestMutexProfile` (untagged stack-shape regression from the
-DST mutex hooks — see `docs/issues/dst-sync-stack-shape.md`); the leg gates green once that issue
-lands.
+builds silently pass). All four legs gate green; a red leg is a regression against this section.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -908,7 +905,9 @@ offline between Runs: two conflicting accesses are **dependent** iff neither clo
 only the conservative access-yield filter; DPOR source sets and replay decisions use the post-Run clocks.
 The recorded events are the same ones the scheduler/sync primitives control, so the HB is self-contained
 (no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful
-oracle, which the conflict-set cross-check against `-race` reports validates. Timer-fire wakeups in synctest fake time are
+oracle, which the conflict-set cross-check against `-race` reports validates (one tracked residual:
+the channel/select/atomic record paths do not yet honor `raceignore` — see the sync-hook mechanism
+passage below). Timer-fire wakeups in synctest fake time are
    validated by `TestDSTExploreTimerHB`: two goroutines sleep until the same virtual time and then race on a
    shared variable; Exhaustive reaches both read outcomes (`timerhb exh=12`), and DPOR matches them while
    exhausted (`timerhb dpor=3`, two outcomes). So the currently-recorded timer wake edges do not over-order
@@ -1033,7 +1032,23 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    release, identity = the embedded writer mutex) auto-announce a `dstSyncAcquire` write-conflict. RWMutex
    suppresses the embedded writer mutex's DST happens-before events while executing RWMutex internals and
    records public RWMutex HB separately on the same `readerSem`/`writerSem` identities used by the race
-   detector, so failed public `TryLock`/`TryRLock` decisions do not synchronize. An
+   detector, so failed public `TryLock`/`TryRLock` decisions do not synchronize. The suppression
+   mechanism is `g.raceignore`: the HB-record bridges (not the decision-announce bridges) early-return
+   when it is non-zero, exactly as `raceacquireg`/`racereleaseg` do, so upstream's existing
+   `race.Disable()` brackets around the `rw.w` operations suppress the embedded mutex's HB with no
+   DST-specific call variants — the mutex/RWMutex HB records honor the same ignore state as the race
+   detector they must agree with, and the public RWMutex HB hooks sit before `race.Disable()`/after
+   `race.Enable()`, exactly where their race-annotation twins sit. (The gate currently covers the
+   sync-package bridges only; the channel/select/atomic HB record paths do not yet consult
+   `raceignore` — a residual disagreement with the race detector's ignore semantics, reachable only
+   by code calling `runtime.RaceDisable` around those ops, tracked in
+   `docs/issues/dst-hb-shadow-coverage.md`.) The mechanism is also load-bearing for DST-L2-4's
+   untagged shape: the hook lines fold away in-place inside upstream's method bodies, adding no wrapper
+   layer between a caller and `lockSlow`/`unlockSlow` — the trace/pprof semaphore skip constants count
+   inline frames, so any indirection (a parameterized `lock(hb)` body, or a `NoDstHB` method variant at
+   a call site) shifts every untagged contention/trace stack one frame too deep and renames RWMutex
+   profile symbols (`TestTraceStacks`, `TestBlockProfile`, and `TestMutexProfile` enforce the upstream
+   shape untagged via the `test:inert-std` leg). An
    UNMODIFIED mutex/channel program's sync-object decision order is therefore explored with no hand
    annotation. The mutex hook is in `Lock` (NOT the `semacquire` slow path): `semacquire` is reached only by
    the *contended loser*, after the uncontended winner already took the fast-path CAS, so it is too late to

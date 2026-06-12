@@ -1838,6 +1838,37 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 	}
 }
 
+// TestDSTSyncHBRaceIgnore verifies the HB shadow's raceignore mirror on the
+// recorded sync-event stream directly: a plain Mutex pair records exactly its
+// acquire+release, a runtime.RaceDisable-bracketed pair records nothing, and
+// RWMutex ops record ONLY the public readerSem/writerSem events — the embedded
+// writer mutex's HB inside Lock/Unlock is suppressed by upstream's race.Disable
+// brackets via the raceignore check in the HB-record bridges. Outcome-based
+// tests cannot enforce this (HB records only prune; RWMutex's embedded pairs
+// are subsumed by public ones in every reachable shape), so the white-box event
+// counts are the teeth: dropping the raceignore check inflates rwLock to 3
+// events and ignoredPair to 2; deleting or mis-placing a public RWMutex hook
+// (e.g. recording RUnlock's release after race.Disable) zeroes its field.
+func TestDSTSyncHBRaceIgnore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the dst-race build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	exe := filepath.Join(t.TempDir(), "tp_race")
+	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
+	out := runBuiltTestProg(t, exe, "DSTSyncHBSuppress", "DSTSEED=1")
+	for _, field := range []string{"mutexPair", "ignoredPair", "rwLock", "rwUnlock", "rwRLock", "rwRUnlock", "exhausted"} {
+		if got := exploreField(t, out, field); got != "true" {
+			t.Fatalf("HB raceignore mirror violated: %s=%s (see DSTSyncHBSuppress fixture):\n%s",
+				field, got, out)
+		}
+	}
+}
+
 // TestDSTForeignCallbackDeferred verifies the ownership boundary of the bubble
 // drain: finalizers/cleanups registered MID-RUN by goroutines outside
 // the simulation bubble are discovered by the simulation's GCs but deferred

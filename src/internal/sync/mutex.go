@@ -59,21 +59,12 @@ const (
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Lock() {
-	m.lock(true)
-}
-
-// LockNoDstHB is Lock without recording a DST happens-before acquire.
-// It is for higher-level primitives that use Mutex only as an internal
-// implementation detail and record their public synchronization separately.
-func (m *Mutex) LockNoDstHB() {
-	m.lock(false)
-}
-
-func (m *Mutex) lock(hb bool) {
 	// DST Level-2: announce the impending acquisition on the mutex identity BEFORE the
 	// fast-path CAS, so the lock-acquisition order is a DPOR transition. The
 	// dstHookEnabled const folds this away outside a -tags dst -race build, so Lock is
-	// hook-inert (DST-L2-4); see dst_on.go/dst_off.go.
+	// hook-inert (DST-L2-4) and keeps upstream's exact logical frame shape — the
+	// trace/pprof skip constants below count inline frames, so no wrapper layer may
+	// sit between a caller and lockSlow; see dst_on.go/dst_off.go.
 	if dstHookEnabled {
 		dstSyncAcquire(m)
 	}
@@ -82,29 +73,19 @@ func (m *Mutex) lock(hb bool) {
 		if race.Enabled {
 			race.Acquire(unsafe.Pointer(m))
 		}
-		if dstHookEnabled && hb {
+		if dstHookEnabled {
 			dstSyncAcquireHB(m)
 		}
 		return
 	}
 	// Slow path (outlined so that the fast path can be inlined)
-	m.lockSlow(hb)
+	m.lockSlow()
 }
 
 // TryLock tries to lock m and reports whether it succeeded.
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) TryLock() bool {
-	return m.tryLock(true)
-}
-
-// TryLockNoDstHB is TryLock without recording a DST happens-before acquire.
-// It still records the mutex decision conflict.
-func (m *Mutex) TryLockNoDstHB() bool {
-	return m.tryLock(false)
-}
-
-func (m *Mutex) tryLock(hb bool) bool {
 	// DST Level-2: TryLock's success/failure is also an acquisition-order decision.
 	// Announce before even the locked-state rejection so a failed attempt in this run
 	// can be reversed into the successful acquirer in another run. Failed-attempt
@@ -127,13 +108,13 @@ func (m *Mutex) tryLock(hb bool) bool {
 	if race.Enabled {
 		race.Acquire(unsafe.Pointer(m))
 	}
-	if dstHookEnabled && hb {
+	if dstHookEnabled {
 		dstSyncAcquireHB(m)
 	}
 	return true
 }
 
-func (m *Mutex) lockSlow(hb bool) {
+func (m *Mutex) lockSlow() {
 	var waitStartTime int64
 	starving := false
 	awoke := false
@@ -220,7 +201,7 @@ func (m *Mutex) lockSlow(hb bool) {
 	if race.Enabled {
 		race.Acquire(unsafe.Pointer(m))
 	}
-	if dstHookEnabled && hb {
+	if dstHookEnabled {
 		dstSyncAcquireHB(m)
 	}
 }
@@ -229,16 +210,6 @@ func (m *Mutex) lockSlow(hb bool) {
 //
 // See package [sync.Mutex] documentation.
 func (m *Mutex) Unlock() {
-	m.unlock(true)
-}
-
-// UnlockNoDstHB is Unlock without recording a DST happens-before release.
-// It still records the mutex decision conflict.
-func (m *Mutex) UnlockNoDstHB() {
-	m.unlock(false)
-}
-
-func (m *Mutex) unlock(hb bool) {
 	if race.Enabled {
 		_ = m.state
 		race.Release(unsafe.Pointer(m))
@@ -251,7 +222,7 @@ func (m *Mutex) unlock(hb bool) {
 
 	// Fast path: drop lock bit.
 	new := atomic.AddInt32(&m.state, -mutexLocked)
-	if dstHookEnabled && hb && (new+mutexLocked)&mutexLocked != 0 {
+	if dstHookEnabled && (new+mutexLocked)&mutexLocked != 0 {
 		dstSyncRelease(m)
 	}
 	if new != 0 {
