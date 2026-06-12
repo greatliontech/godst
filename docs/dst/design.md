@@ -337,10 +337,11 @@ and named Truncate all leave the durable image untouched, and that Chmod does no
 path is ENOENT even with both times zero — Linux's utimensat both-OMIT-succeeds quirk is not
 reproduced.
 
-**The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen at open: the
-tree-file backend here; dst-io's `os.Pipe` (and std streams) later plug in as a stream-shaped
-backend behind the same seam, so dst-io adds a backend, not a retrofit (the Non-foreclosure
-invariant applied at this seam — decided here, recorded against dst-io). `Fd()` on a simulated
+**The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen when the File
+is created: the tree-file backend here, and dst-io's `os.Pipe` landed exactly there — a
+stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than a
+retrofit, validating the Non-foreclosure invariant this paragraph recorded against dst-io when
+the seam was built. `Fd()` on a simulated
 file has no honest answer and **panics** with the standard "unsupported under deterministic
 simulation" shape — loud, deterministic — rather than returning a host fd that would leak the
 simulation; everything `Fd()` feeds (mmap, raw `syscall`, locking) is out of the base model.
@@ -348,8 +349,8 @@ Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced 
 "not yet modeled" never means "reaches the host": within this feature's surface (the os file and
 namespace API; `os/exec`'s process surface is its own roadmap item), every handle-producing or
 namespace-touching entry point is either implemented in-sim or fails with the unsupported shape
-while a run is active (`os.OpenRoot` and `os.Pipe` included — the pipe implementation belongs to
-dst-io; until it lands the fence holds). A `File` or `Root` opened BEFORE the run is a host-backed
+while a run is active (`os.OpenRoot` included; `os.Pipe` is simulated — see "Deterministic pipes
+and the stdio stance"). A `File` or `Root` opened BEFORE the run is a host-backed
 handle and stays outside the base model, exactly as inherited fds are for the network — program
 discipline, recorded here as the inherited-handle stance — and symmetrically, a simulated `File`
 leaked OUT of its run keeps operating on its run's orphaned tree in later runs: deterministic,
@@ -357,6 +358,72 @@ host-isolated, and meaningless, the same discipline applied in reverse. An opera
 with a pre-run host handle behaves as its two halves: the simulated side goes through the gated
 funnels and the host side does real I/O (`io.Copy` from a simulated file to an inherited stdout
 takes the generic loop — the zero-copy fast paths bail whenever either side is simulated).
+
+### Deterministic pipes and the stdio stance (the third I/O feature)
+
+`os.Pipe` under a run is **owned by the fork**: it returns a pair of Files backed by one
+in-memory byte stream — the stream-shaped second implementation of the `dstFileBackend` seam —
+and never allocates a host descriptor (enforced by a /proc/self/fd census across a run). All the
+seam-generic stances apply unchanged because they ride the seam, not the backend: `Fd()` panics,
+`SyscallConn` is fenced, zero-copy fast paths bail, `net.FileConn` rejects, and a simulated pipe
+handed to `os/exec` hits the `Fd()` panic (loud; the process surface is its own roadmap item).
+Determinism rides the schedule as everywhere else; blocking operations wait on channels created
+inside the bubble, so a blocked pipe read or write is **synctest-durably blocked** — the bubble
+clock advances over it and deadlock detection stays sound.
+
+The model is the Linux anonymous pipe, host-probed: capacity 64 KiB (a write blocks at a full
+buffer until a read frees space); writes of at most `PIPE_BUF` (4096) bytes are **atomic** —
+concurrent small writes never interleave, the guarantee logging and record-framing patterns
+depend on — while larger writes chunk and may interleave with other writers, exactly as POSIX
+allows. Error identity is production-shaped throughout `errors.Is`, in the host's *probed
+precedence*: a closed own end beats everything (`ErrClosed`, including an end closed while
+blocked — close wakes its blocked operations); an **expired deadline beats both buffered data
+and the wrong-direction check** (an expired write deadline on the read end yields
+`ErrDeadlineExceeded`, not `EBADF`); then the wrong direction is `EBADF`, a reader-less write
+`EPIPE` (with the partial count when a blocked oversize write had already transferred bytes — no
+write atomicity beyond `PIPE_BUF` is promised), and a writer-less empty read is `io.EOF`.
+Zero-length operations short-circuit to `(0, nil)` at the host's probed point in each ladder —
+reads right after the closed check (so an expired deadline or the wrong direction still reads
+`(0, nil)`), writes only after the closed/deadline/direction checks and ahead of `EPIPE` (so
+`Write(nil)` on the read end is `EBADF`, with an expired write deadline `ErrDeadlineExceeded`,
+but with only the peer closed `(0, nil)`). A closed handle's `SetDeadline` is the host's bare
+"use of closed file" on every backend. `Seek`,
+`ReadAt`/`WriteAt` are `ESPIPE`; `Truncate` and `Sync` are `EINVAL` — a pipe has no durable image
+and sits deliberately outside the filesystem durability contract; `Readdir`/`Chdir` are
+`ENOTDIR`; `Chmod` works (host fchmod does) and shows in `Stat`. `Stat` reports
+`ModeNamedPipe|0600`, size 0 regardless of buffered bytes, the bubble-clock creation time, and
+`SameFile(rfi, wfi) == true` — both ends are one pipe inode, which the shared-identity
+representation gives for free. Deadlines (`SetDeadline` family — pipes are pollable on the host,
+so these work in production) ride the bubble's fake clock exactly as the simulated network's do;
+tree files and directories keep the host's regular-file shape, bare `ErrNoDeadline`. One stance
+*tighter* than the tree's: a pipe end **leaked out of its run is fenced** (the unsupported shape)
+rather than meaninglessly operable — its blocking machinery is the dead bubble's channels —
+except `Close`, which always works (defers and finalizers run anywhere). The *concurrent* dual of
+that temporal stance is likewise program discipline: a run-created pipe shared with a goroutine
+**outside the bubble while the run is live** (one started before `simulation.Run`) is out of the
+model, and synctest makes it loudly fatal — the out-of-bubble operation lands on the bubble's
+channels — rather than silently nondeterministic. Enforced by the
+`TestDSTPipe*` suite in `src/os/dst_pipe_test.go` (identity pins, durable-blocking and deadline
+exactness, PIPE_BUF atomicity under concurrency, fd census, leak fences, same-seed transcript
+equality).
+
+**Stdio is not virtualized — settled here.** `os.Stdin`/`Stdout`/`Stderr` are created at process
+init, before any run: they are pre-run host handles, covered verbatim by the recorded
+inherited-handle stance, and the fork does not swap them under a run. Writes to them are
+outbound, schedule-ordered side effects that feed no nondeterminism back into the run — DST's own
+cross-process replay fixtures print their transcripts through real stdout from inside runs —
+and a program that wants captured or deterministic stdio assigns the package variables to a
+simulated file inside the run (the backend seam makes that work with no extra machinery); reading
+the real terminal under a run is program discipline, exactly like using any inherited handle.
+Completing dst-io's audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
+`ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
+`Getpid` are Options-pinned; env-derived APIs (`Getenv`, `UserHomeDir` and friends) read process
+memory the harness controls, not the OS; processes and signals are the `os/exec` roadmap item.
+One recorded gap: **`os.DevNull`** — the tree starts empty except `/tmp` (that contract stands),
+so opening `/dev/null` under a run is `ENOENT`; the in-sim idioms are `io.Discard` for a sink or
+an ordinary tree file, and the main host consumer of `/dev/null` (process spawning) is out of
+scope here. If a modeled `/dev/null` ever earns its place, it is a new node kind behind the same
+seam — an increment, not a retrofit.
 
 ### Enforcing test configurations
 

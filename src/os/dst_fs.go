@@ -371,7 +371,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 		mode:    node.mode,
 		modTime: node.modTime,
 		isDir:   node.isDir,
-		node:    node,
+		ident:   node,
 	}, true, nil
 }
 
@@ -641,7 +641,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 // dstNewFile builds an *os.File backed by a simulated file. The pfd is left
 // with an invalid Sysfd so any not-yet-gated path fails with EBADF
 // deterministically instead of touching a real descriptor.
-func dstNewFile(d *dstFile, name string) *File {
+func dstNewFile(d dstFileBackend, name string) *File {
 	f := &File{&file{name: name, dstf: d}}
 	f.pfd.Sysfd = -1
 	runtime.SetFinalizer(f.file, (*file).close)
@@ -849,7 +849,7 @@ func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
 			mode:    node.mode,
 			modTime: node.modTime,
 			isDir:   node.isDir,
-			node:    node,
+			ident:   node,
 		})
 	}
 	return names, infos, nil
@@ -924,8 +924,23 @@ func (d *dstFile) stat() (FileInfo, error) {
 		mode:    d.node.mode,
 		modTime: d.node.modTime,
 		isDir:   d.node.isDir,
-		node:    d.node,
+		ident:   d.node,
 	}, nil
+}
+
+// setDeadline implements the deadline half of the backend seam for tree
+// files: the host's regular files and directories are not pollable, so
+// SetDeadline fails with the (unwrapped) ErrNoDeadline shape there, and the
+// simulated tree mirrors that — including the host's precedence, where a
+// closed handle reports the (also unwrapped) closed shape first. Pipes are
+// the pollable case — see dst_pipe.go.
+func (d *dstFile) setDeadline(rd, wd bool, t time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return poll.ErrFileClosing
+	}
+	return poll.ErrNoDeadline
 }
 
 // closeFile closes the handle. The node stays alive while other handles or
@@ -950,7 +965,7 @@ type dstFileInfo struct {
 	mode    FileMode
 	modTime time.Time
 	isDir   bool
-	node    *dstFSNode // identity for SameFile
+	ident   any // identity for SameFile: *dstFSNode, or *dstPipe (both ends share it, as both host fds share one pipe inode)
 }
 
 // dstSameFile reports SameFile for simulated FileInfos. handled=false when
@@ -962,7 +977,7 @@ func dstSameFile(fi1, fi2 FileInfo) (same, handled bool) {
 	if !ok1 && !ok2 {
 		return false, false
 	}
-	return ok1 && ok2 && d1.node == d2.node && d1.node != nil, true
+	return ok1 && ok2 && d1.ident == d2.ident && d1.ident != nil, true
 }
 
 func (fi *dstFileInfo) Name() string       { return fi.name }

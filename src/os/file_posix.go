@@ -277,6 +277,9 @@ func (f *File) setDeadline(t time.Time) error {
 	if err := f.checkValid("SetDeadline"); err != nil {
 		return err
 	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.setDeadline(true, true, t)
+	}
 	return f.pfd.SetDeadline(t)
 }
 
@@ -285,6 +288,9 @@ func (f *File) setReadDeadline(t time.Time) error {
 	if err := f.checkValid("SetReadDeadline"); err != nil {
 		return err
 	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.setDeadline(true, false, t)
+	}
 	return f.pfd.SetReadDeadline(t)
 }
 
@@ -292,6 +298,9 @@ func (f *File) setReadDeadline(t time.Time) error {
 func (f *File) setWriteDeadline(t time.Time) error {
 	if err := f.checkValid("SetWriteDeadline"); err != nil {
 		return err
+	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.setDeadline(false, true, t)
 	}
 	return f.pfd.SetWriteDeadline(t)
 }

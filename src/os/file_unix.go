@@ -69,7 +69,7 @@ type file struct {
 	stdoutOrErr bool                    // whether this is stdout or stderr
 	appendMode  bool                    // whether file is opened for appending
 	inRoot      bool                    // whether file is opened in a Root
-	dstf        *dstFile                // simulated backing under DST; nil otherwise (inert untagged)
+	dstf        dstFileBackend          // simulated backing under DST; nil otherwise (inert untagged)
 }
 
 // fd is the Unix implementation of Fd.

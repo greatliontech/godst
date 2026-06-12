@@ -286,9 +286,13 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 		}
 		woz.Close()
 
-		// os.Pipe is fenced until dst-io implements it.
-		if _, _, err := os.Pipe(); !isDSTUnsupportedFS(err) {
-			t.Fatalf("Pipe = %v, want unsupported-under-simulation", err)
+		// os.Pipe is simulated (dst-io): an in-memory pair, no host
+		// descriptor. Full pipe coverage lives in dst_pipe_test.go.
+		if pr, pw, err := os.Pipe(); err != nil {
+			t.Fatalf("Pipe = %v, want simulated pair", err)
+		} else {
+			pr.Close()
+			pw.Close()
 		}
 
 		// Fd panics loud on a simulated file; SyscallConn fails with the

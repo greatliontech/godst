@@ -10,20 +10,9 @@ import "time"
 
 // Stubs so the dst filesystem gates type-check in a non -tags dst build. The
 // gates are all guarded by the dstSimEnabled constant (false here), so every
-// reference below is dead code the compiler folds away; the method bodies are
-// unreachable by construction.
-
-type dstFile struct{}
-
-func (*dstFile) read(b []byte) (int, error)                { panic("unreachable") }
-func (*dstFile) pread(b []byte, off int64) (int, error)    { panic("unreachable") }
-func (*dstFile) write(b []byte) (int, error)               { panic("unreachable") }
-func (*dstFile) pwrite(b []byte, off int64) (int, error)   { panic("unreachable") }
-func (*dstFile) seek(off int64, whence int) (int64, error) { panic("unreachable") }
-func (*dstFile) truncate(size int64) error                 { panic("unreachable") }
-func (*dstFile) sync() error                               { panic("unreachable") }
-func (*dstFile) stat() (FileInfo, error)                   { panic("unreachable") }
-func (*dstFile) closeFile() error                          { panic("unreachable") }
+// reference below is dead code the compiler folds away. The dstFileBackend
+// field itself needs no stub type: it is an interface (dst_backend.go) that
+// stays nil untagged.
 
 func dstOpenFile(name string, flag int, perm FileMode) (*File, bool, error) {
 	return nil, false, nil
@@ -52,10 +41,7 @@ func dstChmod(name string, mode FileMode) (bool, error) { return false, nil }
 
 func dstChtimes(name string, atime, mtime time.Time) (bool, error) { return false, nil }
 
-func (*dstFile) chmodHandle(mode FileMode) error { panic("unreachable") }
-
-func (*dstFile) readdir(n int) ([]string, []FileInfo, error) { panic("unreachable") }
-func (*dstFile) chdirHandle() error                          { panic("unreachable") }
+func dstNewPipe() (*File, *File, bool) { return nil, nil, false }
 
 // dstErrUnsupportedFS exists untagged only so fence gates type-check; every
 // reference is behind the folded dstSimEnabled constant.
