@@ -302,9 +302,15 @@ Two operational rules for running these configurations honestly: never let a pip
 code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures
 twice; the Taskfile must stay pipeline-free, so each leg's `go test` exit code is the task's exit
 code), and after ANY cmd/compile change run `task compiler` — it chains `go clean -cache` after the
-reinstall because this fork reports a release version string, so tool IDs come from the version,
-not the binary hash, and a reinstalled compiler does NOT invalidate cached objects (stale-compiler
-builds silently pass). All four legs gate green; a red leg is a regression against this section.
+reinstall because this fork reports a release-form version string, so tool IDs come from the
+version, not the binary hash, and a reinstalled compiler does NOT invalidate cached objects
+(stale-compiler builds silently pass). The `VERSION` file carries a `-dst` suffix
+(`go1.26.4-dst`), so this checkout's tool IDs differ from stock's and from any sibling worktree
+still reporting the bare release — distinct checkouts cannot cross-poison the shared
+`~/.cache/go-build`. The suffix does NOT fix the within-checkout trap (a suffixed release is still
+a release to the tool-ID logic: the whole `-V=full` line, constant across rebuilds), so the
+clean-cache rule stands unchanged. All four legs gate green; a red leg is a regression against
+this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
 or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
