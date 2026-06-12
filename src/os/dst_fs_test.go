@@ -531,7 +531,7 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 		for _, e := range ents {
 			names = append(names, e.Name())
 		}
-		want := "aa,bb,mm,sub,zz"
+		want := "aa,bb,mm,sub,tmp,zz" // tmp is the pre-seeded temp dir
 		if got := strings.Join(names, ","); got != want {
 			t.Fatalf("ReadDir order = %s, want %s", got, want)
 		}
@@ -605,6 +605,56 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 			t.Fatalf("fresh run Getwd = %q, want / (cwd leaked across runs)", wd)
 		}
 	})
+}
+
+// TestDSTFSTempDir: os.TempDir reports the fixed simulated /tmp during a
+// run (never the host's machine-dependent $TMPDIR string), /tmp is
+// pre-seeded (mode 1777), CreateTemp/MkdirTemp work unmodified, and their
+// seeded random names replay identically across same-seed runs.
+func TestDSTFSTempDir(t *testing.T) {
+	// Pin TMPDIR to a non-/tmp host path so the in-run assertion has teeth:
+	// with TMPDIR unset the host default is also "/tmp" and a missing
+	// TempDir gate would pass vacuously.
+	t.Setenv("TMPDIR", t.TempDir())
+	hostTmp := os.TempDir()
+	if hostTmp == "/tmp" {
+		t.Fatalf("test harness: host TempDir still /tmp despite TMPDIR pin")
+	}
+	name := func(seed uint64) (got string) {
+		simulation.Run(seed, func() {
+			if td := os.TempDir(); td != "/tmp" {
+				t.Fatalf("TempDir under run = %q, want /tmp", td)
+			}
+			fi, err := os.Stat("/tmp")
+			if err != nil || !fi.IsDir() || fi.Mode() != os.ModeDir|os.ModeSticky|0o777 {
+				t.Fatalf("/tmp = %v %v, %v", fi.Mode(), fi.IsDir(), err)
+			}
+			f, err := os.CreateTemp("", "dst-*")
+			if err != nil {
+				t.Fatalf("CreateTemp: %v", err)
+			}
+			if !strings.HasPrefix(f.Name(), "/tmp/dst-") {
+				t.Fatalf("CreateTemp name = %q", f.Name())
+			}
+			got = f.Name()
+			f.Close()
+			d, err := os.MkdirTemp("", "dstdir-*")
+			if err != nil {
+				t.Fatalf("MkdirTemp: %v", err)
+			}
+			if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+				t.Fatalf("MkdirTemp result: %v, %v", fi, err)
+			}
+		})
+		return got
+	}
+	a, b := name(11), name(11)
+	if a != b {
+		t.Fatalf("CreateTemp names differ across same-seed runs: %q vs %q", a, b)
+	}
+	if os.TempDir() != hostTmp {
+		t.Fatalf("host TempDir changed outside run: %q vs %q", os.TempDir(), hostTmp)
+	}
 }
 
 // TestDSTFSMixedHandleCopy: io.Copy pairing a simulated source with a

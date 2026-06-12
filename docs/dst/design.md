@@ -283,9 +283,13 @@ mechanism as the network registry. All operations execute synchronously on the c
 no new scheduler choices, no new RNG (the Soundness invariant's "take over, never add" principle);
 determinism rides the schedule exactly as it does for the network.
 
-**The tree starts empty.** A run observes a root `/` with nothing in it: the host filesystem is
-NEVER visible (no passthrough, no testdata reads — a host path is machine state, and reading it
-would make runs machine-dependent). A program needing fixture files creates them inside the run.
+**The tree starts empty — except `/tmp`.** A run observes a root `/` containing one empty `/tmp`
+directory (mode `1777`): the host filesystem is NEVER visible (no passthrough, no testdata reads —
+a host path is machine state, and reading it would make runs machine-dependent), and `os.TempDir()`
+reports the fixed simulated `/tmp` during a run rather than the host's `$TMPDIR`-derived string
+(itself machine state), so `CreateTemp`/`MkdirTemp` work unmodified and deterministically — their
+random names draw from the seeded runtime stream. A program needing other fixture files creates
+them inside the run.
 Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
 per-bubble). The working directory is a PATH, not a node reference: renaming a directory out from
 under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,

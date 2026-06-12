@@ -64,6 +64,15 @@ func dstFSRoll() {
 			mode:    ModeDir | 0o755,
 			modTime: time.Now(),
 		}
+		// The one pre-seeded entry: /tmp (mode 1777), so TempDir-based
+		// CreateTemp/MkdirTemp work unmodified (see the spec's empty-tree
+		// clause). os.TempDir reports this fixed path during a run.
+		dstFS.root.entries["tmp"] = &dstFSNode{
+			isDir:   true,
+			entries: make(map[string]*dstFSNode),
+			mode:    ModeDir | ModeSticky | 0o777,
+			modTime: time.Now(),
+		}
 	}
 }
 
@@ -364,6 +373,15 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 		isDir:   node.isDir,
 		node:    node,
 	}, true, nil
+}
+
+// dstTempDir reports the fixed simulated temp directory while a run is
+// active: the host's $TMPDIR-derived string is machine state.
+func dstTempDir() (string, bool) {
+	if !dstFSActive() {
+		return "", false
+	}
+	return "/tmp", true
 }
 
 // dstGetwd / dstChdir: the per-bubble working directory.

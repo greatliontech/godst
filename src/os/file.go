@@ -500,6 +500,11 @@ func (f *File) wrapErr(op string, err error) error {
 // The directory is neither guaranteed to exist nor have accessible
 // permissions.
 func TempDir() string {
+	if dstSimEnabled {
+		if dir, handled := dstTempDir(); handled {
+			return dir
+		}
+	}
 	return tempDir()
 }
 

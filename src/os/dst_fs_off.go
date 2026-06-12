@@ -42,6 +42,8 @@ func dstStatName(op, name string) (FileInfo, bool, error) { return nil, false, n
 func dstGetwd() (string, bool, error)                     { return "", false, nil }
 func dstChdir(dir string) (bool, error)                   { return false, nil }
 
+func dstTempDir() (string, bool) { return "", false }
+
 func (*dstFile) readdir(n int) ([]string, []FileInfo, error) { panic("unreachable") }
 func (*dstFile) chdirHandle() error                          { panic("unreachable") }
 
