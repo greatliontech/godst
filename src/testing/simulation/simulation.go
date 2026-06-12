@@ -62,6 +62,7 @@
 package simulation
 
 import (
+	"internal/godebug"
 	"internal/synctest"
 	"runtime"
 	"sync/atomic"
@@ -221,8 +222,11 @@ type Options struct {
 	//
 	// The rest of the process-identity surface is fixed to deterministic
 	// constants during a simulation (not configurable): os.Getppid is 1;
-	// os.Getuid/Geteuid are 7777 and os.Getgid/Getegid are 7777; os/user.Current
-	// reports user "sim" (uid/gid 7777, home "/home/sim"). crypto/rand is seeded
+	// os.Getuid/Geteuid are 7777 and os.Getgid/Getegid are 7777; os.Getgroups
+	// is [7777]; os/user.Current reports user "sim" (uid/gid 7777, home
+	// "/home/sim"), and the os/user lookup functions resolve against a minimal
+	// database containing exactly that user and its group — anything else is
+	// the deterministic unknown-user/group error, never a host-database read. crypto/rand is seeded
 	// from the simulation's deterministic RNG, so UUIDs/nonces/tokens/keys replay
 	// too — outside a simulation crypto/rand is unaffected and remains the real OS
 	// source. (crypto/rand is deterministic in the standard configuration only;
@@ -263,9 +267,27 @@ const (
 // async-preempt, and GOMAXPROCS are all process-wide for the duration of a run.
 var runActive atomic.Bool
 
+// fips140Mode is latched at startup, mirroring crypto/internal/fips140's own
+// init-time read of the GODEBUG, so a mid-process Setenv cannot desynchronize
+// the two.
+var fips140Mode = func() bool {
+	switch godebug.New("#fips140").Value() {
+	case "on", "only", "debug":
+		return true
+	}
+	return false
+}()
+
 func enterSimulation(api, buildPanic string) {
 	if !dstBuilt() {
 		panic(buildPanic)
+	}
+	if fips140Mode {
+		// FIPS mode keeps a process-global SP 800-90A DRBG that consumes the
+		// simulation's deterministic bytes only as additional input, so
+		// crypto/rand would be silently nondeterministic inside the run. Fail
+		// loud instead — one GODEBUG is all it takes to be in this mode.
+		panic("testing/simulation: " + api + " is unsupported in FIPS 140 mode (GODEBUG fips140=on)")
 	}
 	if synctest.IsInBubble() {
 		panic("testing/simulation: " + api + " called from within a synctest bubble")

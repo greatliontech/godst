@@ -4,7 +4,11 @@
 
 package user
 
-import "sync"
+import (
+	"errors"
+	"strconv"
+	"sync"
+)
 
 const (
 	userFile  = "/etc/passwd"
@@ -44,6 +48,15 @@ var cache struct {
 // Lookup looks up a user by username. If the user cannot be found, the
 // returned error is of type [UnknownUserError].
 func Lookup(username string) (*User, error) {
+	if u, ok := dstLookupUser(); ok {
+		// Deterministic simulation: the user database contains exactly the
+		// simulated user; any other name is deterministically unknown rather
+		// than a host-database lookup. See os/user/dst.go.
+		if u.Username == username {
+			return u, nil
+		}
+		return nil, UnknownUserError(username)
+	}
 	if u, err := Current(); err == nil && u.Username == username {
 		return u, err
 	}
@@ -53,6 +66,17 @@ func Lookup(username string) (*User, error) {
 // LookupId looks up a user by userid. If the user cannot be found, the
 // returned error is of type [UnknownUserIdError].
 func LookupId(uid string) (*User, error) {
+	if u, ok := dstLookupUser(); ok {
+		if u.Uid == uid {
+			return u, nil
+		}
+		i, e := strconv.Atoi(uid)
+		if e != nil {
+			// The osusergo flavor (the in-simulation analog; no cgo database).
+			return nil, errors.New("user: invalid userid " + uid)
+		}
+		return nil, UnknownUserIdError(i)
+	}
 	if u, err := Current(); err == nil && u.Uid == uid {
 		return u, err
 	}
@@ -62,16 +86,40 @@ func LookupId(uid string) (*User, error) {
 // LookupGroup looks up a group by name. If the group cannot be found, the
 // returned error is of type [UnknownGroupError].
 func LookupGroup(name string) (*Group, error) {
+	if g, ok := dstLookupGroup(); ok {
+		if g.Name == name {
+			return g, nil
+		}
+		return nil, UnknownGroupError(name)
+	}
 	return lookupGroup(name)
 }
 
 // LookupGroupId looks up a group by groupid. If the group cannot be found, the
 // returned error is of type [UnknownGroupIdError].
 func LookupGroupId(gid string) (*Group, error) {
+	if g, ok := dstLookupGroup(); ok {
+		if g.Gid == gid {
+			return g, nil
+		}
+		return nil, UnknownGroupIdError(gid)
+	}
 	return lookupGroupId(gid)
 }
 
 // GroupIds returns the list of group IDs that the user is a member of.
 func (u *User) GroupIds() ([]string, error) {
+	if su, ok := dstLookupUser(); ok {
+		if u.Uid == su.Uid || u.Username == su.Username {
+			return []string{su.Gid}, nil
+		}
+		// Production (osusergo) returns the user's primary gid plus any
+		// /etc/group memberships; the simulated database has no other group
+		// entries, so a non-simulated user resolves to just its primary gid.
+		if u.Gid != "" {
+			return []string{u.Gid}, nil
+		}
+		return nil, UnknownUserError(u.Username)
+	}
 	return listGroups(u)
 }

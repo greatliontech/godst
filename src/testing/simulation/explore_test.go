@@ -273,6 +273,38 @@ func TestRunFatalExitsCaller(t *testing.T) {
 	}
 }
 
+// TestRunRejectsFIPSMode verifies the FIPS guard: under GODEBUG=fips140=on,
+// crypto/rand routes through the process-global FIPS DRBG, which the
+// simulation cannot make deterministic — entering a simulation must fail loud
+// instead of running with silently nondeterministic crypto/rand.
+func TestRunRejectsFIPSMode(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	const helperEnv = "GO_WANT_SIMULATION_FIPS_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		defer func() {
+			if v := recover(); v != nil && strings.Contains(panicString(v), "unsupported in FIPS 140 mode") {
+				os.Stdout.WriteString("fips-rejected\n")
+				os.Exit(0)
+			}
+			os.Exit(1)
+		}()
+		Run(1, func() {})
+		os.Exit(1)
+		return
+	}
+
+	testenv.MustHaveExec(t)
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestRunRejectsFIPSMode$", "-test.count=1")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, helperEnv+"=1", "GODEBUG=fips140=on")
+	out, _ := cmd.CombinedOutput()
+	if !strings.Contains(string(out), "fips-rejected") {
+		t.Fatalf("Run under GODEBUG=fips140=on was not rejected:\n%s", out)
+	}
+}
+
 func TestTestFatalExitsCaller(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")

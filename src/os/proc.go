@@ -78,6 +78,14 @@ func Getegid() int {
 // On Windows, it returns [syscall.EWINDOWS]. See the [os/user] package
 // for a possible alternative.
 func Getgroups() ([]int, error) {
+	if dstSimEnabled {
+		if gid, ok := dstSimGetgid(); ok {
+			// Deterministic simulation: the simulated identity belongs to
+			// exactly its own group; the host's supplementary groups vary per
+			// machine and would leak nondeterminism. See os/dst.go.
+			return []int{gid}, nil
+		}
+	}
 	gids, e := syscall.Getgroups()
 	return gids, NewSyscallError("getgroups", e)
 }

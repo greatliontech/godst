@@ -58,6 +58,7 @@ func init() {
 	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
+	register("DSTIdentityGroups", DSTIdentityGroups)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -501,14 +502,20 @@ func DSTCryptoRand() {
 	a := readSeed(n)
 	b := readSeed(n)     // same seed: must equal a
 	c := readSeed(n + 1) // different seed: must differ
-	// Outside any run, crypto/rand is real entropy: two reads differ.
+	// Outside any run, crypto/rand is real entropy: two reads differ within
+	// the process, DST must be fully deactivated, and the bytes must differ
+	// ACROSS processes (the parent compares the out= field of two runs) — an
+	// in-process x != y alone would pass even with a stuck-active
+	// deterministic stream that merely advances.
 	var x, y [16]byte
 	crand.Read(x[:])
 	crand.Read(y[:])
 	os.Stdout.WriteString("h=" + hex.EncodeToString(a[:]) +
 		" eq=" + strconv.FormatBool(a == b) +
 		" seedvaries=" + strconv.FormatBool(a != c) +
-		" realdiffers=" + strconv.FormatBool(x != y) + "\n")
+		" realdiffers=" + strconv.FormatBool(x != y) +
+		" active=" + strconv.FormatBool(dstRuntimeActive()) +
+		" out=" + hex.EncodeToString(x[:]) + "\n")
 }
 
 // dstBubbleFinqFP returns the bubble-local total finalizers discovered (the
@@ -1208,6 +1215,71 @@ func DSTGOMAXPROCSAutoRestore() {
 	})
 	os.Stdout.WriteString("inrun=" + strconv.FormatBool(inRunAuto) +
 		" after=" + strconv.FormatBool(dstGOMAXPROCSAutoFP()) + "\n")
+}
+
+// DSTIdentityGroups exercises the simulated group list and the minimal
+// simulated user/group database: inside a run, os.Getgroups is exactly the
+// simulated gid; os/user lookups resolve the simulated user/group by name and
+// id and report anything else deterministically unknown; GroupIds of the
+// simulated user is its single group. After the run the host values return.
+func DSTIdentityGroups() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	hostGroups, _ := os.Getgroups()
+	fail := func(msg string) {
+		os.Stdout.WriteString(msg + "\n")
+	}
+	okAll := true
+	simulation.Run(n, func() {
+		check := func(cond bool, msg string) {
+			if !cond {
+				okAll = false
+				fail(msg)
+			}
+		}
+		gids, err := os.Getgroups()
+		check(err == nil && len(gids) == 1 && gids[0] == 7777, "getgroups not [7777]")
+		u, err := user.Lookup("sim")
+		check(err == nil && u != nil && u.Uid == "7777" && u.HomeDir == "/home/sim", "Lookup(sim) wrong")
+		_, err = user.Lookup("nosuchuser")
+		var uue user.UnknownUserError
+		check(errors.As(err, &uue), "Lookup(nosuchuser) not UnknownUserError")
+		u2, err := user.LookupId("7777")
+		check(err == nil && u2 != nil && u2.Username == "sim", "LookupId(7777) wrong")
+		var uuie user.UnknownUserIdError
+		_, err = user.LookupId("1000")
+		check(errors.As(err, &uuie), "LookupId(1000) not UnknownUserIdError")
+		g, err := user.LookupGroup("sim")
+		check(err == nil && g != nil && g.Gid == "7777", "LookupGroup(sim) wrong")
+		var uge user.UnknownGroupError
+		_, err = user.LookupGroup("wheel")
+		check(errors.As(err, &uge), "LookupGroup(wheel) not UnknownGroupError")
+		g2, err := user.LookupGroupId("7777")
+		check(err == nil && g2 != nil && g2.Name == "sim", "LookupGroupId(7777) wrong")
+		if u != nil {
+			ids, err := u.GroupIds()
+			check(err == nil && len(ids) == 1 && ids[0] == "7777", "GroupIds(sim) wrong")
+		}
+		other := &user.User{Username: "app", Gid: "1000"}
+		ids2, err := other.GroupIds()
+		check(err == nil && len(ids2) == 1 && ids2[0] == "1000", "GroupIds(other) not primary gid")
+	})
+	after, _ := os.Getgroups()
+	restored := len(after) == len(hostGroups)
+	if restored {
+		for i := range after {
+			if after[i] != hostGroups[i] {
+				restored = false
+				break
+			}
+		}
+	}
+	if !restored {
+		fail("host groups not restored")
+		return
+	}
+	if okAll {
+		os.Stdout.WriteString("done\n")
+	}
 }
 
 // DSTFinProfile takes a goroutine profile from inside a finalizer running on the

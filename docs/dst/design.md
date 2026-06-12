@@ -133,6 +133,21 @@ simulated identity is observably an override), current user `sim` (uid/gid `7777
 and the crypto/rand seam below are the only places the fork patches packages other than
 `runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
 The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.
+
+The group and user-database surface is simulated to match: `os.Getgroups` is exactly `[7777]`, and
+the `os/user` lookup functions resolve against a minimal database containing exactly the simulated
+user and its group — `Lookup("sim")`/`LookupId("7777")`/`LookupGroup("sim")`/`LookupGroupId("7777")`
+return the simulated records, `User.GroupIds` of the simulated user is `["7777"]` (any other `*User`
+resolves to just its primary gid, as the osusergo path does for a user with no group-file
+memberships), and anything else is the deterministic production unknown-error identity rather than a
+host-database read
+(`TestDSTIdentityGroups`). Boundaries that remain host-derived until the I/O features land: the
+environment surface (`os.Environ`/`Getenv`, and therefore `os.UserHomeDir` and `os.TempDir`) reads
+real host values inside a run — note `os.UserHomeDir` (host `$HOME`) and `user.Current().HomeDir`
+(`/home/sim`) disagree in-run; acquire identity through `os/user` for coherence. The simulated
+identity is also process-global while set: a goroutine outside the simulation that reads identity
+during a run (or in the brief set/clear windows around it) observes simulated values — identity
+gates on the sim-env flag, not per-goroutine.
 This is a deliberate gating asymmetry: identity is gated on `dstSimEnvSet` (set only by
 `testing/simulation.run`), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
 by `dstActivate` too). So a white-box run sees seeded RNG, scheduling, and crypto/rand but the *real*
@@ -162,9 +177,12 @@ run is active and returns false otherwise (so production crypto/rand and process
 untouched: `dstActive()` is false outside a run — `dstSeed` is only set by `simulation.Run`, which
 requires `-tags dst` — the same cheap atomic load `rand()` already does on its hot path). This holds under `-race`
 (the per-g RNG drives it). Boundary: only the **standard** configuration is deterministic — FIPS mode
-keeps a process-global SP 800-90A DRBG whose counter the seam does not control, and BoringCrypto uses
-its own generator; neither is a simulation configuration (both need cgo/special builds DST does not
-use).
+keeps a process-global SP 800-90A DRBG whose counter the seam does not control (it consumes the
+seam's deterministic bytes only as additional input), and BoringCrypto uses its own generator.
+BoringCrypto needs a special build DST does not use, but FIPS mode is one `GODEBUG=fips140=on` away
+in any build — so it is **enforced, not just documented**: `enterSimulation` panics when FIPS mode is
+latched, rather than letting `crypto/rand` go silently nondeterministic inside a run
+(`TestRunRejectsFIPSMode`).
 
 **Invariants enforced by the identity/crypto seams:**
 

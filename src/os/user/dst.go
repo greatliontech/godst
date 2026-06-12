@@ -21,6 +21,23 @@ const dstSimUserEnabled = true
 //go:linkname dstSimUser runtime.dstSimUser
 func dstSimUser() (uid, gid int, username, name, home string, ok bool)
 
+// dstLookupUser returns the one entry of the simulated user database (the
+// simulated current user) when a run is active. The database contains exactly
+// this user and its group: lookups for anything else are deterministically
+// unknown instead of host-database reads.
+func dstLookupUser() (*User, bool) {
+	return dstCurrentUser()
+}
+
+// dstLookupGroup returns the simulated user's group when a run is active.
+func dstLookupGroup() (*Group, bool) {
+	_, gid, username, _, _, ok := dstSimUser()
+	if !ok {
+		return nil, false
+	}
+	return &Group{Gid: strconv.Itoa(gid), Name: username}, true
+}
+
 func dstCurrentUser() (*User, bool) {
 	uid, gid, username, name, home, ok := dstSimUser()
 	if !ok {

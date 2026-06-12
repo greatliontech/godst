@@ -1168,11 +1168,35 @@ func TestDSTIdentityExtra(t *testing.T) {
 func TestDSTCryptoRandDeterministic(t *testing.T) {
 	out1 := strings.TrimSpace(runTestProgDST(t, "DSTCryptoRand", "DSTSEED=12345"))
 	out2 := strings.TrimSpace(runTestProgDST(t, "DSTCryptoRand", "DSTSEED=12345"))
-	if !strings.Contains(out1, " eq=true seedvaries=true realdiffers=true") {
-		t.Fatalf("crypto/rand not deterministic/seed-varying/real-outside under DST: %q", out1)
+	if !strings.Contains(out1, " eq=true seedvaries=true realdiffers=true active=false") {
+		t.Fatalf("crypto/rand not deterministic/seed-varying/real-and-inactive-outside under DST: %q", out1)
 	}
-	if out1 != out2 {
+	// The deterministic in-run stream (h=...) replays across processes; the
+	// outside-run bytes (out=...) are real entropy and must NOT. Comparing the
+	// split fields catches a mutation that leaves the deterministic source
+	// active-but-advancing outside the run, which the in-process
+	// realdiffers check alone cannot.
+	det1, outside1, ok1 := strings.Cut(out1, " out=")
+	det2, outside2, ok2 := strings.Cut(out2, " out=")
+	if !ok1 || !ok2 {
+		t.Fatalf("missing out= field:\nrun1=%q\nrun2=%q", out1, out2)
+	}
+	if det1 != det2 {
 		t.Fatalf("crypto/rand not reproducible across processes for the same seed:\nrun1=%q\nrun2=%q", out1, out2)
+	}
+	if outside1 == outside2 {
+		t.Fatalf("outside-run crypto/rand identical across processes (still deterministic?):\nrun1=%q\nrun2=%q", out1, out2)
+	}
+}
+
+// TestDSTIdentityGroups verifies the simulated group list and the minimal
+// simulated user/group database (the simulated user and its group resolve by
+// name and id; everything else is deterministically unknown; host values
+// return after the run).
+func TestDSTIdentityGroups(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTIdentityGroups", "DSTSEED=12345"))
+	if out != "done" {
+		t.Fatalf("simulated identity groups/database failed: %q", out)
 	}
 }
 

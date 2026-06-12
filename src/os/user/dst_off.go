@@ -11,3 +11,7 @@ const dstSimUserEnabled = false
 func dstSimUser() (uid, gid int, username, name, home string, ok bool) { return }
 
 func dstCurrentUser() (*User, bool) { return nil, false }
+
+func dstLookupUser() (*User, bool) { return nil, false }
+
+func dstLookupGroup() (*Group, bool) { return nil, false }
