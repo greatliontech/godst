@@ -292,6 +292,39 @@ var (
 	dstForceSeq           []uint64
 	dstForceCount         []uint64
 	dstForcePC            []uintptr
+
+	// Force-lookup table (BU-22): dstAccessForced runs on every auto-
+	// instrumented access, and a linear scan over the installed triples is
+	// O(F) per access as promotion grows. dstSetAccessForce (off-lock,
+	// between runs) builds this open-addressed table over the triples;
+	// lookups probe O(1). 1-based indices into dstForceSeq/Count/PC; 0 empty.
+	dstForceTab  []int32
+	dstForceMask uintptr
+
+	// Page index over the access entries (BU-21): dstAccessShouldYield needs
+	// every recorded entry overlapping the queried range, and scanning all
+	// entries is O(A) per access — O(A²) for heap-heavy SUTs. Entries are
+	// indexed by the 256-byte pages their range covers: per-page hash chains
+	// of (entry, page) nodes from a preallocated pool. An entry covering more
+	// than dstAccPageMaxSpan pages goes to the small always-scanned large-
+	// entry list; a QUERY spanning more than dstAccPageMaxQuery pages falls
+	// back to the full scan (correct, rare). Pool or list exhaustion sets
+	// dstFilterConservative — the existing lose-pruning-never-a-class
+	// fallback.
+	dstAccPageTab      []int32 // page-hash bucket -> 1-based node index
+	dstAccPageNodeEnt  []int32
+	dstAccPageNodeNext []int32
+	dstAccPageNodePage []uintptr
+	dstAccPageNodeN    int
+	dstAccLargeEnt     [dstAccLargeMax]int32
+	dstAccLargeN       int
+)
+
+const (
+	dstAccPageShift    = 8  // 256-byte pages
+	dstAccPageMaxSpan  = 8  // pages an entry is indexed under before the large list
+	dstAccPageMaxQuery = 64 // pages a query walks before falling back to the full scan
+	dstAccLargeMax     = 64
 )
 
 func dstEnsureSeq(gp *g) uint64 {
@@ -448,7 +481,55 @@ func dstFindAccessEntry(addr, size uintptr, proc int, create bool) int {
 	dstAccessWriteEpoch[e] = 0
 	dstAccessNext[e] = dstAccessTab[b]
 	dstAccessTab[b] = int32(e + 1)
+	dstAccPageInsert(e, addr, size)
 	return e
+}
+
+// dstAccPageBucket hashes a page number into dstAccPageTab.
+func dstAccPageBucket(page uintptr) int {
+	h := page ^ (page >> 13) ^ (page << 5)
+	return int(h % uintptr(len(dstAccPageTab)))
+}
+
+// dstAccPageInsert indexes a freshly created access entry under the pages its
+// range covers (or the large-entry list). Called on the dstFindAccessEntry
+// create path — under sched.lock from dstScheduledSelect's commit, lock-free
+// from dstYieldAccess's inline filtered commit — and pool-allocating only,
+// never the heap, which is what both contexts require. The pool is sized for
+// two pages per entry on average (2x the entry budget): a workload averaging
+// wider ranges exhausts it sooner and flips dstFilterConservative — trading
+// pruning, never a class, exactly as the filter's overflow contract
+// authorizes; size the dstExploreInit budgets up if such a workload needs the
+// pruning.
+func dstAccPageInsert(e int, addr, size uintptr) {
+	if len(dstAccPageTab) == 0 {
+		dstFilterConservative = true
+		return
+	}
+	start := addr >> dstAccPageShift
+	end := (dstAccessRangeEnd(addr, size) - 1) >> dstAccPageShift
+	if end-start >= dstAccPageMaxSpan {
+		if dstAccLargeN >= len(dstAccLargeEnt) {
+			dstFilterConservative = true
+			return
+		}
+		dstAccLargeEnt[dstAccLargeN] = int32(e)
+		dstAccLargeN++
+		return
+	}
+	for p := start; p <= end; p++ {
+		if dstAccPageNodeN >= len(dstAccPageNodeEnt) {
+			dstFilterConservative = true
+			return
+		}
+		b := dstAccPageBucket(p)
+		n := dstAccPageNodeN
+		dstAccPageNodeN++
+		dstAccPageNodeEnt[n] = int32(e)
+		dstAccPageNodePage[n] = p
+		dstAccPageNodeNext[n] = dstAccPageTab[b]
+		dstAccPageTab[b] = int32(n + 1)
+	}
 }
 
 func dstAccessHBBefore(curProc, priorProc int, priorEpoch uint32) bool {
@@ -499,13 +580,27 @@ func dstAccessPCKey(pc uintptr) uintptr {
 	return uintptr(h)
 }
 
+func dstForceHash(seq, count uint64, pc uintptr) uintptr {
+	h := seq*0x9e3779b97f4a7c15 ^ count*0xbf58476d1ce4e5b9 ^ uint64(pc)*0x94d049bb133111eb
+	h ^= h >> 29
+	return uintptr(h)
+}
+
 func dstAccessForced(seq, count uint64, pc uintptr) bool {
-	for i, s := range dstForceSeq {
-		if s == seq && dstForceCount[i] == count && dstForcePC[i] == pc {
+	if dstForceTab == nil {
+		return false
+	}
+	h := dstForceHash(seq, count, pc) & dstForceMask
+	for {
+		i := int(dstForceTab[h]) - 1
+		if i < 0 {
+			return false
+		}
+		if dstForceSeq[i] == seq && dstForceCount[i] == count && dstForcePC[i] == pc {
 			return true
 		}
+		h = (h + 1) & dstForceMask
 	}
-	return false
 }
 
 func dstAccessShouldYield(gp *g, seq uint64, addr, size uintptr, write bool) bool {
@@ -524,20 +619,57 @@ func dstAccessShouldYield(gp *g, seq uint64, addr, size uintptr, write bool) boo
 		dstFilterConservative = true
 		return true
 	}
-	for e := 0; e < dstAccessEntryN; e++ {
-		if !dstAccessOverlap(addr, size, dstAccessEntryAddr[e], dstAccessEntrySize[e]) {
-			continue
+	start := addr >> dstAccPageShift
+	end := (dstAccessRangeEnd(addr, size) - 1) >> dstAccPageShift
+	if len(dstAccPageTab) == 0 || end-start >= dstAccPageMaxQuery {
+		// Index unavailable, or a range so large that walking its pages would
+		// cost more than scanning the entries: full scan, same semantics.
+		for e := 0; e < dstAccessEntryN; e++ {
+			if dstAccessEntryConflicts(e, proc, addr, size, write) {
+				return true
+			}
 		}
-		priorProc := int(dstAccessEntryProc[e])
-		if priorProc == proc {
-			continue
+		return false
+	}
+	for p := start; p <= end; p++ {
+		b := dstAccPageBucket(p)
+		for n := int(dstAccPageTab[b]) - 1; n >= 0; n = int(dstAccPageNodeNext[n]) - 1 {
+			if dstAccPageNodePage[n] != p {
+				// Page-hash collision: a node for another page sharing this
+				// bucket. Skipping is sound — an entry overlapping the query
+				// shares a page with it and is found under that page.
+				continue
+			}
+			if dstAccessEntryConflicts(int(dstAccPageNodeEnt[n]), proc, addr, size, write) {
+				return true
+			}
 		}
-		if dstAccessWriteEpoch[e] != 0 && !dstAccessHBBefore(proc, priorProc, dstAccessWriteEpoch[e]) {
+	}
+	for i := 0; i < dstAccLargeN; i++ {
+		if dstAccessEntryConflicts(int(dstAccLargeEnt[i]), proc, addr, size, write) {
 			return true
 		}
-		if write && dstAccessReadEpoch[e] != 0 && !dstAccessHBBefore(proc, priorProc, dstAccessReadEpoch[e]) {
-			return true
-		}
+	}
+	return false
+}
+
+// dstAccessEntryConflicts reports whether prior access entry e conflicts with
+// the (proc, addr, size, write) access — overlapping range, different
+// goroutine, and not ordered by the live HB clocks. The per-entry test the
+// page index and the full-scan fallback share.
+func dstAccessEntryConflicts(e, proc int, addr, size uintptr, write bool) bool {
+	if !dstAccessOverlap(addr, size, dstAccessEntryAddr[e], dstAccessEntrySize[e]) {
+		return false
+	}
+	priorProc := int(dstAccessEntryProc[e])
+	if priorProc == proc {
+		return false
+	}
+	if dstAccessWriteEpoch[e] != 0 && !dstAccessHBBefore(proc, priorProc, dstAccessWriteEpoch[e]) {
+		return true
+	}
+	if write && dstAccessReadEpoch[e] != 0 && !dstAccessHBBefore(proc, priorProc, dstAccessReadEpoch[e]) {
+		return true
 	}
 	return false
 }
@@ -790,6 +922,10 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 	dstAccessNext = make([]int32, maxAccesses)
 	dstAccessReadEpoch = make([]uint32, maxAccesses)
 	dstAccessWriteEpoch = make([]uint32, maxAccesses)
+	dstAccPageTab = make([]int32, maxAccesses*2+1)
+	dstAccPageNodeEnt = make([]int32, maxAccesses*2)
+	dstAccPageNodeNext = make([]int32, maxAccesses*2)
+	dstAccPageNodePage = make([]uintptr, maxAccesses*2)
 	syncClockObjects := maxEdges
 	if syncClockObjects > dstFilterMaxSyncObjects {
 		syncClockObjects = dstFilterMaxSyncObjects
@@ -826,6 +962,11 @@ func dstScheduleReset() {
 		dstAccessTab[i] = 0
 	}
 	dstAccessEntryN = 0
+	for i := range dstAccPageTab {
+		dstAccPageTab[i] = 0
+	}
+	dstAccPageNodeN = 0
+	dstAccLargeN = 0
 	for i := 0; i < dstSyncClockN*dstClockProcs; i++ {
 		dstSyncClock[i] = 0
 	}
@@ -948,6 +1089,26 @@ func dstSetAccessForce(seq, count []uint64, pc []uintptr) {
 	dstForceSeq = seq
 	dstForceCount = count
 	dstForcePC = pc
+	// Build the O(1) lookup table here, off-lock (BU-22); dstAccessForced
+	// probes it on every auto-instrumented access during the Run.
+	if len(seq) == 0 {
+		dstForceTab = nil
+		dstForceMask = 0
+		return
+	}
+	size := 8
+	for size < len(seq)*2 {
+		size <<= 1
+	}
+	dstForceTab = make([]int32, size)
+	dstForceMask = uintptr(size - 1)
+	for i := range seq {
+		h := dstForceHash(seq[i], count[i], pc[i]) & dstForceMask
+		for dstForceTab[h] != 0 {
+			h = (h + 1) & dstForceMask
+		}
+		dstForceTab[h] = int32(i + 1)
+	}
 }
 
 // dstTraceLenFP reports the decision count recorded by the last scheduled Run.

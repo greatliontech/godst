@@ -19,6 +19,9 @@ import (
 //go:linkname dstAccessYield runtime.dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool)
 
+//go:linkname dstAccessYieldRange runtime.dstAccessYieldRange
+func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool)
+
 //go:linkname dstAccessYieldFP runtime.dstAccessYieldFP
 func dstAccessYieldFP() uint64
 
@@ -1925,5 +1928,154 @@ func TestExploreWithStepBudgetReportsIncomplete(t *testing.T) {
 	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSteps: 1}, budgetedExploreSUT)
 	if !res.BudgetHit || res.Exhausted || res.Overflow {
 		t.Fatalf("step budget not reported distinctly: schedules=%d exhausted=%v overflow=%v budget=%v", res.Schedules, res.Exhausted, res.Overflow, res.BudgetHit)
+	}
+}
+
+// TestExploreFilterPageIndexFindsConflicts pins the shared-address filter's
+// overlap detection through every lookup path of its page index (BU-21): the
+// second of two unordered conflicting accesses must YIELD (the filter sees the
+// prior overlapping entry), so each conflicting case costs exactly one more
+// yield than its structurally identical disjoint control. Cases cover the
+// chained-page path (scalar/scalar, and an entry straddling a page boundary
+// queried from its second page), the large-entry list (a range wider than the
+// per-entry page cap), and the full-scan fallback (a queried range wider than
+// the query page cap). The +1 holds whichever of the two accesses the schedule
+// commits first — either order leaves one filtered and one yielding.
+func TestExploreFilterPageIndexFindsConflicts(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race so the shared-address filter is active")
+	}
+	buf := make([]byte, 1<<17)
+	yields := func(annA, annB func()) uint64 {
+		dstExploreInit(1024, 4096, 1024, 1024)
+		dstAccessYieldReset()
+		runOnce(1, nil, map[accessForce]bool{}, func() bool {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				annA()
+			}()
+			go func() {
+				defer wg.Done()
+				annB()
+			}()
+			wg.Wait()
+			return false
+		})
+		return dstAccessYieldFP()
+	}
+	cases := []struct {
+		name     string
+		overlap  [2]func()
+		disjoint [2]func()
+	}{
+		{
+			name: "scalar-scalar",
+			overlap: [2]func(){
+				func() { dstAccessYield(unsafe.Pointer(&buf[64]), true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[64]), true) },
+			},
+			disjoint: [2]func(){
+				func() { dstAccessYield(unsafe.Pointer(&buf[64]), true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[1<<16]), true) },
+			},
+		},
+		{
+			// A 4-byte entry straddling the 256-byte page boundary at 512,
+			// conflicting with a scalar in its SECOND page: the index must
+			// find it under every page it covers.
+			name: "page-boundary-straddle",
+			overlap: [2]func(){
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[510]), 4, true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[513]), true) },
+			},
+			disjoint: [2]func(){
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[510]), 4, true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[1<<16]), true) },
+			},
+		},
+		{
+			// 4096 bytes = 16 pages, beyond the per-entry page cap: the
+			// entry lives on the always-scanned large-entry list.
+			name: "large-entry-list",
+			overlap: [2]func(){
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[0]), 4096, true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[2000]), true) },
+			},
+			disjoint: [2]func(){
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[0]), 4096, true) },
+				func() { dstAccessYield(unsafe.Pointer(&buf[1<<16]), true) },
+			},
+		},
+		{
+			// A queried range of 256+ pages exceeds the query page cap: the
+			// filter falls back to the full entry scan and must still see
+			// the prior scalar inside the range.
+			name: "full-scan-fallback",
+			overlap: [2]func(){
+				func() { dstAccessYield(unsafe.Pointer(&buf[30000]), true) },
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[0]), 1<<16, true) },
+			},
+			disjoint: [2]func(){
+				func() { dstAccessYield(unsafe.Pointer(&buf[(1<<16)+512]), true) },
+				func() { dstAccessYieldRange(unsafe.Pointer(&buf[0]), 1<<16, true) },
+			},
+		},
+	}
+	for _, tc := range cases {
+		got := yields(tc.overlap[0], tc.overlap[1])
+		want := yields(tc.disjoint[0], tc.disjoint[1])
+		if got != want+1 {
+			t.Errorf("%s: conflicting pair yielded %d times, disjoint control %d — want exactly control+1 (filter missed or over-detected the overlap)", tc.name, got, want)
+		}
+	}
+}
+
+// TestExploreFilterPageIndexExhaustionConservative pins the page-index
+// overflow contract: exhausting the preallocated (entry,page) node pool must
+// flip the filter conservative — every later access yields — never silently
+// skip indexing an entry (which would let the filter miss a real conflict and
+// lose an interleaving class). With a tiny budget, three 7-page ranges
+// overrun the pool, so a later private scalar — normally filtered — must
+// yield; with a roomy budget the same SUT's accesses are all filtered.
+func TestExploreFilterPageIndexExhaustionConservative(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race so the shared-address filter is active")
+	}
+	buf := make([]byte, 1<<17)
+	sut := func() bool {
+		for i := 0; i < 3; i++ {
+			dstAccessYieldRange(unsafe.Pointer(&buf[i*8192]), 7*256, true)
+		}
+		dstAccessYield(unsafe.Pointer(&buf[1<<16]), true)
+		return false
+	}
+	yields := func(maxAccesses int) uint64 {
+		dstExploreInit(64, 256, 64, maxAccesses)
+		dstAccessYieldReset()
+		runOnce(1, nil, map[accessForce]bool{}, sut)
+		return dstAccessYieldFP()
+	}
+	// maxAccesses=8 gives a 16-node pool; 3 ranges need 21 nodes, so the
+	// third range exhausts it and everything after it — the trailing scalar
+	// plus any compiler auto-instrumented in-bubble access — must yield
+	// conservatively. The budgets isolate the NODE pool as the tripped cap:
+	// the SUT creates only 4 entries against an 8-entry budget, so the
+	// entry-table cap cannot be what flips the flag (the silent-exhaustion
+	// mutation run confirms the node pool is the trigger). The roomy run pins the baseline at zero, so any
+	// nonzero count in the tiny run can only come from the conservative
+	// flag the exhaustion set.
+	if got := yields(1024); got != 0 {
+		t.Errorf("roomy pool: %d yields, want 0 (single-goroutine accesses are all filtered)", got)
+	}
+	if got := yields(8); got == 0 {
+		t.Errorf("exhausted pool: 0 yields — node-pool exhaustion did not set the conservative fallback, the filter can silently lose conflicts")
 	}
 }
