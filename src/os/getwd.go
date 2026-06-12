@@ -24,6 +24,11 @@ var getwdCache struct {
 // provides an absolute name, and it is a name of the
 // current directory, it is returned.
 func Getwd() (dir string, err error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("getwd", ""); fenced {
+			return "", err
+		}
+	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
 		// Use syscall.Getwd directly for
 		//   - plan9: see reasons in CL 89575;

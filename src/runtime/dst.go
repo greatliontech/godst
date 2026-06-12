@@ -50,7 +50,9 @@ func dstCallbackWorkersBlocked() bool {
 	return dstActive() || (dstBuild && dstPreparing.Load())
 }
 
-// dstNetEpoch returns the current run's epoch (0 outside a run). net keys its
+// dstNetEpoch returns the current run's epoch (0 outside a run). The name
+// predates the second consumer: both the net registry and the os simulated
+// filesystem key their per-run state off this counter. net keys its
 // simulated-network registry by it: a different epoch means a new run, so the
 // registry resets — keeping listeners from one run out of the next, with no
 // explicit teardown hook. Read by net via linkname.

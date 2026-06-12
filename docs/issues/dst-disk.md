@@ -38,19 +38,21 @@ not exercise real fds under DST, so virtualizing the userspace surface (not the
 3. (later) **crash semantics** — a `Sync`/durability model so crash-faults can
    drop or tear unsynced writes deterministically; **disk faults** as policies.
 
-## Open questions to settle when it lands
+## Design decisions — SETTLED
 
-- Whether to expose this through `os` directly or via an `fs.FS`-shaped seam.
-- **Durability/crash model — settle the CONTRACT at spec tier during THIS
-  feature's design step, not with the fault feature** (decided at sequencing):
-  whether crash faults may drop or tear unsynced writes determines whether the
-  file representation must distinguish synced from unsynced state, so deferring
-  the contract would foreclose the core write path into a retrofit. Implement
-  the no-fault collapse (everything survives, but writes tracked as
-  synced/unsynced from day one); the fault feature then adds policies, not
-  representation.
-- `os.Pipe` ownership (here vs dst-io) — decide during this feature's design
-  step, when the fd-machinery shape exists (also decided at sequencing).
+Authoritative text: design.md "In-memory deterministic filesystem".
+
+All former open questions are settled in the spec section written at this
+feature's design step:
+
+- Seam: the exported `os` surface directly (not `fs.FS` — unmodified code is
+  the goal), gated on `dstActive()`, mirroring the network feature.
+- Durability/crash CONTRACT settled at spec tier there (synced/unsynced
+  representation from day one; crash restores the durable image exactly;
+  fault feature adds policies, never representation).
+- `os.Pipe` ownership: dst-io — but the `os.File` dst backing designed here is
+  a backend interface a stream-shaped pipe plugs into, so dst-io adds a
+  backend, not a retrofit.
 - Fixture placement: any testprog needing `os`-beyond-files imports that pull
   cgo must go to `testprognet`, never `testprog` (the deadlock-detection
   boundary — see design.md "Enforcing test configurations").

@@ -11,6 +11,11 @@ import "syscall"
 // Pipe returns a connected pair of Files; reads from r return bytes written to w.
 // It returns the files and an error, if any.
 func Pipe() (r *File, w *File, err error) {
+	if dstSimEnabled {
+		if ferr, fenced := dstFSFenced("pipe2", "|"); fenced {
+			return nil, nil, ferr
+		}
+	}
 	var p [2]int
 
 	e := syscall.Pipe2(p[0:], syscall.O_CLOEXEC)

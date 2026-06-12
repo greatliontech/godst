@@ -325,6 +325,11 @@ func (f *File) WriteString(s string) (n int, err error) {
 // bits (before umask).
 // If there is an error, it will be of type [*PathError].
 func Mkdir(name string, perm FileMode) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("mkdir", name); fenced {
+			return err
+		}
+	}
 	longName := fixLongPath(name)
 	e := ignoringEINTR(func() error {
 		return syscall.Mkdir(longName, syscallMode(perm))
@@ -359,6 +364,11 @@ func setStickyBit(name string) error {
 // Chdir changes the current working directory to the named directory.
 // If there is an error, it will be of type [*PathError].
 func Chdir(dir string) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("chdir", dir); fenced {
+			return err
+		}
+	}
 	if e := syscall.Chdir(dir); e != nil {
 		testlog.Open(dir) // observe likely non-existent directory
 		return &PathError{Op: "chdir", Path: dir, Err: e}
@@ -435,6 +445,11 @@ func openDir(name string) (*File, error) {
 // Even within the same directory, on non-Unix platforms Rename is not an atomic operation.
 // If there is an error, it will be of type *LinkError.
 func Rename(oldpath, newpath string) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFencedLink("rename", oldpath, newpath); fenced {
+			return err
+		}
+	}
 	return rename(oldpath, newpath)
 }
 
@@ -444,6 +459,11 @@ func Rename(oldpath, newpath string) error {
 // If the link destination is relative, Readlink returns the relative path
 // without resolving it to an absolute one.
 func Readlink(name string) (string, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("readlink", name); fenced {
+			return "", err
+		}
+	}
 	return readlink(name)
 }
 
@@ -641,7 +661,14 @@ func UserHomeDir() (string, error) {
 //
 // On Plan 9, the mode's permission bits, [ModeAppend], [ModeExclusive],
 // and [ModeTemporary] are used.
-func Chmod(name string, mode FileMode) error { return chmod(name, mode) }
+func Chmod(name string, mode FileMode) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("chmod", name); fenced {
+			return err
+		}
+	}
+	return chmod(name, mode)
+}
 
 // Chmod changes the mode of the file to mode.
 // If there is an error, it will be of type [*PathError].
@@ -698,6 +725,9 @@ func (f *File) SetWriteDeadline(t time.Time) error {
 func (f *File) SyscallConn() (syscall.RawConn, error) {
 	if err := f.checkValid("SyscallConn"); err != nil {
 		return nil, err
+	}
+	if dstSimEnabled && f.dstf != nil {
+		return nil, f.wrapErr("syscallconn", dstErrUnsupportedFS)
 	}
 	return newRawConn(f)
 }

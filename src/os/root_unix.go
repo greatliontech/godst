@@ -21,6 +21,11 @@ type sysfdType = int
 
 // openRootNolog is OpenRoot.
 func openRootNolog(name string) (*Root, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("openat", name); fenced {
+			return nil, err
+		}
+	}
 	var fd int
 	err := ignoringEINTR(func() error {
 		var err error

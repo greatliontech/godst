@@ -45,6 +45,9 @@ func (d *dirInfo) close() {
 }
 
 func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return nil, nil, nil, &PathError{Op: "readdirent", Path: f.name, Err: dstErrUnsupportedFS}
+	}
 	// If this file has no dirInfo, create one.
 	var d *dirInfo
 	for {

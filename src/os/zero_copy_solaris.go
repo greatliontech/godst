@@ -41,6 +41,11 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 		// leave further error handling as the responsibility of the caller.
 		return 0, false, nil
 	}
+	if dstSimEnabled && src.dstf != nil {
+		// Simulated source: no real descriptor; generic loop (DST). Must sit
+		// below checkValid — a typed-nil *File reaches this unwrap.
+		return 0, false, nil
+	}
 
 	// If fd_in and fd_out refer to the same file and the source and target ranges overlap,
 	// sendfile(2) on SunOS will allow this kind of overlapping and work like a memmove,

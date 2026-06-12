@@ -273,6 +273,68 @@ are likewise rejected fast under a run — an inherited fd is a host socket, the
 conn/listener-producing surface the typed gates did not cover. FIPS/Boring-style configs are out of
 scope as elsewhere.
 
+### In-memory deterministic filesystem (the second I/O feature)
+
+Like the network: a **contract change** — real filesystem I/O moves from "out of scope" to **owned
+by the fork**, so unmodified file-using code is reproducible under DST. Under a run, the exported
+`os` surface (`OpenFile` and the named-path operations, plus the `*os.File` methods) stops touching
+the OS and operates on a per-bubble **in-memory tree**, reset per run by the same per-run-epoch
+mechanism as the network registry. All operations execute synchronously on the calling goroutine —
+no new scheduler choices, no new RNG (the Soundness invariant's "take over, never add" principle);
+determinism rides the schedule exactly as it does for the network.
+
+**The tree starts empty.** A run observes a root `/` with nothing in it: the host filesystem is
+NEVER visible (no passthrough, no testdata reads — a host path is machine state, and reading it
+would make runs machine-dependent). A program needing fixture files creates them inside the run.
+Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
+per-bubble). Directory listings (`os.ReadDir`, `File.ReadDir`/`Readdir`/`Readdirnames`, including
+chunked `n > 0` reads against a stable cursor) are **sorted by name** — deterministic, and
+consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubble's fake clock.
+Permission bits are stored and reported but not enforced in the base model (no simulated
+credential checks); error identity is production-shaped throughout `errors.Is`: `*PathError`/
+`*LinkError` wrapping `syscall.ENOENT`/`EEXIST`/`ENOTDIR`/`EISDIR`/`ENOTEMPTY`/`EBADF`/`EINVAL`,
+`os.ErrClosed` on use-after-close, exactly as the host would shape them. POSIX namespace
+semantics hold where databases depend on them: an open file removed from the namespace
+(`Remove`, or replaced by `Rename`) keeps its content readable and writable through the open
+handle until close — content lives on the node, names are references.
+
+**Durability contract (spec tier — governs the fault feature; settled here so the write path
+cannot foreclose it).** Every mutation — file write, truncate, create, remove, rename, metadata
+change — enters the tree as **unsynced**. `File.Sync` commits that file's content and size
+durably; a file's *name* becoming durable is a property of its **parent directory** (POSIX: data
+durability and entry durability are separate — fsync the file, fsync the directory), committed by
+syncing an open handle on the directory. `Rename` is atomic in the namespace (observers see old
+or new, never neither/both); its durability rides the parent directories' sync state like any
+other entry change. A simulated **crash** (fault feature) restores exactly the durable image:
+synced state survives byte-exactly; unsynced data and entries MAY be lost or, for file content,
+torn at arbitrary byte granularity — no atomicity of individual `Write` calls is promised beyond
+what was synced. The base (no-fault) model is the collapse of this contract where crash never
+fires: everything survives, and `Sync` is *not* a no-op — it moves the synced/unsynced boundary,
+which the representation carries from day one (per-node durable image + pending state). The fault
+feature later adds crash/EIO/ENOSPC/latency as **policies over this representation**, never new
+representation — same layering as network faults over the registry.
+
+**The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen at open: the
+tree-file backend here; dst-io's `os.Pipe` (and std streams) later plug in as a stream-shaped
+backend behind the same seam, so dst-io adds a backend, not a retrofit (the Non-foreclosure
+invariant applied at this seam — decided here, recorded against dst-io). `Fd()` on a simulated
+file has no honest answer and **panics** with the standard "unsupported under deterministic
+simulation" shape — loud, deterministic — rather than returning a host fd that would leak the
+simulation; everything `Fd()` feeds (mmap, raw `syscall`, locking) is out of the base model.
+Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced until then** —
+"not yet modeled" never means "reaches the host": within this feature's surface (the os file and
+namespace API; `os/exec`'s process surface is its own roadmap item), every handle-producing or
+namespace-touching entry point is either implemented in-sim or fails with the unsupported shape
+while a run is active (`os.OpenRoot` and `os.Pipe` included — the pipe implementation belongs to
+dst-io; until it lands the fence holds). A `File` or `Root` opened BEFORE the run is a host-backed
+handle and stays outside the base model, exactly as inherited fds are for the network — program
+discipline, recorded here as the inherited-handle stance — and symmetrically, a simulated `File`
+leaked OUT of its run keeps operating on its run's orphaned tree in later runs: deterministic,
+host-isolated, and meaningless, the same discipline applied in reverse. An operation pairing a simulated handle
+with a pre-run host handle behaves as its two halves: the simulated side goes through the gated
+funnels and the host side does real I/O (`io.Copy` from a simulated file to an inherited stdout
+takes the generic loop — the zero-copy fast paths bail whenever either side is simulated).
+
 ### Enforcing test configurations
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
@@ -283,7 +345,7 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   enforces that `runtime/testdata/testprog` stays cgo-free — a cgo-pulling import there (net,
   os/user — DST fixtures needing those live in `testprognet`) disables the runtime's deadlock
   detection and hangs the crash tests loudly.
-- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net`,
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net os`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
   `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
@@ -316,6 +378,11 @@ trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk
 or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
 every command pins `TMPDIR` to the gitignored on-disk `.tmp/` at the repo root (freely deletable
 between runs); a FAIL of that shape can still appear in a bare `go test` run outside the tasks.
+A second environmental dependency: the non-`-short` net suite includes external-DNS tests
+(`TestLookupDotsWithRemoteSource` et al.) that require a recursive resolver returning real
+answers; a filtering/captive upstream (observed: quad9 echoing the arpa name for 8.8.8.8 reverse
+lookup) fails them with no fork involvement — confirm on the base branch or another network, then
+re-run with `-skip` for the affected lookup tests, before reading a net FAIL as real.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 

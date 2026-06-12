@@ -24,6 +24,11 @@ type root struct {
 
 // openRootNolog is OpenRoot.
 func openRootNolog(name string) (*Root, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("openat", name); fenced {
+			return nil, err
+		}
+	}
 	r, err := newRoot(name)
 	if err != nil {
 		return nil, &PathError{Op: "open", Path: name, Err: err}

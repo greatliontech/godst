@@ -16,6 +16,11 @@ var (
 )
 
 func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {
+	// A simulated file has no real descriptor; the generic copy loop routes
+	// through the gated Read/Write funnels (DST).
+	if dstSimEnabled && f.dstf != nil {
+		return 0, false, nil
+	}
 	pfd, network := getPollFDAndNetwork(w)
 	// TODO(panjf2000): same as File.spliceToFile.
 	if pfd == nil || !pfd.IsStream || !isUnixOrTCP(string(network)) {
@@ -46,6 +51,14 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 	// Visit https://man7.org/linux/man-pages/man2/copy_file_range.2.html#ERRORS and
 	// https://man7.org/linux/man-pages/man2/splice.2.html#ERRORS for details.
 	if f.appendMode {
+		return 0, false, nil
+	}
+
+	// A simulated destination has no real descriptor; fall back to the
+	// generic copy loop, which routes through the gated funnels (DST). The
+	// source side is checked in copyFileRange, after the unwrap — the only
+	// point that sees through fileWithoutWriteTo/LimitedReader wrappers.
+	if dstSimEnabled && f.dstf != nil {
 		return 0, false, nil
 	}
 
@@ -108,6 +121,10 @@ func (f *File) copyFileRange(r io.Reader) (written int64, handled bool, err erro
 	if src.checkValid("ReadFrom") != nil {
 		// Avoid returning the error as we report handled as false,
 		// leave further error handling as the responsibility of the caller.
+		return 0, false, nil
+	}
+	if dstSimEnabled && src.dstf != nil {
+		// Simulated source: no real descriptor; generic loop (DST).
 		return 0, false, nil
 	}
 

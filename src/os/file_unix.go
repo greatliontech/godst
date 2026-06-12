@@ -64,12 +64,19 @@ type file struct {
 	stdoutOrErr bool                    // whether this is stdout or stderr
 	appendMode  bool                    // whether file is opened for appending
 	inRoot      bool                    // whether file is opened in a Root
+	dstf        *dstFile                // simulated backing under DST; nil otherwise (inert untagged)
 }
 
 // fd is the Unix implementation of Fd.
 func (f *File) fd() uintptr {
 	if f == nil {
 		return ^(uintptr(0))
+	}
+	if dstSimEnabled && f.dstf != nil {
+		// A simulated file has no honest descriptor; returning one would
+		// leak the simulation into raw syscalls. Loud and deterministic
+		// (see design.md "In-memory deterministic filesystem").
+		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
 
 	// If we put the file descriptor into nonblocking mode,
@@ -244,6 +251,11 @@ const DevNull = "/dev/null"
 // openFileNolog is the Unix implementation of OpenFile.
 // Changes here should be reflected in openDirAt and openDirNolog, if relevant.
 func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
+	if dstSimEnabled {
+		if f, handled, err := dstOpenFile(name, flag, perm); handled {
+			return f, err
+		}
+	}
 	setSticky := false
 	if !supportsCreateWithStickyBit && flag&O_CREATE != 0 && perm&ModeSticky != 0 {
 		if _, err := Stat(name); IsNotExist(err) {
@@ -282,6 +294,11 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 }
 
 func openDirNolog(name string) (*File, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("open", name); fenced {
+			return nil, err
+		}
+	}
 	var (
 		r int
 		s poll.SysFile
@@ -308,6 +325,14 @@ func (file *file) close() error {
 	if file == nil {
 		return syscall.EINVAL
 	}
+	if dstSimEnabled && file.dstf != nil {
+		var err error
+		if e := file.dstf.closeFile(); e != nil {
+			err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
+		}
+		runtime.SetFinalizer(file, nil)
+		return err
+	}
 	if info := file.dirinfo.Swap(nil); info != nil {
 		info.close()
 	}
@@ -329,6 +354,9 @@ func (file *file) close() error {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (f *File) seek(offset int64, whence int) (ret int64, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.seek(offset, whence)
+	}
 	if info := f.dirinfo.Swap(nil); info != nil {
 		// Free cached dirinfo, so we allocate a new one if we
 		// access this file as a directory again. See #35767 and #37161.
@@ -343,6 +371,11 @@ func (f *File) seek(offset int64, whence int) (ret int64, err error) {
 // If the file is a symbolic link, it changes the size of the link's target.
 // If there is an error, it will be of type [*PathError].
 func Truncate(name string, size int64) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("truncate", name); fenced {
+			return err
+		}
+	}
 	e := ignoringEINTR(func() error {
 		return syscall.Truncate(name, size)
 	})
@@ -355,6 +388,11 @@ func Truncate(name string, size int64) error {
 // Remove removes the named file or (empty) directory.
 // If there is an error, it will be of type [*PathError].
 func Remove(name string) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("remove", name); fenced {
+			return err
+		}
+	}
 	// System call interface forces us to know
 	// whether name is a file or directory.
 	// Try both: it is cheaper on average than
@@ -402,6 +440,11 @@ func tempDir() string {
 // Link creates newname as a hard link to the oldname file.
 // If there is an error, it will be of type *LinkError.
 func Link(oldname, newname string) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFencedLink("link", oldname, newname); fenced {
+			return err
+		}
+	}
 	e := ignoringEINTR(func() error {
 		return syscall.Link(oldname, newname)
 	})
@@ -416,6 +459,11 @@ func Link(oldname, newname string) error {
 // if oldname is later created as a directory the symlink will not work.
 // If there is an error, it will be of type *LinkError.
 func Symlink(oldname, newname string) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFencedLink("symlink", oldname, newname); fenced {
+			return err
+		}
+	}
 	e := ignoringEINTR(func() error {
 		return syscall.Symlink(oldname, newname)
 	})

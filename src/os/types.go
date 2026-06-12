@@ -67,6 +67,11 @@ func (fs *fileStat) IsDir() bool  { return fs.Mode().IsDir() }
 // SameFile only applies to results returned by this package's [Stat].
 // It returns false in other cases.
 func SameFile(fi1, fi2 FileInfo) bool {
+	if dstSimEnabled {
+		if same, handled := dstSameFile(fi1, fi2); handled {
+			return same
+		}
+	}
 	fs1, ok1 := fi1.(*fileStat)
 	fs2, ok2 := fi2.(*fileStat)
 	if !ok1 || !ok2 {

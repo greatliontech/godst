@@ -9,6 +9,11 @@ import "internal/testlog"
 // Stat returns a [FileInfo] describing the named file.
 // If there is an error, it will be of type [*PathError].
 func Stat(name string) (FileInfo, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("stat", name); fenced {
+			return nil, err
+		}
+	}
 	testlog.Stat(name)
 	return statNolog(name)
 }
@@ -22,6 +27,11 @@ func Stat(name string) (FileInfo, error) {
 // named entity (such as a symbolic link or mounted folder), the returned
 // FileInfo describes the reparse point, and makes no attempt to resolve it.
 func Lstat(name string) (FileInfo, error) {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("lstat", name); fenced {
+			return nil, err
+		}
+	}
 	testlog.Stat(name)
 	return lstatNolog(name)
 }

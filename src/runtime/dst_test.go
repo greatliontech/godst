@@ -1235,6 +1235,21 @@ func TestDSTIdentityGroups(t *testing.T) {
 	}
 }
 
+// TestDSTDiskReplay: a concurrent file workload under the in-memory DST
+// filesystem replays byte-identically across processes — the cross-process
+// form of the filesystem determinism invariant (in-process form and the rest
+// of the chunk surface are covered in os's dst tests).
+func TestDSTDiskReplay(t *testing.T) {
+	out1 := runTestProgDST(t, "DSTDiskReplay", "DSTSEED=42")
+	if !strings.Contains(out1, "content=[g") || !strings.Contains(out1, "sizes=[") {
+		t.Fatalf("malformed disk replay transcript:\n%s", out1)
+	}
+	out2 := runTestProgDST(t, "DSTDiskReplay", "DSTSEED=42")
+	if out1 != out2 {
+		t.Fatalf("in-memory filesystem not reproducible across processes:\nrun1=%q\nrun2=%q", out1, out2)
+	}
+}
+
 // TestDSTNet verifies the in-memory deterministic network (the first I/O feature):
 // inside simulation.Run a client/server exchange over net.Dial/Listen completes
 // with the simulated addresses, replays byte-identically across processes, and the

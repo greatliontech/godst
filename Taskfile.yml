@@ -51,7 +51,7 @@ tasks:
     dir: src
     deps: [tmpdir]
     cmds:
-      - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing/simulation net'
+      - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing/simulation net os'
 
   test:dst-race:
     desc: -tags dst -race testing/simulation — suite is race-clean; any TSan report here is a real finding

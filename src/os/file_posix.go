@@ -27,6 +27,9 @@ func (f *File) Close() error {
 // read reads up to len(b) bytes from the File.
 // It returns the number of bytes read and an error, if any.
 func (f *File) read(b []byte) (n int, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.read(b)
+	}
 	n, err = f.pfd.Read(b)
 	runtime.KeepAlive(f)
 	return n, err
@@ -36,6 +39,9 @@ func (f *File) read(b []byte) (n int, err error) {
 // It returns the number of bytes read and the error, if any.
 // EOF is signaled by a zero count with err set to nil.
 func (f *File) pread(b []byte, off int64) (n int, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.pread(b, off)
+	}
 	n, err = f.pfd.Pread(b, off)
 	runtime.KeepAlive(f)
 	return n, err
@@ -44,6 +50,9 @@ func (f *File) pread(b []byte, off int64) (n int, err error) {
 // write writes len(b) bytes to the File.
 // It returns the number of bytes written and an error, if any.
 func (f *File) write(b []byte) (n int, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.write(b)
+	}
 	n, err = f.pfd.Write(b)
 	runtime.KeepAlive(f)
 	return n, err
@@ -52,6 +61,9 @@ func (f *File) write(b []byte) (n int, err error) {
 // pwrite writes len(b) bytes to the File starting at byte offset off.
 // It returns the number of bytes written and an error, if any.
 func (f *File) pwrite(b []byte, off int64) (n int, err error) {
+	if dstSimEnabled && f.dstf != nil {
+		return f.dstf.pwrite(b, off)
+	}
 	n, err = f.pfd.Pwrite(b, off)
 	runtime.KeepAlive(f)
 	return n, err
@@ -90,6 +102,9 @@ func (f *File) chmod(mode FileMode) error {
 	if err := f.checkValid("chmod"); err != nil {
 		return err
 	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.wrapErr("chmod", dstErrUnsupportedFS)
+	}
 	if e := f.pfd.Fchmod(syscallMode(mode)); e != nil {
 		return f.wrapErr("chmod", e)
 	}
@@ -104,6 +119,11 @@ func (f *File) chmod(mode FileMode) error {
 // On Windows or Plan 9, Chown always returns the [syscall.EWINDOWS] or
 // [syscall.EPLAN9] error, wrapped in [*PathError].
 func Chown(name string, uid, gid int) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("chown", name); fenced {
+			return err
+		}
+	}
 	e := ignoringEINTR(func() error {
 		return syscall.Chown(name, uid, gid)
 	})
@@ -120,6 +140,11 @@ func Chown(name string, uid, gid int) error {
 // On Windows, it always returns the [syscall.EWINDOWS] error, wrapped
 // in [*PathError].
 func Lchown(name string, uid, gid int) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("lchown", name); fenced {
+			return err
+		}
+	}
 	e := ignoringEINTR(func() error {
 		return syscall.Lchown(name, uid, gid)
 	})
@@ -138,6 +163,9 @@ func (f *File) Chown(uid, gid int) error {
 	if err := f.checkValid("chown"); err != nil {
 		return err
 	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.wrapErr("chown", dstErrUnsupportedFS)
+	}
 	if e := f.pfd.Fchown(uid, gid); e != nil {
 		return f.wrapErr("chown", e)
 	}
@@ -151,6 +179,12 @@ func (f *File) Truncate(size int64) error {
 	if err := f.checkValid("truncate"); err != nil {
 		return err
 	}
+	if dstSimEnabled && f.dstf != nil {
+		if e := f.dstf.truncate(size); e != nil {
+			return f.wrapErr("truncate", e)
+		}
+		return nil
+	}
 	if e := f.pfd.Ftruncate(size); e != nil {
 		return f.wrapErr("truncate", e)
 	}
@@ -163,6 +197,12 @@ func (f *File) Truncate(size int64) error {
 func (f *File) Sync() error {
 	if err := f.checkValid("sync"); err != nil {
 		return err
+	}
+	if dstSimEnabled && f.dstf != nil {
+		if e := f.dstf.sync(); e != nil {
+			return f.wrapErr("sync", e)
+		}
+		return nil
 	}
 	if e := f.pfd.Fsync(); e != nil {
 		return f.wrapErr("sync", e)
@@ -178,6 +218,11 @@ func (f *File) Sync() error {
 // less precise time unit.
 // If there is an error, it will be of type [*PathError].
 func Chtimes(name string, atime time.Time, mtime time.Time) error {
+	if dstSimEnabled {
+		if err, fenced := dstFSFenced("chtimes", name); fenced {
+			return err
+		}
+	}
 	utimes := chtimesUtimes(atime, mtime)
 	if e := syscall.UtimesNano(fixLongPath(name), utimes[0:]); e != nil {
 		return &PathError{Op: "chtimes", Path: name, Err: e}
@@ -205,6 +250,9 @@ func chtimesUtimes(atime, mtime time.Time) [2]syscall.Timespec {
 func (f *File) Chdir() error {
 	if err := f.checkValid("chdir"); err != nil {
 		return err
+	}
+	if dstSimEnabled && f.dstf != nil {
+		return f.wrapErr("chdir", dstErrUnsupportedFS)
 	}
 	if e := f.pfd.Fchdir(); e != nil {
 		return f.wrapErr("chdir", e)

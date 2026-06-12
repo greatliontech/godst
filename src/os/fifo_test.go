@@ -82,7 +82,9 @@ func TestNonPollable(t *testing.T) {
 
 	f, err := os.OpenFile(nonPollable, os.O_RDWR, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) || testenv.SyscallIsNotSupported(err) {
+		// ENODEV: the device node exists but the tun module is not loaded —
+		// the fixture is unavailable on this host, same as not existing.
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.ENODEV) || testenv.SyscallIsNotSupported(err) {
 			t.Skipf("can't open %q: %v", nonPollable, err)
 		}
 		t.Fatal(err)
