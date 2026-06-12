@@ -576,6 +576,67 @@ func TestDSTFinalizerStuckDrainResidue(t *testing.T) {
 	}
 }
 
+// TestDSTBubbleStreamIsolation verifies the salted per-bubble re-root: the
+// SUT's second spawned goroutine must not share a per-g RNG stream with the
+// finalizer drain.
+//
+// Teeth: with the bubble re-root unsalted (dstBubbleRoot instead of
+// dstBubbleMainRoot), bubble.main replays the run caller's draws and the
+// second child's first 16 crypto/rand bytes equal the finalizer's - the
+// testprog prints "collision".
+func TestDSTBubbleStreamIsolation(t *testing.T) {
+	out := runTestProgDST(t, "DSTBubbleStreamIsolation", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("bubble stream isolation failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTForeignBubbleIsolation verifies that plain synctest bubbles running
+// concurrently with a simulation - including ones created mid-run - do not
+// perturb the simulation's schedule.
+//
+// Teeth: with foreign-bubble goroutines classified as simulation-owned in
+// firstSystemG (or with the simulation-bubble claim relaxed from
+// activating-goroutine identity to first-bubble-wins in synctestRun), the
+// foreign bubbles consume seed draws / clobber the scheduling RNG and the
+// fingerprints diverge.
+func TestDSTForeignBubbleIsolation(t *testing.T) {
+	out := runTestProgDST(t, "DSTForeignBubbleIsolation", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("foreign bubble isolation failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTNonBubbleAllocTrigger verifies that non-bubble allocations do not
+// advance the deterministic GC trigger: NumGC deltas are identical with and
+// without an outside allocator churning.
+//
+// Teeth: with the simulation-bubble gate removed from the dstHeapAlloc
+// accounting in mallocgc, the outside goroutine's megabyte allocations move
+// the cycle boundaries and the deltas diverge.
+func TestDSTNonBubbleAllocTrigger(t *testing.T) {
+	out := runTestProgDST(t, "DSTNonBubbleAllocTrigger", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("non-bubble alloc trigger isolation failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTGOMAXPROCSAutoModeRestored verifies that in an auto-GOMAXPROCS
+// process the pin sets the custom flag for the run (blocking the sysmon
+// auto-updater) and restores auto mode afterward.
+//
+// Teeth: with the restore reverted to a plain GOMAXPROCS(oldProcs), the
+// custom flag stays set after the Run and "after=" reports false.
+func TestDSTGOMAXPROCSAutoModeRestored(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTGOMAXPROCSAutoRestore", "DSTSEED=12345"))
+	if out == "custom" {
+		t.Skip("process started in custom GOMAXPROCS mode")
+	}
+	if out != "inrun=false after=true" {
+		t.Fatalf("auto GOMAXPROCS pin/restore failed (got %q, want \"inrun=false after=true\")", out)
+	}
+}
+
 // TestDSTFinalizerBubbleChannelOp verifies invariant DST-FIN-1: a finalizer that
 // does a bubble channel op runs without fatal inside dst.Run, because the
 // bubble-scoped drain goroutine (g.bubble == the bubble) runs it, not the async

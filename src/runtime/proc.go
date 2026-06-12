@@ -7870,7 +7870,13 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 		if gp == nil {
 			continue
 		}
-		if gp.bubble == nil {
+		if gp.bubble == nil || gp.bubble != dstSimBubble {
+			// Outside any bubble, or in a FOREIGN bubble (a plain synctest
+			// bubble live concurrently with the simulation): infrastructure
+			// from the simulation's point of view. A foreign bubble's
+			// goroutines must not consume seed draws - the schedule would then
+			// depend on unrelated process activity and the run would not
+			// reproduce in isolation.
 			return k, true
 		}
 		if dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp {
@@ -7908,12 +7914,24 @@ func (c *dstCandidates) at(k uint32) *g {
 func (c *dstCandidates) removeAt(k uint32) (*g, bool) {
 	pp := c.pp
 	if k < c.ringN {
-		// Local-ring element: swap the head element into the vacated slot and
-		// advance the head, keeping the ring contiguous (order within the ring is
-		// irrelevant — selection is by the strategy, not FIFO position).
+		// Local-ring element: shift the elements ahead of it forward by one and
+		// advance the head, preserving the relative order of the remaining
+		// candidates. Order matters: the seeded selection maps draws onto the
+		// candidate enumeration order, which must stay a pure function of the
+		// simulation's own arrival order — a swap-with-head removal would let
+		// the removal of a foreign/system goroutine from a mixed ring permute
+		// the simulation candidates and make the schedule depend on unrelated
+		// process activity. O(k) with k bounded by the runnable set, which is
+		// small under the single-P simulation. (runnext kicks need no such
+		// treatment: a kick always moves the runnext goroutine to the ring
+		// tail, and the runnext slot enumerates after the whole ring, so a
+		// foreign enqueue kicking a simulation goroutine leaves the relative
+		// simulation candidate order unchanged.)
 		idx := (c.h + k) % uint32(len(pp.runq))
 		gp := pp.runq[idx].ptr()
-		pp.runq[idx] = pp.runq[c.h%uint32(len(pp.runq))]
+		for i := k; i > 0; i-- {
+			pp.runq[(c.h+i)%uint32(len(pp.runq))] = pp.runq[(c.h+i-1)%uint32(len(pp.runq))]
+		}
 		atomic.StoreRel(&pp.runqhead, c.h+1)
 		return gp, false
 	}

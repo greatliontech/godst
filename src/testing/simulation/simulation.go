@@ -42,7 +42,9 @@
 //   - GC discovery (unconditional). The GC count, the total set of objects whose
 //     finalizers/weak refs are discovered, and which GC cycle discovers them are
 //     deterministic, including under -race (the trigger fires from per-object
-//     allocated bytes rather than span-granular heap layout).
+//     allocated bytes rather than span-granular heap layout). The contract
+//     covers objects the simulation itself allocates; callback-bearing objects
+//     created mid-run by goroutines outside the simulation are not part of it.
 //
 // Not in the contract: byte-level heap MemStats fields
 // (HeapAlloc/HeapInuse/HeapReleased/HeapIdle, Sys and the per-subsystem *Sys
@@ -159,6 +161,9 @@ func dstSetMemLimit(limit int64)
 
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
+
+//go:linkname dstGOMAXPROCSAuto runtime.dstGOMAXPROCSAutoFP
+func dstGOMAXPROCSAuto() bool
 
 // Strategy selects how RunWith explores goroutine interleavings. All strategies
 // are sound (they only reorder goroutines that are simultaneously runnable, a
@@ -310,6 +315,8 @@ func leaveSimulation() {
 // and must not be called from within a synctest bubble. Attempts to change
 // GOMAXPROCS with runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the
 // simulation are ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
+// A process whose GOMAXPROCS was in container-aware auto mode before the run
+// returns to auto mode afterward.
 //
 // If f exits by calling runtime.Goexit, as when it calls t.Fatal on an enclosing
 // *testing.T, Run restores the simulation state and then exits its caller with
@@ -425,6 +432,12 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numc
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
 func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, propagateGoexit bool, f func()) {
+	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
+	// keeps the sysmon container-aware auto-updater from resizing P count
+	// mid-run); remember whether the process was in auto mode so the restore
+	// can return it there instead of leaving it pinned to a stale snapshot for
+	// the rest of the process.
+	autoProcs := dstGOMAXPROCSAuto()
 	oldProcs := runtime.GOMAXPROCS(1)
 	oldPreempt := dstSetAsyncPreemptOff(true)
 	dstSetSchedStrategy(kind, depth, steps)
@@ -440,7 +453,11 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstClearSimEnv()
 		dstSetMemLimit(0)
 		dstSetAsyncPreemptOff(oldPreempt)
-		runtime.GOMAXPROCS(oldProcs)
+		if autoProcs {
+			runtime.SetDefaultGOMAXPROCS()
+		} else {
+			runtime.GOMAXPROCS(oldProcs)
+		}
 	}()
 	if propagateGoexit {
 		returned := false

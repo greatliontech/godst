@@ -210,6 +210,9 @@ func synctestRun(f func()) {
 		if dstActive() && dstSchedKind == dstSchedScheduled {
 			dstClearSchedState(gp)
 		}
+		if dstSimBubble == bubble {
+			dstSimBubble = nil
+		}
 		gp.bubble = nil
 	}()
 
@@ -218,14 +221,25 @@ func synctestRun(f func()) {
 	systemstack(func() {
 		fv := *(**funcval)(unsafe.Pointer(&f))
 		bubble.main = newproc1(fv, gp, pc, false, waitReasonZero)
-		if dstActive() {
+		if dstActive() && gp == dstSimRootG && dstSimBubble == nil {
+			// Bubble created by the activating goroutine: this is the
+			// simulation's own bubble. Claim it. A FOREIGN synctest bubble —
+			// created by any other goroutine, even between activation and
+			// here (dstActivate's setup GCs block) — must not take this
+			// branch: it would re-root the simulation's scheduling RNG and
+			// heap counter and clobber the run's determinism. Its goroutines
+			// are scheduled RNG-free as infrastructure instead (see
+			// firstSystemG).
+			dstSimBubble = bubble
 			// Re-root the per-g DST tree at this bubble so the bubble's
 			// randomness is independent of what ran before it in this process: a
 			// bubble (test) is then reproducible in isolation. Without this,
 			// bubble.main would inherit the caller's tree position, which depends
 			// on global goroutine-creation order. Safe here: bubble.main is not
-			// yet runnable on any queue. See dstBubbleRoot.
-			bubble.main.dstrand = dstBubbleRoot(dstSeed.Load())
+			// yet runnable on any queue. See dstBubbleMainRoot (salted so
+			// bubble.main does not replay the run caller's draw sequence,
+			// which would alias a SUT goroutine's stream with the drain's).
+			bubble.main.dstrand = dstBubbleMainRoot(dstSeed.Load())
 			// Re-root the scheduling RNG at this bubble too, so the seeded
 			// interleaving (which runnable goroutine proceeds next) is reproducible
 			// in isolation, independent of what scheduled before this bubble. See
@@ -254,7 +268,7 @@ func synctestRun(f func()) {
 		}
 		pp := getg().m.p.ptr()
 		runqput(pp, bubble.main, true)
-		if dstActive() {
+		if dstActive() && bubble == dstSimBubble {
 			// Start the per-bubble finalizer drain. Created here, exactly once per
 			// Run, so it advances the root's DST RNG stream a fixed number of times
 			// (bubble.main was already created and independently re-rooted above, and

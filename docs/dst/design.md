@@ -97,7 +97,8 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   disables async preemption, activates DST + seeds, runs `f` in a `synctest` bubble (re-rooted from
   the seed), and restores everything on return (including on panic). `Run` is bubble-scoped: each
   call is an independent, order-immune deterministic universe (the per-g tree re-roots per bubble in
-  `synctestRun` via `dstBubbleRoot`), so a failing test reproduces identically in isolation.
+  `synctestRun` via `dstBubbleMainRoot`, salted relative to the activation root so the bubble main does
+  not replay the run caller's draw sequence), so a failing test reproduces identically in isolation.
 - **`simulation.Test(t *testing.T, seed uint64, f func(*testing.T))`** is the `testing`-oriented
   entry point. It has the same deterministic envelope as `Run`, but gives `f` a bubble-scoped child
   `*testing.T` with the same control semantics as `testing/synctest.Test`: `t.Fatal`/`FailNow`
@@ -400,9 +401,18 @@ the fixed seams, so later steps add, never rewrite.
   Turns reproducibility into *directed* exploration.
 
 - **System-goroutine isolation (scheduling robustness). LANDED.** The seeded scheduling RNG
-  (`dstSchedRand`) advances only for selections among *bubble* goroutines; runtime-infrastructure
-  goroutines (`g.bubble == nil`) are scheduled by a fixed RNG-free policy (`dstFindRunnable` prefers
-  them in candidate order). Without this, how often infrastructure goroutines need scheduling — which is
+  (`dstSchedRand`) advances only for selections among the *simulation bubble's* goroutines;
+  runtime-infrastructure goroutines (`g.bubble == nil`) AND goroutines of any FOREIGN synctest bubble
+  (a plain bubble live concurrently with the simulation — `g.bubble != dstSimBubble`) are scheduled by
+  a fixed RNG-free policy (`dstFindRunnable` prefers them in candidate order). The simulation claims
+  its bubble by activating-goroutine identity (`dstSimRootG`), so a foreign `synctest.Run` — even one
+  started between activation and the simulation's own bubble — can neither steal the re-root/drain
+  nor consume seed draws; candidate removal is order-preserving so foreign entries cannot permute the
+  simulation candidates' relative order while the runnable set fits the local run queue (overflow
+  spill ordering above ~256 simultaneously runnable goroutines is a tracked residual); and only
+  simulation-bubble allocations advance the
+  deterministic GC trigger. Enforced by `TestDSTForeignBubbleIsolation`, `TestDSTBubbleStreamIsolation`
+  and `TestDSTNonBubbleAllocTrigger` in addition to the invariant below. Without this, how often infrastructure goroutines need scheduling — which is
   timing- and binary-composition-dependent — would consume a varying number of RNG draws and shift the
   program's interleaving (a rare nondeterminism a heavy `import` like `net` exposed). Invariant:
   `rngDraws == decisions − sysScheds`, enforced by `TestDSTSchedSystemIsolation`.

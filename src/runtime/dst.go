@@ -101,6 +101,15 @@ func dstActivate(seed uint64) {
 	if seed == 0 {
 		seed = 1
 	}
+	// Record the activating goroutine: the simulation's own bubble is the one
+	// created by THIS goroutine's synctest.Run call (runLocked calls it right
+	// after activation). Identity, not order: dstActivate blocks in its setup
+	// GCs below, so a foreign goroutine can run — and start a foreign synctest
+	// bubble — between activation and the simulation's own synctest.Run. A
+	// foreign bubble must NOT claim dstSimBubble: it would steal the
+	// simulation's re-root/drain and demote the simulated program to RNG-free
+	// infrastructure scheduling.
+	dstSimRootG = getg()
 	// Bump the per-run epoch so per-run in-memory state keyed by it (e.g. net's
 	// simulated-network registry) resets between runs without an explicit hook:
 	// a consumer that sees a new epoch discards its old state. One dstActivate per
@@ -481,9 +490,38 @@ func dstSetMemLimit(limit int64) { dstMemLimit = limit }
 //go:linkname dstDeactivate
 func dstDeactivate() {
 	dstSeed.Store(0)
+	dstSimRootG = nil
+	dstSimBubble = nil
 	dstReleaseDeferredFinq()
 	dstReleaseDeferredCleanups()
 	dstWakeBlockedCleanupWorkers()
+}
+
+// dstSimBubble is the active simulation's own synctest bubble: the goroutines
+// the seeded scheduler treats as the simulated program. Goroutines outside any
+// bubble — and goroutines of a FOREIGN bubble (a plain synctest bubble live
+// concurrently with the simulation) — are scheduled RNG-free as infrastructure
+// (see firstSystemG): letting a foreign bubble consume seed draws would make
+// the simulation's schedule depend on unrelated process activity, breaking
+// reproduction in isolation. dstSimRootG is the goroutine that ran dstActivate; only a
+// synctest bubble created BY that goroutine claims dstSimBubble (identity, not
+// creation order — dstActivate's setup GCs block, so foreign bubbles can be
+// created in between). Written by the simulation's own goroutine and read by
+// the single-P scheduler; cooperative scheduling serializes access.
+var (
+	dstSimBubble *synctestBubble
+	dstSimRootG  *g
+)
+
+// dstBubbleMainRoot derives bubble.main's per-bubble re-root from the seed,
+// salted to be independent of dstBubbleRoot's activation root for the same
+// seed. Without the salt, bubble.main replays the run caller's draw sequence —
+// whose first two draws seeded bubble.main (overwritten) and bubble.gcDrain —
+// so the second goroutine the SUT spawns would get a per-g stream
+// bit-identical to the finalizer drain's (identical map seeds, math/rand and
+// crypto/rand outputs).
+func dstBubbleMainRoot(seed uint64) uint64 {
+	return dstBubbleRoot(seed ^ 0xB1BB1E00_B1BB1E00)
 }
 
 // dstSetAsyncPreemptOff sets debug.asyncpreemptoff and returns its previous

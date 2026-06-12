@@ -74,6 +74,13 @@ func randinit() {
 		if dstBuild {
 			// Don't consume the global generator to scrub startupRand in a DST
 			// build: keep the hash-key derivation at a fixed stream position.
+			// Still overwrite the OS-provided bytes (with a fixed pattern -
+			// deterministic, no stream draw) so the startup entropy does not
+			// stay readable in memory; a cgo program reading startupRand for
+			// entropy is not a supported configuration in a dst test build.
+			for i := range startupRand {
+				startupRand[i] = 0xA5
+			}
 			startupRand = nil
 		} else {
 			// Overwrite startupRand instead of clearing it, in case cgo programs

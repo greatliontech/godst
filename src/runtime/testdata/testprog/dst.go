@@ -54,6 +54,10 @@ func init() {
 	register("DSTFinStuckDrainRunEnd", DSTFinStuckDrainRunEnd)
 	register("DSTFinAbandonedChainReuse", DSTFinAbandonedChainReuse)
 	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
+	register("DSTBubbleStreamIsolation", DSTBubbleStreamIsolation)
+	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
+	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
+	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -1004,6 +1008,206 @@ func DSTFinStuckDrainResidue() {
 	}
 	time.Sleep(200 * time.Millisecond)
 	os.Stdout.WriteString("done\n")
+}
+
+// dstMakeFinCryptoReader allocates a finalizable object whose finalizer reads
+// 16 deterministic crypto/rand bytes (from the DRAIN goroutine's per-g stream)
+// and sends them out hex-encoded.
+//
+//go:noinline
+func dstMakeFinCryptoReader(out chan string) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(*dstFinObj) {
+		b := make([]byte, 16)
+		crand.Read(b)
+		out <- hex.EncodeToString(b)
+	})
+}
+
+// DSTBubbleStreamIsolation: the second goroutine the SUT main spawns must NOT
+// share a per-g RNG stream with the finalizer drain. Without the salted
+// bubble re-root, bubble.main replays the run caller's draw sequence (whose
+// first two draws seeded bubble.main and the drain), so main's second child
+// derives a stream bit-identical to the drain's: its first crypto/rand bytes
+// equal the bytes a finalizer reads. Prints "done" when the streams differ.
+func DSTBubbleStreamIsolation() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var g2hex, finhex string
+	simulation.Run(n, func() {
+		done1 := make(chan struct{})
+		go func() { close(done1) }() // main's first child (draw #1)
+		<-done1
+		finCh := make(chan string, 1)
+		dstMakeFinCryptoReader(finCh)
+		g2res := make(chan string, 1)
+		go func() { // main's second child (draw #2)
+			b := make([]byte, 16)
+			crand.Read(b)
+			g2res <- hex.EncodeToString(b)
+		}()
+		g2hex = <-g2res
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: the drain runs the finalizer
+		finhex = <-finCh
+	})
+	if g2hex == "" || finhex == "" {
+		os.Stdout.WriteString("missing streams\n")
+		return
+	}
+	if g2hex == finhex {
+		os.Stdout.WriteString("collision: " + g2hex + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// dstSchedFingerprint runs a fixed concurrent workload under simulation.Run
+// and returns a string derived from its goroutine interleaving.
+func dstSchedFingerprint(seed uint64) string {
+	var out []byte
+	simulation.Run(seed, func() {
+		ch := make(chan int, 64)
+		var wg sync.WaitGroup
+		for i := 0; i < 6; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for r := 0; r < 8; r++ {
+					ch <- id
+					time.Sleep(time.Duration(id+1) * time.Microsecond)
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(ch)
+		for v := range ch {
+			out = append(out, byte('0'+v))
+		}
+	})
+	return string(out)
+}
+
+// DSTForeignBubbleIsolation: a plain (non-simulation) synctest bubble running
+// concurrently in the process — including bubbles CREATED while the simulation
+// is live — must not perturb the simulation's schedule: foreign-bubble
+// goroutines are scheduled RNG-free as infrastructure and a foreign
+// synctest.Run must not claim the simulation's re-root path. Compares the
+// schedule fingerprint with foreign bubbles churning against the fingerprint
+// without. Prints "done" when equal.
+func DSTForeignBubbleIsolation() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Repeated short-lived foreign bubbles: some are created while the
+			// simulation is mid-run. Foreign bubbles are scheduled BEFORE the
+			// simulation's goroutines (system-first, RNG-free), so the real
+			// sleep between bubbles is what yields the P and lets the two
+			// workloads actually overlap - a foreign bubble that is always
+			// runnable would serialize ahead of the simulation instead.
+			synctest.Run(func() {
+				for i := 0; i < 20; i++ {
+					time.Sleep(10 * time.Microsecond)
+				}
+			})
+			time.Sleep(200 * time.Microsecond) // real sleep: outside any bubble
+		}
+	}()
+	withForeign := dstSchedFingerprint(n)
+	withForeign2 := dstSchedFingerprint(n)
+	close(stop)
+	<-done
+	alone := dstSchedFingerprint(n)
+	if withForeign != alone || withForeign2 != alone {
+		os.Stdout.WriteString("schedule perturbed by foreign bubble\nwith1= " + withForeign +
+			"\nwith2= " + withForeign2 + "\nalone= " + alone + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+var dstAllocSink []byte
+
+// dstOutsideAllocPump allocates a megabyte on a non-bubble goroutine for every
+// ping received on an UNBUBBLED channel. A simulation goroutine sends the
+// pings, so the outside allocations deterministically interleave with the run
+// (a timer-driven outside loop would not: real timers are not serviced while
+// the simulation has runnable work).
+func dstOutsideAllocPump(ping chan struct{}, done *sync.WaitGroup) {
+	defer done.Done()
+	for range ping {
+		dstAllocSink = make([]byte, 1<<20)
+	}
+}
+
+// DSTNonBubbleAllocTrigger: allocations by goroutines outside the simulation
+// bubble must not advance the deterministic GC trigger - otherwise NumGC and
+// which cycle discovers a finalizer depend on unrelated process activity.
+// Runs the same allocation-heavy SUT twice with an outside allocator churning
+// and once without; all three NumGC deltas must be equal. Prints "done".
+func DSTNonBubbleAllocTrigger() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	gcs := func(ping chan struct{}) uint32 {
+		var delta uint32
+		simulation.Run(n, func() {
+			var m0, m1 runtime.MemStats
+			runtime.ReadMemStats(&m0)
+			for i := 0; i < 200; i++ {
+				dstAllocSink = make([]byte, 64<<10)
+				if ping != nil {
+					ping <- struct{}{} // non-durable op on an unbubbled buffered channel
+				}
+				if i%20 == 0 {
+					time.Sleep(time.Millisecond)
+				}
+			}
+			runtime.ReadMemStats(&m1)
+			delta = m1.NumGC - m0.NumGC
+		})
+		return delta
+	}
+	ping := make(chan struct{}, 256)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go dstOutsideAllocPump(ping, &wg)
+	d1 := gcs(ping)
+	d2 := gcs(ping)
+	close(ping)
+	wg.Wait()
+	alone := gcs(nil)
+	if d1 != alone || d2 != alone {
+		os.Stdout.WriteString("numgc perturbed: with=" + strconv.FormatUint(uint64(d1), 10) +
+			"," + strconv.FormatUint(uint64(d2), 10) +
+			" alone=" + strconv.FormatUint(uint64(alone), 10) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTGOMAXPROCSAutoRestore: in a process whose GOMAXPROCS is in container-aware
+// auto mode, the simulation pin must set the custom flag for the duration of
+// the run (that is what blocks the sysmon auto-updater) and restore AUTO mode
+// afterward - not leave the process pinned to a stale snapshot forever.
+// Prints "custom" (parent skips) when the process starts in custom mode.
+func DSTGOMAXPROCSAutoRestore() {
+	if !dstGOMAXPROCSAutoFP() {
+		os.Stdout.WriteString("custom\n")
+		return
+	}
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	inRunAuto := true
+	simulation.Run(n, func() {
+		inRunAuto = dstGOMAXPROCSAutoFP()
+	})
+	os.Stdout.WriteString("inrun=" + strconv.FormatBool(inRunAuto) +
+		" after=" + strconv.FormatBool(dstGOMAXPROCSAutoFP()) + "\n")
 }
 
 // DSTFinProfile takes a goroutine profile from inside a finalizer running on the
