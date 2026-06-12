@@ -1879,19 +1879,30 @@ func TestExploreReportsDeadlockFailure(t *testing.T) {
 	}
 }
 
+// budgetedExploreSUT gives the explorer multiple interleavings to cut short
+// (two announced writes to one address, so DPOR has reversals to schedule)
+// while keeping the REAL writes mutex-synchronized: the budget tests run
+// in-process, and an actually-racy SUT would leak a TSan report past the
+// harness under -race (the -tags dst -race suite must stay clean; the race
+// oracle itself is enforced by the subprocess-based oracle tests).
 func budgetedExploreSUT() bool {
+	var mu sync.Mutex
 	var x int
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		dstAccessYield(unsafe.Pointer(&x), true)
+		mu.Lock()
 		x = 1
+		mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
 		dstAccessYield(unsafe.Pointer(&x), true)
+		mu.Lock()
 		x = 2
+		mu.Unlock()
 	}()
 	wg.Wait()
 	return false

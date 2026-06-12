@@ -275,7 +275,10 @@ The DST contract tests are dead in a stock `-short`/untagged run; the enforcing 
 `go test -tags dst runtime testing/simulation net` (non-`-short`: the 290-program sweep, the
 race-oracle and auto-instrumentation tests — which build their own `-race` testprogs — and the
 build-mode inertness test all skip under `-short`), `go test -tags dst -race testing/simulation` for
-the dst-race sync-hook encodings (currently modulo the tracked budgeted-racy-SUT exception), and an
+the dst-race sync-hook encodings (the suite is `-race`-clean: every SUT that runs under `-race` is
+race-free — intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg
+via `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
+load-bearing for this invariant), and an
 untagged `go test std`-level pass for build-mode inertness. The untagged build-constraint panic is
 covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog.
 
