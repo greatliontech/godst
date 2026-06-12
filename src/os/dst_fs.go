@@ -536,8 +536,8 @@ func dstChdir(dir string) (handled bool, err error) {
 
 // dstFile is the open-handle state for a simulated file: the node reference,
 // the seek offset, and the access mode. It is the tree-file backend behind
-// the os.File dst seam; dst-io's pipe plugs in as a sibling backend later
-// (the non-foreclosure shape recorded in the spec).
+// the os.File dst seam (dstFileBackend); the pipe (dst_pipe.go) is the
+// sibling stream backend — the non-foreclosure shape recorded in the spec.
 type dstFile struct {
 	mu     sync.Mutex
 	node   *dstFSNode

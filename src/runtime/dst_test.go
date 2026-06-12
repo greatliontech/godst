@@ -1250,6 +1250,28 @@ func TestDSTDiskReplay(t *testing.T) {
 	}
 }
 
+// TestDSTPipeReplay: a concurrent pipe workload under the in-memory DST pipe
+// (the third I/O feature) replays byte-identically across processes — the
+// schedule-sensitivity rides the frame order in the content line, and a
+// fake-clock deadline event pins virtual-time exactness (in-process coverage
+// lives in os's dst tests). The end/total guard is the completeness pin: the
+// drain must terminate in EOF with all 477 record bytes (schedule-invariant)
+// — a transcript that merely STARTED, then died mid-drain, fails here rather
+// than slipping through on byte-identical-because-deterministic failure.
+func TestDSTPipeReplay(t *testing.T) {
+	out1 := runTestProgDST(t, "DSTPipeReplay", "DSTSEED=42")
+	if !strings.Contains(out1, "content=[g") || !strings.Contains(out1, "sips=[") ||
+		!strings.Contains(out1, "end=EOF total=477") ||
+		!strings.Contains(out1, "stat=prw-------") ||
+		!strings.Contains(out1, "deadline: +3s err=read |0: i/o timeout") {
+		t.Fatalf("malformed pipe replay transcript:\n%s", out1)
+	}
+	out2 := runTestProgDST(t, "DSTPipeReplay", "DSTSEED=42")
+	if out1 != out2 {
+		t.Fatalf("in-memory pipe not reproducible across processes:\nrun1=%q\nrun2=%q", out1, out2)
+	}
+}
+
 // TestDSTNet verifies the in-memory deterministic network (the first I/O feature):
 // inside simulation.Run a client/server exchange over net.Dial/Listen completes
 // with the simulated addresses, replays byte-identically across processes, and the

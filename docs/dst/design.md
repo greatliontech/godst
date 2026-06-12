@@ -27,11 +27,13 @@ concurrent path requires structuring the program so exactly one goroutine is run
 fragile discipline that does not survive real concurrency. DST moves that ordering from program
 discipline to **runtime enforcement**, so determinism holds with *many* runnable goroutines.
 
-What DST does **not** virtualize today: pipe/stdio I/O, unsupported network kinds, and cgo. TCP
-`net.Dial`/`net.Listen` are modeled by the in-memory deterministic network below, and the filesystem
-by the in-memory deterministic filesystem (both per-bubble, both reset by the run epoch); what
-remains is modeled in-memory by the program under test or avoided. Bringing pipe/stdio I/O into the
-fork (dst-io) and fault orchestration are the main pending feature set — see the Roadmap.
+What DST does **not** virtualize today: unsupported network kinds, cgo, and — deliberately — the
+standard streams (pre-run host handles under the inherited-handle stance; see "Deterministic pipes
+and the stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
+network below, the filesystem by the in-memory deterministic filesystem, and `os.Pipe` by the
+in-memory deterministic pipe (all per-bubble, all reset by the run epoch); what remains is modeled
+in-memory by the program under test or avoided. Fault orchestration is the main pending feature —
+see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
@@ -338,9 +340,9 @@ path is ENOENT even with both times zero — Linux's utimensat both-OMIT-succeed
 reproduced.
 
 **The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen when the File
-is created: the tree-file backend here, and dst-io's `os.Pipe` landed exactly there — a
+is created: the tree-file backend here, and the pipe feature's `os.Pipe` landed exactly there — a
 stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than a
-retrofit, validating the Non-foreclosure invariant this paragraph recorded against dst-io when
+retrofit, validating the Non-foreclosure invariant this paragraph recorded for that slot when
 the seam was built. `Fd()` on a simulated
 file has no honest answer and **panics** with the standard "unsupported under deterministic
 simulation" shape — loud, deterministic — rather than returning a host fd that would leak the
@@ -415,7 +417,7 @@ cross-process replay fixtures print their transcripts through real stdout from i
 and a program that wants captured or deterministic stdio assigns the package variables to a
 simulated file inside the run (the backend seam makes that work with no extra machinery); reading
 the real terminal under a run is program discipline, exactly like using any inherited handle.
-Completing dst-io's audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
+Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
 `ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
 `Getpid` are Options-pinned; env-derived APIs (`Getenv`, `UserHomeDir` and friends) read process
 memory the harness controls, not the OS; processes and signals are the `os/exec` roadmap item.
@@ -580,7 +582,8 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
-| other I/O (files, pipes, stdio) | in-memory deterministic I/O | ⏳ |
+| pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
+| standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture) | ⛔ (program discipline) |
 | faults (scheduling / net / disk / crash) | fault-orchestration layer | ⏳ |
 | cgo | — | ⛔ |
 | raw pointer addresses (ASLR, `%p`, `uintptr`) | — | ⛔ (program discipline) |
@@ -703,6 +706,18 @@ the fixed seams, so later steps add, never rewrite.
   `TestDSTDiskReplay`. Caveats: no symlinks/`os.Root`/locking yet (fenced follow-ons), no ownership
   model (`Chown` fenced; permission bits stored, not enforced), `Fd()` panics, `Sys()` is nil.
 
+- **I/O (deterministic pipes + the stdio stance). LANDED (third I/O feature).** `os.Pipe` under DST
+  is an in-memory stream behind the `os.File` backend seam the disk feature built — Linux anonymous
+  pipe semantics host-probed end to end (64 KiB capacity, PIPE_BUF atomicity under contention, the
+  full error-precedence ladders, fake-clock deadlines, partial counts, SameFile across the pair),
+  synctest-durable blocking, no host descriptor ever. Stdio is settled as NOT virtualized (the
+  inherited-handle stance covers the package streams; programs swap them in-run for capture), and
+  the remaining OS-backed I/O surface is audited closed — `/dev/null` stays `ENOENT` under a run
+  (recorded gap; `io.Discard` or a tree file is the in-sim idiom). See the "Deterministic pipes and
+  the stdio stance" section above; tested by the `TestDSTPipe*` family and the cross-process
+  `TestDSTPipeReplay`. Caveats: a pipe end leaked out of its run is fenced (except `Close`);
+  `os/exec` remains its own roadmap item.
+
 - **Level 2 — access-granularity interleaving + DPOR. LANDED.** The `-race` access hooks double as DST
   scheduling decision points (`-tags dst -race` builds), explored systematically via source-DPOR (sleep
   sets + weak-initial backtracks) with the HB race detector as deterministic oracle, exposed as
@@ -714,18 +729,16 @@ the fixed seams, so later steps add, never rewrite.
 
 ### Pending features
 
-These bring the remaining real I/O into the bubble and then layer fault injection on top. Each is
-virtualized in-memory and deterministic, riding the existing scheduling/time determinism.
+With the three I/O axes landed (network, disk, pipes), one feature remains: layering fault
+injection on top of the virtualized substrate.
 
-- **I/O** — deterministic file/pipe/stdio I/O for whatever the network and filesystem layers do not
-  cover.
 - **Fault orchestration** — compose scheduling, network, disk, and crash/restart faults under one seed,
   with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound); the
   scheduling- and network/disk-fault targets share one *victim-designation* contract designed here.
-Ordering: the landed runtime substrate is a precondition for all; the I/O features (network ✅ →
-disk ✅ → io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
-once there is something to fault. Level 2 extends the scheduling axis itself and depends only on the
-landed Seq-5 seam + `-race`.
+Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →
+disk ✅ → pipes ✅) each brought a class of real I/O into the bubble; fault orchestration layers
+exploration power on top now that there is something to fault. Level 2 extends the scheduling axis
+itself and depends only on the landed Seq-5 seam + `-race`.
 
 ## Seq 5 design: seeded interleaving diversity (validated seam + framing)
 

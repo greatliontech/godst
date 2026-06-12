@@ -16,8 +16,8 @@ import (
 
 // Under deterministic simulation, os.Pipe returns a pair of Files backed by
 // an in-memory byte stream — the second implementation of the dstFileBackend
-// seam (the stream-shaped backend the disk feature's design recorded against
-// dst-io). Determinism rides the schedule as everywhere else: operations are
+// seam, the stream-shaped backend the disk feature's design reserved this
+// slot for. Determinism rides the schedule as everywhere else: operations are
 // ordered by the deterministic scheduler, blocking waits on channels created
 // inside the bubble (so a blocked pipe read or write is synctest-durably
 // blocked), and deadlines ride the bubble's fake clock exactly as the

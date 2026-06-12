@@ -286,8 +286,9 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 		}
 		woz.Close()
 
-		// os.Pipe is simulated (dst-io): an in-memory pair, no host
-		// descriptor. Full pipe coverage lives in dst_pipe_test.go.
+		// os.Pipe is simulated (design.md "Deterministic pipes and the
+		// stdio stance"): an in-memory pair, no host descriptor. Full
+		// pipe coverage lives in dst_pipe_test.go.
 		if pr, pw, err := os.Pipe(); err != nil {
 			t.Fatalf("Pipe = %v, want simulated pair", err)
 		} else {
