@@ -19,6 +19,11 @@ func (f fileAddr) String() string { return string(f) }
 // It is the caller's responsibility to close f when finished.
 // Closing c does not affect f, and closing f does not affect c.
 func FileConn(f *os.File) (c Conn, err error) {
+	if dstNetEnabled && dstActive() {
+		// Deterministic simulation: an inherited fd is a host socket; using it
+		// would escape the in-memory network entirely.
+		return nil, dstUnsupportedNetAPI("file", "file+net", nil, fileAddr(f.Name()))
+	}
 	c, err = fileConn(f)
 	if err != nil {
 		err = &OpError{Op: "file", Net: "file+net", Source: nil, Addr: fileAddr(f.Name()), Err: err}
@@ -31,6 +36,9 @@ func FileConn(f *os.File) (c Conn, err error) {
 // It is the caller's responsibility to close ln when finished.
 // Closing ln does not affect f, and closing f does not affect ln.
 func FileListener(f *os.File) (ln Listener, err error) {
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("file", "file+net", nil, fileAddr(f.Name()))
+	}
 	ln, err = fileListener(f)
 	if err != nil {
 		err = &OpError{Op: "file", Net: "file+net", Source: nil, Addr: fileAddr(f.Name()), Err: err}
@@ -43,6 +51,9 @@ func FileListener(f *os.File) (ln Listener, err error) {
 // It is the caller's responsibility to close f when finished.
 // Closing c does not affect f, and closing f does not affect c.
 func FilePacketConn(f *os.File) (c PacketConn, err error) {
+	if dstNetEnabled && dstActive() {
+		return nil, dstUnsupportedNetAPI("file", "file+net", nil, fileAddr(f.Name()))
+	}
 	c, err = filePacketConn(f)
 	if err != nil {
 		err = &OpError{Op: "file", Net: "file+net", Source: nil, Addr: fileAddr(f.Name()), Err: err}

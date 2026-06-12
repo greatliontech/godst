@@ -9,9 +9,15 @@ package net
 import (
 	"context"
 	"errors"
+	"internal/nettrace"
+	"io"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	_ "unsafe" // for go:linkname
 )
 
@@ -73,7 +79,25 @@ func dstTCPNetwork(network string) bool {
 	return false
 }
 
+// dstUnsupportedNetwork rejects a network Dial/Listen cannot model. A KNOWN
+// but unmodeled network (UDP, Unix, IP) gets the same "unsupported under
+// deterministic simulation" shape as the typed APIs — it is a simulation
+// boundary, not an unknown name; a genuinely unknown network string keeps the
+// production UnknownNetworkError identity.
 func dstUnsupportedNetwork(op, network string) error {
+	base := network
+	if i := strings.LastIndexByte(base, ':'); i >= 0 {
+		// Production accepts a ":proto" suffix only on the ip networks
+		// (parseNetwork); other colon-bearing strings are unknown networks.
+		switch base[:i] {
+		case "ip", "ip4", "ip6":
+			base = base[:i]
+		}
+	}
+	switch base {
+	case "udp", "udp4", "udp6", "unix", "unixgram", "unixpacket", "ip", "ip4", "ip6":
+		return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: errors.New("network " + network + " unsupported under deterministic simulation")}
+	}
 	return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: UnknownNetworkError(network)}
 }
 
@@ -274,57 +298,215 @@ func dstListenerConflict(network string, ip IP, key string, port int, wildcard b
 	return dup
 }
 
-func dstAllocateListenPort(network string, ip IP, wildcard bool) (port int, key string, err error) {
+func dstAllocateListenPort(network string, ip IP, wildcard, dual bool) (port int, keys []string, err error) {
 	for p := dstNet.nextListenPort; p <= 65535; p++ {
+		if dual {
+			ks := dstDualKeys(p)
+			if !dstAnyListenerConflict(network, ip, ks, p, wildcard, true) {
+				dstNet.nextListenPort = p + 1
+				return p, ks, nil
+			}
+			continue
+		}
 		k := dstListenerKey(network, ip, p, wildcard)
 		if !dstListenerConflict(network, ip, k, p, wildcard) {
 			dstNet.nextListenPort = p + 1
-			return p, k, nil
+			return p, []string{k}, nil
 		}
 	}
-	return 0, "", errors.New("no free ports")
+	return 0, nil, errors.New("no free ports")
 }
 
 // dstConn is a simulated connection: a net.Pipe endpoint (Read/Write/Close/
-// deadlines) wrapped with the connection's real local/remote addresses.
+// deadlines on the bubble's fake clock) wrapped with the connection's real
+// local/remote addresses and production-shaped error identity. The raw pipe
+// errors (io.ErrClosedPipe, bare os.ErrDeadlineExceeded, OpError{Net:"pipe"})
+// would break production-shaped code: after a local Close every op must
+// satisfy errors.Is(err, net.ErrClosed); a connection reset (listener backlog
+// teardown) and writes to a closed peer must carry syscall.ECONNRESET; reads
+// from a gracefully closed peer return io.EOF; deadline errors are *OpError
+// wrapping os.ErrDeadlineExceeded with the connection's network and addresses.
 type dstConn struct {
 	Conn
+	network       string
 	local, remote Addr
+	closed        atomic.Bool  // this end was Closed by its user
+	reset         *atomic.Bool // connection reset (shared by both ends)
+
+	// acceptState tracks a server-end connection through the accept backlog:
+	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
+	// 0→1; the backlog teardown and the dialer's post-send listener-closed
+	// check claim 0→2 — so a connection the server already Accepted can never
+	// be retroactively reset by teardown, and a torn-down connection is never
+	// handed out by Accept. Nil on the dialer end.
+	acceptState *atomic.Int32
 }
 
 func (c *dstConn) LocalAddr() Addr  { return c.local }
 func (c *dstConn) RemoteAddr() Addr { return c.remote }
 
+func (c *dstConn) opError(op string, err error) error {
+	return &OpError{Op: op, Net: c.network, Source: c.local, Addr: c.remote, Err: err}
+}
+
+// resetConn tears the connection down as a reset: the peer's subsequent reads
+// and writes fail with ECONNRESET (production's RST), not EOF/closed-pipe.
+func (c *dstConn) resetConn() {
+	c.reset.Store(true)
+	c.Conn.Close()
+}
+
+// mapConnErr converts a pipe-layer error into the production shape.
+func (c *dstConn) mapConnErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return c.opError(op, os.ErrDeadlineExceeded)
+	case c.closed.Load():
+		return c.opError(op, errClosed)
+	case err == io.EOF:
+		return io.EOF // graceful peer close (a reset read is mapped in Read)
+	case err == io.ErrClosedPipe:
+		// Peer closed or connection reset while we operate: production
+		// surfaces a reset. (This also covers ops on a reset end itself: a
+		// reset closes the underlying pipe, so its own ops land here.)
+		return c.opError(op, syscall.ECONNRESET)
+	}
+	// Unreachable today: the pipe wraps only deadline errors (caught above) in
+	// its own OpError. Kept as a conservative wrap so a future pipe error
+	// cannot leak pipe-shaped identity.
+	return c.opError(op, err)
+}
+
+func (c *dstConn) Read(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, c.opError("read", errClosed)
+	}
+	n, err := c.Conn.Read(b)
+	if err == io.EOF && c.reset.Load() {
+		return n, c.opError("read", syscall.ECONNRESET)
+	}
+	return n, c.mapConnErr("read", err)
+}
+
+func (c *dstConn) Write(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, c.opError("write", errClosed)
+	}
+	n, err := c.Conn.Write(b)
+	return n, c.mapConnErr("write", err)
+}
+
+func (c *dstConn) Close() error {
+	if c.closed.Swap(true) {
+		return c.opError("close", errClosed)
+	}
+	c.Conn.Close()
+	return nil
+}
+
+// setDeadline applies a deadline with production error identity: after a
+// local Close it fails with net.ErrClosed; after a peer close it succeeds (a
+// peer FIN does not invalidate the local endpoint — subsequent reads return
+// EOF/ECONNRESET immediately anyway, so the dropped deadline is unobservable).
+func (c *dstConn) setDeadline(set func(time.Time) error, t time.Time) error {
+	// Production shape for a set-deadline failure: Source nil, Addr local.
+	closedErr := &OpError{Op: "set", Net: c.network, Source: nil, Addr: c.local, Err: errClosed}
+	if c.closed.Load() {
+		return closedErr
+	}
+	if err := set(t); err != nil && !c.closed.Load() {
+		// The pipe rejects deadlines once either side is done; only a LOCAL
+		// close is an error in production.
+		return nil
+	} else if err != nil {
+		return closedErr
+	}
+	return nil
+}
+
+func (c *dstConn) SetDeadline(t time.Time) error {
+	return c.setDeadline(c.Conn.SetDeadline, t)
+}
+
+func (c *dstConn) SetReadDeadline(t time.Time) error {
+	return c.setDeadline(c.Conn.SetReadDeadline, t)
+}
+
+func (c *dstConn) SetWriteDeadline(t time.Time) error {
+	return c.setDeadline(c.Conn.SetWriteDeadline, t)
+}
+
 // dstListener is a simulated Listener. Dial pushes the server end of a new
-// connection onto accept; Accept receives it.
+// connection onto accept; Accept receives it. A dual-stack wildcard listener
+// (plain "tcp" on a wildcard host) registers under both family keys.
 type dstListener struct {
 	network string
 	addr    *TCPAddr
-	key     string
+	keys    []string
 	accept  chan Conn
 	done    chan struct{}
-	once    sync.Once
+	closed  atomic.Bool
+}
+
+func (l *dstListener) opError(op string, err error) error {
+	return &OpError{Op: op, Net: l.network, Source: nil, Addr: l.addr, Err: err}
 }
 
 func (l *dstListener) Accept() (Conn, error) {
+	// Closed-first: production Accept after Close always fails with ErrClosed,
+	// even if connections were still queued in the backlog (Close reset them).
 	select {
-	case c := <-l.accept:
-		return c, nil
 	case <-l.done:
-		return nil, &OpError{Op: "accept", Net: l.network, Source: nil, Addr: l.addr, Err: errClosed}
+		return nil, l.opError("accept", errClosed)
+	default:
+	}
+	for {
+		select {
+		case c := <-l.accept:
+			if dc, ok := c.(*dstConn); ok && dc.acceptState != nil && !dc.acceptState.CompareAndSwap(0, 1) {
+				// Torn down (reset/refused) while queued; never hand it out.
+				continue
+			}
+			return c, nil
+		case <-l.done:
+			return nil, l.opError("accept", errClosed)
+		}
 	}
 }
 
 func (l *dstListener) Close() error {
-	l.once.Do(func() {
-		close(l.done)
-		dstNet.mu.Lock()
-		if dstNet.listeners[l.key] == l {
-			delete(dstNet.listeners, l.key)
+	if l.closed.Swap(true) {
+		return l.opError("close", errClosed)
+	}
+	close(l.done)
+	dstNet.mu.Lock()
+	for _, k := range l.keys {
+		if dstNet.listeners[k] == l {
+			delete(dstNet.listeners, k)
 		}
-		dstNet.mu.Unlock()
-	})
-	return nil
+	}
+	dstNet.mu.Unlock()
+	// Production TCP resets connections still sitting in the accept backlog
+	// when the listener closes; mirror it, so a dialer that already got a
+	// successful Dial observes ECONNRESET on its next op instead of blocking
+	// durably forever on a connection no one will ever accept.
+	for {
+		select {
+		case c := <-l.accept:
+			if dc, ok := c.(*dstConn); ok {
+				if dc.acceptState == nil || dc.acceptState.CompareAndSwap(0, 2) {
+					dc.resetConn()
+				}
+			} else {
+				c.Close()
+			}
+		default:
+			return nil
+		}
+	}
 }
 
 func (l *dstListener) Addr() Addr { return l.addr }
@@ -347,6 +529,11 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		return nil, err
 	}
 	wildcard := dstWildcard(host)
+	// A plain-"tcp" wildcard listen is dual-stack in production (it accepts
+	// both IPv4 and IPv6 peers); model it by registering under both family
+	// keys. "0.0.0.0" stays IPv4-only and "tcp4"/"tcp6" stay single-family,
+	// as in production.
+	dual := network == "tcp" && wildcard && host != "0.0.0.0"
 	listenAddr := &TCPAddr{IP: ip, Port: portnum}
 	if err := dstListenOptionsError(lc, network, listenAddr); err != nil {
 		return nil, err
@@ -355,33 +542,55 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	dstNet.mu.Lock()
 	defer dstNet.mu.Unlock()
 	dstNetRoll()
-	var key string
+	var keys []string
 	if portnum == 0 {
-		portnum, key, err = dstAllocateListenPort(network, ip, wildcard)
+		portnum, keys, err = dstAllocateListenPort(network, ip, wildcard, dual)
 		if err != nil {
 			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
 		}
+	} else if dual {
+		keys = dstDualKeys(portnum)
 	} else {
-		key = dstListenerKey(network, ip, portnum, wildcard)
+		keys = []string{dstListenerKey(network, ip, portnum, wildcard)}
 	}
 	addr := &TCPAddr{IP: ip, Port: portnum}
-	if dstListenerConflict(network, ip, key, portnum, wildcard) {
+	if dual {
+		addr = &TCPAddr{IP: IPv6zero, Port: portnum}
+	}
+	if dstAnyListenerConflict(network, ip, keys, portnum, wildcard, dual) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
 	}
 	l := &dstListener{
 		network: network,
 		addr:    addr,
-		key:     key,
+		keys:    keys,
 		accept:  make(chan Conn, 128), // backlog
 		done:    make(chan struct{}),
 	}
-	dstNet.listeners[key] = l
+	for _, k := range keys {
+		dstNet.listeners[k] = l
+	}
 	return l, nil
+}
+
+func dstDualKeys(port int) []string {
+	p := strconv.Itoa(port)
+	return []string{"tcp4/:" + p, "tcp6/:" + p}
+}
+
+// dstAnyListenerConflict reports whether registering keys would conflict; a
+// dual-stack wildcard conflicts with any listener of either family on the port.
+func dstAnyListenerConflict(network string, ip IP, keys []string, port int, wildcard, dual bool) bool {
+	if dual {
+		return dstListenerConflict("tcp4", nil, keys[0], port, true) ||
+			dstListenerConflict("tcp6", nil, keys[1], port, true)
+	}
+	return dstListenerConflict(network, ip, keys[0], port, wildcard)
 }
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
-func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) {
+func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn Conn, retErr error) {
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("dial", network)
 	}
@@ -407,6 +616,17 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, err
 	}
 	if err := dstDialOptionsError(d, network, localTCPAddr.opAddr(), serverAddr); err != nil {
 		return nil, err
+	}
+	// Fire the nettrace connect callbacks around the simulated connect with
+	// the RESOLVED address, as production does per connect attempt — and not
+	// at all for addresses that fail validation above.
+	if trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace); trace != nil {
+		if trace.ConnectStart != nil {
+			trace.ConnectStart(network, serverAddr.String())
+		}
+		if trace.ConnectDone != nil {
+			defer func() { trace.ConnectDone(network, serverAddr.String(), retErr) }()
+		}
 	}
 
 	dstNet.mu.Lock()
@@ -441,15 +661,31 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, err
 	}
 
 	p1, p2 := Pipe()
-	dialer := &dstConn{Conn: p1, local: localAddr, remote: serverAddr}
-	server := &dstConn{Conn: p2, local: serverAddr, remote: localAddr}
+	reset := new(atomic.Bool)
+	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset}
+	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32)}
 	select {
 	case <-ctx.Done():
 		p1.Close()
 		p2.Close()
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
 	case l.accept <- server:
-		return dialer, nil
+		select {
+		case <-l.done:
+			// The listener closed while this connection sat in (or entered)
+			// the backlog; its teardown resets QUEUED connections, but this
+			// send may have landed after the drain — or the server may have
+			// already Accepted it before we resumed. Claim it: if it is still
+			// queued, refuse the dial; if Accept won, the connection stands.
+			if server.acceptState.CompareAndSwap(0, 2) {
+				server.resetConn()
+				p1.Close()
+				return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+			}
+			return dialer, nil
+		default:
+			return dialer, nil
+		}
 	case <-l.done:
 		p1.Close()
 		p2.Close()

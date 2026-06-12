@@ -7,7 +7,11 @@ package net
 import (
 	"context"
 	"errors"
+	"internal/nettrace"
+	"io"
 	"net/netip"
+	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -694,6 +698,333 @@ func TestDSTNetRejectsUnsupportedOptions(t *testing.T) {
 			}
 			if !isDSTUnsupportedNetOption(err, tt.option) {
 				t.Fatalf("ListenConfig %s option error = %v, want unsupported %s", tt.name, err, tt.option)
+			}
+		}
+	})
+}
+
+// TestDSTNetFileAPIsRejected verifies FileConn/FileListener/FilePacketConn are
+// gated under simulation: an inherited fd is a host socket, and using it would
+// escape the in-memory network entirely (the one conn/listener-producing
+// surface the typed-API gates did not cover).
+func TestDSTNetFileAPIsRejected(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		f := os.NewFile(0, "stdin")
+		if _, err := FileConn(f); !isDSTUnsupportedNetAPI(err) {
+			t.Errorf("FileConn under DST = %v, want unsupported-API error", err)
+		}
+		if _, err := FileListener(f); !isDSTUnsupportedNetAPI(err) {
+			t.Errorf("FileListener under DST = %v, want unsupported-API error", err)
+		}
+		if _, err := FilePacketConn(f); !isDSTUnsupportedNetAPI(err) {
+			t.Errorf("FilePacketConn under DST = %v, want unsupported-API error", err)
+		}
+	})
+}
+
+// TestDSTNetListenerCloseSemantics verifies production listener-close shape:
+// connections still in the accept backlog are reset (the dialer's next op
+// fails with ECONNRESET instead of blocking durably forever), Accept after
+// Close fails with net.ErrClosed even with queued connections, and a second
+// Close fails with net.ErrClosed.
+func TestDSTNetListenerCloseSemantics(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Fatalf("first Close = %v", err)
+		}
+		if _, err := ln.Accept(); !errors.Is(err, ErrClosed) {
+			t.Errorf("Accept after Close = %v, want net.ErrClosed", err)
+		}
+		if err := ln.Close(); !errors.Is(err, ErrClosed) {
+			t.Errorf("second Close = %v, want net.ErrClosed", err)
+		}
+		buf := make([]byte, 1)
+		if _, err := c.Read(buf); !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("Read on backlog-reset conn = %v, want ECONNRESET", err)
+		}
+		if _, err := c.Write([]byte("x")); !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("Write on backlog-reset conn = %v, want ECONNRESET", err)
+		}
+	})
+}
+
+// TestDSTNetConnErrorIdentity verifies established-connection error identity
+// matches production shape: ops after a local Close satisfy
+// errors.Is(err, net.ErrClosed); reads from a gracefully closed peer return
+// io.EOF; writes to a closed peer carry ECONNRESET; a second Close fails with
+// net.ErrClosed; deadline errors are *OpError carrying os.ErrDeadlineExceeded
+// (a net.Error with Timeout() true) on the connection's network, driven by
+// the bubble's virtual clock.
+func TestDSTNetConnErrorIdentity(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		client, err := Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Deadline on the virtual clock: a blocked read fails once virtual
+		// time passes the deadline, with production error shape.
+		if err := client.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1)
+		_, err = client.Read(buf)
+		var ne Error
+		if !errors.As(err, &ne) || !ne.Timeout() || !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("deadline Read = %v, want timeout net.Error wrapping os.ErrDeadlineExceeded", err)
+		}
+		var op *OpError
+		if !errors.As(err, &op) || op.Net != "tcp" {
+			t.Errorf("deadline Read OpError.Net = %v, want tcp OpError", err)
+		}
+		if err := client.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Graceful peer close: in-flight data then EOF on read, ECONNRESET on
+		// write. The pipe is a rendezvous, so the peer writes from its own
+		// goroutine and closes after the write completes.
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			if _, err := server.Write([]byte("ok")); err != nil {
+				t.Errorf("server Write = %v", err)
+			}
+			if err := server.Close(); err != nil {
+				t.Errorf("server Close = %v", err)
+			}
+		}()
+		got := make([]byte, 2)
+		if _, err := io.ReadFull(client, got); err != nil || string(got) != "ok" {
+			t.Errorf("read in-flight data before peer close = %q, %v", got, err)
+		}
+		<-peerDone
+		if _, err := client.Read(buf); err != io.EOF {
+			t.Errorf("Read after peer close = %v, want io.EOF", err)
+		}
+		if _, err := client.Write([]byte("x")); !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("Write after peer close = %v, want ECONNRESET", err)
+		}
+		// A peer close does not invalidate the local endpoint: deadlines still
+		// apply cleanly, as in production.
+		if err := client.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Errorf("SetDeadline after peer close = %v, want nil", err)
+		}
+
+		// Local close: every op is net.ErrClosed, including a second Close.
+		if err := client.Close(); err != nil {
+			t.Fatalf("first Close = %v", err)
+		}
+		if _, err := client.Read(buf); !errors.Is(err, ErrClosed) {
+			t.Errorf("Read after local close = %v, want net.ErrClosed", err)
+		}
+		if _, err := client.Write([]byte("x")); !errors.Is(err, ErrClosed) {
+			t.Errorf("Write after local close = %v, want net.ErrClosed", err)
+		}
+		if err := client.Close(); !errors.Is(err, ErrClosed) {
+			t.Errorf("second Close = %v, want net.ErrClosed", err)
+		}
+		if err := client.SetDeadline(time.Now()); !errors.Is(err, ErrClosed) {
+			t.Errorf("SetDeadline after local close = %v, want net.ErrClosed", err)
+		}
+		if err := client.SetReadDeadline(time.Now()); !errors.Is(err, ErrClosed) {
+			t.Errorf("SetReadDeadline after local close = %v, want net.ErrClosed", err)
+		}
+		if err := client.SetWriteDeadline(time.Now()); !errors.Is(err, ErrClosed) {
+			t.Errorf("SetWriteDeadline after local close = %v, want net.ErrClosed", err)
+		}
+		if _, err := server.Read(buf); !errors.Is(err, ErrClosed) {
+			t.Errorf("server Read after its close = %v, want net.ErrClosed", err)
+		}
+	})
+}
+
+// TestDSTNetDualStackWildcard verifies the plain-"tcp" wildcard listener is
+// dual-stack as in production: it reports the IPv6 wildcard address and
+// accepts dials of both families, and it conflicts with single-family
+// listeners on the same port.
+func TestDSTNetDualStackWildcard(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		ta := ln.Addr().(*TCPAddr)
+		if !ta.IP.Equal(IPv6zero) {
+			t.Errorf("dual-stack wildcard Addr = %v, want [::]:port", ta)
+		}
+		port := strconv.Itoa(ta.Port)
+		c4, err := Dial("tcp", "127.0.0.1:"+port)
+		if err != nil {
+			t.Fatalf("IPv4 dial to dual-stack wildcard: %v", err)
+		}
+		defer c4.Close()
+		if _, err := ln.Accept(); err != nil {
+			t.Fatal(err)
+		}
+		c6, err := Dial("tcp", "[::1]:"+port)
+		if err != nil {
+			t.Fatalf("IPv6 dial to dual-stack wildcard: %v", err)
+		}
+		defer c6.Close()
+		if _, err := ln.Accept(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Listen("tcp4", "127.0.0.1:"+port); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Errorf("tcp4 listen on dual-stack port = %v, want EADDRINUSE", err)
+		}
+		if _, err := Listen("tcp6", "[::1]:"+port); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Errorf("tcp6 listen on dual-stack port = %v, want EADDRINUSE", err)
+		}
+	})
+}
+
+// TestDSTNetDialConnectTrace verifies the nettrace connect callbacks fire
+// around a simulated dial, so httptrace-instrumented clients observe
+// ConnectStart/ConnectDone as in production.
+func TestDSTNetDialConnectTrace(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		var starts, dones []string
+		trace := &nettrace.Trace{
+			ConnectStart: func(network, addr string) { starts = append(starts, network+"/"+addr) },
+			ConnectDone:  func(network, addr string, err error) { dones = append(dones, network+"/"+addr) },
+		}
+		ctx := context.WithValue(context.Background(), nettrace.TraceKey{}, trace)
+		var d Dialer
+		port := strconv.Itoa(ln.Addr().(*TCPAddr).Port)
+		// Dial by name: the callbacks must report the RESOLVED address, as
+		// production fires them per connect attempt after resolution.
+		c, err := d.DialContext(ctx, "tcp", "localhost:"+port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		want := "tcp/127.0.0.1:" + port
+		if len(starts) != 1 || starts[0] != want || len(dones) != 1 || dones[0] != want {
+			t.Errorf("connect trace = starts %v dones %v, want one %q each", starts, dones, want)
+		}
+		// A dial that fails address validation fires no connect callbacks.
+		starts, dones = nil, nil
+		if _, err := d.DialContext(ctx, "tcp", "%%bad%%"); err == nil {
+			t.Error("dial of invalid address succeeded")
+		}
+		if len(starts) != 0 || len(dones) != 0 {
+			t.Errorf("invalid-address dial fired connect trace: starts %v dones %v", starts, dones)
+		}
+	})
+}
+
+// TestDSTNetUnsupportedNetworkText verifies a known-but-unmodeled network is
+// rejected with the simulation-boundary error shape (not "unknown network"),
+// while a genuinely unknown network keeps UnknownNetworkError identity.
+func TestDSTNetUnsupportedNetworkText(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		_, err := Dial("udp", "127.0.0.1:53")
+		var op *OpError
+		if !errors.As(err, &op) || !strings.Contains(op.Err.Error(), "unsupported under deterministic simulation") {
+			t.Errorf("Dial udp = %v, want unsupported-under-simulation error", err)
+		}
+		var unk UnknownNetworkError
+		if errors.As(err, &unk) {
+			t.Errorf("Dial udp classified as unknown network: %v", err)
+		}
+		_, err = Dial("bogusnet", "127.0.0.1:1")
+		if !errors.As(err, &unk) {
+			t.Errorf("Dial bogusnet = %v, want UnknownNetworkError", err)
+		}
+	})
+}
+
+// TestDSTNetListenerCloseFullBacklog verifies teardown with a full backlog and
+// a dial blocked mid-handshake: every queued connection is reset, the blocked
+// dial is refused (or its connection reset), and Accept after Close fails with
+// net.ErrClosed rather than returning a torn-down connection that landed in
+// the backlog after the drain.
+func TestDSTNetListenerCloseFullBacklog(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		var conns []Conn
+		for i := 0; i < 128; i++ { // fill the backlog
+			c, err := Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial %d: %v", i, err)
+			}
+			conns = append(conns, c)
+		}
+		blocked := make(chan error, 1)
+		go func() {
+			c, err := Dial("tcp", addr) // blocks: backlog full
+			if c != nil {
+				buf := make([]byte, 1)
+				_, err = c.Read(buf)
+			}
+			blocked <- err
+		}()
+		time.Sleep(time.Millisecond) // let the dial block
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ln.Accept(); !errors.Is(err, ErrClosed) {
+			t.Errorf("Accept after Close = %v, want net.ErrClosed", err)
+		}
+		// The blocked dial either was refused outright or its connection was
+		// reset; either way the dialer observes a connection-level error.
+		err = <-blocked
+		if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("blocked dial after Close = %v, want ECONNREFUSED or ECONNRESET", err)
+		}
+		buf := make([]byte, 1)
+		for i, c := range conns {
+			if _, err := c.Read(buf); !errors.Is(err, syscall.ECONNRESET) {
+				t.Errorf("conn %d Read after listener Close = %v, want ECONNRESET", i, err)
 			}
 		}
 	})

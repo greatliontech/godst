@@ -527,7 +527,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 	ctx, cancel := d.dialCtx(ctx)
 	defer cancel()
 	if dstNetEnabled && dstActive() {
-		return dstDial(ctx, d, network, address) // deterministic simulation: see net/dst.go
+		// Deterministic simulation: see net/dst.go (which fires the nettrace
+		// connect callbacks with the resolved address, as production does).
+		return dstDial(ctx, d, network, address)
 	}
 
 	// Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.

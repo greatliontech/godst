@@ -196,8 +196,19 @@ connection back while pushing the server end onto the listener's accept queue. A
 the simulated local/remote `*net.TCPAddr`. `DialContext` keeps the public context contract (nil panics,
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set,
 `:0` listeners receive deterministic nonzero ports, listener lookup uses canonical simulated IPs
-(`localhost` maps to loopback), and refused connects / duplicate listens preserve standard syscall error
-identities for `errors.Is`. The seam is the exported
+(`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6
+wildcard address and accepts dials of both families, conflicting with either family's listeners on the
+port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family), and error identity is production-shaped
+throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listens `EADDRINUSE`; every
+operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
+reads from a gracefully closed peer return `io.EOF` while writes to a closed peer and any operation on
+a reset connection carry `ECONNRESET`; deadline failures are `*net.OpError` wrapping
+`os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
+the bubble's virtual clock. Closing a listener resets the connections still in its accept backlog
+(production's RST), so a dialer that already succeeded observes `ECONNRESET` instead of blocking
+durably forever, and `Accept` after `Close` always fails with `net.ErrClosed`. The nettrace
+`ConnectStart`/`ConnectDone` callbacks fire around a simulated dial, so `httptrace`-instrumented
+clients observe connects as in production. The seam is the exported
 `Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it
 compiles out without `-tags dst`; net's internal lookups stay real (the program does not exercise real
 sockets under DST).
@@ -219,7 +230,12 @@ synthetic set consistent with this addressing) are follow-on increments. Public 
 service-name port lookups fail under DST rather than touching the host resolver, while literal-IP,
 numeric-port, and pre-I/O validation fast paths keep their normal no-I/O behavior. Unsupported networks
 at the intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or
-falling through to the real OS. FIPS/Boring-style configs are out of scope as elsewhere.
+falling through to the real OS: a known-but-unmodeled network (UDP, Unix, IP) carries the same
+"unsupported under deterministic simulation" shape as the typed-API gates, while a genuinely unknown
+network string keeps `UnknownNetworkError` identity. `net.FileConn`/`FileListener`/`FilePacketConn`
+are likewise rejected fast under a run — an inherited fd is a host socket, the one
+conn/listener-producing surface the typed gates did not cover. FIPS/Boring-style configs are out of
+scope as elsewhere.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
