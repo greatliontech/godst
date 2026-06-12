@@ -607,6 +607,143 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 	})
 }
 
+// TestDSTFSDurabilityMonotonicity is the enforcement of the spec's
+// durability-monotonicity invariant, promoted from spec tier at this chunk:
+// every mutation enters the tree as unsynced (the durable image is
+// untouched), and sync alone advances the durable boundary — for file
+// content, file metadata, and directory entry sets. A future simulated crash
+// restores exactly the durable image, so a mutation that advanced it
+// directly would later let torn-write faults tear "durable" state — a
+// soundness violation. The white-box inspector (os.DSTFSNodeState) is the
+// only observer until the fault feature lands.
+func TestDSTFSDurabilityMonotonicity(t *testing.T) {
+	simulation.Run(1, func() {
+		state := func(name string) (cur, synced string, ce, se []string) {
+			cur, synced, ce, se, _, _, ok := os.DSTFSNodeState(name)
+			if !ok {
+				t.Fatalf("DSTFSNodeState(%q) not ok", name)
+			}
+			return cur, synced, ce, se
+		}
+		names := func(l []string) string { return strings.Join(l, ",") }
+		must := func(what string, err error) {
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		}
+
+		// File content: write -> unsynced; Sync -> committed; further
+		// mutation (write, truncate, O_TRUNC reopen) leaves the image.
+		f, err := os.Create("/f")
+		must("Create", err)
+		_, err = f.WriteString("abc")
+		must("WriteString", err)
+		if cur, synced, _, _ := state("/f"); cur != "abc" || synced != "" {
+			t.Fatalf("post-write state = %q/%q, want abc/empty (mutation advanced the durable image)", cur, synced)
+		}
+		must("Sync", f.Sync())
+		if _, synced, _, _ := state("/f"); synced != "abc" {
+			t.Fatalf("post-sync image = %q, want abc", synced)
+		}
+		// In-place overwrite of the synced range: the image must be a COPY,
+		// not an alias of the live buffer (the aliasing-mutant kill).
+		_, err = f.WriteAt([]byte("XYZ"), 0)
+		must("WriteAt", err)
+		if cur, synced, _, _ := state("/f"); cur != "XYZ" || synced != "abc" {
+			t.Fatalf("post-overwrite = %q/%q (durable image aliases the live buffer)", cur, synced)
+		}
+		_, err = f.WriteString("def") // appends at offset 3 (WriteAt does not move it)
+		must("WriteString-2", err)
+		if cur, synced, _, _ := state("/f"); cur != "XYZdef" || synced != "abc" {
+			t.Fatalf("post-write-2 = %q/%q", cur, synced)
+		}
+		must("Truncate", f.Truncate(1))
+		if cur, synced, _, _ := state("/f"); cur != "X" || synced != "abc" {
+			t.Fatalf("post-truncate = %q/%q", cur, synced)
+		}
+		f.Close()
+		ft, err := os.OpenFile("/f", os.O_WRONLY|os.O_TRUNC, 0)
+		must("O_TRUNC reopen", err)
+		if cur, synced, _, _ := state("/f"); cur != "" || synced != "abc" {
+			t.Fatalf("post-O_TRUNC = %q/%q", cur, synced)
+		}
+		ft.Close()
+
+		// Truncate-down then extend: the gap is zeros, never resurrected
+		// bytes (the stale-byte regression: backing arrays are reused).
+		g, err := os.Create("/g")
+		must("Create g", err)
+		_, err = g.WriteString("abcdefgh")
+		must("write g", err)
+		must("truncate g", g.Truncate(2))
+		_, err = g.WriteAt([]byte("Z"), 4)
+		must("extend g", err)
+		if cur, _, _, _ := state("/g"); cur != "ab\x00\x00Z" {
+			t.Fatalf("truncate-extend content = %q, want ab\\x00\\x00Z (stale bytes resurrected)", cur)
+		}
+		g.Close()
+
+		// Directory entries: create/remove/rename are unsynced until the
+		// DIRECTORY is synced; the synced set is a snapshot by NAME, not an
+		// alias of the live map.
+		must("Mkdir", os.Mkdir("/d", 0o755))
+		must("WriteFile one", os.WriteFile("/d/one", nil, 0o644))
+		must("WriteFile two", os.WriteFile("/d/two", nil, 0o644))
+		if _, _, ce, se := state("/d"); names(ce) != "one,two" || len(se) != 0 {
+			t.Fatalf("dir pre-sync = %v/%v", ce, se)
+		}
+		dh, err := os.Open("/d")
+		must("open dir", err)
+		must("dir Sync", dh.Sync())
+		if _, _, ce, se := state("/d"); names(ce) != "one,two" || names(se) != "one,two" {
+			t.Fatalf("dir post-sync = %v/%v", ce, se)
+		}
+		must("Remove", os.Remove("/d/one"))
+		if _, _, ce, se := state("/d"); names(ce) != "two" || names(se) != "one,two" {
+			t.Fatalf("dir post-remove = %v/%v (synced set aliases the live map)", ce, se)
+		}
+		must("WriteFile three", os.WriteFile("/d/three", nil, 0o644))
+		if _, _, ce, se := state("/d"); names(ce) != "three,two" || names(se) != "one,two" {
+			t.Fatalf("dir post-create = %v/%v", ce, se)
+		}
+		// Rename mutates the live namespace only.
+		must("Rename", os.Rename("/d/two", "/d/renamed"))
+		if _, _, ce, se := state("/d"); names(ce) != "renamed,three" || names(se) != "one,two" {
+			t.Fatalf("dir post-rename = %v/%v (rename advanced the durable set)", ce, se)
+		}
+		dh.Close()
+
+		// Metadata image: committed by sync alone (commitLocked's mode copy).
+		_, _, _, _, mode, syncedMode, _ := os.DSTFSNodeState("/f")
+		if mode == 0 || syncedMode != mode {
+			t.Fatalf("syncedMode = %v, mode = %v (sync did not commit metadata)", syncedMode, mode)
+		}
+
+		// O_SYNC: every WRITE commits through the single commit point;
+		// ftruncate is NOT covered (POSIX synchronized-I/O is for writes —
+		// O_SYNC-truncate durability would be finer than real disks grant).
+		sf, err := os.OpenFile("/s", os.O_CREATE|os.O_WRONLY|os.O_SYNC, 0o644)
+		must("O_SYNC open", err)
+		_, err = sf.WriteString("123")
+		must("O_SYNC write", err)
+		if cur, synced, _, _ := state("/s"); cur != "123" || synced != "123" {
+			t.Fatalf("O_SYNC write = %q/%q, want 123/123", cur, synced)
+		}
+		// The pwrite path (WriteAt) commits too — "per write" means both
+		// write funnels through the single commit point.
+		_, err = sf.WriteAt([]byte("9"), 0)
+		must("O_SYNC WriteAt", err)
+		if cur, synced, _, _ := state("/s"); cur != "923" || synced != "923" {
+			t.Fatalf("O_SYNC WriteAt = %q/%q, want 923/923", cur, synced)
+		}
+		must("O_SYNC truncate", sf.Truncate(1))
+		if cur, synced, _, _ := state("/s"); cur != "9" || synced != "923" {
+			t.Fatalf("O_SYNC truncate = %q/%q, want 9/923 (truncate must not commit)", cur, synced)
+		}
+		sf.Close()
+	})
+}
+
 // TestDSTFSTempDir: os.TempDir reports the fixed simulated /tmp during a
 // run (never the host's machine-dependent $TMPDIR string), /tmp is
 // pre-seeded (mode 1777), CreateTemp/MkdirTemp work unmodified, and their

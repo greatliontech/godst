@@ -432,6 +432,7 @@ type dstFile struct {
 	dirpos int // directory read cursor (sorted-name index)
 	rd, wr bool
 	app    bool
+	osync  bool // O_SYNC: every write commits the durable image
 	closed bool
 }
 
@@ -484,11 +485,12 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	}
 
 	d := &dstFile{
-		node: node,
-		path: dstFSAbs(name),
-		rd:   flag&O_WRONLY == 0,
-		wr:   accWrite,
-		app:  flag&O_APPEND != 0,
+		node:  node,
+		path:  dstFSAbs(name),
+		rd:    flag&O_WRONLY == 0,
+		wr:    accWrite,
+		app:   flag&O_APPEND != 0,
+		osync: flag&O_SYNC != 0,
 	}
 	return dstNewFile(d, name), true, nil
 }
@@ -604,6 +606,9 @@ func (d *dstFile) write(b []byte) (int, error) {
 	}
 	n := d.writeAtLocked(b, d.off)
 	d.off += int64(n)
+	if d.osync {
+		d.node.commitLocked()
+	}
 	return n, nil
 }
 
@@ -615,7 +620,11 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if !d.wr {
 		return 0, syscall.EBADF
 	}
-	return d.writeAtLocked(b, off), nil
+	n := d.writeAtLocked(b, off)
+	if d.osync {
+		d.node.commitLocked()
+	}
+	return n, nil
 }
 
 // writeAtLocked extends-with-zeros as needed and copies b at off. Caller
@@ -628,7 +637,11 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) int {
 			// O(n^2) over append-heavy workloads).
 			node.data = append(node.data, make([]byte, need-int64(len(node.data)))...)
 		} else {
+			// Re-extending within capacity: zero the gap, or bytes from a
+			// previous longer state resurrect (truncate-down then extend).
+			oldLen := len(node.data)
 			node.data = node.data[:need]
+			clear(node.data[oldLen:])
 		}
 	}
 	n := copy(node.data[off:], b)
@@ -765,18 +778,34 @@ func (d *dstFile) truncate(size int64) error {
 	return nil
 }
 
-// sync commits the file's current content as the durable image (the
-// durability contract's file-data commit point; entry durability is the
-// parent directory's, wired by the durability increment).
+// sync commits the durable image (the durability contract's commit points):
+// for a file, the current content and metadata; for a directory, the current
+// entry set (entry durability is the parent directory's property — POSIX's
+// fsync-the-file-then-fsync-the-directory model). Mutations never touch the
+// durable image; this is its only writer (plus O_SYNC's per-write commit,
+// which routes through the same helper).
 func (d *dstFile) sync() error {
 	if err := d.enter(); err != nil {
 		return err
 	}
 	defer d.leave()
-	d.node.synced = append([]byte(nil), d.node.data...)
-	d.node.syncedMode = d.node.mode
-	d.node.syncedModTime = d.node.modTime
+	d.node.commitLocked()
 	return nil
+}
+
+// commitLocked advances the node's durable image to its current state.
+// Caller holds dstFS.mu.
+func (node *dstFSNode) commitLocked() {
+	if node.isDir {
+		node.syncedEntries = make(map[string]*dstFSNode, len(node.entries))
+		for name, child := range node.entries {
+			node.syncedEntries[name] = child
+		}
+	} else {
+		node.synced = append([]byte(nil), node.data...)
+	}
+	node.syncedMode = node.mode
+	node.syncedModTime = node.modTime
 }
 
 func (d *dstFile) stat() (FileInfo, error) {

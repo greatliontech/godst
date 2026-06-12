@@ -320,7 +320,16 @@ what was synced. The base (no-fault) model is the collapse of this contract wher
 fires: everything survives, and `Sync` is *not* a no-op — it moves the synced/unsynced boundary,
 which the representation carries from day one (per-node durable image + pending state). The fault
 feature later adds crash/EIO/ENOSPC/latency as **policies over this representation**, never new
-representation — same layering as network faults over the registry.
+representation — same layering as network faults over the registry. The monotonicity half is
+ENFORCED now (promoted from spec tier at the durability chunk): `TestDSTFSDurabilityMonotonicity`
+asserts over a test-only node inspector (current vs durable content, sorted entry-name sets,
+metadata image) that content writes, truncate, O_TRUNC, and entry create/remove/rename leave the
+durable image untouched — including that the image is a copy, never an alias of live state — and
+that sync alone advances it. `O_SYNC` commits per WRITE through the same single commit point;
+ftruncate is deliberately not covered (POSIX synchronized I/O is for writes — committing on
+truncate would grant durability real disks do not, hiding exactly the bug class DST exists to
+catch). The metadata-CHANGE operations (Chmod/Chtimes) are still fenced; their unsynced-entry
+semantics activate with the convenience increment.
 
 **The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen at open: the
 tree-file backend here; dst-io's `os.Pipe` (and std streams) later plug in as a stream-shaped
