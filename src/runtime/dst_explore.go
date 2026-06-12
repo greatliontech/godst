@@ -293,7 +293,7 @@ var (
 	dstForceCount         []uint64
 	dstForcePC            []uintptr
 
-	// Force-lookup table (BU-22): dstAccessForced runs on every auto-
+	// Force-lookup table: dstAccessForced runs on every auto-
 	// instrumented access, and a linear scan over the installed triples is
 	// O(F) per access as promotion grows. dstSetAccessForce (off-lock,
 	// between runs) builds this open-addressed table over the triples;
@@ -301,7 +301,7 @@ var (
 	dstForceTab  []int32
 	dstForceMask uintptr
 
-	// Page index over the access entries (BU-21): dstAccessShouldYield needs
+	// Page index over the access entries: dstAccessShouldYield needs
 	// every recorded entry overlapping the queried range, and scanning all
 	// entries is O(A) per access — O(A²) for heap-heavy SUTs. Entries are
 	// indexed by the 256-byte pages their range covers: per-page hash chains
@@ -1089,7 +1089,7 @@ func dstSetAccessForce(seq, count []uint64, pc []uintptr) {
 	dstForceSeq = seq
 	dstForceCount = count
 	dstForcePC = pc
-	// Build the O(1) lookup table here, off-lock (BU-22); dstAccessForced
+	// Build the O(1) lookup table here, off-lock; dstAccessForced
 	// probes it on every auto-instrumented access during the Run.
 	if len(seq) == 0 {
 		dstForceTab = nil

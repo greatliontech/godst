@@ -15,9 +15,4 @@ I/O into the bubble and then layers fault injection on top.
 |---------|-------|---------|
 | [dst-disk](dst-disk.md) | next | In-memory deterministic filesystem (os file ops, deterministic ReadDir order) so unmodified file-using code is reproducible. The base for disk faults (latency/EIO/ENOSPC/torn writes). |
 | [dst-io](dst-io.md) | after disk | Deterministic file/pipe/stdio I/O for whatever network and disk don't cover (os.Pipe, std streams). |
-
-## Deferrals
-
-| Issue | Lands | Summary |
-|-------|-------|---------|
-| [dst-audit-hardening](dst-audit-hardening.md) | before new DST features | Bottom-up hardening and optimization findings from the full `go1.26.4..HEAD` DST audit. |
+| [dst-atomics-decisions](dst-atomics-decisions.md) | pending feature | Hook atomics (and len/cap-of-channel) as Level-2 exploration decision points, removing the documented Completeness-boundary exclusions. |

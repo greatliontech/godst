@@ -1932,7 +1932,7 @@ func TestExploreWithStepBudgetReportsIncomplete(t *testing.T) {
 }
 
 // TestExploreFilterPageIndexFindsConflicts pins the shared-address filter's
-// overlap detection through every lookup path of its page index (BU-21): the
+// overlap detection through every lookup path of its page index: the
 // second of two unordered conflicting accesses must YIELD (the filter sees the
 // prior overlapping entry), so each conflicting case costs exactly one more
 // yield than its structurally identical disjoint control. Cases cover the

@@ -514,9 +514,11 @@ func dstDeactivate() {
 
 // dstFlushRunqOvf moves every P's DST overflow queue to the global run queue.
 // See dstDeactivate. All Ps, not just the caller's: the run executes at one
-// pinned P, but a foreign GOMAXPROCS call racing run entry (its dstActive gate
-// check-then-act window — see issue dst-audit-hardening A2-34) can procresize
-// mid-run, after which the entries' P need not be the deactivator's; flushing
+// pinned P, but a foreign GOMAXPROCS call racing run entry can procresize
+// mid-run (the setters' dstActive gates are check-then-act; the re-checks
+// under their STWs close the public window, but a pin-less white-box run has
+// no entry verify), after which the entries' P need not be the deactivator's;
+// flushing
 // every P bounds that race's damage to the run that suffered it instead of
 // stranding goroutines forever.
 func dstFlushRunqOvf() {

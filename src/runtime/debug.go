@@ -108,8 +108,9 @@ func GOMAXPROCS(n int) int {
 	// under the STW and drop the update rather than defeat the run's P=1 pin
 	// mid-run. The racing caller's end state is exactly GOMAXPROCS(ret) —
 	// manual mode at the unchanged old value, a legal API outcome — and a
-	// public-API run's exit restore rewrites both flag and value anyway. See
-	// dst-audit-hardening A2-34.
+	// public-API run's exit restore rewrites both flag and value anyway.
+	// Enforced by TestDSTGOMAXPROCSDelayedSTWDropped; design.md, the
+	// simulation.Run bullet, records the contract.
 	if dstActive() {
 		startTheWorldGC(stw)
 		return ret

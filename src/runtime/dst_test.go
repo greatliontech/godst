@@ -1819,7 +1819,7 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 }
 
 // TestDSTForeignCallbackDeferred verifies the ownership boundary of the bubble
-// drain (A2-28): finalizers/cleanups registered MID-RUN by goroutines outside
+// drain: finalizers/cleanups registered MID-RUN by goroutines outside
 // the simulation bubble are discovered by the simulation's GCs but deferred
 // past the run (they execute on the ordinary async workers afterward), while
 // the simulation's own registrations still run on the drain in-run.
@@ -1836,8 +1836,8 @@ func TestDSTForeignCallbackDeferred(t *testing.T) {
 	}
 }
 
-// TestDSTRunqOverflowOrder verifies the order-preserving local-ring overflow
-// (A2-29): with more simultaneously-runnable goroutines than the ring holds,
+// TestDSTRunqOverflowOrder verifies the order-preserving local-ring overflow:
+// with more simultaneously-runnable goroutines than the ring holds,
 // foreign goroutines churning through the same ring must not permute the
 // simulation candidates' enumeration order — the schedule fingerprint with
 // foreign churn equals the alone run's, and the overflow path demonstrably
@@ -1879,7 +1879,7 @@ func TestDSTWhiteBoxCleanupChurnP4(t *testing.T) {
 	}
 }
 
-// TestDSTGOMAXPROCSEntryRace verifies the A2-34 closure: a foreign GOMAXPROCS
+// TestDSTGOMAXPROCSEntryRace verifies the entry-race closure: a foreign GOMAXPROCS
 // call racing run entry either loses (its update is dropped under the
 // setter's STW once dstActive) or is caught loud by the post-activation pin
 // verification — a run never proceeds with GOMAXPROCS != 1.
@@ -1890,7 +1890,7 @@ func TestDSTGOMAXPROCSEntryRace(t *testing.T) {
 	}
 }
 
-// TestDSTGOMAXPROCSDelayedSTWDropped pins the runtime side of the A2-34
+// TestDSTGOMAXPROCSDelayedSTWDropped pins the runtime side of the entry-race
 // closure deterministically: a GOMAXPROCS/SetDefaultGOMAXPROCS call held
 // between its not-active gate and its stop-the-world (the
 // computeMaxProcsLock-contention shape) while a simulation activates must

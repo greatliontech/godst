@@ -1031,7 +1031,7 @@ func TestDSTNetListenerCloseFullBacklog(t *testing.T) {
 }
 
 // TestDSTNetParkedAcceptLosesToClose pins the Accept/Close overlap
-// linearization (A2-31): an Accept already blocked in the listener's select
+// linearization: an Accept already blocked in the listener's select
 // when Close runs returns net.ErrClosed — never a connection — and the
 // connection it would have won is reset like the rest of the backlog, exactly
 // as production unblocks every pending accept on close. The sequencing is
@@ -1076,7 +1076,7 @@ func TestDSTNetParkedAcceptLosesToClose(t *testing.T) {
 }
 
 // TestDSTNetFamilyWildcardAddr pins the reported address of single-family
-// wildcard listens (A2-32): production reports the family wildcard form
+// wildcard listens: production reports the family wildcard form
 // (0.0.0.0:p / [::]:p), not the loopback the simulation maps it to
 // internally — and dialing the reported form still reaches the listener.
 func TestDSTNetFamilyWildcardAddr(t *testing.T) {
