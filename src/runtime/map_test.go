@@ -1077,6 +1077,15 @@ func TestMemHashGlobalSeed(t *testing.T) {
 
 	testenv.MustHaveExec(t)
 
+	if runtime.DSTBuild {
+		// -tags dst fixes the global hash key from a constant seed so map
+		// iteration order is reproducible across runs (see docs/dst/design.md,
+		// "Map hash key requires -tags dst"). Per-process seed uniqueness is
+		// intentionally absent in this build mode; the untagged legs still
+		// enforce it for normal builds.
+		t.Skip("global hash seed is intentionally fixed under -tags dst")
+	}
+
 	// aeshash and memhashFallback use separate per-process seeds, so test
 	// both.
 	t.Run("aes", func(t *testing.T) {

@@ -55,6 +55,8 @@ var CgoCheckPointer = cgoCheckPointer
 
 const CrashStackImplemented = crashStackImplemented
 
+const DSTBuild = dstBuild
+
 const TracebackInnerFrames = tracebackInnerFrames
 const TracebackOuterFrames = tracebackOuterFrames
 
