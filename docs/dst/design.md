@@ -275,32 +275,39 @@ scope as elsewhere.
 
 ### Enforcing test configurations
 
-The DST contract tests are dead in a stock `-short`/untagged run; the enforcing configurations are:
-`go test -tags dst runtime testing/simulation net` (non-`-short`: the 802-program sweep, the
-race-oracle and auto-instrumentation tests — which build their own `-race` testprogs — and the
-build-mode inertness test all skip under `-short`), `go test -tags dst -race testing/simulation` for
-the dst-race sync-hook encodings (the suite is `-race`-clean: every SUT that runs under `-race` is
-race-free — intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg
-via `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
-load-bearing for this invariant), and an
-untagged `go test -short std` pass for build-mode inertness. The untagged build-constraint panic is
-covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog. The untagged
-`-short runtime` leg also enforces that `runtime/testdata/testprog` stays cgo-free: a cgo-pulling
-import there (net, os/user — DST fixtures needing those live in `testprognet`) disables the
-runtime's deadlock detection and hangs the crash tests loudly. Two operational rules for running
-these configurations honestly: never let a pipeline eat the exit code (`go test ... | tail -1`
-reports the pipe's status, not the test's — this masked real failures twice), and after ANY
-cmd/compile change run `go clean -cache` — this fork reports a release version string, so tool IDs
-come from the version, not the binary hash, and a reinstalled compiler does NOT invalidate cached
-objects (stale-compiler builds silently pass). These configurations and rules are encoded in
-`Taskfile.yml` at the repo root (the A2-25 runner choice): `task test` runs the untagged, `-tags
-dst`, and `-tags dst -race` legs sequentially and fail-fast; `task test:inert-std` is the heavy
-untagged `-short std` inertness leg; `task compiler` reinstalls cmd/compile and chains
-`go clean -cache` so the cache rule cannot be forgotten. The Taskfile must stay pipeline-free —
-each leg's `go test` exit code is the task's exit code. Known red: `task test:inert-std` currently
-fails `TestTraceStacks`/`TestBlockProfile`/`TestMutexProfile` (untagged stack-shape regression from
-the DST mutex hooks — see `docs/issues/dst-sync-stack-shape.md`); the leg gates green once that
-issue lands.
+The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
+the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the
+authoritative statement of its leg, and the `go test` command in the Taskfile is its definition:
+
+- **`test:untagged`** (`go test -count=1 -short runtime`, untagged): DST hooks are inert; also
+  enforces that `runtime/testdata/testprog` stays cgo-free — a cgo-pulling import there (net,
+  os/user — DST fixtures needing those live in `testprognet`) disables the runtime's deadlock
+  detection and hangs the crash tests loudly.
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net`,
+  non-`-short`): the
+  802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
+  `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
+  build-constraint panic is covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged
+  testprog.
+- **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation`): the dst-race
+  sync-hook encodings. The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
+  intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via
+  `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
+  load-bearing for this invariant.
+- **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
+  of std. Heavy; runs separately from the `test` aggregate, which runs the other three legs
+  sequentially and fail-fast.
+
+Two operational rules for running these configurations honestly: never let a pipeline eat the exit
+code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures
+twice; the Taskfile must stay pipeline-free, so each leg's `go test` exit code is the task's exit
+code), and after ANY cmd/compile change run `task compiler` — it chains `go clean -cache` after the
+reinstall because this fork reports a release version string, so tool IDs come from the version,
+not the binary hash, and a reinstalled compiler does NOT invalidate cached objects (stale-compiler
+builds silently pass). Known red: `test:inert-std` currently fails
+`TestTraceStacks`/`TestBlockProfile`/`TestMutexProfile` (untagged stack-shape regression from the
+DST mutex hooks — see `docs/issues/dst-sync-stack-shape.md`); the leg gates green once that issue
+lands.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
