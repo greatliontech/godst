@@ -163,6 +163,9 @@ func dstSetMemLimit(limit int64)
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
 
+//go:linkname testingSimulationCleanupStarted testing/simulation.testingSimulationCleanupStarted
+func testingSimulationCleanupStarted(t *testing.T) bool
+
 //go:linkname dstGOMAXPROCSAuto runtime.dstGOMAXPROCSAutoFP
 func dstGOMAXPROCSAuto() bool
 
@@ -390,6 +393,12 @@ func RunWith(seed uint64, opts Options, f func()) {
 // and T.Deadline must not be called.
 func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("TestWith", opts)
+	if testingSimulationCleanupStarted(t) {
+		// Reject on the caller goroutine, before the bubble exists: the
+		// equivalent check inside the bubble would panic on the bubble main
+		// goroutine, where it cannot be recovered by the caller.
+		panic("testing/simulation: TestWith called during t.Cleanup")
+	}
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	var ok bool

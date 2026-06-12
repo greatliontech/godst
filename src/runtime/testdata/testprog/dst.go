@@ -59,6 +59,7 @@ func init() {
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
 	register("DSTIdentityGroups", DSTIdentityGroups)
+	register("DSTRunNoTag", DSTRunNoTag)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -1280,6 +1281,24 @@ func DSTIdentityGroups() {
 	if okAll {
 		os.Stdout.WriteString("done\n")
 	}
+}
+
+// DSTRunNoTag exercises the documented build-constraint panic: in a binary
+// built WITHOUT -tags dst, simulation.Run must refuse to start (the map hash
+// key cannot be made deterministic at runtime). Prints the recovered panic.
+func DSTRunNoTag() {
+	defer func() {
+		if v := recover(); v != nil {
+			if s, ok := v.(string); ok {
+				os.Stdout.WriteString("panic: " + s + "\n")
+				return
+			}
+			os.Stdout.WriteString("panic: non-string\n")
+			return
+		}
+		os.Stdout.WriteString("no panic\n")
+	}()
+	simulation.Run(1, func() {})
 }
 
 // DSTFinProfile takes a goroutine profile from inside a finalizer running on the

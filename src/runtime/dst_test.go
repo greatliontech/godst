@@ -637,6 +637,21 @@ func TestDSTGOMAXPROCSAutoModeRestored(t *testing.T) {
 	}
 }
 
+// TestDSTRunRequiresBuildTag verifies the documented build-constraint panic:
+// a binary built WITHOUT -tags dst refuses simulation.Run with the
+// reproducible-map-hash-key message (the one documented panic that can only
+// be tested from an untagged build).
+func TestDSTRunRequiresBuildTag(t *testing.T) {
+	exe, err := buildTestProg(t, "testprog") // no -tags dst
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := strings.TrimSpace(runBuiltTestProg(t, exe, "DSTRunNoTag"))
+	if !strings.Contains(out, "requires building with -tags dst") {
+		t.Fatalf("untagged simulation.Run = %q, want the -tags dst build panic", out)
+	}
+}
+
 // TestDSTFinalizerBubbleChannelOp verifies invariant DST-FIN-1: a finalizer that
 // does a bubble channel op runs without fatal inside dst.Run, because the
 // bubble-scoped drain goroutine (g.bubble == the bubble) runs it, not the async

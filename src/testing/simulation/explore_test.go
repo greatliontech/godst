@@ -305,6 +305,72 @@ func TestRunRejectsFIPSMode(t *testing.T) {
 	}
 }
 
+// TestTestWithChainAbortPropagates pins TestWith's chain-abort semantics: a
+// FailNow on an ANCESTOR T from inside the simulation child aborts the whole
+// subtest chain (the runtime.Goexit is re-issued to TestWith's caller, like
+// nested t.Run), so code after the enclosing t.Run in the root must NOT run.
+// This is deliberately stronger than testing/synctest.Test, whose ok=false
+// path lets the root continue; the design doc records the difference.
+//
+// Teeth: with runLocked's propagateGoexit flipped to false for TestWith, the
+// abort degenerates to FailNow on the subtest and the root continues — the
+// helper prints the after-run marker and this test fails.
+func TestTestWithChainAbortPropagates(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	const helperEnv = "GO_WANT_SIMULATION_CHAIN_ABORT_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		root := t
+		t.Run("sub", func(sub *testing.T) {
+			TestWith(sub, 1, Options{}, func(*testing.T) {
+				root.FailNow() // grandparent abort from inside the simulation
+			})
+		})
+		os.Stdout.WriteString("after-run-executed\n")
+		return
+	}
+
+	testenv.MustHaveExec(t)
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestTestWithChainAbortPropagates$", "-test.count=1")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, helperEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("helper passed unexpectedly:\n%s", out)
+	}
+	if strings.Contains(string(out), "after-run-executed") {
+		t.Fatalf("grandparent FailNow did not abort the chain (root continued past t.Run):\n%s", out)
+	}
+	// Positive evidence of a CLEAN abort: the helper test fails through the
+	// testing framework, not through a runtime crash or timeout.
+	if !strings.Contains(string(out), "--- FAIL: TestTestWithChainAbortPropagates") ||
+		strings.Contains(string(out), "fatal error:") ||
+		strings.Contains(string(out), "panic:") {
+		t.Fatalf("chain abort did not fail cleanly through the testing framework:\n%s", out)
+	}
+}
+
+// TestTestPanicsDuringCleanup verifies the reentry panic names the simulation
+// API when Test is called from a t.Cleanup function.
+func TestTestPanicsDuringCleanup(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	t.Run("sub", func(sub *testing.T) {
+		sub.Cleanup(func() {
+			var got string
+			func() {
+				defer func() { got = panicString(recover()) }()
+				Test(sub, 1, func(*testing.T) {})
+			}()
+			if !strings.Contains(got, "testing/simulation: TestWith called during t.Cleanup") {
+				t.Errorf("cleanup-reentry panic = %q, want it to name the simulation API", got)
+			}
+		})
+	})
+}
+
 func TestTestFatalExitsCaller(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -391,7 +457,7 @@ func TestTestWithOptions(t *testing.T) {
 }
 
 func TestTestWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
-	for _, tt := range []struct {
+	cases := []struct {
 		name string
 		opts Options
 		want string
@@ -401,7 +467,24 @@ func TestTestWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 			opts: Options{Strategy: Strategy(99)},
 			want: "TestWith unknown Strategy",
 		},
-	} {
+	}
+	if strconv.IntSize > 32 {
+		tooLarge := int(maxStrategyParam)
+		tooLarge++
+		cases = append(cases,
+			struct {
+				name string
+				opts Options
+				want string
+			}{name: "pct depth overflow", opts: Options{Strategy: PCT, Depth: tooLarge}, want: "TestWith PCT Depth overflows"},
+			struct {
+				name string
+				opts Options
+				want string
+			}{name: "pct steps overflow", opts: Options{Strategy: PCT, Steps: tooLarge}, want: "TestWith PCT Steps overflows"},
+		)
+	}
+	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			called := false
 			var got string

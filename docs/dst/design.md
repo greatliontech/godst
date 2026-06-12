@@ -100,10 +100,15 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   `synctestRun` via `dstBubbleMainRoot`, salted relative to the activation root so the bubble main does
   not replay the run caller's draw sequence), so a failing test reproduces identically in isolation.
 - **`simulation.Test(t *testing.T, seed uint64, f func(*testing.T))`** is the `testing`-oriented
-  entry point. It has the same deterministic envelope as `Run`, but gives `f` a bubble-scoped child
-  `*testing.T` with the same control semantics as `testing/synctest.Test`: `t.Fatal`/`FailNow`
-  aborts the caller, `t.Cleanup` and `t.Context` run inside the bubble, and testing durations are
-  finalized outside the bubble. `TestWith` is the `Options`-taking form, matching `RunWith`.
+  entry point. It has the same deterministic envelope as `Run`, and gives `f` a bubble-scoped child
+  `*testing.T` with these control semantics: `t.Fatal`/`FailNow` aborts the caller, `t.Cleanup` and
+  `t.Context` run inside the bubble, testing durations are finalized outside the bubble, and calling
+  it during `t.Cleanup` panics naming the simulation API. One deliberate difference from
+  `testing/synctest.Test`: a `FailNow` on an ANCESTOR `T` from inside the simulation aborts the
+  whole subtest chain (the `runtime.Goexit` is re-issued to `Test`'s caller, like nested `t.Run`),
+  where `synctest.Test` lets the root test continue past its `t.Run`
+  (`TestTestWithChainAbortPropagates` pins the choice). `TestWith` is the `Options`-taking form,
+  matching `RunWith`.
 - **Runtime core** (`runtime/dst.go`): `dstSeed atomic.Uint64` (0 = off) is the live flag the hot
   paths and sysmon read; `dstActive()` is the hot-path check; `dstActivate(seed)` roots the caller's
   per-g stream then sets the flag; `dstSetAsyncPreemptOff`, `dstDeactivate`, `dstBuilt` support `Run`.
@@ -254,6 +259,16 @@ network string keeps `UnknownNetworkError` identity. `net.FileConn`/`FileListene
 are likewise rejected fast under a run — an inherited fd is a host socket, the one
 conn/listener-producing surface the typed gates did not cover. FIPS/Boring-style configs are out of
 scope as elsewhere.
+
+### Enforcing test configurations
+
+The DST contract tests are dead in a stock `-short`/untagged run; the enforcing configurations are:
+`go test -tags dst runtime testing/simulation net` (non-`-short`: the 290-program sweep, the
+race-oracle and auto-instrumentation tests — which build their own `-race` testprogs — and the
+build-mode inertness test all skip under `-short`), `go test -tags dst -race testing/simulation` for
+the dst-race sync-hook encodings (currently modulo the tracked budgeted-racy-SUT exception), and an
+untagged `go test std`-level pass for build-mode inertness. The untagged build-constraint panic is
+covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 

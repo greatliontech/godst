@@ -2164,6 +2164,18 @@ func testingSimulationTest(t *T, f func(*T)) (ok bool) {
 	return testingSynctestTest(t, f)
 }
 
+// testingSimulationCleanupStarted reports whether t is already running its
+// cleanup functions. simulation.Test/TestWith check it on the CALLER goroutine
+// before entering the bubble, so the rejection panics where the user can
+// recover it, in the package's own panic style (testingSynctestTest's own
+// check would fire on the bubble main goroutine, where a raw panic kills the
+// process, and names synctest.Run).
+//
+//go:linkname testingSimulationCleanupStarted testing/simulation.testingSimulationCleanupStarted
+func testingSimulationCleanupStarted(t *T) bool {
+	return t.cleanupStarted.Load()
+}
+
 // Deadline reports the time at which the test binary will have
 // exceeded the timeout specified by the -timeout flag.
 //
