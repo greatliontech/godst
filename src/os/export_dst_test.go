@@ -12,15 +12,26 @@ package os
 // alone does. Test-only; the fault feature's crash restoration is the
 // eventual production reader of the durable image.
 func DSTFSNodeState(name string) (cur, synced string, curEntries, syncedEntries []string, mode, syncedMode FileMode, ok bool) {
+	cur, synced, curEntries, syncedEntries, mode, syncedMode, _, _, ok = dstFSNodeStateFull(name)
+	return
+}
+
+// DSTFSNodeTimes exposes the modTime pair for the metadata-monotonicity pins.
+func DSTFSNodeTimes(name string) (modTime, syncedModTime int64, ok bool) {
+	_, _, _, _, _, _, mt, smt, ok := dstFSNodeStateFull(name)
+	return mt, smt, ok
+}
+
+func dstFSNodeStateFull(name string) (cur, synced string, curEntries, syncedEntries []string, mode, syncedMode FileMode, modTime, syncedModTime int64, ok bool) {
 	if !dstFSActive() {
-		return "", "", nil, nil, 0, 0, false
+		return "", "", nil, nil, 0, 0, 0, 0, false
 	}
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
 	_, _, node, errno := dstFSResolve(name)
 	if errno != nil || node == nil {
-		return "", "", nil, nil, 0, 0, false
+		return "", "", nil, nil, 0, 0, 0, 0, false
 	}
 	sorted := func(m map[string]*dstFSNode) []string {
 		out := make([]string, 0, len(m))
@@ -36,5 +47,6 @@ func DSTFSNodeState(name string) (cur, synced string, curEntries, syncedEntries 
 	}
 	return string(node.data), string(node.synced),
 		sorted(node.entries), sorted(node.syncedEntries),
-		node.mode, node.syncedMode, true
+		node.mode, node.syncedMode,
+		node.modTime.UnixNano(), node.syncedModTime.UnixNano(), true
 }

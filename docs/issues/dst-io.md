@@ -32,7 +32,11 @@ than assumed covered.
 
 - How much of stdio to virtualize vs. leave as the program's responsibility
   (a test usually controls its own stdin/stdout already).
-- Whether `os.Pipe` belongs here or with the disk feature (shared fd machinery).
+- ~~Whether `os.Pipe` belongs here or with the disk feature~~ — SETTLED at the
+  disk feature's design step: `os.Pipe` lands HERE, as a stream-shaped backend
+  behind the `os.File` dst seam the disk feature built (it is fenced under a
+  run until then; see design.md "In-memory deterministic filesystem", the
+  backend-not-fd paragraph).
 
 ## Contract note
 

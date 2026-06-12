@@ -384,6 +384,120 @@ func dstTempDir() (string, bool) {
 	return "/tmp", true
 }
 
+// dstTruncateName implements the named Truncate (truncate(2) shapes:
+// EISDIR for directories). Mutates current content only.
+func dstTruncateName(name string, size int64) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "truncate", Path: name, Err: e} }
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	if size < 0 {
+		return wrap(syscall.EINVAL)
+	}
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if node.isDir {
+		return wrap(syscall.EISDIR)
+	}
+	node.truncateLocked(size)
+	return true, nil
+}
+
+// truncateLocked clamps or zero-extends current content. Caller holds
+// dstFS.mu. Shared by handle and named truncate.
+func (node *dstFSNode) truncateLocked(size int64) {
+	switch {
+	case size <= int64(len(node.data)):
+		node.data = node.data[:size]
+	default:
+		grown := make([]byte, size)
+		copy(grown, node.data)
+		node.data = grown
+	}
+	node.modTime = time.Now()
+}
+
+// chmodLocked applies a mode change to a resolved node: permission plus the
+// setuid/setgid/sticky bits, preserving the type bits. A mutation — the
+// durable metadata image moves only on sync. ModTime is untouched: chmod(2)
+// updates ctime only, which is not modeled.
+func (node *dstFSNode) chmodLocked(mode FileMode) {
+	const changeable = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
+	node.mode = node.mode&^changeable | mode&changeable
+}
+
+// dstChmod implements the named Chmod.
+func dstChmod(name string, mode FileMode) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "chmod", Path: name, Err: e} }
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	node.chmodLocked(mode)
+	return true, nil
+}
+
+// chmodHandle implements File.Chmod on a simulated handle.
+func (d *dstFile) chmodHandle(mode FileMode) error {
+	if err := d.enter(); err != nil {
+		return err
+	}
+	defer d.leave()
+	d.node.chmodLocked(mode)
+	return nil
+}
+
+// dstChtimes implements Chtimes: the zero time leaves the corresponding
+// stamp unchanged (the os contract). Only modTime is modeled; atime is not
+// represented (the host's relatime makes it untestable state anyway).
+func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "chtimes", Path: name, Err: e} }
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if !mtime.IsZero() {
+		node.modTime = mtime
+	}
+	_ = atime
+	return true, nil
+}
+
 // dstGetwd / dstChdir: the per-bubble working directory.
 func dstGetwd() (string, bool, error) {
 	if !dstFSActive() {
@@ -765,16 +879,7 @@ func (d *dstFile) truncate(size int64) error {
 	if size < 0 {
 		return syscall.EINVAL
 	}
-	node := d.node
-	switch {
-	case size <= int64(len(node.data)):
-		node.data = node.data[:size]
-	default:
-		grown := make([]byte, size)
-		copy(grown, node.data)
-		node.data = grown
-	}
-	node.modTime = time.Now()
+	d.node.truncateLocked(size)
 	return nil
 }
 

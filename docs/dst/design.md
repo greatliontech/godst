@@ -27,10 +27,11 @@ concurrent path requires structuring the program so exactly one goroutine is run
 fragile discipline that does not survive real concurrency. DST moves that ordering from program
 discipline to **runtime enforcement**, so determinism holds with *many* runnable goroutines.
 
-What DST does **not** virtualize today: real file I/O, unsupported network kinds, and cgo. TCP
-`net.Dial`/`net.Listen` are already modeled by the in-memory deterministic network below; other I/O is
-modeled in-memory by the program under test or avoided. Bringing the remaining I/O into the fork (an
-in-memory deterministic filesystem and file/pipe I/O) is the main pending feature set — see the Roadmap.
+What DST does **not** virtualize today: pipe/stdio I/O, unsupported network kinds, and cgo. TCP
+`net.Dial`/`net.Listen` are modeled by the in-memory deterministic network below, and the filesystem
+by the in-memory deterministic filesystem (both per-bubble, both reset by the run epoch); what
+remains is modeled in-memory by the program under test or avoided. Bringing pipe/stdio I/O into the
+fork (dst-io) and fault orchestration are the main pending feature set — see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
@@ -299,7 +300,8 @@ as the host does. Directory listings (`os.ReadDir`, `File.ReadDir`/`Readdir`/`Re
 chunked `n > 0` reads against a stable cursor) are **sorted by name** — deterministic, and
 consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubble's fake clock.
 Permission bits are stored and reported but not enforced in the base model (no simulated
-credential checks); error identity is production-shaped throughout `errors.Is`: `*PathError`/
+credential checks), and ownership is not represented at all — `Chown`/`Lchown` and `File.Chown`
+stay fenced; error identity is production-shaped throughout `errors.Is`: `*PathError`/
 `*LinkError` wrapping `syscall.ENOENT`/`EEXIST`/`ENOTDIR`/`EISDIR`/`ENOTEMPTY`/`EBADF`/`EINVAL`,
 `os.ErrClosed` on use-after-close, exactly as the host would shape them. POSIX namespace
 semantics hold where databases depend on them: an open file removed from the namespace
@@ -328,8 +330,12 @@ durable image untouched — including that the image is a copy, never an alias o
 that sync alone advances it. `O_SYNC` commits per WRITE through the same single commit point;
 ftruncate is deliberately not covered (POSIX synchronized I/O is for writes — committing on
 truncate would grant durability real disks do not, hiding exactly the bug class DST exists to
-catch). The metadata-CHANGE operations (Chmod/Chtimes) are still fenced; their unsynced-entry
-semantics activate with the convenience increment.
+catch). The metadata-CHANGE operations (Chmod/Chtimes, named Truncate) are implemented with the same
+contract — they mutate current state only; `TestDSTFSMetadata` pins that post-sync Chmod, Chtimes,
+and named Truncate all leave the durable image untouched, and that Chmod does not move mtime
+(chmod(2) updates only ctime, which is not modeled). One deliberate shape: `Chtimes` on a missing
+path is ENOENT even with both times zero — Linux's utimensat both-OMIT-succeeds quirk is not
+reproduced.
 
 **The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen at open: the
 tree-file backend here; dst-io's `os.Pipe` (and std streams) later plug in as a stream-shaped
@@ -506,7 +512,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
-| filesystem / disk I/O | in-memory deterministic filesystem | ⏳ |
+| filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | other I/O (files, pipes, stdio) | in-memory deterministic I/O | ⏳ |
 | faults (scheduling / net / disk / crash) | fault-orchestration layer | ⏳ |
 | cgo | — | ⛔ |
@@ -619,6 +625,17 @@ the fixed seams, so later steps add, never rewrite.
   `net.Interfaces` are follow-ons; public DNS and service-name lookups fail under DST rather than touching
   host resolver state.
 
+- **Disk (in-memory deterministic filesystem). LANDED (second I/O feature).** Under DST the exported
+  `os` surface operates on a per-bubble in-memory tree (empty root + a pre-seeded `/tmp`; fixed
+  `os.TempDir`), reset by the run epoch: the full file-handle surface, the namespace ops with sorted
+  deterministic listings and a per-bubble path-model cwd, unlinked-but-open POSIX semantics, named
+  metadata ops, and the durability representation with its enforced monotonicity invariant (the
+  synced/unsynced split crash faults will tear along). Everything not modeled is fenced — host
+  isolation is an enforced invariant, not a convention. See the "In-memory deterministic filesystem"
+  section above; tested by the `TestDSTFS*` family, the durability white-box, and the cross-process
+  `TestDSTDiskReplay`. Caveats: no symlinks/`os.Root`/locking yet (fenced follow-ons), no ownership
+  model (`Chown` fenced; permission bits stored, not enforced), `Fd()` panics, `Sys()` is nil.
+
 - **Level 2 — access-granularity interleaving + DPOR. LANDED.** The `-race` access hooks double as DST
   scheduling decision points (`-tags dst -race` builds), explored systematically via source-DPOR (sleep
   sets + weak-initial backtracks) with the HB race detector as deterministic oracle, exposed as
@@ -633,15 +650,13 @@ the fixed seams, so later steps add, never rewrite.
 These bring the remaining real I/O into the bubble and then layer fault injection on top. Each is
 virtualized in-memory and deterministic, riding the existing scheduling/time determinism.
 
-- **Disk / filesystem** — an in-memory, deterministic filesystem under DST (file ops, directory
-  iteration), the base for disk faults.
 - **I/O** — deterministic file/pipe/stdio I/O for whatever the network and filesystem layers do not
   cover.
 - **Fault orchestration** — compose scheduling, network, disk, and crash/restart faults under one seed,
   with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound); the
   scheduling- and network/disk-fault targets share one *victim-designation* contract designed here.
-Ordering: the landed runtime substrate is a precondition for all; the I/O features (network → disk →
-io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
+Ordering: the landed runtime substrate is a precondition for all; the I/O features (network ✅ →
+disk ✅ → io) each bring a class of real I/O into the bubble; fault orchestration layers exploration power on top
 once there is something to fault. Level 2 extends the scheduling axis itself and depends only on the
 landed Seq-5 seam + `-race`.
 

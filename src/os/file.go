@@ -663,7 +663,7 @@ func UserHomeDir() (string, error) {
 // and [ModeTemporary] are used.
 func Chmod(name string, mode FileMode) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("chmod", name); fenced {
+		if handled, err := dstChmod(name, mode); handled {
 			return err
 		}
 	}

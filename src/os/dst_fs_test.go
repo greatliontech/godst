@@ -172,11 +172,8 @@ func TestDSTFSFences(t *testing.T) {
 			name string
 			call func() error
 		}{
-			{"truncate", func() error { return os.Truncate("/x", 0) }},
-			{"chmod", func() error { return os.Chmod("/x", 0o644) }},
 			{"chown", func() error { return os.Chown("/x", 0, 0) }},
 			{"lchown", func() error { return os.Lchown("/x", 0, 0) }},
-			{"chtimes", func() error { return os.Chtimes("/x", time.Time{}, time.Time{}) }},
 			{"readlink", func() error { _, err := os.Readlink("/x"); return err }},
 		}
 		for _, op := range pathOps {
@@ -320,8 +317,11 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 		if _, err := mf.Readdirnames(0); !errors.Is(err, syscall.ENOTDIR) {
 			t.Fatalf("Readdirnames on file = %v, want ENOTDIR", err)
 		}
-		if err := mf.Chmod(0o600); !isDSTUnsupportedFS(err) {
-			t.Fatalf("File.Chmod = %v, want unsupported", err)
+		if err := mf.Chmod(0o600); err != nil {
+			t.Fatalf("File.Chmod = %v (implemented as of the metadata chunk)", err)
+		}
+		if fi2, _ := mf.Stat(); fi2.Mode() != 0o600 {
+			t.Fatalf("File.Chmod mode = %v, want 0600", fi2.Mode())
 		}
 		if err := mf.Chown(0, 0); !isDSTUnsupportedFS(err) {
 			t.Fatalf("File.Chown = %v, want unsupported", err)
@@ -741,6 +741,110 @@ func TestDSTFSDurabilityMonotonicity(t *testing.T) {
 			t.Fatalf("O_SYNC truncate = %q/%q, want 9/923 (truncate must not commit)", cur, synced)
 		}
 		sf.Close()
+	})
+}
+
+// TestDSTFSMetadata covers the chunk-4 named metadata ops: Truncate(name)
+// with truncate(2) shapes, Chmod (named and handle) changing exactly the
+// changeable bits, Chtimes with the zero-time leave-unchanged contract, and
+// the monotonicity extension — metadata mutations never advance the durable
+// metadata image.
+func TestDSTFSMetadata(t *testing.T) {
+	simulation.Run(1, func() {
+		must := func(what string, err error) {
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		}
+		must("WriteFile", os.WriteFile("/m", []byte("0123456789"), 0o644))
+
+		// Named truncate.
+		must("Truncate", os.Truncate("/m", 4))
+		if fi, _ := os.Stat("/m"); fi.Size() != 4 {
+			t.Fatalf("post-truncate size = %d", fi.Size())
+		}
+		if err := os.Truncate("/m", -1); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("negative truncate = %v, want EINVAL", err)
+		}
+		if err := os.Truncate("/missing", 0); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("truncate missing = %v, want ENOENT", err)
+		}
+		os.Mkdir("/md", 0o755)
+		if err := os.Truncate("/md", 0); !errors.Is(err, syscall.EISDIR) {
+			t.Fatalf("truncate dir = %v, want EISDIR", err)
+		}
+		// Truncate-up zero-extends.
+		must("Truncate up", os.Truncate("/m", 8))
+		got, _ := os.ReadFile("/m")
+		if string(got) != "0123\x00\x00\x00\x00" {
+			t.Fatalf("truncate-up content = %q", got)
+		}
+
+		// Chmod: changeable bits only; type bits preserved (dir stays dir).
+		must("Chmod", os.Chmod("/m", 0o600|os.ModeSetuid))
+		if fi, _ := os.Stat("/m"); fi.Mode() != 0o600|os.ModeSetuid {
+			t.Fatalf("Chmod mode = %v", fi.Mode())
+		}
+		must("Chmod dir", os.Chmod("/md", 0o700))
+		if fi, _ := os.Stat("/md"); fi.Mode() != os.ModeDir|0o700 || !fi.IsDir() {
+			t.Fatalf("dir Chmod mode = %v", fi.Mode())
+		}
+		if err := os.Chmod("/missing", 0o644); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Chmod missing = %v", err)
+		}
+
+		// Chtimes: explicit mtime sets; zero mtime leaves unchanged.
+		stamp := time.Now().Add(-3 * time.Hour)
+		must("Chtimes", os.Chtimes("/m", time.Time{}, stamp))
+		if fi, _ := os.Stat("/m"); !fi.ModTime().Equal(stamp) {
+			t.Fatalf("Chtimes mtime = %v, want %v", fi.ModTime(), stamp)
+		}
+		must("Chtimes zero", os.Chtimes("/m", time.Time{}, time.Time{}))
+		if fi, _ := os.Stat("/m"); !fi.ModTime().Equal(stamp) {
+			t.Fatalf("zero Chtimes changed mtime: %v", fi.ModTime())
+		}
+
+		// Monotonicity: metadata mutations enter unsynced.
+		f, _ := os.Open("/m")
+		must("Sync", f.Sync())
+		f.Close()
+		_, _, _, _, mode0, syncedMode0, _ := os.DSTFSNodeState("/m")
+		if syncedMode0 != mode0 {
+			t.Fatalf("post-sync metadata image = %v vs %v", syncedMode0, mode0)
+		}
+		must("Chmod after sync", os.Chmod("/m", 0o400))
+		_, _, _, _, mode1, syncedMode1, _ := os.DSTFSNodeState("/m")
+		if mode1 != 0o400 || syncedMode1 != syncedMode0 {
+			t.Fatalf("metadata mutation advanced the durable image: %v/%v", mode1, syncedMode1)
+		}
+		// Chtimes after sync: modTime moves, the durable stamp does not.
+		_, smt0, _ := os.DSTFSNodeTimes("/m")
+		must("Chtimes after sync", os.Chtimes("/m", time.Time{}, stamp.Add(time.Hour)))
+		mt1, smt1, _ := os.DSTFSNodeTimes("/m")
+		if mt1 == smt1 || smt1 != smt0 {
+			t.Fatalf("Chtimes advanced the durable stamp: mt=%d smt=%d smt0=%d", mt1, smt1, smt0)
+		}
+		// Named Truncate after sync: content image untouched (the handle
+		// path is pinned in the durability test; this pins the wrapper).
+		_, synced0, _, _, _, _, _ := os.DSTFSNodeState("/m")
+		must("named Truncate after sync", os.Truncate("/m", 2))
+		cur1, synced1, _, _, _, _, _ := os.DSTFSNodeState("/m")
+		if len(cur1) != 2 || synced1 != synced0 {
+			t.Fatalf("named truncate advanced the durable image: %q vs %q", synced1, synced0)
+		}
+
+		// Chmod does not touch mtime (chmod(2) updates ctime only). The
+		// virtual sleep advances the bubble clock first — without it a
+		// mutant stamping time.Now() writes the same frozen instant and
+		// the probe is vacuous.
+		time.Sleep(time.Second)
+		mtPre, _, _ := os.DSTFSNodeTimes("/m")
+		time.Sleep(time.Second)
+		must("Chmod mtime probe", os.Chmod("/m", 0o644))
+		mtPost, _, _ := os.DSTFSNodeTimes("/m")
+		if mtPre != mtPost {
+			t.Fatalf("Chmod moved mtime: %d -> %d", mtPre, mtPost)
+		}
 	})
 }
 

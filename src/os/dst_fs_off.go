@@ -6,6 +6,8 @@
 
 package os
 
+import "time"
+
 // Stubs so the dst filesystem gates type-check in a non -tags dst build. The
 // gates are all guarded by the dstSimEnabled constant (false here), so every
 // reference below is dead code the compiler folds away; the method bodies are
@@ -43,6 +45,14 @@ func dstGetwd() (string, bool, error)                     { return "", false, ni
 func dstChdir(dir string) (bool, error)                   { return false, nil }
 
 func dstTempDir() (string, bool) { return "", false }
+
+func dstTruncateName(name string, size int64) (bool, error) { return false, nil }
+
+func dstChmod(name string, mode FileMode) (bool, error) { return false, nil }
+
+func dstChtimes(name string, atime, mtime time.Time) (bool, error) { return false, nil }
+
+func (*dstFile) chmodHandle(mode FileMode) error { panic("unreachable") }
 
 func (*dstFile) readdir(n int) ([]string, []FileInfo, error) { panic("unreachable") }
 func (*dstFile) chdirHandle() error                          { panic("unreachable") }

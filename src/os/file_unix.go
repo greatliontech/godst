@@ -377,7 +377,7 @@ func (f *File) seek(offset int64, whence int) (ret int64, err error) {
 // If there is an error, it will be of type [*PathError].
 func Truncate(name string, size int64) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("truncate", name); fenced {
+		if handled, err := dstTruncateName(name, size); handled {
 			return err
 		}
 	}

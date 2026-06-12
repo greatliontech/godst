@@ -103,7 +103,10 @@ func (f *File) chmod(mode FileMode) error {
 		return err
 	}
 	if dstSimEnabled && f.dstf != nil {
-		return f.wrapErr("chmod", dstErrUnsupportedFS)
+		if e := f.dstf.chmodHandle(mode); e != nil {
+			return f.wrapErr("chmod", e)
+		}
+		return nil
 	}
 	if e := f.pfd.Fchmod(syscallMode(mode)); e != nil {
 		return f.wrapErr("chmod", e)
@@ -219,7 +222,7 @@ func (f *File) Sync() error {
 // If there is an error, it will be of type [*PathError].
 func Chtimes(name string, atime time.Time, mtime time.Time) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("chtimes", name); fenced {
+		if handled, err := dstChtimes(name, atime, mtime); handled {
 			return err
 		}
 	}
