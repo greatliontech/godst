@@ -29,28 +29,24 @@ func internal_sync_runtime_dstSyncAcquire(id unsafe.Pointer) {
 	dstSyncAcquire(id)
 }
 
-// The HB-record bridges (NOT the dstSyncAcquire decision-announce bridges) honor
-// g.raceignore exactly as raceacquireg/racereleaseg do: the DST happens-before
-// shadow must agree with the race detector's own HB to stay its faithful mirror.
-// This is what suppresses the embedded writer mutex's HB events while RWMutex
-// executes its internals under race.Disable() — the mutex's decision announce
-// still fires there, so DPOR exploration is unaffected. Public RWMutex HB hooks
-// are placed before race.Disable()/after race.Enable() in sync/rwmutex.go, exactly
-// where their race-annotation twins sit.
+// HB-record suppression under runtime.RaceDisable is NOT handled in these
+// bridges: dstRecordSyncEventForGID — the single choke point every HB recorder
+// funnels through (these bridges, chan.go/select.go, dstAtomicYield) — checks
+// the executing goroutine's raceignore, mirroring race.go's acquire/release
+// variants. That is what suppresses the embedded writer mutex's HB events
+// while RWMutex executes its internals under race.Disable() — the mutex's
+// decision announce still fires there (the dstSyncAcquire bridges do not flow
+// through the HB funnel), so DPOR exploration is unaffected. Public RWMutex HB
+// hooks are placed before race.Disable()/after race.Enable() in
+// sync/rwmutex.go, exactly where their race-annotation twins sit.
 
 //go:linkname internal_sync_runtime_dstRecordSyncRelease internal/sync.runtime_dstRecordSyncRelease
 func internal_sync_runtime_dstRecordSyncRelease(id unsafe.Pointer) {
-	if getg().raceignore != 0 {
-		return
-	}
 	dstRecordSyncRelease(id)
 }
 
 //go:linkname internal_sync_runtime_dstRecordSyncAcquire internal/sync.runtime_dstRecordSyncAcquire
 func internal_sync_runtime_dstRecordSyncAcquire(id unsafe.Pointer) {
-	if getg().raceignore != 0 {
-		return
-	}
 	dstRecordSyncAcquire(id)
 }
 
@@ -65,16 +61,10 @@ func sync_runtime_dstSyncAcquire(id unsafe.Pointer) {
 
 //go:linkname sync_runtime_dstRecordSyncRelease sync.runtime_dstRecordSyncRelease
 func sync_runtime_dstRecordSyncRelease(id unsafe.Pointer) {
-	if getg().raceignore != 0 {
-		return
-	}
 	dstRecordSyncRelease(id)
 }
 
 //go:linkname sync_runtime_dstRecordSyncAcquire sync.runtime_dstRecordSyncAcquire
 func sync_runtime_dstRecordSyncAcquire(id unsafe.Pointer) {
-	if getg().raceignore != 0 {
-		return
-	}
 	dstRecordSyncAcquire(id)
 }

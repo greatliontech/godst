@@ -1861,7 +1861,7 @@ func TestDSTSyncHBRaceIgnore(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "tp_race")
 	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
 	out := runBuiltTestProg(t, exe, "DSTSyncHBSuppress", "DSTSEED=1")
-	for _, field := range []string{"mutexPair", "ignoredPair", "rwLock", "rwUnlock", "rwRLock", "rwRUnlock", "exhausted"} {
+	for _, field := range []string{"mutexPair", "ignoredPair", "rwLock", "rwUnlock", "rwRLock", "rwRUnlock", "tryLockPair", "chanPair", "ignoredChan", "ignoredAtomic", "contended", "exhausted"} {
 		if got := exploreField(t, out, field); got != "true" {
 			t.Fatalf("HB raceignore mirror violated: %s=%s (see DSTSyncHBSuppress fixture):\n%s",
 				field, got, out)

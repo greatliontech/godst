@@ -305,6 +305,10 @@ code), and after ANY cmd/compile change run `task compiler` — it chains `go cl
 reinstall because this fork reports a release version string, so tool IDs come from the version,
 not the binary hash, and a reinstalled compiler does NOT invalidate cached objects (stale-compiler
 builds silently pass). All four legs gate green; a red leg is a regression against this section.
+One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
+trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
+or "no space left on device" from compile/link/cgo) — clear leftover `/tmp/go-build*` and test
+temp dirs, or point `TMPDIR` at disk, before reading FAILs as real.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -905,9 +909,9 @@ offline between Runs: two conflicting accesses are **dependent** iff neither clo
 only the conservative access-yield filter; DPOR source sets and replay decisions use the post-Run clocks.
 The recorded events are the same ones the scheduler/sync primitives control, so the HB is self-contained
 (no dependence on TSan's C-internal clocks); it must agree with `-race`'s own HB to remain the faithful
-oracle, which the conflict-set cross-check against `-race` reports validates (one tracked residual:
-the channel/select/atomic record paths do not yet honor `raceignore` — see the sync-hook mechanism
-passage below). Timer-fire wakeups in synctest fake time are
+oracle, which the conflict-set cross-check against `-race` reports validates; the recorders also honor
+`raceignore` at their common choke point, mirroring the race detector's ignore state (see the sync-hook
+mechanism passage). Timer-fire wakeups in synctest fake time are
    validated by `TestDSTExploreTimerHB`: two goroutines sleep until the same virtual time and then race on a
    shared variable; Exhaustive reaches both read outcomes (`timerhb exh=12`), and DPOR matches them while
    exhausted (`timerhb dpor=3`, two outcomes). So the currently-recorded timer wake edges do not over-order
@@ -1036,13 +1040,18 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    mechanism is `g.raceignore`: the HB-record bridges (not the decision-announce bridges) early-return
    when it is non-zero, exactly as `raceacquireg`/`racereleaseg` do, so upstream's existing
    `race.Disable()` brackets around the `rw.w` operations suppress the embedded mutex's HB with no
-   DST-specific call variants — the mutex/RWMutex HB records honor the same ignore state as the race
-   detector they must agree with, and the public RWMutex HB hooks sit before `race.Disable()`/after
-   `race.Enable()`, exactly where their race-annotation twins sit. (The gate currently covers the
-   sync-package bridges only; the channel/select/atomic HB record paths do not yet consult
-   `raceignore` — a residual disagreement with the race detector's ignore semantics, reachable only
-   by code calling `runtime.RaceDisable` around those ops, tracked in
-   `docs/issues/dst-hb-shadow-coverage.md`.) The mechanism is also load-bearing for DST-L2-4's
+   DST-specific call variants — and the public RWMutex HB hooks sit before `race.Disable()`/after
+   `race.Enable()`, exactly where their race-annotation twins sit. The check lives at the single
+   choke point every HB recorder funnels through (`dstRecordSyncEventForGID` — the sync-package
+   bridges, the chan.go/select.go records including their g-credited sites, and `dstAtomicYield`'s HB
+   contribution), keyed to the EXECUTING goroutine's `raceignore` exactly as every race.go
+   acquire/release variant is (the g-credited `raceacquireg`/`racereleaseg` forms also check
+   `getg().raceignore`), so the whole HB shadow honors the same ignore state as the race detector
+   it must agree with; decision announces and ready/create edges do not flow through that funnel
+   and are unaffected. Enforced by `TestDSTSyncHBRaceIgnore` on the recorded event stream itself
+   (outcome-based tests cannot see HB records — they only prune): RaceDisable-bracketed mutex,
+   channel, and atomic ops record nothing; RWMutex ops record only the public sem events; the
+   contended-Lock and TryLock-success record sites are asserted per call site. The mechanism is also load-bearing for DST-L2-4's
    untagged shape: the hook lines fold away in-place inside upstream's method bodies, adding no wrapper
    layer between a caller and `lockSlow`/`unlockSlow` — the trace/pprof semaphore skip constants count
    inline frames, so any indirection (a parameterized `lock(hb)` body, or a `NoDstHB` method variant at

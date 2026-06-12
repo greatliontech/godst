@@ -862,18 +862,22 @@ func dstRecordSyncEventID(kind uint8, id, aux uintptr) {
 	dstRecordSyncEventForGID(kind, id, aux, gp)
 }
 
-func dstRecordSyncEventForG(kind uint8, id unsafe.Pointer, gp *g) {
-	if id == nil {
-		return
-	}
-	dstRecordSyncEventForGID(kind, uintptr(id), 0, gp)
-}
-
 func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	if !dstActive() || dstSchedKind != dstSchedScheduled {
 		return
 	}
 	if gp == nil || gp.bubble == nil || id == 0 {
+		return
+	}
+	// The HB shadow honors the EXECUTING goroutine's raceignore, exactly as
+	// every race.go acquire/release variant does (the g-credited forms
+	// raceacquireg/racereleaseg also check getg().raceignore, not the passed
+	// g's): an event whose TSan twin is ignored must not enter the shadow, or
+	// the offline clocks disagree with the -race oracle. This single choke
+	// point covers every recorder — the sync-package bridges, chan.go/
+	// select.go (including their g-credited sites), and dstAtomicYield. Announces
+	// and ready/create edges do not flow through here and stay unaffected.
+	if raceenabled && getg().raceignore != 0 {
 		return
 	}
 	seq := dstEnsureSeq(gp)

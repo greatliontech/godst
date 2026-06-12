@@ -6,12 +6,6 @@ chunk-start gate (sub-chunk `N.1`) scans this index for entries resolving to the
 current chunk; the close-out gate promotes any load-bearing rationale inline and
 deletes the resolved entry.
 
-## Open issues
-
-| Issue | Lands | Summary |
-|-------|-------|---------|
-| [dst-hb-shadow-coverage](dst-hb-shadow-coverage.md) | when the dst-race HB recording paths (chan/select/atomic) are next modified | Channel/select/atomic HB records don't honor `raceignore` (mutex/RWMutex bridges do); contended-path mutex HB records lack event-stream enforcement. |
-
 ## Pending features
 
 The I/O and fault features on the design.md Roadmap — planned work that brings real
