@@ -225,7 +225,9 @@ canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated loca
 `:0` listeners receive deterministic nonzero ports, listener lookup uses canonical simulated IPs
 (`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6
 wildcard address and accepts dials of both families, conflicting with either family's listeners on the
-port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family), and error identity is production-shaped
+port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family, and a single-family wildcard listen reports
+the family wildcard form — `0.0.0.0:p` / `[::]:p`, dialable back to the listener — not the loopback it
+maps to internally), and error identity is production-shaped
 throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listens `EADDRINUSE`; every
 operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
 reads from a gracefully closed peer return `io.EOF` while writes to a closed peer and any operation on
@@ -233,7 +235,10 @@ a reset connection carry `ECONNRESET`; deadline failures are `*net.OpError` wrap
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
 the bubble's virtual clock. Closing a listener resets the connections still in its accept backlog
 (production's RST), so a dialer that already succeeded observes `ECONNRESET` instead of blocking
-durably forever, and `Accept` after `Close` always fails with `net.ErrClosed`. The nettrace
+durably forever, and `Accept` after `Close` always fails with `net.ErrClosed` — including an `Accept`
+already blocked in its select when `Close` runs: the overlap linearizes to close-first (the pending
+accept unblocks with `net.ErrClosed` and its would-be connection is reset with the backlog, as
+production unblocks pending accepts on close). The nettrace
 `ConnectStart`/`ConnectDone` callbacks fire around a simulated dial, so `httptrace`-instrumented
 clients observe connects as in production. The seam is the exported
 `Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it

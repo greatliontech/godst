@@ -470,6 +470,23 @@ func (l *dstListener) Accept() (Conn, error) {
 				// Torn down (reset/refused) while queued; never hand it out.
 				continue
 			}
+			// An Accept already parked in this select when Close ran can win
+			// the queued-connection case over the just-closed done case (the
+			// seeded select picks among ready cases); production unblocks
+			// every pending Accept with ErrClosed unconditionally. Recheck:
+			// if Close has begun, this connection belongs to the backlog
+			// Close resets — our claim above (acceptState 0→1) made Close's
+			// drain skip it, so the reset is ours to perform.
+			select {
+			case <-l.done:
+				if dc, ok := c.(*dstConn); ok {
+					dc.resetConn()
+				} else {
+					c.Close()
+				}
+				return nil, l.opError("accept", errClosed)
+			default:
+			}
 			return c, nil
 		case <-l.done:
 			return nil, l.opError("accept", errClosed)
@@ -534,8 +551,22 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	// keys. "0.0.0.0" stays IPv4-only and "tcp4"/"tcp6" stay single-family,
 	// as in production.
 	dual := network == "tcp" && wildcard && host != "0.0.0.0"
-	listenAddr := &TCPAddr{IP: ip, Port: portnum}
-	if err := dstListenOptionsError(lc, network, listenAddr); err != nil {
+	// The address the listener reports (Addr and error texts): production
+	// reports the wildcard form for wildcard listens (0.0.0.0:p / [::]:p, the
+	// IPv6 form for dual-stack), not the loopback the simulation maps them to
+	// internally. The reported form stays dialable: dstHostIP maps it back to
+	// the simulated loopback of the same family.
+	reportIP := ip
+	if dual {
+		reportIP = IPv6zero
+	} else if wildcard {
+		if dstAddrFamily(network, ip) == "tcp4" {
+			reportIP = IPv4zero
+		} else {
+			reportIP = IPv6zero
+		}
+	}
+	if err := dstListenOptionsError(lc, network, &TCPAddr{IP: reportIP, Port: portnum}); err != nil {
 		return nil, err
 	}
 
@@ -553,10 +584,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	} else {
 		keys = []string{dstListenerKey(network, ip, portnum, wildcard)}
 	}
-	addr := &TCPAddr{IP: ip, Port: portnum}
-	if dual {
-		addr = &TCPAddr{IP: IPv6zero, Port: portnum}
-	}
+	addr := &TCPAddr{IP: reportIP, Port: portnum}
 	if dstAnyListenerConflict(network, ip, keys, portnum, wildcard, dual) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
 	}

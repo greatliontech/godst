@@ -1029,3 +1029,99 @@ func TestDSTNetListenerCloseFullBacklog(t *testing.T) {
 		}
 	})
 }
+
+// TestDSTNetParkedAcceptLosesToClose pins the Accept/Close overlap
+// linearization (A2-31): an Accept already blocked in the listener's select
+// when Close runs returns net.ErrClosed — never a connection — and the
+// connection it would have won is reset like the rest of the backlog, exactly
+// as production unblocks every pending accept on close. The sequencing is
+// deterministic under the simulation: the acceptor parks at a quiescence
+// point, the dial hands it the connection, and Close runs before the acceptor
+// is resumed.
+func TestDSTNetParkedAcceptLosesToClose(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln, err := Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		type acceptResult struct {
+			c   Conn
+			err error
+		}
+		res := make(chan acceptResult, 1)
+		go func() {
+			c, err := ln.Accept()
+			res <- acceptResult{c, err}
+		}()
+		time.Sleep(time.Millisecond) // quiescence: the acceptor is parked in its select
+		c, err := Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ln.Close(); err != nil { // before the acceptor is resumed
+			t.Fatalf("Close = %v", err)
+		}
+		r := <-res
+		if r.err == nil || !errors.Is(r.err, ErrClosed) {
+			t.Errorf("Accept overlapping Close = (%v, %v), want net.ErrClosed", r.c, r.err)
+		}
+		buf := make([]byte, 1)
+		if _, err := c.Read(buf); !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("Read on the reset connection = %v, want ECONNRESET", err)
+		}
+	})
+}
+
+// TestDSTNetFamilyWildcardAddr pins the reported address of single-family
+// wildcard listens (A2-32): production reports the family wildcard form
+// (0.0.0.0:p / [::]:p), not the loopback the simulation maps it to
+// internally — and dialing the reported form still reaches the listener.
+func TestDSTNetFamilyWildcardAddr(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		ln4, err := Listen("tcp4", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ta4 := ln4.Addr().(*TCPAddr)
+		if !ta4.IP.Equal(IPv4zero) {
+			t.Errorf("tcp4 wildcard Addr = %v, want 0.0.0.0:port", ta4)
+		}
+		ln6, err := Listen("tcp6", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ta6 := ln6.Addr().(*TCPAddr); !ta6.IP.Equal(IPv6zero) {
+			t.Errorf("tcp6 wildcard Addr = %v, want [::]:port", ta6)
+		}
+		ln40, err := Listen("tcp", "0.0.0.0:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ta40 := ln40.Addr().(*TCPAddr); !ta40.IP.Equal(IPv4zero) {
+			t.Errorf(`Listen("tcp", "0.0.0.0:0") Addr = %v, want 0.0.0.0:port`, ta40)
+		}
+		// The reported wildcard form is dialable and reaches the listener.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c, err := ln4.Accept()
+			if err != nil {
+				t.Errorf("Accept on tcp4 wildcard: %v", err)
+				return
+			}
+			c.Close()
+		}()
+		c, err := Dial("tcp4", ln4.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial(%q) = %v", ln4.Addr().String(), err)
+		}
+		<-done
+		c.Close()
+	})
+}
