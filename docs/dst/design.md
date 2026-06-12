@@ -287,7 +287,13 @@ untagged `go test std`-level pass for build-mode inertness. The untagged build-c
 covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog. The untagged
 `-short runtime` leg also enforces that `runtime/testdata/testprog` stays cgo-free: a cgo-pulling
 import there (net, os/user — DST fixtures needing those live in `testprognet`) disables the
-runtime's deadlock detection and hangs the crash tests loudly.
+runtime's deadlock detection and hangs the crash tests loudly. Two operational rules for running
+these configurations honestly: never let a pipeline eat the exit code (`go test ... | tail -1`
+reports the pipe's status, not the test's — this masked real failures twice), and after ANY
+cmd/compile change run `go clean -cache` — this fork reports a release version string, so tool IDs
+come from the version, not the binary hash, and a reinstalled compiler does NOT invalidate cached
+objects (stale-compiler builds silently pass). The A2-25 runner choice is made: a Taskfile encoding
+these configurations (with honest exit codes and the cache rule) is the next infrastructure chunk.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 

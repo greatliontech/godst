@@ -41,9 +41,19 @@ not exercise real fds under DST, so virtualizing the userspace surface (not the
 ## Open questions to settle when it lands
 
 - Whether to expose this through `os` directly or via an `fs.FS`-shaped seam.
-- The durability/crash model (what survives a simulated crash) — this is the part
-  that matters most for storage-engine SUTs and should be designed with the
-  fault feature.
+- **Durability/crash model — settle the CONTRACT at spec tier during THIS
+  feature's design step, not with the fault feature** (decided at sequencing):
+  whether crash faults may drop or tear unsynced writes determines whether the
+  file representation must distinguish synced from unsynced state, so deferring
+  the contract would foreclose the core write path into a retrofit. Implement
+  the no-fault collapse (everything survives, but writes tracked as
+  synced/unsynced from day one); the fault feature then adds policies, not
+  representation.
+- `os.Pipe` ownership (here vs dst-io) — decide during this feature's design
+  step, when the fd-machinery shape exists (also decided at sequencing).
+- Fixture placement: any testprog needing `os`-beyond-files imports that pull
+  cgo must go to `testprognet`, never `testprog` (the deadlock-detection
+  boundary — see design.md "Enforcing test configurations").
 
 ## Contract note
 
