@@ -157,12 +157,19 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 // Exhaustive enumerates the whole decision tree. DPOR explores one interleaving
 // per Mazurkiewicz equivalence class, finding the same bugs with far fewer runs.
 //
-// Boundary: exploration branches on recorded transitions — memory accesses and
-// channel/mutex/RWMutex decisions. sync/atomic operations and len/cap reads of
-// channels are NOT recorded: a bug requiring a specific winner of an atomic CAS
-// race (or a len(ch) observed concurrently with a send) may not be found even
-// when Exhausted reports true. The race detector still models atomics, so this
-// does not produce false races — only unexplored atomic-order outcome classes.
+// Boundary: exploration branches on recorded transitions — memory accesses,
+// channel/mutex/RWMutex decisions, sync/atomic operations (free functions and
+// the typed APIs, recorded at instrumented STATIC call sites), and len(ch)
+// reads (cap(ch) is immutable after make and carries no ordering decision).
+// Atomic call forms that record no transition: calls from inside
+// non-instrumented packages (the runtime; a norace package like sync when the
+// call is not inlined into instrumented code — the sync packages' own
+// decision hooks cover their primitives), and dynamic forms — interface
+// dispatch on an atomic value, method values (f := x.Load), and func-valued
+// free functions — plus //go:nosplit callers and embedded-promotion tail-call
+// wrappers. An outcome-determining atomic
+// reached only through those forms may under-explore even when Exhausted
+// reports true.
 func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 	return ExploreWith(seed, ExploreOptions{Mode: mode}, sut)
 }

@@ -276,7 +276,7 @@ scope as elsewhere.
 ### Enforcing test configurations
 
 The DST contract tests are dead in a stock `-short`/untagged run; the enforcing configurations are:
-`go test -tags dst runtime testing/simulation net` (non-`-short`: the 290-program sweep, the
+`go test -tags dst runtime testing/simulation net` (non-`-short`: the 802-program sweep, the
 race-oracle and auto-instrumentation tests — which build their own `-race` testprogs — and the
 build-mode inertness test all skip under `-short`), `go test -tags dst -race testing/simulation` for
 the dst-race sync-hook encodings (the suite is `-race`-clean: every SUT that runs under `-race` is
@@ -284,7 +284,10 @@ race-free — intentionally racy SUTs are either subprocess testprogs or skip-ga
 via `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
 load-bearing for this invariant), and an
 untagged `go test std`-level pass for build-mode inertness. The untagged build-constraint panic is
-covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog.
+covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog. The untagged
+`-short runtime` leg also enforces that `runtime/testdata/testprog` stays cgo-free: a cgo-pulling
+import there (net, os/user — DST fixtures needing those live in `testprognet`) disables the
+runtime's deadlock detection and hangs the crash tests loudly.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -505,8 +508,10 @@ the fixed seams, so later steps add, never rewrite.
 - **Level 2 — access-granularity interleaving + DPOR. LANDED.** The `-race` access hooks double as DST
   scheduling decision points (`-tags dst -race` builds), explored systematically via source-DPOR (sleep
   sets + weak-initial backtracks) with the HB race detector as deterministic oracle, exposed as
-  `Explore`/`ExploreWith`/`Replay`. Increments D1–D5 implemented and validated (see the "Level 2" design
-  section below; enforcement: the 290-program sweep `TestDSTExploreSweep`, `TestDSTExploreComplete`,
+  `Explore`/`ExploreWith`/`Replay`. `sync/atomic` operations (free and typed APIs) and `len(ch)`
+  observations are recorded decision transitions too — the former Completeness-boundary exclusions are
+  closed (`TestDSTExploreAtomicAutoInstrument`; the sweep's atomic families). Increments D1–D5 implemented and validated (see the "Level 2" design
+  section below; enforcement: the 802-program sweep `TestDSTExploreSweep`, `TestDSTExploreComplete`,
   the race-oracle and replay tests, and build-mode inertness `TestDSTAccessYieldBuildModeInert`).
 
 ### Pending features
@@ -769,11 +774,11 @@ mutex is sound and is exactly the interleaving Gap A needs.
   "explored to exhaustion" is a false negative. *Encoding:* **`TestDSTExploreSweep`** — for a generated
   family of small closed programs (reads/writes over shared vars, with/without mutexes; plus channel
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
-  every member (290 SUTs, mutation-tested: 23 fail with `dstSyncAcquire` neutered). The committed
+  every member (802 SUTs — the original 290 plus the atomic, atomic-plain-mixed, multi-way, and two-variable-mixed families — mutation-tested: 23 of the original family fail with `dstSyncAcquire` neutered; 411 fail with `dstAtomicYield` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
 - **DST-L2-4 (clause-explicit: production untouched).** Level-2 hooks are build-mode inert outside
-  `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield` or
-  `dstAccessYieldRange` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under
+  `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield`,
+  `dstAccessYieldRange`, or `dstAtomicYield` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under
   the scheduled strategy. Runtime structs may carry inert DST fields in this fork; byte-identical layout is
   not the contract. *violation:* production, plain-`-race`, or `-tags dst` without `-race` emits or executes
   Level-2 hooks, changing behavior or scheduling. *Encoding:* a build-mode objdump test proves user code
@@ -786,8 +791,13 @@ mutex is sound and is exactly the interleaving Gap A needs.
 
 A **transition boundary** under Level 2 is, at a safe point on a SUT (bubble) goroutine, either (a) an
 instrumented **memory access** (read/write/range) to a *shared* address (`dstAccessYield`), or (b) a
-**synchronization object decision** — mutex/RWMutex acquire, try, release, channel send/recv/select/close —
-recorded as a write-conflict on the sync object's identity (`dstSyncAcquire`) — *in addition to* the
+**synchronization object decision**: mutex/RWMutex acquire, try, release, and channel
+send/recv/select/close, recorded as a write-conflict on the sync object's identity
+(`dstSyncAcquire`); a `sync/atomic` operation, recorded on the operand's address and real byte
+width — write-conflict, or read-conflict for pure loads (`dstAtomicYield`, emitted at instrumented
+call sites; see "Atomics and len(ch) are recorded transitions" under the Completeness boundary);
+or a `len(ch)` observation, recorded as a read-conflict on the channel identity
+(`dstSyncObserve`) — *in addition to* the
 existing coarse boundaries (block/select/`Gosched`/create), which remain. At a boundary the active strategy
 may switch goroutines, so the scheduler can interleave at the grain of a single access.
 
@@ -1081,16 +1091,54 @@ they carry no outcome-determining order choice a recorded access/sync-object dec
 relation is sound and complete *for SUTs whose shared memory accesses **and** synchronization
 object decisions are recorded as transitions, and that do not observe finalizer/cleanup timing* — enforced
 over a generated family (mutex- and channel-decision-order cases included) by the
-`TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 290 SUTs).
+`TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 802 SUTs).
 
-**Named exclusions (not recorded transitions).** `sync/atomic` operations carry no decision hook
-(under `-race` they route through TSan's atomic entry points, which model the synchronization for
-the race oracle but record no DST transition), and `len(ch)`/`cap(ch)` reads record nothing. A SUT
-whose outcome turns on the winner of an atomic CAS race, or on a `len(ch)` observed concurrently with
-a send, explores ONE of the outcome classes and still reports `Exhausted=true` — the prog#257 lesson
-replayed for atomics: an outcome-determining decision with no recorded identity. The `Explore` API doc
-states the boundary; hooking atomics as decision points (a `dstSyncAcquire` analog at TSan's atomic
-entry points) is the tracked candidate that would close it.
+**Atomics and len(ch) are recorded transitions (former named exclusions — closed).** `sync/atomic`
+operations are decision points: the dst-race compiler mode emits `dstAtomicYield(addr, width, kind)`
+immediately before each static `sync/atomic` call in instrumented code — the atomic implementations
+are NOSPLIT race assembly that cannot host a yield, so this is the D1 Option-1 shape (an ADDITIONAL
+call, TSan untouched) applied at the call-site choke point. Both forms are classified: the free
+functions and the typed-API methods — the latter are load-bearing because `sync/atomic` is a
+noRaceFunc package whose functions are NOT inlinable under `-race`, so a typed call stays out of
+line and only the instrumented call site can announce it (the typed structs' zero-size
+noCopy/align64 prefixes put the value at offset 0, so the receiver address IS the atomic's
+address). Loads announce as read-conflicts (load pairs commute); stores/RMWs/CAS as write-conflicts
+on the operand's real byte width, so atomics also pair with PLAIN accesses of the same memory.
+After the yield returns — the op commits next, with no further yield — the hook records the op's
+happens-before contribution for offline-DPOR pruning and the live filter clocks: Load acquire,
+Store release, RMW acquire+release (acquire first, so RMW chains stay transitively ordered), and
+**CAS acquire-only** — it always observes but may write nothing, and the hook runs before the
+outcome is known; the missed release of a successful CAS only forgoes pruning. The *effective*
+release semantics are cumulative, not the literal per-op observed-by edge: release clocks MERGE
+on the object (a load after two stores acquires both stores' history, though it observed only the
+last — a deliberate over-approximation on the load side; TSan's own AtomicStore overwrites rather
+than merges, so this is strictly more ordered than TSan for W→W→R), while the storer side
+deliberately under-approximates (a pure Store records no acquire). Where
+this merged model claims an edge the strict observed-by reading would not (the W→W→R pattern, or
+a failed CAS if it over-claimed a release), the explorer's architecture masks the difference
+rather than losing a class: same-address atomic announces always form a conflicting pair, so the
+release/acquire ops are always reorderable, and the per-trace re-analysis of the reordered trace
+drops the claimed edge — verified by an outcome-equivalent over-claim mutant across the sweep
+(including the two-variable A5 family built to defeat it) and a crafted probe. CAS stays
+acquire-only as the faithful floor so no MORE of the model rests on that masking than the merge
+semantics already do; the enforced contract is the sweep's DPOR == Exhaustive equivalence.
+`len(ch)` announces the channel identity as a READ-conflict in `chanlen` (`dstSyncObserve`),
+pairing with the ops' write-conflict announces; `cap(ch)` is NOT hooked — capacity is immutable
+after `make`, so a cap read carries no ordering decision (the earlier draft of this boundary named
+cap as an exclusion to close; it is a non-decision, not an exclusion). Remaining boundary — atomic call forms that record NO transition: (1) calls from inside a
+non-instrumented package (the runtime's own atomics; a norace package's internal call sites when
+not inlined into instrumented code) — the sync packages' primitives carry their own decision
+hooks; (2) DYNAMIC call forms, where the callee is not a static symbol the emission can classify:
+interface dispatch on an atomic value, method values (`f := x.Load; f()` — the generated `-fm`
+wrapper lives in the noRaceFunc sync/atomic package), and func-valued free functions
+(`f := atomic.LoadInt32`); (3) instrumented `//go:nosplit` callers (the yield is splittable;
+skipping is sound but unexplored) and embedded-promotion tail-call wrappers. A SUT whose
+outcome-determining atomic is reached ONLY through these forms under-explores exactly as the old
+exclusion did; the direct static forms — overwhelmingly the way atomics are written — are covered. Enforced by the atomic/mixed/multi-way
+sweep families (DPOR == Exhaustive, including the conservative-HB pruning) and
+`TestDSTExploreAtomicAutoInstrument` (unmodified SUTs: CAS winner, store/swap order, add-vs-load,
+And/Or, 64-bit and pointer widths, typed-API wrappers, len-vs-send — each Outcomes==2,
+Exhausted==true).
 
 An **earlier draft of this note was wrong**: it claimed completeness for "SUTs whose shared *accesses* are
 all annotated," overlooking that **synchronization object decision order is itself a dependency**. A
@@ -1130,7 +1178,7 @@ relation.
       DPOR explored *outcome set* equals `exhaustiveExplore`'s for every member, not just the committed
       micro-SUTs. This is the real DST-L2-3 guard. **VALIDATED [V] — and it immediately earned its keep:**
       it exposed a *pre-existing* DST-L2-3 completeness defect (the persistent-set DPOR dropped every
-      **synchronization-object-decision-order** class in the sweep — 23/290 SUTs, all-and-only
+      **synchronization-object-decision-order** class in the sweep — 23 SUTs of the then-290, all-and-only
       mutex/channel cases), because the lock/rendezvous-order decision is an `addr=0` transition the dependency relation
       ignored. **Fixed before sleep sets** (a reduction layered on an incomplete search would drop even
       more): `dstSyncAcquire` (D1) records sync-object decisions as conflicting transitions — zero brain change —
@@ -1158,7 +1206,8 @@ relation.
       and drop a class.
    3. **Adversarial review** (incompleteness failure mode + determinism/soundness) — run per the
       Adversarial loop on the change set.
-   Measured (290-program standing sweep, mismatches=0, including the timer-gated HB SUT): source-DPOR vs
+   Measured (at the then-290-program standing sweep, mismatches=0, including the timer-gated HB SUT;
+   the sweep now stands at 802 with the atomic families, still mismatches=0): source-DPOR vs
    the persistent-set baseline cuts the worst-program schedule count `maxDpor` 125→69; current totals are
    `totExh=13414`, `totDpor=1965`; a
    370-program run (incl. the timer-HB SUT, 3 goroutines × 2 ops, and 4-way contention; exhaustive up to

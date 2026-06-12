@@ -169,6 +169,7 @@ func InitConfig() {
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
 	ir.Syms.DstAccessYield = typecheck.LookupRuntimeFunc("dstAccessYield")
 	ir.Syms.DstAccessYieldRange = typecheck.LookupRuntimeFunc("dstAccessYieldRange")
+	ir.Syms.DstAtomicYield = typecheck.LookupRuntimeFunc("dstAtomicYield")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
@@ -4983,6 +4984,62 @@ func (s *state) callAddr(n *ir.CallExpr, k callKind) *ssa.Value {
 
 // Calls the function n using the specified call type.
 // Returns the address of the return value (or nil if none).
+// dstAtomicCallInfo classifies a static call to a sync/atomic function for the
+// dst-race compiler mode (DST Level-2): the atomic kind dstAtomicYield takes.
+// Kind values MIRROR runtime's dstAtomic* constants (0 load, 1 store, 2 RMW,
+// 3 CAS) — the compiler cannot import runtime, so the values are a shared
+// convention. Both forms are classified: the free functions ("LoadInt32",
+// "CompareAndSwapPointer", ...) and the typed-API methods
+// ("(*Int32).CompareAndSwap", "(*Value).Store", ...) — the latter matter
+// because sync/atomic is a noRaceFunc package, whose functions are NOT
+// inlinable under -race, so a typed-API call stays an out-of-line call into
+// uninstrumented code and the emission must happen at this (instrumented)
+// call site. The operand width is not derived from the name: the caller takes
+// it from the pointer argument's element type, which is uniform across both
+// forms (the typed structs' zero-size noCopy/align64 prefixes put the value
+// at offset 0, so the receiver address IS the atomic's address).
+func dstAtomicCallInfo(name string) (kind int64, ok bool) {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		// Typed-API method form.
+		switch name[i+1:] {
+		case "Load":
+			return 0, true
+		case "Store":
+			return 1, true
+		case "Swap", "Add", "And", "Or":
+			return 2, true
+		case "CompareAndSwap":
+			return 3, true
+		}
+		return 0, false
+	}
+	var op string
+	var kindv int64
+	switch {
+	case strings.HasPrefix(name, "Load"):
+		op, kindv = name[len("Load"):], 0
+	case strings.HasPrefix(name, "Store"):
+		op, kindv = name[len("Store"):], 1
+	case strings.HasPrefix(name, "Swap"):
+		op, kindv = name[len("Swap"):], 2
+	case strings.HasPrefix(name, "Add"):
+		op, kindv = name[len("Add"):], 2
+	case strings.HasPrefix(name, "And"):
+		op, kindv = name[len("And"):], 2
+	case strings.HasPrefix(name, "Or"):
+		op, kindv = name[len("Or"):], 2
+	case strings.HasPrefix(name, "CompareAndSwap"):
+		op, kindv = name[len("CompareAndSwap"):], 3
+	default:
+		return 0, false
+	}
+	switch op {
+	case "Int32", "Uint32", "Int64", "Uint64", "Uintptr", "Pointer":
+		return kindv, true
+	}
+	return 0, false
+}
+
 func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExtra ir.Expr) *ssa.Value {
 	s.prevCall = nil
 	var calleeLSym *obj.LSym // target function (if static)
@@ -4990,6 +5047,8 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 	var codeptr *ssa.Value   // ptr to target code (if dynamic)
 	var dextra *ssa.Value    // defer extra arg
 	var rcvr *ssa.Value      // receiver to set
+	var dstAtomicWidth, dstAtomicKind int64 // dst-race mode: hooked sync/atomic call (see below)
+	dstAtomicOK := false
 	fn := n.Fun
 	var ACArgs []*types.Type    // AuxCall args
 	var ACResults []*types.Type // AuxCall results
@@ -5008,6 +5067,27 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 		if (k == callNormal || k == callTail) && fn.Op() == ir.ONAME && fn.(*ir.Name).Class == ir.PFUNC {
 			fn := fn.(*ir.Name)
 			calleeLSym = callTargetLSym(fn)
+			// DST Level-2 (dst-race mode): a static call to a sync/atomic
+			// operation from instrumented code is an outcome-determining
+			// decision point (which goroutine's op on an address commits
+			// first — a CAS winner) committed inside NOSPLIT race assembly
+			// that cannot host a yield. Exactly like the access hooks (D1,
+			// instrument2): classify here, then emit an ADDITIONAL
+			// runtime.dstAtomicYield call before the atomic, TSan untouched.
+			// Same gates as the access emission: dst-race mode, -race,
+			// instrumented function (noRaceFunc packages — sync,
+			// internal/sync, sync/atomic itself — are excluded, so sync
+			// primitives' internals keep their own decision hooks), not
+			// //go:nosplit (the yield is splittable; skipping is sound).
+			if base.Debug.DstRace != 0 && base.Flag.Race && s.instrumentMemory && k == callNormal &&
+				s.curfn.Pragma&ir.Nosplit == 0 && fn.Sym().Pkg.Path == "sync/atomic" &&
+				len(n.Args) > 0 && n.Args[0].Type().IsPtr() {
+				if kind, ok := dstAtomicCallInfo(fn.Sym().Name); ok {
+					dstAtomicKind = kind
+					dstAtomicWidth = n.Args[0].Type().Elem().Size()
+					dstAtomicOK = true
+				}
+			}
 			if buildcfg.Experiment.RegabiArgs {
 				// This is a static call, so it may be
 				// a direct call to a non-ABIInternal
@@ -5130,6 +5210,21 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 
 		for i, n := range args {
 			callArgs = append(callArgs, s.putArg(n, t.Param(i).Type))
+		}
+
+		// dst-race mode, hooked sync/atomic call (classified above): emit the
+		// decision-point yield AFTER the argument loop — argument side
+		// effects must run exactly once, before the decision, and the
+		// evaluated address value is reused rather than re-evaluated — and
+		// before the call's memory is taken, so the yield is ordered before
+		// the atomic op. Inserting a call here is legal only while every
+		// hooked signature's arguments are SSA-able scalars/pointers (true
+		// for all of sync/atomic): a non-SSA-able argument would recreate
+		// the OpDereference/call memory-state mismatch of issue #49282.
+		if dstAtomicOK {
+			s.rtcall(ir.Syms.DstAtomicYield, true, nil, callArgs[0],
+				s.constInt(types.Types[types.TUINTPTR], dstAtomicWidth),
+				s.constInt(types.Types[types.TUINTPTR], dstAtomicKind))
 		}
 
 		callArgs = append(callArgs, s.mem())

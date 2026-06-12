@@ -117,6 +117,95 @@ func dstSyncAcquire(id unsafe.Pointer) {
 	dstYieldAccess(uintptr(id), 1, true, false, sys.GetCallerPC())
 }
 
+// Atomic-operation kinds for dstAtomicYield. MIRRORED by the compiler's
+// dst-race emission (cmd/compile/internal/ssagen, dstAtomicCallInfo) — the
+// compiler cannot import runtime, so the values are a shared convention.
+const (
+	dstAtomicLoad  = 0 // Load*: read-conflict; HB acquire (it observes)
+	dstAtomicStore = 1 // Store*: write-conflict; HB release (it publishes, observes nothing)
+	dstAtomicRMW   = 2 // Swap*/Add*/And*/Or*: write-conflict; HB acquire+release (observes and publishes)
+	dstAtomicCAS   = 3 // CompareAndSwap*: write-conflict; HB acquire ONLY (see below)
+)
+
+// dstSyncAtomicAux keys atomic happens-before events apart from the channel
+// auxes on the same id space (close=0, buffered slots=slot+1, rendezvous=^0):
+// an atomic variable's address and a channel pointer are distinct objects, but
+// a distinct aux keeps the keying collision-free by construction.
+const dstSyncAtomicAux = ^uintptr(1)
+
+// dstAtomicYield is the Level-2 transition boundary for a sync/atomic
+// operation: the dst-race compiler mode emits it immediately before each
+// static call to a sync/atomic function in instrumented code (the atomic
+// implementations themselves are NOSPLIT race assembly and cannot host a
+// yield — the same constraint that put dstAccessYield in the compiler, D1).
+// Which goroutine's atomic op on an address commits first is an
+// outcome-determining decision (a CAS winner) decided at TSan's atomic entry
+// points, which record no DST transition — without this hook DPOR explores
+// one outcome class and still reports Exhausted=true (the prog#257 lesson
+// replayed for atomics; the Completeness boundary's former named exclusion).
+//
+// Announced like dstSyncAcquire — always-yield, never the shared-address
+// filter: atomic ops create happens-before BETWEEN THEMSELVES (the events
+// below), so the filter would learn the executed order and suppress exactly
+// the decisions whose reversals matter. Loads announce as read-conflicts
+// (load pairs commute), everything else as write-conflicts on the address's
+// real byte width, so atomics also pair with PLAIN accesses of the same
+// memory in the dependency relation.
+//
+// After the yield returns — the goroutine is resumed and the atomic commits
+// next, in the NOSPLIT assembly, with no further yield — the op's
+// happens-before contribution is recorded for the offline DPOR relation and
+// the live filter clocks. The effective release semantics are cumulative
+// (release clocks MERGE on the object — see the design.md effective-semantics
+// paragraph; where the merge claims an edge the literal observed-by reading
+// would not, the announce-reorderability masking below applies and the
+// sweep's DPOR==Exhaustive equivalence is the enforced contract). On top of
+// that floor, CAS records acquire ONLY: it
+// always observes the old value (acquire is real, success or failure) but
+// may write nothing, and the hook runs before the outcome is known —
+// claiming its release would publish a failed CAS's clock, an edge the
+// memory model does not grant. In the CURRENT explorer that over-claim is
+// masked rather than fatal: same-address atomic announces always form a
+// conflicting pair, so the release-op/acquire-op reorder is always seeded,
+// and the per-trace re-analysis drops the claimed edge in the reordered
+// trace and recovers any class it suppressed (verified: the over-claim
+// mutant is outcome-equivalent across the sweep and a crafted two-variable
+// probe). Acquire-only is kept as the faithful model so pruning soundness
+// rests on the memory model, not on that masking. The missed release edge
+// of a SUCCESSFUL CAS only forgoes pruning (over-exploration), never a
+// class.
+//
+//go:linkname dstAtomicYield
+func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr) {
+	dstYieldAccess(uintptr(addr), size, kind != dstAtomicLoad, false, sys.GetCallerPC())
+	switch kind {
+	case dstAtomicLoad, dstAtomicCAS:
+		dstRecordSyncAcquireID(uintptr(addr), dstSyncAtomicAux)
+	case dstAtomicStore:
+		dstRecordSyncReleaseID(uintptr(addr), dstSyncAtomicAux)
+	case dstAtomicRMW:
+		// Acquire first, then release: the published clock then includes the
+		// just-observed history, so RMW chains (atomic counters) stay
+		// transitively ordered for pruning.
+		dstRecordSyncAcquireID(uintptr(addr), dstSyncAtomicAux)
+		dstRecordSyncReleaseID(uintptr(addr), dstSyncAtomicAux)
+	}
+}
+
+// dstSyncObserve is the read-side sibling of dstSyncAcquire: a len(ch)
+// observation announces the channel's identity as a READ-conflict and yields
+// before reading the count. A len observed concurrently with a send/recv/
+// close (write-conflicts on the same identity) is an outcome-determining
+// order the explorer must branch on; two len observations commute, so a
+// read-conflict (not write) avoids exploring their orders. cap(ch) is NOT
+// hooked: a channel's capacity is immutable after make, so a cap read
+// carries no ordering decision at all.
+//
+//go:linkname dstSyncObserve
+func dstSyncObserve(id unsafe.Pointer) {
+	dstYieldAccess(uintptr(id), 1, false, false, sys.GetCallerPC())
+}
+
 // dstYieldPoint is a cooperative yield with no specific memory access recorded — a
 // pure scheduling point (used by soundness probes). See dstAccessYield.
 //

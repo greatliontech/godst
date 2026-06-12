@@ -65,6 +65,7 @@ type symsStruct struct {
 	Racewriterange            *obj.LSym
 	DstAccessYield            *obj.LSym // DST Level-2: scalar access-granularity yield (dst-race mode)
 	DstAccessYieldRange       *obj.LSym // DST Level-2: range/composite access-granularity yield (dst-race mode)
+	DstAtomicYield            *obj.LSym // DST Level-2: sync/atomic decision-point yield (dst-race mode)
 	TypeAssert                *obj.LSym
 	WBZero                    *obj.LSym
 	WBMove                    *obj.LSym

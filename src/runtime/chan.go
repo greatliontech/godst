@@ -892,6 +892,14 @@ func chanlen(c *hchan) int {
 	if c == nil {
 		return 0
 	}
+	if dstBuild && raceenabled {
+		// A len(ch) observed concurrently with a send/recv/close is an
+		// outcome-determining order: announce the channel identity as a
+		// READ-conflict (it pairs with the ops' write-conflict announces;
+		// len-len pairs commute) and yield before reading the count. cap(ch)
+		// is deliberately not announced — capacity is immutable after make.
+		dstSyncObserve(unsafe.Pointer(c))
+	}
 	async := debug.asynctimerchan.Load() != 0
 	if c.timer != nil && async {
 		c.timer.maybeRunChan(c)

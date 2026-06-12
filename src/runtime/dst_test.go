@@ -254,14 +254,20 @@ func TestDSTAccessYieldBuildModeInert(t *testing.T) {
 	dir := t.TempDir()
 	src := []byte(`package main
 
+import "sync/atomic"
+
 var scalarSink int
 var rangeSink [32]byte
 var rangeSource [32]byte
+var atomicSink atomic.Int32
+var atomicWord int32
 
 //go:noinline
 func touch() {
 	scalarSink++
 	rangeSink = rangeSource
+	atomic.AddInt32(&atomicWord, 1)
+	atomicSink.Store(2)
 }
 
 func main() {
@@ -274,6 +280,7 @@ func main() {
 	type dstAccessHooks struct {
 		scalar bool
 		range_ bool
+		atomic bool
 	}
 	dstAccessHookPresence := func(name string, flags ...string) dstAccessHooks {
 		t.Helper()
@@ -297,18 +304,19 @@ func main() {
 		return dstAccessHooks{
 			scalar: strings.Contains(text, "runtime.dstAccessYield(SB)"),
 			range_: strings.Contains(text, "runtime.dstAccessYieldRange(SB)"),
+			atomic: strings.Contains(text, "runtime.dstAtomicYield(SB)"),
 		}
 	}
 	assertNoDSTAccessHooks := func(name string, flags ...string) {
 		t.Helper()
-		if got := dstAccessHookPresence(name, flags...); got.scalar || got.range_ {
-			t.Fatalf("%s build emitted DST access hooks: scalar=%v range=%v", name, got.scalar, got.range_)
+		if got := dstAccessHookPresence(name, flags...); got.scalar || got.range_ || got.atomic {
+			t.Fatalf("%s build emitted DST access hooks: scalar=%v range=%v atomic=%v", name, got.scalar, got.range_, got.atomic)
 		}
 	}
 	assertDSTAccessHooks := func(name string, flags ...string) {
 		t.Helper()
-		if got := dstAccessHookPresence(name, flags...); !got.scalar || !got.range_ {
-			t.Fatalf("%s build emitted DST access hooks: scalar=%v range=%v", name, got.scalar, got.range_)
+		if got := dstAccessHookPresence(name, flags...); !got.scalar || !got.range_ || !got.atomic {
+			t.Fatalf("%s build missing DST hooks: scalar=%v range=%v atomic=%v", name, got.scalar, got.range_, got.atomic)
 		}
 	}
 
@@ -1911,5 +1919,44 @@ func TestDSTGOMAXPROCSDelayedSTWDropped(t *testing.T) {
 	out := runTestProgDST(t, "DSTGOMAXPROCSDelayedSTW")
 	if strings.TrimSpace(out) != "done" {
 		t.Fatalf("delayed-STW setter not dropped (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTExploreAtomicAutoInstrument is the acceptance for the dst-race
+// sync/atomic decision-point emission: an
+// UNMODIFIED SUT whose outcome turns on same-address atomic order — the CAS
+// winner, the last store/swap, an add racing a load, And/Or order, the typed
+// API's out-of-line method calls, pointer/64-bit widths — or on len(ch) racing a
+// send, must have DPOR reach BOTH outcomes (Outcomes==2, Exhausted==true)
+// with no manual hooks. (The typed-API SUT exercises the OUT-OF-LINE method
+// classification: sync/atomic is a noRaceFunc package, so its methods are not
+// inlinable under -race and only the instrumented call site can announce.) Without the emission the decision commits inside
+// TSan's NOSPLIT atomic assembly with no recorded transition and DPOR
+// explores one class while still reporting Exhausted=true — the
+// Completeness-boundary exclusion this feature removes.
+func TestDSTExploreAtomicAutoInstrument(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips the dst-race atomic auto-instrumentation build")
+	}
+	testenv.MustHaveGoBuild(t)
+	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("race detector not supported on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveCGO(t) // -race requires cgo
+	exe := filepath.Join(t.TempDir(), "tp_race")
+	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
+	out := runBuiltTestProg(t, exe, "DSTExploreAtomicAuto", "DSTSEED=1")
+	for _, sut := range []string{"caswinner", "storeorder", "addload", "swaporder", "orand", "store64", "casptr", "typedcas", "lenobserve"} {
+		if exploreField(t, out, sut+"Exhausted") != "true" {
+			t.Fatalf("unmodified %s SUT did not cleanly exhaust under DPOR:\n%s", sut, out)
+		}
+		if n, err := strconv.Atoi(exploreField(t, out, sut+"Outcomes")); err != nil {
+			t.Fatalf("bad %sOutcomes field in %q: %v", sut, out, err)
+		} else if n != 2 {
+			t.Fatalf("atomic decision-point emission missing or ineffective: DPOR reached %d "+
+				"outcomes on the unmodified %s SUT, want 2 (both orders). Without the emission "+
+				"the atomic commits in NOSPLIT race assembly with no recorded transition, so "+
+				"DPOR cannot reverse the order and silently under-explores:\n%s", n, sut, out)
+		}
 	}
 }

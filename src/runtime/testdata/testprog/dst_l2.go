@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing/simulation"
 	"time"
 	"unsafe" // for go:linkname and access-yield addresses
@@ -33,6 +34,7 @@ func init() {
 	register("DSTExploreBudgetPromotion", DSTExploreBudgetPromotion)
 	register("DSTExploreAuto", DSTExploreAuto)
 	register("DSTExploreSyncAuto", DSTExploreSyncAuto)
+	register("DSTExploreAtomicAuto", DSTExploreAtomicAuto)
 	register("DSTExploreTimerHB", DSTExploreTimerHB)
 }
 
@@ -47,6 +49,15 @@ func dstYieldPoint()
 
 //go:linkname dstAccessYield runtime.dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool)
+
+// dstAtomicYield announces a sync/atomic operation as a decision transition
+// (kind: 0 load, 1 store, 2 RMW, 3 CAS — mirroring runtime's dstAtomic*
+// constants) and records its conservative happens-before contribution. Placed
+// manually here for the brain-validation sweep; the dst-race compiler mode
+// emits it automatically before sync/atomic calls in instrumented code.
+//
+//go:linkname dstAtomicYield runtime.dstAtomicYield
+func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr)
 
 // dstSyncAcquire announces a synchronization-object decision as a write-conflict on
 // the object's identity and yields BEFORE the state decision/transition, so that
@@ -1360,18 +1371,23 @@ func DSTExploreSyncAuto() {
 // (Level 2, increment 5, "Validator first").
 
 // spOp is one instruction of a generated program: a read/write of shared var arg,
-// or a lock/unlock of mutex arg.
+// a lock/unlock of mutex arg, a sync/atomic operation on atomic var arg
+// ('l' Load, 's' Store, 'a' Add, 'C' CompareAndSwap — announced via
+// dstAtomicYield, the manual analog of the dst-race emission), or a PLAIN
+// read/write of atomic var arg ('r'/'w' — announced via dstAccessYield), so
+// atomic-plain mixed dependencies are generated too.
 type spOp struct {
-	kind byte // 'R' read, 'W' write, 'L' lock, 'U' unlock
-	arg  int  // var index (R/W) or mutex index (L/U)
+	kind byte // 'R' read, 'W' write, 'L' lock, 'U' unlock, 'l'/'s'/'a'/'C' atomic, 'r'/'w' plain-on-atomic-var
+	arg  int  // var index (R/W), mutex index (L/U), or atomic var index (the rest)
 }
 
-// spProg is a generated program: nVars shared ints, nMu mutexes, and one
-// instruction sequence per goroutine.
+// spProg is a generated program: nVars shared ints, nAVars shared atomic
+// int32s, nMu mutexes, and one instruction sequence per goroutine.
 type spProg struct {
-	nVars int
-	nMu   int
-	gor   [][]spOp
+	nVars  int
+	nAVars int
+	nMu    int
+	gor    [][]spOp
 }
 
 // sweepFamily deterministically enumerates the validation corpus. Each shape
@@ -1431,6 +1447,83 @@ func sweepFamily(heavy bool) []spProg {
 			}
 		}
 	}
+	at1 := []spOp{{'l', 0}, {'s', 0}, {'a', 0}, {'C', 0}} // 1 atomic var, all atomic op kinds
+	pl1 := []spOp{{'r', 0}, {'w', 0}}                     // plain ops on the SAME atomic var
+	// (A1) 2 goroutines, 2 atomic ops each over 1 atomic var — the atomic
+	// decision-point dependency relation end to end: same-address atomic pairs
+	// (CAS winners, store orders, add chains) must explore both orders, while
+	// the conservative HB events the hook records (load:acq, store:rel,
+	// RMW:acq+rel, CAS:acq-only) must prune only truly ordered pairs — an
+	// over-claimed edge (e.g. a failed CAS publishing a release) loses an
+	// outcome here vs Exhaustive.
+	for _, a := range at1 {
+		for _, b := range at1 {
+			for _, c := range at1 {
+				for _, d := range at1 {
+					fam = append(fam, spProg{nAVars: 1, gor: [][]spOp{{a, b}, {c, d}}})
+				}
+			}
+		}
+	}
+	// (A2) atomic-plain mixed: one goroutine's atomic ops against another's
+	// PLAIN accesses of the same memory — atomics must pair with plain
+	// accesses in the byte-interval dependency relation (a data race the
+	// manual build runs deterministically; the -race oracle is separate).
+	for _, a := range at1 {
+		for _, b := range at1 {
+			for _, c := range pl1 {
+				for _, d := range pl1 {
+					fam = append(fam, spProg{nAVars: 1, gor: [][]spOp{{a, b}, {c, d}}})
+				}
+			}
+		}
+	}
+	// (A3) 3 goroutines, 1 atomic op each — multi-way same-address contention
+	// (3-way CAS/store orders).
+	for _, a := range at1 {
+		for _, b := range at1 {
+			for _, c := range at1 {
+				fam = append(fam, spProg{nAVars: 1, gor: [][]spOp{{a}, {b}, {c}}})
+			}
+		}
+	}
+	// (A4) plain and atomic MIXED WITHIN each goroutine: g0 plain-then-atomic,
+	// g1 atomic-then-plain, one shared var. Exercises atomic-HB pruning over
+	// plain accesses interleaved with the atomics in program order (e.g.
+	// g0=[w,C] vs g1=[l,r]). Like (A5), it enforces the modeling's soundness
+	// envelope via DPOR==Exhaustive; an over-claimed edge is outcome-MASKED
+	// here too (the same-address announce pair recovers the class), so the
+	// acquire-only CAS choice is held by design, not by a failing member.
+	for _, p0 := range pl1 {
+		for _, a0 := range at1 {
+			for _, a1 := range at1 {
+				for _, p1 := range pl1 {
+					fam = append(fam, spProg{nAVars: 1, gor: [][]spOp{{p0, a0}, {a1, p1}}})
+				}
+			}
+		}
+	}
+	// (A5) the two-variable form of (A4): plain ops target avar 1, atomics
+	// avar 0 — the PLAIN pair is the only dependent pair between the
+	// goroutines and the atomic pair their only sync channel. Stresses
+	// pruning driven purely by recorded atomic HB (e.g. g0=[w(1), CAS(0)]
+	// vs g1=[l(0), r(1)]: whether r-before-w survives depends on the atomic
+	// edges alone). Note an over-claimed edge (a failed CAS publishing a
+	// release) is outcome-MASKED in the current explorer — the same-address
+	// announce pair is always reorderable and re-analysis of the reordered
+	// trace drops the claimed edge — so this family enforces the modeling's
+	// soundness envelope, not the acquire-only choice itself (which is held
+	// to the memory model by design, not by a failing test).
+	pl2 := []spOp{{'r', 1}, {'w', 1}}
+	for _, p0 := range pl2 {
+		for _, a0 := range at1 {
+			for _, a1 := range at1 {
+				for _, p1 := range pl2 {
+					fam = append(fam, spProg{nAVars: 2, gor: [][]spOp{{p0, a0}, {a1, p1}}})
+				}
+			}
+		}
+	}
 	if !heavy {
 		// Standing sweep stops here (~8s). The heavy families below add no bug class
 		// the standing families miss — the trace-HB source-set regression is already
@@ -1487,6 +1580,7 @@ var sweepSeen map[string]bool
 func makeSweepSUT(p spProg) func() bool {
 	return func() bool {
 		vars := make([]int, p.nVars)
+		avars := make([]int32, p.nAVars)
 		mus := make([]sync.Mutex, p.nMu)
 		logs := make([][]int, len(p.gor))
 		var wg sync.WaitGroup
@@ -1515,12 +1609,45 @@ func makeSweepSUT(p spProg) func() bool {
 						mus[ins.arg].Lock()
 					case 'U':
 						mus[ins.arg].Unlock()
+					case 'l':
+						dstAtomicYield(unsafe.Pointer(&avars[ins.arg]), 4, 0)
+						logs[gi] = append(logs[gi], int(atomic.LoadInt32(&avars[ins.arg])))
+					case 's':
+						dstAtomicYield(unsafe.Pointer(&avars[ins.arg]), 4, 1)
+						atomic.StoreInt32(&avars[ins.arg], int32(1000*(gi+1)+si))
+					case 'a':
+						// The returned new value distinguishes the op's position in
+						// the addition order (the final sum alone would not).
+						dstAtomicYield(unsafe.Pointer(&avars[ins.arg]), 4, 2)
+						logs[gi] = append(logs[gi], int(atomic.AddInt32(&avars[ins.arg], int32(10*(gi+1)+si+1))))
+					case 'C':
+						// CAS from zero: succeeds only for the first CAS the schedule
+						// commits (and fails after any store/add), so both the success
+						// bit and the final value are order observables. Exercises the
+						// acquire-only HB modeling on both outcomes.
+						dstAtomicYield(unsafe.Pointer(&avars[ins.arg]), 4, 3)
+						ok := atomic.CompareAndSwapInt32(&avars[ins.arg], 0, int32(1000*(gi+1)+si))
+						v := 0
+						if ok {
+							v = 1
+						}
+						logs[gi] = append(logs[gi], v)
+					case 'r':
+						dstAccessYield(unsafe.Pointer(&avars[ins.arg]), false)
+						logs[gi] = append(logs[gi], int(avars[ins.arg]))
+					case 'w':
+						dstAccessYield(unsafe.Pointer(&avars[ins.arg]), true)
+						avars[ins.arg] = int32(1000*(gi+1) + si)
 					}
 				}
 			}()
 		}
 		wg.Wait()
-		sweepSeen[encodeObs(vars, logs)] = true
+		obs := append([]int{}, vars...)
+		for _, v := range avars {
+			obs = append(obs, int(v))
+		}
+		sweepSeen[encodeObs(obs, logs)] = true
 		return false
 	}
 }
@@ -1786,4 +1913,207 @@ func DSTExploreOutcomes() {
 		s += strconv.Itoa(v)
 	}
 	os.Stdout.WriteString(s + "]\n")
+}
+
+// DSTExploreAtomicAuto is the acceptance for the dst-race sync/atomic
+// decision-point emission: an UNMODIFIED SUT
+// whose outcome depends on the order of same-address atomic operations (the
+// CAS winner, the last store, an add racing a load) — or on a len(ch)
+// observed concurrently with a send — built -tags dst -race, must have DPOR
+// reach BOTH outcomes with NO manual hooks. The compiler emits dstAtomicYield
+// before each static sync/atomic call in instrumented code; chanlen announces
+// via dstSyncObserve. Same DPOR-only oracle as DSTExploreSyncAuto: each SUT
+// is two goroutines contending over one decision with EXACTLY two outcomes by
+// construction, so Outcomes==2 with Exhausted==true is the completeness
+// signal; with the emission (or a hook) missing, the decision commits inside
+// TSan's NOSPLIT atomic assembly with no recorded transition and DPOR finds 1.
+// The typed-API SUT proves the out-of-line method classification (sync/atomic
+// is noRaceFunc, so its methods are not inlinable under -race; the emission
+// must land at the instrumented call site by classifying the method symbol).
+// Meaningful only in a -tags dst -race build.
+func DSTExploreAtomicAuto() {
+	seed := dstSeedEnv()
+	check := func(name string, sut func() bool) {
+		syncAutoSeen = map[string]bool{}
+		dpor := simulation.Explore(seed, simulation.DPOR, sut)
+		os.Stdout.WriteString(name + "Dpor=" + strconv.Itoa(dpor.Schedules) +
+			" " + name + "Outcomes=" + strconv.Itoa(len(syncAutoSeen)) +
+			" " + name + "Exhausted=" + strconv.FormatBool(dpor.Exhausted && !dpor.Overflow) + "\n")
+	}
+	os.Stdout.WriteString("atomicauto\n")
+	check("caswinner", autoAtomicCASWinnerSUT)
+	check("storeorder", autoAtomicStoreOrderSUT)
+	check("addload", autoAtomicAddLoadSUT)
+	check("swaporder", autoAtomicSwapOrderSUT)
+	check("orand", autoAtomicOrAndSUT)
+	check("store64", autoAtomicStore64OrderSUT)
+	check("casptr", autoAtomicCASPointerSUT)
+	check("typedcas", autoAtomicTypedCASSUT)
+	check("lenobserve", autoChanLenObserveSUT)
+}
+
+// autoAtomicCASWinnerSUT: both goroutines CAS the same zeroed int32 to their
+// id; exactly one wins, and which is the decision (outcomes "1"/"2").
+func autoAtomicCASWinnerSUT() bool {
+	var x int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := int32(i)
+		go func() {
+			defer wg.Done()
+			atomic.CompareAndSwapInt32(&x, 0, id)
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
+	return false
+}
+
+// autoAtomicStoreOrderSUT: last store wins (outcomes "1"/"2").
+func autoAtomicStoreOrderSUT() bool {
+	var x int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := int32(i)
+		go func() {
+			defer wg.Done()
+			atomic.StoreInt32(&x, id)
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
+	return false
+}
+
+// autoAtomicAddLoadSUT: a load racing an add observes 0 or 1.
+func autoAtomicAddLoadSUT() bool {
+	var x, seen int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		atomic.AddInt32(&x, 1)
+	}()
+	go func() {
+		defer wg.Done()
+		atomic.StoreInt32(&seen, atomic.LoadInt32(&x))
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&seen)))] = true
+	return false
+}
+
+// autoAtomicSwapOrderSUT: last swap wins (outcomes "1"/"2").
+func autoAtomicSwapOrderSUT() bool {
+	var x int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := int32(i)
+		go func() {
+			defer wg.Done()
+			atomic.SwapInt32(&x, id)
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
+	return false
+}
+
+// autoAtomicOrAndSUT: Or(1) vs And(0) — final value is 0 if the Or commits
+// first, 1 if the And does (outcomes "0"/"1"); covers the And/Or hook names.
+func autoAtomicOrAndSUT() bool {
+	var x int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		atomic.OrInt32(&x, 1)
+	}()
+	go func() {
+		defer wg.Done()
+		atomic.AndInt32(&x, 0)
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
+	return false
+}
+
+// autoAtomicStore64OrderSUT: the 64-bit widths route through the same
+// emission (outcomes "1"/"2").
+func autoAtomicStore64OrderSUT() bool {
+	var x int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := int64(i)
+		go func() {
+			defer wg.Done()
+			atomic.StoreInt64(&x, id)
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.FormatInt(atomic.LoadInt64(&x), 10)] = true
+	return false
+}
+
+// autoAtomicCASPointerSUT: pointer-width CAS winner (outcomes "1"/"2").
+func autoAtomicCASPointerSUT() bool {
+	var p unsafe.Pointer
+	var a, b int32 = 1, 2
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, t := range []*int32{&a, &b} {
+		t := t
+		go func() {
+			defer wg.Done()
+			atomic.CompareAndSwapPointer(&p, nil, unsafe.Pointer(t))
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(*(*int32)(atomic.LoadPointer(&p))))] = true
+	return false
+}
+
+// autoAtomicTypedCASSUT: the typed API (atomic.Int32 methods) — out-of-line
+// under -race (noRaceFunc methods are not inlinable), so the emission must
+// come from classifying the method symbol at the user call site (outcomes
+// "1"/"2").
+func autoAtomicTypedCASSUT() bool {
+	var x atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 1; i <= 2; i++ {
+		id := int32(i)
+		go func() {
+			defer wg.Done()
+			x.CompareAndSwap(0, id)
+		}()
+	}
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(int(x.Load()))] = true
+	return false
+}
+
+// autoChanLenObserveSUT: len(ch) observed concurrently with a send sees 0 or
+// 1 — the chanlen runtime hook (dstSyncObserve) makes the observation a
+// decision DPOR reverses against the send.
+func autoChanLenObserveSUT() bool {
+	ch := make(chan int, 1)
+	var n int
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ch <- 1
+	}()
+	go func() {
+		defer wg.Done()
+		n = len(ch)
+	}()
+	wg.Wait()
+	syncAutoSeen[strconv.Itoa(n)] = true
+	return false
 }
