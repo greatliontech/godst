@@ -138,10 +138,6 @@ var depsRules = `
 	RUNTIME
 	< arena;
 
-	# testing/simulation is the deterministic-simulation-testing (DST) control API.
-	RUNTIME, internal/synctest
-	< testing/simulation;
-
 	syscall !< io;
 	reflect !< sort;
 
@@ -711,6 +707,11 @@ var depsRules = `
 
 	FMT, DEBUG, flag, runtime/trace, internal/sysinfo, math/rand
 	< testing;
+
+	# testing/simulation is the deterministic-simulation-testing (DST) control API;
+	# it imports testing for its simulation-test helper.
+	RUNTIME, internal/synctest, testing
+	< testing/simulation;
 
 	testing, math
 	< simd/archsimd/internal/test_helpers;

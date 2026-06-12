@@ -9,11 +9,11 @@ package net
 import (
 	"context"
 	"errors"
+	"internal/bytealg"
 	"internal/nettrace"
 	"io"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -86,7 +86,7 @@ func dstTCPNetwork(network string) bool {
 // production UnknownNetworkError identity.
 func dstUnsupportedNetwork(op, network string) error {
 	base := network
-	if i := strings.LastIndexByte(base, ':'); i >= 0 {
+	if i := bytealg.LastIndexByteString(base, ':'); i >= 0 {
 		// Production accepts a ":proto" suffix only on the ip networks
 		// (parseNetwork); other colon-bearing strings are unknown networks.
 		switch base[:i] {
