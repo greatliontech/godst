@@ -486,6 +486,9 @@ bufrecv:
 	qp = chanbuf(c, c.recvx)
 	if dstBuild && raceenabled {
 		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
+		// Mirror racereleaseacquire: the receive also releases the slot (the
+		// k → k+C edge); see chan.go.
+		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
 	}
 	if cas.elem != nil {
 		typedmemmove(c.elemtype, cas.elem, qp)
@@ -514,6 +517,8 @@ bufsend:
 	qp = chanbuf(c, c.sendx)
 	typedmemmove(c.elemtype, qp, cas.elem)
 	if dstBuild && raceenabled {
+		// Mirror racereleaseacquire: the send also acquires the slot; see chan.go.
+		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
 		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
 	}
 	c.sendx++

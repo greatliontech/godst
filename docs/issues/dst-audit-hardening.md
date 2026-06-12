@@ -76,6 +76,8 @@ Fresh full audit of `git diff go1.26.4..HEAD` after the first-audit fixes landed
 | A2-31 | L | A blocked `Accept` already parked in its select when `Close` runs can receive a queued connection instead of `net.ErrClosed` (the seeded select may pick the non-empty accept case over the just-closed done case; the closed-first check covers only Accept calls made after Close). Production unblocks pending accepts with ErrClosed unconditionally. Pre-existing select shape (adjacent). | Make Close tear down pending accepts deterministically (e.g. drain claims queued conns before the parked Accept can win them, or Accept rechecks done after receiving). |
 | A2-32 | nit | Single-family wildcard `Addr()` reports loopback: `Listen("tcp4", ":0").Addr()` is `127.0.0.1:p` where production reports `0.0.0.0:p` (adjacent; the dual-stack wildcard now reports `[::]:p` correctly). | Report the family wildcard form. |
 
+| A2-33 | L | `testing/simulation` is not `-tags dst -race`-clean: `TestExploreWithScheduleBudgetReportsIncomplete` runs an intentionally racy SUT in-process, and the race report escapes the Level-2 oracle's accounting into the `testing` harness ("race detected during execution of test"). The racy-SUT oracle tests avoid this by running in subprocesses. Pre-existing (reproduces at the audit base); surfaced by the first in-process `-race` run of the suite. | Run intentionally racy in-process SUTs in subprocesses, or reset the harness race accounting through the oracle the way the testprog-based oracle tests do. |
+
 ## Close-out criteria
 
 - Each sequence item is either fixed with regression coverage, deliberately folded into another tracked issue, or the spec is amended to the chosen contract.

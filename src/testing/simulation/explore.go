@@ -156,6 +156,13 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 //
 // Exhaustive enumerates the whole decision tree. DPOR explores one interleaving
 // per Mazurkiewicz equivalence class, finding the same bugs with far fewer runs.
+//
+// Boundary: exploration branches on recorded transitions — memory accesses and
+// channel/mutex/RWMutex decisions. sync/atomic operations and len/cap reads of
+// channels are NOT recorded: a bug requiring a specific winner of an atomic CAS
+// race (or a len(ch) observed concurrently with a send) may not be found even
+// when Exhausted reports true. The race detector still models atomics, so this
+// does not produce false races — only unexplored atomic-order outcome classes.
 func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 	return ExploreWith(seed, ExploreOptions{Mode: mode}, sut)
 }
@@ -180,6 +187,11 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 // same process already observed that race, because TSan dedups reports by signature.
 // Replay is a process-global simulation operation and must not overlap any other
 // simulation operation in one process.
+//
+// raced reports whether the race detector fired during the replay; it does not
+// verify the replayed race is the SAME race the original exploration found. A
+// different (new) race also reports raced=true — confirm specific races in a
+// fresh process, where the detector's per-process dedup cannot suppress them.
 func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) {
 	enterSimulation("Replay", "testing/simulation: Replay requires building with -tags dst")
 	defer leaveSimulation()
@@ -369,6 +381,12 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 			}
 		}
 		out.deadlock = dstExploreDeadlockFP()
+		// The out.panic == "" guard is load-bearing, not a masking bug: a
+		// recorded SUT panic legitimately truncates the run (the panicking
+		// goroutine dies, so later prefix entries naming it are not enabled)
+		// and the abort flag is then expected. The recorded Failure replays —
+		// the panic fires at the same point, before the truncated tail. Only
+		// an abort with NO panic signals a determinism violation.
 		if out.tr.aborted && out.panic == "" {
 			panic("testing/simulation: internal error: schedule prefix diverged on replay " +
 				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")

@@ -261,6 +261,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		}
 		typedmemmove(c.elemtype, qp, ep)
 		if dstBuild && raceenabled {
+			// Mirror racereleaseacquire on the slot: the send also ACQUIRES it,
+			// pairing with the receive that previously released it — the
+			// k'th-receive → (k+C)'th-send edge of the memory model. Acquire
+			// before release so predecessors merge before publishing.
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 		}
 		c.sendx++
@@ -669,6 +674,9 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		}
 		if dstBuild && raceenabled {
 			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+			// Mirror racereleaseacquire: the receive also RELEASES the slot for
+			// the sender that will reuse it (the k → k+C edge).
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 		}
 		if ep != nil {
 			typedmemmove(c.elemtype, ep, qp)
@@ -780,6 +788,9 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		}
 		if dstBuild && raceenabled {
 			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+			// Mirror racereleaseacquire: the receive also RELEASES the slot
+			// (the k → k+C edge).
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
 		}
 		// copy data from queue to receiver
 		if ep != nil {
@@ -995,11 +1006,15 @@ func racesync(c *hchan, sg *sudog) {
 	racereleaseg(sg.g, chanbuf(c, 0))
 	raceacquire(chanbuf(c, 0))
 	if dstBuild && raceenabled {
+		// Distinct aux from close (aux 0): TSan keys the rendezvous on
+		// chanbuf(c,0) and close on c.raceaddr() — separate sync objects.
+		// Sharing aux 0 would accumulate a rendezvous-participant →
+		// later-closed-receiver edge the memory model does not order.
 		id := uintptr(unsafe.Pointer(c))
-		dstRecordSyncReleaseID(id, 0)
-		dstRecordSyncEventForGID(dstSyncEventAcquire, id, 0, sg.g)
-		dstRecordSyncEventForGID(dstSyncEventRelease, id, 0, sg.g)
-		dstRecordSyncAcquireID(id, 0)
+		dstRecordSyncReleaseID(id, dstSyncRendezvousAux)
+		dstRecordSyncEventForGID(dstSyncEventAcquire, id, dstSyncRendezvousAux, sg.g)
+		dstRecordSyncEventForGID(dstSyncEventRelease, id, dstSyncRendezvousAux, sg.g)
+		dstRecordSyncAcquireID(id, dstSyncRendezvousAux)
 	}
 }
 

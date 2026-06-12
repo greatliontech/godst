@@ -686,6 +686,91 @@ func TestExploreRecordsBufferedChannelZeroSizeSlotIDs(t *testing.T) {
 	}
 }
 
+// TestExploreRendezvousAndCloseDistinctSyncObjects verifies the unbuffered
+// rendezvous and channel close record HB events under DISTINCT sync-object
+// keys (different aux on the same channel id), mirroring TSan, which keys the
+// rendezvous on chanbuf(c,0) and close on c.raceaddr(). Sharing a key would
+// accumulate a rendezvous-participant -> later-closed-receiver edge the memory
+// model does not order.
+func TestExploreRendezvousAndCloseDistinctSyncObjects(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("channel HB events are emitted by dst-race sync hooks")
+	}
+	dstExploreInit(256, 1024, 256, 1024)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan int)
+		done := make(chan struct{})
+		go func() {
+			ch <- 1
+			close(done)
+		}()
+		<-ch
+		<-done
+		close(ch)
+		<-ch // closed receive
+		return false
+	})
+	auxByKindRendezvous := false
+	auxZeroRelease := false
+	for i := range tr.syncKind {
+		if tr.syncAux[i] == ^uintptr(0) {
+			auxByKindRendezvous = true
+		}
+		if tr.syncKind[i] == syncEventRelease && tr.syncAux[i] == 0 {
+			auxZeroRelease = true
+		}
+	}
+	if !auxByKindRendezvous || !auxZeroRelease {
+		t.Fatalf("rendezvous and close events not keyed as distinct sync objects: aux=%v kind=%v",
+			tr.syncAux, tr.syncKind)
+	}
+}
+
+// TestExploreRecordsBufferedSlotReuseEdges verifies buffered channel
+// operations mirror racereleaseacquire on the slot: a receive also RELEASES
+// the slot and a send also ACQUIRES it, giving DPOR the k'th-receive ->
+// (k+C)'th-send edge of the memory model (missing it only over-explores, but
+// over-exploration burns schedule budget).
+func TestExploreRecordsBufferedSlotReuseEdges(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
+	}
+	dstExploreInit(256, 1024, 256, 1024)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan int, 1)
+		ch <- 1
+		<-ch
+		ch <- 2
+		<-ch
+		return false
+	})
+	slotReleases, slotAcquires := 0, 0
+	for i := range tr.syncKind {
+		if tr.syncAux[i] == 0 || tr.syncAux[i] == ^uintptr(0) {
+			continue
+		}
+		switch tr.syncKind[i] {
+		case syncEventRelease:
+			slotReleases++
+		case syncEventAcquire:
+			slotAcquires++
+		}
+	}
+	// Two sends + two receives, each recording both directions on slot 1:
+	// four releases and four acquires. Without the reuse edges, only the two
+	// send-releases and two receive-acquires exist.
+	if slotReleases < 4 || slotAcquires < 4 {
+		t.Fatalf("buffered slot-reuse edges missing: releases=%d acquires=%d aux=%v kind=%v",
+			slotReleases, slotAcquires, tr.syncAux, tr.syncKind)
+	}
+}
+
 func TestExploreRecordsFullBufferedChannelSenderRelease(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -728,7 +813,9 @@ func TestExploreRecordsFullBufferedChannelSenderRelease(t *testing.T) {
 		t.Fatalf("missing sender access in trace: %#v", tr)
 	}
 	for i, k := range tr.syncKind {
-		if k != syncEventRelease || tr.syncSeq[i] != senderSeq || tr.syncAux[i] == 0 {
+		// Only buffered SLOT releases (aux slot+1): close is aux 0 and the
+		// unbuffered rendezvous carries the dedicated rendezvous key.
+		if k != syncEventRelease || tr.syncSeq[i] != senderSeq || tr.syncAux[i] == 0 || tr.syncAux[i] == ^uintptr(0) {
 			continue
 		}
 		step := tr.syncStep[i]
@@ -885,7 +972,9 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 			releases, acquires := 0, 0
 			readAcquire := false
 			for i, k := range tr.syncKind {
-				if tr.syncAux[i] != 0 {
+				// Rendezvous events carry the dedicated rendezvous key,
+				// distinct from close (aux 0) and buffered slots (slot+1).
+				if tr.syncAux[i] != ^uintptr(0) {
 					continue
 				}
 				switch k {

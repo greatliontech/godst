@@ -56,6 +56,9 @@ func dstAccessYield(addr unsafe.Pointer, write bool)
 //go:linkname dstSyncAcquire runtime.dstSyncAcquire
 func dstSyncAcquire(id unsafe.Pointer)
 
+//go:linkname dstFilterForceConservativeTP runtime.dstFilterForceConservativeFP
+func dstFilterForceConservativeTP(on bool)
+
 //go:linkname dstAccessYieldFP runtime.dstAccessYieldFP
 func dstAccessYieldFP() uint64
 
@@ -712,6 +715,24 @@ func DSTExploreAuto() {
 	manualRWRExh, manualRWRDpor, manualRWRExhSet, manualRWRDporSet := runStringCompare(filteredManualRWROutcomes, filteredManualRWRSUT)
 	createExh, createDpor, createExhSet, createDporSet := runCompare(autoCreateOutcomes, unmodifiedCreateThenWriteSUT)
 	wakeExh, wakeDpor, wakeExhSet, wakeDporSet := runCompare(autoWakeOutcomes, unmodifiedWakeThenWriteSUT)
+	// Unfiltered cross-check leg: re-explore the primary RMW SUT with the
+	// shared-address filter's YIELD GATE forced into its conservative
+	// yield-everything mode. The filtered DPOR==Exhaustive equivalence runs
+	// the same filter on both sides, so a filter defect that drops an outcome
+	// class cancels out of it; this leg anchors the committed ground-truth
+	// outcome set to an observation that bypasses the yield gate. (The
+	// stack-locality classifier still applies to the access log; a classifier
+	// defect can only shrink the explored set, which the ==2 assertion
+	// catches rather than cancels.)
+	dstFilterForceConservativeTP(true)
+	for k := range autoOutcomes {
+		delete(autoOutcomes, k)
+	}
+	unf := func() simulation.ExploreResult {
+		defer dstFilterForceConservativeTP(false)
+		return simulation.Explore(seed, simulation.DPOR, unmodifiedRMWSUT)
+	}()
+	unfOutcomes := len(autoOutcomes)
 	assertfail, racefail := 0, 0
 	for _, f := range dpor.Failures {
 		if f.Race {
@@ -726,6 +747,8 @@ func DSTExploreAuto() {
 		" assertfail=" + strconv.Itoa(assertfail) +
 		" racefail=" + strconv.Itoa(racefail) +
 		" complete=" + strconv.FormatBool(sameSet(exhSet, dporSet)) +
+		" unfOutcomes=" + strconv.Itoa(unfOutcomes) +
+		" unfExhausted=" + strconv.FormatBool(unf.Exhausted) +
 		" noiseExh=" + strconv.Itoa(noiseExh.Schedules) +
 		" noiseDpor=" + strconv.Itoa(noiseDpor.Schedules) +
 		" noiseOutcomes=" + strconv.Itoa(len(noiseExhSet)) +

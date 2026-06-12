@@ -1043,6 +1043,15 @@ object decisions are recorded as transitions, and that do not observe finalizer/
 over a generated family (mutex- and channel-decision-order cases included) by the
 `TestDSTExploreSweep` equivalence sweep (DPOR outcome set == exhaustive, 290 SUTs).
 
+**Named exclusions (not recorded transitions).** `sync/atomic` operations carry no decision hook
+(under `-race` they route through TSan's atomic entry points, which model the synchronization for
+the race oracle but record no DST transition), and `len(ch)`/`cap(ch)` reads record nothing. A SUT
+whose outcome turns on the winner of an atomic CAS race, or on a `len(ch)` observed concurrently with
+a send, explores ONE of the outcome classes and still reports `Exhausted=true` — the prog#257 lesson
+replayed for atomics: an outcome-determining decision with no recorded identity. The `Explore` API doc
+states the boundary; hooking atomics as decision points (a `dstSyncAcquire` analog at TSan's atomic
+entry points) is the tracked candidate that would close it.
+
 An **earlier draft of this note was wrong**: it claimed completeness for "SUTs whose shared *accesses* are
 all annotated," overlooking that **synchronization object decision order is itself a dependency**. A
 mutex-bracketed program with every access annotated still lost a class (`prog#257`: exhaustive 2

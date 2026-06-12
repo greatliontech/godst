@@ -1684,6 +1684,16 @@ func TestDSTExploreAutoInstrument(t *testing.T) {
 	} else if n >= 1000 {
 		t.Fatalf("shared-address filtering did not control the RMW exhaustive explosion: exh=%d, want <1000:\n%s", n, out)
 	}
+	if n, err := strconv.Atoi(exploreField(t, out, "unfOutcomes")); err != nil {
+		t.Fatalf("bad unfOutcomes field in %q: %v", out, err)
+	} else if n != 2 {
+		t.Fatalf("UNFILTERED DPOR outcome set diverges from the filtered ground truth: "+
+			"unfOutcomes=%d, want 2 (a filter defect cancels out of the filtered "+
+			"DPOR==Exhaustive check; this leg bypasses the filter):\n%s", n, out)
+	}
+	if exploreField(t, out, "unfExhausted") != "true" {
+		t.Fatalf("unfiltered cross-check leg did not complete exploration:\n%s", out)
+	}
 	if exploreField(t, out, "noiseComplete") != "true" {
 		t.Fatalf("source-DPOR dropped a class on the private-noise auto-instrumented SUT:\n%s", out)
 	}

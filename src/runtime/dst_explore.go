@@ -32,6 +32,12 @@ var dstAccessYieldPoints uint64
 const (
 	dstFilterMaxClockProcs  = 1024
 	dstFilterMaxSyncObjects = 1024
+
+	// dstSyncRendezvousAux keys unbuffered-channel rendezvous HB events,
+	// distinct from close/closed-receive events (aux 0) and buffered slot
+	// events (slot+1) — mirroring TSan, which keys the rendezvous on
+	// chanbuf(c,0) and close on c.raceaddr().
+	dstSyncRendezvousAux = ^uintptr(0)
 )
 
 // dstYieldAccess is the shared core of every Level-2 transition-boundary hook: it
@@ -503,7 +509,7 @@ func dstAccessForced(seq, count uint64, pc uintptr) bool {
 }
 
 func dstAccessShouldYield(gp *g, seq uint64, addr, size uintptr, write bool) bool {
-	if addr == 0 || dstFilterConservative {
+	if addr == 0 || dstFilterConservative || dstFilterForceConservative {
 		return true
 	}
 	if !dstAccessMaybeShared(gp, addr, size) {
@@ -651,6 +657,10 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	}
 	seq := dstEnsureSeq(gp)
 	dstApplyLiveSyncEvent(kind, id, aux, seq)
+	// Buffer overflow below drops the event SILENTLY — sound, asymmetric with
+	// dstEdgeOverflow on purpose: the live clocks were already applied above,
+	// and a missing OFFLINE edge only enlarges the computed concurrent set
+	// (more backtracks/forces — over-exploration), never prunes a class.
 	if dstSyncEventN < len(dstSyncEventKind) {
 		dstSyncEventKind[dstSyncEventN] = kind
 		dstSyncEventID[dstSyncEventN] = id
@@ -662,6 +672,18 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 		dstHBEventN++
 		dstSyncEventN++
 	}
+}
+
+// dstFilterForceConservative forces the live shared-address filter into its
+// conservative yield-everything mode. Test-only (set via the FP below): it
+// gives enforcement tests an UNFILTERED exploration leg to cross-check the
+// filtered outcome set against, so a filter defect cannot cancel out of a
+// filtered-vs-filtered comparison.
+var dstFilterForceConservative bool
+
+//go:linkname dstFilterForceConservativeFP
+func dstFilterForceConservativeFP(on bool) {
+	dstFilterForceConservative = on
 }
 
 func dstExploreRecordUncaughtPanic(v any) bool {
