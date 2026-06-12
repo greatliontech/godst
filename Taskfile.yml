@@ -11,18 +11,27 @@
 #      tool IDs come from the version, not the binary hash, and a reinstalled
 #      compiler does NOT invalidate cached objects.
 #
-# Every command runs as `GOROOT={{.ROOT_DIR}} {{.GO}} ...` (via the RUN var):
-# an exported GOROOT in the developer's environment would otherwise redirect
-# every leg to another toolchain's runtime — green exit codes, vacuous run.
-# The shell-level assignment is deliberate: Taskfile `env:` loses to the OS
-# environment by default, a shell prefix never does. (The prefix assumes a
-# space-free repo path; quote RUN's expansion if that ever changes.)
+# Every command runs as `GOROOT={{.ROOT_DIR}} TMPDIR={{.ROOT_DIR}}/.tmp ...`
+# (via the RUN var): an exported GOROOT in the developer's environment would
+# otherwise redirect every leg to another toolchain's runtime — green exit
+# codes, vacuous run — and TMPDIR pins the heavy build/test temp trees to the
+# gitignored on-disk .tmp/ at the repo root, because the std leg's parallel
+# build trees plus accumulated per-test temp dirs can fill a tmpfs /tmp
+# mid-leg ("disk quota exceeded" / "no space left on device" masquerading as
+# build regressions). .tmp/ is freely deletable between runs. The shell-level
+# assignments are deliberate: Taskfile `env:` loses to the OS environment by
+# default, a shell prefix never does. (The prefix assumes a space-free repo
+# path; quote RUN's expansion if that ever changes.)
 version: '3'
 
 vars:
-  RUN: 'GOROOT={{.ROOT_DIR}} {{.ROOT_DIR}}/bin/go'
+  RUN: 'GOROOT={{.ROOT_DIR}} TMPDIR={{.ROOT_DIR}}/.tmp {{.ROOT_DIR}}/bin/go'
 
 tasks:
+  tmpdir:
+    internal: true
+    cmds:
+      - mkdir -p {{.ROOT_DIR}}/.tmp
   test:
     desc: The fast enforcing legs (untagged, dst, dst-race), sequential and fail-fast; test:inert-std runs separately
     cmds:
@@ -33,30 +42,35 @@ tasks:
   test:untagged:
     desc: Untagged -short runtime — DST hooks inert; testprog stays cgo-free (deadlock crash tests live)
     dir: src
+    deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -count=1 -short runtime'
 
   test:dst:
     desc: -tags dst, non-short — explore sweep, race oracle, auto-instrumentation, build-mode inertness, net shims
     dir: src
+    deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing/simulation net'
 
   test:dst-race:
     desc: -tags dst -race testing/simulation — suite is race-clean; any TSan report here is a real finding
     dir: src
+    deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -tags dst -race -count=1 testing/simulation'
 
   test:inert-std:
     desc: Untagged -short std — build-mode inertness across all of std (heavy; not in `task test`)
     dir: src
+    deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -count=1 -short std'
 
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
     dir: src
+    deps: [tmpdir]
     cmds:
       - '{{.RUN}} install cmd/compile'
       - '{{.RUN}} clean -cache'

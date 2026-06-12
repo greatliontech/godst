@@ -307,8 +307,9 @@ not the binary hash, and a reinstalled compiler does NOT invalidate cached objec
 builds silently pass). All four legs gate green; a red leg is a regression against this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
-or "no space left on device" from compile/link/cgo) — clear leftover `/tmp/go-build*` and test
-temp dirs, or point `TMPDIR` at disk, before reading FAILs as real.
+or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
+every command pins `TMPDIR` to the gitignored on-disk `.tmp/` at the repo root (freely deletable
+between runs); a FAIL of that shape can still appear in a bare `go test` run outside the tasks.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
