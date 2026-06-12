@@ -283,7 +283,7 @@ the dst-race sync-hook encodings (the suite is `-race`-clean: every SUT that run
 race-free — intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg
 via `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
 load-bearing for this invariant), and an
-untagged `go test std`-level pass for build-mode inertness. The untagged build-constraint panic is
+untagged `go test -short std` pass for build-mode inertness. The untagged build-constraint panic is
 covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged testprog. The untagged
 `-short runtime` leg also enforces that `runtime/testdata/testprog` stays cgo-free: a cgo-pulling
 import there (net, os/user — DST fixtures needing those live in `testprognet`) disables the
@@ -292,8 +292,15 @@ these configurations honestly: never let a pipeline eat the exit code (`go test 
 reports the pipe's status, not the test's — this masked real failures twice), and after ANY
 cmd/compile change run `go clean -cache` — this fork reports a release version string, so tool IDs
 come from the version, not the binary hash, and a reinstalled compiler does NOT invalidate cached
-objects (stale-compiler builds silently pass). The A2-25 runner choice is made: a Taskfile encoding
-these configurations (with honest exit codes and the cache rule) is the next infrastructure chunk.
+objects (stale-compiler builds silently pass). These configurations and rules are encoded in
+`Taskfile.yml` at the repo root (the A2-25 runner choice): `task test` runs the untagged, `-tags
+dst`, and `-tags dst -race` legs sequentially and fail-fast; `task test:inert-std` is the heavy
+untagged `-short std` inertness leg; `task compiler` reinstalls cmd/compile and chains
+`go clean -cache` so the cache rule cannot be forgotten. The Taskfile must stay pipeline-free —
+each leg's `go test` exit code is the task's exit code. Known red: `task test:inert-std` currently
+fails `TestTraceStacks`/`TestBlockProfile`/`TestMutexProfile` (untagged stack-shape regression from
+the DST mutex hooks — see `docs/issues/dst-sync-stack-shape.md`); the leg gates green once that
+issue lands.
 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
@@ -306,7 +313,9 @@ alone is not sufficient; the key is also derived position-independently (see nex
 is still *seed-varied* via the per-g `m.seed`; only this one global key is fixed. `simulation.Run` **panics if
 the binary was not built with `-tags dst`**, so the constraint can't be silently violated. A
 `-tags dst` binary has a fixed hash key for all maps (hash-flooding exposure) — acceptable for a test
-build, and absent from normal builds.
+build, and absent from normal builds. Upstream's `TestMemHashGlobalSeed` asserts the opposite
+(per-process seed uniqueness), so it skip-gates on `runtime.DSTBuild`; the untagged legs still
+enforce it for normal builds.
 
 **The hash key is derived position-independently, so map order is *build*-invariant too.** Fixing the
 global RNG *seed* (`dstFixedSeed`) is necessary but not sufficient: `alginit` fills the hash key

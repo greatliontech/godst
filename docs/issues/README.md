@@ -6,6 +6,12 @@ chunk-start gate (sub-chunk `N.1`) scans this index for entries resolving to the
 current chunk; the close-out gate promotes any load-bearing rationale inline and
 deletes the resolved entry.
 
+## Open issues
+
+| Issue | Lands | Summary |
+|-------|-------|---------|
+| [dst-sync-stack-shape](dst-sync-stack-shape.md) | when `task test:inert-std` is required to gate green | Untagged trace/pprof stack-shape regression: the DST mutex hook refactor adds one inlined logical frame, shifting the fixed semaphore skip constants; `TestTraceStacks`, `TestBlockProfile`, `TestMutexProfile` fail untagged. |
+
 ## Pending features
 
 The I/O and fault features on the design.md Roadmap — planned work that brings real
