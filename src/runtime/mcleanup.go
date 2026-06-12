@@ -948,6 +948,14 @@ func dstDeferPreBubbleCleanups() {
 // dstReleaseDeferredCleanups returns pre-bubble cleanup blocks to the ordinary
 // cleanup pool after DST is deactivated.
 func dstReleaseDeferredCleanups() {
+	// The async pool may not exist: worker creation is deferred while DST is
+	// active (AddCleanup's createGs gate), so in a process whose FIRST
+	// AddCleanup happened inside a run there is no cleanup goroutine to
+	// consume the released blocks — they would strand forever. DST is already
+	// inactive here (dstDeactivate stored 0 first), so this creates normally.
+	if gcCleanups.needG() {
+		gcCleanups.createGs()
+	}
 	lock(&finlock)
 	if b := dstDeferredCleanupPartial; b != nil {
 		dstDeferredCleanupPartial = nil

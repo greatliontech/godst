@@ -474,6 +474,11 @@ func dstDeferPreBubbleFinq() {
 // goroutine after a DST run is deactivated. They never execute with dstActive set
 // and never enter the run's bubble drain.
 func dstReleaseDeferredFinq() {
+	// The finalizer goroutine may not exist: its creation is deferred while
+	// DST is active (createfing's gate), so in a process whose FIRST
+	// SetFinalizer happened inside a run the released chain would otherwise
+	// strand with no fing to wake. DST is already inactive here.
+	createfing()
 	lock(&finlock)
 	fb := dstDeferredFinq
 	dstDeferredFinq = nil
