@@ -25,8 +25,8 @@ var getwdCache struct {
 // current directory, it is returned.
 func Getwd() (dir string, err error) {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("getwd", ""); fenced {
-			return "", err
+		if wd, handled, werr := dstGetwd(); handled {
+			return wd, werr
 		}
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {

@@ -172,22 +172,12 @@ func TestDSTFSFences(t *testing.T) {
 			name string
 			call func() error
 		}{
-			{"mkdir", func() error { return os.Mkdir("/d", 0o755) }},
-			{"mkdirall", func() error { return os.MkdirAll("/d/e", 0o755) }},
-			{"remove", func() error { return os.Remove("/x") }},
-			{"removeall", func() error { return os.RemoveAll("/x") }},
-			{"stat", func() error { _, err := os.Stat("/x"); return err }},
-			{"lstat", func() error { _, err := os.Lstat("/x"); return err }},
 			{"truncate", func() error { return os.Truncate("/x", 0) }},
 			{"chmod", func() error { return os.Chmod("/x", 0o644) }},
 			{"chown", func() error { return os.Chown("/x", 0, 0) }},
 			{"lchown", func() error { return os.Lchown("/x", 0, 0) }},
 			{"chtimes", func() error { return os.Chtimes("/x", time.Time{}, time.Time{}) }},
 			{"readlink", func() error { _, err := os.Readlink("/x"); return err }},
-			{"getwd", func() error { _, err := os.Getwd(); return err }},
-			{"chdir", func() error { return os.Chdir("/") }},
-			{"readdir", func() error { _, err := os.ReadDir("/"); return err }},
-			{"open-dir", func() error { _, err := os.Open("/"); return err }},
 		}
 		for _, op := range pathOps {
 			err := op.call()
@@ -204,7 +194,6 @@ func TestDSTFSFences(t *testing.T) {
 			name string
 			call func() error
 		}{
-			{"rename", func() error { return os.Rename("/a", "/b") }},
 			{"link", func() error { return os.Link("/a", "/b") }},
 			{"symlink", func() error { return os.Symlink("/a", "/b") }},
 		}
@@ -325,9 +314,11 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 			t.Fatalf("OpenRoot = %v, want unsupported-under-simulation", err)
 		}
 
-		// Unmodeled handle methods carry the fence shape, not EBADF.
-		if _, err := mf.Readdirnames(0); !isDSTUnsupportedFS(err) {
-			t.Fatalf("Readdirnames = %v, want unsupported", err)
+		// Readdir on a regular file: the production ENOTDIR shape (the
+		// funnel is implemented as of the namespace chunk); the remaining
+		// unmodeled handle methods carry the fence shape.
+		if _, err := mf.Readdirnames(0); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf("Readdirnames on file = %v, want ENOTDIR", err)
 		}
 		if err := mf.Chmod(0o600); !isDSTUnsupportedFS(err) {
 			t.Fatalf("File.Chmod = %v, want unsupported", err)
@@ -335,10 +326,284 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 		if err := mf.Chown(0, 0); !isDSTUnsupportedFS(err) {
 			t.Fatalf("File.Chown = %v, want unsupported", err)
 		}
-		if err := mf.Chdir(); !isDSTUnsupportedFS(err) {
-			t.Fatalf("File.Chdir = %v, want unsupported", err)
+		if err := mf.Chdir(); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf("File.Chdir on file = %v, want ENOTDIR", err)
 		}
 		mf.Close()
+	})
+}
+
+// TestDSTFSNamespace covers the chunk-2 named operations end to end:
+// Mkdir/MkdirAll/Remove/RemoveAll/Rename/Stat/Lstat with production error
+// identity, rename atomicity rules, and unlinked-but-open semantics.
+func TestDSTFSNamespace(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/a", 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		if err := os.Mkdir("/a", 0o755); !errors.Is(err, syscall.EEXIST) {
+			t.Fatalf("Mkdir exists = %v, want EEXIST", err)
+		}
+		if err := os.MkdirAll("/a/b/c", 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		fi, err := os.Stat("/a/b/c")
+		if err != nil || !fi.IsDir() || fi.Name() != "c" {
+			t.Fatalf("Stat dir = %v, %v", fi, err)
+		}
+		if _, err := os.Stat("/a/missing"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Stat missing = %v", err)
+		}
+		if fi2, err := os.Lstat("/a/b/c"); err != nil || !os.SameFile(fi, fi2) {
+			t.Fatalf("Lstat/SameFile = %v, %v", fi2, err)
+		}
+
+		// Remove: non-empty dir refuses; empty dir and files go.
+		if err := os.Remove("/a"); !errors.Is(err, syscall.ENOTEMPTY) {
+			t.Fatalf("Remove non-empty = %v, want ENOTEMPTY", err)
+		}
+		if err := os.Remove("/a/b/c"); err != nil {
+			t.Fatalf("Remove empty dir: %v", err)
+		}
+		if err := os.WriteFile("/a/f", []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := os.RemoveAll("/a"); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+		if _, err := os.Stat("/a"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("post-RemoveAll Stat = %v", err)
+		}
+		if err := os.RemoveAll("/nosuch"); err != nil {
+			t.Fatalf("RemoveAll missing = %v, want nil", err)
+		}
+
+		// Rename: move, replace-file target, missing source, into-self.
+		os.WriteFile("/r1", []byte("one"), 0o644)
+		os.WriteFile("/r2", []byte("two"), 0o644)
+		if err := os.Rename("/r1", "/r3"); err != nil {
+			t.Fatalf("Rename move: %v", err)
+		}
+		if err := os.Rename("/r3", "/r2"); err != nil {
+			t.Fatalf("Rename replace: %v", err)
+		}
+		got, _ := os.ReadFile("/r2")
+		if string(got) != "one" {
+			t.Fatalf("rename-replace content = %q", got)
+		}
+		if _, err := os.Stat("/r3"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rename left the old name: %v", err)
+		}
+		if err := os.Rename("/missing", "/x"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Rename missing = %v", err)
+		}
+		var le *os.LinkError
+		if err := os.Rename("/missing", "/x"); !errors.As(err, &le) {
+			t.Fatalf("Rename error type = %T", err)
+		}
+		os.Mkdir("/d1", 0o755)
+		if err := os.Rename("/d1", "/d1/sub"); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("Rename into self = %v, want EINVAL", err)
+		}
+
+		// Unlinked-but-open: content survives the name.
+		f, _ := os.Create("/wal")
+		f.WriteString("entry1")
+		if err := os.Remove("/wal"); err != nil {
+			t.Fatalf("Remove open file: %v", err)
+		}
+		if _, err := os.Stat("/wal"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("name survived remove: %v", err)
+		}
+		f.WriteString("|entry2")
+		buf := make([]byte, 64)
+		n, _ := f.ReadAt(buf, 0)
+		if string(buf[:n]) != "entry1|entry2" {
+			t.Fatalf("unlinked-open content = %q", buf[:n])
+		}
+		f.Close()
+	})
+}
+
+// TestDSTFSNamespaceEdgeIdentity pins the host shapes for the degenerate
+// names (the M1 review family — Remove("") must NOT delete the cwd), the
+// rename dir-target EEXIST precheck, root removal, and relative two-name ops
+// against a non-root cwd (the M2 review case: relative Open + File.Chdir).
+func TestDSTFSNamespaceEdgeIdentity(t *testing.T) {
+	simulation.Run(1, func() {
+		os.Mkdir("/work", 0o755)
+		if err := os.Chdir("/work"); err != nil {
+			t.Fatalf("Chdir: %v", err)
+		}
+
+		// Degenerate names: host shapes, and the cwd must survive.
+		if err := os.Remove(""); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf(`Remove("") = %v, want ENOENT`, err)
+		}
+		if err := os.Remove("."); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf(`Remove(".") = %v, want EINVAL`, err)
+		}
+		if err := os.RemoveAll("."); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf(`RemoveAll(".") = %v, want EINVAL`, err)
+		}
+		if err := os.Rename("", "/x"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf(`Rename("",x) = %v, want ENOENT`, err)
+		}
+		if err := os.Rename("/work", ""); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf(`Rename(x,"") = %v, want ENOENT`, err)
+		}
+		if err := os.Chdir(""); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf(`Chdir("") = %v, want ENOENT`, err)
+		}
+		if _, err := os.Stat("/work"); err != nil {
+			t.Fatalf("cwd was harmed by degenerate names: %v", err)
+		}
+
+		// Relative two-name ops resolve both names against the cwd.
+		os.WriteFile("relsrc", []byte("rel"), 0o644)
+		if err := os.Rename("relsrc", "reldst"); err != nil {
+			t.Fatalf("relative Rename: %v", err)
+		}
+		if got, err := os.ReadFile("/work/reldst"); err != nil || string(got) != "rel" {
+			t.Fatalf("relative rename target = %q, %v", got, err)
+		}
+		if err := os.Remove("reldst"); err != nil {
+			t.Fatalf("relative Remove: %v", err)
+		}
+
+		// Relative dir open + File.Chdir (the M2 case).
+		os.Mkdir("sub", 0o755)
+		dh, err := os.Open("sub")
+		if err != nil {
+			t.Fatalf("relative Open dir: %v", err)
+		}
+		if err := dh.Chdir(); err != nil {
+			t.Fatalf("File.Chdir: %v", err)
+		}
+		dh.Close()
+		if wd, _ := os.Getwd(); wd != "/work/sub" {
+			t.Fatalf("Getwd after relative File.Chdir = %q, want /work/sub", wd)
+		}
+		os.Chdir("/")
+
+		// Rename onto an existing directory target: the wrapper's EEXIST
+		// shape (Go's deliberate cross-platform unification), via the
+		// sim-aware Lstat precheck.
+		os.WriteFile("/pf", []byte("x"), 0o644)
+		os.Mkdir("/pd", 0o755)
+		if err := os.Rename("/pf", "/pd"); !errors.Is(err, syscall.EEXIST) {
+			t.Fatalf("Rename file->dir = %v, want EEXIST", err)
+		}
+
+		// Root removal: EBUSY, like the host's error-priority pick.
+		if err := os.Remove("/"); !errors.Is(err, syscall.EBUSY) {
+			t.Fatalf(`Remove("/") = %v, want EBUSY`, err)
+		}
+
+		// Empty-directory listing: non-nil empty result.
+		os.Mkdir("/empty", 0o755)
+		eh, _ := os.Open("/empty")
+		names, err := eh.Readdirnames(0)
+		if err != nil || names == nil || len(names) != 0 {
+			t.Fatalf("empty Readdirnames = %v (nil=%v), %v", names, names == nil, err)
+		}
+		eh.Close()
+	})
+}
+
+// TestDSTFSReadDirAndCwd covers the sorted deterministic listing (one-shot
+// and chunked with the stable cursor), os.ReadDir, Readdirnames, and the
+// per-bubble working directory (Getwd/Chdir/File.Chdir + relative paths).
+func TestDSTFSReadDirAndCwd(t *testing.T) {
+	simulation.Run(1, func() {
+		for _, n := range []string{"zz", "aa", "mm", "bb"} {
+			if err := os.WriteFile("/"+n, []byte(n), 0o644); err != nil {
+				t.Fatalf("WriteFile %s: %v", n, err)
+			}
+		}
+		os.Mkdir("/sub", 0o755)
+
+		ents, err := os.ReadDir("/")
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		want := "aa,bb,mm,sub,zz"
+		if got := strings.Join(names, ","); got != want {
+			t.Fatalf("ReadDir order = %s, want %s", got, want)
+		}
+		if !ents[3].IsDir() || ents[3].Type()&os.ModeDir == 0 {
+			t.Fatalf("DirEntry sub not a dir: %v %v", ents[3].IsDir(), ents[3].Type())
+		}
+
+		// Chunked reads: stable cursor, io.EOF at exhaustion.
+		dh, err := os.Open("/")
+		if err != nil {
+			t.Fatalf("Open dir: %v", err)
+		}
+		n1, err1 := dh.Readdirnames(2)
+		n2, err2 := dh.Readdirnames(2)
+		n3, err3 := dh.Readdirnames(2)
+		_, err4 := dh.Readdirnames(2)
+		if err1 != nil || err2 != nil || err3 != nil {
+			t.Fatalf("chunked errs: %v %v %v", err1, err2, err3)
+		}
+		if err4 != io.EOF {
+			t.Fatalf("exhausted Readdirnames err = %v, want io.EOF", err4)
+		}
+		if got := strings.Join(append(append(n1, n2...), n3...), ","); got != want {
+			t.Fatalf("chunked order = %s, want %s", got, want)
+		}
+		// Read(2) on a directory handle: EISDIR.
+		if _, err := dh.Read(make([]byte, 4)); !errors.Is(err, syscall.EISDIR) {
+			t.Fatalf("Read on dir = %v, want EISDIR", err)
+		}
+		dh.Close()
+
+		// cwd: starts at /, Chdir is per-bubble, relative paths resolve.
+		if wd, err := os.Getwd(); wd != "/" || err != nil {
+			t.Fatalf("Getwd = %q, %v", wd, err)
+		}
+		if err := os.Chdir("/sub"); err != nil {
+			t.Fatalf("Chdir: %v", err)
+		}
+		if wd, _ := os.Getwd(); wd != "/sub" {
+			t.Fatalf("Getwd after Chdir = %q", wd)
+		}
+		if err := os.WriteFile("rel.txt", []byte("relative"), 0o644); err != nil {
+			t.Fatalf("relative WriteFile: %v", err)
+		}
+		if got, err := os.ReadFile("/sub/rel.txt"); err != nil || string(got) != "relative" {
+			t.Fatalf("relative file = %q, %v", got, err)
+		}
+		if err := os.Chdir("/sub/rel.txt"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf("Chdir to file = %v, want ENOTDIR", err)
+		}
+		root, _ := os.Open("/")
+		if err := root.Chdir(); err != nil {
+			t.Fatalf("File.Chdir: %v", err)
+		}
+		root.Close()
+		if wd, _ := os.Getwd(); wd != "/" {
+			t.Fatalf("Getwd after File.Chdir = %q", wd)
+		}
+	})
+
+	// cwd resets across runs with the rest of the tree — proven by a run
+	// that ENDS away from root (a run ending at "/" would mask a stale cwd).
+	simulation.Run(1, func() {
+		os.Mkdir("/leftover", 0o755)
+		if err := os.Chdir("/leftover"); err != nil {
+			t.Fatalf("Chdir: %v", err)
+		}
+	})
+	simulation.Run(1, func() {
+		if wd, _ := os.Getwd(); wd != "/" {
+			t.Fatalf("fresh run Getwd = %q, want / (cwd leaked across runs)", wd)
+		}
 	})
 }
 

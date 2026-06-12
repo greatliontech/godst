@@ -287,7 +287,11 @@ determinism rides the schedule exactly as it does for the network.
 NEVER visible (no passthrough, no testdata reads — a host path is machine state, and reading it
 would make runs machine-dependent). A program needing fixture files creates them inside the run.
 Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
-per-bubble). Directory listings (`os.ReadDir`, `File.ReadDir`/`Readdir`/`Readdirnames`, including
+per-bubble). The working directory is a PATH, not a node reference: renaming a directory out from
+under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,
+recorded here as contractual (the host's fchdir-tracked inode semantics are not promised). A
+`DirEntry` from a listing carries its listing-time `Info` snapshot rather than re-statting lazily
+as the host does. Directory listings (`os.ReadDir`, `File.ReadDir`/`Readdir`/`Readdirnames`, including
 chunked `n > 0` reads against a stable cursor) are **sorted by name** — deterministic, and
 consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubble's fake clock.
 Permission bits are stored and reported but not enforced in the base model (no simulated

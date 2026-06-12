@@ -33,6 +33,18 @@ func dstFSFencedLink(op, oldname, newname string) (error, bool) { return nil, fa
 
 func dstSameFile(fi1, fi2 FileInfo) (same, handled bool) { return false, false }
 
+func dstOpenDir(name string) (*File, bool, error)         { return nil, false, nil }
+func dstMkdir(name string, perm FileMode) (bool, error)   { return false, nil }
+func dstRemove(name string) (bool, error)                 { return false, nil }
+func dstRemoveAll(name string) (bool, error)              { return false, nil }
+func dstRename(oldname, newname string) (bool, error)     { return false, nil }
+func dstStatName(op, name string) (FileInfo, bool, error) { return nil, false, nil }
+func dstGetwd() (string, bool, error)                     { return "", false, nil }
+func dstChdir(dir string) (bool, error)                   { return false, nil }
+
+func (*dstFile) readdir(n int) ([]string, []FileInfo, error) { panic("unreachable") }
+func (*dstFile) chdirHandle() error                          { panic("unreachable") }
+
 // dstErrUnsupportedFS exists untagged only so fence gates type-check; every
 // reference is behind the folded dstSimEnabled constant.
 var dstErrUnsupportedFS error

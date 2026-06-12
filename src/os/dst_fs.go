@@ -50,12 +50,14 @@ var dstFS struct {
 	mu    sync.Mutex
 	epoch uint64
 	root  *dstFSNode
+	cwd   string // per-bubble working directory (process-wide, POSIX-style)
 }
 
 // dstFSRoll resets the tree when the run epoch advances. Caller holds dstFS.mu.
 func dstFSRoll() {
 	if e := dstFSEpoch(); e != dstFS.epoch || dstFS.root == nil {
 		dstFS.epoch = e
+		dstFS.cwd = "/"
 		dstFS.root = &dstFSNode{
 			isDir:   true,
 			entries: make(map[string]*dstFSNode),
@@ -133,7 +135,7 @@ func dstFSFencedLink(op, oldname, newname string) (error, bool) {
 // parent directory node, the base name, and the target node (nil if absent).
 // Caller holds dstFS.mu. Errors are bare errnos; callers wrap.
 func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
-	clean := path.Clean("/" + name)
+	clean := dstFSAbs(name)
 	if clean == "/" {
 		return nil, "/", dstFS.root, nil
 	}
@@ -160,6 +162,246 @@ func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode,
 	}
 }
 
+// dstFSAbs resolves name against the per-bubble working directory and cleans
+// it. Caller holds dstFS.mu (cwd is per-run state).
+func dstFSAbs(name string) string {
+	if len(name) > 0 && name[0] == '/' {
+		return path.Clean(name)
+	}
+	return path.Clean(dstFS.cwd + "/" + name)
+}
+
+// dstMkdir implements Mkdir on the simulated tree.
+func dstMkdir(name string, perm FileMode) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "mkdir", Path: name, Err: e} }
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	parent, base, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node != nil {
+		return wrap(syscall.EEXIST)
+	}
+	parent.entries[base] = &dstFSNode{
+		isDir:   true,
+		entries: make(map[string]*dstFSNode),
+		mode:    ModeDir | perm&ModePerm,
+		modTime: time.Now(),
+	}
+	parent.modTime = time.Now()
+	return true, nil
+}
+
+// dstRemove implements Remove: files and empty directories. The node outlives
+// the entry while open handles reference it (unlinked-but-open).
+func dstRemove(name string) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "remove", Path: name, Err: e} }
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	if base := path.Base(name); base == "." || base == ".." {
+		// unlink/rmdir of "." and ".." are rejected by the host (EINVAL /
+		// ENOTEMPTY); EINVAL is os.Remove's observed shape for ".".
+		return wrap(syscall.EINVAL)
+	}
+	parent, base, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if node == dstFS.root {
+		return wrap(syscall.EBUSY)
+	}
+	if node.isDir && len(node.entries) > 0 {
+		return wrap(syscall.ENOTEMPTY)
+	}
+	delete(parent.entries, base)
+	parent.modTime = time.Now()
+	return true, nil
+}
+
+// dstRemoveAll implements RemoveAll directly on the tree: one atomic subtree
+// unlink under the lock (the portable removeAll uses openat-family syscalls
+// that never reach the gated funnels). A missing path is success, like the
+// host's.
+func dstRemoveAll(name string) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	if name == "" {
+		return true, nil // RemoveAll("") is a no-op success, like the host
+	}
+	if base := path.Base(name); base == "." || base == ".." {
+		// The host's removeall rejects trailing-dot paths with EINVAL.
+		return true, &PathError{Op: "RemoveAll", Path: name, Err: syscall.EINVAL}
+	}
+	parent, base, node, errno := dstFSResolve(name)
+	if errno != nil {
+		if errno == syscall.ENOENT {
+			return true, nil
+		}
+		return true, &PathError{Op: "removeall", Path: name, Err: errno}
+	}
+	if node == nil {
+		return true, nil
+	}
+	if node == dstFS.root {
+		// Match RemoveAll("/"): refuse to destroy the root.
+		return true, &PathError{Op: "removeall", Path: name, Err: syscall.EBUSY}
+	}
+	delete(parent.entries, base)
+	parent.modTime = time.Now()
+	return true, nil
+}
+
+// dstRename implements the rename syscall's semantics on the tree: atomic in
+// the namespace (observers under the same lock see old or new, never
+// neither), replacing a file target, requiring an empty directory target for
+// a directory source, and refusing ancestor moves.
+func dstRename(oldname, newname string) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &LinkError{Op: "rename", Old: oldname, New: newname, Err: e} }
+	if oldname == "" || newname == "" {
+		return wrap(syscall.ENOENT)
+	}
+	if b := path.Base(oldname); b == "." || b == ".." {
+		return wrap(syscall.EBUSY) // rename(2): oldpath/newpath "." or ".."
+	}
+	if b := path.Base(newname); b == "." || b == ".." {
+		return wrap(syscall.EBUSY)
+	}
+	oldParent, oldBase, oldNode, errno := dstFSResolve(oldname)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if oldNode == nil {
+		return wrap(syscall.ENOENT)
+	}
+	newParent, newBase, newNode, errno := dstFSResolve(newname)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if oldNode == dstFS.root || newNode == dstFS.root {
+		return wrap(syscall.EBUSY)
+	}
+	if newNode == oldNode {
+		return true, nil // same file: POSIX no-op success
+	}
+	oldAbs, newAbs := dstFSAbs(oldname), dstFSAbs(newname)
+	if newAbs == oldAbs || (len(newAbs) > len(oldAbs) && newAbs[:len(oldAbs)] == oldAbs && newAbs[len(oldAbs)] == '/') {
+		return wrap(syscall.EINVAL) // new is inside old
+	}
+	if newNode != nil {
+		switch {
+		case newNode.isDir && !oldNode.isDir:
+			return wrap(syscall.EISDIR)
+		case !newNode.isDir && oldNode.isDir:
+			return wrap(syscall.ENOTDIR)
+		case newNode.isDir && len(newNode.entries) > 0:
+			return wrap(syscall.ENOTEMPTY)
+		}
+	}
+	delete(oldParent.entries, oldBase)
+	newParent.entries[newBase] = oldNode
+	now := time.Now()
+	oldParent.modTime = now
+	newParent.modTime = now
+	return true, nil
+}
+
+// dstStatName implements named Stat (and Lstat — no symlinks in the base
+// model, so they coincide).
+func dstStatName(op, name string) (FileInfo, bool, error) {
+	if !dstFSActive() {
+		return nil, false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	if name == "" {
+		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
+	}
+	_, base, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return nil, true, &PathError{Op: op, Path: name, Err: errno}
+	}
+	if node == nil {
+		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
+	}
+	if node == dstFS.root {
+		base = "/"
+	}
+	size := int64(len(node.data))
+	return &dstFileInfo{
+		name:    base,
+		size:    size,
+		mode:    node.mode,
+		modTime: node.modTime,
+		isDir:   node.isDir,
+		node:    node,
+	}, true, nil
+}
+
+// dstGetwd / dstChdir: the per-bubble working directory.
+func dstGetwd() (string, bool, error) {
+	if !dstFSActive() {
+		return "", false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	return dstFS.cwd, true, nil
+}
+
+func dstChdir(dir string) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &PathError{Op: "chdir", Path: dir, Err: e} }
+	if dir == "" {
+		return wrap(syscall.ENOENT)
+	}
+	_, _, node, errno := dstFSResolve(dir)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if !node.isDir {
+		return wrap(syscall.ENOTDIR)
+	}
+	dstFS.cwd = dstFSAbs(dir)
+	return true, nil
+}
+
 // dstFile is the open-handle state for a simulated file: the node reference,
 // the seek offset, and the access mode. It is the tree-file backend behind
 // the os.File dst seam; dst-io's pipe plugs in as a sibling backend later
@@ -169,6 +411,7 @@ type dstFile struct {
 	node   *dstFSNode
 	path   string
 	off    int64
+	dirpos int // directory read cursor (sorted-name index)
 	rd, wr bool
 	app    bool
 	closed bool
@@ -197,13 +440,8 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	}
 
 	accWrite := flag&(O_WRONLY|O_RDWR) != 0
-	if node != nil && node.isDir {
-		if accWrite {
-			return wrap(syscall.EISDIR)
-		}
-		// Directory handles (ReadDir, directory Sync) are the namespace
-		// increment; until then a directory open is fenced, not half-modeled.
-		return wrap(dstErrUnsupportedFS)
+	if node != nil && node.isDir && accWrite {
+		return wrap(syscall.EISDIR)
 	}
 
 	switch {
@@ -229,11 +467,40 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 
 	d := &dstFile{
 		node: node,
-		path: path.Clean("/" + name),
+		path: dstFSAbs(name),
 		rd:   flag&O_WRONLY == 0,
 		wr:   accWrite,
 		app:  flag&O_APPEND != 0,
 	}
+	return dstNewFile(d, name), true, nil
+}
+
+// dstOpenDir is openDirNolog's counterpart: the target must be a directory
+// (ENOTDIR for a file — the O_DIRECTORY shape), opened read-only.
+func dstOpenDir(name string) (f *File, handled bool, err error) {
+	if !dstFSActive() {
+		return nil, false, nil
+	}
+	wrap := func(e error) (*File, bool, error) {
+		return nil, true, &PathError{Op: "open", Path: name, Err: e}
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	if name == "" {
+		return wrap(syscall.ENOENT)
+	}
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if node == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if !node.isDir {
+		return wrap(syscall.ENOTDIR)
+	}
+	d := &dstFile{node: node, path: dstFSAbs(name), rd: true}
 	return dstNewFile(d, name), true, nil
 }
 
@@ -278,6 +545,9 @@ func (d *dstFile) read(b []byte) (int, error) {
 	if !d.rd {
 		return 0, syscall.EBADF
 	}
+	if d.node.isDir {
+		return 0, syscall.EISDIR
+	}
 	if d.off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -293,6 +563,9 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 	defer d.leave()
 	if !d.rd {
 		return 0, syscall.EBADF
+	}
+	if d.node.isDir {
+		return 0, syscall.EISDIR
 	}
 	if off >= int64(len(d.node.data)) {
 		return 0, io.EOF
@@ -365,8 +638,89 @@ func (d *dstFile) seek(offset int64, whence int) (int64, error) {
 	if pos < 0 {
 		return 0, syscall.EINVAL
 	}
+	if d.node.isDir {
+		if pos != 0 {
+			return 0, syscall.EISDIR
+		}
+		d.dirpos = 0
+		return 0, nil
+	}
 	d.off = pos
 	return pos, nil
+}
+
+// sortedEntryNames returns the directory's entry names sorted ascending.
+// Caller holds both locks. Sorted order is the deterministic listing order
+// the spec promises (and matches os.ReadDir's documented sorting).
+func (d *dstFile) sortedEntryNamesLocked() []string {
+	names := make([]string, 0, len(d.node.entries))
+	for name := range d.node.entries {
+		names = append(names, name)
+	}
+	for i := 1; i < len(names); i++ { // insertion sort: no new imports
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	return names
+}
+
+// readdir implements the File.Readdir/ReadDir/Readdirnames funnel for a
+// simulated directory handle: sorted names with a stable cursor for chunked
+// (n > 0) reads; io.EOF at exhaustion for chunked mode, as the host funnel.
+func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
+	if e := d.enter(); e != nil {
+		return nil, nil, e
+	}
+	defer d.leave()
+	if !d.node.isDir {
+		return nil, nil, syscall.ENOTDIR
+	}
+	all := d.sortedEntryNamesLocked()
+	if d.dirpos > len(all) {
+		d.dirpos = len(all)
+	}
+	rest := all[d.dirpos:]
+	if n > 0 {
+		if len(rest) == 0 {
+			return nil, nil, io.EOF
+		}
+		if len(rest) > n {
+			rest = rest[:n]
+		}
+	}
+	d.dirpos += len(rest)
+	names = make([]string, 0, len(rest))
+	names = append(names, rest...)
+	infos = make([]FileInfo, 0, len(names))
+	for _, name := range names {
+		node := d.node.entries[name]
+		if node == nil {
+			continue // racing remove between snapshot and here is impossible under the lock; defensive
+		}
+		infos = append(infos, &dstFileInfo{
+			name:    name,
+			size:    int64(len(node.data)),
+			mode:    node.mode,
+			modTime: node.modTime,
+			isDir:   node.isDir,
+			node:    node,
+		})
+	}
+	return names, infos, nil
+}
+
+// chdirHandle implements File.Chdir for a simulated directory handle.
+func (d *dstFile) chdirHandle() error {
+	if e := d.enter(); e != nil {
+		return e
+	}
+	defer d.leave()
+	if !d.node.isDir {
+		return syscall.ENOTDIR
+	}
+	dstFS.cwd = d.path
+	return nil
 }
 
 func (d *dstFile) truncate(size int64) error {

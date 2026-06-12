@@ -72,7 +72,7 @@ func MkdirAll(path string, perm FileMode) error {
 // If there is an error, it will be of type [*PathError].
 func RemoveAll(path string) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("removeall", path); fenced {
+		if handled, err := dstRemoveAll(path); handled {
 			return err
 		}
 	}

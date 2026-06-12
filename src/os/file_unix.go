@@ -43,6 +43,11 @@ func rename(oldname, newname string) error {
 			return &LinkError{"rename", oldname, newname, syscall.EEXIST}
 		}
 	}
+	if dstSimEnabled {
+		if handled, derr := dstRename(oldname, newname); handled {
+			return derr
+		}
+	}
 	err = ignoringEINTR(func() error {
 		return syscall.Rename(oldname, newname)
 	})
@@ -295,8 +300,8 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 
 func openDirNolog(name string) (*File, error) {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("open", name); fenced {
-			return nil, err
+		if f, handled, err := dstOpenDir(name); handled {
+			return f, err
 		}
 	}
 	var (
@@ -389,7 +394,7 @@ func Truncate(name string, size int64) error {
 // If there is an error, it will be of type [*PathError].
 func Remove(name string) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("remove", name); fenced {
+		if handled, err := dstRemove(name); handled {
 			return err
 		}
 	}

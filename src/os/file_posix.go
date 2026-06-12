@@ -252,7 +252,10 @@ func (f *File) Chdir() error {
 		return err
 	}
 	if dstSimEnabled && f.dstf != nil {
-		return f.wrapErr("chdir", dstErrUnsupportedFS)
+		if e := f.dstf.chdirHandle(); e != nil {
+			return f.wrapErr("chdir", e)
+		}
+		return nil
 	}
 	if e := f.pfd.Fchdir(); e != nil {
 		return f.wrapErr("chdir", e)

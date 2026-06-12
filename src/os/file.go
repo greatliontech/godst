@@ -326,7 +326,7 @@ func (f *File) WriteString(s string) (n int, err error) {
 // If there is an error, it will be of type [*PathError].
 func Mkdir(name string, perm FileMode) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("mkdir", name); fenced {
+		if handled, err := dstMkdir(name, perm); handled {
 			return err
 		}
 	}
@@ -365,7 +365,7 @@ func setStickyBit(name string) error {
 // If there is an error, it will be of type [*PathError].
 func Chdir(dir string) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("chdir", dir); fenced {
+		if handled, err := dstChdir(dir); handled {
 			return err
 		}
 	}
@@ -445,11 +445,6 @@ func openDir(name string) (*File, error) {
 // Even within the same directory, on non-Unix platforms Rename is not an atomic operation.
 // If there is an error, it will be of type *LinkError.
 func Rename(oldpath, newpath string) error {
-	if dstSimEnabled {
-		if err, fenced := dstFSFencedLink("rename", oldpath, newpath); fenced {
-			return err
-		}
-	}
 	return rename(oldpath, newpath)
 }
 

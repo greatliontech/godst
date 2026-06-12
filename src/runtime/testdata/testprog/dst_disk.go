@@ -65,5 +65,30 @@ func DSTDiskReplay() {
 		f.Close()
 		fmt.Printf("content=%s\n", all)
 		fmt.Printf("sizes=%v\n", sizes)
+
+		// Namespace transcript: concurrent per-goroutine subtrees, then a
+		// deterministic listing walk and a rename.
+		var wg2 sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			wg2.Add(1)
+			go func(g int) {
+				defer wg2.Done()
+				dir := fmt.Sprintf("/n%d", g)
+				os.Mkdir(dir, 0o755)
+				for i := 0; i < 3; i++ {
+					os.WriteFile(fmt.Sprintf("%s/f%d", dir, i), []byte{byte(g), byte(i)}, 0o644)
+				}
+			}(g)
+		}
+		wg2.Wait()
+		os.Rename("/n0", "/renamed")
+		ents, err := os.ReadDir("/")
+		if err != nil {
+			fmt.Println("readdir:", err)
+			return
+		}
+		for _, e := range ents {
+			fmt.Printf("ent=%s dir=%v\n", e.Name(), e.IsDir())
+		}
 	})
 }

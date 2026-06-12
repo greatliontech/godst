@@ -10,8 +10,8 @@ import "internal/testlog"
 // If there is an error, it will be of type [*PathError].
 func Stat(name string) (FileInfo, error) {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("stat", name); fenced {
-			return nil, err
+		if fi, handled, err := dstStatName("stat", name); handled {
+			return fi, err
 		}
 	}
 	testlog.Stat(name)
@@ -28,8 +28,8 @@ func Stat(name string) (FileInfo, error) {
 // FileInfo describes the reparse point, and makes no attempt to resolve it.
 func Lstat(name string) (FileInfo, error) {
 	if dstSimEnabled {
-		if err, fenced := dstFSFenced("lstat", name); fenced {
-			return nil, err
+		if fi, handled, err := dstStatName("lstat", name); handled {
+			return fi, err
 		}
 	}
 	testlog.Stat(name)
