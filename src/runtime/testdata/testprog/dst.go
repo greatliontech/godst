@@ -5,15 +5,11 @@
 package main
 
 import (
-	"context"
 	crand "crypto/rand"
 	"encoding/hex"
-	"errors"
 	"internal/synctest"
 	"math/rand/v2"
-	"net"
 	"os"
-	"os/user"
 	"runtime"
 	"runtime/metrics"
 	"strconv"
@@ -64,7 +60,6 @@ func init() {
 	register("DSTGOMAXPROCSEntryRace", DSTGOMAXPROCSEntryRace)
 	register("DSTGOMAXPROCSDelayedSTW", DSTGOMAXPROCSDelayedSTW)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
-	register("DSTIdentityGroups", DSTIdentityGroups)
 	register("DSTRunNoTag", DSTRunNoTag)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
@@ -74,11 +69,7 @@ func init() {
 	register("DSTCleanupChanOpPriorG", DSTCleanupChanOpPriorG)
 	register("DSTWeakClearing", DSTWeakClearing)
 	register("DSTGCOffBound", DSTGCOffBound)
-	register("DSTProcessIdentity", DSTProcessIdentity)
-	register("DSTIdentityExtra", DSTIdentityExtra)
 	register("DSTCryptoRand", DSTCryptoRand)
-	register("DSTNet", DSTNet)
-	register("DSTNetSemantics", DSTNetSemantics)
 	register("DSTFinChain", DSTFinChain)
 	register("DSTFinLongChain", DSTFinLongChain)
 	register("DSTCleanupLongChain", DSTCleanupLongChain)
@@ -222,279 +213,9 @@ func DSTFinLongChain() {
 	}
 }
 
-// DSTProcessIdentity checks that os.Getpid/os.Hostname return the simulated
-// process identity inside simulation.Run (a deterministic default, or the value
-// set via Options), and the real machine's identity outside it. Prints
-// "def=<pid>/<host> custom=<pid>/<host> restored=<bool> realoverridden=<bool>".
-func DSTProcessIdentity() {
-	host := func() string { h, _ := os.Hostname(); return h }
-	realPID, realHost := os.Getpid(), host()
-	var def, custom string
-	simulation.Run(1, func() {
-		def = strconv.Itoa(os.Getpid()) + "/" + host()
-	})
-	simulation.RunWith(1, simulation.Options{Hostname: "node7", PID: 4242}, func() {
-		custom = strconv.Itoa(os.Getpid()) + "/" + host()
-	})
-	restored := os.Getpid() == realPID && host() == realHost
-	// realoverridden confirms the real identity differs from the simulated default,
-	// so def=1/sim is a genuine override and not a coincidence.
-	realOverridden := realPID != 1 || realHost != "sim"
-	os.Stdout.WriteString("def=" + def + " custom=" + custom +
-		" restored=" + strconv.FormatBool(restored) +
-		" realoverridden=" + strconv.FormatBool(realOverridden) + "\n")
-}
 
-// DSTNet exercises the in-memory deterministic network: inside simulation.Run a
-// server Listens/Accepts and a client Dials over net's TCP API, exchange a
-// request/response over the simulated connection, with the simulated addresses.
-// With the real OS network this could not run deterministically (or at all in a
-// sandbox); here it is a function of the seed. Prints a summary line; two runs (a
-// and b) check same-seed determinism and that the per-run registry reset (b's
-// Listen on the same address must not be "address already in use").
-func DSTNet() {
-	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	exchange := func() string {
-		var out string
-		simulation.Run(n, func() {
-			const addr = "10.0.0.1:9000"
-			ln, err := net.Listen("tcp", addr)
-			if err != nil {
-				out = "listen err: " + err.Error()
-				return
-			}
-			done := make(chan string, 1)
-			go func() {
-				c, err := ln.Accept()
-				if err != nil {
-					done <- "accept err: " + err.Error()
-					return
-				}
-				buf := make([]byte, 16)
-				nr, _ := c.Read(buf)
-				msg := string(buf[:nr])
-				c.Write([]byte("echo:" + msg))
-				from := c.RemoteAddr().String()
-				c.Close()
-				done <- "server saw " + msg + " from " + from
-			}()
-			client, err := net.Dial("tcp", addr)
-			if err != nil {
-				out = "dial err: " + err.Error()
-				return
-			}
-			client.Write([]byte("ping"))
-			buf := make([]byte, 32)
-			nr, _ := client.Read(buf)
-			resp := string(buf[:nr])
-			srv := <-done
-			out = "resp=" + resp + " local=" + client.LocalAddr().String() +
-				" remote=" + client.RemoteAddr().String() + " | " + srv
-		})
-		return out
-	}
-	a := exchange()
-	b := exchange()
-	if a != b {
-		os.Stdout.WriteString("DIVERGED\n a=" + a + "\n b=" + b + "\n")
-		return
-	}
-	os.Stdout.WriteString(a + "\n")
-}
 
-// DSTNetSemantics checks that the DST network shim preserves public net semantics
-// for the TCP surface it owns, and rejects protocol shapes it does not model.
-// Prints booleans for: canceled/deadline DialContext errors, nil DialContext
-// panics, unsupported UDP Listen/Dial errors, deterministic :0 listener ports,
-// invalid ports, localhost canonicalization, DNS/service-name rejection, and
-// tcp4/tcp6 address-family constraints.
-func DSTNetSemantics() {
-	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	var canceled, deadline, nilPanic, udpRejected, udpDialRejected, zeroPorts, invalidPort, localhost, dnsRejected, serviceRejected, familyRejected, wildcardFamilyRejected, tcp6WildcardRejected, tcp6Local, tcp4Unspecified bool
-	simulation.Run(n, func() {
-		ln, err := net.Listen("tcp", "127.0.0.1:9100")
-		if err == nil {
-			defer ln.Close()
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			c, err := (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:9100")
-			if c != nil {
-				c.Close()
-			}
-			canceled = errors.Is(err, context.Canceled)
 
-			ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
-			defer cancel()
-			c, err = (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:9100")
-			if c != nil {
-				c.Close()
-			}
-			deadline = errors.Is(err, context.DeadlineExceeded)
-
-			func() {
-				defer func() { nilPanic = recover() != nil }()
-				c, _ := (&net.Dialer{}).DialContext(nil, "tcp", "127.0.0.1:9100")
-				if c != nil {
-					c.Close()
-				}
-			}()
-		}
-
-		if ln, err := net.Listen("udp", "127.0.0.1:9101"); err != nil {
-			udpRejected = true
-		} else {
-			ln.Close()
-		}
-		if c, err := net.Dial("udp", "127.0.0.1:9100"); err != nil {
-			udpDialRejected = true
-		} else {
-			c.Close()
-		}
-
-		l1, err1 := net.Listen("tcp", "127.0.0.1:0")
-		l2, err2 := net.Listen("tcp", "127.0.0.1:0")
-		if err1 == nil && err2 == nil {
-			p1 := l1.Addr().(*net.TCPAddr).Port
-			p2 := l2.Addr().(*net.TCPAddr).Port
-			zeroPorts = p1 == 10000 && p2 == 10001
-		}
-		if l1 != nil {
-			l1.Close()
-		}
-		if l2 != nil {
-			l2.Close()
-		}
-
-		if ln, err := net.Listen("tcp", "127.0.0.1:999999"); err != nil {
-			invalidPort = true
-		} else {
-			ln.Close()
-		}
-
-		lnLocal, err := net.Listen("tcp", "127.0.0.1:9102")
-		if err == nil {
-			defer lnLocal.Close()
-			c, err := net.Dial("tcp", "localhost:9102")
-			if err == nil {
-				localhost = true
-				c.Close()
-				if srv, err := lnLocal.Accept(); err == nil {
-					srv.Close()
-				}
-			}
-		}
-
-		if c, err := net.Dial("tcp", "definitely-not-localhost.invalid:9102"); err != nil {
-			dnsRejected = strings.Contains(err.Error(), "DNS lookup unsupported under deterministic simulation")
-		} else {
-			c.Close()
-		}
-		if ln, err := net.Listen("tcp", "127.0.0.1:http"); err != nil {
-			serviceRejected = true
-		} else {
-			ln.Close()
-		}
-
-		if c, err := net.Dial("tcp6", "127.0.0.1:9102"); err != nil {
-			familyRejected = true
-		} else {
-			c.Close()
-		}
-		if ln6, err := net.Listen("tcp6", "[::]:9103"); err == nil {
-			if c, err := net.Dial("tcp4", "127.0.0.1:9103"); err != nil {
-				wildcardFamilyRejected = true
-			} else {
-				c.Close()
-			}
-			ln6.Close()
-		}
-		if ln, err := net.Listen("tcp6", "0.0.0.0:9104"); err != nil {
-			tcp6WildcardRejected = true
-		} else {
-			ln.Close()
-		}
-		if ln6, err := net.Listen("tcp6", "[::1]:9105"); err == nil {
-			c, err := net.Dial("tcp6", "[::1]:9105")
-			if err == nil {
-				tcp6Local = c.LocalAddr().(*net.TCPAddr).IP.To4() == nil
-				c.Close()
-				if srv, err := ln6.Accept(); err == nil {
-					srv.Close()
-				}
-			}
-			ln6.Close()
-		}
-		if ln4, err := net.Listen("tcp4", "127.0.0.1:9106"); err == nil {
-			c, err := net.Dial("tcp4", "[::]:9106")
-			if err == nil {
-				tcp4Unspecified = true
-				c.Close()
-				if srv, err := ln4.Accept(); err == nil {
-					srv.Close()
-				}
-			}
-			ln4.Close()
-		}
-	})
-	simulation.Run(n, func() {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err == nil {
-			zeroPorts = zeroPorts && ln.Addr().(*net.TCPAddr).Port == 10000
-			ln.Close()
-		} else {
-			zeroPorts = false
-		}
-	})
-	os.Stdout.WriteString("canceled=" + strconv.FormatBool(canceled) +
-		" deadline=" + strconv.FormatBool(deadline) +
-		" nilpanic=" + strconv.FormatBool(nilPanic) +
-		" udpreject=" + strconv.FormatBool(udpRejected) +
-		" udpdialreject=" + strconv.FormatBool(udpDialRejected) +
-		" zeroports=" + strconv.FormatBool(zeroPorts) +
-		" invalidport=" + strconv.FormatBool(invalidPort) +
-		" localhost=" + strconv.FormatBool(localhost) +
-		" dnsreject=" + strconv.FormatBool(dnsRejected) +
-		" servicereject=" + strconv.FormatBool(serviceRejected) +
-		" familyreject=" + strconv.FormatBool(familyRejected) +
-		" wildcardfamilyreject=" + strconv.FormatBool(wildcardFamilyRejected) +
-		" tcp6wildcardreject=" + strconv.FormatBool(tcp6WildcardRejected) +
-		" tcp6local=" + strconv.FormatBool(tcp6Local) +
-		" tcp4unspecified=" + strconv.FormatBool(tcp4Unspecified) + "\n")
-}
-
-// DSTIdentityExtra checks the rest of the process-identity surface beyond
-// pid/hostname: os.Getppid/Getuid/Getgid/Geteuid/Getegid, runtime.NumCPU, and
-// os/user.Current return fixed simulated values inside simulation.Run (NumCPU
-// overridable via Options), and are restored to real values outside it. Prints
-// "inside=[<ppid> <uid> <gid> <euid> <egid> <numcpu> <uid:gid:user:home>]
-// customcpu=<n> restoredids=<bool>". restoredids compares the whole identity
-// surface read *outside* the run before and after it: equality proves the run
-// did not leak simulated identity (and, since the pre-run read caches the real
-// os/user, that the in-run synthetic user never poisoned that cache).
-func DSTIdentityExtra() {
-	read := func() string {
-		u, _ := user.Current()
-		return strings.Join([]string{
-			strconv.Itoa(os.Getppid()),
-			strconv.Itoa(os.Getuid()),
-			strconv.Itoa(os.Getgid()),
-			strconv.Itoa(os.Geteuid()),
-			strconv.Itoa(os.Getegid()),
-			strconv.Itoa(runtime.NumCPU()),
-			u.Uid + ":" + u.Gid + ":" + u.Username + ":" + u.HomeDir,
-		}, " ")
-	}
-	realBefore := read()
-	var inside string
-	simulation.Run(1, func() { inside = read() })
-	// A custom NumCPU unlikely to equal the host's real count proves the override
-	// is genuine on any machine (whereas the default 8 could coincide with it).
-	var customCPU int
-	simulation.RunWith(1, simulation.Options{NumCPU: 3}, func() { customCPU = runtime.NumCPU() })
-	realAfter := read()
-	os.Stdout.WriteString("inside=[" + inside + "] customcpu=" + strconv.Itoa(customCPU) +
-		" restoredids=" + strconv.FormatBool(realAfter == realBefore) + "\n")
-}
 
 // DSTCryptoRand checks that crypto/rand is deterministic inside simulation.Run
 // (seeded by the run) but real OS entropy outside it. With DSTSEED=s it prints
@@ -1230,70 +951,6 @@ func DSTGOMAXPROCSAutoRestore() {
 		" after=" + strconv.FormatBool(dstGOMAXPROCSAutoFP()) + "\n")
 }
 
-// DSTIdentityGroups exercises the simulated group list and the minimal
-// simulated user/group database: inside a run, os.Getgroups is exactly the
-// simulated gid; os/user lookups resolve the simulated user/group by name and
-// id and report anything else deterministically unknown; GroupIds of the
-// simulated user is its single group. After the run the host values return.
-func DSTIdentityGroups() {
-	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	hostGroups, _ := os.Getgroups()
-	fail := func(msg string) {
-		os.Stdout.WriteString(msg + "\n")
-	}
-	okAll := true
-	simulation.Run(n, func() {
-		check := func(cond bool, msg string) {
-			if !cond {
-				okAll = false
-				fail(msg)
-			}
-		}
-		gids, err := os.Getgroups()
-		check(err == nil && len(gids) == 1 && gids[0] == 7777, "getgroups not [7777]")
-		u, err := user.Lookup("sim")
-		check(err == nil && u != nil && u.Uid == "7777" && u.HomeDir == "/home/sim", "Lookup(sim) wrong")
-		_, err = user.Lookup("nosuchuser")
-		var uue user.UnknownUserError
-		check(errors.As(err, &uue), "Lookup(nosuchuser) not UnknownUserError")
-		u2, err := user.LookupId("7777")
-		check(err == nil && u2 != nil && u2.Username == "sim", "LookupId(7777) wrong")
-		var uuie user.UnknownUserIdError
-		_, err = user.LookupId("1000")
-		check(errors.As(err, &uuie), "LookupId(1000) not UnknownUserIdError")
-		g, err := user.LookupGroup("sim")
-		check(err == nil && g != nil && g.Gid == "7777", "LookupGroup(sim) wrong")
-		var uge user.UnknownGroupError
-		_, err = user.LookupGroup("wheel")
-		check(errors.As(err, &uge), "LookupGroup(wheel) not UnknownGroupError")
-		g2, err := user.LookupGroupId("7777")
-		check(err == nil && g2 != nil && g2.Name == "sim", "LookupGroupId(7777) wrong")
-		if u != nil {
-			ids, err := u.GroupIds()
-			check(err == nil && len(ids) == 1 && ids[0] == "7777", "GroupIds(sim) wrong")
-		}
-		other := &user.User{Username: "app", Gid: "1000"}
-		ids2, err := other.GroupIds()
-		check(err == nil && len(ids2) == 1 && ids2[0] == "1000", "GroupIds(other) not primary gid")
-	})
-	after, _ := os.Getgroups()
-	restored := len(after) == len(hostGroups)
-	if restored {
-		for i := range after {
-			if after[i] != hostGroups[i] {
-				restored = false
-				break
-			}
-		}
-	}
-	if !restored {
-		fail("host groups not restored")
-		return
-	}
-	if okAll {
-		os.Stdout.WriteString("done\n")
-	}
-}
 
 // DSTRunNoTag exercises the documented build-constraint panic: in a binary
 // built WITHOUT -tags dst, simulation.Run must refuse to start (the map hash

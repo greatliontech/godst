@@ -51,6 +51,18 @@ func runTestProgDST(t *testing.T, name string, env ...string) string {
 	return runBuiltTestProg(t, exe, name, env...)
 }
 
+// runTestProgNetDST builds testprognet with -tags dst and runs the named
+// function. The DST net testprogs live in testprognet, not testprog: importing
+// net links cgo into the binary, and a cgo binary disables the runtime's
+// deadlock detection, which testprog's crash tests depend on.
+func runTestProgNetDST(t *testing.T, name string, env ...string) string {
+	exe, err := buildTestProg(t, "testprognet", "-tags=dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runBuiltTestProg(t, exe, name, env...)
+}
+
 // runTestProgDSTNoRace builds the testprog with -tags=dst but NEVER -race (unlike
 // runTestProgDST, whose buildTestProg appends -race when the outer test runs under
 // -race). The DPOR brain-validation Explore tests use it: they validate the algorithm
@@ -1151,7 +1163,7 @@ func TestDSTSchedulePCTChangePoints(t *testing.T) {
 // restores the real machine's identity afterward. Closes the determinism hole a
 // SUT reading pid/hostname would otherwise have.
 func TestDSTProcessIdentity(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDST(t, "DSTProcessIdentity"))
+	out := strings.TrimSpace(runTestProgNetDST(t, "DSTProcessIdentity"))
 	const want = "def=1/sim custom=4242/node7 restored=true realoverridden=true"
 	if out != want {
 		t.Fatalf("process identity not simulated correctly:\n got=%q\nwant=%q", out, want)
@@ -1164,7 +1176,7 @@ func TestDSTProcessIdentity(t *testing.T) {
 // (the last overridable via Options.NumCPU). Mutation check: dropping any
 // dstSim* accessor branch in os/runtime changes the corresponding field.
 func TestDSTIdentityExtra(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDST(t, "DSTIdentityExtra"))
+	out := strings.TrimSpace(runTestProgNetDST(t, "DSTIdentityExtra"))
 	const want = "inside=[1 7777 7777 7777 7777 8 7777:7777:sim:/home/sim] customcpu=3 restoredids=true"
 	if out != want {
 		t.Fatalf("extended identity not simulated correctly:\n got=%q\nwant=%q", out, want)
@@ -1209,7 +1221,7 @@ func TestDSTCryptoRandDeterministic(t *testing.T) {
 // name and id; everything else is deterministically unknown; host values
 // return after the run).
 func TestDSTIdentityGroups(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDST(t, "DSTIdentityGroups", "DSTSEED=12345"))
+	out := strings.TrimSpace(runTestProgNetDST(t, "DSTIdentityGroups", "DSTSEED=12345"))
 	if out != "done" {
 		t.Fatalf("simulated identity groups/database failed: %q", out)
 	}
@@ -1226,11 +1238,11 @@ func TestDSTIdentityGroups(t *testing.T) {
 // dstActive() makes it hit the real network (refused/hang).
 func TestDSTNet(t *testing.T) {
 	const want = "resp=echo:ping local=127.0.0.1:40000 remote=10.0.0.1:9000 | server saw ping from 127.0.0.1:40000"
-	out1 := strings.TrimSpace(runTestProgDST(t, "DSTNet", "DSTSEED=42"))
+	out1 := strings.TrimSpace(runTestProgNetDST(t, "DSTNet", "DSTSEED=42"))
 	if out1 != want {
 		t.Fatalf("in-memory net exchange wrong:\n got=%q\nwant=%q", out1, want)
 	}
-	out2 := strings.TrimSpace(runTestProgDST(t, "DSTNet", "DSTSEED=42"))
+	out2 := strings.TrimSpace(runTestProgNetDST(t, "DSTNet", "DSTSEED=42"))
 	if out2 != out1 {
 		t.Fatalf("in-memory net not reproducible across processes:\nrun1=%q\nrun2=%q", out1, out2)
 	}
@@ -1240,7 +1252,7 @@ func TestDSTNet(t *testing.T) {
 // at the TCP surface it intercepts and rejects unsupported network kinds rather
 // than modeling them as impossible TCP-like streams.
 func TestDSTNetSemantics(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDST(t, "DSTNetSemantics", "DSTSEED=42"))
+	out := strings.TrimSpace(runTestProgNetDST(t, "DSTNetSemantics", "DSTSEED=42"))
 	const want = "canceled=true deadline=true nilpanic=true udpreject=true udpdialreject=true zeroports=true invalidport=true localhost=true dnsreject=true servicereject=true familyreject=true wildcardfamilyreject=true tcp6wildcardreject=true tcp6local=true tcp4unspecified=true"
 	if out != want {
 		t.Fatalf("DST net semantics mismatch:\n got=%q\nwant=%q", out, want)
