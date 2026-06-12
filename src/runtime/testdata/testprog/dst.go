@@ -61,6 +61,8 @@ func init() {
 	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
 	register("DSTOvfFlushAtDeactivate", DSTOvfFlushAtDeactivate)
 	register("DSTWhiteBoxCleanupChurnP4", DSTWhiteBoxCleanupChurnP4)
+	register("DSTGOMAXPROCSEntryRace", DSTGOMAXPROCSEntryRace)
+	register("DSTGOMAXPROCSDelayedSTW", DSTGOMAXPROCSDelayedSTW)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
 	register("DSTIdentityGroups", DSTIdentityGroups)
 	register("DSTRunNoTag", DSTRunNoTag)
@@ -99,6 +101,9 @@ func dstGOMAXPROCSAutoFP() bool
 
 //go:linkname dstSchedOvfPutsFP runtime.dstSchedOvfPutsFP
 func dstSchedOvfPutsFP() uint64
+
+//go:linkname dstSetGOMAXPROCSSTWHook runtime.dstSetGOMAXPROCSSTWHook
+func dstSetGOMAXPROCSSTWHook(f func())
 
 // dstMemSink keeps the most recent allocation live so the rest become garbage.
 var dstMemSink []byte
@@ -2655,6 +2660,142 @@ func DSTWhiteBoxCleanupChurnP4() {
 	}
 	if got := ran.Load(); got != 1600 {
 		os.Stdout.WriteString("cleanups lost: " + strconv.FormatInt(got, 10) + "/1600\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTGOMAXPROCSEntryRace: a foreign GOMAXPROCS call racing simulation.Run
+// entry must never produce a silently nondeterministic run. The dstActive
+// gate in the setters is check-then-act, so a call that passed it can land
+// its stop-the-world inside the pin->activate window; the runtime re-checks
+// dstActive under every setter's STW (dropping the update mid-run) and Run
+// verifies the pin held after activation (failing loud). Outcome per run:
+// success with GOMAXPROCS==1 observed throughout, or the loud entry panic —
+// never an in-run observation of GOMAXPROCS != 1. Prints "done".
+func DSTGOMAXPROCSEntryRace() {
+	stop := make(chan struct{})
+	var cwg sync.WaitGroup
+	cwg.Add(1)
+	go func() {
+		defer cwg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				// Set-only (never back to 1): a toggling churner can undo its
+				// own mid-window resize before activation samples it,
+				// self-healing the very race the test must catch. Repeated
+				// sets at the same value skip the STW (n == ret fast path),
+				// so each pin opens exactly one effective resize attempt.
+				runtime.GOMAXPROCS(2)
+				// Real sleep: while a run is active the setter returns at
+				// the cheap dstActive gate without blocking, and an
+				// always-runnable foreign goroutine would starve the
+				// simulation under system-first scheduling (it never yields
+				// the only P).
+				time.Sleep(20 * time.Microsecond)
+			}
+		}
+	}()
+	violations, panics := 0, 0
+	var garbage [][]byte
+	for i := 0; i < 300; i++ {
+		// Pre-run garbage widens the pin->activate window: the activation's
+		// preparation GCs then do real sweep work, giving the churner's
+		// stop-the-world a real interval to land fully inside (the case only
+		// the post-activation pin verification can catch).
+		garbage = nil
+		for j := 0; j < 32; j++ {
+			garbage = append(garbage, make([]byte, 128<<10))
+		}
+		garbage = nil // drop blocks and backing array: dead at Run entry, swept by the prep GCs
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if s, ok := r.(string); ok && strings.Contains(s, "GOMAXPROCS changed during simulation entry") {
+						panics++
+						return
+					}
+					panic(r)
+				}
+			}()
+			simulation.Run(uint64(i+1), func() {
+				done := make(chan struct{})
+				go func() { close(done) }()
+				<-done
+				// Sample across real wall time, not just fake-clock points: a
+				// foreign setter whose gate passed before activation can have
+				// its stop-the-world land mid-SUT (after the entry
+				// verification), and only a sample taken after that landing
+				// observes the resize.
+				var sink []byte
+				for k := 0; k < 3000; k++ {
+					if runtime.GOMAXPROCS(0) != 1 {
+						violations++
+						break
+					}
+					sink = make([]byte, 1024)
+				}
+				_ = sink
+				time.Sleep(time.Millisecond)
+				if runtime.GOMAXPROCS(0) != 1 {
+					violations++
+				}
+			})
+		}()
+	}
+	close(stop)
+	cwg.Wait()
+	if violations != 0 {
+		os.Stdout.WriteString("in-run GOMAXPROCS violations: " + strconv.Itoa(violations) +
+			" (entry panics: " + strconv.Itoa(panics) + ")\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTGOMAXPROCSDelayedSTW: the deterministic form of the entry race — a
+// setter whose not-active gate passed BEFORE activation but whose
+// stop-the-world lands only AFTER (in production, a contended
+// computeMaxProcsLock — sysmon reads cgroup files under it — creates exactly
+// this delay). The runtime's post-STW dstActive re-check must drop the
+// update: GOMAXPROCS stays 1 while the simulation is active, for both
+// GOMAXPROCS and SetDefaultGOMAXPROCS. White-box (no bubble needed — the
+// re-check keys on dstActive alone). Prints "done".
+func DSTGOMAXPROCSDelayedSTW() {
+	runtime.GOMAXPROCS(1)
+	check := func(name string, call func()) bool {
+		reached := make(chan struct{})
+		gate := make(chan struct{})
+		dstSetGOMAXPROCSSTWHook(func() {
+			close(reached)
+			<-gate
+		})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			call()
+		}()
+		<-reached // the setter passed its not-active gate and is held pre-STW
+		dstActivate(7)
+		dstSetGOMAXPROCSSTWHook(nil) // the held call is already past the hook read
+		close(gate)                  // its STW proceeds; the re-check must drop the update
+		<-done
+		ok := true
+		if got := runtime.GOMAXPROCS(0); got != 1 {
+			os.Stdout.WriteString(name + ": delayed setter resized mid-simulation: GOMAXPROCS=" + strconv.Itoa(got) + "\n")
+			ok = false
+		}
+		dstDeactivate()
+		runtime.GOMAXPROCS(1)
+		return ok
+	}
+	if !check("GOMAXPROCS", func() { runtime.GOMAXPROCS(2) }) {
+		return
+	}
+	if !check("SetDefaultGOMAXPROCS", func() { runtime.SetDefaultGOMAXPROCS() }) {
 		return
 	}
 	os.Stdout.WriteString("done\n")

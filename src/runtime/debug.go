@@ -97,7 +97,23 @@ func GOMAXPROCS(n int) int {
 		return ret
 	}
 
+	if dstBuild && dstGOMAXPROCSSTWHook != nil {
+		dstGOMAXPROCSSTWHook()
+	}
 	stw := stopTheWorldGC(stwGOMAXPROCS)
+
+	// A simulation can have activated between the dstActive gate above
+	// (checked before this STW) and here — the gate is check-then-act, and
+	// run entry's pin->activate sequence is not atomic against it. Re-check
+	// under the STW and drop the update rather than defeat the run's P=1 pin
+	// mid-run. The racing caller's end state is exactly GOMAXPROCS(ret) —
+	// manual mode at the unchanged old value, a legal API outcome — and a
+	// public-API run's exit restore rewrites both flag and value anyway. See
+	// dst-audit-hardening A2-34.
+	if dstActive() {
+		startTheWorldGC(stw)
+		return ret
+	}
 
 	// newprocs will be processed by startTheWorld
 	//
@@ -140,7 +156,17 @@ func SetDefaultGOMAXPROCS() {
 		return
 	}
 
+	if dstBuild && dstGOMAXPROCSSTWHook != nil {
+		dstGOMAXPROCSSTWHook()
+	}
 	stw := stopTheWorldGC(stwGOMAXPROCS)
+
+	// Same entry-race re-check as GOMAXPROCS: a simulation activated since
+	// the gate above must keep its pin (and the custom flag backing it).
+	if dstActive() {
+		startTheWorldGC(stw)
+		return
+	}
 
 	// newprocs will be processed by startTheWorld
 	//
@@ -153,6 +179,20 @@ func SetDefaultGOMAXPROCS() {
 
 	startTheWorldGC(stw)
 }
+
+// dstGOMAXPROCSSTWHook, when non-nil, runs in GOMAXPROCS/SetDefaultGOMAXPROCS
+// after the not-active gate and before the stop-the-world — the window a
+// contended computeMaxProcsLock (sysmon reads cgroup files under it) extends
+// in production. Test-only: it lets the entry-race regression hold a setter
+// in flight deterministically while a simulation activates, proving the
+// post-STW dstActive re-check drops the update. Set via the linkname'd
+// dstSetGOMAXPROCSSTWHook; nil in normal operation, and the dstBuild guard on
+// its checks folds them out of non-dst builds entirely (the zero-footprint
+// contract in dst.go).
+var dstGOMAXPROCSSTWHook func()
+
+//go:linkname dstSetGOMAXPROCSSTWHook
+func dstSetGOMAXPROCSSTWHook(f func()) { dstGOMAXPROCSSTWHook = f }
 
 //go:linkname dstGOMAXPROCSAutoFP
 func dstGOMAXPROCSAutoFP() bool {

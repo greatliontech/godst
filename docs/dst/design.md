@@ -99,7 +99,11 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   GOMAXPROCS *auto mode* when the process was in it (the pin sets the manual flag, which is what
   blocks the sysmon auto-updater for the run; the runtime's update-helper goroutine re-parks rather
   than exits when it observes the pin, so an update pushed just before run entry cannot permanently
-  kill automatic updates — `TestUpdateMaxProcsHelperSurvivesCustomBail`). `Run` is bubble-scoped: each
+  kill automatic updates — `TestUpdateMaxProcsHelperSurvivesCustomBail`). The pin is also closed
+  against a foreign `GOMAXPROCS`/`SetDefaultGOMAXPROCS` call racing run entry: the setters re-check
+  `dstActive` under their stop-the-world and drop the update, and `Run` verifies the pin held after
+  activation, panicking loud rather than running a silently nondeterministic simulation
+  (`TestDSTGOMAXPROCSDelayedSTWDropped`, `TestDSTGOMAXPROCSEntryRace`). `Run` is bubble-scoped: each
   call is an independent, order-immune deterministic universe (the per-g tree re-roots per bubble in
   `synctestRun` via `dstBubbleMainRoot`, salted relative to the activation root so the bubble main does
   not replay the run caller's draw sequence), so a failing test reproduces identically in isolation.

@@ -1878,3 +1878,26 @@ func TestDSTWhiteBoxCleanupChurnP4(t *testing.T) {
 		t.Fatalf("white-box cleanup churn failed (got %q, want \"done\")", out)
 	}
 }
+
+// TestDSTGOMAXPROCSEntryRace verifies the A2-34 closure: a foreign GOMAXPROCS
+// call racing run entry either loses (its update is dropped under the
+// setter's STW once dstActive) or is caught loud by the post-activation pin
+// verification — a run never proceeds with GOMAXPROCS != 1.
+func TestDSTGOMAXPROCSEntryRace(t *testing.T) {
+	out := runTestProgDST(t, "DSTGOMAXPROCSEntryRace")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("GOMAXPROCS entry race not contained (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTGOMAXPROCSDelayedSTWDropped pins the runtime side of the A2-34
+// closure deterministically: a GOMAXPROCS/SetDefaultGOMAXPROCS call held
+// between its not-active gate and its stop-the-world (the
+// computeMaxProcsLock-contention shape) while a simulation activates must
+// have its update dropped by the post-STW dstActive re-check.
+func TestDSTGOMAXPROCSDelayedSTWDropped(t *testing.T) {
+	out := runTestProgDST(t, "DSTGOMAXPROCSDelayedSTW")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("delayed-STW setter not dropped (got %q, want \"done\")", out)
+	}
+}

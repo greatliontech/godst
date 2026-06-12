@@ -495,6 +495,16 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 			runtime.GOMAXPROCS(oldProcs)
 		}
 	}()
+	// The pin (GOMAXPROCS(1) above) and activation are not one atomic step: a
+	// foreign GOMAXPROCS call that passed its not-yet-active gate can land its
+	// stop-the-world inside the window (which spans the activation's
+	// preparation GCs). Past activation the runtime re-checks dstActive under
+	// every setter's STW and drops such updates, so verifying the pin held
+	// here closes the race: fail loud rather than run a silently
+	// nondeterministic simulation. (GOMAXPROCS(0) is a pure read.)
+	if runtime.GOMAXPROCS(0) != 1 {
+		panic("testing/simulation: GOMAXPROCS changed during simulation entry")
+	}
 	if propagateGoexit {
 		returned := false
 		synctest.Run(func() {

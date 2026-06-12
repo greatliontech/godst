@@ -7196,7 +7196,10 @@ func updateMaxProcsGoroutine() {
 		lock(&sched.lock)
 		custom := sched.customGOMAXPROCS
 		unlock(&sched.lock)
-		if custom {
+		if custom || dstActive() {
+			// dstActive: a white-box simulation (no public-API pin, so no
+			// custom flag) must not be resized mid-run any more than a
+			// pinned one; drop the update and re-park.
 			// A manual GOMAXPROCS set (or a DST run's pin) raced in between
 			// sysmon's push and our STW. Drop this update and re-park rather
 			// than exit: sysmon's push protocol assumes idle==false means the
@@ -7225,12 +7228,14 @@ func sysmonUpdateGOMAXPROCS() {
 	// Synchronize with GOMAXPROCS. See comment on computeMaxProcsLock.
 	lock(&computeMaxProcsLock)
 
-	// No update if GOMAXPROCS was set manually.
+	// No update if GOMAXPROCS was set manually, or while a simulation is
+	// active (the white-box activation path has no pin to set the custom
+	// flag; the helper re-checks both under its STW either way).
 	lock(&sched.lock)
 	custom := sched.customGOMAXPROCS
 	curr := gomaxprocs
 	unlock(&sched.lock)
-	if custom {
+	if custom || dstActive() {
 		unlock(&computeMaxProcsLock)
 		return
 	}
