@@ -272,9 +272,18 @@ func dstSchedRandUint64() uint64 {
 // and holds for both.) Reset per bubble. Read by the regression test via linkname.
 var dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws uint64
 
+// dstSchedOvfPuts counts puts routed to the DST order-preserving ring overflow
+// (p.dstRunqOvf) this bubble. Observability for the overflow-order regression:
+// the test asserts the overflow path actually fired, so the order assertion is
+// not vacuously passing on a run that never overflowed.
+var dstSchedOvfPuts uint64
+
 func dstSchedStatsReset() {
-	dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws = 0, 0, 0
+	dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws, dstSchedOvfPuts = 0, 0, 0, 0
 }
+
+//go:linkname dstSchedOvfPutsFP
+func dstSchedOvfPutsFP() uint64 { return dstSchedOvfPuts }
 
 //go:linkname dstSchedStatsFP
 func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64) {
@@ -492,9 +501,36 @@ func dstDeactivate() {
 	dstSeed.Store(0)
 	dstSimRootG = nil
 	dstSimBubble = nil
+	// Hand any goroutines still in the DST ring-overflow queue (foreign
+	// goroutines can legitimately be runnable at run end) back to the normal
+	// scheduler, which does not look at p.dstRunqOvf. The store above already
+	// turned the put-side gate off, and at GOMAXPROCS=1 the single P belongs to
+	// the M running this code, so no put can race the flush.
+	dstFlushRunqOvf()
 	dstReleaseDeferredFinq()
 	dstReleaseDeferredCleanups()
 	dstWakeBlockedCleanupWorkers()
+}
+
+// dstFlushRunqOvf moves every P's DST overflow queue to the global run queue.
+// See dstDeactivate. All Ps, not just the caller's: the run executes at one
+// pinned P, but a foreign GOMAXPROCS call racing run entry (its dstActive gate
+// check-then-act window — see issue dst-audit-hardening A2-34) can procresize
+// mid-run, after which the entries' P need not be the deactivator's; flushing
+// every P bounds that race's damage to the run that suffered it instead of
+// stranding goroutines forever.
+func dstFlushRunqOvf() {
+	lock(&sched.lock)
+	for _, pp := range allp {
+		if pp == nil || pp.dstRunqOvf.empty() {
+			continue
+		}
+		var q gQueue
+		q = pp.dstRunqOvf
+		pp.dstRunqOvf = gQueue{}
+		globrunqputbatch(&q)
+	}
+	unlock(&sched.lock)
 }
 
 // dstSimBubble is the active simulation's own synctest bubble: the goroutines
@@ -512,6 +548,29 @@ var (
 	dstSimBubble *synctestBubble
 	dstSimRootG  *g
 )
+
+// dstCallbackEpoch returns the ownership stamp recorded on a finalizer/cleanup
+// special at registration (SetFinalizer/AddCleanup): the current run epoch if
+// the registering goroutine belongs to the active simulation's bubble, else 0.
+// Queue-time routing (queuefinalizer, cleanupQueue.enqueue) compares the stamp
+// against the then-current epoch: only a callback registered by THIS run's
+// bubble goroutines is the run's own work and may run on the bubble drain;
+// anything else — registered before the run, by a goroutine outside any bubble,
+// by a FOREIGN synctest bubble, or by a previous run — is process-level work
+// and is deferred past dstDeactivate exactly like the pre-bubble queues. The
+// run's drained set is then a pure function of the run's own activity
+// (reproducible in isolation); a foreign callback can never advance the drain
+// goroutine's per-g RNG stream mid-run. May run on the system stack (uses
+// m.curg). Folds to a constant 0 in non-dst builds.
+func dstCallbackEpoch() uint64 {
+	if !dstActive() {
+		return 0
+	}
+	if gp := getg().m.curg; gp != nil && gp.bubble != nil && gp.bubble == dstSimBubble {
+		return dstRunEpoch.Load()
+	}
+	return 0
+}
 
 // dstBubbleMainRoot derives bubble.main's per-bubble re-root from the seed,
 // salted to be independent of dstBubbleRoot's activation root for the same

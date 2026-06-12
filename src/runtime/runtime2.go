@@ -827,6 +827,17 @@ type p struct {
 	// only the owner P can CAS it to a valid G.
 	runnext guintptr
 
+	// dstRunqOvf is the DST order-preserving overflow of the local ring: under
+	// the DST seam (dstActive at GOMAXPROCS=1), a put that finds the ring full —
+	// or any put while this queue is non-empty — appends here instead of
+	// spilling half the ring to the global runq (runqputslow), whose rotation
+	// would let foreign ring occupancy permute the simulation candidates'
+	// relative enumeration order (see dstFindRunnable). Enumerated by the seam
+	// as a ring extension: ring, then this queue, then runnext, then the global
+	// runq. Owner-P access only, like the ring; flushed to the global runq at
+	// dstDeactivate. Empty in non-DST operation.
+	dstRunqOvf gQueue
+
 	// Available G's (status == Gdead)
 	gFree gList
 

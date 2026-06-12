@@ -1817,3 +1817,64 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 		}
 	}
 }
+
+// TestDSTForeignCallbackDeferred verifies the ownership boundary of the bubble
+// drain (A2-28): finalizers/cleanups registered MID-RUN by goroutines outside
+// the simulation bubble are discovered by the simulation's GCs but deferred
+// past the run (they execute on the ordinary async workers afterward), while
+// the simulation's own registrations still run on the drain in-run.
+//
+// Teeth: with the epoch routing removed from queuefinalizer (or
+// cleanupQueue.enqueue), the foreign callback runs on the drain mid-run and the
+// program reports it; with the routing inverted, the simulation's own control
+// callbacks never run in-run; with the release dropped, the deferred callbacks
+// never run after the run.
+func TestDSTForeignCallbackDeferred(t *testing.T) {
+	out := runTestProgDST(t, "DSTForeignCallbackDeferred", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("foreign callback deferral failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTRunqOverflowOrder verifies the order-preserving local-ring overflow
+// (A2-29): with more simultaneously-runnable goroutines than the ring holds,
+// foreign goroutines churning through the same ring must not permute the
+// simulation candidates' enumeration order — the schedule fingerprint with
+// foreign churn equals the alone run's, and the overflow path demonstrably
+// fired (a run that never overflows is reported as vacuous).
+//
+// Teeth: with the DST overflow branch in runqput removed (falling back to
+// runqputslow's spill), foreign ring occupancy shifts the spill boundary and
+// the rotated candidates diverge the fingerprint; with the overflow rerouted
+// to the global-runq tail instead of the ring-extension queue, the overflowed
+// goroutines land behind the Gosched'd ones and the fingerprint diverges too.
+func TestDSTRunqOverflowOrder(t *testing.T) {
+	out := runTestProgDST(t, "DSTRunqOverflowOrder", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("runq overflow order isolation failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTOvfFlushAtDeactivate verifies that goroutines still in the DST
+// ring-overflow queue at deactivation are flushed to the global run queue: the
+// normal scheduler never reads the overflow queue, so a missing flush strands
+// them forever (the testprog hangs and times out).
+func TestDSTOvfFlushAtDeactivate(t *testing.T) {
+	out := runTestProgDST(t, "DSTOvfFlushAtDeactivate")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("overflow flush at deactivate failed (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTWhiteBoxCleanupChurnP4 pins the white-box GOMAXPROCS>1 deferral
+// contract: with DST active and no bubble, every mid-active cleanup defers
+// through the finlock-serialized partial block and the exact count survives
+// to the post-deactivation release — none run while active, none are lost.
+// The churn straddles the activation boundary, where a background GC latched
+// pre-activation sweeps lazily (concurrently) across dstSeed.Store.
+func TestDSTWhiteBoxCleanupChurnP4(t *testing.T) {
+	out := runTestProgDST(t, "DSTWhiteBoxCleanupChurnP4")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("white-box cleanup churn failed (got %q, want \"done\")", out)
+	}
+}

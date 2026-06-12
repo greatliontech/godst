@@ -43,8 +43,13 @@
 //     finalizers/weak refs are discovered, and which GC cycle discovers them are
 //     deterministic, including under -race (the trigger fires from per-object
 //     allocated bytes rather than span-granular heap layout). The contract
-//     covers objects the simulation itself allocates; callback-bearing objects
-//     created mid-run by goroutines outside the simulation are not part of it.
+//     covers objects the simulation itself allocates. Finalizers and cleanups
+//     are ownership-scoped: only callbacks registered by the simulation's own
+//     goroutines during the run execute inside it; a callback registered
+//     outside the simulation (before the run, or mid-run by an outside
+//     goroutine) never runs during the run even if a simulation GC discovers
+//     its object — it is deferred and runs on the ordinary runtime workers
+//     after Run returns.
 //
 // Not in the contract: byte-level heap MemStats fields
 // (HeapAlloc/HeapInuse/HeapReleased/HeapIdle, Sys and the per-subsystem *Sys

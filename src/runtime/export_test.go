@@ -2105,3 +2105,50 @@ var (
 	Complex128Bytes = complex128Bytes
 	Complex64Bytes  = complex64Bytes
 )
+
+// UpdateMaxProcsGStarted reports whether the GOMAXPROCS auto-update helper
+// goroutine exists (it is not started under GODEBUG=updatemaxprocs=0).
+func UpdateMaxProcsGStarted() bool {
+	return updateMaxProcsG.g != nil
+}
+
+// UpdateMaxProcsGIdle reports whether the GOMAXPROCS auto-update helper is
+// parked waiting for a sysmon push. idle==false with no pending update means
+// the helper died — the protocol breakage the helper-survival regression
+// guards against.
+func UpdateMaxProcsGIdle() bool {
+	return updateMaxProcsG.idle.Load()
+}
+
+// WakeUpdateMaxProcsG performs the same push sysmon does to hand the helper an
+// update (with the current gomaxprocs as the target value, so the resulting
+// procresize is a no-op). Returns false without pushing if the helper is not
+// idle.
+func WakeUpdateMaxProcsG() bool {
+	if !updateMaxProcsG.idle.Load() {
+		return false
+	}
+	lock(&updateMaxProcsG.lock)
+	if !updateMaxProcsG.idle.Load() {
+		// A real sysmon push raced in between the check above and the lock;
+		// injecting the helper g twice would ready an already-runnable g.
+		unlock(&updateMaxProcsG.lock)
+		return false
+	}
+	updateMaxProcsG.procs = gomaxprocs
+	updateMaxProcsG.idle.Store(false)
+	var list gList
+	list.push(updateMaxProcsG.g)
+	injectglist(&list)
+	unlock(&updateMaxProcsG.lock)
+	return true
+}
+
+// CustomGOMAXPROCS reports whether automatic GOMAXPROCS updating is disabled
+// by a manual setting.
+func CustomGOMAXPROCS() bool {
+	lock(&sched.lock)
+	custom := sched.customGOMAXPROCS
+	unlock(&sched.lock)
+	return custom
+}

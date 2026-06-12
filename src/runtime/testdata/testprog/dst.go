@@ -57,6 +57,10 @@ func init() {
 	register("DSTBubbleStreamIsolation", DSTBubbleStreamIsolation)
 	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
+	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
+	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
+	register("DSTOvfFlushAtDeactivate", DSTOvfFlushAtDeactivate)
+	register("DSTWhiteBoxCleanupChurnP4", DSTWhiteBoxCleanupChurnP4)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
 	register("DSTIdentityGroups", DSTIdentityGroups)
 	register("DSTRunNoTag", DSTRunNoTag)
@@ -92,6 +96,9 @@ func dstRuntimeActive() bool
 
 //go:linkname dstGOMAXPROCSAutoFP runtime.dstGOMAXPROCSAutoFP
 func dstGOMAXPROCSAutoFP() bool
+
+//go:linkname dstSchedOvfPutsFP runtime.dstSchedOvfPutsFP
+func dstSchedOvfPutsFP() uint64
 
 // dstMemSink keeps the most recent allocation live so the rest become garbage.
 var dstMemSink []byte
@@ -2386,4 +2393,269 @@ func DSTSelectOrder() {
 	buf := dstSelectSeq(256)
 	buf = append(buf, '\n')
 	os.Stdout.Write(buf)
+}
+
+var dstForeignFinRan, dstForeignCleanupRan atomic.Int64
+var dstSimFinRan, dstSimCleanupRan atomic.Bool
+
+// dstForeignRegisterPump registers a finalizer and a cleanup on garbage objects
+// from a NON-bubble goroutine, one round per ping, acking each round so the
+// simulation knows the registration (and the objects' death) happened before it
+// continues. The callbacks must NOT run during the run (ownership: they were
+// registered outside the simulation bubble, so they are process-level work the
+// drain must not execute) and ALL of them must run after it (released to the
+// async pool — exact counts, so losing part of the deferred chain, e.g. an
+// unflushed partial block, is caught).
+func dstForeignRegisterPump(ping, ack chan struct{}, done *sync.WaitGroup) {
+	defer done.Done()
+	for range ping {
+		obj := new([64]byte)
+		runtime.SetFinalizer(obj, func(*[64]byte) { dstForeignFinRan.Add(1) })
+		obj2 := new([64]byte)
+		runtime.AddCleanup(obj2, func(struct{}) { dstForeignCleanupRan.Add(1) }, struct{}{})
+		ack <- struct{}{}
+	}
+}
+
+// DSTForeignCallbackDeferred: finalizers/cleanups registered MID-RUN by
+// goroutines outside the simulation bubble are discovered by the simulation's
+// GCs but must be deferred past the run (run on the ordinary async workers
+// afterward), never executed on the bubble drain — while the simulation's own
+// mid-run registrations still run on the drain. Prints "done".
+func DSTForeignCallbackDeferred() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	ping := make(chan struct{})
+	ack := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go dstForeignRegisterPump(ping, ack, &wg)
+	fail := ""
+	simulation.Run(n, func() {
+		for i := 0; i < 30; i++ {
+			ping <- struct{}{} // unbubbled rendezvous: non-durable, serviced in real time
+			<-ack
+			// Allocation burst: cross the deterministic GC trigger so mid-run
+			// GCs sweep the pump's dead objects and queue their callbacks.
+			for j := 0; j < 16; j++ {
+				dstMemSink = make([]byte, 256<<10)
+			}
+			time.Sleep(time.Millisecond) // quiescence: the drain runs what may run
+		}
+		// The simulation's own registrations run on the drain in-run (control:
+		// proves deferral is ownership-based, not a blanket mid-run deferral).
+		simObj := new([64]byte)
+		runtime.SetFinalizer(simObj, func(*[64]byte) { dstSimFinRan.Store(true) })
+		simObj2 := new([64]byte)
+		runtime.AddCleanup(simObj2, func(struct{}) { dstSimCleanupRan.Store(true) }, struct{}{})
+		simObj, simObj2 = nil, nil
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+		if !dstSimFinRan.Load() || !dstSimCleanupRan.Load() {
+			fail = "simulation-owned callbacks did not run on the drain"
+		}
+		if dstForeignFinRan.Load() != 0 || dstForeignCleanupRan.Load() != 0 {
+			fail = "foreign callback ran during the run"
+		}
+	})
+	close(ping)
+	wg.Wait()
+	if fail != "" {
+		os.Stdout.WriteString(fail + "\n")
+		return
+	}
+	// Every deferred foreign callback was released at deactivation and ran on
+	// the ordinary async workers — exact counts, not just "some ran".
+	for i := 0; i < 400 && !(dstForeignFinRan.Load() == 30 && dstForeignCleanupRan.Load() == 30); i++ {
+		runtime.GC()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if fins, cleanups := dstForeignFinRan.Load(), dstForeignCleanupRan.Load(); fins != 30 || cleanups != 30 {
+		os.Stdout.WriteString("deferred foreign callbacks incomplete after the run: fins=" +
+			strconv.FormatInt(fins, 10) + "/30 cleanups=" + strconv.FormatInt(cleanups, 10) + "/30\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// dstOverflowFingerprint runs a workload with more simultaneously-runnable
+// goroutines than the local run-queue ring holds (256), so the DST
+// order-preserving overflow path is exercised, and returns the interleaving
+// fingerprint plus the overflow-put count observed inside the run.
+func dstOverflowFingerprint(seed uint64) (string, uint64) {
+	var fp []byte
+	var ovf uint64
+	simulation.Run(seed, func() {
+		var mu sync.Mutex
+		order := make([]int, 0, 420)
+		var wg sync.WaitGroup
+		// Gosched'd goroutines keep the global runq populated during the
+		// burst, so an overflow rerouted to the global tail (instead of the
+		// ring-extension queue) lands AFTER them and is caught as a reorder.
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for r := 0; r < 4; r++ {
+					runtime.Gosched()
+				}
+				mu.Lock()
+				order = append(order, 1000+id)
+				mu.Unlock()
+			}(i)
+		}
+		// Sleepers: durably blocked during the burst, woken one by one by the
+		// first burst workers to run. Each wake is a put that lands while the
+		// overflow queue is still non-empty — the boundary the order contract
+		// must hold at: a woken goroutine must queue BEHIND the overflowed
+		// stragglers (ring extension), not refill a freed ring slot ahead of
+		// them, or its position becomes a function of foreign ring occupancy.
+		const sleepers = 64
+		chs := make([]chan struct{}, sleepers)
+		for i := 0; i < sleepers; i++ {
+			ch := make(chan struct{})
+			chs[i] = ch
+			wg.Add(1)
+			go func(id int, ch chan struct{}) {
+				defer wg.Done()
+				<-ch
+				mu.Lock()
+				order = append(order, 2000+id)
+				mu.Unlock()
+			}(i, ch)
+		}
+		// The burst: spawned without yielding, so the ring fills and overflows.
+		for i := 0; i < 320; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				if id < sleepers {
+					chs[id] <- struct{}{}
+				}
+				mu.Lock()
+				order = append(order, id)
+				mu.Unlock()
+			}(i)
+		}
+		wg.Wait()
+		ovf = dstSchedOvfPutsFP()
+		for _, id := range order {
+			fp = append(fp, byte(id), byte(id>>8))
+		}
+	})
+	return string(fp), ovf
+}
+
+// DSTRunqOverflowOrder: when the runnable set exceeds the local ring, the
+// overflow must be order-preserving — foreign (non-bubble) goroutines occupying
+// ring slots must not shift WHICH simulation goroutines spill nor where they
+// re-enter the enumeration, so the schedule fingerprint with foreign churn must
+// equal the alone run's. Prints "done".
+func DSTRunqOverflowOrder() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	stop := make(chan struct{})
+	var cwg sync.WaitGroup
+	// Foreign churners: woken by short real timers, they enter the same local
+	// ring as the simulation's goroutines at unpredictable wall-clock points,
+	// shifting its occupancy while the burst overflows.
+	for c := 0; c < 4; c++ {
+		cwg.Add(1)
+		go func() {
+			defer cwg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					time.Sleep(50 * time.Microsecond)
+				}
+			}
+		}()
+	}
+	with1, ovf1 := dstOverflowFingerprint(n)
+	with2, ovf2 := dstOverflowFingerprint(n)
+	close(stop)
+	cwg.Wait()
+	alone, ovfAlone := dstOverflowFingerprint(n)
+	if ovf1 == 0 || ovf2 == 0 || ovfAlone == 0 {
+		os.Stdout.WriteString("vacuous: overflow path never fired\n")
+		return
+	}
+	if with1 != alone || with2 != alone {
+		os.Stdout.WriteString("schedule perturbed by overflow under foreign churn\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+//go:linkname dstDeactivate runtime.dstDeactivate
+func dstDeactivate()
+
+// DSTOvfFlushAtDeactivate: goroutines still sitting in the DST ring-overflow
+// queue when DST deactivates must be handed back to the normal scheduler
+// (which never looks at the overflow queue) — otherwise they are stranded
+// forever. White-box: activates DST at GOMAXPROCS=1, fills the ring past
+// capacity WITHOUT yielding (so the overflow is provably non-empty), then
+// deactivates immediately and waits for every spawned goroutine to run.
+// Prints "done"; hangs (parent timeout) if the flush is missing.
+func DSTOvfFlushAtDeactivate() {
+	runtime.GOMAXPROCS(1)
+	var wg sync.WaitGroup
+	dstActivate(1)
+	for i := 0; i < 320; i++ {
+		wg.Add(1)
+		go func() { wg.Done() }()
+	}
+	ovf := dstSchedOvfPutsFP()
+	dstDeactivate()
+	if ovf == 0 {
+		os.Stdout.WriteString("vacuous: overflow path never fired\n")
+		return
+	}
+	wg.Wait()
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTWhiteBoxCleanupChurnP4: the cleanup deferral on the white-box dstActivate
+// path at GOMAXPROCS>1 — where every cleanup carries stamp 0 (no bubble) and
+// so every one defers, and where a background GC latched just before
+// activation sweeps lazily across the boundary, so concurrent sweepers can
+// reach the (finlock-serialized) deferral simultaneously. The churn runs
+// BEFORE, ACROSS, and AFTER the activation boundary to give that straddling
+// cycle real allocators to race with. Pins the behavioral contract: nothing
+// runs while active, and the EXACT count survives deferral and release (a
+// lost partial-pointer update loses a block of cleanups forever). Prints
+// "done".
+func DSTWhiteBoxCleanupChurnP4() {
+	runtime.GOMAXPROCS(4)
+	var ran atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			var sink []byte // per-goroutine: the churn must not race on a shared global
+			for i := 0; i < 400; i++ {
+				obj := new([4096]byte)
+				runtime.AddCleanup(obj, func(struct{}) { ran.Add(1) }, struct{}{})
+				sink = make([]byte, 64<<10)
+			}
+			_ = sink
+		}()
+	}
+	close(start) // churn is already running when activation begins
+	dstActivate(7)
+	wg.Wait()
+	runtime.GC()
+	dstDeactivate()
+	for i := 0; i < 400 && ran.Load() != 1600; i++ {
+		runtime.GC()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ran.Load(); got != 1600 {
+		os.Stdout.WriteString("cleanups lost: " + strconv.FormatInt(got, 10) + "/1600\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
 }

@@ -95,7 +95,11 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
 - **`simulation.Run(seed uint64, f func())`** is the entry point. It **enforces the determinism
   preconditions itself** — they are not user knobs that can be forgotten: it sets `GOMAXPROCS(1)`,
   disables async preemption, activates DST + seeds, runs `f` in a `synctest` bubble (re-rooted from
-  the seed), and restores everything on return (including on panic). `Run` is bubble-scoped: each
+  the seed), and restores everything on return (including on panic) — including container-aware
+  GOMAXPROCS *auto mode* when the process was in it (the pin sets the manual flag, which is what
+  blocks the sysmon auto-updater for the run; the runtime's update-helper goroutine re-parks rather
+  than exits when it observes the pin, so an update pushed just before run entry cannot permanently
+  kill automatic updates — `TestUpdateMaxProcsHelperSurvivesCustomBail`). `Run` is bubble-scoped: each
   call is an independent, order-immune deterministic universe (the per-g tree re-roots per bubble in
   `synctestRun` via `dstBubbleMainRoot`, salted relative to the activation root so the bubble main does
   not replay the run caller's draw sequence), so a failing test reproduces identically in isolation.
@@ -457,11 +461,20 @@ the fixed seams, so later steps add, never rewrite.
   its bubble by activating-goroutine identity (`dstSimRootG`), so a foreign `synctest.Run` — even one
   started between activation and the simulation's own bubble — can neither steal the re-root/drain
   nor consume seed draws; candidate removal is order-preserving so foreign entries cannot permute the
-  simulation candidates' relative order while the runnable set fits the local run queue (overflow
-  spill ordering above ~256 simultaneously runnable goroutines is a tracked residual); and only
+  simulation candidates' relative order, and so is local-ring **overflow**: when the runnable set
+  exceeds the ring (256), puts divert to an order-preserving FIFO ring extension (`p.dstRunqOvf`,
+  enumerated between the ring and `runnext`, flushed to the global runq at deactivation) instead of
+  `runqputslow`'s rotation of the ring head to the global tail — whose spill boundary foreign ring
+  occupancy would otherwise shift, permuting which simulation candidates spill and where they
+  re-enter the enumeration; and only
   simulation-bubble allocations advance the
-  deterministic GC trigger. Enforced by `TestDSTForeignBubbleIsolation`, `TestDSTBubbleStreamIsolation`
-  and `TestDSTNonBubbleAllocTrigger` in addition to the invariant below. Without this, how often infrastructure goroutines need scheduling — which is
+  deterministic GC trigger. Mid-run finalizer/cleanup **registrations** are isolated by ownership:
+  each finalizer/cleanup special carries the registering goroutine's run-epoch stamp
+  (`dstCallbackEpoch`), and queue-time routing defers any callback not registered by THIS run's
+  bubble goroutines past deactivation with the pre-bubble queues — so the drain executes exactly the
+  run's own callbacks and a foreign callback can never advance the drain's per-g RNG stream (the
+  drained set is a pure function of the run's own activity). Enforced by `TestDSTForeignBubbleIsolation`, `TestDSTBubbleStreamIsolation`,
+  `TestDSTNonBubbleAllocTrigger`, `TestDSTRunqOverflowOrder` and `TestDSTForeignCallbackDeferred` in addition to the invariant below. Without this, how often infrastructure goroutines need scheduling — which is
   timing- and binary-composition-dependent — would consume a varying number of RNG draws and shift the
   program's interleaving (a rare nondeterminism a heavy `import` like `net` exposed). Invariant:
   `rngDraws == decisions − sysScheds`, enforced by `TestDSTSchedSystemIsolation`.
@@ -1439,7 +1452,17 @@ The unifying invariant — the load-bearing piece of Tier 2:
 > `g.bubble == ` the Run's bubble, scheduled by the deterministic scheduler, woken at the deterministic
 > **quiescence** point (not at GC-completion — see "Where it runs / when it drains" below, corrected by
 > Chunk A round-2). Never on the async system `fing` (`runFinalizers`) or the async cleanup pool
-> (`runCleanups`).
+> (`runCleanups`). Scope — **ownership by registration**: the drain executes exactly the callbacks
+> registered by THIS run's bubble goroutines among those a simulation GC discovers in-run (a
+> run-owned object discovered only after the run finalizes on the ordinary async workers, as always;
+> each special carries a run-epoch stamp,
+> `dstCallbackEpoch`, recorded at `SetFinalizer`/`AddCleanup`). A callback registered before the run,
+> by a goroutine outside the bubble, by a foreign synctest bubble, or by a previous run is
+> process-level work: even when a simulation GC discovers it mid-run, queue-time routing
+> (`queuefinalizer`/`cleanupQueue.enqueue`) defers it past `dstDeactivate` with the pre-bubble queues
+> and it executes on the ordinary async workers afterward. The drained set is therefore a pure
+> function of the run's own activity — foreign registrations can neither appear in it nor advance the
+> drain's per-g RNG stream (`TestDSTForeignCallbackDeferred`).
 
 Why this is the faithful collapse, dimension by dimension:
 

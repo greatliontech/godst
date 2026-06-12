@@ -117,7 +117,7 @@ func lockRankMayQueueFinalizer() {
 	lockWithRankMayAcquire(&finlock, getLockRank(&finlock))
 }
 
-func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
+func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64) {
 	if gcphase != _GCoff {
 		// Currently we assume that the finalizer queue won't
 		// grow during marking so we don't have to rescan it
@@ -130,34 +130,29 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 
 	lock(&finlock)
 
-	if finq == nil || finq.cnt == uint32(len(finq.fin)) {
-		if finc == nil {
-			finc = (*finBlock)(persistentalloc(finBlockSize, 0, &memstats.gcMiscSys))
-			finc.alllink = allfin
-			allfin = finc
-			if finptrmask[0] == 0 {
-				// Build pointer mask for Finalizer array in block.
-				// Check assumptions made in finalizer1 array above.
-				if (unsafe.Sizeof(finalizer{}) != 5*goarch.PtrSize ||
-					unsafe.Offsetof(finalizer{}.fn) != 0 ||
-					unsafe.Offsetof(finalizer{}.arg) != goarch.PtrSize ||
-					unsafe.Offsetof(finalizer{}.nret) != 2*goarch.PtrSize ||
-					unsafe.Offsetof(finalizer{}.fint) != 3*goarch.PtrSize ||
-					unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize) {
-					throw("finalizer out of sync")
-				}
-				for i := range finptrmask {
-					finptrmask[i] = finalizer1[i%len(finalizer1)]
-				}
-			}
-		}
-		block := finc
-		finc = block.next
-		block.next = finq
-		finq = block
+	q := &finq
+	deferred := false
+	if dstActive() && dstEpoch != dstRunEpoch.Load() {
+		// Not this run's work: the finalizer was registered before the run, by
+		// a goroutine outside the simulation bubble, or by a previous run (see
+		// dstCallbackEpoch). Defer it past dstDeactivate with the pre-bubble
+		// queue rather than letting the bubble drain run it: the drained set
+		// must be a pure function of the run's own activity, and a foreign
+		// callback would advance the drain's per-g RNG stream. finqueued still
+		// counts it (process truth — it executes on fing after release), so
+		// the run ledger balances it as handled below, exactly as the
+		// dead-drain discard does; finPending stays exact.
+		q = &dstDeferredFinq
+		dstFinqRunExecuted.Add(1)
+		deferred = true
 	}
-	f := &finq.fin[finq.cnt]
-	atomic.Xadd(&finq.cnt, +1) // Sync with markroots
+	if *q == nil || (*q).cnt == uint32(len((*q).fin)) {
+		block := finAllocBlockLocked()
+		block.next = *q
+		*q = block
+	}
+	f := &(*q).fin[(*q).cnt]
+	atomic.Xadd(&(*q).cnt, +1) // Sync with markroots
 	f.fn = fn
 	f.nret = nret
 	f.fint = fint
@@ -165,7 +160,40 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 	f.arg = p
 	finqueued++
 	unlock(&finlock)
-	fingStatus.Or(fingWake)
+	if !deferred {
+		// A deferred entry must not arm a fing wake mid-run; the release at
+		// dstDeactivate arms it when the work actually becomes fing's.
+		fingStatus.Or(fingWake)
+	}
+}
+
+// finAllocBlockLocked returns a free finBlock (from the cache, or freshly
+// allocated and registered on allfin so markroots scans it). Caller holds
+// finlock.
+func finAllocBlockLocked() *finBlock {
+	if finc == nil {
+		finc = (*finBlock)(persistentalloc(finBlockSize, 0, &memstats.gcMiscSys))
+		finc.alllink = allfin
+		allfin = finc
+		if finptrmask[0] == 0 {
+			// Build pointer mask for Finalizer array in block.
+			// Check assumptions made in finalizer1 array above.
+			if (unsafe.Sizeof(finalizer{}) != 5*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.fn) != 0 ||
+				unsafe.Offsetof(finalizer{}.arg) != goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.nret) != 2*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.fint) != 3*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize) {
+				throw("finalizer out of sync")
+			}
+			for i := range finptrmask {
+				finptrmask[i] = finalizer1[i%len(finalizer1)]
+			}
+		}
+	}
+	block := finc
+	finc = block.next
+	return block
 }
 
 //go:nowritebarrier

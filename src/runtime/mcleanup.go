@@ -467,9 +467,40 @@ func (q *cleanupQueue) tryTakeWork() bool {
 // enqueue queues a single cleanup for execution.
 //
 // Called by the sweeper, and only the sweeper.
-func (q *cleanupQueue) enqueue(c cleanupFn) {
+func (q *cleanupQueue) enqueue(c cleanupFn, dstEpoch uint64) {
 	mp := acquirem()
 	pp := mp.p.ptr()
+	if dstActive() && dstEpoch != dstRunEpoch.Load() {
+		// Not this run's work (see dstCallbackEpoch and the queuefinalizer
+		// analog): defer it past dstDeactivate with the pre-bubble blocks
+		// rather than letting the bubble drain run it. The queued count still
+		// advances (process truth — it executes on the async pool after
+		// release), so the run ledger balances it as handled, exactly as the
+		// dead-drain discard does; cleanupPending stays exact.
+		//
+		// finlock serializes the deferred-chain state. Cycles STARTED while
+		// dstActive are gcForceBlockMode (STW eager sweep), but a background
+		// cycle latched in the instruction window between dstActivate's last
+		// preparation GC and dstSeed.Store sweeps LAZILY across the store —
+		// on the white-box dstActivate path at GOMAXPROCS>1 that means
+		// concurrent sweepers (bgsweep, allocation-time sweeps, the entry
+		// GC's sweep-termination) can reach this branch simultaneously while
+		// dstActive, and the runtime is not race-instrumented, so only
+		// construction keeps them safe. The recheck under the lock also
+		// linearizes against dstDeactivate's release: a sweeper that loses
+		// the race re-reads dstActive and takes the normal path instead of
+		// stranding the entry on a drained chain.
+		lock(&finlock)
+		if dstActive() {
+			q.dstDeferCleanup(c)
+			unlock(&finlock)
+			pp.cleanupsQueued++
+			dstCleanupRunExecuted.Add(1)
+			releasem(mp)
+			return
+		}
+		unlock(&finlock)
+	}
 	b := pp.cleanups
 	if b == nil {
 		if q.flushed.Load() {
@@ -721,13 +752,54 @@ func maxCleanupGs() uint32 {
 // gcCleanups is the global cleanup queue.
 var gcCleanups cleanupQueue
 
-// Cleanups queued before a DST run are process-level work. Detach them before
-// dstActive and release them back to the ordinary cleanup pool after deactivation
-// so they cannot run on the run's bubble drain.
+// Cleanups queued before a DST run — and cleanups discovered mid-run whose
+// registration stamp is not this run's (cleanupQueue.dstDeferCleanup) — are
+// process-level work. Detach them before dstActive (or divert them at enqueue)
+// and release them back to the ordinary cleanup pool after deactivation so they
+// cannot run on the run's bubble drain.
 var (
 	dstDeferredCleanups      lfstack
 	dstDeferredCleanupBlocks uint64 // cleanup blocks, for workUnits restoration
+
+	// dstDeferredCleanupPartial is the partially-filled block dstDeferCleanup
+	// is appending to, and dstDeferredCleanupBlocks its block count: both are
+	// finlock-protected. A background GC latched just before dstSeed.Store
+	// sweeps lazily across the activation boundary, so on the white-box
+	// GOMAXPROCS>1 path concurrent sweepers can defer simultaneously (see the
+	// enqueue deferral comment); the release at dstDeactivate serializes
+	// against late deferrals under the same lock. Flushed by
+	// dstReleaseDeferredCleanups. The partial is registered on q.all at
+	// allocation, so markroot scans it like any block.
+	dstDeferredCleanupPartial *cleanupBlock
 )
+
+// dstDeferCleanup appends one not-this-run cleanup (see enqueue) to the
+// deferred chain, bypassing the per-P blocks the bubble drain consumes.
+// Called only from enqueue — sweeper context, gcphase == _GCoff. Caller holds
+// finlock (proven rank-safe in sweep context by queuefinalizer, which takes it
+// from the same freeSpecial path).
+func (q *cleanupQueue) dstDeferCleanup(c cleanupFn) {
+	b := dstDeferredCleanupPartial
+	if b == nil {
+		b = (*cleanupBlock)(q.free.pop())
+		if b == nil {
+			b = (*cleanupBlock)(persistentalloc(cleanupBlockSize, tagAlign, &memstats.gcMiscSys))
+			for {
+				next := (*cleanupBlock)(q.all.Load())
+				b.alllink = next
+				if q.all.CompareAndSwap(unsafe.Pointer(next), unsafe.Pointer(b)) {
+					break
+				}
+			}
+		}
+		dstDeferredCleanupPartial = b
+	}
+	if full := b.enqueue(c); full {
+		dstDeferredCleanupBlocks++
+		dstDeferredCleanups.push(&b.lfnode)
+		dstDeferredCleanupPartial = nil
+	}
+}
 
 var dstCleanupRunBaseQueued, dstCleanupRunExecuted atomic.Uint64
 
@@ -876,6 +948,16 @@ func dstDeferPreBubbleCleanups() {
 // dstReleaseDeferredCleanups returns pre-bubble cleanup blocks to the ordinary
 // cleanup pool after DST is deactivated.
 func dstReleaseDeferredCleanups() {
+	lock(&finlock)
+	if b := dstDeferredCleanupPartial; b != nil {
+		dstDeferredCleanupPartial = nil
+		if b.empty() {
+			gcCleanups.free.push(&b.lfnode)
+		} else {
+			dstDeferredCleanupBlocks++
+			dstDeferredCleanups.push(&b.lfnode)
+		}
+	}
 	blocks := dstDeferredCleanupBlocks
 	for {
 		p := dstDeferredCleanups.pop()
@@ -888,6 +970,7 @@ func dstReleaseDeferredCleanups() {
 		gcCleanups.addWork(int(blocks))
 	}
 	dstDeferredCleanupBlocks = 0
+	unlock(&finlock)
 }
 
 func (q *cleanupQueue) dstParkWorkerIfBlocked() bool {

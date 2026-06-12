@@ -7197,8 +7197,15 @@ func updateMaxProcsGoroutine() {
 		custom := sched.customGOMAXPROCS
 		unlock(&sched.lock)
 		if custom {
+			// A manual GOMAXPROCS set (or a DST run's pin) raced in between
+			// sysmon's push and our STW. Drop this update and re-park rather
+			// than exit: sysmon's push protocol assumes idle==false means the
+			// helper will run and eventually re-park, so exiting here would
+			// leave idle false forever and silently kill automatic updates for
+			// the rest of the process — even after SetDefaultGOMAXPROCS
+			// restores automatic mode.
 			startTheWorldGC(stw)
-			return
+			continue
 		}
 
 		// newprocs will be processed by startTheWorld
@@ -7241,11 +7248,16 @@ func sysmonUpdateGOMAXPROCS() {
 	// still pending.
 	if updateMaxProcsG.idle.Load() {
 		lock(&updateMaxProcsG.lock)
-		updateMaxProcsG.procs = procs
-		updateMaxProcsG.idle.Store(false)
-		var list gList
-		list.push(updateMaxProcsG.g)
-		injectglist(&list)
+		// Recheck under the lock: another pusher (the runtime test hooks use
+		// the same protocol) may have readied the helper since the check
+		// above, and injecting an already-runnable g throws.
+		if updateMaxProcsG.idle.Load() {
+			updateMaxProcsG.procs = procs
+			updateMaxProcsG.idle.Store(false)
+			var list gList
+			list.push(updateMaxProcsG.g)
+			injectglist(&list)
+		}
 		unlock(&updateMaxProcsG.lock)
 	}
 }
@@ -7629,6 +7641,22 @@ func runqput(pp *p, gp *g, next bool) {
 retry:
 	h := atomic.LoadAcq(&pp.runqhead) // load-acquire, synchronize with consumers
 	t := pp.runqtail
+	if dstActive() && gomaxprocs == 1 {
+		// DST order-preserving overflow. runqputslow's spill rotates the ring
+		// head half to the global-runq tail, so when foreign occupancy shifts
+		// the spill boundary the simulation candidates' relative enumeration
+		// order diverges from the alone run. Instead, treat dstRunqOvf as an
+		// unbounded FIFO extension of the ring: a full-ring put goes to its
+		// tail, and so does EVERY later put while it is non-empty — otherwise a
+		// later arrival entering the freshly-drained ring would enumerate ahead
+		// of an earlier overflowed one, breaking arrival order. Cost-free for
+		// non-DST builds (dstActive folds to const false).
+		if !pp.dstRunqOvf.empty() || t-h >= uint32(len(pp.runq)) {
+			pp.dstRunqOvf.pushBack(gp)
+			dstSchedOvfPuts++
+			return
+		}
+	}
 	if t-h < uint32(len(pp.runq)) {
 		pp.runq[t%uint32(len(pp.runq))].set(gp)
 		atomic.StoreRel(&pp.runqtail, t+1) // store-release, makes the item available for consumption
@@ -7688,6 +7716,19 @@ func runqputbatch(pp *p, q *gQueue) {
 	if q.empty() {
 		return
 	}
+	// No DST overflow handling here (unlike runqput). The findRunnable callers
+	// run either on the non-DST path or after dstFindRunnable returned nil —
+	// the whole unified runnable set, overflow included, was empty, and only
+	// the owner M (then inside findRunnable) appends to it. The remaining
+	// reachable-with-overflow caller is injectglist's netpoll injection (e.g.
+	// startTheWorldWithSema after a simulation STW GC): under the determinism
+	// contract that list holds only foreign (bubble==nil) goroutines — sim
+	// goroutines park in simulated net and fake timers, never netpoll, and one
+	// that does is doing real I/O, which breaks determinism upstream of
+	// enumeration order. Foreign entries are scheduled RNG-free in either
+	// segment and cannot permute sim candidates' relative order, and a batch
+	// landing in the ring never strands anything (the seam enumerates ring,
+	// overflow, and global runq alike).
 	h := atomic.LoadAcq(&pp.runqhead)
 	t := pp.runqtail
 	n := uint32(0)
@@ -7763,7 +7804,8 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	lock(&sched.lock)
 	c := dstCandidates{pp: pp, hasNext: pp.runnext != 0, h: pp.runqhead}
 	c.ringN = pp.runqtail - c.h
-	total := c.ringN + uint32(sched.runq.size)
+	c.ovfN = uint32(pp.dstRunqOvf.size)
+	total := c.ringN + c.ovfN + uint32(sched.runq.size)
 	if c.hasNext {
 		total++
 	}
@@ -7842,14 +7884,17 @@ func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
 
 // dstCandidates is a stack-allocated view of the unified runnable set for one
 // scheduling decision, indexed [0,total): the local ring occupies [0,ringN);
-// runnext (if present) is at ringN; the global runq follows. It carries no
-// goroutine slice, so enumerating/removing a candidate allocates nothing (which
-// would otherwise perturb GC determinism).
+// the DST overflow queue — the ring's order-preserving extension, see
+// dstRunqOvf — follows at [ringN,ringN+ovfN); runnext (if present) is at
+// ringN+ovfN; the global runq follows. It carries no goroutine slice, so
+// enumerating/removing a candidate allocates nothing (which would otherwise
+// perturb GC determinism).
 type dstCandidates struct {
 	pp      *p
 	hasNext bool
 	h       uint32 // runqhead snapshot
 	ringN   uint32
+	ovfN    uint32
 }
 
 // firstSystemG returns the index of the first candidate that should be scheduled
@@ -7895,10 +7940,17 @@ func (c *dstCandidates) at(k uint32) *g {
 	if k < c.ringN {
 		return pp.runq[(c.h+k)%uint32(len(pp.runq))].ptr()
 	}
-	if c.hasNext && k == c.ringN {
+	if k < c.ringN+c.ovfN {
+		n := pp.dstRunqOvf.head.ptr()
+		for gi := k - c.ringN; gi > 0; gi-- {
+			n = n.schedlink.ptr()
+		}
+		return n
+	}
+	if c.hasNext && k == c.ringN+c.ovfN {
 		return pp.runnext.ptr()
 	}
-	gi := k - c.ringN
+	gi := k - c.ringN - c.ovfN
 	if c.hasNext {
 		gi--
 	}
@@ -7935,12 +7987,17 @@ func (c *dstCandidates) removeAt(k uint32) (*g, bool) {
 		atomic.StoreRel(&pp.runqhead, c.h+1)
 		return gp, false
 	}
-	if c.hasNext && k == c.ringN {
+	if k < c.ringN+c.ovfN {
+		// Overflow-queue element: linked-list unlink preserves the relative
+		// order of the remaining candidates, like the ring shift above.
+		return pp.dstRunqOvf.removeAt(k - c.ringN), false
+	}
+	if c.hasNext && k == c.ringN+c.ovfN {
 		gp := pp.runnext.ptr()
 		pp.runnext = 0
 		return gp, true
 	}
-	gi := k - c.ringN
+	gi := k - c.ringN - c.ovfN
 	if c.hasNext {
 		gi--
 	}
