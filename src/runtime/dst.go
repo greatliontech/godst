@@ -906,6 +906,26 @@ func dstSetNetCrossHostJitter(ns int64) { dstNetCrossHostJitter = ns }
 //go:linkname dstNetCrossHostJitterNs
 func dstNetCrossHostJitterNs() int64 { return dstNetCrossHostJitter }
 
+// dstNetCrossHostBandwidth is the per-run bandwidth limit in bytes per second for
+// each cross-host connection direction: the link transmits one segment after
+// another at this rate (a segment of S bytes occupies the link S/bandwidth before
+// it propagates), so a receiver gets bytes no faster than the rate. 0 (the
+// default, and same-host always) means unlimited. Set once before the bubble and
+// reset after, like the latency/jitter globals.
+var dstNetCrossHostBandwidth int64
+
+// dstSetNetCrossHostBandwidth sets the per-run cross-host bandwidth limit. Reached
+// via //go:linkname from testing/simulation's run envelope.
+//
+//go:linkname dstSetNetCrossHostBandwidth
+func dstSetNetCrossHostBandwidth(bytesPerSec int64) { dstNetCrossHostBandwidth = bytesPerSec }
+
+// dstNetCrossHostBandwidthBps reports the per-run cross-host bandwidth limit.
+// Reached via //go:linkname from net.
+//
+//go:linkname dstNetCrossHostBandwidthBps
+func dstNetCrossHostBandwidthBps() int64 { return dstNetCrossHostBandwidth }
+
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //

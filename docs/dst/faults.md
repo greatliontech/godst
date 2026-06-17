@@ -238,6 +238,16 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   `TestDSTNetLatencyDeterminism` pin the one-way/RTT delay, the same-host-instant rule, and same-seed
   reproducibility, and `TestDSTNetLatencyDeadline` confirms the delay is a real fake-timer wait (a read
   deadline shorter than the latency times out before delivery) (`net`), mutation-tested.
+- **DST-NET-THROTTLE (entailed: rate bound / soundness).** On a connection with bandwidth limit B, the
+  receiver gets N bytes no faster than N/B of base time — the link transmits segments serially at B.
+  *violation:* a transfer delivered faster than B (e.g. segments not serialized through the per-direction
+  `linkFreeAt`, or transmission time mis-scaled) lets a SUT pass only because the harness gave it
+  impossible bandwidth — a false negative the finite-link DoF forbids. *Enforced:* `push` advances a
+  per-direction `linkFreeAt` by `len/B` per segment (store-and-forward) so each segment's `deliverAt` is no
+  earlier than the prior segment's transmit-end + its own (`net/dst_wire.go`); `TestDSTNetThrottleRate`
+  asserts a 1 MiB transfer's first-to-last read span is ≥ (size−chunk)/B, and `TestDSTNetThrottleDeterminism`
+  that it replays exactly (`net`), mutation-tested (disabling the gate, halving the transmission time, and
+  dropping the serialization each fail the rate bound).
 
 (The fault-feature invariants are in the next section.)
 
@@ -372,7 +382,14 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   the conn's existing `resetConn()` (already wired for backlog teardown: peer reads & writes then carry
   `ECONNRESET`). DoF: a real RST (peer crash, middlebox).
 - **Throttle / bandwidth** — pace delivery so ≤ B bytes cross per virtual time unit (latency
-  proportional to bytes, the same fake-timer queue as latency). DoF: finite link bandwidth.
+  proportional to bytes, the same fake-timer queue as latency). DoF: finite link bandwidth. **Landed** as
+  `Options.Network.CrossHostBandwidth` (bytes/sec, **per connection-direction**): the wire serializes
+  transmission via a per-direction `linkFreeAt` clock — a segment of S bytes occupies the link `S/B`
+  (store-and-forward) before the base latency + jitter propagate it — so a receiver gets bytes no faster
+  than B (DST-NET-THROTTLE). Deterministic (no fault-RNG draw) and FIFO-preserving (`linkFreeAt` monotone +
+  head-of-line). Default 0 = unlimited; same-host always unlimited. Shared-link contention (one budget
+  across a host-pair's flows) is the L4 per-link refinement; this is per-flow (each direction an
+  independent B-capacity link, so executions stay ⊆ real).
 
 Collapse-check (net axis): **not finer** — each fault is a real TCP-flow event; crucially **no
 drop/reorder/duplicate of bytes on a live stream** (those are not real degrees of freedom of a reliable
@@ -498,12 +515,14 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Enforced (jitter class landed; each further fault class as it lands):* per-fault structural argument +
-  a regression test per fault class that the faulted execution is one the real stack can produce. Jitter is
-  a real link degree of freedom (variable latency) that only *delays* — bounded to [0, max), never dropping
-  or reordering a live stream (delivery is head-of-line, in order, DST-NET-FIFO): `TestDSTNetJitterBounded`
-  / `TestDSTNetJitterFIFO` (`net`), mutation-tested. (A partition will likewise only ever yield
-  refuse/blackhole/heal, never a missing byte on a healed stream.)
+  *Enforced (jitter + throttle classes landed; each further fault class as it lands):* per-fault structural
+  argument + a regression test per fault class that the faulted execution is one the real stack can
+  produce. Jitter is a real link degree of freedom (variable latency) that only *delays* — bounded to
+  [0, max), never dropping or reordering a live stream (delivery is head-of-line, in order, DST-NET-FIFO):
+  `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link bandwidth, modeled per-flow as
+  an independent B-capacity link (a real dedicated link, so ⊆ real), delivering no faster than B
+  (DST-NET-THROTTLE): `TestDSTNetThrottleRate` (`net`), mutation-tested. (A partition will likewise only
+  ever yield refuse/blackhole/heal, never a missing byte on a healed stream.)
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.

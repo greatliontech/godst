@@ -422,3 +422,108 @@ func TestDSTNetJitterFIFO(t *testing.T) {
 		}
 	}
 }
+
+// dstThrottledTransfer sends `total` bytes in `chunk`-sized writes from host B to
+// host A over a connection configured by opts, and returns the base-time span
+// from the receiver's first read to its last (when it has all `total` bytes) plus
+// the byte count received. With a bandwidth limit the link transmits chunks
+// serially, so this span reflects the enforced rate.
+func dstThrottledTransfer(t *testing.T, seed uint64, opts simulation.Options, total, chunk int) (span time.Duration, got int) {
+	t.Helper()
+	simulation.RunWith(seed, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					close(done)
+					return
+				}
+				buf := make([]byte, chunk)
+				var firstAt time.Time
+				for got < total {
+					n, err := c.Read(buf)
+					if n > 0 && firstAt.IsZero() {
+						firstAt = time.Now()
+					}
+					got += n
+					if err != nil {
+						break
+					}
+				}
+				span = time.Since(firstAt)
+				c.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			payload := make([]byte, chunk)
+			for sent := 0; sent < total; sent += chunk {
+				c.Write(payload)
+			}
+			<-done
+			c.Close()
+		})
+	})
+	return span, got
+}
+
+// TestDSTNetThrottleRate: a bandwidth-limited cross-host link delivers bytes no
+// faster than the configured rate — the receiver's first-to-last read span is at
+// least (total-chunk)/bandwidth of base time (the propagation latency cancels
+// between the first and last read). DST-NET-THROTTLE.
+func TestDSTNetThrottleRate(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const total = 1 << 20  // 1 MiB
+	const chunk = 32 << 10 // 32 KiB
+	const bw = 10 << 20    // 10 MiB/s
+	const lat = 5 * time.Millisecond
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: lat, CrossHostBandwidth: bw}}
+	span, got := dstThrottledTransfer(t, 1, opts, total, chunk)
+	if got != total {
+		t.Fatalf("received %d/%d bytes", got, total)
+	}
+	// Lower bound is the invariant (DST-NET-THROTTLE: no faster than B). The upper
+	// bound is a sanity that throttle adds no gross spurious delay, with a slack of
+	// one chunk's transmit time (the natural granularity) so it does not couple to
+	// the exact store-and-forward arithmetic.
+	minSpan := time.Duration((int64(total) - int64(chunk)) * int64(time.Second) / int64(bw))
+	chunkXmit := time.Duration((int64(chunk)*int64(time.Second) + int64(bw) - 1) / int64(bw))
+	if span < minSpan {
+		t.Errorf("%d bytes at %d B/s: first-to-last read span %v, want >= %v (rate not limited)", total, bw, span, minSpan)
+	}
+	if span > minSpan+chunkXmit+time.Millisecond {
+		t.Errorf("transfer span %v exceeds %v (excess delay beyond the transmission time)", span, minSpan+chunkXmit+time.Millisecond)
+	}
+}
+
+// TestDSTNetThrottleDeterminism: throttle is deterministic (no random draw) — the
+// same seed replays the same paced transfer (DST-FAULT-REPLAY). Throttle is
+// intentionally seed-INDEPENDENT, so the analytic span assertion (not just
+// run-to-run equality) guards against the transfer being a no-op or unpaced.
+func TestDSTNetThrottleDeterminism(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const total, chunk, bw = 256 << 10, 16 << 10, 4 << 20
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 3 * time.Millisecond, CrossHostBandwidth: bw}}
+	wantSpan := time.Duration((int64(total) - int64(chunk)) * int64(time.Second) / int64(bw)) // (total-chunk)/B, exact here
+	for seed := uint64(0); seed < 8; seed++ {
+		s1, g1 := dstThrottledTransfer(t, seed, opts, total, chunk)
+		s2, g2 := dstThrottledTransfer(t, seed, opts, total, chunk)
+		if s1 != s2 || g1 != g2 {
+			t.Fatalf("seed %d: throttled transfer not reproducible: span %v vs %v, got %d vs %d", seed, s1, s2, g1, g2)
+		}
+		if g1 != total || s1 != wantSpan {
+			t.Fatalf("seed %d: got %d bytes in span %v, want %d in %v", seed, g1, s1, total, wantSpan)
+		}
+	}
+}

@@ -16,12 +16,12 @@ import (
 
 // A dstWire is the delay-bearing transport under a simulated cross-host
 // connection. It replaces net.Pipe (the synchronous, zero-delay transport used for
-// same-host connections) when a cross-host connection has a non-zero base latency
-// OR jitter: a byte written at base-time T becomes readable at T+latency+jitter,
-// in order, on the deterministic fake clock. It is the seam every network-delivery
-// fault hooks (jitter draws the per-segment delay; throttle will pace it by bytes,
-// partition will blackhole it) — base latency and jitter are its first two
-// delivery policies.
+// same-host connections) when a cross-host connection has a non-zero base latency,
+// jitter, OR bandwidth limit: a segment is transmitted (bandwidth, store-and-
+// forward), then propagates (latency + jitter), becoming readable in order on the
+// deterministic fake clock. It is the seam every network-delivery fault hooks
+// (jitter draws the per-segment delay; throttle paces it by bytes; partition will
+// blackhole it) — base latency, jitter, and throttle are its delivery policies.
 //
 // Two properties make it sound and replay-exact:
 //
@@ -41,8 +41,8 @@ import (
 // Unlike net.Pipe, a write is buffered (it returns immediately, modeling a TCP
 // send buffer the propagation delay drains) rather than rendezvousing with the
 // reader; that is exactly the decoupling latency requires. Same-host connections
-// keep net.Pipe's synchronous behavior (neither latency nor jitter ever builds a
-// dstWire for them), so the N=1 collapse and every run that sets neither are
+// keep net.Pipe's synchronous behavior (none of latency/jitter/bandwidth ever
+// builds a dstWire for them), so the N=1 collapse and every run that sets none are
 // byte-identical.
 
 //go:linkname dstClockOffsetNow runtime.dstClockOffsetNow
@@ -53,6 +53,9 @@ func dstNetCrossHostLatencyNs() int64
 
 //go:linkname dstNetCrossHostJitterNs runtime.dstNetCrossHostJitterNs
 func dstNetCrossHostJitterNs() int64
+
+//go:linkname dstNetCrossHostBandwidthBps runtime.dstNetCrossHostBandwidthBps
+func dstNetCrossHostBandwidthBps() int64
 
 // dstFaultRandN draws a deterministic value in [0,n) from the dedicated, seeded,
 // stream-isolated fault RNG (n<=0 draws nothing) — the source for the per-segment
@@ -85,10 +88,11 @@ type dstSeg struct {
 // head-of-line, bunches the ones behind it), never the ORDER. So a live stream is
 // never reordered (DST-NET-FIFO) without any need to clamp deliverAt.
 type dstStream struct {
-	mu     sync.Mutex
-	segs   []dstSeg
-	closed bool          // writer end closed: the reader drains, then sees EOF
-	ready  chan struct{} // buffered(1) wakeup, pinged on append/close
+	mu         sync.Mutex
+	segs       []dstSeg
+	linkFreeAt int64         // base-time when the bandwidth-limited link finishes transmitting all queued bytes
+	closed     bool          // writer end closed: the reader drains, then sees EOF
+	ready      chan struct{} // buffered(1) wakeup, pinged on append/close
 }
 
 func newDstStream() *dstStream {
@@ -103,16 +107,32 @@ func (s *dstStream) wake() {
 	}
 }
 
-// push appends a copy of b for delivery (latencyNs + a jitter draw in [0,jitterNs))
-// base-time nanoseconds from now. Non-blocking (a send buffer). FIFO order needs no
-// clamp: the reader consumes the head first, so a later segment (even one with a
-// smaller jitter draw) is never delivered before an earlier one — head-of-line
-// bunches it instead. jitterNs <= 0 draws nothing (so an inactive jitter fault
-// leaves the fault stream — and every later fault's draw position — untouched).
-func (s *dstStream) push(b []byte, latencyNs, jitterNs int64) {
+// push appends a copy of b for delivery from now: a bandwidth-limited link
+// transmits the segment (it occupies the link len(b)/bandwidth before propagating,
+// serialized after earlier queued bytes via linkFreeAt), then the base latency and
+// a jitter draw in [0,jitterNs) apply. Non-blocking (a send buffer). FIFO order
+// needs no clamp: the reader consumes the head first, so a later segment (even one
+// with a smaller jitter draw) is never delivered before an earlier one —
+// head-of-line bunches it instead. bandwidthBps<=0 is unlimited; jitterNs<=0 draws
+// nothing (so an inactive jitter fault leaves the fault stream untouched).
+func (s *dstStream) push(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
 	data := append([]byte(nil), b...)
 	s.mu.Lock()
-	at := dstBaseNanos() + latencyNs + dstFaultRandN(jitterNs)
+	transmitEnd := dstBaseNanos()
+	if bandwidthBps > 0 {
+		// Serialize transmission at bandwidthBps bytes/sec: this segment starts when
+		// the link is free (or now, whichever is later) and occupies it for
+		// len/bandwidth, store-and-forward (delivered whole at the transmit end). The
+		// transmit time is rounded UP, so even a sub-nanosecond segment costs ≥1ns —
+		// delivery is never faster than B (the sound direction; the round-up adds at
+		// most 1ns per segment).
+		if s.linkFreeAt > transmitEnd {
+			transmitEnd = s.linkFreeAt
+		}
+		transmitEnd += (int64(len(b))*1_000_000_000 + bandwidthBps - 1) / bandwidthBps
+		s.linkFreeAt = transmitEnd
+	}
+	at := transmitEnd + latencyNs + dstFaultRandN(jitterNs)
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
 	s.mu.Unlock()
 	s.wake()
@@ -164,9 +184,10 @@ func (s *dstStream) pop(b []byte) (n int, eof bool, wait time.Duration) {
 // deadline), so the dstConn wrapper maps it to production error identity
 // unchanged.
 type dstWireEnd struct {
-	out, in   *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
-	latencyNs int64
-	jitterNs  int64 // per-segment delivery jitter is drawn from [0,jitterNs)
+	out, in      *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
+	latencyNs    int64
+	jitterNs     int64 // per-segment delivery jitter is drawn from [0,jitterNs)
+	bandwidthBps int64 // link transmit rate in bytes/sec; 0 = unlimited
 
 	once       sync.Once
 	localDone  chan struct{}
@@ -176,16 +197,16 @@ type dstWireEnd struct {
 	wrDead pipeDeadline
 }
 
-func dstWirePair(latencyNs, jitterNs int64) (Conn, Conn) {
+func dstWirePair(latencyNs, jitterNs, bandwidthBps int64) (Conn, Conn) {
 	ab, ba := newDstStream(), newDstStream()
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	a := &dstWireEnd{
-		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs,
+		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
 		localDone: doneA, remoteDone: doneB,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
-		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs,
+		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
 		localDone: doneB, remoteDone: doneA,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
@@ -261,11 +282,13 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	case isClosedChan(e.wrDead.wait()):
 		return 0, os.ErrDeadlineExceeded
 	}
-	// Buffered: the bytes are queued for delivery latencyNs later and the call
-	// returns immediately (a TCP send buffer the propagation delay drains). An
-	// unbounded buffer never blocks, so a write deadline only gates entry — until
-	// throttle adds a bounded buffer.
-	e.out.push(b, e.latencyNs, e.jitterNs)
+	// Buffered: the bytes are queued for delivery (transmission + latency + jitter)
+	// and the call returns immediately (a TCP send buffer the propagation delay
+	// drains). The buffer is unbounded so a write never blocks — even under
+	// throttle, which paces delivery, not the sender; a write deadline therefore
+	// only gates entry. Sender backpressure (a bounded send buffer whose fill blocks
+	// Write) is a deferred refinement.
+	e.out.push(b, e.latencyNs, e.jitterNs, e.bandwidthBps)
 	return len(b), nil
 }
 
