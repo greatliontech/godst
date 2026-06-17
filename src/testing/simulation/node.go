@@ -49,6 +49,19 @@ func dstProcAllocEnsure(procid uint32)
 //go:linkname dstProcAllocBytes runtime.dstProcAllocBytes
 func dstProcAllocBytes(procid uint32) int64
 
+// dstHostIdentMu serializes dstSetHostIdent, which publishes a host's identity into
+// a copy-on-write table that concurrent Host/Process declarations would otherwise
+// race on (the table copy). Host/Process declarations are rare — not a hot path — so
+// the lock is free; the table READS (os.Hostname / runtime.NumCPU, in the runtime)
+// stay lock-free atomic loads of the published table.
+var dstHostIdentMu sync.Mutex
+
+func setHostIdent(host uint32, hostname string, numcpu int) {
+	dstHostIdentMu.Lock()
+	dstSetHostIdent(host, hostname, numcpu)
+	dstHostIdentMu.Unlock()
+}
+
 // HostConfig configures a host declared with Host. It is the declarative place to
 // set a host's simulated properties; today it carries the host's clock, hostname,
 // and NumCPU, and grows as later layers add more per-host identity (e.g. IP). The
@@ -181,7 +194,7 @@ func Host(name string, config HostConfig, f func()) {
 	if hostname == "" {
 		hostname = name
 	}
-	dstSetHostIdent(hid, hostname, config.NumCPU)
+	setHostIdent(hid, hostname, config.NumCPU)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
 	oldOff := dstSetHostClockOffset(config.Clock.offsetNanos(hid))
@@ -206,7 +219,7 @@ func Process(name string, f func()) {
 	host, _ := dstCurrentNode()
 	if host == 0 {
 		host = internHost(name)
-		dstSetHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
+		setHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
 	}
 	pid := internProc(name)
 	dstProcAllocEnsure(pid) // per-process allocation counter exists before the body allocates
