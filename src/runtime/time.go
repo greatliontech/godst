@@ -15,9 +15,23 @@ import (
 
 //go:linkname time_runtimeNow time.runtimeNow
 func time_runtimeNow() (sec int64, nsec int32, mono int64) {
-	if bubble := getg().bubble; bubble != nil {
-		sec = bubble.now / (1000 * 1000 * 1000)
-		nsec = int32(bubble.now % (1000 * 1000 * 1000))
+	gp := getg()
+	if bubble := gp.bubble; bubble != nil {
+		wall := bubble.now
+		if dstActive() {
+			// Under an active simulation, shift only the wall reading by the calling
+			// goroutine's per-host clock offset (testing/simulation.Host's clock
+			// config), so co-located processes share a clock while different hosts can
+			// be skewed — the primitive an HLC is built to tolerate. The offset never
+			// touches bubble.now, so monotonic time (time_runtimeNano), timer
+			// deadlines, and the synctest advance are unaffected: a static offset
+			// preserves durations. Folds away in non-dst builds (dstActive is a
+			// constant false), leaving the reading byte-identical. See
+			// runtime.dstSetHostClockOffset and docs/dst/faults.md "Per-host clock".
+			wall += gp.dstClockOffset
+		}
+		sec = wall / (1000 * 1000 * 1000)
+		nsec = int32(wall % (1000 * 1000 * 1000))
 		// Don't return a monotonic time inside a synctest bubble.
 		// If we return a monotonic time based on the fake clock,
 		// arithmetic on times created inside/outside bubbles is confusing.

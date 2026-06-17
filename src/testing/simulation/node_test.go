@@ -40,7 +40,7 @@ func TestDSTNodeIdentity(t *testing.T) {
 		})
 		afterP1 = curNode()
 
-		Host("h1", func() {
+		Host("h1", HostConfig{}, func() {
 			Process("a", func() { h1a = curNode() })
 			Process("b", func() { h1b = curNode() })
 		})
@@ -121,7 +121,7 @@ func TestDSTNodeDeterministic(t *testing.T) {
 	run := func() [3]nodeIDs {
 		var got [3]nodeIDs
 		Run(7, func() {
-			Host("h1", func() {
+			Host("h1", HostConfig{}, func() {
 				Process("a", func() { got[0] = curNode() })
 				Process("b", func() { got[1] = curNode() })
 			})

@@ -27,26 +27,26 @@ func TestDSTNodeFSIsolation(t *testing.T) {
 	)
 	simulation.Run(1, func() {
 		// Cross-host isolation: two hosts write the SAME path independently.
-		simulation.Host("hA", func() {
+		simulation.Host("hA", simulation.HostConfig{}, func() {
 			os.WriteFile("/data", []byte("A"), 0o644)
 		})
-		simulation.Host("hB", func() {
+		simulation.Host("hB", simulation.HostConfig{}, func() {
 			os.WriteFile("/data", []byte("B"), 0o644)
 			os.WriteFile("/onlyB", []byte("x"), 0o644)
 		})
-		simulation.Host("hA", func() { // re-enter host hA: same tree
+		simulation.Host("hA", simulation.HostConfig{}, func() { // re-enter host hA: same tree
 			b, _ := os.ReadFile("/data")
 			gotA = string(b)
 			_, err := os.Stat("/onlyB") // host hA never created this
 			aSeesOnlyB = err == nil
 		})
-		simulation.Host("hB", func() {
+		simulation.Host("hB", simulation.HostConfig{}, func() {
 			b, _ := os.ReadFile("/data")
 			gotB = string(b)
 		})
 
 		// Co-located processes share their host tree; cwd is per-process.
-		simulation.Host("h1", func() {
+		simulation.Host("h1", simulation.HostConfig{}, func() {
 			simulation.Process("p1", func() {
 				os.WriteFile("/shared", []byte("hello"), 0o644)
 				os.Mkdir("/p1dir", 0o755)
@@ -95,21 +95,21 @@ func TestDSTNodeCwdIsolation(t *testing.T) {
 	)
 	simulation.Run(1, func() {
 		// Bare hosts (both at process 0): hA's Chdir must not move hB's cwd.
-		simulation.Host("hA", func() {
+		simulation.Host("hA", simulation.HostConfig{}, func() {
 			os.Mkdir("/onlyA", 0o755)
 			os.Chdir("/onlyA")
 			os.WriteFile("/tmp/fromA", []byte("a"), 0o644)
 		})
-		simulation.Host("hB", func() {
+		simulation.Host("hB", simulation.HostConfig{}, func() {
 			hBcwd, _ = os.Getwd()
-			_, hBStatErr = os.Stat(".")        // "." must resolve to hB's own root
+			_, hBStatErr = os.Stat(".")         // "." must resolve to hB's own root
 			_, hBTmpErr = os.Stat("/tmp/fromA") // per-host /tmp: hA's file absent on hB
 		})
 		// Same-named process on two hosts: different machines, independent cwd.
-		simulation.Host("h2", func() {
+		simulation.Host("h2", simulation.HostConfig{}, func() {
 			simulation.Process("srv", func() { os.Mkdir("/d", 0o755); os.Chdir("/d") })
 		})
-		simulation.Host("h3", func() {
+		simulation.Host("h3", simulation.HostConfig{}, func() {
 			simulation.Process("srv", func() { srvCwd, _ = os.Getwd() })
 		})
 	})
@@ -140,7 +140,7 @@ func TestDSTNodeHostFS(t *testing.T) {
 		bList   []string
 	)
 	simulation.Run(1, func() {
-		simulation.Host("hA", func() {
+		simulation.Host("hA", simulation.HostConfig{}, func() {
 			os.WriteFile("/data", []byte("payload"), 0o644)
 			os.Mkdir("/sub", 0o755)
 		})

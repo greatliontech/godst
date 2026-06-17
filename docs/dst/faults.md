@@ -107,13 +107,21 @@ per-host:
 
 Time is **no longer purely universe-global**: the Universe owns the *base* virtual clock and the synctest
 advance; each **Host** owns a clock *function over base time*. A goroutine's `time.Now()` wall reading is
-`wall = base + offset_h(t)`, applying the calling host's offset (via `g.dstHost`). This is the primitive
-an HLC database is *built to tolerate*, so it cannot be a single global clock.
+`wall = base + offset_h(t)`, applying the calling goroutine's host offset (carried on `g.dstClockOffset`,
+stamped from the host's config and inherited like `g.dstHost`). This is the primitive an HLC database is
+*built to tolerate*, so it cannot be a single global clock.
 
-- **Foundation (substrate): static per-host offset** (`HostConfig.Clock`, default 0, or seeded within a
-  bound). Clean — an offset shifts only what `time.Now()` *reads*, not durations, so relative timers fire
-  at the same base time on every host and the synctest "advance to next deadline" machinery is untouched
-  (only the rare absolute-wall-time timer shifts by the offset).
+- **Foundation (substrate): static per-host offset** — **landed**. `HostConfig.Clock` is a `ClockConfig`
+  built by `Skew(d)` (a fixed offset) or `BoundedSkew(max)` (an offset drawn deterministically from the run
+  seed within ±max, independently per host — the per-seed knob for exploring bounded skew, stable across a
+  host restart since it depends only on `(seed, host id)`). The offset is stamped on the Host body's
+  goroutine (`g.dstClockOffset`, inherited at `newproc1` like `g.dstHost`, so co-located processes and the
+  host's whole subtree share one clock) and added to **only** the wall split in `runtime/time.go`
+  `time_runtimeNow`, guarded by `dstActive` (so it folds away in non-dst builds). `bubble.now`, monotonic
+  time (`time_runtimeNano`), timer deadlines, and the synctest "advance to next deadline" machinery are
+  untouched — an offset shifts what `time.Now()` *reads*, not durations, so relative timers fire at the
+  same base time on every host (only the rare absolute-wall-time timer shifts by the offset). Default 0 is
+  the N=1 collapse, byte-identical to the universe-global clock.
 - **Drift/step are clock faults (later).** *Drift* (`rate ≠ 1`) and *step* (an NTP jump) perturb
   `offset_h(t)` dynamically — **sequencing, not a concession**: the representation is `wall = f_h(base)`
   (offset = `base + c`, drift = `base*rate + c`, the same function slot), so drift fills the slot with no
@@ -135,22 +143,34 @@ an HLC database is *built to tolerate*, so it cannot be a single global clock.
   seam (counter now; live-set later if a SUT ever needs RSS-accurate thresholds), non-foreclosing. The
   universe-wide `Options.MemoryLimit` keeps its faithful live-set bound.
 
-### Project invariants (distributed model) — recorded spec-tier
+### Project invariants (distributed model)
 
 - **DST-NODE-ISOLATION (entailed: isolation boundary).** A goroutine's FS ops resolve only against its
   *host's* tree, and processes share no Go memory; a process observes another's state only over the
   simulated network or a shared *host* filesystem. *violation:* process A on host hA reads a path process
   B wrote on host hB and sees B's bytes — a back-channel two separate machines never had, so a SUT passes
   only because the nodes secretly shared a disk (a false negative) — or a crash on B corrupts A's file.
-  *Encoding when built:* structural (per-host tree, resolver keyed by `g.dstHost`; per-process cwd/fds) +
-  a test that two hosts writing the same path get independent files and a crash on one leaves the other
-  intact, *and* the inverse — co-located processes *do* share their host tree. *Lands: the per-host-FS
-  substrate chunk.*
+  *Enforced:* structural (per-host tree, resolver keyed by `g.dstHost`; per-`(host, process)` cwd) +
+  `TestDSTNodeFSIsolation`/`TestDSTNodeCwdIsolation` (`os/dst_node_fs_test.go`): two hosts writing the same
+  path get independent files, per-host `/tmp` is independent, and per-process cwd does not leak — *and* the
+  inverse, co-located processes *do* share their host tree. The crash-tear half (a crash on one host
+  leaving another intact) enforces with the crash fault.
 - **DST-CLOCK-DET (clause-explicit: determinism).** Same seed + same host clock config → identical
   per-host `time.Now()` readings and identical timer firings. *violation:* a host offset or drift
-  conversion drawn from a load-dependent source (real time, per-m RNG) varies run-to-run. *Encoding when
-  built:* offsets/rates are deterministic functions of seed/config; a determinism probe over a skewed
-  multi-host run, mutation-tested. *Lands: the per-host-clock substrate chunk.*
+  conversion drawn from a load-dependent source (real time, per-m RNG) varies run-to-run. *Enforced:*
+  offsets are deterministic functions of seed/config (`runtime.dstHostSeededClockOffset` hashes the seed
+  with the host id, advancing no RNG stream; `Skew` is a constant); `TestDSTClockDeterminism` /
+  `TestDSTClockBoundedSeeded` (`testing/simulation/clock_test.go`) probe a skewed multi-host run across two
+  same-seed runs and across seeds, mutation-tested.
+- **DST-CLOCK-DURATION (entailed: the offset preserves durations).** A static per-host wall offset shifts
+  only `time.Now()`'s wall reading, never monotonic time, durations, or timer deadlines — so relative
+  timers fire at the same base time on every host regardless of offset. *violation:* folding the offset
+  into the shared base clock (`bubble.now`) or the monotonic reading fires a skewed host's 1 s relative
+  timer early/late and corrupts `time.Since` across the offset boundary, while a naive "`Now()` differs per
+  host" check still passes (the strongest counterexample — every per-host reading looks right yet durations
+  are wrong). *Enforced:* `TestDSTClockDurationPreserved` (`testing/simulation/clock_test.go`) asserts that
+  under a non-zero offset an in-bubble interval's `time.Since` and the base-clock advance over a host's
+  sleep are byte-identical to offset 0, mutation-tested against the `bubble.now`-corruption implementation.
 
 (The fault-feature invariants are in the next section.)
 

@@ -132,6 +132,7 @@ func dstActivate(seed uint64) {
 	// how it leaves the simulated process identity unset.
 	getg().dstHost = 0
 	getg().dstProc = 0
+	getg().dstClockOffset = 0
 	dstSchedRand = dstSchedRoot(seed)
 	// Queue process-level finalizers/cleanups before DST is active and detach them
 	// from the queues the bubble drain observes. They are not part of this run's
@@ -190,6 +191,55 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32) {
 func dstCurrentNode() (host, proc uint32) {
 	gp := getg()
 	return gp.dstHost, gp.dstProc
+}
+
+// dstSetHostClockOffset stamps the calling goroutine's per-host wall-clock offset
+// (nanoseconds) and returns the previous value, so testing/simulation.Host can
+// restore it when its body returns. Like dstHost/dstProc the offset inherits to
+// child goroutines at newproc1 (the labeled subtree), so stamping the Host body's
+// goroutine applies the host's clock to its whole subtree; Process does not touch
+// it (a process inherits its host's clock). It shifts only time.Now's wall reading
+// inside an active run (runtime/time.go time_runtimeNow); monotonic time and timer
+// deadlines, which read bubble.now directly, are unaffected — a static offset
+// preserves durations. This is the L2 collapse of the per-host clock function
+// wall = f_h(base) (docs/dst/faults.md "Per-host clock"): the constant case
+// base + offset_h. Reached via //go:linkname.
+//
+//go:linkname dstSetHostClockOffset
+func dstSetHostClockOffset(offset int64) (old int64) {
+	gp := getg()
+	old = gp.dstClockOffset
+	gp.dstClockOffset = offset
+	return
+}
+
+// dstHostSeededClockOffset returns a deterministic per-host wall-clock offset in
+// [-bound, +bound] nanoseconds, a stateless function of the run seed and the host
+// id (testing/simulation.BoundedSkew). It advances no RNG stream — neither a per-g
+// tree (g.dstrand) nor the scheduling RNG (dstSchedRand) — so seeding a host's skew
+// can neither perturb the program's interleaving nor shift any other draw, and the
+// offset is stable across a host re-declaration (restart) because it depends only
+// on (seed, host id). Sweeping the run seed sweeps the whole bounded
+// skew-assignment space, which is how a bounded static skew is explored
+// (faults.md "Per-host clock": "seeded within a bound"). A non-positive bound is no
+// skew. Reached via //go:linkname.
+//
+//go:linkname dstHostSeededClockOffset
+func dstHostSeededClockOffset(hostid uint32, bound int64) int64 {
+	if bound <= 0 {
+		return 0
+	}
+	// splitmix64 finalizer over (seed, salt, host id): stateless, advances nothing.
+	x := dstSeed.Load() ^ 0xC10CC10CC10CC10C ^ (uint64(hostid) * 0x9e3779b97f4a7c15)
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	// Map uniformly into [-bound, bound]. Compute the span and the centering in
+	// uint64 so neither 2*bound nor the subtraction overflows int64; the signed
+	// result lands in [-bound, +bound] for every bound in [1, MaxInt64] (for r <
+	// bound the uint64 subtraction wraps to the correct two's-complement negative).
+	span := 2*uint64(bound) + 1
+	return int64(x%span - uint64(bound))
 }
 
 // dstHeapBase is the process-live heap snapshot taken at bubble entry (after a

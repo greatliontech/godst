@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"sync"
+	"time"
 	_ "unsafe" // for go:linkname
 )
 
@@ -26,6 +27,67 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
 
 //go:linkname dstCurrentNode runtime.dstCurrentNode
 func dstCurrentNode() (host, proc uint32)
+
+//go:linkname dstSetHostClockOffset runtime.dstSetHostClockOffset
+func dstSetHostClockOffset(offset int64) (old int64)
+
+//go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
+func dstHostSeededClockOffset(hostid uint32, bound int64) int64
+
+// HostConfig configures a host declared with Host. It is the declarative place to
+// set a host's simulated properties; today it carries the host's clock, and grows
+// as later layers add per-host identity (IP, NumCPU, hostname). The zero HostConfig
+// is the unconfigured host — its clock in sync with the universe base clock — so
+// Host(name, HostConfig{}, f) is the plain host (the N=1 default, identical to a
+// host that declares nothing).
+type HostConfig struct {
+	// Clock sets the host's wall clock relative to the universe base virtual clock.
+	// The zero value is in sync (no skew). Build one with Skew or BoundedSkew.
+	Clock ClockConfig
+}
+
+// ClockConfig describes a host's wall clock as a function of the universe base
+// virtual clock (docs/dst/faults.md "Per-host clock"). Today it expresses a static
+// wall offset — the clock skew an HLC and other time-sensitive distributed systems
+// are built to tolerate. The offset shifts only what time.Now reads on the host,
+// never durations or timer deadlines, so relative timers fire at the same base time
+// on every host. Build one with Skew (a fixed offset) or BoundedSkew (a per-host
+// offset drawn from the seed within a bound). The zero value is no skew. Dynamic
+// clock perturbation — drift (rate != 1) and step (an NTP jump) — is a later
+// fault-layer axis over this same representation.
+type ClockConfig struct {
+	seeded bool          // false: fixed offset; true: offset seeded within ±bound
+	offset time.Duration // static wall offset (when !seeded)
+	bound  time.Duration // seeded offset is drawn from [-bound, +bound] (when seeded)
+}
+
+// Skew returns a ClockConfig that puts the host's wall clock a fixed offset ahead
+// of (offset > 0) or behind (offset < 0) the universe base clock. The offset is
+// constant for the run and shifts only time.Now's reading on the host, not
+// durations or timer deadlines.
+func Skew(offset time.Duration) ClockConfig {
+	return ClockConfig{offset: offset}
+}
+
+// BoundedSkew returns a ClockConfig whose offset is drawn deterministically from
+// the run seed within [-bound, +bound], independently per host. It is stable within
+// a run (and across a host restart) and varies with the seed, so sweeping the seed
+// (Test/Explore) sweeps the bounded skew-assignment space — the way to explore "all
+// the ways N clocks can disagree by up to bound" rather than pinning one offset by
+// hand. A non-positive bound is no skew.
+func BoundedSkew(bound time.Duration) ClockConfig {
+	return ClockConfig{seeded: true, bound: bound}
+}
+
+// offsetNanos resolves the configured clock to a concrete wall offset in
+// nanoseconds for the given host id. The seeded case asks the runtime, which hashes
+// the run seed with the host id (advancing no RNG stream).
+func (c ClockConfig) offsetNanos(hostid uint32) int64 {
+	if c.seeded {
+		return dstHostSeededClockOffset(hostid, int64(c.bound))
+	}
+	return int64(c.offset)
+}
 
 // nodeReg interns Host/Process names to the integer ids the runtime carries on each
 // goroutine. Process-global, reset per run (nodeRegReset, called by the run
@@ -74,19 +136,27 @@ func internProc(name string) uint32 {
 	return nodeReg.nextProc
 }
 
-// Host runs f as the named host. Goroutines f starts (and their descendants) belong
-// to host name, sharing its filesystem and network identity; a Process started
-// within f runs on this host. Host stamps the running goroutine's host identity for
-// the dynamic extent of f and restores it on return — the ids inherit at goroutine
+// Host runs f as the named host with the given configuration. Goroutines f starts
+// (and their descendants) belong to host name, sharing its filesystem and network
+// identity and its clock (config.Clock); a Process started within f runs on this
+// host. Host stamps the running goroutine's host identity and clock offset for the
+// dynamic extent of f and restores them on return — they inherit at goroutine
 // creation, so the stamp labels the whole subtree and the subtree's long-lived
 // goroutines outlive the Host call. Hosts and processes may be declared at any time
-// during a run, including mid-run to model a node joining. Calling Host outside a
-// simulation has no effect beyond running f.
-func Host(name string, f func()) {
+// during a run, including mid-run to model a node joining; re-declaring a host with
+// the same name and a seeded clock (BoundedSkew) yields the same offset, so a
+// restart keeps the host's clock. The zero HostConfig is the plain, in-sync host.
+// Calling Host outside a simulation has no effect beyond running f (the stamped
+// clock offset is read only by time.Now inside an active run).
+func Host(name string, config HostConfig, f func()) {
 	hid := internHost(name)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
-	defer dstSetNode(oldH, oldP)
+	oldOff := dstSetHostClockOffset(config.Clock.offsetNanos(hid))
+	defer func() {
+		dstSetHostClockOffset(oldOff)
+		dstSetNode(oldH, oldP)
+	}()
 	f()
 }
 
