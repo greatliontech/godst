@@ -505,6 +505,11 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	if runtime.GOMAXPROCS(0) != 1 {
 		panic("testing/simulation: GOMAXPROCS changed during simulation entry")
 	}
+	// Reset the Host/Process name→id interning so id assignment is a deterministic
+	// function of call order within this run (the schedule, hence call order, is
+	// deterministic). Before the bubble starts; the bubble's Host/Process calls
+	// then populate it.
+	nodeRegReset()
 	if propagateGoexit {
 		returned := false
 		synctest.Run(func() {

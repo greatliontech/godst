@@ -510,6 +510,8 @@ type g struct {
 	dstrand      uint64  // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
 	dstPrio      int64   // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	dstSeq       uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
+	dstHost      uint32  // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1; identity, not RNG; unused when DST off
+	dstProc      uint32  // DST process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1; identity, not RNG; unused when DST off
 	dstAccAddr   uintptr // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR; unused otherwise
 	dstAccSize   uintptr // DST pending memory-access size in bytes; paired with dstAccAddr for interval-overlap dependencies
 	dstAccWrite  bool    // DST pending access is a write (vs read); paired with dstAccAddr

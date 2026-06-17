@@ -124,6 +124,14 @@ func dstActivate(seed uint64) {
 	// rooted here; a synctest bubble re-roots its main independently. The store
 	// order just avoids the caller observing dstActive with an unrooted dstrand.
 	getg().dstrand = dstBubbleRoot(seed)
+	// Root the caller's host/process identity at the default (0,0); the bubble
+	// main re-roots to (0,0) too (synctestRun), and Host/Process stamp subtrees
+	// from there. Only bubble goroutines are attributed: a goroutine that already
+	// existed before activation keeps its current (host,proc), and the white-box
+	// dstActivate path (GOMAXPROCS>1, no bubble) never reads identity — mirroring
+	// how it leaves the simulated process identity unset.
+	getg().dstHost = 0
+	getg().dstProc = 0
 	dstSchedRand = dstSchedRoot(seed)
 	// Queue process-level finalizers/cleanups before DST is active and detach them
 	// from the queues the bubble drain observes. They are not part of this run's
@@ -151,11 +159,37 @@ func dstActivate(seed uint64) {
 	// process *live* set, and we snapshot it as the baseline the relative heap
 	// trigger subtracts out. Without the GC the baseline would include pre-bubble
 	// garbage that the first in-bubble GC then frees, driving heapMarked below the
-	// baseline and breaking the relative computation. See docs/dst/design.md
+	// baseline and breaking the relative computation. See docs/dst/gc.md
 	// (Tier 2, per-bubble relative trigger).
 	GC()
 	dstHeapBase.Store(gcController.heapMarked)
 	dstFinqBase.Store(finqueued)
+}
+
+// dstSetNode stamps the calling goroutine's DST host/process identity and returns
+// the previous values, so testing/simulation.Host/Process can restore them when
+// their body returns. The identity inherits to child goroutines at newproc1 (the
+// labeled-subtree tree), so stamping the calling goroutine for the dynamic extent
+// of a Host/Process body labels its whole subtree. The runtime carries integer
+// ids; the string↔id interning is in testing/simulation. Reached via //go:linkname.
+//
+//go:linkname dstSetNode
+func dstSetNode(host, proc uint32) (oldHost, oldProc uint32) {
+	gp := getg()
+	oldHost, oldProc = gp.dstHost, gp.dstProc
+	gp.dstHost = host
+	gp.dstProc = proc
+	return
+}
+
+// dstCurrentNode returns the calling goroutine's DST host/process identity (0,0 is
+// the root/default host and process). testing/simulation.Process reads it to detect
+// whether it runs inside a Host body (host != 0); white-box tests read it directly.
+//
+//go:linkname dstCurrentNode
+func dstCurrentNode() (host, proc uint32) {
+	gp := getg()
+	return gp.dstHost, gp.dstProc
 }
 
 // dstHeapBase is the process-live heap snapshot taken at bubble entry (after a
@@ -168,7 +202,7 @@ func dstActivate(seed uint64) {
 // The trigger crossing itself is driven off per-object allocated bytes
 // (dstHeapAlloc), not physical heapLive, so *which cycle* discovers a given object
 // is also a deterministic function of the seed in normal AND -race builds (Phase
-// 2a; see dstHeapAlloc and design.md "How per-cycle discovery is made deterministic
+// 2a; see dstHeapAlloc and gc.md "How per-cycle discovery is made deterministic
 // under -race"). dstHeapBase only enters the GOGC-scaled *target*
 // ((heapMarked - dstHeapBase)*GOGC/100); it carries a rare sub-object residual
 // (a pre-bubble transient captured at entry) that does not flip discovery and is

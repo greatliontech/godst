@@ -5444,6 +5444,13 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// trackingSeq cheaprand below so the child's seed depends only on
 		// logical ancestry, not on runtime-internal per-m draws.
 		newg.dstrand = dstrandUint64(callergp)
+		// Inherit the host/process identity from the parent — the labeled-subtree
+		// tree, extended exactly as dstrand extends the per-g RNG tree
+		// (testing/simulation.Host/Process stamp it on a subtree root). Identity,
+		// not scheduling state, so it is copied here and NOT cleared by
+		// dstClearSchedState below.
+		newg.dstHost = callergp.dstHost
+		newg.dstProc = callergp.dstProc
 		dstClearSchedState(newg)
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
 			// PCT: give the new goroutine a random base priority from the scheduling
