@@ -548,10 +548,12 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	dstSimNumCPU = numcpu
 	dstSimEnvSet = true
 	// Fresh per-host table; pid counter based at the root pid so the first process
-	// gets root pid + 1. Both reset here (start of run) rather than at clear so a
-	// re-run starts clean even if a prior run's defer was skipped.
+	// gets root pid + 1; fresh per-process allocation table. All reset here (start of
+	// run) rather than at clear so a re-run starts clean even if a prior run's defer
+	// was skipped.
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(int32(pid))
+	dstProcAlloc.Store(nil)
 }
 
 // dstClearSimEnv stops simulating process identity (run end).
@@ -564,6 +566,7 @@ func dstClearSimEnv() {
 	dstSimNumCPU = 0
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(0)
+	dstProcAlloc.Store(nil)
 }
 
 // dstSetHostIdent records host's simulated hostname and NumCPU (numcpu 0 = use the
@@ -623,6 +626,98 @@ func dstSetProcessPid(pid int32) (old int32) {
 	old = gp.dstPid
 	gp.dstPid = pid
 	return
+}
+
+// Per-process allocation accounting (docs/dst/faults.md "Memory accounting"): each
+// heap allocation by a process's goroutine adds its size-class size (elemsize) to
+// the process's counter at the mallocgc hook (malloc.go), attributed to the
+// allocating goroutine's process id (g.dstProc). It is allocation *flow*, not
+// RSS/live-set — deterministic and -race-invariant (elemsize is, and the program's
+// allocations are a function of the seed), the metric the L3 OOM fault thresholds.
+//
+// The table is a FIXED-size counter vector, allocated once per run and never grown.
+// Fixed by design: a grow-on-demand (copy-on-write) table would mutate its shape
+// while the hot path reads it on every allocation — a data race between the copy
+// and concurrent declarations/reads. A stable backing array makes that race
+// unrepresentable: the hot path indexes the array and does a single atomic add, and
+// declarations only flip an already-present counter. Keyed by g.dstProc (the
+// interned process id), so a logical process accumulates across a restart —
+// faults.md attributes by dstProc; per-instance reset, if the OOM fault wants it, is
+// a later increment over this seam.
+
+// dstMaxSimProcs bounds the distinct processes (Process names) a single run may
+// declare for allocation accounting. It fixes the counter table's size so the hot
+// path never races a table growth; a run that declares more panics loudly (no
+// silent drop), as net's routable-IP space does past its host bound. Generous:
+// realistic simulations declare a handful to dozens of processes (a restart reuses
+// the name's id, so restarts do not consume the budget).
+const dstMaxSimProcs = 4096
+
+// dstProcAllocTable is the per-run per-process allocation counters, indexed by
+// process id (slot 0 unused: proc 0 is the un-budgeted root). Allocated once
+// (dstProcAllocEnsure) and never grown, so its backing array is stable for the run.
+type dstProcAllocTable struct {
+	ctr [dstMaxSimProcs]atomic.Int64
+}
+
+var dstProcAlloc atomic.Pointer[dstProcAllocTable]
+
+// dstProcAllocEnsure allocates the per-run counter table on the first Process
+// declaration and bounds the process id. The table is fixed-size, so this never
+// grows or copies it; concurrent first declarations each build a fresh zero table
+// and CAS-publish, the losers discarding theirs (no copy → no race). Called by
+// testing/simulation.Process before the process body runs. Reached via //go:linkname.
+//
+//go:linkname dstProcAllocEnsure
+func dstProcAllocEnsure(procid uint32) {
+	if procid == 0 {
+		return
+	}
+	if procid >= dstMaxSimProcs {
+		var buf [20]byte
+		panic("testing/simulation: too many distinct processes for per-process allocation accounting (limit " + string(itoa(buf[:], dstMaxSimProcs)) + ")")
+	}
+	if dstProcAlloc.Load() == nil {
+		// First Process of the run allocates the table once. This is a normal
+		// in-bubble allocation (it flows through the mallocgc hook and is attributed
+		// to the declaring goroutine's process, usually the root), deterministic
+		// because the first Process is at a seed-deterministic point. Concurrent
+		// first declarations each build a fresh zero table; the CAS losers discard
+		// theirs — no copy, so no race with the hot path.
+		dstProcAlloc.CompareAndSwap(nil, new(dstProcAllocTable))
+	}
+}
+
+// dstProcAllocAdd attributes nbytes to process procid's counter (no-op for proc 0 or
+// before the table exists). Called from the mallocgc hook under the simulation-bubble
+// gate. nosplit: it runs on the allocation path; the procid < dstMaxSimProcs guard
+// lets the compiler elide the array bounds check (no panicIndex on the nosplit path).
+// The over-bound case cannot occur with a live table — dstProcAllocEnsure is the
+// single choke point every Process passes and it panics on an over-bound id, so the
+// guard here exists only to license bounds-check elision, not as a second check.
+//
+//go:nosplit
+func dstProcAllocAdd(procid uint32, nbytes int64) {
+	if procid == 0 || procid >= dstMaxSimProcs {
+		return
+	}
+	if t := dstProcAlloc.Load(); t != nil {
+		t.ctr[procid].Add(nbytes)
+	}
+}
+
+// dstProcAllocBytes returns the bytes process procid has allocated this run (0 if
+// none recorded). Read by tests and the OOM fault. Reached via //go:linkname.
+//
+//go:linkname dstProcAllocBytes
+func dstProcAllocBytes(procid uint32) int64 {
+	if procid == 0 || procid >= dstMaxSimProcs {
+		return 0
+	}
+	if t := dstProcAlloc.Load(); t != nil {
+		return t.ctr[procid].Load()
+	}
+	return 0
 }
 
 // The accessors below are read by os.Getpid/Getppid/Getuid/.../os.Hostname and

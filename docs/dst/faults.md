@@ -139,9 +139,15 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   new pid — no stable-pid), cwd; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
   (per-process possible later, non-foreclosing). Host 0 / unconfigured uses the run defaults
   (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is unchanged.
-- **Memory accounting.** Per-process **allocation accounting** extends the existing per-object hook
-  (`malloc.go:1225`, where `cur` is already in hand) to also attribute `elemsize` to `cur.dstProc` —
-  deterministic, `-race`-invariant, ~free. This is *allocation flow*, **not** true RSS/live-set: faithful
+- **Memory accounting** — **landed**. Per-process **allocation accounting** extends the existing
+  per-object hook (`malloc.go`, inside the simulation-bubble gate where `cur` and `elemsize` are already in
+  hand) to also attribute `elemsize` to `cur.dstProc` — deterministic, `-race`-invariant, ~free. The
+  counters live in a **fixed-size** per-run vector keyed by process id (`dstProcAlloc`), allocated once on
+  the first `Process` declaration and never grown — a stable backing array, so the hot path is a single
+  atomic add with no table copy to race (a grow-on-demand table would race the copy against concurrent
+  declarations); read via `dstProcAllocBytes` (the L3 OOM fault's metric). A run is bounded to
+  `dstMaxSimProcs` distinct processes (it panics past that, never silently drops accounting). This is
+  *allocation flow*, **not** true RSS/live-set: faithful
   per-process residency would need per-object/per-span process attribution + a mark-time sum and would
   have to resolve the shared-package-globals ambiguity (one Go program has one set of globals) —
   deliberately **not** built. The counter drives the **OOM fault** (fault section); the metric source is a
@@ -193,6 +199,15 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   (`dstSimEnvSet` / `dstActive`) and return only synthetic values; `TestDSTIdentitySound`
   (`testing/simulation`, for hostname/NumCPU/pid) and `TestDSTNetInterfaces` (`net`, the synthetic
   `lo`+`eth0` set replacing the real NICs).
+- **DST-MEMALLOC-DET (entailed: determinism + attribution).** A process's accumulated allocation bytes is
+  a deterministic function of the seed, and each heap allocation accrues to the *allocating* goroutine's
+  process (`cur.dstProc`, inherited by its subtree); distinct processes have independent counters.
+  *violation:* an allocation attributed to the wrong process (or the root), or a count that varies
+  run-to-run from a load-dependent source, so the OOM fault that thresholds the counter fires
+  nondeterministically or on the wrong process. *Enforced:* `elemsize` (size-class size, `-race`-invariant)
+  summed per-object at the one mallocgc hook under the bubble gate, counters keyed by `g.dstProc`;
+  `TestDSTMem{PerProcessAccounting,ChildAttributed,Determinism,Independent}` (`testing/simulation`),
+  mutation-tested.
 
 (The fault-feature invariants are in the next section.)
 

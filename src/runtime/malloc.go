@@ -1228,6 +1228,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// otherwise move the cycle boundary and make NumGC and which cycle
 			// discovers a finalizer depend on unrelated process activity.
 			dstHeapAlloc.Add(int64(elemsize))
+			// Also attribute this object to the allocating goroutine's process
+			// (per-process allocation accounting, the OOM-fault metric; see
+			// dstProcAllocAdd). Same gate, same elemsize — deterministic allocation
+			// flow per process. No-op for the un-budgeted root (dstProc 0).
+			dstProcAllocAdd(cur.dstProc, int64(elemsize))
 		}
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)

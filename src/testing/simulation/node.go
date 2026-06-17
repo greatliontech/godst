@@ -43,6 +43,12 @@ func dstAllocPid() int32
 //go:linkname dstSetProcessPid runtime.dstSetProcessPid
 func dstSetProcessPid(pid int32) (old int32)
 
+//go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
+func dstProcAllocEnsure(procid uint32)
+
+//go:linkname dstProcAllocBytes runtime.dstProcAllocBytes
+func dstProcAllocBytes(procid uint32) int64
+
 // HostConfig configures a host declared with Host. It is the declarative place to
 // set a host's simulated properties; today it carries the host's clock, hostname,
 // and NumCPU, and grows as later layers add more per-host identity (e.g. IP). The
@@ -203,6 +209,7 @@ func Process(name string, f func()) {
 		dstSetHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
 	}
 	pid := internProc(name)
+	dstProcAllocEnsure(pid) // per-process allocation counter exists before the body allocates
 	oldH, oldP := dstSetNode(host, pid)
 	oldPid := dstSetProcessPid(dstAllocPid())
 	defer func() {
