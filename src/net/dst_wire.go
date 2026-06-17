@@ -15,13 +15,14 @@ import (
 )
 
 // A dstWire is the delay-bearing transport under a simulated cross-host
-// connection. It replaces net.Pipe (the synchronous, zero-delay transport used for
-// same-host connections) when a cross-host connection has a non-zero base latency,
-// jitter, OR bandwidth limit: a segment is transmitted (bandwidth, store-and-
-// forward), then propagates (latency + jitter), becoming readable in order on the
-// deterministic fake clock. It is the seam every network-delivery fault hooks
-// (jitter draws the per-segment delay; throttle paces it by bytes; partition will
-// blackhole it) — base latency, jitter, and throttle are its delivery policies.
+// connection. It backs EVERY cross-host connection (same-host stays on the
+// synchronous, zero-delay net.Pipe): a segment is transmitted (bandwidth, store-
+// and-forward), then propagates (latency + jitter), becoming readable in order on
+// the deterministic fake clock. It is the seam every network-delivery fault hooks —
+// jitter draws the per-segment delay, throttle paces it by bytes, partition
+// blackholes its reads while writes keep buffering. With no fault configured the
+// delay is zero, so it is a buffered-but-instant link (the faithful TCP send-buffer
+// shape, and what partition's buffer-and-recover needs).
 //
 // Two properties make it sound and replay-exact:
 //
@@ -40,10 +41,10 @@ import (
 //
 // Unlike net.Pipe, a write is buffered (it returns immediately, modeling a TCP
 // send buffer the propagation delay drains) rather than rendezvousing with the
-// reader; that is exactly the decoupling latency requires. Same-host connections
-// keep net.Pipe's synchronous behavior (none of latency/jitter/bandwidth ever
-// builds a dstWire for them), so the N=1 collapse and every run that sets none are
-// byte-identical.
+// reader; that is exactly the decoupling latency and buffer-and-recover require.
+// Same-host connections keep net.Pipe's synchronous behavior (a dstWire is built
+// only for cross-host conns), so the N=1 collapse — which has no cross-host conns —
+// is byte-identical.
 
 //go:linkname dstClockOffsetNow runtime.dstClockOffsetNow
 func dstClockOffsetNow() int64
@@ -184,10 +185,11 @@ func (s *dstStream) pop(b []byte) (n int, eof bool, wait time.Duration) {
 // deadline), so the dstConn wrapper maps it to production error identity
 // unchanged.
 type dstWireEnd struct {
-	out, in      *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
-	latencyNs    int64
-	jitterNs     int64 // per-segment delivery jitter is drawn from [0,jitterNs)
-	bandwidthBps int64 // link transmit rate in bytes/sec; 0 = unlimited
+	out, in             *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
+	latencyNs           int64
+	jitterNs            int64  // per-segment delivery jitter is drawn from [0,jitterNs)
+	bandwidthBps        int64  // link transmit rate in bytes/sec; 0 = unlimited
+	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
 
 	once       sync.Once
 	localDone  chan struct{}
@@ -197,16 +199,20 @@ type dstWireEnd struct {
 	wrDead pipeDeadline
 }
 
-func dstWirePair(latencyNs, jitterNs, bandwidthBps int64) (Conn, Conn) {
+// dstWirePair builds the two ends of a cross-host connection between dialerHost
+// (the a/dialer end) and listenHost (the b/server end).
+func dstWirePair(latencyNs, jitterNs, bandwidthBps int64, dialerHost, listenHost uint32) (Conn, Conn) {
 	ab, ba := newDstStream(), newDstStream()
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	a := &dstWireEnd{
 		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
+		localHost: dialerHost, peerHost: listenHost,
 		localDone: doneA, remoteDone: doneB,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
 		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
+		localHost: listenHost, peerHost: dialerHost,
 		localDone: doneB, remoteDone: doneA,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
@@ -231,6 +237,21 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		case isClosedChan(e.rdDead.wait()):
 			return 0, os.ErrDeadlineExceeded
+		}
+		// Partition blackhole: while the link is cut, deliver nothing — block until
+		// it heals, the read deadline fires, or this end closes. The peer's writes
+		// keep buffering on the wire (push is unaffected) and flush in order once
+		// the reader resumes here, so a healed stream loses no bytes and never
+		// reorders (the sound buffer-and-recover model). Fetch the wake channel
+		// before the check so a heal racing the check still wakes us.
+		wake := dstPartWakeCh()
+		if dstPartitioned(e.localHost, e.peerHost) {
+			select {
+			case <-wake:
+			case <-e.localDone:
+			case <-e.rdDead.wait():
+			}
+			continue
 		}
 		n, eof, wait := e.in.pop(b)
 		if n > 0 {

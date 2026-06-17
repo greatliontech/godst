@@ -305,7 +305,9 @@ API compiles to per-host-pair / per-process fault records over the full mesh —
 
 Attribution is what makes targeting sound and leak-free: a conn records both endpoints' host+process, a
 file its host, a goroutine its host+process — so a host-pair partition touches exactly that pair's
-cross-host conns, and a process crash exactly that process's resources (DST-FAULT-VICTIM).
+cross-host conns, and a process crash exactly that process's resources (DST-FAULT-VICTIM). The host-pair
+targeting (`Partition`/`Heal`/`Isolate`/`HealHost`) is **landed** as the imperative network-partition API;
+the per-process/zone forms and the `Link`/`Crash`/`OOM`/… sugar extend it as the later axes land.
 
 ### The fault model: policies at existing seams
 
@@ -375,7 +377,15 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   outcomes and a SUT tests against each, so the choice is the SUT's, not hardcoded. *On an established conn:* bytes across the partition are blackholed —
   reads block durably on the fake clock, writes fill a send buffer that never drains — until the
   partition **heals** (in-order delivery resumes; TCP buffers and recovers) or a deadline/`Close` errors
-  the conn. DoF: a transient partition. **"Drop" lives here**, at flow granularity — a partition window
+  the conn. DoF: a transient partition. **Landed** (blackhole mode) via the imperative targeting API
+  `simulation.Partition(a,b)` / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)` (the mechanism; the declarative
+  `Options.Faults` + per-fault mode is L4). It drives a per-run host-pair/isolated-host table in net
+  (`net/dst_partition.go`) — keyed by the conn's host attribution (`dstConn.localHost`/`remoteHost`), so a
+  cut touches exactly the targeted pair's cross-host conns (DST-FAULT-VICTIM). Cross-host conns are
+  **always wire-backed** (the buffered transport — itself the faithful TCP send-buffer shape), so writes
+  during a cut queue and **flush in order on heal with no loss** (DST-NET-FIFO + the sound buffer-and-
+  recover model). The connect **refuse** mode (`ECONNREFUSED`) is deferred (`docs/issues/`); blackhole is
+  the harder, realistic case. **"Drop" lives here**, at flow granularity — a partition window
   drops everything between A↔B; there is *no* single-byte drop on a live stream (TCP forbids it — that is
   the UDP follow-on).
 - **Connection reset** — inject `ECONNRESET` on a targeted conn, or a process's / a host-pair's conns, reusing
@@ -515,14 +525,15 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Enforced (jitter + throttle classes landed; each further fault class as it lands):* per-fault structural
-  argument + a regression test per fault class that the faulted execution is one the real stack can
-  produce. Jitter is a real link degree of freedom (variable latency) that only *delays* — bounded to
-  [0, max), never dropping or reordering a live stream (delivery is head-of-line, in order, DST-NET-FIFO):
-  `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link bandwidth, modeled per-flow as
-  an independent B-capacity link (a real dedicated link, so ⊆ real), delivering no faster than B
-  (DST-NET-THROTTLE): `TestDSTNetThrottleRate` (`net`), mutation-tested. (A partition will likewise only
-  ever yield refuse/blackhole/heal, never a missing byte on a healed stream.)
+  *Enforced (jitter + throttle + partition classes landed; each further fault class as it lands):*
+  per-fault structural argument + a regression test per fault class that the faulted execution is one the
+  real stack can produce. Jitter is a real link degree of freedom (variable latency) that only *delays* —
+  bounded to [0, max), never dropping or reordering a live stream (delivery is head-of-line, in order,
+  DST-NET-FIFO): `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link bandwidth,
+  modeled per-flow as an independent B-capacity link (a real dedicated link, so ⊆ real), delivering no
+  faster than B (DST-NET-THROTTLE): `TestDSTNetThrottleRate`. Partition only ever blackholes then heals —
+  reads block while cut, buffered writes flush in order on heal, never a missing or reordered byte on a
+  healed stream: `TestDSTNetPartitionRecover` (`net`), mutation-tested.
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -537,9 +548,12 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a
   non-victim. *violation:* a `Partition(h1,h2)` resets a conn between h1 and h3 because attribution
   confused ownership → a failure on h3 the real partition never caused, while the partition itself is
-  correct. *Encoding when built:* `dstHost`/`dstProc` on `g` inherited at `newproc1`; a conn records both
-  endpoints' host+process; a file records its host; a test that a fault on one victim leaves all
-  non-victims' resources untouched. *Lands: network axis (conn attribution), then per later axis.*
+  correct. *Enforced (network axis landed; per later axis as it lands):* `dstHost`/`dstProc` on `g`
+  inherited at `newproc1`; a cross-host conn records its host pair (`dstConn.localHost`/`remoteHost`, the
+  always-wire end's `localHost`/`peerHost`), which keys the partition table; `TestDSTNetPartitionVictim`
+  (`net`) asserts `Partition(A,B)` cuts the A-B conn while an A-C conn is untouched, mutation-tested (a
+  check that blocks all pairs once any partition exists fails it). Per-process conn attribution and a
+  file's host extend it as the reset and disk faults land.
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or

@@ -926,6 +926,33 @@ func dstSetNetCrossHostBandwidth(bytesPerSec int64) { dstNetCrossHostBandwidth =
 //go:linkname dstNetCrossHostBandwidthBps
 func dstNetCrossHostBandwidthBps() int64 { return dstNetCrossHostBandwidth }
 
+// dstNetPartitionHook is net's handler for partition targeting (Partition / Heal /
+// Isolate / HealHost), registered by net at init when built with -tags dst. The
+// partition state and its blocked-reader wakeups live in net (next to the conns
+// and with sync/chan available); runtime is only the always-linked rendezvous, so
+// testing/simulation can drive partitioning without a fragile simulation->net
+// linkname (net is not in a simulation binary unless the SUT uses it). The op
+// codes are net's contract (see net/dst_partition.go), mirrored by the caller in
+// testing/simulation; b is ignored for the host-level ops. A nil hook (net not
+// linked) makes the call a no-op — a partition with no network to cut.
+var dstNetPartitionHook func(op, a, b uint32)
+
+// dstSetNetPartitionHook registers net's partition handler. Reached via
+// //go:linkname from net's init.
+//
+//go:linkname dstSetNetPartitionHook
+func dstSetNetPartitionHook(fn func(op, a, b uint32)) { dstNetPartitionHook = fn }
+
+// dstNetPartitionOp invokes net's partition handler (no-op if net is not linked).
+// Reached via //go:linkname from testing/simulation's targeting API.
+//
+//go:linkname dstNetPartitionOp
+func dstNetPartitionOp(op, a, b uint32) {
+	if dstNetPartitionHook != nil {
+		dstNetPartitionHook(op, a, b)
+	}
+}
+
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //

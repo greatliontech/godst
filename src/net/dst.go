@@ -792,6 +792,24 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	}
 
 	dialerHost, _ := dstNetCurrentNode()
+	// Partition (blackhole connect): a Dial across a cut link drops the SYN — it
+	// blocks until the link heals or the context/deadline expires. The target host
+	// is the routable IP's owner; a loopback/own-host target is never partitioned.
+	targetHost := dialerHost
+	if h, ok := dstHostForRoutableIP(ip); ok {
+		targetHost = h
+	}
+	for {
+		wake := dstPartWakeCh()
+		if !dstPartitioned(dialerHost, targetHost) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: mapErr(ctx.Err())}
+		case <-wake:
+		}
+	}
 	scope := dstDialScope(ip, dialerHost)
 	dstNet.mu.Lock()
 	dstNetRoll()
@@ -827,19 +845,16 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		localAddr.Zone = localTCPAddr.Zone
 	}
 
-	// Cross-host connections carry the configured base link latency, jitter, and
-	// bandwidth limit; same-host and loopback (dialer and listener on one host) stay
-	// on the synchronous, zero-delay net.Pipe — byte-identical to the pre-latency
-	// behavior, so the N=1 collapse and any run that sets none are unaffected.
-	latencyNs, jitterNs, bandwidthBps := int64(0), int64(0), int64(0)
-	if l.host != dialerHost {
-		latencyNs = dstNetCrossHostLatencyNs()
-		jitterNs = dstNetCrossHostJitterNs()
-		bandwidthBps = dstNetCrossHostBandwidthBps()
-	}
+	// Cross-host connections are wire-backed (buffered delivery carrying the
+	// configured latency/jitter/bandwidth, and partitionable); same-host and
+	// loopback (dialer and listener on one host) stay on the synchronous net.Pipe —
+	// the N=1 collapse has no cross-host conns, so it is byte-identical. The wire's
+	// buffered write is also the faithful TCP shape (a send buffer the link drains),
+	// and it is required for partition's buffer-and-recover: writes during a cut
+	// queue and flush in order on heal.
 	var p1, p2 Conn
-	if latencyNs > 0 || jitterNs > 0 || bandwidthBps > 0 {
-		p1, p2 = dstWirePair(latencyNs, jitterNs, bandwidthBps)
+	if l.host != dialerHost {
+		p1, p2 = dstWirePair(dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps(), dialerHost, l.host)
 	} else {
 		p1, p2 = Pipe()
 	}
