@@ -34,16 +34,35 @@ func dstSetHostClockOffset(offset int64) (old int64)
 //go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
 func dstHostSeededClockOffset(hostid uint32, bound int64) int64
 
+//go:linkname dstSetHostIdent runtime.dstSetHostIdent
+func dstSetHostIdent(host uint32, hostname string, numcpu int)
+
+//go:linkname dstAllocPid runtime.dstAllocPid
+func dstAllocPid() int32
+
+//go:linkname dstSetProcessPid runtime.dstSetProcessPid
+func dstSetProcessPid(pid int32) (old int32)
+
 // HostConfig configures a host declared with Host. It is the declarative place to
-// set a host's simulated properties; today it carries the host's clock, and grows
-// as later layers add per-host identity (IP, NumCPU, hostname). The zero HostConfig
-// is the unconfigured host — its clock in sync with the universe base clock — so
+// set a host's simulated properties; today it carries the host's clock, hostname,
+// and NumCPU, and grows as later layers add more per-host identity (e.g. IP). The
+// zero HostConfig is the unconfigured host — clock in sync with the universe base
+// clock, hostname defaulting to the host name, NumCPU to the run default — so
 // Host(name, HostConfig{}, f) is the plain host (the N=1 default, identical to a
 // host that declares nothing).
 type HostConfig struct {
 	// Clock sets the host's wall clock relative to the universe base virtual clock.
 	// The zero value is in sync (no skew). Build one with Skew or BoundedSkew.
 	Clock ClockConfig
+
+	// Hostname is os.Hostname() on this host. Empty means the host's declared name
+	// (Host("node1", ...) reports "node1"), so distinct nodes get distinct hostnames
+	// with no extra config; set it to override.
+	Hostname string
+
+	// NumCPU is runtime.NumCPU() on this host. A value <= 0 means the run default
+	// (Options.NumCPU, default 8). GOMAXPROCS stays 1 for determinism regardless.
+	NumCPU int
 }
 
 // ClockConfig describes a host's wall clock as a function of the universe base
@@ -145,11 +164,18 @@ func internProc(name string) uint32 {
 // goroutines outlive the Host call. Hosts and processes may be declared at any time
 // during a run, including mid-run to model a node joining; re-declaring a host with
 // the same name and a seeded clock (BoundedSkew) yields the same offset, so a
-// restart keeps the host's clock. The zero HostConfig is the plain, in-sync host.
-// Calling Host outside a simulation has no effect beyond running f (the stamped
-// clock offset is read only by time.Now inside an active run).
+// restart keeps the host's clock. The host's hostname (os.Hostname, default the host
+// name) and NumCPU (runtime.NumCPU) come from config and are recorded for the host
+// for the rest of the run. The zero HostConfig is the plain, in-sync host whose
+// os.Hostname is its name. Calling Host outside a simulation has no effect beyond
+// running f (the recorded identity is read only inside an active run).
 func Host(name string, config HostConfig, f func()) {
 	hid := internHost(name)
+	hostname := config.Hostname
+	if hostname == "" {
+		hostname = name
+	}
+	dstSetHostIdent(hid, hostname, config.NumCPU)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
 	oldOff := dstSetHostClockOffset(config.Clock.offsetNanos(hid))
@@ -164,17 +190,24 @@ func Host(name string, config HostConfig, f func()) {
 // isolation. A Process declared inside a Host body runs on that host; a Process
 // outside any Host gets an implicit dedicated host named after the process (the
 // common one-process-per-machine topology, so CrashHost(name) and Crash(name) both
-// address it). Process stamps the running goroutine's process identity (and host,
-// if it allocated an implicit one) for the dynamic extent of f and restores it on
+// address it; its os.Hostname is the process name). Process stamps the running
+// goroutine's process identity (and host, if it allocated an implicit one) and a
+// fresh per-process pid (os.Getpid) for the dynamic extent of f and restores them on
 // return, labeling the whole subtree. A process is restarted by calling Process
-// again with the same name.
+// again with the same name — it keeps the logical name but gets a new pid, as a real
+// restart does.
 func Process(name string, f func()) {
 	host, _ := dstCurrentNode()
 	if host == 0 {
 		host = internHost(name)
+		dstSetHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
 	}
 	pid := internProc(name)
 	oldH, oldP := dstSetNode(host, pid)
-	defer dstSetNode(oldH, oldP)
+	oldPid := dstSetProcessPid(dstAllocPid())
+	defer func() {
+		dstSetProcessPid(oldPid)
+		dstSetNode(oldH, oldP)
+	}()
 	f()
 }

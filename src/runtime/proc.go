@@ -5453,6 +5453,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.dstHost = callergp.dstHost
 		newg.dstProc = callergp.dstProc
 		newg.dstClockOffset = callergp.dstClockOffset
+		newg.dstPid = callergp.dstPid
 		dstClearSchedState(newg)
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
 			// PCT: give the new goroutine a random base priority from the scheduling

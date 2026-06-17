@@ -133,6 +133,7 @@ func dstActivate(seed uint64) {
 	getg().dstHost = 0
 	getg().dstProc = 0
 	getg().dstClockOffset = 0
+	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
 	// Queue process-level finalizers/cleanups before DST is active and detach them
 	// from the queues the bubble drain observes. They are not part of this run's
@@ -475,19 +476,50 @@ func dstPCTAssignPrio(newg *g) {
 // os.Getpid and os.Hostname to deterministic values, closing the determinism
 // hole a SUT that reads pid/hostname (for node IDs, temp names, pid-seeded RNGs)
 // would otherwise have: the real machine's pid/hostname vary per run and per host.
-// Set by dstSetSimEnv *before* dstActivate, so the activation's atomic store
-// publishes them to the bubble's goroutines; read by os.Getpid/os.Hostname etc.
-// and runtime.NumCPU via the linkname'd accessors below. dstSimEnvSet is false on
-// the white-box dstActivate path (no public Run), so the real identity is
-// returned there. Hostname, PID, and NumCPU are configurable (testing/simulation
-// Options); the remaining identity (ppid, uid/gid, the current user) is fixed to
-// the deterministic constants below, which testing/simulation documents.
+//
+// Identity splits by ownership (docs/dst/faults.md "Per-process identity"):
+// hostname and NumCPU are per-HOST, pid is per-PROCESS. These globals hold the
+// run-wide *defaults* — set by dstSetSimEnv *before* dstActivate from
+// testing/simulation Options: dstSimHostname is host 0's hostname, dstSimNumCPU the
+// default NumCPU, dstSimPID the root (host-0/proc-0 driver) pid and the base of the
+// per-process pid counter. Per-host overrides live in dstHostIdent (keyed by
+// g.dstHost); the per-process pid lives on g.dstPid. dstSimEnvSet is false on the
+// white-box dstActivate path (no public Run), so the real identity is returned
+// there. The remaining identity (ppid, uid/gid, the current user) is fixed to the
+// deterministic constants below, which testing/simulation documents.
 var (
 	dstSimPID      int
 	dstSimHostname string
-	dstSimNumCPU   int // simulated runtime.NumCPU(); 0 leaves NumCPU real
+	dstSimNumCPU   int // default simulated runtime.NumCPU(); 0 leaves NumCPU real
 	dstSimEnvSet   bool
 )
+
+// dstHostIdentity is a host's simulated identity: its os.Hostname and
+// runtime.NumCPU (0 = use the run default dstSimNumCPU). Per-host so co-located
+// processes share a hostname/NumCPU while different hosts can differ.
+type dstHostIdentity struct {
+	hostname string
+	numcpu   int32
+	set      bool
+}
+
+// dstHostIdentTable is the per-host identity vector, indexed by host id (slot 0 is
+// unused — host 0 uses the run defaults). It is immutable once published: Host
+// installs a new copy via a CAS on dstHostIdent, so reads (os.Hostname,
+// runtime.NumCPU) are lock-free atomic loads with no per-g string storage and no
+// runtime lock. The string lives in this one process-global table, not on every g.
+type dstHostIdentTable struct {
+	ent []dstHostIdentity
+}
+
+// dstHostIdent publishes the current per-host identity table. nil between runs and
+// until the first Host declares identity. Reset to nil at dstSetSimEnv.
+var dstHostIdent atomic.Pointer[dstHostIdentTable]
+
+// dstSimPidNext is the per-process pid allocator: dstAllocPid bumps it, so each
+// Process invocation (including a restart) gets a fresh, deterministic pid. Reset
+// to the root pid (dstSimPID) at dstSetSimEnv, so the first process is root pid + 1.
+var dstSimPidNext atomic.Int32
 
 // Fixed simulated identity returned during a run for the parts testing/simulation
 // does not make configurable. Deterministic constants so a SUT that derives state
@@ -515,6 +547,11 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	dstSimPID = pid
 	dstSimNumCPU = numcpu
 	dstSimEnvSet = true
+	// Fresh per-host table; pid counter based at the root pid so the first process
+	// gets root pid + 1. Both reset here (start of run) rather than at clear so a
+	// re-run starts clean even if a prior run's defer was skipped.
+	dstHostIdent.Store(nil)
+	dstSimPidNext.Store(int32(pid))
 }
 
 // dstClearSimEnv stops simulating process identity (run end).
@@ -525,18 +562,94 @@ func dstClearSimEnv() {
 	dstSimHostname = ""
 	dstSimPID = 0
 	dstSimNumCPU = 0
+	dstHostIdent.Store(nil)
+	dstSimPidNext.Store(0)
+}
+
+// dstSetHostIdent records host's simulated hostname and NumCPU (numcpu 0 = use the
+// run default), called by testing/simulation.Host. It publishes a new immutable
+// table via a CAS loop, so concurrent Host declarations on different hosts cannot
+// lose an update and readers stay lock-free. Reached via //go:linkname.
+//
+//go:linkname dstSetHostIdent
+func dstSetHostIdent(host uint32, hostname string, numcpu int) {
+	for {
+		old := dstHostIdent.Load()
+		n := int(host) + 1
+		if old != nil && len(old.ent) > n {
+			n = len(old.ent)
+		}
+		ent := make([]dstHostIdentity, n)
+		if old != nil {
+			copy(ent, old.ent)
+		}
+		ent[host] = dstHostIdentity{hostname: hostname, numcpu: int32(numcpu), set: true}
+		if dstHostIdent.CompareAndSwap(old, &dstHostIdentTable{ent: ent}) {
+			return
+		}
+	}
+}
+
+// dstHostIdentFor returns host's recorded identity (host 0 and any host that never
+// declared identity report not-found, so callers fall back to the run defaults). A
+// lock-free atomic load of the immutable published table.
+func dstHostIdentFor(host uint32) (dstHostIdentity, bool) {
+	if host == 0 {
+		return dstHostIdentity{}, false
+	}
+	t := dstHostIdent.Load()
+	if t != nil && int(host) < len(t.ent) && t.ent[host].set {
+		return t.ent[host], true
+	}
+	return dstHostIdentity{}, false
+}
+
+// dstAllocPid returns the next per-process pid (deterministic: the Process call
+// order is a function of the seed). Reached via //go:linkname.
+//
+//go:linkname dstAllocPid
+func dstAllocPid() int32 {
+	return dstSimPidNext.Add(1)
+}
+
+// dstSetProcessPid stamps the calling goroutine's pid and returns the previous
+// value, so testing/simulation.Process can restore it when its body returns. The
+// pid inherits to child goroutines at newproc1 (the labeled subtree), so the whole
+// process subtree reports one pid. Reached via //go:linkname.
+//
+//go:linkname dstSetProcessPid
+func dstSetProcessPid(pid int32) (old int32) {
+	gp := getg()
+	old = gp.dstPid
+	gp.dstPid = pid
+	return
 }
 
 // The accessors below are read by os.Getpid/Getppid/Getuid/.../os.Hostname and
 // os/user.Current (via linkname) to return the simulated identity during a run;
 // the bool reports whether process identity is being simulated. runtime.NumCPU
-// reads dstSimNumCPU/dstSimEnvSet directly (same package).
+// reads the per-host identity directly (same package).
+//
+// dstSimGetpid returns the calling goroutine's per-process pid (g.dstPid, stamped
+// by Process and inherited by its subtree; the root pid for proc 0).
 //
 //go:linkname dstSimGetpid
-func dstSimGetpid() (int, bool) { return dstSimPID, dstSimEnvSet }
+func dstSimGetpid() (int, bool) { return int(getg().dstPid), dstSimEnvSet }
 
+// dstSimGethostname returns the calling goroutine's host hostname: its per-host
+// override if the host declared one, else the run default (host 0 / unconfigured).
+//
 //go:linkname dstSimGethostname
-func dstSimGethostname() (string, bool) { return dstSimHostname, dstSimEnvSet }
+func dstSimGethostname() (string, bool) {
+	// A declared host (set) reports its recorded hostname; only host 0 / an
+	// undeclared host (dstHostIdentFor returns false) falls back to the run default.
+	// "declared" is the single source of truth (id.set), so an explicitly-empty
+	// hostname is not silently re-routed to the default.
+	if id, ok := dstHostIdentFor(getg().dstHost); ok {
+		return id.hostname, dstSimEnvSet
+	}
+	return dstSimHostname, dstSimEnvSet
+}
 
 //go:linkname dstSimGetppid
 func dstSimGetppid() (int, bool) { return dstSimPPID, dstSimEnvSet }

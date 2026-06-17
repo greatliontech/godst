@@ -221,12 +221,18 @@ type Options struct {
 	// int32 strategy field.
 	Steps int
 
-	// Hostname and PID are the simulated process identity: within a simulation,
-	// os.Hostname and os.Getpid return these instead of the real machine's values
-	// (which vary per run and per host, and would leak nondeterminism into any
-	// program under test that reads them). Run, RunWith, Test, and TestWith fix
-	// them — to "sim" and 1 by default — so even plain Run or Test is reproducible
-	// for a SUT that reads pid/hostname.
+	// Hostname and PID are the simulated process identity defaults: within a
+	// simulation, os.Hostname and os.Getpid return deterministic values instead of
+	// the real machine's (which vary per run and per host, and would leak
+	// nondeterminism into any program under test that reads them). Run, RunWith,
+	// Test, and TestWith fix them — to "sim" and 1 by default — so even plain Run or
+	// Test is reproducible for a SUT that reads pid/hostname.
+	//
+	// These are the host-0 / driver defaults; the distributed model refines them.
+	// Hostname is os.Hostname() for the root (no Host declared); a Host reports its
+	// declared name by default, or HostConfig.Hostname. PID is the root pid; each
+	// Process gets a fresh, deterministic pid (a restart gets a new one), so distinct
+	// processes have distinct pids.
 	//
 	// The rest of the process-identity surface is fixed to deterministic
 	// constants during a simulation (not configurable): os.Getppid is 1;
@@ -244,13 +250,13 @@ type Options struct {
 	Hostname string
 	PID      int
 
-	// NumCPU is the simulated runtime.NumCPU() within a simulation (default 8; any value
-	// <= 0 selects the default). GOMAXPROCS is independently forced to 1 for
-	// determinism, but NumCPU is reported separately, so a SUT that sizes worker
-	// pools or shards by NumCPU still creates real concurrency for the simulation
-	// to explore — fixed here so it is reproducible across hosts rather than the
-	// real machine's core count. A value of 1 makes the simulated machine
-	// single-CPU.
+	// NumCPU is the default simulated runtime.NumCPU() within a simulation (default
+	// 8; any value <= 0 selects the default), used by every host that does not set
+	// HostConfig.NumCPU. GOMAXPROCS is independently forced to 1 for determinism, but
+	// NumCPU is reported separately, so a SUT that sizes worker pools or shards by
+	// NumCPU still creates real concurrency for the simulation to explore — fixed
+	// here so it is reproducible across hosts rather than the real machine's core
+	// count. A value of 1 makes the simulated machine single-CPU.
 	NumCPU int
 
 	// MemoryLimit, if > 0, is a deterministic bubble-local memory budget in bytes:
