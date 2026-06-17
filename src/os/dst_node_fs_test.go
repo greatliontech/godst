@@ -7,7 +7,9 @@
 package os_test
 
 import (
+	"io/fs"
 	"os"
+	"strings"
 	"testing"
 	"testing/simulation"
 )
@@ -123,5 +125,48 @@ func TestDSTNodeCwdIsolation(t *testing.T) {
 	}
 	if srvCwd != "/" {
 		t.Errorf(`process "srv" on host h3 cwd = %q, want / (shared proc-id cwd leak from h2)`, srvCwd)
+	}
+}
+
+// TestDSTNodeHostFS exercises the read-only HostFS inspector (idiom 2): the harness
+// reads a host's disk from outside that host. It also confirms the view is the
+// owning host's tree (not the caller's) and that an untouched host reports its
+// baseline (/tmp only).
+func TestDSTNodeHostFS(t *testing.T) {
+	var (
+		data    []byte
+		readErr error
+		listing string
+		bList   []string
+	)
+	simulation.Run(1, func() {
+		simulation.Host("hA", func() {
+			os.WriteFile("/data", []byte("payload"), 0o644)
+			os.Mkdir("/sub", 0o755)
+		})
+		// Driver (host 0) inspects hA's disk without being hA.
+		fsA := simulation.HostFS("hA")
+		data, readErr = fs.ReadFile(fsA, "data")
+		ents, _ := fs.ReadDir(fsA, ".")
+		var ns []string
+		for _, e := range ents {
+			ns = append(ns, e.Name())
+		}
+		listing = strings.Join(ns, ",")
+		// Host hB never touched its filesystem: baseline is /tmp only.
+		bents, _ := fs.ReadDir(simulation.HostFS("hB"), ".")
+		for _, e := range bents {
+			bList = append(bList, e.Name())
+		}
+	})
+
+	if readErr != nil || string(data) != "payload" {
+		t.Errorf("HostFS read /data = %q, err=%v; want %q", data, readErr, "payload")
+	}
+	if listing != "data,sub,tmp" {
+		t.Errorf("HostFS ReadDir(.) of hA = %q, want %q", listing, "data,sub,tmp")
+	}
+	if len(bList) != 1 || bList[0] != "tmp" {
+		t.Errorf("untouched host hB listing = %v, want [tmp]", bList)
 	}
 }
