@@ -8,7 +8,7 @@
 // bubble-goroutine choices at the dstSchedSelect seam and records, per decision,
 // the enabled bubble-goroutine set and the chosen one. The exploration brain
 // (offline, between Runs: exhaustive enumeration, then DPOR) consumes the trace
-// and emits the next prefix. See docs/dst/design.md "Level 2 — access-granularity
+// and emits the next prefix. See docs/dst/exploration.md "Level 2 — access-granularity
 // interleaving + DPOR", increments 2–4 (build order (b): the brain is proven on
 // the manual access-yield hook before auto-instrumentation).
 //
@@ -156,7 +156,7 @@ const dstSyncAtomicAux = ^uintptr(1)
 // next, in the NOSPLIT assembly, with no further yield — the op's
 // happens-before contribution is recorded for the offline DPOR relation and
 // the live filter clocks. The effective release semantics are cumulative
-// (release clocks MERGE on the object — see the design.md effective-semantics
+// (release clocks MERGE on the object — see the exploration.md effective-semantics
 // paragraph; where the merge claims an edge the literal observed-by reading
 // would not, the announce-reorderability masking below applies and the
 // sweep's DPOR==Exhaustive equivalence is the enforced contract). On top of
@@ -331,7 +331,7 @@ var (
 // (accessing goroutine dstSeq, addr, size, hook PC key, hook ordinal, isWrite, the
 // dstScheduleStep it occurred under) — decoupled from whether the access yielded.
 // This decoupling is what lets the runtime FILTER: a single-owner access can "record
-// but not yield" (design.md D1) while the brain still sees it for the dependency
+// but not yield" (exploration.md D1) while the brain still sees it for the dependency
 // relation. The PC+ordinal let the brain promote a filtered access to a forced replay
 // yield if a later conflict proves the inline interval needed a split. Pre-sized
 // (never grown under the lock); over-budget sets dstAccLogOverflow (reported, never a

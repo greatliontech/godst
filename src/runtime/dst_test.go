@@ -939,7 +939,7 @@ func TestDSTCleanupPriorGoroutineNotWoken(t *testing.T) {
 // of the same seed. The testprog drops half of 256 weakly-referenced objects and,
 // after a quiescence, reads how many weak refs cleared (in-bubble). Prints
 // "cleared alive"; identical across runs, normal and -race (set-level). Weak
-// clearing happens during the STW sweep (design.md D4 dimension 7), so the cleared
+// clearing happens during the STW sweep (gc.md D4 dimension 7), so the cleared
 // set is the quiescent dead set, deterministic.
 func TestDSTWeakClearingDeterministic(t *testing.T) {
 	env := []string{"DSTSEED=12345", "GOGC=100"}
@@ -1335,7 +1335,7 @@ func TestDSTSchedSystemIsolation(t *testing.T) {
 
 // TestDSTFinalizerChainNoLeak verifies the Run-end fixpoint drain resolves a
 // finalizer chain whose tail touches a bubble channel fully in-bubble, so it does
-// not leak to post-teardown async processing and fatal (design.md D4: Run-end fixpoint).
+// not leak to post-teardown async processing and fatal (gc.md D4: Run-end fixpoint).
 // Mutation check: reverting the dstStopGCDrain fixpoint to a single drain makes
 // the testprog fatal instead of printing "ok".
 func TestDSTFinalizerChainNoLeak(t *testing.T) {
@@ -1347,7 +1347,7 @@ func TestDSTFinalizerChainNoLeak(t *testing.T) {
 }
 
 // TestDSTMemoryLimit verifies Options.MemoryLimit deterministically bounds the
-// bubble's heap growth (design.md D6: Options.MemoryLimit): a tighter limit forces
+// bubble's heap growth (gc.md D6: Options.MemoryLimit): a tighter limit forces
 // more GCs, and the GC count is reproducible. It also guards the per-bubble
 // relative trigger's dstHeapBase baseline (the mechanism that makes GC
 // deterministic across processes by excluding the run-to-run-varying pre-bubble
@@ -1397,7 +1397,7 @@ func TestDSTMemoryLimit(t *testing.T) {
 // schedules>1 confirms the yield drove interleavings (not a vacuous pass). Built
 // NON-race (access-granularity yielding is a scheduled-strategy mechanism; the dst-race
 // compiler auto-instrumentation, active only under -race, would add unrelated yields).
-// Deterministic across same-seed runs (DST-L2-2). See docs/dst/design.md "Level 2".
+// Deterministic across same-seed runs (DST-L2-2). See docs/dst/exploration.md "Level 2".
 func TestDSTAccessYieldSound(t *testing.T) {
 	out1 := runTestProgDSTNoRace(t, "DSTYieldSound", "DSTSEED=1")
 	if exploreFailures(t, out1) != 0 {
@@ -1420,7 +1420,7 @@ func TestDSTAccessYieldSound(t *testing.T) {
 // a single Explore call, the atomicity violation that the coarse random/PCT
 // strategies miss for every seed (0/200). It also confirms the explorer is sound
 // (the mutex-protected counter SUT yields no failing interleaving) and
-// deterministic. See docs/dst/design.md (Level 2, DST-L2-1/2).
+// deterministic. See docs/dst/exploration.md (Level 2, DST-L2-1/2).
 func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
 	out := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=atomicity", "DSTMODE=dpor")
 	if exploreFailures(t, out) == 0 {
@@ -1447,7 +1447,7 @@ func TestDSTExploreFindsAtomicityViolation(t *testing.T) {
 // TestDSTExploreComplete verifies DPOR is COMPLETE — it reaches the identical set
 // of reachable outcomes as exhaustive enumeration, while exploring no more
 // interleavings. If DPOR's outcome set were a subset, it would be silently missing
-// reachable states (bugs). See docs/dst/design.md (Level 2, DST-L2-3). The larger
+// reachable states (bugs). See docs/dst/exploration.md (Level 2, DST-L2-3). The larger
 // generated sweep below carries the strict reduction/optimality guard; this tiny SUT's
 // exhaustive tree becomes minimal once shared-address filtering removes private steps.
 func TestDSTExploreComplete(t *testing.T) {
@@ -1514,7 +1514,7 @@ func exploreOutcomes(t *testing.T, out string) string {
 // happens-before order prunes the futile reorderings of those ordered accesses and
 // explores 4 schedules with no failures; the address-only relation (no HB)
 // over-explores them (21). The <=10 bound passes with HB pruning (4) and fails
-// without it (21), so it has teeth. See docs/dst/design.md (Level 2, increment 2).
+// without it (21), so it has teeth. See docs/dst/exploration.md (Level 2, increment 2).
 func TestDSTExploreHBPrunes(t *testing.T) {
 	out := runTestProgDSTNoRace(t, "DSTExplore", "DSTSEED=1", "DSTEXPLORE=twopair", "DSTMODE=dpor")
 	if exploreFailures(t, out) != 0 {
@@ -1563,7 +1563,7 @@ func TestDSTExploreTimerHB(t *testing.T) {
 // choice that changes the outcome, but it occurs at a transition recording no
 // memory access, so DPOR drops one order unless each acquisition is recorded as a
 // conflicting transition (runtime.dstSyncAcquire). With that hook neutered the
-// sweep fails 23/290; with it, 0 — so it has teeth. See docs/dst/design.md
+// sweep fails 23/290; with it, 0 — so it has teeth. See docs/dst/exploration.md
 // (Level 2, DST-L2-3 + "Completeness boundary").
 //
 // It ALSO guards source-DPOR OPTIMALITY: the sweep reports maxDpor, the largest
@@ -1612,7 +1612,7 @@ func TestDSTExploreSweep(t *testing.T) {
 // otherwise). Skipped where the race detector is unavailable. The testprog exits
 // nonzero (race detector exit) and prints a DATA RACE report to stderr; runBuiltTestProg
 // ignores the exit code, and the assertions parse only the deterministic "raceoracle"
-// summary fields (not the address-bearing report). See docs/dst/design.md (Level 2, D5).
+// summary fields (not the address-bearing report). See docs/dst/exploration.md (Level 2, D5).
 func TestDSTExploreRaceOracle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips the -race oracle build")

@@ -1347,7 +1347,7 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// required: what DST guarantees is OBSERVABLE program determinism (allocation
 	// results, scheduling, and — via STW eliminating concurrent floating garbage —
 	// the GC count), which holds with or without a runway override. So we leave the
-	// production runway formula untouched. See docs/dst/design.md (Tier 2, D1).
+	// production runway formula untouched. See docs/dst/gc.md (Tier 2, D1).
 	c.runway.Store(uint64((c.consMark * (1 - gcGoalUtilization) / (gcGoalUtilization)) * float64(c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load())))
 }
 

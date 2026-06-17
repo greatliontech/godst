@@ -716,7 +716,7 @@ func (t gcTrigger) test() bool {
 			// process baseline. This makes the GC *set level* — numGC and the total
 			// finalizer/weak set discovered — a deterministic function of the bubble's
 			// allocation (the contract, DST-GC-1). The heapMinimum floor is as
-			// production. See docs/dst/design.md.
+			// production. See docs/dst/gc.md.
 			//
 			// It fires on dstHeapAlloc — bytes summed per-object at allocation
 			// (mallocgc) — NOT physical heapLive. heapLive advances span-granularly
@@ -865,7 +865,7 @@ func gcStart(trigger gcTrigger) {
 		// and lazy/proportional sweep would float finalizer/weak-handle discovery
 		// order; gcForceBlockMode does mark and sweep with the world stopped, so
 		// the whole cycle is a deterministic function of the (deterministic) heap.
-		// See docs/dst/design.md (Tier 2, D2/D3).
+		// See docs/dst/gc.md (Tier 2, D2/D3).
 		mode = gcForceBlockMode
 	}
 

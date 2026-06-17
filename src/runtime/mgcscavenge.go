@@ -440,7 +440,7 @@ func (s *scavengerState) wake() {
 		// RSS, not program semantics), so leave it parked for the duration of a
 		// run. The one observable consequence is that MemStats.HeapReleased is a
 		// DST artifact — documented alongside the no-real-I/O caveats. See
-		// docs/dst/design.md (Tier 2, D5).
+		// docs/dst/gc.md (Tier 2, D5).
 		return
 	}
 	lock(&s.lock)

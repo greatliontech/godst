@@ -179,7 +179,7 @@ func dstMakeFinStoreChainLen(n int, done, active *atomic.Bool) {
 
 // DSTFinChain drops a finalizer chain whose tail touches a bubble channel and
 // then returns immediately (no in-run quiescence to resolve it), exercising the
-// Run-end fixpoint drain (design.md D4: Run-end fixpoint). Without the
+// Run-end fixpoint drain (gc.md D4: Run-end fixpoint). Without the
 // fixpoint, the tail's finalizer runs on post-teardown async fing
 // (g.bubble == nil) and its send fatals "send on synctest channel from outside
 // bubble"; with it, the whole chain runs in-bubble. Prints "ok" iff the run
@@ -268,7 +268,7 @@ type dstFinObj struct{ b [256]byte }
 // the DST contract (DST-GC-1): deterministic in normal AND -race builds (the
 // trigger fires the right number of times with the right total). Which GC *cycle*
 // discovers a given object is ALSO contractual since the per-object trigger
-// landed (per-cycle discovery determinism, design.md D1); that finer observable
+// landed (per-cycle discovery determinism, gc.md D1); that finer observable
 // is exercised by DSTGCPerCycle / TestDSTGCPerCycleDiscoveryDeterministic.
 func DSTGCFinDiscovery() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)

@@ -6,7 +6,7 @@
 // systematic interleaving explorer (simulation.Explore, Exhaustive + DPOR). These
 // are driven by dst_test.go's harness (which shells out to a -tags=dst build), so
 // they must run under the testing/simulation API rather than calling the runtime
-// white-box. See docs/dst/design.md "Level 2 — access-granularity interleaving +
+// white-box. See docs/dst/exploration.md "Level 2 — access-granularity interleaving +
 // DPOR".
 
 package main
@@ -1367,7 +1367,7 @@ func DSTExploreSyncAuto() {
 // member, asserts that DPOR reaches the IDENTICAL set of observable outcomes as
 // brute-force Exhaustive enumeration — the real DST-L2-3 guard, especially for the
 // optimal-DPOR (sleep-set) work, whose failure mode is silently dropping a
-// Mazurkiewicz class while still reporting Exhausted=true. See docs/dst/design.md
+// Mazurkiewicz class while still reporting Exhausted=true. See docs/dst/exploration.md
 // (Level 2, increment 5, "Validator first").
 
 // spOp is one instruction of a generated program: a read/write of shared var arg,

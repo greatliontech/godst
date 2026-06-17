@@ -9,7 +9,7 @@ package simulation
 // (the scheduled strategy, runtime/dst_explore.go), and enumerates the sound
 // interleavings — exhaustively, or (later) pruned by DPOR. The runtime is a pure
 // schedule-follower + trace-recorder; the exploration "brain" lives here, offline
-// between Runs. See docs/dst/design.md "Level 2 — access-granularity interleaving
+// between Runs. See docs/dst/exploration.md "Level 2 — access-granularity interleaving
 // + DPOR".
 
 // ExploreMode selects the interleaving-exploration algorithm.
@@ -718,7 +718,7 @@ type dporFrame struct {
 // intervals (dstAccessYield/dstAccessYieldRange) or the same synchronization object's
 // identity, with at least one write, by different goroutines (dstSyncAcquire records
 // mutex/channel state decisions as write-conflicts so their order is a dependency;
-// see runtime/dst_explore.go and design.md "Completeness boundary"). Each run
+// see runtime/dst_explore.go and exploration.md "Completeness boundary"). Each run
 // re-executes from the start following the stack's
 // chosen prefix.
 //
@@ -748,7 +748,7 @@ type dporFrame struct {
 // addr==0 transitions (goroutine creation, WaitGroup wakeups, the isolated gcDrain
 // goroutine) record no conflict identity and are independent of everything — they
 // carry no outcome-determining order choice a recorded access/sync decision does not
-// already capture. See design.md "Completeness boundary (addr=0 transitions)".
+// already capture. See exploration.md "Completeness boundary (addr=0 transitions)".
 //
 // Under race-enabled auto-instrumentation, filtered intervals and replay-promoted
 // accesses can make the minimal source-set calculation too narrow around goroutine

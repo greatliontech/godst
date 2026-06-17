@@ -1584,7 +1584,7 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 
 	// DST Level-2 (dst-race mode): immediately before the race hook, emit a
 	// cooperative access-yield so this memory access is a deterministic scheduling
-	// decision point (design.md D1). It is an ADDITIONAL call — the race hook below is
+	// decision point (exploration.md D1). It is an ADDITIONAL call — the race hook below is
 	// unchanged, so TSan detection/PC-attribution stay byte-identical to a stock -race
 	// build (the oracle is never modified). Gated to -race with -d=dstrace (cmd/go sets
 	// it only for -tags dst + -race); off → this is dead and instrument2 emits exactly
