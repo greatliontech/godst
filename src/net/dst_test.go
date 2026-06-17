@@ -432,7 +432,12 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	simulation.Run(1, func() {
-		ln, err := Listen("tcp", "10.0.0.1:0")
+		// Listen on a host-owned address (loopback): under the per-host network a
+		// host cannot bind an IP it does not own, and 10.0.0.1 is now host 1's
+		// routable IP, not an arbitrary address. Dialer.LocalAddr (the source
+		// address, below) is still exercised with a distinct value; it is reported,
+		// not bound, so it need not be a local interface address.
+		ln, err := Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -475,6 +480,93 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// TestDSTNetHostIsolation exercises the per-host network: cross-host reach via a
+// host's routable IP (simulation.HostIP), host-private loopback, per-host port
+// space, and the can't-bind-a-foreign-IP rule.
+func TestDSTNetHostIsolation(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var (
+		serverGot, clientGot        string
+		serverRemoteIP, hbIP        string
+		loopbackErr, foreignBindErr error
+		bothBound9090               bool
+	)
+	simulation.Run(1, func() {
+		var port string
+		ready := make(chan struct{})
+
+		simulation.Host("hA", func() { // host id 1 -> routable 10.0.0.1
+			ln, err := Listen("tcp", ":0") // wildcard: hA's loopback + 10.0.0.1
+			if err != nil {
+				panic(err)
+			}
+			_, port, _ = SplitHostPort(ln.Addr().String())
+			// hA cannot bind a routable IP it does not own (10.0.0.2 is host 2's).
+			if _, e := Listen("tcp", "10.0.0.2:0"); e != nil {
+				foreignBindErr = e
+			}
+			if ln2, e := Listen("tcp", ":9090"); e == nil {
+				defer ln2.Close()
+			}
+			go func() {
+				close(ready)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 16)
+				n, _ := c.Read(buf)
+				serverGot = string(buf[:n])
+				serverRemoteIP = c.RemoteAddr().(*TCPAddr).IP.String()
+				c.Write([]byte("pong"))
+				c.Close()
+			}()
+		})
+
+		simulation.Host("hB", func() { // host id 2
+			<-ready
+			hbIP = simulation.HostIP("hB")
+			// hB cannot reach hA's loopback (host-private).
+			if _, e := Dial("tcp", "127.0.0.1:"+port); e != nil {
+				loopbackErr = e
+			}
+			// hB reaches hA via hA's routable IP.
+			c, err := Dial("tcp", simulation.HostIP("hA")+":"+port)
+			if err != nil {
+				panic(err)
+			}
+			c.Write([]byte("ping"))
+			buf := make([]byte, 16)
+			n, _ := c.Read(buf)
+			clientGot = string(buf[:n])
+			c.Close()
+			// hB can bind :9090 even though hA holds it (per-host port space).
+			if ln, e := Listen("tcp", ":9090"); e == nil {
+				bothBound9090 = true
+				ln.Close()
+			}
+		})
+	})
+
+	if serverGot != "ping" || clientGot != "pong" {
+		t.Errorf("cross-host exchange: server got %q, client got %q; want ping/pong", serverGot, clientGot)
+	}
+	if !errors.Is(loopbackErr, syscall.ECONNREFUSED) {
+		t.Errorf("hB dial to hA's loopback = %v, want ECONNREFUSED (host-private loopback breached)", loopbackErr)
+	}
+	if serverRemoteIP != hbIP {
+		t.Errorf("server saw cross-host source IP %q, want hB's routable IP %q", serverRemoteIP, hbIP)
+	}
+	if !bothBound9090 {
+		t.Errorf("hB could not bind :9090 while hA holds it (port space not per-host)")
+	}
+	if !errors.Is(foreignBindErr, syscall.EADDRNOTAVAIL) {
+		t.Errorf("hA bind 10.0.0.2 (host 2's IP) = %v, want EADDRNOTAVAIL", foreignBindErr)
+	}
 }
 
 func TestDSTNetDialerLocalAddrValidation(t *testing.T) {

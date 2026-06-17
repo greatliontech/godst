@@ -1282,7 +1282,7 @@ func TestDSTPipeReplay(t *testing.T) {
 // second run fail "address already in use" (DIVERGED); not gating Dial/Listen on
 // dstActive() makes it hit the real network (refused/hang).
 func TestDSTNet(t *testing.T) {
-	const want = "resp=echo:ping local=127.0.0.1:40000 remote=10.0.0.1:9000 | server saw ping from 127.0.0.1:40000"
+	const want = "resp=echo:ping local=127.0.0.1:40000 remote=127.0.0.1:9000 | server saw ping from 127.0.0.1:40000"
 	out1 := strings.TrimSpace(runTestProgNetDST(t, "DSTNet", "DSTSEED=42"))
 	if out1 != want {
 		t.Fatalf("in-memory net exchange wrong:\n got=%q\nwant=%q", out1, want)

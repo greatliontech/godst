@@ -71,6 +71,66 @@ func dstNetRoll() {
 	}
 }
 
+//go:linkname dstNetCurrentNode runtime.dstCurrentNode
+func dstNetCurrentNode() (host, proc uint32)
+
+// The simulated network is per HOST (testing/simulation.Host): every listener is
+// scoped to its listening host, so loopback is host-private (two hosts each have
+// their own 127.0.0.1) and the port space is per-host (two hosts can both bind
+// :80). Each host also has a deterministic routable IPv4 (10.<hi>.<mid>.<lo> from
+// its host id) so a process on one host reaches another by its routable IP — the
+// implicit full mesh. A dial resolves its target to a host scope: a loopback target
+// is the dialer's OWN host; a routable 10.x target is the host that IP encodes. The
+// default host 0 (a program that declares no Host) is the only host, so its
+// loopback registry is the whole network — identical to the pre-per-host behaviour.
+
+// dstNetScope is the registry-key prefix for a host's listeners.
+func dstNetScope(host uint32) string {
+	return "h" + strconv.FormatUint(uint64(host), 10) + "|"
+}
+
+// dstHostRoutableIP is host's deterministic routable IPv4 (the 10.0.0.0/8 block,
+// the host id in the low three octets).
+func dstHostRoutableIP(host uint32) IP {
+	if host >= 1<<24 {
+		// The 10.0.0.0/8 block encodes the host id in three octets; a larger id
+		// would alias another host's IP and silently misroute. No realistic run
+		// declares 2^24 hosts — fail loud rather than misroute.
+		panic("net: DST simulated routable-IP space exhausted (max 2^24 hosts)")
+	}
+	return IPv4(10, byte(host>>16), byte(host>>8), byte(host))
+}
+
+// dstHostRoutableIPString is the string form, exposed to testing/simulation.HostIP
+// via //go:linkname so a SUT can address a peer host without DNS. HostIP returns a
+// string (not a net.IP) so testing/simulation need not import net — which would
+// cycle with net's own white-box DST tests.
+//
+//go:linkname dstHostRoutableIPString
+func dstHostRoutableIPString(host uint32) string {
+	return dstHostRoutableIP(host).String()
+}
+
+// dstHostForRoutableIP reports the host a routable 10.x IP encodes (ok=false for a
+// non-routable IP, e.g. loopback).
+func dstHostForRoutableIP(ip IP) (uint32, bool) {
+	v4 := ip.To4()
+	if v4 == nil || v4[0] != 10 {
+		return 0, false
+	}
+	return uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3]), true
+}
+
+// dstDialScope returns the host scope a dial to ip resolves in: a routable 10.x IP
+// names its owning host; anything else (loopback, wildcard mapped to loopback) is
+// the dialer's own host. dialer is the calling goroutine's host.
+func dstDialScope(ip IP, dialer uint32) string {
+	if h, ok := dstHostForRoutableIP(ip); ok {
+		return dstNetScope(h)
+	}
+	return dstNetScope(dialer)
+}
+
 func dstTCPNetwork(network string) bool {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
@@ -281,11 +341,11 @@ func dstKeyHasPrefix(key, prefix string) bool {
 	return len(key) >= len(prefix) && key[:len(prefix)] == prefix
 }
 
-func dstListenerConflict(network string, ip IP, key string, port int, wildcard bool) bool {
-	if _, dup := dstNet.listeners[key]; dup {
+func dstListenerConflict(scope, network string, ip IP, key string, port int, wildcard bool) bool {
+	if _, dup := dstNet.listeners[scope+key]; dup {
 		return true
 	}
-	familyPrefix := dstAddrFamily(network, ip) + "/"
+	familyPrefix := scope + dstAddrFamily(network, ip) + "/"
 	if wildcard {
 		for k := range dstNet.listeners {
 			if dstKeyHasPrefix(k, familyPrefix) && dstKeyHasPort(k, port) {
@@ -298,18 +358,18 @@ func dstListenerConflict(network string, ip IP, key string, port int, wildcard b
 	return dup
 }
 
-func dstAllocateListenPort(network string, ip IP, wildcard, dual bool) (port int, keys []string, err error) {
+func dstAllocateListenPort(scope, network string, ip IP, wildcard, dual bool) (port int, keys []string, err error) {
 	for p := dstNet.nextListenPort; p <= 65535; p++ {
 		if dual {
 			ks := dstDualKeys(p)
-			if !dstAnyListenerConflict(network, ip, ks, p, wildcard, true) {
+			if !dstAnyListenerConflict(scope, network, ip, ks, p, wildcard, true) {
 				dstNet.nextListenPort = p + 1
 				return p, ks, nil
 			}
 			continue
 		}
 		k := dstListenerKey(network, ip, p, wildcard)
-		if !dstListenerConflict(network, ip, k, p, wildcard) {
+		if !dstListenerConflict(scope, network, ip, k, p, wildcard) {
 			dstNet.nextListenPort = p + 1
 			return p, []string{k}, nil
 		}
@@ -546,6 +606,16 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		return nil, err
 	}
 	wildcard := dstWildcard(host)
+	listeningHost, _ := dstNetCurrentNode()
+	scope := dstNetScope(listeningHost)
+	// A host may bind only an address it owns: its loopback, its own routable IP,
+	// or a wildcard. Binding another host's routable IP — or any other literal IP —
+	// is EADDRNOTAVAIL, exactly as on a real host.
+	if !wildcard && !ip.IsLoopback() {
+		if h, ok := dstHostForRoutableIP(ip); !ok || h != listeningHost {
+			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: ip, Port: portnum}, Err: syscall.EADDRNOTAVAIL}
+		}
+	}
 	// A plain-"tcp" wildcard listen is dual-stack in production (it accepts
 	// both IPv4 and IPv6 peers); model it by registering under both family
 	// keys. "0.0.0.0" stays IPv4-only and "tcp4"/"tcp6" stay single-family,
@@ -575,7 +645,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	dstNetRoll()
 	var keys []string
 	if portnum == 0 {
-		portnum, keys, err = dstAllocateListenPort(network, ip, wildcard, dual)
+		portnum, keys, err = dstAllocateListenPort(scope, network, ip, wildcard, dual)
 		if err != nil {
 			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
 		}
@@ -585,17 +655,24 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		keys = []string{dstListenerKey(network, ip, portnum, wildcard)}
 	}
 	addr := &TCPAddr{IP: reportIP, Port: portnum}
-	if dstAnyListenerConflict(network, ip, keys, portnum, wildcard, dual) {
+	if dstAnyListenerConflict(scope, network, ip, keys, portnum, wildcard, dual) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
+	}
+	// Scope the keys to the listening host: every registry entry is host-scoped, so
+	// loopback and the port space are per-host. l.keys holds the scoped keys so
+	// Close removes exactly these entries.
+	scoped := make([]string, len(keys))
+	for i, k := range keys {
+		scoped[i] = scope + k
 	}
 	l := &dstListener{
 		network: network,
 		addr:    addr,
-		keys:    keys,
+		keys:    scoped,
 		accept:  make(chan Conn, 128), // backlog
 		done:    make(chan struct{}),
 	}
-	for _, k := range keys {
+	for _, k := range scoped {
 		dstNet.listeners[k] = l
 	}
 	return l, nil
@@ -608,12 +685,12 @@ func dstDualKeys(port int) []string {
 
 // dstAnyListenerConflict reports whether registering keys would conflict; a
 // dual-stack wildcard conflicts with any listener of either family on the port.
-func dstAnyListenerConflict(network string, ip IP, keys []string, port int, wildcard, dual bool) bool {
+func dstAnyListenerConflict(scope, network string, ip IP, keys []string, port int, wildcard, dual bool) bool {
 	if dual {
-		return dstListenerConflict("tcp4", nil, keys[0], port, true) ||
-			dstListenerConflict("tcp6", nil, keys[1], port, true)
+		return dstListenerConflict(scope, "tcp4", nil, keys[0], port, true) ||
+			dstListenerConflict(scope, "tcp6", nil, keys[1], port, true)
 	}
-	return dstListenerConflict(network, ip, keys[0], port, wildcard)
+	return dstListenerConflict(scope, network, ip, keys[0], port, wildcard)
 }
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
@@ -657,11 +734,13 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		}
 	}
 
+	dialerHost, _ := dstNetCurrentNode()
+	scope := dstDialScope(ip, dialerHost)
 	dstNet.mu.Lock()
 	dstNetRoll()
-	l := dstNet.listeners[dstListenerKey(network, ip, portnum, false)]
+	l := dstNet.listeners[scope+dstListenerKey(network, ip, portnum, false)]
 	if l == nil {
-		l = dstNet.listeners[dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
+		l = dstNet.listeners[scope+dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
 	}
 	localPort := 0
 	if localTCPAddr != nil {
@@ -677,7 +756,10 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	}
 	localIP := IPv4(127, 0, 0, 1)
-	if dstAddrFamily(network, ip) == "tcp6" {
+	if _, routable := dstHostForRoutableIP(ip); routable {
+		// Cross-host dial: the source address is the dialer's own routable IP.
+		localIP = dstHostRoutableIP(dialerHost)
+	} else if dstAddrFamily(network, ip) == "tcp6" {
 		localIP = IPv6loopback
 	}
 	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {

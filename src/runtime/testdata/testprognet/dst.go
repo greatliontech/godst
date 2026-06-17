@@ -38,7 +38,10 @@ func DSTNet() {
 	exchange := func() string {
 		var out string
 		simulation.Run(n, func() {
-			const addr = "10.0.0.1:9000"
+			// Loopback: under the per-host network a single host (this program
+			// declares none, so it is host 0) owns its loopback, while 10.0.0.1 is
+			// now host 1's routable IP and binding it would be EADDRNOTAVAIL.
+			const addr = "127.0.0.1:9000"
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
 				out = "listen err: " + err.Error()
