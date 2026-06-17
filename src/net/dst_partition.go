@@ -26,17 +26,32 @@ import (
 //go:linkname dstSetNetPartitionHook runtime.dstSetNetPartitionHook
 func dstSetNetPartitionHook(fn func(op, a, b uint32))
 
-// Partition op codes — net's contract with testing/simulation's targeting API,
+// Net-fault op codes — net's contract with testing/simulation's targeting API,
 // which passes the same codes through runtime.dstNetPartitionOp. b is ignored for
-// the host-level ops.
+// the host/process-level ops.
 const (
-	dstPartOpPartition uint32 = iota + 1 // cut host-pair (a,b), symmetric
-	dstPartOpHeal                        // restore host-pair (a,b)
-	dstPartOpIsolate                     // cut host a from all others
-	dstPartOpHealHost                    // restore host a
+	dstPartOpPartition  uint32 = iota + 1 // cut host-pair (a,b), symmetric
+	dstPartOpHeal                         // restore host-pair (a,b)
+	dstPartOpIsolate                      // cut host a from all others
+	dstPartOpHealHost                     // restore host a
+	dstFaultOpResetPair                   // reset all conns between hosts a and b
+	dstFaultOpResetProc                   // reset all conns owned by process a
 )
 
-func init() { dstSetNetPartitionHook(dstApplyPartitionOp) }
+func init() { dstSetNetPartitionHook(dstApplyNetFaultOp) }
+
+// dstApplyNetFaultOp dispatches a net-fault targeting op (from testing/simulation
+// via runtime's passthrough) to the partition table or the connection registry.
+func dstApplyNetFaultOp(op, a, b uint32) {
+	switch op {
+	case dstFaultOpResetPair:
+		dstResetPair(a, b)
+	case dstFaultOpResetProc:
+		dstResetProc(a)
+	default:
+		dstApplyPartitionOp(op, a, b)
+	}
+}
 
 // dstPart is the per-run partition table. Keyed off the run epoch (dstNetEpoch) so
 // it resets each run with no explicit teardown. The wake channel is closed and

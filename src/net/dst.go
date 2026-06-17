@@ -444,9 +444,11 @@ type dstConn struct {
 	// {localHost, remoteHost} match the pair (DST-FAULT-VICTIM). The base link
 	// latency is the first consumer: a connection between distinct hosts carries
 	// the configured cross-host delay, a same-host/loopback one is instant.
-	// (Per-process attribution — the owning process of each end — lands with the
-	// reset/crash faults that target a process, at this same Dial stamp.)
+	// localProc/remoteProc likewise attribute each end to its owning process (the
+	// dialer's process and the listening process), so a process-targeted reset acts
+	// on exactly that process's conns (DST-FAULT-VICTIM, the process leg).
 	localHost, remoteHost uint32
+	localProc, remoteProc uint32
 
 	// acceptState tracks a server-end connection through the accept backlog:
 	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
@@ -469,6 +471,7 @@ func (c *dstConn) opError(op string, err error) error {
 func (c *dstConn) resetConn() {
 	c.reset.Store(true)
 	c.Conn.Close()
+	dstConnDeregister(c)
 }
 
 // mapConnErr converts a pipe-layer error into the production shape.
@@ -519,6 +522,7 @@ func (c *dstConn) Close() error {
 		return c.opError("close", errClosed)
 	}
 	c.Conn.Close()
+	dstConnDeregister(c)
 	return nil
 }
 
@@ -565,6 +569,7 @@ type dstListener struct {
 	done    chan struct{}
 	closed  atomic.Bool
 	host    uint32 // the host that owns this listener (its network identity)
+	proc    uint32 // the process that created this listener (owns its accepted conns)
 }
 
 func (l *dstListener) opError(op string, err error) error {
@@ -662,7 +667,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		return nil, err
 	}
 	wildcard := dstWildcard(host)
-	listeningHost, _ := dstNetCurrentNode()
+	listeningHost, listeningProc := dstNetCurrentNode()
 	scope := dstNetScope(listeningHost)
 	// A host may bind only an address it owns: its loopback, its own routable IP,
 	// or a wildcard. Binding another host's routable IP — or any other literal IP —
@@ -728,6 +733,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		accept:  make(chan Conn, 128), // backlog
 		done:    make(chan struct{}),
 		host:    listeningHost,
+		proc:    listeningProc,
 	}
 	for _, k := range scoped {
 		dstNet.listeners[k] = l
@@ -791,7 +797,7 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		}
 	}
 
-	dialerHost, _ := dstNetCurrentNode()
+	dialerHost, dialerProc := dstNetCurrentNode()
 	// Partition (blackhole connect): a Dial across a cut link drops the SYN — it
 	// blocks until the link heals or the context/deadline expires. The target host
 	// is the routable IP's owner; a loopback/own-host target is never partitioned.
@@ -859,8 +865,8 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		p1, p2 = Pipe()
 	}
 	reset := new(atomic.Bool)
-	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host}
-	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost}
+	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc}
+	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc}
 	select {
 	case <-ctx.Done():
 		p1.Close()
@@ -879,8 +885,17 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 				p1.Close()
 				return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			}
+			// Register both ends once the conn is live (the dial is about to return
+			// it). Registration intentionally trails the l.accept handoff: a Reset
+			// racing a conn still in establishment benignly misses it — under-firing
+			// a reset is sound (a real RST can miss a conn mid-handshake too), whereas
+			// the failure paths above never register, so a reset never over-fires.
+			dstConnRegister(dialer) // accepted before teardown: a live conn
+			dstConnRegister(server)
 			return dialer, nil
 		default:
+			dstConnRegister(dialer) // queued: a live conn
+			dstConnRegister(server)
 			return dialer, nil
 		}
 	case <-l.done:

@@ -388,9 +388,14 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   the harder, realistic case. **"Drop" lives here**, at flow granularity — a partition window
   drops everything between A↔B; there is *no* single-byte drop on a live stream (TCP forbids it — that is
   the UDP follow-on).
-- **Connection reset** — inject `ECONNRESET` on a targeted conn, or a process's / a host-pair's conns, reusing
-  the conn's existing `resetConn()` (already wired for backlog teardown: peer reads & writes then carry
-  `ECONNRESET`). DoF: a real RST (peer crash, middlebox).
+- **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns, reusing the conn's
+  existing `resetConn()` (already wired for backlog teardown: peer reads & writes then carry `ECONNRESET`).
+  DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
+  `ResetProcess(p)` (process), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
+  host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
+  exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). A reset hits **both ends**, so
+  each closes and a subsequent read returns `ECONNRESET` before draining — **in-flight bytes are dropped**,
+  as a real RST discards them (DST-FAULT-SOUND). This completes the network axis.
 - **Throttle / bandwidth** — pace delivery so ≤ B bytes cross per virtual time unit (latency
   proportional to bytes, the same fake-timer queue as latency). DoF: finite link bandwidth. **Landed** as
   `Options.Network.CrossHostBandwidth` (bytes/sec, **per connection-direction**): the wire serializes
@@ -552,8 +557,10 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   inherited at `newproc1`; a cross-host conn records its host pair (`dstConn.localHost`/`remoteHost`, the
   always-wire end's `localHost`/`peerHost`), which keys the partition table; `TestDSTNetPartitionVictim`
   (`net`) asserts `Partition(A,B)` cuts the A-B conn while an A-C conn is untouched, mutation-tested (a
-  check that blocks all pairs once any partition exists fails it). Per-process conn attribution and a
-  file's host extend it as the reset and disk faults land.
+  check that blocks all pairs once any partition exists fails it). The **process leg** is landed with reset
+  (`dstConn.localProc`/`remoteProc`; `TestDSTNetResetVictim` asserts an A-B reset spares an A-C conn,
+  `TestDSTNetResetProcess` that `ResetProcess(p)` resets exactly p's conns — both ends). A file's host
+  extends it as the disk faults land.
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or

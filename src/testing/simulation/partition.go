@@ -21,12 +21,14 @@ import _ "unsafe" // for go:linkname
 //go:linkname dstNetPartitionOp runtime.dstNetPartitionOp
 func dstNetPartitionOp(op, a, b uint32)
 
-// Partition op codes — must match net's dst_partition.go.
+// Net-fault op codes — must match net's dst_partition.go.
 const (
 	partOpPartition uint32 = iota + 1
 	partOpHeal
 	partOpIsolate
 	partOpHealHost
+	partOpResetPair
+	partOpResetProc
 )
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections
@@ -50,4 +52,19 @@ func Isolate(host string) {
 // HealHost restores a host isolated by Isolate.
 func HealHost(host string) {
 	dstNetPartitionOp(partOpHealHost, internHost(host), 0)
+}
+
+// Reset injects ECONNRESET on every active connection between hosts a and b (in
+// either direction), modeling a transient that tears those flows down — a real RST
+// from a peer crash or a middlebox. Both ends of each connection observe
+// ECONNRESET on their next operation; any in-flight buffered bytes are dropped.
+func Reset(a, b string) {
+	dstNetPartitionOp(partOpResetPair, internHost(a), internHost(b))
+}
+
+// ResetProcess injects ECONNRESET on every active connection process p owns an end
+// of (as dialer or as the listening process) — modeling that process's sockets
+// being torn down (e.g. as a lighter-weight precursor to the process crash fault).
+func ResetProcess(p string) {
+	dstNetPartitionOp(partOpResetProc, internProc(p), 0)
 }
