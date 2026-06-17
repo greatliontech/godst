@@ -41,39 +41,99 @@ func dstFSActive() bool
 //go:linkname dstFSEpoch runtime.dstNetEpoch
 func dstFSEpoch() uint64
 
-// dstFS is the process-global simulated filesystem: a per-run in-memory tree.
-// Keyed by the run epoch so a new run starts with a fresh empty root, with no
-// explicit teardown hook. All node state (tree shape and file content) is
-// guarded by mu; per-handle state (offset, closed) is guarded by the handle's
-// own mutex, acquired before mu where both are needed.
+// dstFS is the process-global simulated filesystem. The tree is per HOST: each
+// host (testing/simulation.Host) owns its own root, so co-located processes share a
+// filesystem while different hosts are isolated — process A on host hA cannot
+// observe or mutate host hB's files except over the simulated network
+// (DST-NODE-ISOLATION). The working directory is per PROCESS: a path into the
+// process's host tree, so one process's Chdir does not move another's even on the
+// same host. Both maps are keyed by the run epoch (reset in dstFSRoll) so a new run
+// starts fresh with no teardown hook. The default host/process (id 0 — a program
+// that declares neither) is one host, one process, identical to a plain run. All
+// node state is guarded by mu; per-handle state by the handle's own mutex, acquired
+// before mu where both are needed.
 var dstFS struct {
 	mu    sync.Mutex
 	epoch uint64
-	root  *dstFSNode
-	cwd   string // per-bubble working directory (process-wide, POSIX-style)
+	disks map[uint32]*dstFSDisk   // host id -> the host's in-memory tree
+	cwds  map[[2]uint32]string    // (host id, process id) -> that process's working directory into its host tree
 }
 
-// dstFSRoll resets the tree when the run epoch advances. Caller holds dstFS.mu.
+// dstFSDisk is one host's tree (its filesystem). The durability state lives on the
+// nodes; a host's disk is what a host (power-loss) crash later restores.
+type dstFSDisk struct {
+	root *dstFSNode
+}
+
+//go:linkname dstFSCurrentNode runtime.dstCurrentNode
+func dstFSCurrentNode() (host, proc uint32)
+
+// dstFSRoll resets the per-run filesystem state when the run epoch advances. Caller
+// holds dstFS.mu. Per-host trees are created lazily (dstFSDiskHere), so Roll only
+// clears the maps.
 func dstFSRoll() {
-	if e := dstFSEpoch(); e != dstFS.epoch || dstFS.root == nil {
+	if e := dstFSEpoch(); e != dstFS.epoch || dstFS.disks == nil {
 		dstFS.epoch = e
-		dstFS.cwd = "/"
-		dstFS.root = &dstFSNode{
-			isDir:   true,
-			entries: make(map[string]*dstFSNode),
-			mode:    ModeDir | 0o755,
-			modTime: time.Now(),
-		}
-		// The one pre-seeded entry: /tmp (mode 1777), so TempDir-based
-		// CreateTemp/MkdirTemp work unmodified (see the spec's empty-tree
-		// clause). os.TempDir reports this fixed path during a run.
-		dstFS.root.entries["tmp"] = &dstFSNode{
-			isDir:   true,
-			entries: make(map[string]*dstFSNode),
-			mode:    ModeDir | ModeSticky | 0o777,
-			modTime: time.Now(),
-		}
+		dstFS.disks = make(map[uint32]*dstFSDisk)
+		dstFS.cwds = make(map[[2]uint32]string)
 	}
+}
+
+// dstFSDiskHere returns the calling goroutine's host disk, creating it (with the
+// pre-seeded /tmp) on first touch. Caller holds dstFS.mu.
+func dstFSDiskHere() *dstFSDisk {
+	host, _ := dstFSCurrentNode()
+	d := dstFS.disks[host]
+	if d == nil {
+		d = newDstFSDisk()
+		dstFS.disks[host] = d
+	}
+	return d
+}
+
+// newDstFSDisk builds a fresh host tree: an empty root containing only /tmp (mode
+// 1777), so TempDir-based CreateTemp/MkdirTemp work unmodified (the spec's
+// empty-tree clause). Every host gets its own /tmp; os.TempDir reports the fixed
+// path "/tmp" during a run.
+func newDstFSDisk() *dstFSDisk {
+	root := &dstFSNode{
+		isDir:   true,
+		entries: make(map[string]*dstFSNode),
+		mode:    ModeDir | 0o755,
+		modTime: time.Now(),
+	}
+	root.entries["tmp"] = &dstFSNode{
+		isDir:   true,
+		entries: make(map[string]*dstFSNode),
+		mode:    ModeDir | ModeSticky | 0o777,
+		modTime: time.Now(),
+	}
+	return &dstFSDisk{root: root}
+}
+
+// dstFSCwdHere returns the calling process's working directory (default "/");
+// dstFSSetCwd sets it. The key is the (host, process) pair — the real process
+// identity — because a process id is not unique across hosts: a Host with no
+// Process runs at process id 0 on every host, and a same-named Process on two hosts
+// shares a process id, yet they are different machines whose cwds must be
+// independent (DST-NODE-ISOLATION). Caller holds dstFS.mu.
+func dstFSCwdHere() string {
+	host, proc := dstFSCurrentNode()
+	if c, ok := dstFS.cwds[[2]uint32{host, proc}]; ok {
+		return c
+	}
+	return "/"
+}
+
+func dstFSSetCwd(cwd string) {
+	host, proc := dstFSCurrentNode()
+	dstFS.cwds[[2]uint32{host, proc}] = cwd
+}
+
+// dstFSIsRoot reports whether node is the calling goroutine's host-tree root (which
+// cannot be removed or renamed). Caller holds dstFS.mu.
+func dstFSIsRoot(node *dstFSNode) bool {
+	return node == dstFSDiskHere().root
 }
 
 // dstFSNode is one node of the simulated tree. Content lives on the node and
@@ -139,16 +199,17 @@ func dstFSFencedLink(op, oldname, newname string) (error, bool) {
 	return &LinkError{Op: op, Old: oldname, New: newname, Err: dstErrUnsupportedFS}, true
 }
 
-// dstFSResolve walks cleaned absolute path name (resolved against the
-// per-bubble root; the base-model working directory is "/") and returns the
+// dstFSResolve walks cleaned absolute path name (resolved against the calling
+// host's tree root and the calling process's working directory) and returns the
 // parent directory node, the base name, and the target node (nil if absent).
 // Caller holds dstFS.mu. Errors are bare errnos; callers wrap.
 func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
 	clean := dstFSAbs(name)
+	root := dstFSDiskHere().root
 	if clean == "/" {
-		return nil, "/", dstFS.root, nil
+		return nil, "/", root, nil
 	}
-	dir := dstFS.root
+	dir := root
 	rest := clean[1:]
 	for {
 		i := 0
@@ -171,13 +232,13 @@ func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode,
 	}
 }
 
-// dstFSAbs resolves name against the per-bubble working directory and cleans
-// it. Caller holds dstFS.mu (cwd is per-run state).
+// dstFSAbs resolves name against the calling process's working directory and
+// cleans it. Caller holds dstFS.mu.
 func dstFSAbs(name string) string {
 	if len(name) > 0 && name[0] == '/' {
 		return path.Clean(name)
 	}
-	return path.Clean(dstFS.cwd + "/" + name)
+	return path.Clean(dstFSCwdHere() + "/" + name)
 }
 
 // dstMkdir implements Mkdir on the simulated tree.
@@ -234,7 +295,7 @@ func dstRemove(name string) (handled bool, err error) {
 	if node == nil {
 		return wrap(syscall.ENOENT)
 	}
-	if node == dstFS.root {
+	if dstFSIsRoot(node) {
 		return wrap(syscall.EBUSY)
 	}
 	if node.isDir && len(node.entries) > 0 {
@@ -273,7 +334,7 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	if node == nil {
 		return true, nil
 	}
-	if node == dstFS.root {
+	if dstFSIsRoot(node) {
 		// Match RemoveAll("/"): refuse to destroy the root.
 		return true, &PathError{Op: "removeall", Path: name, Err: syscall.EBUSY}
 	}
@@ -314,7 +375,7 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if errno != nil {
 		return wrap(errno)
 	}
-	if oldNode == dstFS.root || newNode == dstFS.root {
+	if dstFSIsRoot(oldNode) || dstFSIsRoot(newNode) {
 		return wrap(syscall.EBUSY)
 	}
 	if newNode == oldNode {
@@ -361,7 +422,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if node == nil {
 		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
 	}
-	if node == dstFS.root {
+	if dstFSIsRoot(node) {
 		base = "/"
 	}
 	size := int64(len(node.data))
@@ -506,7 +567,7 @@ func dstGetwd() (string, bool, error) {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
-	return dstFS.cwd, true, nil
+	return dstFSCwdHere(), true, nil
 }
 
 func dstChdir(dir string) (handled bool, err error) {
@@ -530,7 +591,7 @@ func dstChdir(dir string) (handled bool, err error) {
 	if !node.isDir {
 		return wrap(syscall.ENOTDIR)
 	}
-	dstFS.cwd = dstFSAbs(dir)
+	dstFSSetCwd(dstFSAbs(dir))
 	return true, nil
 }
 
@@ -864,7 +925,7 @@ func (d *dstFile) chdirHandle() error {
 	if !d.node.isDir {
 		return syscall.ENOTDIR
 	}
-	dstFS.cwd = d.path
+	dstFSSetCwd(d.path)
 	return nil
 }
 
