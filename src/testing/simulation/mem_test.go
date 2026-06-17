@@ -6,7 +6,10 @@
 
 package simulation
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 // memSink keeps the test allocations live (escapes), so the compiler does not
 // elide the make calls whose bytes the per-process counter must see.
@@ -71,31 +74,74 @@ func TestDSTMemChildAttributed(t *testing.T) {
 	}
 }
 
-// TestDSTMemDeterminism enforces DST-MEMALLOC-DET: same seed → identical per-process
-// allocation byte counts.
+// TestDSTMemDeterminism enforces DST-MEMALLOC-DET (refined): the per-process counter
+// is deterministic to the granularity the OOM fault needs — the budget-CROSSING
+// decision is a deterministic function of the seed — while the exact byte count
+// carries sub-observable runtime-pool-refill noise (the per-process analogue of the
+// GC's DST-MEM-1: a sudog cache refill from a channel op is charged to whichever
+// process empties the process-global, cross-run pool, so the raw count is not
+// byte-exact across runs in concurrent programs). This concurrent program with
+// channel synchronization exercises that pool churn; two same-seed runs must agree
+// on the budget crossing and stay within the noise band — and must NOT diverge at
+// the MB scale (a real attribution bug).
 func TestDSTMemDeterminism(t *testing.T) {
-	run := func() [2]int64 {
-		var got [2]int64
+	const budget = 4 << 20 // a meaningful OOM-style budget, far above the pool-noise floor
+	const noise = 64 << 10 // sub-observable tolerance: real divergence is MB-scale, the noise ~hundreds of bytes
+	type sample struct{ heavy, light int64 }
+	run := func() sample {
+		var s sample
+		var mu sync.Mutex
 		Run(7, func() {
-			Process("a", func() {
-				memSink = make([]byte, 100000)
-				got[0] = procBytes()
-			})
-			Process("b", func() {
-				for i := 0; i < 64; i++ {
-					memSink = make([]byte, 1000)
-				}
-				got[1] = procBytes()
-			})
+			ch := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				Process("heavy", func() {
+					allocSink(8 << 20) // crosses the budget
+					<-ch
+					v := procBytes()
+					mu.Lock()
+					s.heavy = v
+					mu.Unlock()
+				})
+			}()
+			go func() {
+				defer wg.Done()
+				Process("light", func() {
+					allocSink(4096) // a few KB — under the budget
+					ch <- struct{}{}
+					v := procBytes()
+					mu.Lock()
+					s.light = v
+					mu.Unlock()
+				})
+			}()
+			wg.Wait()
 		})
-		return got
+		return s
 	}
 	a, b := run(), run()
-	if a != b {
-		t.Errorf("per-process allocation not reproducible across same-seed runs: %v vs %v", a, b)
+
+	absI := func(x int64) int64 {
+		if x < 0 {
+			return -x
+		}
+		return x
 	}
-	if a[0] <= 0 || a[1] <= 0 {
-		t.Errorf("processes accounted %v bytes, want both > 0", a)
+	// (1) Counts are deterministic up to sub-observable pool noise — bounded, not divergent.
+	if absI(a.heavy-b.heavy) > noise || absI(a.light-b.light) > noise {
+		t.Errorf("per-process accounting diverged beyond the %d B pool-noise band: heavy %d vs %d, light %d vs %d",
+			noise, a.heavy, b.heavy, a.light, b.light)
+	}
+	// (2) OOM-relevant determinism: the budget-crossing decision replays exactly (the
+	//     sub-observable noise cannot flip a budget-scale crossing).
+	if (a.heavy >= budget) != (b.heavy >= budget) || (a.light >= budget) != (b.light >= budget) {
+		t.Errorf("budget-crossing nondeterministic vs %d B: heavy %d/%d light %d/%d", budget, a.heavy, b.heavy, a.light, b.light)
+	}
+	// Non-vacuous: the heavy process crosses the budget, the light one does not.
+	if a.heavy < budget || a.light >= budget {
+		t.Errorf("expected heavy>=%d>light; got heavy=%d light=%d", budget, a.heavy, a.light)
 	}
 }
 

@@ -199,15 +199,21 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   (`dstSimEnvSet` / `dstActive`) and return only synthetic values; `TestDSTIdentitySound`
   (`testing/simulation`, for hostname/NumCPU/pid) and `TestDSTNetInterfaces` (`net`, the synthetic
   `lo`+`eth0` set replacing the real NICs).
-- **DST-MEMALLOC-DET (entailed: determinism + attribution).** A process's accumulated allocation bytes is
-  a deterministic function of the seed, and each heap allocation accrues to the *allocating* goroutine's
-  process (`cur.dstProc`, inherited by its subtree); distinct processes have independent counters.
-  *violation:* an allocation attributed to the wrong process (or the root), or a count that varies
-  run-to-run from a load-dependent source, so the OOM fault that thresholds the counter fires
+- **DST-MEMALLOC-DET (entailed: OOM-relevant determinism + attribution).** Each heap allocation accrues to
+  the *allocating* goroutine's process (`cur.dstProc`, inherited by its subtree); distinct processes have
+  independent counters; and the per-process counter is deterministic *to the granularity the OOM fault
+  needs* — the budget-**crossing** decision (does process P exceed budget B?) is a deterministic function
+  of the seed. The *exact* byte count is **not** byte-deterministic across runs: it carries sub-observable
+  runtime-pool-refill noise — a `sudog` cache refill from a channel op is charged to whichever process
+  empties the process-global, cross-run pool — the per-process analogue of the GC's `DST-MEM-1` byte-noise,
+  sound for the same reason (it cannot flip a budget-scale crossing; an OOM budget sits far above the noise
+  floor of a few KB). *violation:* an allocation attributed to the wrong process (or the root), or counts
+  that diverge at the *budget* scale (not within the sub-observable band), so the OOM fault fires
   nondeterministically or on the wrong process. *Enforced:* `elemsize` (size-class size, `-race`-invariant)
   summed per-object at the one mallocgc hook under the bubble gate, counters keyed by `g.dstProc`;
-  `TestDSTMem{PerProcessAccounting,ChildAttributed,Determinism,Independent}` (`testing/simulation`),
-  mutation-tested.
+  `TestDSTMem{PerProcessAccounting,ChildAttributed,Independent}` assert attribution, and
+  `TestDSTMemDeterminism` asserts the budget crossing replays exactly + the counts stay within the
+  sub-observable noise band across two same-seed *concurrent* runs (`testing/simulation`), mutation-tested.
 
 (The fault-feature invariants are in the next section.)
 
@@ -400,7 +406,9 @@ The host crash additionally tears the host disk; the process crash leaves it int
 
 **OOM** is a **process crash** whose *trigger* is the per-process allocation counter crossing a budget
 (cgroup-style per-process budget by default; a host-total kernel-OOM with victim selection is a recordable
-variant). Same effect, *organic* trigger — the node dies where its own workload takes it, so it tests "how
+variant). The budget must sit above the counter's **noise floor** (a few KB — the counter carries
+sub-observable runtime-pool-refill noise, DST-MEMALLOC-DET); a realistic OOM budget (KB–MB+) does, so the
+crossing is replay-exact. Same effect, *organic* trigger — the node dies where its own workload takes it, so it tests "how
 the cluster handles a node hitting its memory limit" at a workload-determined point. **Hard-kill only**:
 soft `GOMEMLIMIT`-style per-node degradation (GC thrash/backpressure *approaching* the limit) is **out** —
 it needs the per-process live-set deliberately not built (a consequence of the allocation-accounting
