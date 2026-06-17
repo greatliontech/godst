@@ -254,6 +254,10 @@ func synctestRun(f func()) {
 			// in isolation, independent of what scheduled before this bubble. See
 			// dstSchedRand.
 			dstSchedRand = dstSchedRoot(dstSeed.Load())
+			// Re-root the fault RNG at this bubble too (separate, salt-independent
+			// stream), so injected faults replay in isolation like the schedule. See
+			// dstFaultRand.
+			dstFaultRand.Store(dstFaultRoot(dstSeed.Load()))
 			dstSchedStatsReset()
 			dstHeapAlloc.Store(0) // start the bubble's per-object alloc counter clean
 			if dstSchedKind == dstSchedPCT {

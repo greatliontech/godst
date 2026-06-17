@@ -2154,3 +2154,11 @@ func CustomGOMAXPROCS() bool {
 	unlock(&sched.lock)
 	return custom
 }
+
+// DST fault-RNG test hooks. The fault RNG (dstFaultRand) is a dedicated seeded
+// stream for fault decisions (e.g. network jitter); it must be independent of the
+// scheduling RNG (dstSchedRand) so a fault policy's draw count never shifts the
+// goroutine interleaving (DST-FAULT-REPLAY stream isolation).
+func DstFaultRandDraw() uint64                  { return dstFaultRandUint64() }
+func DstSchedRandPeek() uint64                  { return dstSchedRand }
+func DstFaultSchedRootsDiffer(seed uint64) bool { return dstFaultRoot(seed) != dstSchedRoot(seed) }

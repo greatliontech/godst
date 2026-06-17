@@ -135,6 +135,7 @@ func dstActivate(seed uint64) {
 	getg().dstClockOffset = 0
 	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
+	dstFaultRand.Store(dstFaultRoot(seed))
 	// Queue process-level finalizers/cleanups before DST is active and detach them
 	// from the queues the bubble drain observes. They are not part of this run's
 	// deterministic universe: running them here could block Run entry or consume
@@ -348,6 +349,65 @@ func dstSchedRoot(seed uint64) uint64 {
 	return dstBubbleRoot(seed ^ 0x5C7ED000_5C7ED000)
 }
 
+// dstFaultRand is the per-bubble DST fault RNG state (splitmix64): the dedicated
+// seeded stream for fault decisions (a jitter draw, later which victim / when in a
+// window). Rooted at activation and re-rooted per bubble like dstSchedRand, so
+// faults replay in isolation (DST-FAULT-REPLAY). Its salt makes it a stream
+// INDEPENDENT of both the per-g tree and the scheduling RNG: a fault policy's draw
+// count never shifts dstSchedRand's sequence, so the program's interleaving is the
+// same whatever (and however often) faults draw — the stream-isolation discipline
+// that keeps each policy's determinism independent of the others'. (A fault
+// *changing* the execution — a longer delivery delay — is intended; only the fault
+// *choices* are stream-isolated.) Unlike dstSchedRand (advanced on g0 at the
+// scheduling seam, single-context), this is drawn from bubble goroutines (e.g. a
+// conn's delivery push), so it is atomic: at GOMAXPROCS=1 the draws are serialized
+// in the deterministic cooperative-schedule order, and the atomic supplies the
+// happens-before that keeps the access -race-clean.
+var dstFaultRand atomic.Uint64
+
+// dstFaultRoot derives the fault RNG root from the DST seed, salted to be
+// independent of both the per-g tree root (dstBubbleRoot) and the scheduling RNG
+// root (dstSchedRoot) for the same seed.
+func dstFaultRoot(seed uint64) uint64 {
+	return dstBubbleRoot(seed ^ 0xFA017000_FA017000)
+}
+
+// dstFaultRandUint64 advances and returns the next fault-RNG value. Reached via
+// //go:linkname from packages that inject faults (e.g. net's delivery jitter).
+//
+//go:linkname dstFaultRandUint64
+func dstFaultRandUint64() uint64 {
+	// CAS loop rather than Add: the splitmix64 increment does not fit the signed
+	// delta of atomic.Uint64.Add. At GOMAXPROCS=1 with async preemption off the
+	// Load→CAS window has no concurrent writer, so it succeeds first try and the
+	// advance order is the deterministic cooperative-schedule order; the atomic
+	// keeps it -race-clean across the per-stream locks that callers hold.
+	var z uint64
+	for {
+		old := dstFaultRand.Load()
+		z = old + 0x9e3779b97f4a7c15
+		if dstFaultRand.CompareAndSwap(old, z) {
+			break
+		}
+	}
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// dstFaultRandN returns a deterministic value in [0, n) from the fault RNG,
+// advancing it; n <= 0 returns 0 WITHOUT drawing (so an inactive fault leaves the
+// stream — and every later fault's draw position — untouched). Reached via
+// //go:linkname.
+//
+//go:linkname dstFaultRandN
+func dstFaultRandN(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	return int64(dstFaultRandUint64() % uint64(n))
+}
+
 // dstSchedRandUint64 advances and returns the next scheduling-RNG value.
 //
 //go:nosplit
@@ -388,6 +448,13 @@ func dstSchedOvfPutsFP() uint64 { return dstSchedOvfPuts }
 func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64) {
 	return dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws
 }
+
+// dstSchedRandPeekFP reads the scheduling RNG state without advancing it, so a
+// test can assert that fault-RNG draws leave the scheduling stream untouched
+// (stream isolation — DST-FAULT-REPLAY). Reached via //go:linkname.
+//
+//go:linkname dstSchedRandPeekFP
+func dstSchedRandPeekFP() uint64 { return dstSchedRand }
 
 // dstSchedRandn returns a deterministic value in [0,n) from the scheduling RNG,
 // advancing it. Used by the random strategy at the unified scheduling choice
@@ -819,6 +886,25 @@ func dstSetNetCrossHostLatency(ns int64) { dstNetCrossHostLatency = ns }
 //
 //go:linkname dstNetCrossHostLatencyNs
 func dstNetCrossHostLatencyNs() int64 { return dstNetCrossHostLatency }
+
+// dstNetCrossHostJitter is the per-run max delivery jitter in nanoseconds for
+// cross-host connections: each segment's delivery is delayed by the base latency
+// plus a value drawn from [0, dstNetCrossHostJitter) from the fault RNG. 0 (the
+// default, and same-host always) means no jitter. Set once before the bubble and
+// reset after, like dstNetCrossHostLatency.
+var dstNetCrossHostJitter int64
+
+// dstSetNetCrossHostJitter sets the per-run cross-host jitter. Reached via
+// //go:linkname from testing/simulation's run envelope.
+//
+//go:linkname dstSetNetCrossHostJitter
+func dstSetNetCrossHostJitter(ns int64) { dstNetCrossHostJitter = ns }
+
+// dstNetCrossHostJitterNs reports the per-run cross-host jitter. Reached via
+// //go:linkname from net.
+//
+//go:linkname dstNetCrossHostJitterNs
+func dstNetCrossHostJitterNs() int64 { return dstNetCrossHostJitter }
 
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.

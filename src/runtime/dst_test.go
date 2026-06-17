@@ -2028,3 +2028,27 @@ func TestDSTExploreAtomicAutoInstrument(t *testing.T) {
 		}
 	}
 }
+
+// TestDSTFaultRandStreamIsolation verifies the fault RNG is a stream independent
+// of the scheduling RNG (DST-FAULT-REPLAY): drawing from the fault stream never
+// advances the scheduling stream (so a fault policy's draw count cannot shift the
+// goroutine interleaving), and the two streams derive from distinct roots for the
+// same seed (not one a phase-shift of the other).
+func TestDSTFaultRandStreamIsolation(t *testing.T) {
+	before := runtime.DstSchedRandPeek()
+	var acc uint64
+	for i := 0; i < 256; i++ {
+		acc ^= runtime.DstFaultRandDraw()
+	}
+	if after := runtime.DstSchedRandPeek(); after != before {
+		t.Errorf("fault-RNG draws advanced the scheduling RNG (%#x -> %#x): streams not isolated", before, after)
+	}
+	if acc == 0 {
+		t.Errorf("256 fault-RNG draws XORed to zero; the stream looks dead")
+	}
+	for _, seed := range []uint64{1, 2, 42, 0xDEADBEEF, 1<<63 + 7} {
+		if !runtime.DstFaultSchedRootsDiffer(seed) {
+			t.Errorf("seed %#x: fault and scheduling RNG roots coincide (not independent streams)", seed)
+		}
+	}
+}

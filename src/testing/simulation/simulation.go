@@ -169,6 +169,9 @@ func dstSetMemLimit(limit int64)
 //go:linkname dstSetNetCrossHostLatency runtime.dstSetNetCrossHostLatency
 func dstSetNetCrossHostLatency(ns int64)
 
+//go:linkname dstSetNetCrossHostJitter runtime.dstSetNetCrossHostJitter
+func dstSetNetCrossHostJitter(ns int64)
+
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
 
@@ -295,6 +298,17 @@ type NetworkConfig struct {
 	// against. Delivery stays in-order (FIFO, as TCP). Per-pair asymmetric
 	// latencies arrive with the targeting API; this is the single base default.
 	CrossHostLatency time.Duration
+
+	// CrossHostJitter, if > 0, is the maximum extra per-segment delivery jitter on
+	// every cross-host connection: each segment is delivered after CrossHostLatency
+	// plus a value drawn from [0, CrossHostJitter) by the dedicated seeded fault
+	// RNG. It is the network-jitter fault — variable link latency — and like the
+	// base latency it is base-time and FIFO-preserving (a later segment never
+	// overtakes an earlier one, so a reliable in-order stream is never reordered).
+	// Deterministic per seed and stream-isolated: enabling it never shifts the
+	// goroutine interleaving. The zero value is no jitter (same-host is always
+	// jitter-free). Per-link jitter arrives with the L4 targeting API.
+	CrossHostJitter time.Duration
 }
 
 // default simulated process identity (see Options.Hostname/PID/NumCPU).
@@ -423,7 +437,7 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), nil, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -441,7 +455,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	var ok bool
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), nil, true, func() {
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	if !ok {
@@ -493,15 +507,15 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, prefix, true, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, prefix, true, f)
 }
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs int64, prefix []uint64, propagateGoexit bool, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs int64, prefix []uint64, propagateGoexit bool, f func()) {
 	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
 	// keeps the sysmon container-aware auto-updater from resizing P count
 	// mid-run); remember whether the process was in auto mode so the restore
@@ -517,6 +531,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
 	dstSetMemLimit(memLimit)
 	dstSetNetCrossHostLatency(netLatencyNs)
+	dstSetNetCrossHostJitter(netJitterNs)
 	dstActivate(seed)
 	defer func() {
 		dstDeactivate()
@@ -524,6 +539,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstClearSimEnv()
 		dstSetMemLimit(0)
 		dstSetNetCrossHostLatency(0)
+		dstSetNetCrossHostJitter(0)
 		dstSetAsyncPreemptOff(oldPreempt)
 		if autoProcs {
 			runtime.SetDefaultGOMAXPROCS()

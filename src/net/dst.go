@@ -827,17 +827,18 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		localAddr.Zone = localTCPAddr.Zone
 	}
 
-	// Cross-host connections carry the configured base link latency; same-host
-	// and loopback (dialer and listener on one host) stay on the synchronous,
-	// zero-latency net.Pipe — byte-identical to the pre-latency behavior, so the
-	// N=1 collapse and any run that sets no latency are unaffected.
-	latencyNs := int64(0)
+	// Cross-host connections carry the configured base link latency and jitter;
+	// same-host and loopback (dialer and listener on one host) stay on the
+	// synchronous, zero-delay net.Pipe — byte-identical to the pre-latency
+	// behavior, so the N=1 collapse and any run that sets neither are unaffected.
+	latencyNs, jitterNs := int64(0), int64(0)
 	if l.host != dialerHost {
 		latencyNs = dstNetCrossHostLatencyNs()
+		jitterNs = dstNetCrossHostJitterNs()
 	}
 	var p1, p2 Conn
-	if latencyNs > 0 {
-		p1, p2 = dstWirePair(latencyNs)
+	if latencyNs > 0 || jitterNs > 0 {
+		p1, p2 = dstWirePair(latencyNs, jitterNs)
 	} else {
 		p1, p2 = Pipe()
 	}

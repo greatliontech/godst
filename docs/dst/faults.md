@@ -221,11 +221,12 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   become readable in write order; the simulated link never reorders a live stream. *violation:* a later
   write is delivered before an earlier one (e.g. a future jitter draw not clamped monotone), so a peer
   reads bytes a reliable in-order transport (TCP) could never produce out of order — a soundness false
-  positive while every send is correctly ordered. *Enforced:* each segment's `deliverAt` is computed under
-  the direction's lock together with the append, so append order equals delivery order — monotone even
-  under concurrent writers, no reorder representable (`net/dst_wire.go`); `TestDSTNetLatencyFIFO` (`net`)
-  asserts two time-separated writes arrive in order at their distinct delivery instants. (The jitter fault
-  will add a monotonic clamp when per-segment delays vary.)
+  positive while every send is correctly ordered. *Enforced:* the reader always consumes the head (oldest)
+  segment first (`pop`, `net/dst_wire.go`), so delivery order equals append (write) order *whatever* the
+  per-segment delivery times — a jitter draw varies only *when* a segment is released, and head-of-line
+  bunches a later, smaller-jitter segment behind an earlier one rather than letting it overtake. No reorder
+  is representable, with no `deliverAt` clamp needed. `TestDSTNetLatencyFIFO` (two time-separated writes)
+  and `TestDSTNetJitterFIFO` (a jittered burst) assert in-order delivery (`net`).
 - **DST-NET-LATENCY-DET (entailed: determinism).** A connection's delivery virtual-times are a
   deterministic function of the seed and the configured latency, and a same-host/loopback connection
   delivers instantly. *violation:* delivery timing drawn from a load-dependent source (wall clock, per-m
@@ -344,15 +345,19 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
 
 - **Latency / jitter** — delay delivery by a virtual duration, FIFO preserved (in-order, as TCP). A
   latency policy interposes a deterministic, **fake-clock-driven delivery queue** on the conn
-  (`net/dst_wire.go`): written bytes become readable after the delay (jitter = a per-segment delay drawn
-  from the fault RNG within a range). The **base latency** — every cross-host link's always-on delay even
-  with no fault, load-bearing for HLC where delayed delivery *while clocks differ* is the bug surface — is
-  **landed** as `Options.Network.CrossHostLatency`: a single base-time scalar applied to every
-  distinct-host connection (same-host/loopback instant; default 0, so the N=1 collapse and any run that
-  sets no latency are byte-identical), gated in universe base time so per-host clock skew never changes the
-  wire delay (DST-NET-FIFO, DST-NET-LATENCY-DET). The per-host-pair **matrix** (asymmetric per-link
-  latencies) is the L4 targeting API (`Link("h1","h2").Latency()`); latency *faults* perturb the base. DoF:
-  a real link has latency. Sound — it is a fake timer, the contract `time` already virtualizes.
+  (`net/dst_wire.go`): written bytes become readable after the delay. The **base latency** — every
+  cross-host link's always-on delay even with no fault, load-bearing for HLC where delayed delivery *while
+  clocks differ* is the bug surface — is **landed** as `Options.Network.CrossHostLatency`: a single
+  base-time scalar applied to every distinct-host connection (same-host/loopback instant; default 0, so the
+  N=1 collapse and any run that sets no latency are byte-identical), gated in universe base time so per-host
+  clock skew never changes the wire delay (DST-NET-FIFO, DST-NET-LATENCY-DET). **Jitter** — the first
+  network *fault* — is **landed** as `Options.Network.CrossHostJitter`: each cross-host segment is delayed
+  by the base latency plus a value drawn from `[0, jitter)` by the dedicated, seeded, stream-isolated fault
+  RNG (`dstFaultRand`), so it replays exactly and never perturbs the schedule (DST-FAULT-REPLAY). It only
+  *delays*; FIFO is preserved with no clamp because the reader is head-of-line (a smaller later draw bunches
+  behind an earlier segment, never overtakes it). The per-host-pair **matrix** (asymmetric per-link latency
+  / jitter) is the L4 targeting API (`Link("h1","h2").Latency()`). DoF: a real link has variable latency.
+  Sound — it is a fake timer, the contract `time` already virtualizes.
 - **Partition** — between a host-pair (symmetric or one-directional) or isolating a host, over a virtual
   window. *On connect:* a Dial across the partition either **refuses** (`ECONNREFUSED`, peer-down
   semantics) or **blackholes** (the Dial blocks until its context/deadline — packets-dropped semantics);
@@ -493,16 +498,21 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Encoding when built:* per-fault structural argument + a regression test per fault class that the
-  faulted execution is one the real stack can produce (e.g. a partition only ever yields
-  refuse/blackhole/heal, never a missing byte on a healed stream). *Lands: when the network axis is built
-  (then per later axis).*
+  *Enforced (jitter class landed; each further fault class as it lands):* per-fault structural argument +
+  a regression test per fault class that the faulted execution is one the real stack can produce. Jitter is
+  a real link degree of freedom (variable latency) that only *delays* — bounded to [0, max), never dropping
+  or reordering a live stream (delivery is head-of-line, in order, DST-NET-FIFO): `TestDSTNetJitterBounded`
+  / `TestDSTNetJitterFIFO` (`net`), mutation-tested. (A partition will likewise only ever yield
+  refuse/blackhole/heal, never a missing byte on a healed stream.)
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
-  *Encoding when built:* the dedicated per-bubble `dstFaultRand`, advanced deterministically; a
-  determinism probe (1 distinct over N same-seed runs with faults enabled), mutation-tested. *Lands:
-  network axis.*
+  *Enforced:* the dedicated per-bubble `dstFaultRand` (splitmix64), rooted at activation and re-rooted per
+  bubble, **stream-isolated** from the scheduling RNG by a distinct salt so a fault's draw count never
+  shifts the interleaving; `TestDSTFaultRandStreamIsolation` (`runtime`: fault draws leave the scheduling
+  RNG untouched, and the two roots differ for the same seed) and `TestDSTNetJitterDeterminism` (`net`: same
+  seed → identical jittered delivery, varying with the seed), mutation-tested. (Extends to each further
+  fault class's draws as it lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process**, a file/tree/port to a **host** — and a fault on
   host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a

@@ -14,36 +14,52 @@ import (
 	_ "unsafe" // for go:linkname
 )
 
-// A dstWire is the latency-bearing transport under a simulated cross-host
-// connection. It replaces net.Pipe (the synchronous, zero-latency transport used
-// for same-host connections) when a connection has a non-zero base latency: a
-// byte written at base-time T becomes readable at T+latency, in order, on the
-// deterministic fake clock. It is the seam every network-delivery fault will hook
-// (jitter varies the per-segment delay, throttle paces it by bytes, partition
-// blackholes it) — base latency is its first, constant-delay policy.
+// A dstWire is the delay-bearing transport under a simulated cross-host
+// connection. It replaces net.Pipe (the synchronous, zero-delay transport used for
+// same-host connections) when a cross-host connection has a non-zero base latency
+// OR jitter: a byte written at base-time T becomes readable at T+latency+jitter,
+// in order, on the deterministic fake clock. It is the seam every network-delivery
+// fault hooks (jitter draws the per-segment delay; throttle will pace it by bytes,
+// partition will blackhole it) — base latency and jitter are its first two
+// delivery policies.
 //
 // Two properties make it sound and replay-exact:
 //
-//   - In-order (DST-NET-FIFO): a segment's delivery time is clamped to be no
-//     earlier than the previous segment's, so bytes are never reordered on a live
-//     stream — the contract a reliable in-order transport (TCP) already enforces.
+//   - In-order (DST-NET-FIFO): the reader consumes the head (oldest) segment
+//     first, so delivery is in append (write) order whatever each segment's
+//     delivery time — bytes are never reordered on a live stream, the contract a
+//     reliable in-order transport (TCP) already enforces. No deliverAt clamp is
+//     needed: a later segment with a smaller delay is bunched behind the head
+//     (head-of-line), never overtaking it.
 //   - Base-time gated (DST-NET-LATENCY-DET): delivery is measured in universe
 //     base time (time.Now minus the reader/writer's host clock offset) and waited
-//     out with a relative fake-clock timer, so a configured latency is the same
-//     wire delay regardless of per-host clock skew, and the delivery instants are
-//     a deterministic function of the seed.
+//     out with a relative fake-clock timer, so a configured delay is the same wire
+//     delay regardless of per-host clock skew, and the delivery instants are a
+//     deterministic function of the seed — the jitter draw comes from the
+//     dedicated, stream-isolated fault RNG, so it replays too (DST-FAULT-REPLAY).
 //
 // Unlike net.Pipe, a write is buffered (it returns immediately, modeling a TCP
 // send buffer the propagation delay drains) rather than rendezvousing with the
 // reader; that is exactly the decoupling latency requires. Same-host connections
-// keep net.Pipe's synchronous behavior (latency 0 never constructs a dstWire), so
-// the N=1 collapse and every test that sets no latency are byte-identical.
+// keep net.Pipe's synchronous behavior (neither latency nor jitter ever builds a
+// dstWire for them), so the N=1 collapse and every run that sets neither are
+// byte-identical.
 
 //go:linkname dstClockOffsetNow runtime.dstClockOffsetNow
 func dstClockOffsetNow() int64
 
 //go:linkname dstNetCrossHostLatencyNs runtime.dstNetCrossHostLatencyNs
 func dstNetCrossHostLatencyNs() int64
+
+//go:linkname dstNetCrossHostJitterNs runtime.dstNetCrossHostJitterNs
+func dstNetCrossHostJitterNs() int64
+
+// dstFaultRandN draws a deterministic value in [0,n) from the dedicated, seeded,
+// stream-isolated fault RNG (n<=0 draws nothing) — the source for the per-segment
+// jitter, so injected jitter replays exactly and never perturbs the schedule.
+//
+//go:linkname dstFaultRandN runtime.dstFaultRandN
+func dstFaultRandN(n int64) int64
 
 // dstBaseNanos is the current universe BASE virtual time in nanoseconds: the
 // calling goroutine's host wall clock (time.Now) minus its host clock offset.
@@ -63,10 +79,11 @@ type dstSeg struct {
 
 // dstStream is one direction of a dstWire: a FIFO byte queue whose segments
 // become readable at their base-time deliverAt. The writer appends without
-// blocking (a send buffer); the reader gates on the head segment's deliverAt.
-// deliverAt is computed under mu, so it is monotone non-decreasing in append
-// (write) order — delivery is strictly in order, never reordering a live stream
-// even under concurrent writers (DST-NET-FIFO).
+// blocking (a send buffer); the reader always consumes the head (oldest) segment
+// first, so delivery is strictly in append (write) order whatever the per-segment
+// deliverAt is — a jitter draw varies only WHEN a segment is released (and, via
+// head-of-line, bunches the ones behind it), never the ORDER. So a live stream is
+// never reordered (DST-NET-FIFO) without any need to clamp deliverAt.
 type dstStream struct {
 	mu     sync.Mutex
 	segs   []dstSeg
@@ -86,14 +103,16 @@ func (s *dstStream) wake() {
 	}
 }
 
-// push appends a copy of b for delivery latencyNs base-time nanoseconds from now.
-// Non-blocking (a send buffer). deliverAt is read under mu together with the
-// append, so concurrent writers cannot interleave a lower deliverAt behind a
-// higher one: append order equals base-time order equals delivery order (FIFO).
-func (s *dstStream) push(b []byte, latencyNs int64) {
+// push appends a copy of b for delivery (latencyNs + a jitter draw in [0,jitterNs))
+// base-time nanoseconds from now. Non-blocking (a send buffer). FIFO order needs no
+// clamp: the reader consumes the head first, so a later segment (even one with a
+// smaller jitter draw) is never delivered before an earlier one — head-of-line
+// bunches it instead. jitterNs <= 0 draws nothing (so an inactive jitter fault
+// leaves the fault stream — and every later fault's draw position — untouched).
+func (s *dstStream) push(b []byte, latencyNs, jitterNs int64) {
 	data := append([]byte(nil), b...)
 	s.mu.Lock()
-	at := dstBaseNanos() + latencyNs
+	at := dstBaseNanos() + latencyNs + dstFaultRandN(jitterNs)
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
 	s.mu.Unlock()
 	s.wake()
@@ -147,6 +166,7 @@ func (s *dstStream) pop(b []byte) (n int, eof bool, wait time.Duration) {
 type dstWireEnd struct {
 	out, in   *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
 	latencyNs int64
+	jitterNs  int64 // per-segment delivery jitter is drawn from [0,jitterNs)
 
 	once       sync.Once
 	localDone  chan struct{}
@@ -156,16 +176,16 @@ type dstWireEnd struct {
 	wrDead pipeDeadline
 }
 
-func dstWirePair(latencyNs int64) (Conn, Conn) {
+func dstWirePair(latencyNs, jitterNs int64) (Conn, Conn) {
 	ab, ba := newDstStream(), newDstStream()
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	a := &dstWireEnd{
-		out: ab, in: ba, latencyNs: latencyNs,
+		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs,
 		localDone: doneA, remoteDone: doneB,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
-		out: ba, in: ab, latencyNs: latencyNs,
+		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs,
 		localDone: doneB, remoteDone: doneA,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
@@ -245,7 +265,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	// returns immediately (a TCP send buffer the propagation delay drains). An
 	// unbounded buffer never blocks, so a write deadline only gates entry — until
 	// throttle adds a bounded buffer.
-	e.out.push(b, e.latencyNs)
+	e.out.push(b, e.latencyNs, e.jitterNs)
 	return len(b), nil
 }
 

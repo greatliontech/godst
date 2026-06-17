@@ -5,7 +5,9 @@
 package net
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"testing/simulation"
@@ -318,5 +320,105 @@ func TestDSTNetLatencyDeadline(t *testing.T) {
 	}
 	if !longOK {
 		t.Errorf("response not delivered after the latency elapsed with a generous deadline")
+	}
+}
+
+// TestDSTNetJitterBounded: with CrossHostJitter set, a cross-host segment's
+// one-way delay is the base latency plus a value in [0, jitter) — so it stays
+// within [base, base+jitter) and varies across seeds (the jitter is actually
+// drawn, not a constant).
+func TestDSTNetJitterBounded(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const base = 10 * time.Millisecond
+	const jit = 40 * time.Millisecond
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: base, CrossHostJitter: jit}}
+	seen := map[time.Duration]bool{}
+	for seed := uint64(0); seed < 32; seed++ {
+		oneWay, _ := dstPingPong(t, seed, opts)
+		if oneWay < base || oneWay >= base+jit {
+			t.Errorf("seed %d: one-way delay %v outside [%v, %v)", seed, oneWay, base, base+jit)
+		}
+		seen[oneWay] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("jitter produced a single delay across 32 seeds; it must vary with the seed")
+	}
+}
+
+// TestDSTNetJitterDeterminism: jittered delivery replays exactly for a given seed
+// (DST-FAULT-REPLAY) and the seed steers it (the RTT is not constant across seeds).
+func TestDSTNetJitterDeterminism(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond, CrossHostJitter: 40 * time.Millisecond}}
+	distinct := map[time.Duration]bool{}
+	for seed := uint64(0); seed < 24; seed++ {
+		ow1, rtt1 := dstPingPong(t, seed, opts)
+		ow2, rtt2 := dstPingPong(t, seed, opts)
+		if ow1 != ow2 || rtt1 != rtt2 {
+			t.Fatalf("seed %d: jittered delivery not reproducible: one-way %v vs %v, rtt %v vs %v", seed, ow1, ow2, rtt1, rtt2)
+		}
+		distinct[rtt1] = true
+	}
+	if len(distinct) < 2 {
+		t.Errorf("jittered RTT identical across seeds; jitter must steer with the seed")
+	}
+}
+
+// TestDSTNetJitterFIFO: a burst of back-to-back messages, each given an
+// independent jitter draw, still arrives in order — head-of-line keeps delivery
+// in write order even when a later segment draws a smaller delay (DST-NET-FIFO
+// under jitter).
+func TestDSTNetJitterFIFO(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const N = 12
+	var got []string
+	simulation.RunWith(3, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 5 * time.Millisecond, CrossHostJitter: 50 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					close(done)
+					return
+				}
+				r := bufio.NewReader(c)
+				for i := 0; i < N; i++ {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						break
+					}
+					got = append(got, line[:len(line)-1])
+				}
+				c.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			for i := 0; i < N; i++ {
+				fmt.Fprintf(c, "msg%02d\n", i) // each Write is a separate segment with its own jitter draw
+			}
+			<-done
+			c.Close()
+		})
+	})
+	if len(got) != N {
+		t.Fatalf("received %d/%d messages: %v", len(got), N, got)
+	}
+	for i := 0; i < N; i++ {
+		if want := fmt.Sprintf("msg%02d", i); got[i] != want {
+			t.Errorf("message %d = %q, want %q (jitter reordered the stream)", i, got[i], want)
+		}
 	}
 }
