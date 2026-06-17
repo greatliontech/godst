@@ -214,6 +214,18 @@ func dstSetHostClockOffset(offset int64) (old int64) {
 	return
 }
 
+// dstClockOffsetNow returns the calling goroutine's host clock offset (the
+// nanoseconds time.Now reads ahead of the universe base clock on this host).
+// The simulated network reads it to convert a host-skewed wall reading into
+// universe BASE time: link latency is a base-time duration (a skewed clock
+// shifts time.Now but never durations — the per-host clock contract), so
+// delivery must be gated in base time, consistently across hosts that disagree
+// on wall time. Zero outside a host (and outside simulation). Reached via
+// //go:linkname.
+//
+//go:linkname dstClockOffsetNow
+func dstClockOffsetNow() int64 { return getg().dstClockOffset }
+
 // dstHostSeededClockOffset returns a deterministic per-host wall-clock offset in
 // [-bound, +bound] nanoseconds, a stateless function of the run seed and the host
 // id (testing/simulation.BoundedSkew). It advances no RNG stream — neither a per-g
@@ -786,6 +798,27 @@ var dstMemLimit int64
 //
 //go:linkname dstSetMemLimit
 func dstSetMemLimit(limit int64) { dstMemLimit = limit }
+
+// dstNetCrossHostLatency is the per-run base (always-on) one-way latency in
+// nanoseconds applied to every cross-host simulated TCP connection; 0 (the
+// default, and same-host/loopback always) means instant delivery — byte-identical
+// to a connection with no latency machinery. Set once before the bubble starts
+// (from Options.Network.CrossHostLatency) and reset to 0 after the run, exactly
+// like dstMemLimit, so it is read-only for the run's duration and safe for the
+// simulated network's bubble goroutines to read without synchronization.
+var dstNetCrossHostLatency int64
+
+// dstSetNetCrossHostLatency sets the per-run cross-host base latency. Reached via
+// //go:linkname from testing/simulation's run envelope.
+//
+//go:linkname dstSetNetCrossHostLatency
+func dstSetNetCrossHostLatency(ns int64) { dstNetCrossHostLatency = ns }
+
+// dstNetCrossHostLatencyNs reports the per-run cross-host base latency. Reached
+// via //go:linkname from net (which has no import of runtime).
+//
+//go:linkname dstNetCrossHostLatencyNs
+func dstNetCrossHostLatencyNs() int64 { return dstNetCrossHostLatency }
 
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.

@@ -399,7 +399,7 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
 		}
 	}()
-	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, prefix, false, func() {
+	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, 0, prefix, false, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
 				if pv, ok := dstExplorePanicFP(); ok {

@@ -97,8 +97,11 @@ per-host:
   machinery, exactly what partition/latency faults already express, and adds no physical behavior in a
   deterministic sim.
 - **Conn attribution** records both the host and process of each end (dialer = the `Dial` caller's
-  `dstHost`/`dstProc`; server = the `Listen` caller's, propagated to accepted conns), so net faults target
-  a host-pair (partition) or a process (reset).
+  `dstHost`/`dstProc`; server = the `Listen` caller's host/process — the process that owns the listener and
+  accepts on it — stamped on the conn at Dial), so net faults target a host-pair (partition) or a process
+  (reset). The **host** half is **landed** (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
+  `net/dst.go`), consumed by the base-latency link lookup; the **process** half lands with the reset/crash
+  faults that target a process, at the same Dial stamp.
 - **DNS by hostname is deferred.** Dial by assigned IP:port; `hostname → IP` is a planned minimal sim-DNS
   increment (until then DNS-by-name stays fenced, as today) — a thin lookup over the host IP assignment,
   same address model.
@@ -214,6 +217,26 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   `TestDSTMem{PerProcessAccounting,ChildAttributed,Independent}` assert attribution, and
   `TestDSTMemDeterminism` asserts the budget crossing replays exactly + the counts stay within the
   sub-observable noise band across two same-seed *concurrent* runs (`testing/simulation`), mutation-tested.
+- **DST-NET-FIFO (entailed: in-order delivery / soundness).** On one direction of a connection, bytes
+  become readable in write order; the simulated link never reorders a live stream. *violation:* a later
+  write is delivered before an earlier one (e.g. a future jitter draw not clamped monotone), so a peer
+  reads bytes a reliable in-order transport (TCP) could never produce out of order — a soundness false
+  positive while every send is correctly ordered. *Enforced:* each segment's `deliverAt` is computed under
+  the direction's lock together with the append, so append order equals delivery order — monotone even
+  under concurrent writers, no reorder representable (`net/dst_wire.go`); `TestDSTNetLatencyFIFO` (`net`)
+  asserts two time-separated writes arrive in order at their distinct delivery instants. (The jitter fault
+  will add a monotonic clamp when per-segment delays vary.)
+- **DST-NET-LATENCY-DET (entailed: determinism).** A connection's delivery virtual-times are a
+  deterministic function of the seed and the configured latency, and a same-host/loopback connection
+  delivers instantly. *violation:* delivery timing drawn from a load-dependent source (wall clock, per-m
+  RNG), or measured in host-skewed wall time instead of universe base time, varies run-to-run or with a
+  peer's clock skew — breaking replay (and making a cross-host link's delay depend on which hosts' clocks
+  disagree, the exact HLC bug surface this substrate exists to test). *Enforced:* delivery is gated in
+  base time (`time.Now` minus the calling goroutine's host clock offset) and waited out with a relative
+  fake-clock timer (`net/dst_wire.go`); `TestDSTNetCrossHostLatency` / `TestDSTNetSameHostInstant` /
+  `TestDSTNetLatencyDeterminism` pin the one-way/RTT delay, the same-host-instant rule, and same-seed
+  reproducibility, and `TestDSTNetLatencyDeadline` confirms the delay is a real fake-timer wait (a read
+  deadline shorter than the latency times out before delivery) (`net`), mutation-tested.
 
 (The fault-feature invariants are in the next section.)
 
@@ -320,16 +343,21 @@ Each fault is checked on the conn's `Read`/`Write` and on `Dial`/`Accept`; all a
 reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/message-granular:
 
 - **Latency / jitter** — delay delivery by a virtual duration, FIFO preserved (in-order, as TCP). A
-  latency policy interposes a deterministic, **fake-clock-driven delivery queue** on the conn: written
-  bytes become readable after the delay (jitter = a per-segment delay drawn from the fault RNG within a
-  range). A per-host-pair **base-latency matrix** (a host/network config, default 0 for loopback, a small
-  cross-host default) gives every link non-zero latency even with no fault — load-bearing for HLC, where
-  delayed delivery *while clocks differ* is the bug surface; latency faults perturb the base. DoF: a real
-  link has latency. Sound — it is a fake timer, the contract `time` already virtualizes.
+  latency policy interposes a deterministic, **fake-clock-driven delivery queue** on the conn
+  (`net/dst_wire.go`): written bytes become readable after the delay (jitter = a per-segment delay drawn
+  from the fault RNG within a range). The **base latency** — every cross-host link's always-on delay even
+  with no fault, load-bearing for HLC where delayed delivery *while clocks differ* is the bug surface — is
+  **landed** as `Options.Network.CrossHostLatency`: a single base-time scalar applied to every
+  distinct-host connection (same-host/loopback instant; default 0, so the N=1 collapse and any run that
+  sets no latency are byte-identical), gated in universe base time so per-host clock skew never changes the
+  wire delay (DST-NET-FIFO, DST-NET-LATENCY-DET). The per-host-pair **matrix** (asymmetric per-link
+  latencies) is the L4 targeting API (`Link("h1","h2").Latency()`); latency *faults* perturb the base. DoF:
+  a real link has latency. Sound — it is a fake timer, the contract `time` already virtualizes.
 - **Partition** — between a host-pair (symmetric or one-directional) or isolating a host, over a virtual
   window. *On connect:* a Dial across the partition either **refuses** (`ECONNREFUSED`, peer-down
   semantics) or **blackholes** (the Dial blocks until its context/deadline — packets-dropped semantics);
-  the spec picks which, both real. *On an established conn:* bytes across the partition are blackholed —
+  the mode is **selectable per fault** (the `Fault` record carries refuse | blackhole) — both are real TCP
+  outcomes and a SUT tests against each, so the choice is the SUT's, not hardcoded. *On an established conn:* bytes across the partition are blackholed —
   reads block durably on the fake clock, writes fill a send buffer that never drains — until the
   partition **heals** (in-order delivery resumes; TCP buffers and recovers) or a deadline/`Close` errors
   the conn. DoF: a transient partition. **"Drop" lives here**, at flow granularity — a partition window

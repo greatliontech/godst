@@ -437,6 +437,17 @@ type dstConn struct {
 	closed        atomic.Bool  // this end was Closed by its user
 	reset         *atomic.Bool // connection reset (shared by both ends)
 
+	// localHost/remoteHost attribute the connection's two ends to their owning
+	// hosts (this end's host and the peer's). Stamped at Dial — the dialer's host
+	// and the listening host — and the foundation faults target a connection by:
+	// a host-pair partition/latency/reset acts on exactly the connections whose
+	// {localHost, remoteHost} match the pair (DST-FAULT-VICTIM). The base link
+	// latency is the first consumer: a connection between distinct hosts carries
+	// the configured cross-host delay, a same-host/loopback one is instant.
+	// (Per-process attribution — the owning process of each end — lands with the
+	// reset/crash faults that target a process, at this same Dial stamp.)
+	localHost, remoteHost uint32
+
 	// acceptState tracks a server-end connection through the accept backlog:
 	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
 	// 0→1; the backlog teardown and the dialer's post-send listener-closed
@@ -553,6 +564,7 @@ type dstListener struct {
 	accept  chan Conn
 	done    chan struct{}
 	closed  atomic.Bool
+	host    uint32 // the host that owns this listener (its network identity)
 }
 
 func (l *dstListener) opError(op string, err error) error {
@@ -715,6 +727,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		keys:    scoped,
 		accept:  make(chan Conn, 128), // backlog
 		done:    make(chan struct{}),
+		host:    listeningHost,
 	}
 	for _, k := range scoped {
 		dstNet.listeners[k] = l
@@ -814,10 +827,23 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		localAddr.Zone = localTCPAddr.Zone
 	}
 
-	p1, p2 := Pipe()
+	// Cross-host connections carry the configured base link latency; same-host
+	// and loopback (dialer and listener on one host) stay on the synchronous,
+	// zero-latency net.Pipe — byte-identical to the pre-latency behavior, so the
+	// N=1 collapse and any run that sets no latency are unaffected.
+	latencyNs := int64(0)
+	if l.host != dialerHost {
+		latencyNs = dstNetCrossHostLatencyNs()
+	}
+	var p1, p2 Conn
+	if latencyNs > 0 {
+		p1, p2 = dstWirePair(latencyNs)
+	} else {
+		p1, p2 = Pipe()
+	}
 	reset := new(atomic.Bool)
-	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset}
-	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32)}
+	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host}
+	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost}
 	select {
 	case <-ctx.Done():
 		p1.Close()

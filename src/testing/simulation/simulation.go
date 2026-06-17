@@ -72,6 +72,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 	_ "unsafe" // for go:linkname
 )
 
@@ -164,6 +165,9 @@ func dstClearSimEnv()
 
 //go:linkname dstSetMemLimit runtime.dstSetMemLimit
 func dstSetMemLimit(limit int64)
+
+//go:linkname dstSetNetCrossHostLatency runtime.dstSetNetCrossHostLatency
+func dstSetNetCrossHostLatency(ns int64)
 
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
@@ -267,6 +271,30 @@ type Options struct {
 	// bounds the program's heap growth, not total process RSS; 0 leaves memory
 	// bounded by GOGC (and a floor when GOGC=off).
 	MemoryLimit int64
+
+	// Network configures the simulated in-memory network (the testing/simulation
+	// deterministic net). Today it carries the base cross-host link latency; it
+	// grows as later network-fault axes (partition, reset, throttle) add policy.
+	// The zero value is the plain instant network — byte-identical to no Network
+	// config — so even plain Run keeps today's behavior.
+	Network NetworkConfig
+}
+
+// NetworkConfig configures the simulated network for a run.
+type NetworkConfig struct {
+	// CrossHostLatency is the base one-way delivery latency applied to every
+	// simulated TCP connection between two DISTINCT hosts; same-host and loopback
+	// connections are always instant. The zero value is instant cross-host
+	// delivery — byte-identical to a connection with no latency machinery, so it
+	// does not perturb the N=1 collapse or any test that does not set it.
+	//
+	// It is measured in universe BASE (virtual) time: a per-host clock skew
+	// (HostConfig.Clock) shifts what time.Now reads on a host but never the wire
+	// delay, so two hosts that disagree on wall time still observe the same
+	// latency — the property a clock-skew-tolerant system (e.g. an HLC) is tested
+	// against. Delivery stays in-order (FIFO, as TCP). Per-pair asymmetric
+	// latencies arrive with the targeting API; this is the single base default.
+	CrossHostLatency time.Duration
 }
 
 // default simulated process identity (see Options.Hostname/PID/NumCPU).
@@ -395,7 +423,7 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -413,7 +441,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	var ok bool
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, nil, true, func() {
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	if !ok {
@@ -465,15 +493,15 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, prefix, true, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, prefix, true, f)
 }
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit int64, prefix []uint64, propagateGoexit bool, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs int64, prefix []uint64, propagateGoexit bool, f func()) {
 	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
 	// keeps the sysmon container-aware auto-updater from resizing P count
 	// mid-run); remember whether the process was in auto mode so the restore
@@ -488,12 +516,14 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	}
 	dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
 	dstSetMemLimit(memLimit)
+	dstSetNetCrossHostLatency(netLatencyNs)
 	dstActivate(seed)
 	defer func() {
 		dstDeactivate()
 		dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
 		dstClearSimEnv()
 		dstSetMemLimit(0)
+		dstSetNetCrossHostLatency(0)
 		dstSetAsyncPreemptOff(oldPreempt)
 		if autoProcs {
 			runtime.SetDefaultGOMAXPROCS()

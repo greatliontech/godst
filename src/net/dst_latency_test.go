@@ -1,0 +1,322 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package net
+
+import (
+	"errors"
+	"os"
+	"testing"
+	"testing/simulation"
+	"time"
+)
+
+// These tests exercise the simulated network's base cross-host link latency (the
+// fake-clock-gated delivery-queue wire, dst_wire.go) and the connection host
+// attribution it keys on. The base latency is the substrate every later network
+// delivery fault perturbs; here it is the constant per-link delay.
+//
+// Invariants enforced:
+//   - cross-host delivery takes exactly the configured latency; same-host/loopback
+//     is instant (the attribution-keyed link matrix);
+//   - delivery is in order (DST-NET-FIFO);
+//   - delivery virtual-times replay exactly (DST-NET-LATENCY-DET);
+//   - a read deadline shorter than the latency times out (the wire honors the
+//     fake clock — soundness);
+//   - latency is base-time, so a per-host clock skew does not change the wire delay.
+
+// dstPingPong dials host "A" (the server) from host "B" (the client) with opts,
+// exchanges one request/response, and returns the measured one-way client→server
+// virtual delay and the full round-trip delay. Hosts A and B have no clock skew,
+// so time.Now reads universe base time on both.
+func dstPingPong(t *testing.T, seed uint64, opts simulation.Options) (oneWay, rtt time.Duration) {
+	t.Helper()
+	var writeAt, serverReadAt, clientRespAt time.Time
+	simulation.RunWith(seed, opts, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() { // server
+			ln, err := Listen("tcp", ":0")
+			if err != nil {
+				panic(err)
+			}
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 16)
+				n, _ := c.Read(buf)
+				serverReadAt = time.Now()
+				c.Write(append([]byte("re:"), buf[:n]...))
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() { // client
+			p := <-port
+			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				panic(err)
+			}
+			writeAt = time.Now()
+			c.Write([]byte("ping"))
+			buf := make([]byte, 16)
+			c.Read(buf)
+			clientRespAt = time.Now()
+			c.Close()
+		})
+	})
+	return serverReadAt.Sub(writeAt), clientRespAt.Sub(writeAt)
+}
+
+// TestDSTNetCrossHostLatency: a cross-host connection delivers each byte exactly
+// CrossHostLatency later (one-way), so a request/response round-trip is twice that
+// — measured on the deterministic fake clock.
+func TestDSTNetCrossHostLatency(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const L = 50 * time.Millisecond
+	oneWay, rtt := dstPingPong(t, 1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}})
+	if oneWay != L {
+		t.Errorf("cross-host one-way delay = %v, want %v", oneWay, L)
+	}
+	if rtt != 2*L {
+		t.Errorf("cross-host round-trip delay = %v, want %v", rtt, 2*L)
+	}
+}
+
+// TestDSTNetSameHostInstant: with the same non-zero latency configured, a
+// same-host (loopback) connection is instant — the latency matrix is keyed by
+// host pair, so co-located peers pay nothing (and stay on the synchronous pipe).
+func TestDSTNetSameHostInstant(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var writeAt, serverReadAt time.Time
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func() {
+		simulation.Host("solo", simulation.HostConfig{}, func() {
+			ln, err := Listen("tcp", ":0")
+			if err != nil {
+				panic(err)
+			}
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 16)
+				c.Read(buf)
+				serverReadAt = time.Now()
+				c.Close()
+			}()
+			c, err := Dial("tcp", "127.0.0.1:"+p) // loopback: same host
+			if err != nil {
+				panic(err)
+			}
+			writeAt = time.Now()
+			c.Write([]byte("ping"))
+			c.Close()
+		})
+	})
+	if d := serverReadAt.Sub(writeAt); d != 0 {
+		t.Errorf("same-host loopback delay = %v, want 0 (latency must not apply within a host)", d)
+	}
+}
+
+// TestDSTNetLatencyFIFO: two writes separated by a 10ms gap arrive in order and
+// each delayed by the link latency — delivery never reorders a live stream
+// (DST-NET-FIFO), even though the second segment's delivery instant differs.
+func TestDSTNetLatencyFIFO(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const L = 50 * time.Millisecond
+	var got []string
+	var firstAt, secondAt time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		var base time.Time
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				for i := 0; i < 2; i++ {
+					buf := make([]byte, 16)
+					n, err := c.Read(buf)
+					if err != nil {
+						break
+					}
+					got = append(got, string(buf[:n]))
+					if i == 0 {
+						firstAt = time.Since(base)
+					} else {
+						secondAt = time.Since(base)
+					}
+				}
+				c.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			base = time.Now()
+			c.Write([]byte("first"))
+			time.Sleep(10 * time.Millisecond)
+			c.Write([]byte("second"))
+			<-done
+			c.Close()
+		})
+	})
+	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("delivery order = %v, want [first second]", got)
+	}
+	if firstAt != L {
+		t.Errorf("first segment delivered at %v, want %v", firstAt, L)
+	}
+	if secondAt != 10*time.Millisecond+L {
+		t.Errorf("second segment delivered at %v, want %v", secondAt, 10*time.Millisecond+L)
+	}
+}
+
+// TestDSTNetLatencyDeterminism: the same seed replays the same delivery
+// virtual-times (DST-NET-LATENCY-DET) — checked across a small seed sweep, two
+// runs per seed.
+func TestDSTNetLatencyDeterminism(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 37 * time.Millisecond}}
+	for seed := uint64(0); seed < 16; seed++ {
+		ow1, rtt1 := dstPingPong(t, seed, opts)
+		ow2, rtt2 := dstPingPong(t, seed, opts)
+		if ow1 != ow2 || rtt1 != rtt2 {
+			t.Fatalf("seed %d: delivery timing not reproducible: one-way %v vs %v, rtt %v vs %v", seed, ow1, ow2, rtt1, rtt2)
+		}
+		if ow1 != 37*time.Millisecond {
+			t.Fatalf("seed %d: one-way delay = %v, want 37ms", seed, ow1)
+		}
+	}
+}
+
+// TestDSTNetLatencySkewInvariant: the wire delay is universe BASE time, not
+// host-skewed wall time — so a cross-host link between two hosts whose clocks
+// disagree still delivers exactly CrossHostLatency of base time later (the
+// property an HLC is tested against). Measured by converting each host's skewed
+// wall reading back to base (subtracting its configured offset); the one-way base
+// delay must be exactly L regardless of the skews, and the client's own-clock
+// round trip is exactly 2L (its offset cancels between send and receive).
+func TestDSTNetLatencySkewInvariant(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const (
+		L    = 50 * time.Millisecond
+		offA = 30 * time.Millisecond  // server host clock skew
+		offB = -20 * time.Millisecond // client host clock skew
+	)
+	var writeWall, serverReadWall, clientRespWall time.Time
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{Clock: simulation.Skew(offA)}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 16)
+				c.Read(buf)
+				serverReadWall = time.Now() // host A's skewed wall clock
+				c.Write([]byte("pong"))
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{Clock: simulation.Skew(offB)}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			writeWall = time.Now() // host B's skewed wall clock
+			c.Write([]byte("ping"))
+			buf := make([]byte, 16)
+			c.Read(buf)
+			clientRespWall = time.Now()
+			c.Close()
+		})
+	})
+	// Convert each host-skewed wall reading back to universe base time.
+	oneWayBase := serverReadWall.Add(-offA).Sub(writeWall.Add(-offB))
+	if oneWayBase != L {
+		t.Errorf("base-time one-way delay under skew = %v, want %v (latency must be skew-invariant)", oneWayBase, L)
+	}
+	if rtt := clientRespWall.Sub(writeWall); rtt != 2*L {
+		t.Errorf("client own-clock RTT under skew = %v, want %v (offset must cancel over a round trip)", rtt, 2*L)
+	}
+}
+
+// TestDSTNetLatencyDeadline: a read deadline shorter than the link latency times
+// out before delivery (the wire blocks on the fake clock and honors deadlines);
+// a deadline past the latency delivers. This is the soundness check that latency
+// is a real fake-timer wait, not an unobservable instant transfer.
+func TestDSTNetLatencyDeadline(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const L = 50 * time.Millisecond
+	var shortErr error
+	var longOK bool
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+		port := make(chan string, 1)
+		srvDone := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				defer close(srvDone)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 16)
+				c.Read(buf)
+				c.Write([]byte("pong")) // delivered to the client L later
+				c.Read(buf)             // block until the client closes (EOF), then tear down
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			c.Write([]byte("ping"))
+			// A 20ms deadline expires before the 50ms one-way response arrives.
+			c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+			buf := make([]byte, 16)
+			if _, err := c.Read(buf); err != nil {
+				shortErr = err
+			}
+			// A generous deadline lets the (already in-flight) response arrive.
+			c.SetReadDeadline(time.Now().Add(time.Second))
+			if n, err := c.Read(buf); err == nil && string(buf[:n]) == "pong" {
+				longOK = true
+			}
+			c.Close()
+			<-srvDone // let the server goroutine finish (no dangling bubble goroutine)
+		})
+	})
+	var ne Error
+	if !errors.As(shortErr, &ne) || !ne.Timeout() || !errors.Is(shortErr, os.ErrDeadlineExceeded) {
+		t.Errorf("short read deadline = %v, want timeout wrapping os.ErrDeadlineExceeded", shortErr)
+	}
+	if !longOK {
+		t.Errorf("response not delivered after the latency elapsed with a generous deadline")
+	}
+}
