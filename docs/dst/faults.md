@@ -130,10 +130,15 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
 
 ### Per-process identity and memory accounting
 
-- **Identity split.** Per-**host**: `os.Hostname`, `runtime.NumCPU`, `net.Interfaces` (a fixed synthetic
-  per-host set — retiring the one host-derived identity hole the net section recorded). Per-**process**:
-  `os.Getpid`/`Getppid`, cwd, `os.Getuid`/`Getgid`/user (uniform `7777`/"sim" default; per-process
-  possible later, non-foreclosing — currently constants).
+- **Identity split** — **landed**. Per-**host**: `os.Hostname` (defaults to the host's declared name,
+  `HostConfig.Hostname` overrides), `runtime.NumCPU` (`HostConfig.NumCPU`, else the run default), and
+  `net.Interfaces` (a fixed synthetic per-host set — `lo` plus `eth0` bearing the host's routable
+  `10.0.0.<id>`, retiring the real-NIC nondeterminism the net section recorded). Per-host identity lives in
+  a lock-free copy-on-write `atomic.Pointer` table keyed by `g.dstHost` (the string stays off `g`).
+  Per-**process**: `os.Getpid`/`Getppid` (a fresh per-*invocation* pid on `g.dstPid`, so a restart gets a
+  new pid — no stable-pid), cwd; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
+  (per-process possible later, non-foreclosing). Host 0 / unconfigured uses the run defaults
+  (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is unchanged.
 - **Memory accounting.** Per-process **allocation accounting** extends the existing per-object hook
   (`malloc.go:1225`, where `cur` is already in hand) to also attribute `elemsize` to `cur.dstProc` —
   deterministic, `-race`-invariant, ~free. This is *allocation flow*, **not** true RSS/live-set: faithful
@@ -171,6 +176,23 @@ stamped from the host's config and inherited like `g.dstHost`). This is the prim
   are wrong). *Enforced:* `TestDSTClockDurationPreserved` (`testing/simulation/clock_test.go`) asserts that
   under a non-zero offset an in-bubble interval's `time.Since` and the base-clock advance over a host's
   sleep are byte-identical to offset 0, mutation-tested against the `bubble.now`-corruption implementation.
+- **DST-IDENTITY-DET (entailed: determinism + consistency).** Every goroutine of a host observes one
+  `os.Hostname`/`runtime.NumCPU`; every goroutine of a process observes one `os.Getpid`; distinct
+  hosts/processes observe distinct values; same seed + config → identical run-to-run. *violation:*
+  `os.Hostname`/`Getpid` returns different values on two goroutines of one host/process (an inheritance
+  gap), or a value drawn from a load-dependent source varies run-to-run, so a SUT that derives node ids
+  from them diverges across replays. *Enforced:* per-host identity is a deterministic table keyed by
+  `g.dstHost`, per-process pid is `g.dstPid` inherited at `newproc1` and allocated from a seed-ordered
+  counter; `TestDSTIdentity{PerHostHostname,PerHostNumCPU,PerProcessPid,Determinism}`
+  (`testing/simulation/identity_test.go`), mutation-tested.
+- **DST-IDENTITY-SOUND (entailed: simulated replaces real).** Under an active run the simulated identity
+  fully replaces the real machine's — `os.Hostname`/`Getpid`/`runtime.NumCPU`/`net.Interfaces` never leak
+  the developer's box. *violation:* a real hostname/pid/interface leaks into a run → behavior depends on
+  the dev machine and is unreproducible elsewhere (a soundness break — an execution the simulated universe
+  could not produce identically on another machine). *Enforced:* the accessors gate on the run being active
+  (`dstSimEnvSet` / `dstActive`) and return only synthetic values; `TestDSTIdentitySound`
+  (`testing/simulation`, for hostname/NumCPU/pid) and `TestDSTNetInterfaces` (`net`, the synthetic
+  `lo`+`eth0` set replacing the real NICs).
 
 (The fault-feature invariants are in the next section.)
 

@@ -21,3 +21,7 @@ func dstUnsupportedNetAPI(op, network string, source, addr Addr) error { return 
 func dstUnsupportedDNSLookup(name string) error { return nil }
 
 func dstUnsupportedServiceLookup(network, service string) error { return nil }
+
+func dstInterfaces() []Interface { return nil }
+
+func dstInterfaceAddrs(ifi *Interface) []Addr { return nil }

@@ -111,6 +111,50 @@ func dstHostRoutableIPString(host uint32) string {
 	return dstHostRoutableIP(host).String()
 }
 
+// dstInterfaces is the calling host's fixed synthetic interface set: a loopback
+// (lo) and one Ethernet (eth0) bearing the host's routable IP. Under simulation
+// net.Interfaces returns this instead of the real machine's NICs — deterministic
+// per host and with no real-interface leak (DST-IDENTITY-SOUND), and consistent
+// with the host-owned address model (loopback host-private, eth0 = 10.0.0.<host>).
+func dstInterfaces() []Interface {
+	host, _ := dstNetCurrentNode()
+	return []Interface{
+		{Index: 1, MTU: 65536, Name: "lo", Flags: FlagUp | FlagLoopback | FlagRunning},
+		{Index: 2, MTU: 1500, Name: "eth0", HardwareAddr: dstHostMAC(host), Flags: FlagUp | FlagBroadcast | FlagMulticast | FlagRunning},
+	}
+}
+
+// dstHostMAC is a host's deterministic locally-administered MAC (02:00 prefix, the
+// host id in the low four octets), so a SUT that reads HardwareAddr replays.
+func dstHostMAC(host uint32) HardwareAddr {
+	return HardwareAddr{0x02, 0x00, byte(host >> 24), byte(host >> 16), byte(host >> 8), byte(host)}
+}
+
+// dstInterfaceAddrs returns the unicast addresses of interface ifi in the calling
+// host's synthetic set (lo: 127.0.0.1/8 and ::1/128; eth0: the routable 10.x /24),
+// or every interface's addresses when ifi is nil (net.InterfaceAddrs). An interface
+// not in the synthetic set has no addresses.
+func dstInterfaceAddrs(ifi *Interface) []Addr {
+	host, _ := dstNetCurrentNode()
+	lo := []Addr{
+		&IPNet{IP: IPv4(127, 0, 0, 1), Mask: CIDRMask(8, 32)},
+		&IPNet{IP: ParseIP("::1"), Mask: CIDRMask(128, 128)},
+	}
+	eth0 := []Addr{
+		&IPNet{IP: dstHostRoutableIP(host), Mask: CIDRMask(24, 32)},
+	}
+	switch {
+	case ifi == nil:
+		return append(append([]Addr{}, lo...), eth0...)
+	case ifi.Index == 1:
+		return lo
+	case ifi.Index == 2:
+		return eth0
+	default:
+		return nil
+	}
+}
+
 // dstHostForRoutableIP reports the host a routable 10.x IP encodes (ok=false for a
 // non-routable IP, e.g. loopback).
 func dstHostForRoutableIP(ip IP) (uint32, bool) {

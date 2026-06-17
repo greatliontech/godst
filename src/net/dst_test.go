@@ -482,6 +482,88 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 	})
 }
 
+// TestDSTNetInterfaces verifies net.Interfaces and friends return the calling
+// host's fixed synthetic set (lo + eth0 bearing the host's routable IP) rather than
+// the real machine's NICs — deterministic per host, no real-interface leak
+// (DST-IDENTITY-SOUND), and consistent with the host-owned address model.
+func TestDSTNetInterfaces(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	type view struct {
+		names, addrs            string
+		eth0IP, eth0MAC, byIdx2 string
+		byNameOK, byBadErr      bool
+	}
+	capture := func() view {
+		var v view
+		ifs, err := Interfaces()
+		if err != nil {
+			t.Errorf("Interfaces: %v", err)
+		}
+		var ns []string
+		for i := range ifs {
+			ifi := &ifs[i]
+			ns = append(ns, ifi.Name)
+			if ifi.Name == "eth0" {
+				v.eth0MAC = ifi.HardwareAddr.String()
+				as, _ := ifi.Addrs()
+				for _, a := range as {
+					if ipn, ok := a.(*IPNet); ok && ipn.IP.To4() != nil {
+						v.eth0IP = ipn.String()
+					}
+				}
+			}
+		}
+		v.names = strings.Join(ns, ",")
+		if ifi, err := InterfaceByName("eth0"); err == nil && ifi.Name == "eth0" {
+			v.byNameOK = true
+		}
+		if _, err := InterfaceByName("wlan0"); err != nil {
+			v.byBadErr = true
+		}
+		if ifi, err := InterfaceByIndex(2); err == nil {
+			v.byIdx2 = ifi.Name
+		}
+		all, _ := InterfaceAddrs()
+		var ss []string
+		for _, a := range all {
+			ss = append(ss, a.String())
+		}
+		v.addrs = strings.Join(ss, ",")
+		return v
+	}
+
+	var hA, hB view
+	simulation.Run(1, func() {
+		simulation.Host("hA", simulation.HostConfig{}, func() { hA = capture() }) // id 1 -> 10.0.0.1
+		simulation.Host("hB", simulation.HostConfig{}, func() { hB = capture() }) // id 2 -> 10.0.0.2
+	})
+
+	for _, tc := range []struct {
+		got, want, what string
+	}{
+		{hA.names, "lo,eth0", "hA synthetic interface set (real NICs must not leak)"},
+		{hB.names, "lo,eth0", "hB synthetic interface set"},
+		{hA.eth0IP, "10.0.0.1/24", "hA eth0 address"},
+		{hB.eth0IP, "10.0.0.2/24", "hB eth0 address"},
+		{hA.byIdx2, "eth0", "hA InterfaceByIndex(2)"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.what, tc.got, tc.want)
+		}
+	}
+	if !hA.byNameOK || !hA.byBadErr {
+		t.Errorf("hA lookups: InterfaceByName(eth0)ok=%v InterfaceByName(wlan0)err=%v", hA.byNameOK, hA.byBadErr)
+	}
+	if !strings.Contains(hA.addrs, "10.0.0.1/24") || !strings.Contains(hA.addrs, "127.0.0.1/8") || !strings.Contains(hA.addrs, "::1/128") {
+		t.Errorf("hA InterfaceAddrs = %q, want loopback + routable", hA.addrs)
+	}
+	if hA.eth0MAC == hB.eth0MAC {
+		t.Errorf("hA and hB share eth0 MAC %q, want per-host", hA.eth0MAC)
+	}
+}
+
 // TestDSTNetHostIsolation exercises the per-host network: cross-host reach via a
 // host's routable IP (simulation.HostIP), host-private loopback, per-host port
 // space, and the can't-bind-a-foreign-IP rule.
