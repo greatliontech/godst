@@ -128,13 +128,18 @@ tolerate*, so it cannot be a single global clock.
   timer shifts by the offset). Storing the offset **per host** (not per goroutine) is what lets a *step* move
   a whole host's subtree at once mid-run — a per-g snapshot, fixed at goroutine creation, could not. A nil
   table / unconfigured host reads 0: the N=1 collapse, byte-identical to the universe-global clock.
-- **Step is landed; drift follows.** *Step* (an NTP jump) and *drift* (`rate ≠ 1`) perturb `offset_h(t)`
-  dynamically over the same representation `wall = f_h(base)` (offset = `base + c`, drift = `base*rate + c`,
-  the same function slot). **Step — landed**: `simulation.StepClock(host, delta)` adds (forward or backward)
-  to the host's table entry mid-run (`runtime.dstStepHostClock`), shifting only the wall reading; timer
-  deadlines, which read the base clock, are untouched. **Drift** (which needs a per-host *monotonic* clock
-  and rate-aware deadline conversion at the synctest wake — it must also scale *durations*, which step and
-  offset deliberately do not) follows. See "Clock faults".
+- **Step and drift are landed.** *Step* (an NTP jump) and *drift* (`rate ≠ 1`) perturb `offset_h(t)`
+  over the same representation `wall = f_h(base)`. The implemented per-host clock is the **anchored** form
+  `wall = base + offset + (base − t0)·ppb/1e9` — a skew/step `offset` plus a rate departure of `ppb`
+  parts-per-billion accumulated from an anchor `t0` (the base time the rate took effect). It is equivalent
+  to `base·rate + c` but has no discontinuity when the rate is applied, and composes additively with the
+  offset (rate 1 / `ppb` 0 is exactly the offset case). **Step — landed**: `simulation.StepClock(host, delta)`
+  adds (forward or backward) to `offset` mid-run (`runtime.dstStepHostClock`), shifting only the wall reading.
+  **Drift — landed (constant rate)**: `simulation.Drift(ppb)` sets a host's rate at declaration; the wall
+  reading drifts, and a relative timer's host-duration `d` is converted to base `d/rate` at the single timer
+  arm choke (`runtime.dstTimerArmForDrift` at `(*timer).modify`), so a rate-r host's `d`-timer fires after
+  `d/r` of base. Mid-run rate change (`DriftClock`) and seeded drift are deferred
+  (`docs/issues/clock-drift-dynamic.md`). See "Clock faults".
 
 ### Per-process identity and memory accounting
 
@@ -182,10 +187,12 @@ tolerate*, so it cannot be a single global clock.
   delta at a schedule-deterministic point; `TestDSTClockDeterminism` / `TestDSTClockBoundedSeeded` probe a
   skewed multi-host run across two same-seed runs and across seeds, and `TestDSTClockStepDeterminism` extends
   it to a step schedule (`testing/simulation/clock_test.go`), mutation-tested.
-- **DST-CLOCK-DURATION (entailed: the clock perturbs reads, not timer deadlines).** A per-host wall offset —
+- **DST-CLOCK-DURATION (entailed: an *offset* perturbs reads, not timer deadlines).** A per-host wall offset —
   static (skew) or stepped (`StepClock`) — shifts only `time.Now()`'s wall reading, never the base clock
   (`bubble.now`), the monotonic source, or timer deadlines, so relative timers (`time.After`, context
-  deadlines) fire at the same base time on every host regardless of skew or step. (A wall-derived *duration*
+  deadlines) fire at the same base time on every host regardless of skew or step. (Drift is the deliberate
+  exception: a *rate* ≠ 1 does convert timer deadlines — DST-CLOCK-DRIFT-DURATION below. This invariant scopes
+  to the offset legs.) (A wall-derived *duration*
   across a step does reflect the step — the recorded soundness boundary under "Clock faults"; a static skew
   cancels in the subtraction, so it preserves durations.) *violation:* folding the offset into the shared
   base clock (`bubble.now`) fires a skewed/stepped host's 1 s relative timer early/late, while a naive
@@ -194,6 +201,24 @@ tolerate*, so it cannot be a single global clock.
   in-bubble interval's `time.Since` and the base-clock advance over a host's sleep are byte-identical to
   offset 0) and `TestDSTClockStepTimerImmune` (a step mid-flight does not move a pending timer's base firing)
   (`testing/simulation/clock_test.go`), mutation-tested against the `bubble.now`-corruption implementation.
+- **DST-CLOCK-DRIFT-DURATION (entailed: a *rate* scales durations and deadlines coherently).** A host whose
+  clock runs at rate `r` (`Drift(ppb)`, `r = 1 + ppb/1e9`) reads `time.Now`/`time.Since` advancing `r×` base,
+  *and* its relative timers fire after the rate-converted base interval — a rate-r host's `d`-timer fires
+  after `d/r` of base. The two are coherent: a host cannot detect its own drift (its `time.Since` over its own
+  `Sleep(d)` reads back `d`, exact for exact-dividing rates and within the integer-floor rounding ~`r+1` ns
+  otherwise). *violation:* drifting the wall reading but firing timers at the unconverted base `d` (a rate-2
+  host's 1 s timer firing after 1 s of base = 2 s of its own time), or converting deadlines but not the wall
+  — either makes the host's own clock self-inconsistent, a state no real crystal produces. *Enforced:* the
+  wall split adds `(base−t0)·ppb/1e9` and the single timer choke `(*timer).modify` converts `d→d·1e9/(1e9+ppb)`
+  (overflow-safe integer floor, mutation-tested against a `big.Int` oracle); `TestDSTClockDrift{Wall,
+  TimerConversion,Ticker,SelfConsistent,Property}` (`testing/simulation/clock_drift_test.go`).
+- **DST-CLOCK-DRIFT-MONOTONIC (entailed: a drifting clock still moves forward).** A drift rate is strictly
+  positive (`ppb > -1e9`, rate in (0, 2]); a clock that stops or reverses is a *step* (a discontinuous wall
+  jump), not drift. So a drifting host's `time.Now` advances monotonically across base advances, fast or slow.
+  *violation:* a non-positive rate (a frozen or backward-running clock with no NTP step) — the
+  DST-FAULT-SOUND counterexample "a clock that runs backward with no NTP step". *Enforced:* `simulation.Drift`
+  rejects `ppb ≤ -1e9` and the runtime clamps defensively; `TestDSTClockDriftMonotonic` /
+  `TestDSTClockDriftRateValidation`, mutation-tested.
 - **DST-IDENTITY-DET (entailed: determinism + consistency).** Every goroutine of a host observes one
   `os.Hostname`/`runtime.NumCPU`; every goroutine of a process observes one `os.Getpid`; distinct
   hosts/processes observe distinct values; same seed + config → identical run-to-run. *violation:*
@@ -459,10 +484,20 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   interleaving. Per-host victim isolation, timer-deadline immunity, forward/backward steps, accumulation
   over a base skew, and seed-deterministic replay are enforced by `TestDSTClockStep*`
   (`testing/simulation/clock_test.go`), mutation-tested.
-- **Drift** — a host's clock rate departs from 1 over a window (runs fast/slow), drawn from the fault RNG
-  or declared. Needs the per-host *monotonic* clock and rate-aware deadline conversion at the synctest
-  wake (the harder increment — step and offset ship over the wall split alone; drift fills the same
-  `wall = f_h(base)` slot but must additionally scale *durations* and convert relative-timer deadlines).
+- **Drift** — **landed (constant rate)**. A host's clock rate departs from 1 (runs fast/slow), declared at
+  Host declaration by `simulation.Drift(ppb)` (parts-per-billion; rate `1 + ppb/1e9`, rate in (0, 2]). Unlike
+  step/offset, drift scales *durations* and *deadlines*: the wall reading drifts (`(base−t0)·ppb/1e9` added at
+  the wall split), and a relative timer's host-duration `d` is converted to base `d/rate` at the single timer
+  arm choke `(*timer).modify` (`runtime.dstTimerArmForDrift`) — through which every Sleep / After / NewTimer /
+  NewTicker / AfterFunc / context deadline funnels, the periodic ticker re-arm reusing the converted period.
+  The conversion is an overflow-safe integer floor (clamped, never wrapping). So the *monotonic* clock the
+  earlier design note anticipated is realized as the wall reading itself (bubble durations are wall-based), and
+  the "rate-aware deadline conversion at the synctest wake" as arm-time conversion — equivalent for a constant
+  rate, simpler than re-walking the heap (that re-walk is what mid-run rate change needs, the deferred
+  increment). Enforced by `TestDSTClockDrift*` (`testing/simulation/clock_drift_test.go`), mutation-tested,
+  incl. a `big.Int` oracle for the conversion and a direct overflow-clamp regression. **Deferred**
+  (`docs/issues/clock-drift-dynamic.md`): mid-run rate change (`DriftClock`, the pending-timer re-walk) and
+  the fault-RNG-drawn (seeded) rate. The `wall = f_h(base)` representation does not change for those.
 
 **Soundness boundary (recorded, contractual).** In a simulation bubble `time.Now()` carries no monotonic
 component (the synctest design — it returns `mono = 0`), so a *duration* is a wall-clock subtraction. A
@@ -559,9 +594,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Enforced (jitter + throttle + partition + clock-step classes landed; each further fault class as it
-  lands):* per-fault structural argument + a regression test per fault class that the faulted execution is
-  one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
+  *Enforced (jitter + throttle + partition + clock-step + clock-drift classes landed; each further fault
+  class as it lands):* per-fault structural argument + a regression test per fault class that the faulted
+  execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
   *delays* — bounded to [0, max), never dropping or reordering a live stream (delivery is head-of-line, in
   order, DST-NET-FIFO): `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link
   bandwidth, modeled per-flow as an independent B-capacity link (a real dedicated link, so ⊆ real),
@@ -572,7 +607,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   never fires a timer before its base deadline and the only failures it surfaces are real wall-clock ones —
   `TestDSTClockStepBackward` (wall goes backward, the HLC adversary) / `TestDSTClockStepTimerImmune` (a
   pending timer's base firing is unmoved); the wall-derived-duration boundary is recorded contractually
-  under "Clock faults".
+  under "Clock faults". A **clock drift** is a real crystal running fast/slow: its rate is strictly positive
+  (DST-CLOCK-DRIFT-MONOTONIC, never a backward-running clock without a step), and a host's own clock stays
+  self-consistent (its `d`-timer fires after exactly `d` of its own time) — so the only failures it surfaces
+  are the real ones of two nodes' clocks advancing at different rates: `TestDSTClockDriftSelfConsistent` /
+  `TestDSTClockDriftMonotonic` / `TestDSTClockDriftRateValidation`.
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -582,8 +621,10 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   RNG untouched, and the two roots differ for the same seed) and `TestDSTNetJitterDeterminism` (`net`: same
   seed → identical jittered delivery, varying with the seed), mutation-tested. The **clock step** takes an
   explicit delta rather than a fault draw, so its replay rides the deterministic schedule directly (no RNG):
-  `TestDSTClockStepDeterminism` (same seed + same `StepClock` sequence → identical readings). (Extends to
-  each further fault class's draws as it lands.)
+  `TestDSTClockStepDeterminism` (same seed + same `StepClock` sequence → identical readings). **Clock drift**
+  likewise takes an explicit declared rate (the seeded leg is deferred), so the same seed + same `Drift`
+  config replays identically: `TestDSTClockDriftDeterminism`. (Extends to each further fault class's draws as
+  it lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process**, a file/tree/port to a **host** — and a fault on
   host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a
@@ -596,10 +637,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   check that blocks all pairs once any partition exists fails it). The **process leg** is landed with reset
   (`dstConn.localProc`/`remoteProc`; `TestDSTNetResetVictim` asserts an A-B reset spares an A-C conn,
   `TestDSTNetResetProcess` that `ResetProcess(p)` resets exactly p's conns — both ends). The **clock leg**
-  is landed with the step: `StepClock(host)` shifts exactly the named host's per-host offset entry (keyed by
-  host id), so a step on hA leaves hB and the root untouched — `TestDSTClockStepVictim` (hA's goroutines
-  move together, hB reads 0), mutation-tested (a read that ignores the host id fails it). A file's host
-  extends it as the disk faults land.
+  is landed with the step and drift: `StepClock(host)` shifts exactly the named host's per-host offset entry,
+  and `Drift(host rate)` sets exactly that host's rate (both keyed by host id), so a fault on hA leaves hB and
+  the root untouched — `TestDSTClockStepVictim` and `TestDSTClockDriftVictim` (a rate-2 host A wakes at base
+  0.5 s while a rate-1 host B still wakes at 1 s), each mutation-tested (a read that ignores the host id fails
+  it). A file's host extends it as the disk faults land.
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
@@ -625,7 +667,8 @@ adversarial loop.
   uid / cwd, per-**process** allocation accounting. Establishes DST-NODE-ISOLATION and DST-CLOCK-DET. No
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
-  clock **step** — **done**, **drift** next; disk (EIO / ENOSPC / latency), scheduling (straggler), OOM
+  clock **step** — **done**, **drift** (constant rate) — **done** (mid-run rate change + seeded drift
+  deferred, `docs/issues/clock-drift-dynamic.md`); disk (EIO / ENOSPC / latency), scheduling (straggler), OOM
   (allocation-triggered process crash), process crash + host crash, restart — pending. Establishes
   DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded

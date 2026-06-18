@@ -201,23 +201,45 @@ func dstCurrentNode() (host, proc uint32) {
 // dozens of hosts (a restart reuses the name's id, so it does not consume the budget).
 const dstMaxSimHosts = 4096
 
-// dstHostClockTable is the per-run per-host wall-clock offset vector, indexed by host
-// id (slot 0 unused: host 0 is the universe root/driver, always in sync with the base
-// clock). Allocated once (dstHostClockEnsure) and never grown, so its backing array is
-// stable for the run — the time.Now wall split reads it on every reading under
-// simulation and a clock step mutates one entry with a single atomic op, so a fixed
-// array keeps the read path race-free (a grow-on-demand table would race the copy
-// against a concurrent read). The offset is MUTABLE, unlike the immutable identity
-// table dstHostIdent: testing/simulation.StepClock adds to a host's entry mid-run.
-// That is exactly why the per-host clock lives here and not on g — a per-g snapshot,
-// set at goroutine creation, could not be moved for a host's already-running
-// goroutines when a step fires. Keying reads by g.dstHost (inherited at newproc1)
-// makes every goroutine of a host observe its host's CURRENT offset.
+// dstHostClockTable is the per-run per-host clock vector, indexed by host id (slot 0
+// unused: host 0 is the universe root/driver, always in sync with the base clock).
+// Allocated once (dstHostClockEnsure) and never grown, so its backing array is stable
+// for the run — the time.Now wall split reads it on every reading under simulation and
+// a clock step/drift mutates one entry with atomic ops, so a fixed array keeps the read
+// path race-free (a grow-on-demand table would race the copy against a concurrent
+// read). Each entry is MUTABLE, unlike the immutable identity table dstHostIdent:
+// StepClock adds to offset mid-run (and a mid-run rate change is a planned follow-on).
+// That is why the per-host clock lives here and not on g — a per-g snapshot, set at goroutine creation,
+// could not be moved for a host's already-running goroutines. Keying reads by g.dstHost
+// (inherited at newproc1) makes every goroutine of a host observe its host's CURRENT
+// clock.
+//
+// A host's wall reading is wall = base + offset + drift, where the drift term
+// (base − driftT0)·driftPPB/1e9 accumulates a rate departure of driftPPB parts-per-billion
+// from base time, anchored at driftT0 (the base time the rate took effect). driftPPB 0
+// is rate 1 (no drift): the drift term is 0 and an entry behaves as the pure skew/step
+// offset, byte-identical to before drift existed.
+type dstHostClockEntry struct {
+	offset   atomic.Int64 // wall skew/step in ns (Skew/BoundedSkew set it, StepClock adds)
+	driftPPB atomic.Int64 // clock-rate departure in parts-per-billion (0 = rate 1); rate = 1 + driftPPB/1e9
+	driftT0  atomic.Int64 // base-time anchor (ns) from which the drift term accumulates
+}
+
 type dstHostClockTable struct {
-	off [dstMaxSimHosts]atomic.Int64
+	ent [dstMaxSimHosts]dstHostClockEntry
 }
 
 var dstHostClock atomic.Pointer[dstHostClockTable]
+
+// dstDriftPPBBase is the parts-per-billion scale of a clock rate: rate =
+// (dstDriftPPBBase + driftPPB) / dstDriftPPBBase. driftPPB 0 is rate 1, +dstDriftPPBBase
+// is rate 2. driftPPB must stay > -dstDriftPPBBase so the rate stays positive — a stopped
+// or reversed clock is a step, not drift (DST-CLOCK-DRIFT-MONOTONIC) — and ≤ dstMaxDriftPPB
+// so the integer rate arithmetic (dstDriftAccum / dstDriftToBase) cannot overflow.
+const (
+	dstDriftPPBBase = 1_000_000_000   // 1e9
+	dstMaxDriftPPB  = dstDriftPPBBase // rate in (0, 2]
+)
 
 // dstHostClockEnsure allocates the per-run clock table on first use and bounds the
 // host id. Fixed-size, so this never grows or copies it; concurrent first uses each
@@ -236,17 +258,76 @@ func dstHostClockEnsure(host uint32) {
 	}
 }
 
-// dstHostClockOffset returns host's current wall-clock offset (the nanoseconds
-// time.Now reads ahead of the universe base clock on that host), 0 if none is set.
-// Host 0 (the root/driver) is always in sync. A lock-free atomic load of the fixed
-// table; on the time.Now wall-split path under an active simulation. nil table (no
-// host ever set a clock or stepped) reads 0, so an unconfigured run is byte-identical.
-func dstHostClockOffset(host uint32) int64 {
+// dstDriftAccum returns the wall drift accumulated over an elapsed base interval at a
+// rate departure of ppb parts-per-billion: elapsed·ppb/1e9, computed exactly in int64
+// without overflow. elapsed·ppb can exceed int64 over a long run, so it is split as
+// (elapsed/1e9)·ppb + (elapsed%1e9)·ppb/1e9 — each term in range for |ppb| ≤ dstMaxDriftPPB.
+// elapsed < 0 (a reading before the anchor, not reachable in-spec) yields 0.
+func dstDriftAccum(elapsed, ppb int64) int64 {
+	if ppb == 0 || elapsed <= 0 {
+		return 0
+	}
+	q := elapsed / dstDriftPPBBase
+	r := elapsed % dstDriftPPBBase
+	return q*ppb + r*ppb/dstDriftPPBBase
+}
+
+// dstDriftToBase converts a host-perceived duration d (ns) to the base-time duration it
+// occupies on a clock with rate departure ppb: d·1e9/(1e9+ppb) = d/rate. The divisor
+// den = 1e9 + ppb is > 0 for ppb > -1e9. d·1e9 can exceed int64, so it is split as
+// (d/den)·1e9 + (d%den)·1e9/den, overflow-safe for |ppb| ≤ dstMaxDriftPPB. A result that
+// would still overflow int64 — reachable only with an extreme slow clock (ppb near -1e9)
+// over a multi-century duration — is clamped to maxWhen, so the timer simply never fires
+// rather than wrapping negative (a negative when would trip modify's positivity throw).
+// BOTH terms of the sum are checked, not just the high one. Linknamed for direct testing.
+//
+//go:linkname dstDriftToBase
+func dstDriftToBase(d, ppb int64) int64 {
+	if ppb == 0 || d <= 0 {
+		return d
+	}
+	den := int64(dstDriftPPBBase) + ppb // rate·1e9, > 0 for ppb > -1e9
+	a := d / den
+	b := d % den
+	if a > maxWhen/dstDriftPPBBase {
+		return maxWhen // a·1e9 alone would overflow
+	}
+	hi := a * dstDriftPPBBase
+	lo := b * dstDriftPPBBase / den // < 1e9, since b < den
+	if hi > maxWhen-lo {
+		return maxWhen // hi + lo would overflow
+	}
+	return hi + lo
+}
+
+// dstHostWallAdjust returns the nanoseconds host's wall clock reads ahead of base time
+// at base time `base`: the skew/step offset plus the accumulated drift. Host 0 and a nil
+// table read 0 (in sync). A lock-free atomic load of the fixed table; on the time.Now
+// wall-split path under an active simulation.
+func dstHostWallAdjust(host uint32, base int64) int64 {
+	if host == 0 || host >= dstMaxSimHosts {
+		return 0
+	}
+	t := dstHostClock.Load()
+	if t == nil {
+		return 0
+	}
+	e := &t.ent[host]
+	adj := e.offset.Load()
+	if ppb := e.driftPPB.Load(); ppb != 0 {
+		adj += dstDriftAccum(base-e.driftT0.Load(), ppb)
+	}
+	return adj
+}
+
+// dstHostDriftPPB returns host's clock-rate departure in parts-per-billion (0 = rate 1),
+// read by the timer-arm conversion (dstTimerArmForDrift). Host 0 / nil table is rate 1.
+func dstHostDriftPPB(host uint32) int64 {
 	if host == 0 || host >= dstMaxSimHosts {
 		return 0
 	}
 	if t := dstHostClock.Load(); t != nil {
-		return t.off[host].Load()
+		return t.ent[host].driftPPB.Load()
 	}
 	return 0
 }
@@ -259,7 +340,7 @@ func dstHostClockOffset(host uint32) int64 {
 // g.dstHost (saved/restored by Host's dstSetNode) and applies to the host's whole
 // subtree, including goroutines created later — the basis the dynamic step builds on.
 // This is the per-host clock function wall = f_h(base) (docs/dst/faults.md "Per-host
-// clock") in its constant case base + offset_h. Reached via //go:linkname.
+// clock"). Reached via //go:linkname.
 //
 //go:linkname dstSetHostClockOffset
 func dstSetHostClockOffset(host uint32, offset int64) {
@@ -267,7 +348,7 @@ func dstSetHostClockOffset(host uint32, offset int64) {
 		return
 	}
 	dstHostClockEnsure(host)
-	dstHostClock.Load().off[host].Store(offset)
+	dstHostClock.Load().ent[host].offset.Store(offset)
 }
 
 // dstStepHostClock applies an instantaneous wall-clock step of delta nanoseconds to
@@ -286,22 +367,86 @@ func dstStepHostClock(host uint32, delta int64) {
 		return
 	}
 	dstHostClockEnsure(host)
-	dstHostClock.Load().off[host].Add(delta)
+	dstHostClock.Load().ent[host].offset.Add(delta)
 }
 
-// dstClockOffsetNow returns the calling goroutine's host clock offset (the
-// nanoseconds time.Now reads ahead of the universe base clock on this host).
-// The simulated network reads it to convert a host-skewed wall reading into
-// universe BASE time: link latency is a base-time duration (a skewed clock
-// shifts time.Now but never durations — the per-host clock contract), so
-// delivery must be gated in base time, consistently across hosts that disagree
-// on wall time. It reads the host's CURRENT offset, so a step's wall jump and the
-// matching offset shift cancel (base = wall − offset is step-invariant, as it must
-// be — a step moves wall, not base time). Zero outside a host (and outside
-// simulation). Reached via //go:linkname.
+// dstSetHostDrift sets host's clock rate to a departure of ppb parts-per-billion from
+// base time, anchored at the current base time, called by testing/simulation.Host for a
+// Drift clock config. The host's wall then advances at rate 1 + ppb/1e9 and its relative
+// timers fire after the rate-converted base interval (dstTimerArmForDrift). ppb must be
+// in (-1e9, dstMaxDriftPPB] (rate in (0, 2]); simulation.Drift validates, and the runtime
+// clamps defensively so the rate can never reach 0/negative (a stopped/reversed clock is
+// a step, not drift). A no-op outside a run. Reached via //go:linkname.
+//
+//go:linkname dstSetHostDrift
+func dstSetHostDrift(host uint32, ppb int64) {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return
+	}
+	if ppb <= -dstDriftPPBBase {
+		ppb = -dstDriftPPBBase + 1 // rate stays > 0
+	} else if ppb > dstMaxDriftPPB {
+		ppb = dstMaxDriftPPB
+	}
+	dstHostClockEnsure(host)
+	e := &dstHostClock.Load().ent[host]
+	// Anchor before publishing the rate, so a reader that observes a non-zero driftPPB
+	// also observes the matching driftT0 (coherent under the single-P cooperative
+	// schedule DST runs on, like the rest of the per-host clock state).
+	e.driftT0.Store(b.now)
+	e.driftPPB.Store(ppb)
+}
+
+// dstClockOffsetNow returns the calling goroutine's host wall adjustment now (the
+// nanoseconds time.Now reads ahead of the universe base clock on this host, skew plus
+// accumulated drift). The simulated network reads it to convert a host-skewed wall
+// reading into universe BASE time: link latency is a base-time duration, so delivery
+// must be gated in base time consistently across hosts that disagree on wall time. It
+// reads the host's CURRENT adjustment, so a step's wall jump (and a drifting host's
+// accumulated wall) cancel against the matching reading — base = wall − adjustment stays
+// base-invariant, as it must (a clock fault moves wall, not base time). Zero outside a
+// bubble. Reached via //go:linkname.
 //
 //go:linkname dstClockOffsetNow
-func dstClockOffsetNow() int64 { return dstHostClockOffset(getg().dstHost) }
+func dstClockOffsetNow() int64 {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return 0
+	}
+	return dstHostWallAdjust(gp.dstHost, b.now)
+}
+
+// dstTimerArmForDrift converts a timer's absolute fire time `when` and repeat `period`
+// from the arming host's perceived time to universe base time, for a host whose clock
+// drifts (rate ≠ 1). A relative arm reaches the runtime as when = bubble.now + d and
+// period = the interval, both in the host's perceived ns; on a rate-r host that duration
+// occupies d/r of base time, so the timer must fire at when = now + (when−now)/r and
+// repeat every period/r of base. Identity for rate 1 (driftPPB 0) and outside a bubble,
+// so non-drifting timers and non-dst builds are unaffected. Called at the single timer
+// choke point (*timer).modify, through which every Sleep / After / NewTimer / NewTicker /
+// AfterFunc and context deadline funnels (the periodic re-arm reuses the converted
+// period, so ticks stay rate-correct without re-entering modify).
+func dstTimerArmForDrift(when, period int64) (int64, int64) {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return when, period
+	}
+	ppb := dstHostDriftPPB(gp.dstHost)
+	if ppb == 0 {
+		return when, period
+	}
+	if now := b.now; when > now {
+		when = now + dstDriftToBase(when-now, ppb)
+	}
+	if period > 0 {
+		period = dstDriftToBase(period, ppb)
+	}
+	return when, period
+}
 
 // dstHostSeededClockOffset returns a deterministic per-host wall-clock offset in
 // [-bound, +bound] nanoseconds, a stateless function of the run seed and the host

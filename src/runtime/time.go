@@ -31,8 +31,9 @@ func time_runtimeNow() (sec int64, nsec int32, mono int64) {
 			// still fire at the same base time. Folds away in non-dst builds (dstActive
 			// is a constant false), leaving the reading byte-identical. See
 			// runtime.dstSetHostClockOffset/dstStepHostClock and docs/dst/faults.md
-			// "Per-host clock" / "Clock faults".
-			wall += dstHostClockOffset(gp.dstHost)
+			// "Per-host clock" / "Clock faults". The adjustment includes a drifting
+			// host's accumulated wall departure (rate ≠ 1), a function of base time.
+			wall += dstHostWallAdjust(gp.dstHost, bubble.now)
 		}
 		sec = wall / (1000 * 1000 * 1000)
 		nsec = int32(wall % (1000 * 1000 * 1000))
@@ -593,6 +594,17 @@ func (t *timer) modify(when, period int64, f func(arg any, seq uintptr, delay in
 	}
 	if period < 0 {
 		throw("timer period must be non-negative")
+	}
+	if dstActive() && t.isFake {
+		// Under a drifting host's clock (rate ≠ 1), convert the arming host's perceived
+		// fire time and repeat interval to universe base time, so a rate-r host's d-timer
+		// fires after d/r of base. This is the single timer choke point every relative
+		// arm (Sleep/After/NewTimer/NewTicker/AfterFunc/context) funnels through; identity
+		// for rate 1, so non-drifting timers are unchanged. Folds away in non-dst builds.
+		// Gated on t.isFake — only a bubble's simulated timers are in base time; a real-FD
+		// poll deadline (non-fake) carries real-monotonic time, which must not be rate-
+		// converted against bubble.now (real I/O in a bubble is out of the simulation).
+		when, period = dstTimerArmForDrift(when, period)
 	}
 	async := debug.asynctimerchan.Load() != 0
 

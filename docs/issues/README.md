@@ -15,6 +15,10 @@ deletes the resolved entry.
 - [net-partition-directional](net-partition-directional.md) — `Lands:` when
   asymmetric-partition scenarios are needed. The partition fault implements
   **symmetric** cuts; the spec also allows **one-directional** partitions, deferred.
+- [clock-drift-dynamic](clock-drift-dynamic.md) — `Lands:` mid-run rate change in the
+  next drift chunk (D2); seeded/fault-RNG drift with fault orchestration. The drift fault
+  landed as a **declared, constant** per-host rate; the spec's mid-run ("over a window")
+  and fault-RNG-drawn legs are deferred.
 
 The remaining planned roadmap work (the rest of fault orchestration) is tracked in
 the design.md Roadmap, not here — it gets an issue doc when it is scoped into chunks.

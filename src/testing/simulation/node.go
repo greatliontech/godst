@@ -31,6 +31,9 @@ func dstCurrentNode() (host, proc uint32)
 //go:linkname dstSetHostClockOffset runtime.dstSetHostClockOffset
 func dstSetHostClockOffset(host uint32, offset int64)
 
+//go:linkname dstSetHostDrift runtime.dstSetHostDrift
+func dstSetHostDrift(host uint32, ppb int64)
+
 //go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
 func dstHostSeededClockOffset(hostid uint32, bound int64) int64
 
@@ -84,19 +87,31 @@ type HostConfig struct {
 	NumCPU int
 }
 
+// driftPPBBase is the parts-per-billion scale of a clock rate: rate = 1 + ppb/1e9.
+// A host's drift must keep the rate positive (ppb > -driftPPBBase) — a stopped or
+// reversed clock is a step, not drift — and is bounded to rate ≤ 2 (ppb ≤
+// maxDriftPPB) so the runtime's integer rate arithmetic cannot overflow. Realistic
+// crystal drift is parts-per-million (ppb in the thousands), far inside this range.
+const (
+	driftPPBBase = 1_000_000_000 // 1e9
+	maxDriftPPB  = driftPPBBase  // rate in (0, 2]
+)
+
 // ClockConfig describes a host's wall clock as a function of the universe base
-// virtual clock (docs/dst/faults.md "Per-host clock"). Today it expresses a static
-// wall offset — the clock skew an HLC and other time-sensitive distributed systems
-// are built to tolerate. The offset shifts only what time.Now reads on the host,
-// never durations or timer deadlines, so relative timers fire at the same base time
-// on every host. Build one with Skew (a fixed offset) or BoundedSkew (a per-host
-// offset drawn from the seed within a bound). The zero value is no skew. A step (an
-// NTP jump, forward or backward) is injected mid-run over this same representation by
-// StepClock; drift (rate != 1) is a later fault-layer axis.
+// virtual clock (docs/dst/faults.md "Per-host clock"): a static wall offset (skew)
+// and/or a rate departure (drift). The offset shifts only what time.Now reads on the
+// host. Drift (rate ≠ 1) additionally makes the host's wall advance faster/slower than
+// base and its relative timers fire after the rate-converted interval — a crystal that
+// runs fast or slow, which time-sensitive distributed systems must tolerate. Build one
+// with Skew (a fixed offset), BoundedSkew (a per-host seeded offset), or Drift (a rate);
+// compose skew and drift with Skew(d).WithDrift(ppb). The zero value is an in-sync clock.
+// A step (an NTP jump) is injected mid-run by StepClock; a mid-run rate change is a
+// planned follow-on (docs/issues/clock-drift-dynamic.md).
 type ClockConfig struct {
-	seeded bool          // false: fixed offset; true: offset seeded within ±bound
-	offset time.Duration // static wall offset (when !seeded)
-	bound  time.Duration // seeded offset is drawn from [-bound, +bound] (when seeded)
+	seeded   bool          // false: fixed offset; true: offset seeded within ±bound
+	offset   time.Duration // static wall offset (when !seeded)
+	bound    time.Duration // seeded offset is drawn from [-bound, +bound] (when seeded)
+	driftPPB int64         // clock-rate departure in parts-per-billion (0 = rate 1)
 }
 
 // Skew returns a ClockConfig that puts the host's wall clock a fixed offset ahead
@@ -115,6 +130,30 @@ func Skew(offset time.Duration) ClockConfig {
 // hand. A non-positive bound is no skew.
 func BoundedSkew(bound time.Duration) ClockConfig {
 	return ClockConfig{seeded: true, bound: bound}
+}
+
+// Drift returns a ClockConfig whose wall clock runs at rate 1 + ppb/1e9 — a departure
+// of ppb parts-per-billion from base time. ppb > 0 runs fast (a 2× clock is ppb 1e9),
+// ppb < 0 runs slow; the rate is constant for the host's life. A drifting host's
+// time.Now and time.Since advance at the rate, and its relative timers (Sleep, After,
+// NewTimer, NewTicker, context deadlines) fire after the rate-converted base interval —
+// a rate-r host's d-timer fires after d/r of base time. ppb must be in (-1e9, 1e9]
+// (rate in (0, 2]); Drift panics otherwise (a non-positive or reversed rate is a step,
+// not drift). Realistic crystal drift is a few parts-per-million.
+func Drift(ppb int64) ClockConfig {
+	return ClockConfig{}.WithDrift(ppb)
+}
+
+// WithDrift returns a copy of c with the clock rate set to a departure of ppb
+// parts-per-billion (see Drift), so a skew and a drift compose: Skew(d).WithDrift(ppb)
+// is a host that is both offset by d and running at rate 1 + ppb/1e9. It panics if ppb
+// is out of (-1e9, 1e9].
+func (c ClockConfig) WithDrift(ppb int64) ClockConfig {
+	if ppb <= -driftPPBBase || ppb > maxDriftPPB {
+		panic("testing/simulation: Drift ppb out of range (-1e9, 1e9]; rate must be in (0, 2]")
+	}
+	c.driftPPB = ppb
+	return c
 }
 
 // offsetNanos resolves the configured clock to a concrete wall offset in
@@ -199,13 +238,17 @@ func Host(name string, config HostConfig, f func()) {
 	setHostIdent(hid, hostname, config.NumCPU)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
-	// Establish the host's configured clock offset in the per-host table (keyed by
-	// host id). No save/restore: the offset is read via g.dstHost, which dstSetNode
-	// already saves and restores, so after f returns the caller reads its own host's
-	// clock again; the table entry persists for hid's long-lived goroutines that
-	// outlive this call. A re-declaration (restart) overwrites it, re-establishing the
-	// base clock. StepClock adds to this entry mid-run.
+	// Establish the host's configured clock (offset, and rate if drifting) in the
+	// per-host table (keyed by host id). No save/restore: the clock is read via
+	// g.dstHost, which dstSetNode already saves and restores, so after f returns the
+	// caller reads its own host's clock again; the table entry persists for hid's
+	// long-lived goroutines that outlive this call. A re-declaration (restart) overwrites
+	// it, re-establishing the base clock. StepClock adds to the offset mid-run (a mid-run
+	// rate change is a planned follow-on).
 	dstSetHostClockOffset(hid, config.Clock.offsetNanos(hid))
+	if config.Clock.driftPPB != 0 {
+		dstSetHostDrift(hid, config.Clock.driftPPB)
+	}
 	defer dstSetNode(oldH, oldP)
 	f()
 }
