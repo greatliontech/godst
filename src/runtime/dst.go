@@ -132,7 +132,6 @@ func dstActivate(seed uint64) {
 	// how it leaves the simulated process identity unset.
 	getg().dstHost = 0
 	getg().dstProc = 0
-	getg().dstClockOffset = 0
 	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
 	dstFaultRand.Store(dstFaultRoot(seed))
@@ -195,24 +194,99 @@ func dstCurrentNode() (host, proc uint32) {
 	return gp.dstHost, gp.dstProc
 }
 
-// dstSetHostClockOffset stamps the calling goroutine's per-host wall-clock offset
-// (nanoseconds) and returns the previous value, so testing/simulation.Host can
-// restore it when its body returns. Like dstHost/dstProc the offset inherits to
-// child goroutines at newproc1 (the labeled subtree), so stamping the Host body's
-// goroutine applies the host's clock to its whole subtree; Process does not touch
-// it (a process inherits its host's clock). It shifts only time.Now's wall reading
-// inside an active run (runtime/time.go time_runtimeNow); monotonic time and timer
-// deadlines, which read bubble.now directly, are unaffected — a static offset
-// preserves durations. This is the L2 collapse of the per-host clock function
-// wall = f_h(base) (docs/dst/faults.md "Per-host clock"): the constant case
-// base + offset_h. Reached via //go:linkname.
+// dstMaxSimHosts bounds the distinct hosts (Host names) a single run may declare
+// for per-host clock state. Like dstMaxSimProcs it fixes the clock table's size so
+// the time.Now read path never races a table growth; a run that declares more panics
+// loudly (no silent drop). Generous: realistic simulations declare a handful to
+// dozens of hosts (a restart reuses the name's id, so it does not consume the budget).
+const dstMaxSimHosts = 4096
+
+// dstHostClockTable is the per-run per-host wall-clock offset vector, indexed by host
+// id (slot 0 unused: host 0 is the universe root/driver, always in sync with the base
+// clock). Allocated once (dstHostClockEnsure) and never grown, so its backing array is
+// stable for the run — the time.Now wall split reads it on every reading under
+// simulation and a clock step mutates one entry with a single atomic op, so a fixed
+// array keeps the read path race-free (a grow-on-demand table would race the copy
+// against a concurrent read). The offset is MUTABLE, unlike the immutable identity
+// table dstHostIdent: testing/simulation.StepClock adds to a host's entry mid-run.
+// That is exactly why the per-host clock lives here and not on g — a per-g snapshot,
+// set at goroutine creation, could not be moved for a host's already-running
+// goroutines when a step fires. Keying reads by g.dstHost (inherited at newproc1)
+// makes every goroutine of a host observe its host's CURRENT offset.
+type dstHostClockTable struct {
+	off [dstMaxSimHosts]atomic.Int64
+}
+
+var dstHostClock atomic.Pointer[dstHostClockTable]
+
+// dstHostClockEnsure allocates the per-run clock table on first use and bounds the
+// host id. Fixed-size, so this never grows or copies it; concurrent first uses each
+// build a fresh zero table and CAS-publish, the losers discarding theirs (no copy →
+// no race with the read path). Mirrors dstProcAllocEnsure. Linknamed so the bound
+// test can drive the choke point directly (like dstProcAllocEnsure).
+//
+//go:linkname dstHostClockEnsure
+func dstHostClockEnsure(host uint32) {
+	if host >= dstMaxSimHosts {
+		var buf [20]byte
+		panic("testing/simulation: too many distinct hosts for per-host clock (limit " + string(itoa(buf[:], dstMaxSimHosts)) + ")")
+	}
+	if dstHostClock.Load() == nil {
+		dstHostClock.CompareAndSwap(nil, new(dstHostClockTable))
+	}
+}
+
+// dstHostClockOffset returns host's current wall-clock offset (the nanoseconds
+// time.Now reads ahead of the universe base clock on that host), 0 if none is set.
+// Host 0 (the root/driver) is always in sync. A lock-free atomic load of the fixed
+// table; on the time.Now wall-split path under an active simulation. nil table (no
+// host ever set a clock or stepped) reads 0, so an unconfigured run is byte-identical.
+func dstHostClockOffset(host uint32) int64 {
+	if host == 0 || host >= dstMaxSimHosts {
+		return 0
+	}
+	if t := dstHostClock.Load(); t != nil {
+		return t.off[host].Load()
+	}
+	return 0
+}
+
+// dstSetHostClockOffset sets host's wall-clock offset (nanoseconds), called by
+// testing/simulation.Host to establish the host's configured skew. It OVERWRITES (not
+// adds), so re-declaring a host (a restart) re-establishes its base clock, discarding
+// any prior step. A no-op outside a run (no bubble): Host outside a simulation has no
+// clock to set. The offset is keyed by host id, not stamped on g, so it follows
+// g.dstHost (saved/restored by Host's dstSetNode) and applies to the host's whole
+// subtree, including goroutines created later — the basis the dynamic step builds on.
+// This is the per-host clock function wall = f_h(base) (docs/dst/faults.md "Per-host
+// clock") in its constant case base + offset_h. Reached via //go:linkname.
 //
 //go:linkname dstSetHostClockOffset
-func dstSetHostClockOffset(offset int64) (old int64) {
-	gp := getg()
-	old = gp.dstClockOffset
-	gp.dstClockOffset = offset
-	return
+func dstSetHostClockOffset(host uint32, offset int64) {
+	if getg().bubble == nil {
+		return
+	}
+	dstHostClockEnsure(host)
+	dstHostClock.Load().off[host].Store(offset)
+}
+
+// dstStepHostClock applies an instantaneous wall-clock step of delta nanoseconds to
+// host's clock (testing/simulation.StepClock) — a positive delta jumps the host's
+// time.Now forward, a negative delta backward (an NTP slew/correction; a backward step
+// is the HLC adversary). It ADDS to the host's current offset, so successive steps
+// accumulate, and shifts only the wall reading: timer deadlines and the synctest
+// advance read bubble.now directly and are untouched, so relative timers (time.After,
+// context deadlines) fire at the same base time regardless of a step. It affects
+// exactly host's subtree (keyed by host id) and no other host (DST-FAULT-VICTIM). A
+// no-op outside a run or for a zero step. Reached via //go:linkname.
+//
+//go:linkname dstStepHostClock
+func dstStepHostClock(host uint32, delta int64) {
+	if delta == 0 || getg().bubble == nil {
+		return
+	}
+	dstHostClockEnsure(host)
+	dstHostClock.Load().off[host].Add(delta)
 }
 
 // dstClockOffsetNow returns the calling goroutine's host clock offset (the
@@ -221,11 +295,13 @@ func dstSetHostClockOffset(offset int64) (old int64) {
 // universe BASE time: link latency is a base-time duration (a skewed clock
 // shifts time.Now but never durations — the per-host clock contract), so
 // delivery must be gated in base time, consistently across hosts that disagree
-// on wall time. Zero outside a host (and outside simulation). Reached via
-// //go:linkname.
+// on wall time. It reads the host's CURRENT offset, so a step's wall jump and the
+// matching offset shift cancel (base = wall − offset is step-invariant, as it must
+// be — a step moves wall, not base time). Zero outside a host (and outside
+// simulation). Reached via //go:linkname.
 //
 //go:linkname dstClockOffsetNow
-func dstClockOffsetNow() int64 { return getg().dstClockOffset }
+func dstClockOffsetNow() int64 { return dstHostClockOffset(getg().dstHost) }
 
 // dstHostSeededClockOffset returns a deterministic per-host wall-clock offset in
 // [-bound, +bound] nanoseconds, a stateless function of the run seed and the host
@@ -633,6 +709,7 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(int32(pid))
 	dstProcAlloc.Store(nil)
+	dstHostClock.Store(nil)
 }
 
 // dstClearSimEnv stops simulating process identity (run end).
@@ -646,6 +723,7 @@ func dstClearSimEnv() {
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(0)
 	dstProcAlloc.Store(nil)
+	dstHostClock.Store(nil)
 }
 
 // dstSetHostIdent records host's simulated hostname and NumCPU (numcpu 0 = use the

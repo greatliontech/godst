@@ -5448,11 +5448,13 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// parent — the labeled-subtree tree, extended exactly as dstrand extends the
 		// per-g RNG tree (testing/simulation.Host/Process stamp it on a subtree
 		// root). Identity, not scheduling state, so it is copied here and NOT cleared
-		// by dstClearSchedState below. The clock offset rides with the host identity
-		// so co-located processes and the host's whole subtree share one clock.
+		// by dstClearSchedState below. The host's clock offset is not copied here: it
+		// lives in a per-host table keyed by dstHost (dst.go dstHostClock), so the
+		// child inherits its host's clock implicitly via dstHost and observes the
+		// host's CURRENT offset (including any later StepClock), which a per-g snapshot
+		// could not.
 		newg.dstHost = callergp.dstHost
 		newg.dstProc = callergp.dstProc
-		newg.dstClockOffset = callergp.dstClockOffset
 		newg.dstPid = callergp.dstPid
 		dstClearSchedState(newg)
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {

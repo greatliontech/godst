@@ -29,7 +29,7 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
 func dstCurrentNode() (host, proc uint32)
 
 //go:linkname dstSetHostClockOffset runtime.dstSetHostClockOffset
-func dstSetHostClockOffset(offset int64) (old int64)
+func dstSetHostClockOffset(host uint32, offset int64)
 
 //go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
 func dstHostSeededClockOffset(hostid uint32, bound int64) int64
@@ -90,9 +90,9 @@ type HostConfig struct {
 // are built to tolerate. The offset shifts only what time.Now reads on the host,
 // never durations or timer deadlines, so relative timers fire at the same base time
 // on every host. Build one with Skew (a fixed offset) or BoundedSkew (a per-host
-// offset drawn from the seed within a bound). The zero value is no skew. Dynamic
-// clock perturbation — drift (rate != 1) and step (an NTP jump) — is a later
-// fault-layer axis over this same representation.
+// offset drawn from the seed within a bound). The zero value is no skew. A step (an
+// NTP jump, forward or backward) is injected mid-run over this same representation by
+// StepClock; drift (rate != 1) is a later fault-layer axis.
 type ClockConfig struct {
 	seeded bool          // false: fixed offset; true: offset seeded within ±bound
 	offset time.Duration // static wall offset (when !seeded)
@@ -177,10 +177,12 @@ func internProc(name string) uint32 {
 // Host runs f as the named host with the given configuration. Goroutines f starts
 // (and their descendants) belong to host name, sharing its filesystem and network
 // identity and its clock (config.Clock); a Process started within f runs on this
-// host. Host stamps the running goroutine's host identity and clock offset for the
-// dynamic extent of f and restores them on return — they inherit at goroutine
-// creation, so the stamp labels the whole subtree and the subtree's long-lived
-// goroutines outlive the Host call. Hosts and processes may be declared at any time
+// host. Host stamps the running goroutine's host identity for the dynamic extent of f
+// and restores it on return — it inherits at goroutine creation, so the stamp labels
+// the whole subtree and the subtree's long-lived goroutines outlive the Host call. The
+// host's clock offset is recorded in a per-host table keyed by that identity, so it
+// likewise applies to the whole subtree and can be moved mid-run by StepClock. Hosts
+// and processes may be declared at any time
 // during a run, including mid-run to model a node joining; re-declaring a host with
 // the same name and a seeded clock (BoundedSkew) yields the same offset, so a
 // restart keeps the host's clock. The host's hostname (os.Hostname, default the host
@@ -197,11 +199,14 @@ func Host(name string, config HostConfig, f func()) {
 	setHostIdent(hid, hostname, config.NumCPU)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
-	oldOff := dstSetHostClockOffset(config.Clock.offsetNanos(hid))
-	defer func() {
-		dstSetHostClockOffset(oldOff)
-		dstSetNode(oldH, oldP)
-	}()
+	// Establish the host's configured clock offset in the per-host table (keyed by
+	// host id). No save/restore: the offset is read via g.dstHost, which dstSetNode
+	// already saves and restores, so after f returns the caller reads its own host's
+	// clock again; the table entry persists for hid's long-lived goroutines that
+	// outlive this call. A re-declaration (restart) overwrites it, re-establishing the
+	// base clock. StepClock adds to this entry mid-run.
+	dstSetHostClockOffset(hid, config.Clock.offsetNanos(hid))
+	defer dstSetNode(oldH, oldP)
 	f()
 }
 

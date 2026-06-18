@@ -240,14 +240,14 @@ func synctestRun(f func()) {
 			// bubble.main does not replay the run caller's draw sequence,
 			// which would alias a SUT goroutine's stream with the drain's).
 			bubble.main.dstrand = dstBubbleMainRoot(dstSeed.Load())
-			// Root the bubble main's host/process identity at the default (0,0), its
-			// clock offset at 0 (in sync with the base clock), and its pid at the run's
-			// root pid (dstSimPID, the host-0/proc-0 driver pid); Host/Process stamp
-			// subtrees from there. Explicit (not relying on inheritance) so a reused g
-			// cannot carry a stale identity, skew, or pid in.
+			// Root the bubble main's host/process identity at the default (0,0) and its
+			// pid at the run's root pid (dstSimPID, the host-0/proc-0 driver pid);
+			// Host/Process stamp subtrees from there. Explicit (not relying on
+			// inheritance) so a reused g cannot carry a stale identity or pid in. The
+			// clock offset is not a g field: host 0's offset is 0 (dstHostClockOffset
+			// returns 0 for host 0), so the bubble main is in sync with the base clock.
 			bubble.main.dstHost = 0
 			bubble.main.dstProc = 0
-			bubble.main.dstClockOffset = 0
 			bubble.main.dstPid = int32(dstSimPID)
 			// Re-root the scheduling RNG at this bubble too, so the seeded
 			// interleaving (which runnable goroutine proceeds next) is reproducible

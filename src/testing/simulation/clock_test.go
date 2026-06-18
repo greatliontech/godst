@@ -7,9 +7,14 @@
 package simulation
 
 import (
+	"math/rand"
 	"testing"
 	"time"
+	_ "unsafe" // for go:linkname
 )
+
+//go:linkname dstHostClockEnsure runtime.dstHostClockEnsure
+func dstHostClockEnsure(host uint32)
 
 // TestDSTClockSkewApplied verifies the per-host clock substrate (docs/dst/faults.md
 // "Per-host clock"): a host's configured offset shifts what time.Now reads on that
@@ -165,8 +170,10 @@ func TestDSTClockBoundedSeeded(t *testing.T) {
 }
 
 // TestDSTClockN1Collapse pins the N=1 collapse: a host with no clock config (or an
-// explicit Skew(0)) is in sync with the universe base clock, so its time.Now reads
-// identically to the root — byte-identical to pre-feature behavior.
+// explicit Skew(0)) is in sync with the universe base clock, so its time.Now wall
+// reading is identical to the root — byte-identical to the pre-feature universe-global
+// clock. (The truly host-free program never allocates the per-host clock table at all;
+// here the claim is about the observable reading, not internal allocation.)
 func TestDSTClockN1Collapse(t *testing.T) {
 	var rootT, plainHostT, zeroSkewT time.Time
 	Run(1, func() {
@@ -180,4 +187,389 @@ func TestDSTClockN1Collapse(t *testing.T) {
 	if !zeroSkewT.Equal(rootT) {
 		t.Errorf("Skew(0) host wall = %v, want root wall %v", zeroSkewT, rootT)
 	}
+}
+
+// The following tests exercise the STEP clock fault (StepClock — a sudden NTP
+// slew/correction over the per-host clock seam, docs/dst/faults.md "Clock faults").
+// A step shifts only what time.Now reads on the victim host; timer deadlines read the
+// base clock and are untouched. Each reads "before" and "after" across a StepClock
+// that the harness arranges at a FROZEN base instant — the readers park on a channel
+// (channel ops never advance the synctest clock, only timer waits do), so the only
+// change between the two readings is the step, and after.Sub(before) is exactly the
+// step with no base advance to subtract out.
+
+// TestDSTClockStepForward: a forward step jumps the host's time.Now ahead by the step,
+// and does not touch another host's clock (the root, host 0, here).
+func TestDSTClockStepForward(t *testing.T) {
+	const step = 500 * time.Millisecond
+	var before, after, rootBefore, rootAfter time.Time
+	Run(1, func() {
+		ready := make(chan struct{})
+		go1 := make(chan struct{})
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				before = time.Now()
+				close(ready)
+				<-go1
+				after = time.Now()
+				close(done)
+			}()
+		})
+		<-ready
+		rootBefore = time.Now()
+		StepClock("h", step)
+		rootAfter = time.Now()
+		close(go1)
+		<-done
+	})
+	if got := after.Sub(before); got != step {
+		t.Errorf("forward step: host time.Now jumped %v across StepClock(+%v), want %v", got, step, step)
+	}
+	if !rootBefore.Equal(rootAfter) {
+		t.Errorf("root clock moved across a StepClock on host h: %v != %v (a step on h must not touch host 0, and the base must be frozen)", rootBefore, rootAfter)
+	}
+}
+
+// TestDSTClockStepBackward: a backward step makes the host's wall time go backward —
+// exactly the adversary an HLC is built to tolerate (DST-FAULT-SOUND clock class: a
+// real NTP correction can move wall backward).
+func TestDSTClockStepBackward(t *testing.T) {
+	const step = -300 * time.Millisecond
+	var before, after time.Time
+	Run(1, func() {
+		ready := make(chan struct{})
+		go1 := make(chan struct{})
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				before = time.Now()
+				close(ready)
+				<-go1
+				after = time.Now()
+				close(done)
+			}()
+		})
+		<-ready
+		StepClock("h", step)
+		close(go1)
+		<-done
+	})
+	if got := after.Sub(before); got != step {
+		t.Errorf("backward step: host time.Now moved %v across StepClock(%v), want %v", got, step, step)
+	}
+	if !after.Before(before) {
+		t.Errorf("backward step: after=%v is not before before=%v — wall must go backward (the HLC adversary)", after, before)
+	}
+}
+
+// TestDSTClockStepTimerImmune is the load-bearing soundness test: a step shifts only
+// the wall reading, never timer deadlines. A relative timer armed on a host BEFORE a
+// step still fires after exactly its delay in BASE time, regardless of a large
+// concurrent step — so timeouts/leases built on timers and contexts are step-immune
+// (DST-CLOCK-DURATION, dynamic case). Base advance is measured on the root (host 0,
+// unstepped), so it is the true base elapsed.
+func TestDSTClockStepTimerImmune(t *testing.T) {
+	const delay = 1 * time.Second
+	const step = 5 * time.Second
+	var baseAdvance time.Duration
+	Run(1, func() {
+		armed := make(chan struct{})
+		fired := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				timer := time.After(delay) // armed at base T0
+				close(armed)
+				<-timer
+				close(fired)
+			}()
+		})
+		<-armed
+		rootStart := time.Now() // root (host 0): base T0
+		StepClock("h", step)    // step h forward 5s while its timer is pending
+		<-fired
+		baseAdvance = time.Since(rootStart)
+	})
+	if baseAdvance != delay {
+		t.Errorf("relative timer on a stepped host fired after %v of base time, want %v (a step must not move timer deadlines)", baseAdvance, delay)
+	}
+}
+
+// TestDSTClockStepVictim enforces DST-FAULT-VICTIM for the clock leg: StepClock(hA)
+// moves every goroutine of host hA together and leaves host hB untouched.
+func TestDSTClockStepVictim(t *testing.T) {
+	const step = 700 * time.Millisecond
+	var aDelta, a2Delta, bDelta time.Duration
+	Run(1, func() {
+		ready := make(chan struct{}, 3)
+		go1 := make(chan struct{})
+		done := make(chan struct{}, 3)
+		measure := func(d *time.Duration) {
+			b := time.Now()
+			ready <- struct{}{}
+			<-go1
+			*d = time.Now().Sub(b)
+			done <- struct{}{}
+		}
+		Host("hA", HostConfig{}, func() {
+			go measure(&aDelta) // two goroutines of hA must move together
+			go measure(&a2Delta)
+		})
+		Host("hB", HostConfig{}, func() {
+			go measure(&bDelta) // hB must not move
+		})
+		<-ready
+		<-ready
+		<-ready
+		StepClock("hA", step) // only hA
+		close(go1)
+		<-done
+		<-done
+		<-done
+	})
+	if aDelta != step || a2Delta != step {
+		t.Errorf("hA goroutines moved %v/%v across StepClock(hA,+%v), want %v each (a step moves the host's whole subtree)", aDelta, a2Delta, step, step)
+	}
+	if bDelta != 0 {
+		t.Errorf("hB moved %v across StepClock(hA,...), want 0 (DST-FAULT-VICTIM: a step on hA must not touch hB)", bDelta)
+	}
+}
+
+// TestDSTClockStepAccumulate: successive steps add, on top of a configured base skew —
+// the host's offset is base skew + the sum of its steps.
+func TestDSTClockStepAccumulate(t *testing.T) {
+	const base = 100 * time.Millisecond
+	const s1 = 250 * time.Millisecond
+	const s2 = -90 * time.Millisecond
+	var before, after time.Time
+	Run(1, func() {
+		ready := make(chan struct{})
+		go1 := make(chan struct{})
+		done := make(chan struct{})
+		Host("h", HostConfig{Clock: Skew(base)}, func() {
+			go func() {
+				before = time.Now()
+				close(ready)
+				<-go1
+				after = time.Now()
+				close(done)
+			}()
+		})
+		<-ready
+		StepClock("h", s1)
+		StepClock("h", s2)
+		close(go1)
+		<-done
+	})
+	if got := after.Sub(before); got != s1+s2 {
+		t.Errorf("accumulated steps over a base skew: host moved %v, want %v (steps add on top of the configured skew)", got, s1+s2)
+	}
+}
+
+// TestDSTClockStepDeterminism enforces DST-FAULT-REPLAY / DST-CLOCK-DET for steps: the
+// same seed and the same step schedule produce identical readings, including a reading
+// after a relative timer fires (the step does not perturb the timer).
+func TestDSTClockStepDeterminism(t *testing.T) {
+	run := func() (time.Time, time.Time) {
+		var a, b time.Time
+		Run(7, func() {
+			ready := make(chan struct{})
+			go1 := make(chan struct{})
+			done := make(chan struct{})
+			Host("h", HostConfig{Clock: Skew(40 * time.Millisecond)}, func() {
+				go func() {
+					close(ready)
+					<-go1
+					a = time.Now()
+					<-time.After(100 * time.Millisecond)
+					b = time.Now()
+					close(done)
+				}()
+			})
+			<-ready
+			StepClock("h", 250*time.Millisecond)
+			StepClock("h", -80*time.Millisecond)
+			close(go1)
+			<-done
+		})
+		return a, b
+	}
+	a1, b1 := run()
+	a2, b2 := run()
+	if !a1.Equal(a2) || !b1.Equal(b2) {
+		t.Errorf("stepped-clock readings not reproducible across same-seed runs: a %v/%v, b %v/%v", a1, a2, b1, b2)
+	}
+}
+
+// stepFrozen runs body inside a host "h" whose worker reads time.Now into *before,
+// then parks; the harness calls do (which arranges steps at a frozen base instant —
+// channel handoffs never advance the synctest clock), then the worker reads *after.
+// So *after − *before isolates exactly what do() did to h's clock, with no base
+// advance to subtract. config configures h's base clock.
+func stepFrozen(config HostConfig, do func(), before, after *time.Time) {
+	Run(1, func() {
+		ready := make(chan struct{})
+		go1 := make(chan struct{})
+		done := make(chan struct{})
+		Host("h", config, func() {
+			go func() {
+				*before = time.Now()
+				close(ready)
+				<-go1
+				*after = time.Now()
+				close(done)
+			}()
+		})
+		<-ready
+		do()
+		close(go1)
+		<-done
+	})
+}
+
+// TestDSTClockStepProperty is the property/fuzz coverage behind the example pins: for
+// an arbitrary delta the host's wall jumps by EXACTLY that delta, and for an arbitrary
+// SEQUENCE of steps over an arbitrary base skew the host lands at base + the sum of the
+// steps (steps are atomic adds, so they compose and commute with the skew). Inputs are
+// drawn by a test-local deterministic PRNG (NOT the DST RNG) and generated outside Run,
+// so the test itself is reproducible; the magnitudes stay within ±~2s so the assertions
+// are about the arithmetic, not time-representation extremes.
+func TestDSTClockStepProperty(t *testing.T) {
+	rng := rand.New(rand.NewSource(0xC10C57E9))
+
+	// Single step: wall jumps by exactly delta, forward and backward, edges included.
+	deltas := []time.Duration{
+		0, 1, -1,
+		time.Nanosecond, -time.Nanosecond,
+		time.Millisecond, -time.Millisecond,
+		time.Second, -time.Second,
+	}
+	for i := 0; i < 80; i++ {
+		deltas = append(deltas, time.Duration(rng.Int63n(2_000_000_001)-1_000_000_000))
+	}
+	for _, d := range deltas {
+		var before, after time.Time
+		stepFrozen(HostConfig{}, func() { StepClock("h", d) }, &before, &after)
+		if got := after.Sub(before); got != d {
+			t.Fatalf("single step %v: host wall jumped %v, want exactly %v", d, got, d)
+		}
+	}
+
+	// Step sequence over a base skew: lands at sum(steps), independent of the skew.
+	for trial := 0; trial < 50; trial++ {
+		baseSkew := time.Duration(rng.Int63n(200_000_001) - 100_000_000)
+		n := 1 + rng.Intn(6)
+		steps := make([]time.Duration, n)
+		var sum time.Duration
+		for j := range steps {
+			steps[j] = time.Duration(rng.Int63n(400_000_001) - 200_000_000)
+			sum += steps[j]
+		}
+		var before, after time.Time
+		stepFrozen(HostConfig{Clock: Skew(baseSkew)}, func() {
+			for _, s := range steps {
+				StepClock("h", s)
+			}
+		}, &before, &after)
+		if got := after.Sub(before); got != sum {
+			t.Fatalf("step sequence %v over skew %v: host moved %v, want sum %v", steps, baseSkew, got, sum)
+		}
+	}
+}
+
+// TestDSTClockStepWallDurationReflectsStep pins the recorded soundness boundary (see
+// docs/dst/faults.md "Clock faults"): inside a bubble time.Now carries no monotonic
+// component, so a wall-derived duration (time.Since) ACROSS a step reflects the step —
+// the model, matching wall-clock arithmetic across a real NTP step. With the base
+// frozen (no timer waited), the whole measured duration IS the step. A future change
+// that made in-bubble durations step-immune (e.g. a per-host monotonic reading) would
+// fail this and force a deliberate contract revisit, not slip through.
+func TestDSTClockStepWallDurationReflectsStep(t *testing.T) {
+	const step = 400 * time.Millisecond
+	var since time.Duration
+	Run(1, func() {
+		ready := make(chan struct{})
+		go1 := make(chan struct{})
+		done := make(chan struct{})
+		var start time.Time
+		Host("h", HostConfig{}, func() {
+			go func() {
+				start = time.Now()
+				close(ready)
+				<-go1
+				since = time.Since(start) // wall-based in the bubble; spans the step
+				close(done)
+			}()
+		})
+		<-ready
+		StepClock("h", step) // base frozen by the channel handoff; only the offset moves
+		close(go1)
+		<-done
+	})
+	if since != step {
+		t.Errorf("time.Since across a +%v step = %v, want %v (wall-derived durations reflect a step — the recorded boundary)", step, since, step)
+	}
+}
+
+// TestDSTClockStepResetByRedeclare verifies the restart semantic documented on Host
+// and dstSetHostClockOffset: re-declaring a host re-establishes its configured base
+// clock, discarding any step taken before the re-declaration (a reboot re-syncs to
+// config). A long-lived worker of the first declaration reads the stepped offset; the
+// re-declared host reads the reset offset. Base is frozen throughout.
+func TestDSTClockStepResetByRedeclare(t *testing.T) {
+	const skew = 60 * time.Millisecond
+	const step = 500 * time.Millisecond
+	var root, stepped, restarted time.Time
+	Run(1, func() {
+		root = time.Now()
+		readStepped := make(chan struct{})
+		doneStepped := make(chan struct{})
+		Host("h", HostConfig{Clock: Skew(skew)}, func() {
+			go func() {
+				<-readStepped
+				stepped = time.Now() // table[h] = skew + step
+				close(doneStepped)
+			}()
+		})
+		StepClock("h", step)
+		close(readStepped)
+		<-doneStepped
+		// Re-declare host h (restart): overwrites its offset back to the configured skew.
+		Host("h", HostConfig{Clock: Skew(skew)}, func() {
+			restarted = time.Now()
+		})
+	})
+	if got := stepped.Sub(root); got != skew+step {
+		t.Errorf("before restart host offset = %v, want %v (skew + step)", got, skew+step)
+	}
+	if got := restarted.Sub(root); got != skew {
+		t.Errorf("after re-declaring host its offset = %v, want %v (restart must discard the step, re-establishing config)", got, skew)
+	}
+}
+
+// TestDSTClockStepOutsideRunNoop verifies the bubble guard: StepClock outside a Run is
+// a no-op — it must not panic and must not leak into a later run.
+func TestDSTClockStepOutsideRunNoop(t *testing.T) {
+	StepClock("h", time.Hour) // no bubble → no-op (must not panic or allocate a leaking table)
+	var rootT, hostT time.Time
+	Run(1, func() {
+		rootT = time.Now()
+		Host("h", HostConfig{}, func() { hostT = time.Now() })
+	})
+	if !hostT.Equal(rootT) {
+		t.Errorf("StepClock before a run leaked into it: host=%v root=%v (outside-run calls must be no-ops)", hostT, rootT)
+	}
+}
+
+// TestDSTClockHostBound verifies the per-host clock bound is enforced loudly (a
+// non-silent cap), mirroring TestDSTMemProcessBound for the process counter: an
+// over-bound host id at the choke point (dstHostClockEnsure, which Host/StepClock
+// reach) panics rather than silently dropping the host's clock state.
+func TestDSTClockHostBound(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Errorf("dstHostClockEnsure past the host bound did not panic (silent cap)")
+		}
+	}()
+	dstHostClockEnsure(1 << 20) // far beyond dstMaxSimHosts; must panic
 }

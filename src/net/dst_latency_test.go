@@ -26,7 +26,8 @@ import (
 //   - delivery virtual-times replay exactly (DST-NET-LATENCY-DET);
 //   - a read deadline shorter than the latency times out (the wire honors the
 //     fake clock — soundness);
-//   - latency is base-time, so a per-host clock skew does not change the wire delay.
+//   - latency is base-time, so a per-host clock skew — or a mid-flight clock step —
+//     does not change the wire delay.
 
 // dstPingPong dials host "A" (the server) from host "B" (the client) with opts,
 // exchanges one request/response, and returns the measured one-way client→server
@@ -261,6 +262,92 @@ func TestDSTNetLatencySkewInvariant(t *testing.T) {
 	}
 	if rtt := clientRespWall.Sub(writeWall); rtt != 2*L {
 		t.Errorf("client own-clock RTT under skew = %v, want %v (offset must cancel over a round trip)", rtt, 2*L)
+	}
+}
+
+// TestDSTNetClockStepInvariantDelivery is the cross-axis (clock x net) check: the wire
+// delivers in universe BASE time (dstBaseNanos = wall minus the host's clock offset)
+// even when a host on the link has been stepped, so a clock step on a receiver does
+// not change the wire delay. The receiver is stepped a large amount (>> L) BEFORE the
+// send is gated, so the server evaluates its delivery gate with its clock already
+// stepped — the discriminating case: a wall-based wire (one gating on time.Now without
+// subtracting the offset) would see the receiver's clock already past the delivery
+// instant and deliver ~immediately, whereas the base-time wire converts the stepped
+// wall back to base and still waits exactly L. (A step injected AFTER the segment is
+// already gated cannot discriminate this: the wire arms a fake-clock relative timer
+// once and that timer is step-immune regardless, so the step must precede the gate.)
+// Delivery latency is measured on the ROOT (host 0, never stepped, so its clock is
+// base); the receiver's own wall reading confirms the step took effect (else a no-op
+// StepClock would pass) — proving both that the step fired and that delivery stayed
+// base-correct.
+func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const (
+		L       = 100 * time.Millisecond
+		bigStep = 10 * time.Second // >> L; a wall-based wire would deliver ~instantly
+	)
+	var baseLatency time.Duration
+	var got string
+	var serverReadWall, startBase time.Time
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+		port := make(chan string, 1)
+		accepted := make(chan struct{})
+		doWrite := make(chan struct{})
+		wrote := make(chan struct{})
+		readDone := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() { // server (receiver)
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				close(accepted)
+				buf := make([]byte, 16)
+				n, _ := c.Read(buf) // gate evaluated post-step: must still wait L of base time
+				serverReadWall = time.Now()
+				got = string(buf[:n])
+				c.Close()
+				close(readDone)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() { // client (sender)
+			go func() { // in a goroutine so Host("B") returns and the root can drive
+				p := <-port
+				c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+				if err != nil {
+					panic(err)
+				}
+				<-doWrite
+				c.Write([]byte("ping")) // deliverAt = base now + L (B is unstepped)
+				close(wrote)
+				<-readDone // hold the conn open until the server has read
+				c.Close()
+			}()
+		})
+		<-accepted                         // the server is blocked in Read with no data yet
+		simulation.StepClock("A", bigStep) // step the RECEIVER before the send is gated
+		startBase = time.Now()             // root (host 0) = base, after the step
+		close(doWrite)                     // let the client write; the server's gate eval is now post-step
+		<-wrote
+		<-readDone // the server unblocks after L of base time, not immediately
+		baseLatency = time.Since(startBase)
+	})
+	if got != "ping" {
+		t.Errorf("data delivered to a stepped receiver = %q, want \"ping\" (a step must not corrupt or drop bytes)", got)
+	}
+	if baseLatency != L {
+		t.Errorf("base-time delivery latency with a +%v step on the receiver = %v, want %v (the wire is base-time; a clock step must not change the delay)", bigStep, baseLatency, L)
+	}
+	// The receiver's own (stepped) wall reading at delivery is base+L shifted by the
+	// step: this confirms the step actually took effect on host A while the wire still
+	// delivered in base time — a no-op step would land at base+L (no step term).
+	if got := serverReadWall.Sub(startBase); got != L+bigStep {
+		t.Errorf("receiver wall at delivery − base start = %v, want %v (L + step): the step must take effect on the receiver yet leave delivery base-correct", got, L+bigStep)
 	}
 }
 

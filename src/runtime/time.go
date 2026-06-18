@@ -20,15 +20,19 @@ func time_runtimeNow() (sec int64, nsec int32, mono int64) {
 		wall := bubble.now
 		if dstActive() {
 			// Under an active simulation, shift only the wall reading by the calling
-			// goroutine's per-host clock offset (testing/simulation.Host's clock
-			// config), so co-located processes share a clock while different hosts can
-			// be skewed — the primitive an HLC is built to tolerate. The offset never
-			// touches bubble.now, so monotonic time (time_runtimeNano), timer
-			// deadlines, and the synctest advance are unaffected: a static offset
-			// preserves durations. Folds away in non-dst builds (dstActive is a
-			// constant false), leaving the reading byte-identical. See
-			// runtime.dstSetHostClockOffset and docs/dst/faults.md "Per-host clock".
-			wall += gp.dstClockOffset
+			// goroutine's host's clock offset (testing/simulation.Host's clock config,
+			// plus any StepClock the host has taken), so co-located processes share a
+			// clock while different hosts can be skewed/stepped — the primitive an HLC
+			// is built to tolerate. The offset lives in a per-host table keyed by
+			// g.dstHost (not on g) so a step can shift a whole host's subtree at once;
+			// it never touches bubble.now, so monotonic time (time_runtimeNano), timer
+			// deadlines, and the synctest advance are unaffected: a static offset (and
+			// a step between two readings) shifts what time.Now reads, while timers
+			// still fire at the same base time. Folds away in non-dst builds (dstActive
+			// is a constant false), leaving the reading byte-identical. See
+			// runtime.dstSetHostClockOffset/dstStepHostClock and docs/dst/faults.md
+			// "Per-host clock" / "Clock faults".
+			wall += dstHostClockOffset(gp.dstHost)
 		}
 		sec = wall / (1000 * 1000 * 1000)
 		nsec = int32(wall % (1000 * 1000 * 1000))

@@ -22,10 +22,12 @@ func TestSizeof(t *testing.T) {
 		_64bit uintptr // size on 64bit platforms
 	}{
 		// g carries the DST per-goroutine fields (dstrand, dstPrio, dstSeq, the
-		// host/process identity dstHost/dstProc, the per-host clock offset
-		// dstClockOffset, the per-process pid dstPid, and the pending-access record —
-		// see runtime2.go): +72 bytes on 32-bit, +96 on 64-bit over upstream's 288/448.
-		{runtime.G{}, 360 + xreg, 544 + xreg}, // g, but exported for testing
+		// host/process identity dstHost/dstProc, the per-process pid dstPid, and the
+		// pending-access record — see runtime2.go): +64 bytes on 32-bit, +88 on 64-bit
+		// over upstream's 288/448. The per-host clock offset is NOT a g field — it
+		// lives in a per-host table keyed by dstHost (dst.go dstHostClock) so a step
+		// can move a whole host's subtree (see runtime2.go dstHost).
+		{runtime.G{}, 352 + xreg, 536 + xreg}, // g, but exported for testing
 		{runtime.Sudog{}, 64, 104},            // sudog, but exported for testing
 	}
 
