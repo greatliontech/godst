@@ -23,6 +23,8 @@ const (
 	diskOpHealDisk                   // host-disk EIO off
 	diskOpFailFile                   // per-file EIO on (name is the host-absolute path)
 	diskOpHealFile                   // per-file EIO off
+	diskOpLimit                      // ENOSPC: cap the disk at arg total bytes
+	diskOpUnlimit                    // remove the capacity
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook
@@ -70,6 +72,11 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		if node := dstFSNodeAt(d.root, name); node != nil && d.eioFiles != nil {
 			delete(d.eioFiles, node)
 		}
+	case diskOpLimit:
+		d.capped = true
+		d.capacity = arg
+	case diskOpUnlimit:
+		d.capped = false
 	}
 }
 

@@ -15,7 +15,10 @@ import _ "unsafe" // for go:linkname
 // disk returns from a read / write / fsync that hits bad media or a failing
 // controller, so it is injected only at those calls (never at an infallible call
 // like seek), and it never touches the durable image — a failed fsync does not
-// advance it (DST-FAULT-SOUND). Faults are explicit toggles (no fault-RNG draw), so
+// advance it; ENOSPC is a full disk, so it is injected only where writing more, or
+// creating a file, needs space the cap does not allow — a real disk fills what it can
+// first, and frees count, so deleting makes room (DST-FAULT-SOUND). Faults are
+// explicit toggles (no fault-RNG draw), so
 // the same seed + same fault schedule replays identically (DST-FAULT-REPLAY), and
 // each affects exactly the named host's disk — or, for FailFile, exactly the named
 // file — leaving every other host and file untouched (DST-FAULT-VICTIM). Calls
@@ -31,6 +34,8 @@ const (
 	diskOpHealDisk
 	diskOpFailFile
 	diskOpHealFile
+	diskOpLimit
+	diskOpUnlimit
 )
 
 // FailDisk makes every read, write, and fsync on the named host's disk fail with
@@ -62,4 +67,26 @@ func FailFile(host, path string) {
 // HealFile clears the per-file EIO fault set by FailFile on the named host's file.
 func HealFile(host, path string) {
 	dstDiskFaultOp(diskOpHealFile, internHost(host), 0, path)
+}
+
+// LimitDisk caps the named host's disk at bytes total of regular-file content,
+// modeling a full (or filling) disk: a write that would grow the disk past the cap
+// fills the remaining space and the rest fails with ENOSPC, and creating a new file
+// or directory on an already-full disk fails with ENOSPC. Space in use is the live
+// total, so deleting or truncating a file frees room for later writes; an in-place
+// overwrite (no growth) always succeeds, and reads are unaffected. A cap below the
+// current usage is allowed (the disk is over quota: growth and creates fail until
+// enough is freed). bytes must be >= 0. UnlimitDisk removes the cap. Call from within
+// a Run.
+func LimitDisk(host string, bytes int64) {
+	if bytes < 0 {
+		panic("testing/simulation: LimitDisk bytes must be >= 0")
+	}
+	dstDiskFaultOp(diskOpLimit, internHost(host), bytes, "")
+}
+
+// UnlimitDisk removes the capacity set by LimitDisk on the named host's disk; writes
+// and creates stop failing with ENOSPC.
+func UnlimitDisk(host string) {
+	dstDiskFaultOp(diskOpUnlimit, internHost(host), 0, "")
 }

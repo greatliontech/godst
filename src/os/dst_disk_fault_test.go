@@ -374,3 +374,353 @@ func TestDSTDiskEIODeterminism(t *testing.T) {
 		t.Fatalf("trace = %q, want .E.E.", a)
 	}
 }
+
+// enospcErr fails the test unless err is a *PathError wrapping syscall.ENOSPC.
+func enospcErr(t *testing.T, what string, err error) {
+	t.Helper()
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("%s: error %v, want errors.Is syscall.ENOSPC", what, err)
+	}
+	if _, ok := err.(*os.PathError); !ok {
+		t.Fatalf("%s: error %T, want *os.PathError", what, err)
+	}
+}
+
+// TestDSTDiskENOSPCBasic: under a capacity, a write up to the cap succeeds, a write
+// past it fails ENOSPC, and UnlimitDisk restores writes.
+func TestDSTDiskENOSPCBasic(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 4)
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			if n, err := f.Write([]byte("abcd")); n != 4 || err != nil {
+				t.Fatalf("write to cap = %d, %v; want 4, nil", n, err)
+			}
+			if _, err := f.Write([]byte("e")); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("write past cap: %v, want ENOSPC", err)
+			}
+			simulation.UnlimitDisk("h")
+			if n, err := f.Write([]byte("e")); n != 1 || err != nil {
+				t.Fatalf("write after UnlimitDisk = %d, %v; want 1, nil", n, err)
+			}
+			f.Close()
+		})
+	})
+}
+
+// TestDSTDiskENOSPCPartialFill (DST-FAULT-SOUND): a write that would exceed the cap
+// fills the remaining space (a short write, io.ErrShortWrite) rather than failing
+// outright — a real disk writes what it can; the next write, with nothing left, gets
+// ENOSPC. An all-or-nothing implementation (0 bytes + ENOSPC when room > 0) fails
+// here.
+func TestDSTDiskENOSPCPartialFill(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 5)
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+
+			n, err := f.Write([]byte("abcdefghij")) // 10 bytes, room for 5
+			if n != 5 || !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("filling write = %d, %v; want 5, io.ErrShortWrite", n, err)
+			}
+			if _, err := f.Write([]byte("Z")); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("write on full disk: %v, want ENOSPC", err)
+			}
+			f.Close()
+			if b, err := os.ReadFile("/f"); err != nil || string(b) != "abcde" {
+				t.Fatalf("content = %q, %v; want abcde (the bytes that fit)", b, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCFillsToExactlyCapacity (DST-FAULT-SOUND, property): writing in
+// chunks until ENOSPC fills the disk to *exactly* the cap — never less (a false
+// ENOSPC with room to spare) nor more (over-allocation past the cap).
+func TestDSTDiskENOSPCFillsToExactlyCapacity(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			const cap = 1000
+			simulation.LimitDisk("h", cap)
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			chunk := make([]byte, 7) // a size that does not divide the cap
+			total := 0
+			for i := 0; i < cap+100; i++ {
+				n, err := f.Write(chunk)
+				total += n
+				if errors.Is(err, syscall.ENOSPC) {
+					break
+				}
+				if err != nil && !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("unexpected write error: %v", err)
+				}
+			}
+			if total != cap {
+				t.Fatalf("filled %d bytes, want exactly %d (cap)", total, cap)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCFreesHonored (DST-FAULT-SOUND): space in use is the live total, so
+// deleting a file makes room for a write that just failed. A budget that decremented
+// per byte written (ignoring frees) would still fail after the delete — a false
+// positive.
+func TestDSTDiskENOSPCFreesHonored(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 10)
+			mustOK(t, "fill /a", os.WriteFile("/a", make([]byte, 10), 0o644)) // 10/10 full
+			if err := os.WriteFile("/b", []byte("x"), 0o644); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("create on full disk: %v, want ENOSPC", err)
+			}
+			mustOK(t, "remove /a", os.Remove("/a")) // frees 10
+			if err := os.WriteFile("/b", []byte("x"), 0o644); err != nil {
+				t.Fatalf("write after freeing space: %v, want nil (frees not honored)", err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCTruncateFrees (DST-FAULT-SOUND): truncating a file down frees its
+// bytes, so a subsequent write that needs that space succeeds.
+func TestDSTDiskENOSPCTruncateFrees(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 10)
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			if n, err := f.Write([]byte("0123456789")); n != 10 || err != nil {
+				t.Fatalf("fill = %d, %v; want 10, nil", n, err)
+			}
+			if _, err := f.Write([]byte("Z")); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("write on full disk: %v, want ENOSPC", err)
+			}
+			mustOK(t, "Truncate", f.Truncate(4)) // frees 6 bytes
+			if n, err := f.WriteAt([]byte("ab"), 4); n != 2 || err != nil {
+				t.Fatalf("write after truncate = %d, %v; want 2, nil", n, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCOverwriteInPlace (DST-FAULT-SOUND): an in-place overwrite consumes
+// no new space, so it succeeds even on a full disk. A check on total size regardless
+// of growth would wrongly fail it.
+func TestDSTDiskENOSPCOverwriteInPlace(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 4)
+			mustOK(t, "fill", os.WriteFile("/f", []byte("abcd"), 0o644)) // 4/4 full
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "OpenFile", err)
+			defer f.Close()
+			if n, err := f.WriteAt([]byte("WXYZ"), 0); n != 4 || err != nil {
+				t.Fatalf("in-place overwrite on full disk = %d, %v; want 4, nil", n, err)
+			}
+			if b, err := os.ReadFile("/f"); err != nil || string(b) != "WXYZ" {
+				t.Fatalf("content = %q, %v; want WXYZ", b, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCCreate: creating a new file or directory on a full disk fails
+// ENOSPC; with room, both succeed.
+func TestDSTDiskENOSPCCreate(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 4)
+			mustOK(t, "fill", os.WriteFile("/f", []byte("abcd"), 0o644)) // 4/4 full
+
+			_, err := os.Create("/g")
+			enospcErr(t, "Create on full disk", err)
+			enospcErr(t, "Mkdir on full disk", os.Mkdir("/d", 0o755))
+
+			// Freeing space lets a create succeed again.
+			mustOK(t, "remove /f", os.Remove("/f"))
+			mustOK(t, "Mkdir after free", os.Mkdir("/d", 0o755))
+		})
+	})
+}
+
+// TestDSTDiskENOSPCTruncExistingOnFull: opening an EXISTING file with O_CREATE|O_TRUNC
+// on a full disk succeeds — the node already exists (no allocation) and O_TRUNC frees
+// its bytes. The create-full check must fire only for a genuinely new node; a refactor
+// that hoisted it above the resolve would wrongly fail this.
+func TestDSTDiskENOSPCTruncExistingOnFull(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 4)
+			mustOK(t, "fill", os.WriteFile("/f", []byte("abcd"), 0o644)) // 4/4 full
+			f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+			mustOK(t, "O_CREATE|O_TRUNC existing on full disk", err)
+			defer f.Close()
+			if n, err := f.Write([]byte("WXYZ")); n != 4 || err != nil {
+				t.Fatalf("write after O_TRUNC freed space = %d, %v; want 4, nil", n, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCSyncPartialDurable: an O_SYNC write the cap only partly satisfies
+// commits exactly the bytes that fit to the durable image — never 0, never more than
+// fit. Guards the durability invariant on the partial-write path.
+func TestDSTDiskENOSPCSyncPartialDurable(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 3)
+			f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_SYNC, 0o644)
+			mustOK(t, "OpenFile O_SYNC", err)
+			n, err := f.Write([]byte("abcde")) // room 3, only 3 fit
+			if n != 3 || !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("O_SYNC partial write = %d, %v; want 3, io.ErrShortWrite", n, err)
+			}
+			f.Close()
+			_, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok || synced != "abc" {
+				t.Fatalf("durable image = %q (ok=%v), want abc (O_SYNC committed exactly what fit)", synced, ok)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCCapBelowUsage: a cap set below current usage puts the disk over
+// quota — growth and creates fail, but in-place overwrites still work, and freeing
+// below the cap re-enables writes.
+func TestDSTDiskENOSPCCapBelowUsage(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "write 10", os.WriteFile("/f", []byte("0123456789"), 0o644))
+			simulation.LimitDisk("h", 5) // below the 10 already in use
+
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "OpenFile", err)
+			// Growth (append at the end) fails: the disk is over quota.
+			if _, err := f.WriteAt([]byte("X"), 10); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("append while over quota: %v, want ENOSPC", err)
+			}
+			// In-place overwrite consumes no space: succeeds even over quota.
+			if n, err := f.WriteAt([]byte("AB"), 8); n != 2 || err != nil {
+				t.Fatalf("in-place overwrite over quota = %d, %v; want 2, nil", n, err)
+			}
+			mustOK(t, "Truncate to 3", f.Truncate(3)) // 3 < cap 5, frees room
+			if n, err := f.WriteAt([]byte("YZ"), 3); n != 2 || err != nil {
+				t.Fatalf("append after truncate = %d, %v; want 2, nil (freed space unusable)", n, err)
+			}
+			f.Close()
+		})
+	})
+}
+
+// TestDSTDiskENOSPCStraddleOverQuota (DST-FAULT-SOUND): a write that straddles EOF on
+// an over-quota disk writes its in-place prefix (no new space) and fails only on the
+// growth past EOF — the room-clamp must not let a negative free count exclude the
+// no-growth prefix. Without the clamp this write stores 0 bytes and the prefix is
+// lost.
+func TestDSTDiskENOSPCStraddleOverQuota(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "write 10", os.WriteFile("/f", []byte("0123456789"), 0o644))
+			simulation.LimitDisk("h", 5) // over quota (10 in use, 0 free)
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "OpenFile", err)
+			defer f.Close()
+			// 5 bytes at offset 7: [7,10) overwrites in place, [10,12) is growth.
+			n, err := f.WriteAt([]byte("ABCDE"), 7)
+			if n != 3 || !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("straddle write over quota = %d, %v; want 3, ENOSPC (in-place prefix, then growth fails)", n, err)
+			}
+			if b, err := os.ReadFile("/f"); err != nil || string(b) != "0123456ABC" {
+				t.Fatalf("content = %q, %v; want 0123456ABC (bytes 7-9 overwritten, no growth)", b, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCReadUnaffected (DST-FAULT-SOUND): ENOSPC is a write/create fault;
+// reads on a full disk are unaffected.
+func TestDSTDiskENOSPCReadUnaffected(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 4)
+			mustOK(t, "fill", os.WriteFile("/f", []byte("abcd"), 0o644))
+			if b, err := os.ReadFile("/f"); err != nil || string(b) != "abcd" {
+				t.Fatalf("read on full disk = %q, %v; want abcd, nil", b, err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCVictim (DST-FAULT-VICTIM): LimitDisk caps exactly the named host's
+// disk; another host writing the same data is unaffected.
+func TestDSTDiskENOSPCVictim(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.LimitDisk("hA", 0) // full: even a new file's create fails
+		onHost("hA", func() {
+			if err := os.WriteFile("/f", []byte("abcd"), 0o644); !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("hA write: %v, want ENOSPC", err)
+			}
+		})
+		onHost("hB", func() {
+			if err := os.WriteFile("/f", []byte("abcd"), 0o644); err != nil {
+				t.Fatalf("hB write: %v, want nil (cap leaked onto hB)", err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCEIOPrecedence: when a disk is both EIO-failing and full, a write
+// reports EIO — the hardware failure is checked before the space check, as on a real
+// disk that cannot even attempt the write.
+func TestDSTDiskENOSPCEIOPrecedence(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			simulation.LimitDisk("h", 0) // full
+			simulation.FailDisk("h")     // and failing
+			if _, err := f.Write([]byte("x")); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("write on EIO+full disk: %v, want EIO (EIO precedes ENOSPC)", err)
+			}
+		})
+	})
+}
+
+// TestDSTDiskENOSPCDeterminism (DST-FAULT-REPLAY): LimitDisk is an explicit toggle, so
+// the same seed + same fault schedule yields an identical outcome sequence.
+func TestDSTDiskENOSPCDeterminism(t *testing.T) {
+	run := func() string {
+		var trace string
+		simulation.Run(9, func() {
+			onHost("h", func() {
+				wr := func() string {
+					if err := os.WriteFile("/f", []byte("abc"), 0o644); errors.Is(err, syscall.ENOSPC) {
+						return "E"
+					}
+					os.Remove("/f")
+					return "."
+				}
+				trace += wr() // ok
+				simulation.LimitDisk("h", 0)
+				trace += wr() // E
+				simulation.UnlimitDisk("h")
+				trace += wr() // ok
+			})
+		})
+		return trace
+	}
+	a, b := run(), run()
+	if a != b {
+		t.Fatalf("non-deterministic ENOSPC trace: %q vs %q", a, b)
+	}
+	if a != ".E." {
+		t.Fatalf("trace = %q, want .E.", a)
+	}
+}

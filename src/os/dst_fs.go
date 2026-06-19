@@ -67,13 +67,20 @@ var dstFS struct {
 // I/O with EIO, and eioFiles fails just the listed nodes (a bad sector on one
 // file). A node, not a path, is the per-file key, so a faulted file stays faulted
 // across a rename and a removed-but-open handle keeps failing — the physical
-// bad-block semantics. Both are read at the dstFile I/O choke points (read / write /
-// sync) and set through the runtime relay (see dst_disk_fault.go). All under
+// bad-block semantics. capped/capacity model a full disk: writes that would grow the
+// disk past capacity, and creates on an already-full disk, fail with ENOSPC. The
+// space in use is summed on demand from the live tree (residentLocked), not tracked
+// incrementally, so a delete or truncate-down frees space for the next write with no
+// accounting threaded through every mutation — and never a false ENOSPC a
+// budget-that-ignores-frees would produce. All read at the dstFile / create choke
+// points and set through the runtime relay (see dst_disk_fault.go). All under
 // dstFS.mu.
 type dstFSDisk struct {
 	root     *dstFSNode
 	eio      bool                // host-disk EIO: every read/write/sync on this disk fails EIO
 	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
+	capped   bool                // whether a capacity (full-disk / ENOSPC) limit is set
+	capacity int64               // max total regular-file bytes when capped
 }
 
 //go:linkname dstFSCurrentNode runtime.dstCurrentNode
@@ -270,6 +277,9 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	}
 	if node != nil {
 		return wrap(syscall.EEXIST)
+	}
+	if dstFSDiskHere().diskFullForCreate() {
+		return wrap(syscall.ENOSPC)
 	}
 	parent.entries[base] = &dstFSNode{
 		isDir:   true,
@@ -656,6 +666,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	case node != nil && flag&(O_CREATE|O_EXCL) == O_CREATE|O_EXCL:
 		return wrap(syscall.EEXIST)
 	case node == nil:
+		if dstFSDiskHere().diskFullForCreate() {
+			return wrap(syscall.ENOSPC)
+		}
 		node = &dstFSNode{
 			mode:    perm & ModePerm,
 			modTime: time.Now(),
@@ -751,6 +764,70 @@ func (d *dstFile) diskEIO() error {
 	return nil
 }
 
+// residentLocked sums the live byte size of every regular file on the disk — the
+// space a capacity is measured against. Summed on demand (not tracked incrementally)
+// so a delete or truncate-down frees space for the next write with no accounting in
+// the mutation paths; each node has exactly one name (no hard links — os.Link is
+// fenced under simulation), so the walk counts each file once. Removed-but-open files
+// are not in the tree and so are not counted, which only ever under-counts space in
+// use — never a false ENOSPC. Caller holds dstFS.mu.
+func (disk *dstFSDisk) residentLocked() int64 {
+	var total int64
+	var walk func(n *dstFSNode)
+	walk = func(n *dstFSNode) {
+		if n.isDir {
+			for _, c := range n.entries {
+				walk(c)
+			}
+			return
+		}
+		total += int64(len(n.data))
+	}
+	walk(disk.root)
+	return total
+}
+
+// enospcAllowed returns how many of the n bytes a write at off may store before the
+// disk's capacity is hit. It is a dstFile method (not dstFSDisk) because it needs the
+// file's current length to tell growth from an in-place overwrite. Equal to n when
+// the disk is uncapped, when the write does
+// not grow the file (a pure in-place overwrite consumes no space), or when the growth
+// fits; otherwise it is the short count that fills the remaining space (0 if none is
+// left). A real disk fills what it can and reports the shortfall, so the caller writes
+// the allowed prefix and returns ENOSPC only when nothing fit (DST-FAULT-SOUND: a
+// growth a real disk would partially satisfy is never failed outright). Caller holds
+// dstFS.mu.
+func (d *dstFile) enospcAllowed(off, n int64) int64 {
+	if !d.disk.capped {
+		return n
+	}
+	L := int64(len(d.node.data))
+	end := off + n
+	if end <= L {
+		return n // pure overwrite: no growth, no space consumed
+	}
+	room := d.disk.capacity - d.disk.residentLocked()
+	if room < 0 {
+		room = 0
+	}
+	writableEnd := L + room
+	if end <= writableEnd {
+		return n // the growth fits
+	}
+	if writableEnd <= off {
+		return 0 // not even the write's start offset is reachable
+	}
+	return writableEnd - off
+}
+
+// diskFullForCreate reports whether the disk has no room to allocate a new file or
+// directory (ENOSPC on create/mkdir on a full disk). A 0-byte create consumes no file
+// bytes, so it is refused only once the disk is already at or over capacity. Caller
+// holds dstFS.mu.
+func (disk *dstFSDisk) diskFullForCreate() bool {
+	return disk.capped && disk.residentLocked() >= disk.capacity
+}
+
 func (d *dstFile) read(b []byte) (int, error) {
 	if err := d.enter(); err != nil {
 		return 0, err
@@ -814,7 +891,11 @@ func (d *dstFile) write(b []byte) (int, error) {
 	if d.app {
 		d.off = int64(len(d.node.data))
 	}
-	n := d.writeAtLocked(b, d.off)
+	allowed := d.enospcAllowed(d.off, int64(len(b)))
+	if allowed == 0 && len(b) > 0 {
+		return 0, syscall.ENOSPC
+	}
+	n := d.writeAtLocked(b[:allowed], d.off)
 	d.off += int64(n)
 	if d.osync {
 		d.node.commitLocked()
@@ -833,7 +914,11 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
-	n := d.writeAtLocked(b, off)
+	allowed := d.enospcAllowed(off, int64(len(b)))
+	if allowed == 0 && len(b) > 0 {
+		return 0, syscall.ENOSPC
+	}
+	n := d.writeAtLocked(b[:allowed], off)
 	if d.osync {
 		d.node.commitLocked()
 	}
