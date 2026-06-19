@@ -55,14 +55,25 @@ func dstFSEpoch() uint64
 var dstFS struct {
 	mu    sync.Mutex
 	epoch uint64
-	disks map[uint32]*dstFSDisk   // host id -> the host's in-memory tree
-	cwds  map[[2]uint32]string    // (host id, process id) -> that process's working directory into its host tree
+	disks map[uint32]*dstFSDisk // host id -> the host's in-memory tree
+	cwds  map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
 }
 
 // dstFSDisk is one host's tree (its filesystem). The durability state lives on the
 // nodes; a host's disk is what a host (power-loss) crash later restores.
+//
+// Disk faults are policy on the disk itself (one source of truth, reset with the
+// disk when the run epoch rolls — no separate teardown): eio fails the whole disk's
+// I/O with EIO, and eioFiles fails just the listed nodes (a bad sector on one
+// file). A node, not a path, is the per-file key, so a faulted file stays faulted
+// across a rename and a removed-but-open handle keeps failing — the physical
+// bad-block semantics. Both are read at the dstFile I/O choke points (read / write /
+// sync) and set through the runtime relay (see dst_disk_fault.go). All under
+// dstFS.mu.
 type dstFSDisk struct {
-	root *dstFSNode
+	root     *dstFSNode
+	eio      bool                // host-disk EIO: every read/write/sync on this disk fails EIO
+	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
 }
 
 //go:linkname dstFSCurrentNode runtime.dstCurrentNode
@@ -602,6 +613,7 @@ func dstChdir(dir string) (handled bool, err error) {
 type dstFile struct {
 	mu     sync.Mutex
 	node   *dstFSNode
+	disk   *dstFSDisk // the host disk this handle was opened on (for disk faults)
 	path   string
 	off    int64
 	dirpos int // directory read cursor (sorted-name index)
@@ -661,6 +673,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 
 	d := &dstFile{
 		node:  node,
+		disk:  dstFSDiskHere(),
 		path:  dstFSAbs(name),
 		rd:    flag&O_WRONLY == 0,
 		wr:    accWrite,
@@ -695,7 +708,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	if !node.isDir {
 		return wrap(syscall.ENOTDIR)
 	}
-	d := &dstFile{node: node, path: dstFSAbs(name), rd: true}
+	d := &dstFile{node: node, disk: dstFSDiskHere(), path: dstFSAbs(name), rd: true}
 	return dstNewFile(d, name), true, nil
 }
 
@@ -727,6 +740,17 @@ func (d *dstFile) leave() {
 	d.mu.Unlock()
 }
 
+// diskEIO returns syscall.EIO if this handle's disk is under a host-wide EIO fault
+// or this file's node is under a per-file EIO fault, else nil. Caller holds
+// dstFS.mu. Checked only at the calls a real disk can fail with EIO (read / write /
+// sync), never at an infallible call (seek, in-memory stat) — DST-FAULT-SOUND.
+func (d *dstFile) diskEIO() error {
+	if d.disk.eio || d.disk.eioFiles[d.node] {
+		return syscall.EIO
+	}
+	return nil
+}
+
 func (d *dstFile) read(b []byte) (int, error) {
 	if err := d.enter(); err != nil {
 		return 0, err
@@ -743,6 +767,9 @@ func (d *dstFile) read(b []byte) (int, error) {
 	if d.node.isDir {
 		return 0, syscall.EISDIR
 	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
+	}
 	if d.off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -756,11 +783,16 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 		return 0, err
 	}
 	defer d.leave()
+	// No empty-buffer early return (unlike read): pread is reached only from
+	// File.ReadAt's `for len(b) > 0` loop, so b is never empty here.
 	if !d.rd {
 		return 0, syscall.EBADF
 	}
 	if d.node.isDir {
 		return 0, syscall.EISDIR
+	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
 	}
 	if off >= int64(len(d.node.data)) {
 		return 0, io.EOF
@@ -775,6 +807,9 @@ func (d *dstFile) write(b []byte) (int, error) {
 	defer d.leave()
 	if !d.wr {
 		return 0, syscall.EBADF
+	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
 	}
 	if d.app {
 		d.off = int64(len(d.node.data))
@@ -794,6 +829,9 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	defer d.leave()
 	if !d.wr {
 		return 0, syscall.EBADF
+	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
 	}
 	n := d.writeAtLocked(b, off)
 	if d.osync {
@@ -955,6 +993,9 @@ func (d *dstFile) sync() error {
 		return err
 	}
 	defer d.leave()
+	if err := d.diskEIO(); err != nil {
+		return err
+	}
 	d.node.commitLocked()
 	return nil
 }

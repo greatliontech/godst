@@ -455,9 +455,22 @@ now reserves nothing they need.
 Seam: the per-bubble FS tree + the **durability representation** (durable image + pending state) the
 disk feature built and froze monotonicity on precisely so crash could tear along it. Faults:
 
-- **EIO** — a targeted file / a host's disk fails `read`/`write`/`Sync` with `EIO`. DoF: real disks
-  return EIO. (Sound only where the real call can fail — read/write/sync can; this never makes a truly
-  infallible call fallible, the Soundness boundary.)
+- **EIO** — **landed**. A targeted file or a host's disk fails `read`/`write`/`Sync` with `EIO`, injected
+  mid-run by `simulation.FailDisk(host)` / `FailFile(host, path)` (and cleared by `HealDisk` / `HealFile`).
+  The fault is policy on the host's disk (`os` `dstFSDisk.eio` / `eioFiles`), consulted at the `dstFile`
+  I/O choke points (`read`/`pread`/`write`/`pwrite`/`sync`) — never new representation. DoF: real disks
+  return EIO. Sound only where the real call can fail: it is injected *before* any mutation, so a faulted
+  write writes no bytes and a faulted `fsync` does **not** advance the durable image (it cannot tear
+  "durable" state — the durability-monotonicity invariant holds under fault); and never at an infallible
+  call (seek, in-memory stat) — the Soundness boundary. The per-file fault keys on the *node*, not the
+  path, so a bad sector follows the file across a rename and a removed-but-open handle keeps failing;
+  `FailFile` is scoped to a regular file (a directory is a no-op — its own `fsync` stays clean — while a
+  whole-disk `FailDisk` does fail a directory `fsync`, a dead disk persisting nothing). Faults are explicit
+  toggles (no fault-RNG draw, like the clock step), so the schedule replays directly off the deterministic
+  interleaving. Per-host / per-file victim isolation, durable-image preservation, infallible-call immunity,
+  and replay are enforced by `TestDSTDiskEIO*` (`os/dst_disk_fault_test.go`), mutation-tested. Driven
+  through the runtime relay `dstDiskFaultOp` (os registers the handler from init, mirroring the net
+  partition relay), so `testing/simulation` needs no `os` dependency.
 - **ENOSPC** — writes/creates on a host's disk fail `ENOSPC` past a budget. DoF: a full disk.
 - **Latency** — delay an FS op by a virtual duration (fake timer). DoF: a slow disk.
 - **Crash (the durability tear)** is the **host (power-loss) crash** — see "Crash / restart faults". It
@@ -601,9 +614,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Enforced (jitter + throttle + partition + clock-step + clock-drift classes landed; each further fault
-  class as it lands):* per-fault structural argument + a regression test per fault class that the faulted
-  execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
+  *Enforced (jitter + throttle + partition + clock-step + clock-drift + disk-EIO classes landed; each
+  further fault class as it lands):* per-fault structural argument + a regression test per fault class that
+  the faulted execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
   *delays* — bounded to [0, max), never dropping or reordering a live stream (delivery is head-of-line, in
   order, DST-NET-FIFO): `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link
   bandwidth, modeled per-flow as an independent B-capacity link (a real dedicated link, so ⊆ real),
@@ -618,7 +631,12 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   (DST-CLOCK-DRIFT-MONOTONIC, never a backward-running clock without a step), and a host's own clock stays
   self-consistent (its `d`-timer fires after exactly `d` of its own time) — so the only failures it surfaces
   are the real ones of two nodes' clocks advancing at different rates: `TestDSTClockDriftSelfConsistent` /
-  `TestDSTClockDriftMonotonic` / `TestDSTClockDriftRateValidation`.
+  `TestDSTClockDriftMonotonic` / `TestDSTClockDriftRateValidation`. A **disk EIO** is what a real disk
+  returns from a `read`/`write`/`fsync` that hits bad media; it is injected only at those calls (an
+  infallible `seek`/in-memory `stat` is untouched — `TestDSTDiskEIOInfallibleOpsUnaffected`) and *before*
+  any state change, so a faulted write writes nothing and a faulted `fsync` leaves the durable image where
+  it was (`TestDSTDiskEIODurabilityPreserved`) — the only failures it surfaces are the real ones of a disk
+  returning errors, never a torn durable image.
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -630,8 +648,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   explicit delta rather than a fault draw, so its replay rides the deterministic schedule directly (no RNG):
   `TestDSTClockStepDeterminism` (same seed + same `StepClock` sequence → identical readings). **Clock drift**
   likewise takes an explicit declared rate (the seeded leg is deferred), so the same seed + same `Drift`
-  config replays identically: `TestDSTClockDriftDeterminism`. (Extends to each further fault class's draws as
-  it lands.)
+  config replays identically: `TestDSTClockDriftDeterminism`. **Disk EIO** is likewise an explicit toggle
+  (`FailDisk`/`FailFile`, no fault draw), so the same seed + same fault schedule yields an identical
+  outcome sequence: `TestDSTDiskEIODeterminism`. (Extends to each further fault class's draws as it lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process**, a file/tree/port to a **host** — and a fault on
   host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a
@@ -648,7 +667,10 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   and `Drift(host rate)` sets exactly that host's rate (both keyed by host id), so a fault on hA leaves hB and
   the root untouched — `TestDSTClockStepVictim` and `TestDSTClockDriftVictim` (a rate-2 host A wakes at base
   0.5 s while a rate-1 host B still wakes at 1 s), each mutation-tested (a read that ignores the host id fails
-  it). A file's host extends it as the disk faults land.
+  it). The **disk leg** is landed with EIO: a `dstFile` records its owning host disk and (per-file) its node,
+  so `FailDisk(hA)` fails exactly hA's I/O while hB is untouched (`TestDSTDiskEIOVictimHost`) and
+  `FailFile(hA,"/x")` fails exactly that file while a sibling reads clean (`TestDSTDiskEIOPerFile`), each
+  mutation-tested (a check ignoring the host id, or the node, fails it).
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
@@ -675,9 +697,9 @@ adversarial loop.
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
   clock **step** — **done**, **drift** (constant rate + mid-run `DriftClock`) — **done** (seeded drift
-  deferred, `docs/issues/clock-drift-dynamic.md`); disk (EIO / ENOSPC / latency), scheduling (straggler), OOM
-  (allocation-triggered process crash), process crash + host crash, restart — pending. Establishes
-  DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
+  deferred, `docs/issues/clock-drift-dynamic.md`); disk **EIO** — **done**, ENOSPC / latency — pending;
+  scheduling (straggler), OOM (allocation-triggered process crash), process crash + host crash, restart —
+  pending. Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded
   exploration (`Options.FaultPolicy`) as the `Explore`/`Failure` fault dimension; `Replay` of a fault set;
   failure shrinking.

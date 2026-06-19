@@ -1309,6 +1309,32 @@ func dstNetPartitionOp(op, a, b uint32) {
 	}
 }
 
+// dstDiskFaultHook is os's disk-fault handler, registered from os's init via the
+// same passthrough shape as the net hook above (os, unlike net, is always linked,
+// but the indirection keeps runtime free of an os dependency and lets the off-build
+// leave it nil). The op codes are os's contract (see os/dst_disk_fault.go),
+// mirrored by the caller in testing/simulation; host is the victim host id, arg an
+// op-specific scalar (a capacity / a latency, for the later disk-fault chunks), and
+// path the per-file target (empty for host-level ops). A nil hook makes the call a
+// no-op.
+var dstDiskFaultHook func(op, host uint32, arg int64, path string)
+
+// dstSetDiskFaultHook registers os's disk-fault handler. Reached via //go:linkname
+// from os's init.
+//
+//go:linkname dstSetDiskFaultHook
+func dstSetDiskFaultHook(fn func(op, host uint32, arg int64, path string)) { dstDiskFaultHook = fn }
+
+// dstDiskFaultOp invokes os's disk-fault handler. Reached via //go:linkname from
+// testing/simulation's targeting API.
+//
+//go:linkname dstDiskFaultOp
+func dstDiskFaultOp(op, host uint32, arg int64, path string) {
+	if dstDiskFaultHook != nil {
+		dstDiskFaultHook(op, host, arg, path)
+	}
+}
+
 // dstDeactivate turns DST off. Used by testing/simulation.Run to restore normal
 // behavior after a run.
 //
