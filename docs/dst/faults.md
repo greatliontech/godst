@@ -482,7 +482,20 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   honored, and the partial-fill matches real short-write semantics). Per-host victim isolation, frees,
   partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` (`os/dst_disk_fault_test.go`),
   mutation-tested.
-- **Latency** — delay an FS op by a virtual duration (fake timer). DoF: a slow disk.
+- **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set
+  mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
+  sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op
+  that reads/writes content, traverses directories, or allocates a node (read/write/sync, open, stat,
+  mkdir, remove, rename, readdir, truncate, chmod, chtimes); pure in-memory ops (seek, `Getwd`, a closed-fd
+  read that returns EBADF without I/O) are not delayed, as a real slow disk would not delay them. The sleep
+  is read lock-free and taken *outside* the tree lock — so a slow disk on one host never stalls another's
+  filesystem (sleeping under the shared lock would in fact deadlock the bubble, since virtual time cannot
+  advance while a goroutine holds a mutex) — and a composite helper pays the latency once per backend op
+  (`os.Rename` = stat + rename = 2×). DoF: a slow disk; sound because the delay only postpones the op (its
+  result is unchanged) and only on ops that truly touch the disk. The duration is explicit (no fault-RNG
+  draw), so the virtual delays replay deterministically. Per-host victim isolation, host independence,
+  in-memory/closed-fd exemption, and replay are enforced by `TestDSTDiskLatency*`
+  (`os/dst_disk_fault_test.go`), mutation-tested. This completes the disk axis.
 - **Crash (the durability tear)** is the **host (power-loss) crash** — see "Crash / restart faults". It
   restores a host's disk to **exactly its durable image** (synced survives byte-exact; unsynced data/
   entries MAY be lost, unsynced content MAY be torn at arbitrary byte granularity, drawn from the fault
@@ -624,9 +637,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   killed mid-critical-section another *process's in-process* code depends on, a *process* crash that tears
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
-  *Enforced (jitter + throttle + partition + clock-step + clock-drift + disk-EIO + disk-ENOSPC classes
-  landed; each further fault class as it lands):* per-fault structural argument + a regression test per
-  fault class that the faulted execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
+  *Enforced (jitter + throttle + partition + clock-step + clock-drift + disk-EIO + disk-ENOSPC +
+  disk-latency classes landed; each further fault class as it lands):* per-fault structural argument + a
+  regression test per fault class that the faulted execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
   *delays* — bounded to [0, max), never dropping or reordering a live stream (delivery is head-of-line, in
   order, DST-NET-FIFO): `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link
   bandwidth, modeled per-flow as an independent B-capacity link (a real dedicated link, so ⊆ real),
@@ -650,7 +663,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   for the bytes that do not fit (a real disk fills what it can — the rest short-writes then ENOSPCs), a
   create only when the disk is already full, never an in-place overwrite or a read; space in use is summed
   live so a delete frees room — so the only failures it surfaces are the real ones of a disk out of space
-  (`TestDSTDiskENOSPCFreesHonored` / `…PartialFill` / `…OverwriteInPlace`).
+  (`TestDSTDiskENOSPCFreesHonored` / `…PartialFill` / `…OverwriteInPlace`). A **disk latency** is a slow
+  disk: it only *delays* a disk-touching op (the result is unchanged), never an in-memory op (seek/`Getwd`)
+  or a closed-fd EBADF, and the delay sleeps outside the tree lock so it never stalls another host — the
+  only behaviours it surfaces are a real slow device's (`TestDSTDiskLatencyInMemoryOpsUnaffected` /
+  `…ClosedFdNoDelay` / `…HostIndependence`).
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -665,7 +682,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   config replays identically: `TestDSTClockDriftDeterminism`. **Disk EIO** is likewise an explicit toggle
   (`FailDisk`/`FailFile`, no fault draw), so the same seed + same fault schedule yields an identical
   outcome sequence: `TestDSTDiskEIODeterminism`; **disk ENOSPC** (`LimitDisk`/`UnlimitDisk`) likewise:
-  `TestDSTDiskENOSPCDeterminism`. (Extends to each further fault class's draws as it lands.)
+  `TestDSTDiskENOSPCDeterminism`; **disk latency** (`SlowDisk`, an explicit per-op duration) replays the
+  same virtual delays: `TestDSTDiskLatencyDeterminism`. (Extends to each further fault class's draws as it
+  lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process**, a file/tree/port to a **host** — and a fault on
   host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a
@@ -687,7 +706,8 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   `FailFile(hA,"/x")` fails exactly that file while a sibling reads clean (`TestDSTDiskEIOPerFile`), each
   mutation-tested (a check ignoring the host id, or the node, fails it). The **ENOSPC** capacity is keyed
   the same way, so `LimitDisk(hA, …)` caps exactly hA's disk while hB writes the same data unimpeded
-  (`TestDSTDiskENOSPCVictim`).
+  (`TestDSTDiskENOSPCVictim`), and `SlowDisk(hA, …)` delays exactly hA's ops while hB's identical read is
+  instant (`TestDSTDiskLatencyVictim`).
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
@@ -714,7 +734,7 @@ adversarial loop.
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
   clock **step** — **done**, **drift** (constant rate + mid-run `DriftClock`) — **done** (seeded drift
-  deferred, `docs/issues/clock-drift-dynamic.md`); disk **EIO** / **ENOSPC** — **done**, latency — pending;
+  deferred, `docs/issues/clock-drift-dynamic.md`); disk **EIO** / **ENOSPC** / **latency** — **done**;
   scheduling (straggler), OOM (allocation-triggered process crash), process crash + host crash, restart —
   pending. Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded

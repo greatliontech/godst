@@ -10,9 +10,11 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/simulation"
+	"time"
 )
 
 // Disk-fault (EIO) tests — the storage-axis counterpart of the net partition/reset
@@ -722,5 +724,271 @@ func TestDSTDiskENOSPCDeterminism(t *testing.T) {
 	}
 	if a != ".E." {
 		t.Fatalf("trace = %q, want .E.", a)
+	}
+}
+
+// --- Latency (slow disk) tests ---
+// Latency is observed via the bubble's virtual clock: time.Since across a slowed op
+// equals the configured per-op delay; across an in-memory op it is zero.
+
+// TestDSTDiskLatencyBasic: under SlowDisk a read takes the per-op latency (virtual);
+// SlowDisk(0) removes it.
+func TestDSTDiskLatencyBasic(t *testing.T) {
+	const lat = 50 * time.Millisecond
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644))
+			f, err := os.Open("/f")
+			mustOK(t, "Open", err)
+			defer f.Close()
+
+			simulation.SlowDisk("h", lat)
+			t0 := time.Now()
+			if _, err := f.Read(make([]byte, 4)); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if d := time.Since(t0); d != lat {
+				t.Fatalf("slowed read took %v, want %v", d, lat)
+			}
+
+			simulation.SlowDisk("h", 0) // clear
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			t1 := time.Now()
+			if _, err := f.Read(make([]byte, 4)); err != nil {
+				t.Fatalf("read after clear: %v", err)
+			}
+			if d := time.Since(t1); d != 0 {
+				t.Fatalf("read after SlowDisk(0) took %v, want 0", d)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyAllOps: every disk-touching op pays the per-op latency exactly
+// once. Setup runs before SlowDisk so it is not itself delayed.
+func TestDSTDiskLatencyAllOps(t *testing.T) {
+	const lat = 20 * time.Millisecond
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "WriteFile f", os.WriteFile("/f", []byte("data"), 0o644))
+			mustOK(t, "WriteFile g", os.WriteFile("/g", []byte("xyz"), 0o644))
+			mustOK(t, "Mkdir", os.Mkdir("/d", 0o755))
+			mustOK(t, "Mkdir rr", os.Mkdir("/rr", 0o755))
+			fr, err := os.Open("/f")
+			mustOK(t, "Open fr", err)
+			defer fr.Close()
+			fw, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "OpenFile fw", err)
+			defer fw.Close()
+
+			simulation.SlowDisk("h", lat)
+			measure := func(name string, op func()) {
+				t0 := time.Now()
+				op()
+				if d := time.Since(t0); d != lat {
+					t.Errorf("%s took %v, want %v", name, d, lat)
+				}
+			}
+			measure("read", func() { fr.Read(make([]byte, 4)) })
+			measure("pread", func() { fr.ReadAt(make([]byte, 4), 0) })
+			measure("write", func() { fw.WriteAt([]byte("X"), 0) })
+			measure("sync", func() { fw.Sync() })
+			measure("truncate-handle", func() { fw.Truncate(3) })
+			measure("chmod-handle", func() { fw.Chmod(0o600) })
+			measure("open", func() { g, _ := os.Open("/g"); g.Close() })
+			measure("stat", func() { os.Stat("/g") })
+			measure("mkdir", func() { os.Mkdir("/d2", 0o755) })
+			measure("remove", func() { os.Remove("/d2") })
+			measure("removeAll", func() { os.RemoveAll("/rr") })
+			measure("truncate-name", func() { os.Truncate("/f", 2) })
+			measure("chmod-name", func() { os.Chmod("/f", 0o644) })
+			measure("chtimes", func() { os.Chtimes("/f", time.Now(), time.Now()) })
+
+			// os.Rename does an internal Lstat(newname) before the rename itself,
+			// so on a slow disk it pays the latency twice — two real disk ops, the
+			// faithful result (not double-counting one op).
+			t0 := time.Now()
+			mustOK(t, "Rename", os.Rename("/g", "/g2"))
+			if d := time.Since(t0); d != 2*lat {
+				t.Errorf("rename took %v, want %v (Lstat + rename)", d, 2*lat)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyReaddir: a directory read is delayed too. ReadDir may call the
+// backend more than once, so assert it is delayed by at least the per-op latency.
+func TestDSTDiskLatencyReaddir(t *testing.T) {
+	const lat = 10 * time.Millisecond
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "Mkdir", os.Mkdir("/d", 0o755))
+			mustOK(t, "WriteFile", os.WriteFile("/d/a", nil, 0o644))
+			d, err := os.Open("/d")
+			mustOK(t, "Open dir", err)
+			defer d.Close()
+
+			simulation.SlowDisk("h", lat)
+			t0 := time.Now()
+			if _, err := d.ReadDir(-1); err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			if got := time.Since(t0); got < lat {
+				t.Fatalf("ReadDir took %v, want >= %v", got, lat)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyInMemoryOpsUnaffected (DST-FAULT-SOUND): seek and Getwd touch no
+// disk, so a slow disk never delays them — delaying them would be a delay the real
+// stack never imposes.
+func TestDSTDiskLatencyInMemoryOpsUnaffected(t *testing.T) {
+	const lat = 50 * time.Millisecond
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644))
+			f, err := os.Open("/f")
+			mustOK(t, "Open", err)
+			defer f.Close()
+
+			simulation.SlowDisk("h", lat)
+			t0 := time.Now()
+			if _, err := f.Seek(2, io.SeekStart); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			if _, err := os.Getwd(); err != nil {
+				t.Fatalf("getwd: %v", err)
+			}
+			if d := time.Since(t0); d != 0 {
+				t.Fatalf("seek+getwd under SlowDisk took %v, want 0", d)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyClosedFdNoDelay (DST-FAULT-SOUND): a read on a closed handle
+// returns EBADF/closing without touching the disk, so it is not delayed.
+func TestDSTDiskLatencyClosedFdNoDelay(t *testing.T) {
+	const lat = 50 * time.Millisecond
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644))
+			f, err := os.Open("/f")
+			mustOK(t, "Open", err)
+			f.Close()
+
+			simulation.SlowDisk("h", lat)
+			t0 := time.Now()
+			if _, err := f.Read(make([]byte, 4)); err == nil {
+				t.Fatal("read on closed fd succeeded, want error")
+			}
+			if d := time.Since(t0); d != 0 {
+				t.Fatalf("read on closed fd under SlowDisk took %v, want 0 (no disk access)", d)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyVictim (DST-FAULT-VICTIM): SlowDisk slows exactly the named host;
+// another host's identical read is instant.
+func TestDSTDiskLatencyVictim(t *testing.T) {
+	const lat = 30 * time.Millisecond
+	simulation.Run(1, func() {
+		seed := func() { mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644)) }
+		onHost("hA", seed)
+		onHost("hB", seed)
+		simulation.SlowDisk("hA", lat)
+
+		onHost("hA", func() {
+			f, _ := os.Open("/f")
+			defer f.Close()
+			t0 := time.Now()
+			f.Read(make([]byte, 4))
+			if d := time.Since(t0); d != lat {
+				t.Fatalf("hA read took %v, want %v", d, lat)
+			}
+		})
+		onHost("hB", func() {
+			f, _ := os.Open("/f")
+			defer f.Close()
+			t0 := time.Now()
+			f.Read(make([]byte, 4))
+			if d := time.Since(t0); d != 0 {
+				t.Fatalf("hB read took %v, want 0 (slow disk leaked onto hB)", d)
+			}
+		})
+	})
+}
+
+// TestDSTDiskLatencyHostIndependence: a slow disk on hA must NOT stall hB's
+// filesystem — the delay sleeps outside the shared tree lock. hB's read runs to
+// completion at virtual time 0 while hA is mid-sleep; if the sleep held dstFS.mu, hB
+// would block until hA woke (== lat).
+func TestDSTDiskLatencyHostIndependence(t *testing.T) {
+	const lat = 40 * time.Millisecond
+	simulation.Run(1, func() {
+		seed := func() { mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644)) }
+		onHost("hA", seed)
+		onHost("hB", seed)
+		simulation.SlowDisk("hA", lat)
+
+		var hbElapsed time.Duration
+		var wg sync.WaitGroup
+		wg.Add(2)
+		onHost("hA", func() {
+			go func() {
+				defer wg.Done()
+				f, _ := os.Open("/f") // slow (hA): lat
+				f.Read(make([]byte, 4))
+				f.Close()
+			}()
+		})
+		onHost("hB", func() {
+			go func() {
+				defer wg.Done()
+				t0 := time.Now()
+				f, _ := os.Open("/f") // hB: not slow
+				f.Read(make([]byte, 4))
+				f.Close()
+				hbElapsed = time.Since(t0)
+			}()
+		})
+		wg.Wait()
+		if hbElapsed != 0 {
+			t.Fatalf("hB filesystem stalled %v behind hA's slow disk (sleep held the shared lock)", hbElapsed)
+		}
+	})
+}
+
+// TestDSTDiskLatencyDeterminism (DST-FAULT-REPLAY): an explicit per-op duration, so
+// the same seed + schedule replays the same virtual delays.
+func TestDSTDiskLatencyDeterminism(t *testing.T) {
+	const lat = 15 * time.Millisecond
+	run := func() time.Duration {
+		var total time.Duration
+		simulation.Run(3, func() {
+			onHost("h", func() {
+				mustOK(t, "WriteFile", os.WriteFile("/f", []byte("data"), 0o644))
+				f, _ := os.Open("/f")
+				defer f.Close()
+				simulation.SlowDisk("h", lat)
+				t0 := time.Now()
+				f.Read(make([]byte, 4))
+				f.Seek(0, io.SeekStart)
+				f.Read(make([]byte, 4))
+				total = time.Since(t0)
+			})
+		})
+		return total
+	}
+	a, b := run(), run()
+	if a != b {
+		t.Fatalf("non-deterministic latency: %v vs %v", a, b)
+	}
+	if a != 2*lat { // two slowed reads; the seek is in-memory
+		t.Fatalf("two reads + a seek took %v, want %v", a, 2*lat)
 	}
 }

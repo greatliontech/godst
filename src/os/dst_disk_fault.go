@@ -25,6 +25,7 @@ const (
 	diskOpHealFile                   // per-file EIO off
 	diskOpLimit                      // ENOSPC: cap the disk at arg total bytes
 	diskOpUnlimit                    // remove the capacity
+	diskOpSlow                       // latency: arg nanoseconds per disk-touching op (0 = none)
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook
@@ -77,6 +78,11 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		d.capacity = arg
 	case diskOpUnlimit:
 		d.capped = false
+	case diskOpSlow:
+		d.latency.Store(arg)
+		if arg > 0 {
+			dstDiskSlow.Store(true) // arm the global gate; reset on the next run's roll
+		}
 	}
 }
 

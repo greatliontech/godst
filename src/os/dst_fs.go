@@ -12,6 +12,7 @@ import (
 	"path"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	_ "unsafe" // for go:linkname
@@ -72,16 +73,26 @@ var dstFS struct {
 // space in use is summed on demand from the live tree (residentLocked), not tracked
 // incrementally, so a delete or truncate-down frees space for the next write with no
 // accounting threaded through every mutation — and never a false ENOSPC a
-// budget-that-ignores-frees would produce. All read at the dstFile / create choke
-// points and set through the runtime relay (see dst_disk_fault.go). All under
-// dstFS.mu.
+// budget-that-ignores-frees would produce. latency models a slow disk: a per-op
+// delay (nanoseconds) the calling goroutine sleeps before each disk-touching op. It
+// is atomic, not under dstFS.mu, because the delay is read and slept on BEFORE the op
+// takes the tree lock — sleeping while holding dstFS.mu would freeze every host's
+// filesystem, not just the slow one. (eio/capacity are read inside the op under the
+// lock; only latency needs the lock-free read.) Set through the runtime relay (see
+// dst_disk_fault.go).
 type dstFSDisk struct {
 	root     *dstFSNode
 	eio      bool                // host-disk EIO: every read/write/sync on this disk fails EIO
 	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
 	capped   bool                // whether a capacity (full-disk / ENOSPC) limit is set
 	capacity int64               // max total regular-file bytes when capped
+	latency  atomic.Int64        // slow-disk: per-op delay in nanoseconds (0 = none)
 }
+
+// dstDiskSlow gates the per-op latency delay: true once any host's disk has a latency
+// set this run, so the no-fault path is a single atomic load with no lock. Reset when
+// the run epoch rolls (dstFSRoll).
+var dstDiskSlow atomic.Bool
 
 //go:linkname dstFSCurrentNode runtime.dstCurrentNode
 func dstFSCurrentNode() (host, proc uint32)
@@ -94,6 +105,9 @@ func dstFSRoll() {
 		dstFS.epoch = e
 		dstFS.disks = make(map[uint32]*dstFSDisk)
 		dstFS.cwds = make(map[[2]uint32]string)
+		// New run: no host is slow until a SlowDisk fault re-arms the gate (the
+		// per-disk latency resets with the disks above).
+		dstDiskSlow.Store(false)
 	}
 }
 
@@ -264,6 +278,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -297,6 +312,7 @@ func dstRemove(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -335,6 +351,7 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -372,6 +389,7 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -430,6 +448,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -472,6 +491,7 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -524,6 +544,7 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -544,6 +565,7 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 
 // chmodHandle implements File.Chmod on a simulated handle.
 func (d *dstFile) chmodHandle(mode FileMode) error {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -559,6 +581,7 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -646,6 +669,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		return wrap(syscall.ENOENT)
 	}
 
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -705,6 +729,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	wrap := func(e error) (*File, bool, error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: e}
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -751,6 +776,45 @@ func (d *dstFile) enter() error {
 func (d *dstFile) leave() {
 	dstFS.mu.Unlock()
 	d.mu.Unlock()
+}
+
+// diskDelay sleeps this handle's disk's per-op latency before a disk-touching op (a
+// slow disk). It reads the latency lock-free and sleeps OUTSIDE the tree lock — the
+// op takes dstFS.mu afterward — so a slow disk on one host never blocks another's
+// filesystem. The gate makes the no-fault path a single atomic load. A closed handle
+// is skipped: a closed fd returns EBADF without touching the disk, so a delay there
+// would be one a real slow disk never imposes (DST-FAULT-SOUND).
+func (d *dstFile) diskDelay() {
+	if !dstDiskSlow.Load() {
+		return
+	}
+	lat := d.disk.latency.Load()
+	if lat <= 0 {
+		return
+	}
+	d.mu.Lock()
+	closed := d.closed
+	d.mu.Unlock()
+	if !closed {
+		time.Sleep(time.Duration(lat))
+	}
+}
+
+// dstDiskDelayHere is diskDelay for a named (path) op, which has no handle: it sleeps
+// the calling host's disk latency before the op takes the tree lock. The brief lock
+// is only to look up the host's disk (a map read); the sleep happens after releasing
+// it. Gated like diskDelay so an unslowed run pays only the atomic load.
+func dstDiskDelayHere() {
+	if !dstDiskSlow.Load() {
+		return
+	}
+	dstFS.mu.Lock()
+	dstFSRoll()
+	lat := dstFSDiskHere().latency.Load()
+	dstFS.mu.Unlock()
+	if lat > 0 {
+		time.Sleep(time.Duration(lat))
+	}
 }
 
 // diskEIO returns syscall.EIO if this handle's disk is under a host-wide EIO fault
@@ -829,6 +893,7 @@ func (disk *dstFSDisk) diskFullForCreate() bool {
 }
 
 func (d *dstFile) read(b []byte) (int, error) {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -856,6 +921,7 @@ func (d *dstFile) read(b []byte) (int, error) {
 }
 
 func (d *dstFile) pread(b []byte, off int64) (int, error) {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -878,6 +944,7 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 }
 
 func (d *dstFile) write(b []byte) (int, error) {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -904,6 +971,7 @@ func (d *dstFile) write(b []byte) (int, error) {
 }
 
 func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -998,6 +1066,7 @@ func (d *dstFile) sortedEntryNamesLocked() []string {
 // simulated directory handle: sorted names with a stable cursor for chunked
 // (n > 0) reads; io.EOF at exhaustion for chunked mode, as the host funnel.
 func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
+	d.diskDelay()
 	if e := d.enter(); e != nil {
 		return nil, nil, e
 	}
@@ -1053,6 +1122,7 @@ func (d *dstFile) chdirHandle() error {
 }
 
 func (d *dstFile) truncate(size int64) error {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -1074,6 +1144,7 @@ func (d *dstFile) truncate(size int64) error {
 // durable image; this is its only writer (plus O_SYNC's per-write commit,
 // which routes through the same helper).
 func (d *dstFile) sync() error {
+	d.diskDelay()
 	if err := d.enter(); err != nil {
 		return err
 	}

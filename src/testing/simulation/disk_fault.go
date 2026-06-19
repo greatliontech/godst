@@ -4,7 +4,10 @@
 
 package simulation
 
-import _ "unsafe" // for go:linkname
+import (
+	"time"
+	_ "unsafe" // for go:linkname
+)
 
 // Disk faults over the per-host filesystem seam (docs/dst/faults.md "Disk faults"),
 // the storage-axis counterpart of the network targeting API (Partition / Reset). A
@@ -36,6 +39,7 @@ const (
 	diskOpHealFile
 	diskOpLimit
 	diskOpUnlimit
+	diskOpSlow
 )
 
 // FailDisk makes every read, write, and fsync on the named host's disk fail with
@@ -89,4 +93,23 @@ func LimitDisk(host string, bytes int64) {
 // and creates stop failing with ENOSPC.
 func UnlimitDisk(host string) {
 	dstDiskFaultOp(diskOpUnlimit, internHost(host), 0, "")
+}
+
+// SlowDisk models a slow disk: every disk-touching filesystem operation on the named
+// host — read, write, fsync, open, stat, mkdir, remove, rename, readdir, truncate,
+// chmod, chtimes — takes perOp longer (virtual time), as if serviced by a slow
+// device. Pure in-memory operations that a real slow disk does not slow (seek, Getwd)
+// are unaffected. The delay is the calling goroutine's alone — a slow disk on one
+// host does not stall another's filesystem — and is deterministic (an explicit
+// duration, no fault-RNG draw), so the same seed and schedule replay identically.
+// The delay is per backend operation, so a composite helper pays it once for each
+// op it issues: os.Rename does an internal stat then the rename (two delays), and
+// os.ReadFile / os.WriteFile open, then read or write, then close (close is not a
+// disk op) — as a real slow disk would charge each syscall. perOp of 0 removes the
+// latency. Negative perOp is invalid. Call from within a Run.
+func SlowDisk(host string, perOp time.Duration) {
+	if perOp < 0 {
+		panic("testing/simulation: SlowDisk perOp must be >= 0")
+	}
+	dstDiskFaultOp(diskOpSlow, internHost(host), int64(perOp), "")
 }
