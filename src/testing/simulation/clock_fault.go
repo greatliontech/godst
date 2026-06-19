@@ -22,6 +22,9 @@ import (
 //go:linkname dstStepHostClock runtime.dstStepHostClock
 func dstStepHostClock(host uint32, delta int64)
 
+//go:linkname dstDriftHostClock runtime.dstDriftHostClock
+func dstDriftHostClock(host uint32, ppb int64)
+
 // StepClock applies an instantaneous wall-clock step to the named host's clock,
 // modeling an NTP slew/correction during the run. A positive delta jumps the host's
 // time.Now forward, a negative delta backward; a backward step makes wall-time
@@ -37,4 +40,21 @@ func dstStepHostClock(host uint32, delta int64)
 // Steps accumulate. Calls outside a run are no-ops. Call from within a Run.
 func StepClock(host string, delta time.Duration) {
 	dstStepHostClock(internHost(host), int64(delta))
+}
+
+// DriftClock changes the named host's clock rate to a departure of ppb parts-per-billion
+// (rate 1 + ppb/1e9) mid-run — the dynamic complement of the declared Drift: a host can
+// start drifting at one point and re-sync (DriftClock(host, 0)) at another, modeling a
+// crystal whose error appears over a window or an NTP discipline that corrects the rate.
+// From the change instant the host's wall advances at the new rate and its relative
+// timers convert at the new rate; the wall stays continuous across the change (no jump),
+// and every timer already pending on the host is re-mapped so it still fires after the
+// host-perceived time it was set for. ppb must be in (-1e9, 1e9] (rate in (0, 2]);
+// DriftClock panics otherwise (a non-positive or reversed rate is a step, not drift).
+// Affects exactly the named host. Calls outside a run are no-ops. Call from within a Run.
+func DriftClock(host string, ppb int64) {
+	if ppb <= -driftPPBBase || ppb > maxDriftPPB {
+		panic("testing/simulation: DriftClock ppb out of range (-1e9, 1e9]; rate must be in (0, 2]")
+	}
+	dstDriftHostClock(internHost(host), ppb)
 }

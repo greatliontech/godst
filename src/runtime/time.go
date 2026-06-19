@@ -82,6 +82,8 @@ type timer struct {
 
 	blocked uint32 // number of goroutines blocked on timer's channel
 	rand    uint32 // randomizes order of timers at same instant; only set when isFake
+	dstHost uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
+	dstReg  uint32 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
 
 	// Timer wakes up at when, and then at when+period, ... (period > 0 only)
 	// each time calling f(arg, seq, delay) in the timer goroutine, so f must be
@@ -596,14 +598,24 @@ func (t *timer) modify(when, period int64, f func(arg any, seq uintptr, delay in
 		throw("timer period must be non-negative")
 	}
 	if dstActive() && t.isFake {
+		gp := getg()
+		// Tag the arming host on the fake timer and register it in the per-run fake-timer
+		// list, so DriftClock can find this host's armed timers — heaped OR not — to
+		// rate-convert on a mid-run rate change. Done for every fake-timer arm (even a
+		// non-drifting host), so a host that drifts only later still owns and can re-map
+		// its already-armed timers. A channel timer is heaped only while a goroutine is
+		// blocked on it (needsAdd), so the heap alone is not a complete set of armed
+		// timers; the list is.
+		t.dstHost = gp.dstHost
+		dstRegisterFakeTimer(t)
 		// Under a drifting host's clock (rate ≠ 1), convert the arming host's perceived
 		// fire time and repeat interval to universe base time, so a rate-r host's d-timer
-		// fires after d/r of base. This is the single timer choke point every relative
-		// arm (Sleep/After/NewTimer/NewTicker/AfterFunc/context) funnels through; identity
-		// for rate 1, so non-drifting timers are unchanged. Folds away in non-dst builds.
-		// Gated on t.isFake — only a bubble's simulated timers are in base time; a real-FD
-		// poll deadline (non-fake) carries real-monotonic time, which must not be rate-
-		// converted against bubble.now (real I/O in a bubble is out of the simulation).
+		// fires after d/r of base. This is the single timer choke point every relative arm
+		// (Sleep/After/NewTimer/NewTicker/AfterFunc/context) funnels through; identity for
+		// rate 1. Folds away in non-dst builds. Gated on t.isFake — only a bubble's
+		// simulated timers are in base time; a real-FD poll deadline (non-fake) carries
+		// real-monotonic time, which must not be rate-converted against bubble.now (real
+		// I/O in a bubble is out of the simulation).
 		when, period = dstTimerArmForDrift(when, period)
 	}
 	async := debug.asynctimerchan.Load() != 0
