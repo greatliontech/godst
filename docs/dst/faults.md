@@ -451,7 +451,10 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   Bytes **already delivered** before the cut sit in the receiver's kernel buffer on a real machine, so
   they **stay readable during the cut** — a partition severs the link, never data the receiver already
   holds; blackholing pre-delivered bytes fails a read a real kernel serves (a sim-only failure, the
-  false-positive class the Soundness invariant forbids). DoF: a transient partition. **Landed**
+  false-positive class the Soundness invariant forbids). The reader's arrival horizon is capped at the
+  cut-start (`dstPartCutStart`): bytes delivered strictly before the cut are readable, in-flight and
+  after-cut bytes are held (`TestDSTNetPartitionPreDeliveredReadable` / `TestDSTNetPartitionRecover`).
+  DoF: a transient partition. **Landed**
   (blackhole mode) via the imperative targeting API
   `simulation.Partition(a,b)` / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)` (the mechanism; the declarative
   `Options.Faults` + per-fault mode is L4). It drives a per-run host-pair/isolated-host table in net

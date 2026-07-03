@@ -252,15 +252,14 @@ registry**: `Listen` registers a simulated listener; `Dial` looks it up and hand
 connection back while pushing the server end onto the listener's accept queue. **Every** connection —
 cross-host, same-host, and loopback alike — is **wire-backed** (`net/dst_wire.go`: a buffered,
 synctest-durable transport; deadlines on the fake clock) wrapped with the simulated local/remote
-`*net.TCPAddr`; a same-host wire simply has zero link latency (the wire-backed-everywhere shape lands
-with the network-transport chunk; same-host conns are `net.Pipe` until then). One transport shape
+`*net.TCPAddr`; a same-host wire simply has zero link latency. One transport shape
 everywhere is load-bearing for soundness: a rendezvous pipe (writes blocking until the peer reads) would deadlock
 two co-located processes that each write before reading — an execution real TCP, whose send buffer
 is never zero, cannot produce (the Soundness invariant's false-positive class).
 
-**Transport model (contract; the byte-stream and wakeup legs land with the network-transport chunk,
-the flow-control, horizon, connect-cost, and FIN/RST legs with the network-flow-control chunk).**
-The wire models a TCP socket pair, not a message queue:
+**Transport model (contract).** The byte-stream and no-lost-wakeup legs are landed; the
+flow-control, retransmission-horizon, connect-cost, and FIN/RST legs land with the
+network-flow-control chunk. The wire models a TCP socket pair, not a message queue:
 
 - **Byte stream, not messages.** The receive side is a byte buffer: one `Read` returns delivered
   contiguous bytes, up to the buffer's length — reads **coalesce across write

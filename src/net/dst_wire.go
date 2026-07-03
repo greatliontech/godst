@@ -14,11 +14,11 @@ import (
 	_ "unsafe" // for go:linkname
 )
 
-// A dstWire is the delay-bearing transport under a simulated cross-host
-// connection. It backs EVERY cross-host connection (same-host stays on the
-// synchronous, zero-delay net.Pipe): a segment is transmitted (bandwidth, store-
-// and-forward), then propagates (latency + jitter), becoming readable in order on
-// the deterministic fake clock. It is the seam every network-delivery fault hooks —
+// A dstWire is the delay-bearing transport under a simulated connection. It backs
+// EVERY connection — cross-host with the configured latency/jitter/bandwidth,
+// same-host and loopback with a zero-latency wire (never partitioned): a segment is
+// transmitted (bandwidth, store-and-forward), then propagates (latency + jitter),
+// becoming readable in order on the deterministic fake clock. It is the seam every network-delivery fault hooks —
 // jitter draws the per-segment delay, throttle paces it by bytes, partition
 // blackholes its reads while writes keep buffering. With no fault configured the
 // delay is zero, so it is a buffered-but-instant link (the faithful TCP send-buffer
@@ -41,10 +41,11 @@ import (
 //
 // Unlike net.Pipe, a write is buffered (it returns immediately, modeling a TCP
 // send buffer the propagation delay drains) rather than rendezvousing with the
-// reader; that is exactly the decoupling latency and buffer-and-recover require.
-// Same-host connections keep net.Pipe's synchronous behavior (a dstWire is built
-// only for cross-host conns), so the N=1 collapse — which has no cross-host conns —
-// is byte-identical.
+// reader; that is exactly the decoupling latency and buffer-and-recover require,
+// and it is why same-host conns are wire-backed too: a rendezvous pipe deadlocks
+// two co-located peers that each write before reading, an execution real TCP cannot
+// produce. Reads are a byte STREAM: one Read returns whatever arrived bytes fit,
+// coalescing across write boundaries (TCP gives no framing), never message-framed.
 
 //go:linkname dstClockOffsetNow runtime.dstClockOffsetNow
 func dstClockOffsetNow() int64
@@ -93,6 +94,7 @@ type dstStream struct {
 	segs       []dstSeg
 	linkFreeAt int64         // base-time when the bandwidth-limited link finishes transmitting all queued bytes
 	closed     bool          // writer end closed: the reader drains, then sees EOF
+	closeAt    int64         // base-time the writer closed (the FIN's arrival); valid iff closed
 	ready      chan struct{} // buffered(1) wakeup, pinged on append/close
 }
 
@@ -139,44 +141,73 @@ func (s *dstStream) push(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
 	s.wake()
 }
 
-// closeWrite marks the writer end gracefully closed: the reader drains queued
-// segments at their delivery times, then sees EOF.
+// closeWrite marks the writer end gracefully closed at the current base time (the
+// FIN's arrival): the reader drains queued segments at their delivery times, then
+// sees EOF — but a partition holds the FIN too, so EOF is withheld until heal unless
+// the close arrived before the cut (closeAt <= cut-start), exactly like a data byte.
 func (s *dstStream) closeWrite() {
 	s.mu.Lock()
 	s.closed = true
+	s.closeAt = dstBaseNanos()
 	s.mu.Unlock()
 	s.wake()
 }
 
-// pop copies deliverable bytes into b. It returns n>0 when bytes are ready;
-// eof=true when the writer closed and the queue is drained; otherwise wait is the
-// duration until the head segment becomes deliverable, or wait<0 when the queue
-// is empty and open (block until woken).
-func (s *dstStream) pop(b []byte) (n int, eof bool, wait time.Duration) {
+// pop copies bytes that have ARRIVED (deliverAt <= maxArrival) into b, coalescing
+// across segment boundaries exactly as a TCP receive buffer does — one Read returns
+// whatever contiguous arrived bytes fit, spanning as many writes as fit in b (write
+// boundaries are not preserved; TCP does not preserve them). maxArrival is the
+// caller's arrival horizon: base-time now normally, or the partition cut-start while
+// cut (so only bytes that reached the receive buffer before the cut are readable).
+//
+// Returns: n>0 with remain=true when ANY segment is still queued after filling b —
+// arrived (b filled first) OR in-flight. The caller re-wakes on remain so a second
+// blocked reader is signaled; the cap-1 ready channel cannot hold a second ping, and
+// a reader parked on an empty queue has no timer of its own, so re-waking on an
+// in-flight remainder too (not just arrived bytes) is what lets it arm a timer for
+// that segment instead of stranding. eof=true when the writer's close has arrived
+// (closeAt <= maxArrival) and no segments remain; otherwise wait is the base-time
+// duration until the head segment arrives (>0), or wait<0 when nothing is pending
+// within the horizon (block until woken).
+func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wait time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.segs) > 0 {
+	for len(s.segs) > 0 && n < len(b) {
 		head := &s.segs[0]
-		now := dstBaseNanos()
-		if head.deliverAt > now {
-			return 0, false, time.Duration(head.deliverAt - now)
+		if head.deliverAt > maxArrival {
+			// Head not yet arrived within the horizon. If we already copied some,
+			// return it (a segment remains → remain=true); else report the wait until
+			// this segment arrives (only meaningful when maxArrival is base-time now —
+			// a partition caps the horizon at cut-start, and the caller blocks on the
+			// heal instead).
+			if n > 0 {
+				return n, true, false, 0
+			}
+			return 0, false, false, time.Duration(head.deliverAt - maxArrival)
 		}
-		n = copy(b, head.data)
-		if n < len(head.data) {
-			head.data = head.data[n:]
-			return n, false, 0
+		c := copy(b[n:], head.data)
+		n += c
+		if c < len(head.data) {
+			head.data = head.data[c:]
+			return n, true, false, 0 // b full mid-segment, bytes remain: signal another reader
 		}
 		s.segs[0] = dstSeg{} // release the delivered buffer (don't retain it in the backing array)
 		s.segs = s.segs[1:]
 		if len(s.segs) == 0 {
 			s.segs = nil
 		}
-		return n, false, 0
 	}
-	if s.closed {
-		return 0, true, 0
+	if n > 0 {
+		// Re-signal iff any segment remains — arrived (b filled at a boundary) or
+		// in-flight. A woken second reader either grabs arrived bytes (re-waking
+		// again) or arms a timer for the in-flight head; either terminates. A reader
+		// that pops nothing does not re-wake, so there is no spin.
+		return n, len(s.segs) > 0, false, 0
 	}
-	return 0, false, -1
+	if s.closed && s.closeAt <= maxArrival && len(s.segs) == 0 {
+		return 0, false, true, 0
+	}
+	return 0, false, false, -1
 }
 
 // dstWireEnd is one endpoint of a dstWire; it implements net.Conn with the same
@@ -231,6 +262,9 @@ func (e *dstWireEnd) Read(b []byte) (int, error) {
 }
 
 func (e *dstWireEnd) read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	for {
 		switch {
 		case isClosedChan(e.localDone):
@@ -238,14 +272,42 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		case isClosedChan(e.rdDead.wait()):
 			return 0, os.ErrDeadlineExceeded
 		}
-		// Partition blackhole: while the link is cut, deliver nothing — block until
-		// it heals, the read deadline fires, or this end closes. The peer's writes
-		// keep buffering on the wire (push is unaffected) and flush in order once
-		// the reader resumes here, so a healed stream loses no bytes and never
-		// reorders (the sound buffer-and-recover model). Fetch the wake channel
-		// before the check so a heal racing the check still wakes us.
+		// Fetch the partition wake channel BEFORE reading the cut state so a heal
+		// racing the check still wakes us. Partition holds only bytes NOT yet in the
+		// receiver's buffer at the cut: the arrival horizon is base-time now normally,
+		// capped at the cut-start while cut, so bytes that arrived before the cut stay
+		// readable (they sit in the kernel receive buffer — blackholing them would be
+		// a sim-only failure), while in-flight and after-cut bytes are held until heal.
+		// The peer's writes keep buffering on the wire (push is unaffected) and flush
+		// in order once the link heals — the sound buffer-and-recover model.
 		wake := dstPartWakeCh()
-		if dstPartitioned(e.localHost, e.peerHost) {
+		maxArrival := dstBaseNanos()
+		cutStart, cut := dstPartCutStart(e.localHost, e.peerHost)
+		if cut {
+			// A byte counts as arrived-before-the-cut only if it was delivered
+			// STRICTLY before the cut began: cutStart-1 is the inclusive horizon.
+			// The boundary is load-bearing — a write issued right after Partition()
+			// with no virtual time in between has deliverAt == cutStart, and it must
+			// be HELD (it was sent after the cut), not delivered. Held bytes flush on
+			// heal, when cut is false and the horizon returns to now.
+			if cutStart-1 < maxArrival {
+				maxArrival = cutStart - 1
+			}
+		}
+		n, remain, eof, wait := e.in.pop(b, maxArrival)
+		if n > 0 {
+			if remain {
+				e.in.wake() // a segment remains; re-signal so a second blocked reader wakes
+			}
+			return n, nil
+		}
+		if eof {
+			return 0, io.EOF
+		}
+		if cut {
+			// Arrived-before-cut bytes exhausted; anything else (in flight, written
+			// after the cut, or a not-yet-arrived FIN) is held. Block until heal, a
+			// deadline, or a local close.
 			select {
 			case <-wake:
 			case <-e.localDone:
@@ -253,15 +315,8 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			}
 			continue
 		}
-		n, eof, wait := e.in.pop(b)
-		if n > 0 {
-			return n, nil
-		}
-		if eof {
-			return 0, io.EOF
-		}
 		// Block until data arrives, the head segment becomes deliverable, a
-		// deadline fires, or either end closes; then re-evaluate.
+		// deadline fires, or this end closes; then re-evaluate.
 		var timerC <-chan time.Time
 		var timer *time.Timer
 		if wait > 0 {

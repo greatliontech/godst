@@ -851,19 +851,20 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		localAddr.Zone = localTCPAddr.Zone
 	}
 
-	// Cross-host connections are wire-backed (buffered delivery carrying the
-	// configured latency/jitter/bandwidth, and partitionable); same-host and
-	// loopback (dialer and listener on one host) stay on the synchronous net.Pipe —
-	// the N=1 collapse has no cross-host conns, so it is byte-identical. The wire's
-	// buffered write is also the faithful TCP shape (a send buffer the link drains),
-	// and it is required for partition's buffer-and-recover: writes during a cut
-	// queue and flush in order on heal.
-	var p1, p2 Conn
+	// EVERY connection is wire-backed (a buffered byte-stream transport). Cross-host
+	// conns carry the configured latency/jitter/bandwidth and are partitionable;
+	// same-host and loopback conns use a zero-latency wire (never partitioned, since
+	// dstPartitioned is false for a==b). One transport shape everywhere is required
+	// for soundness: net.Pipe rendezvouses (a write blocks until the peer reads), so
+	// two co-located processes that each write before reading would deadlock in
+	// simulation where real TCP — whose send buffer is never zero — completes both
+	// instantly, a false positive the Soundness invariant forbids. The wire's
+	// buffered write is the faithful TCP shape (a send buffer the link drains).
+	latency, jitter, bandwidth := int64(0), int64(0), int64(0)
 	if l.host != dialerHost {
-		p1, p2 = dstWirePair(dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps(), dialerHost, l.host)
-	} else {
-		p1, p2 = Pipe()
+		latency, jitter, bandwidth = dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps()
 	}
+	p1, p2 := dstWirePair(latency, jitter, bandwidth, dialerHost, l.host)
 	reset := new(atomic.Bool)
 	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc}
 	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc}

@@ -57,11 +57,17 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 // it resets each run with no explicit teardown. The wake channel is closed and
 // remade on every change, to wake reads/dials blocked on a partition; it is made
 // lazily under mu from in-bubble callers, so it is a bubble channel for the run.
+//
+// pairs/isolated map a cut source to the universe BASE time it became cut (its
+// cut-start), not merely a present flag: an established conn's read must know
+// which bytes ARRIVED before the cut (deliverAt <= cut-start — readable, they sit
+// in the receiver's buffer) versus which are in flight or written after it (held
+// until heal). Absent = not cut by that source.
 var dstPart struct {
 	mu       sync.Mutex
 	epoch    uint64
-	pairs    map[uint64]bool
-	isolated map[uint32]bool
+	pairs    map[uint64]int64
+	isolated map[uint32]int64
 	wake     chan struct{}
 }
 
@@ -77,25 +83,32 @@ func dstPartKey(a, b uint32) uint64 {
 func dstPartRoll() {
 	if e := dstNetEpoch(); e != dstPart.epoch || dstPart.wake == nil {
 		dstPart.epoch = e
-		dstPart.pairs = make(map[uint64]bool)
-		dstPart.isolated = make(map[uint32]bool)
+		dstPart.pairs = make(map[uint64]int64)
+		dstPart.isolated = make(map[uint32]int64)
 		dstPart.wake = make(chan struct{})
 	}
 }
 
 // dstApplyPartitionOp is the hook runtime invokes for simulation.Partition etc. It
 // mutates the table and wakes everything blocked on a partition by closing and
-// remaking the wake channel.
+// remaking the wake channel. A cut records the current base time as its cut-start
+// (only when it was not already cut by that source, so a redundant re-cut does not
+// move the boundary); a heal removes the source.
 func dstApplyPartitionOp(op, a, b uint32) {
+	now := dstBaseNanos()
 	dstPart.mu.Lock()
 	dstPartRoll()
 	switch op {
 	case dstPartOpPartition:
-		dstPart.pairs[dstPartKey(a, b)] = true
+		if _, cut := dstPart.pairs[dstPartKey(a, b)]; !cut {
+			dstPart.pairs[dstPartKey(a, b)] = now
+		}
 	case dstPartOpHeal:
 		delete(dstPart.pairs, dstPartKey(a, b))
 	case dstPartOpIsolate:
-		dstPart.isolated[a] = true
+		if _, cut := dstPart.isolated[a]; !cut {
+			dstPart.isolated[a] = now
+		}
 	case dstPartOpHealHost:
 		delete(dstPart.isolated, a)
 	}
@@ -107,13 +120,37 @@ func dstApplyPartitionOp(op, a, b uint32) {
 // dstPartitioned reports whether the link between hosts a and b is currently cut
 // (either host isolated, or the pair partitioned). The same host is never cut.
 func dstPartitioned(a, b uint32) bool {
+	_, cut := dstPartCutStart(a, b)
+	return cut
+}
+
+// dstPartCutStart reports whether the link between hosts a and b is currently cut
+// and, if so, the base-time the cut began — the EARLIEST start among the active cut
+// sources (pair cut, either host isolated). Earliest is the conservative choice: a
+// segment counts as arrived-before-the-cut only if it was delivered before every
+// active source's start, so no byte the real link would have held is delivered. The
+// same host is never cut.
+func dstPartCutStart(a, b uint32) (int64, bool) {
 	if a == b {
-		return false
+		return 0, false
 	}
 	dstPart.mu.Lock()
 	defer dstPart.mu.Unlock()
 	dstPartRoll()
-	return dstPart.isolated[a] || dstPart.isolated[b] || dstPart.pairs[dstPartKey(a, b)]
+	start := int64(0)
+	cut := false
+	consider := func(t int64, ok bool) {
+		if ok && (!cut || t < start) {
+			start, cut = t, true
+		}
+	}
+	ta, oka := dstPart.isolated[a]
+	consider(ta, oka)
+	tb, okb := dstPart.isolated[b]
+	consider(tb, okb)
+	tp, okp := dstPart.pairs[dstPartKey(a, b)]
+	consider(tp, okp)
+	return start, cut
 }
 
 // dstPartWakeCh returns the channel closed on the next partition change, so a
