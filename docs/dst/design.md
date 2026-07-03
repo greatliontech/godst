@@ -181,7 +181,13 @@ in-run; acquire identity through `os/user` for coherence. `os.TempDir` stays fix
 `/tmp` (see the filesystem section). The simulated
 identity is also process-global while set: a goroutine outside the simulation that reads identity
 during a run (or in the brief set/clear windows around it) observes simulated values — identity
-gates on the sim-env flag, not per-goroutine.
+gates on the sim-env flag, not per-goroutine. The per-process environment view shares this
+process-global gate but adds a *write* path the read-only identity surface lacks: a `Setenv` by a
+goroutine *outside* the simulation during a run mutates the root process (proc 0) view rather than
+the host, so run determinism additionally requires that no foreign goroutine writes the environment
+mid-run. This holds by construction — a SUT's own goroutines run inside the bubble (deterministically
+ordered), and the harness does not `Setenv` mid-run — and is the write-side analogue of the read-only
+"harmless" argument below.
 This is a deliberate gating asymmetry: identity is gated on `dstSimEnvSet` (set only by
 `testing/simulation.run`), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
 by `dstActivate` too). So a white-box run sees seeded RNG, scheduling, and crypto/rand but the *real*

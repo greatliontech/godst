@@ -50,6 +50,11 @@ var copyenv = sync.OnceFunc(func() {
 })
 
 func Unsetenv(key string) error {
+	if dstEnvEnabled {
+		if err, ok := dstUnsetenv(key); ok {
+			return err
+		}
+	}
 	copyenv()
 
 	envLock.Lock()
@@ -64,6 +69,11 @@ func Unsetenv(key string) error {
 }
 
 func Getenv(key string) (value string, found bool) {
+	if dstEnvEnabled {
+		if v, f, ok := dstGetenv(key); ok {
+			return v, f
+		}
+	}
 	copyenv()
 	if len(key) == 0 {
 		return "", false
@@ -86,6 +96,11 @@ func Getenv(key string) (value string, found bool) {
 }
 
 func Setenv(key, value string) error {
+	if dstEnvEnabled {
+		if err, ok := dstSetenv(key, value); ok {
+			return err
+		}
+	}
 	copyenv()
 	if len(key) == 0 {
 		return EINVAL
@@ -121,6 +136,11 @@ func Setenv(key, value string) error {
 }
 
 func Clearenv() {
+	if dstEnvEnabled {
+		if ok := dstClearenv(); ok {
+			return
+		}
+	}
 	copyenv()
 
 	envLock.Lock()
@@ -133,6 +153,11 @@ func Clearenv() {
 }
 
 func Environ() []string {
+	if dstEnvEnabled {
+		if env, ok := dstEnviron(); ok {
+			return env
+		}
+	}
 	copyenv()
 	envLock.RLock()
 	defer envLock.RUnlock()

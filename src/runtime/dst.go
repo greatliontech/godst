@@ -1397,6 +1397,19 @@ func dstSimGeteuid() (int, bool) { return dstSimUID, dstSimEnvSet }
 //go:linkname dstSimGetegid
 func dstSimGetegid() (int, bool) { return dstSimGID, dstSimEnvSet }
 
+// dstSimEnvProc returns the calling goroutine's simulated process id (g.dstProc)
+// and whether a run's environment is active (dstSimEnvSet). The syscall package
+// pulls it to key its per-process copy-on-write environment view: under a run,
+// os/syscall.Getenv/Setenv/… operate on the calling process's isolated copy of
+// the host environment instead of the shared host env (see design.md
+// "Environment surface"). Like identity, env gates on dstSimEnvSet (process-
+// global while set), not per-goroutine — a non-bubble goroutine reading env
+// during a run sees the root process (dstProc 0) view — and the run epoch
+// (dstNetEpoch) drives the per-run reset of those copies.
+//
+//go:linkname dstSimEnvProc
+func dstSimEnvProc() (proc uint32, ok bool) { return getg().dstProc, dstSimEnvSet }
+
 // dstSimUser is read by os/user.Current to return the simulated current user. It
 // returns uid/gid as ints from the single source of truth; os/user formats them.
 //
