@@ -346,8 +346,16 @@ wall-clock). So the achievable invariant is **set-at-quiescence, not per-cycle**
 > behaviour production also leaves unspecified. Registration order is the deterministic *default*,
 > not a foreclosure: production can exhibit other orders, so a seeded/strategy-driven permutation of
 > the drain batch is a legitimate future exploration axis — it slots in at the same point (order the
-> batch before running it) with no representation change. (The registration-order leg lands with the
-> GC-determinism chunk; until then drain order is sweep order — sound but not replay-stable.)
+> batch before running it) with no representation change. **Landed for finalizers:** a per-run
+> registration sequence (`dstCallbackSeq`, stamped at `SetFinalizer` via `dstNextCallbackSeq`, carried on
+> `finalizer.dstSeq`) by which `dstDrainFinq` re-lays the detached `finq` chain (`dstSortFinqBySeq`, a
+> bottom-up merge sort — package `runtime` cannot import `sort`) before `runFinqBlocks` runs it, so
+> execution is ascending registration order; the block structure is preserved, so the discard/ledger
+> machinery is untouched. Pinned by `TestDSTFinalizerGoexitLedger` (the Goexit finalizer registered LAST
+> runs LAST → `ran==batch-1`; sweep order would run it FIRST → `ran==0`). **The cleanup drain leg is a
+> follow-on** (its `cleanupBlock`/`full`-stack layout needs a cross-block collect-sort-execute rather
+> than the finalizer chain re-lay); until it lands, cleanup drain order is sweep order — sound but not
+> replay-stable.
 
 Draining **at quiescence** (above) is what realizes this: by a quiescence point every mid-burst GC's
 queue plus a fresh quiescence GC have been folded in, so the drained set is the deterministic dead set.
@@ -690,19 +698,24 @@ All four layers are unconditional. Every DST heap-trigger crossing fires on `dst
 allocated bytes): the floored case (`target == heapMinimum`), the GOGC-scaled case
 (`target == (heapMarked − base)·GOGC/100`), and the `Options.MemoryLimit` case (the bubble's net heap
 `bubbleMarked + dstHeapAlloc` vs the limit). Two closure conditions make the per-cycle row hold beyond
-the channel-light workloads that first validated it (both land with the GC-determinism chunk):
+the channel-light workloads that first validated it (both **landed** with the GC-determinism chunk):
 
-- **Per-P pool normalization at activation.** `clearpools` deliberately leaves per-P caches alone
-  (sudog, defer) and per-P `gFree` lists also survive across runs — so whether a bubble channel op or
-  `go` statement must *refill* a cache (a heap allocation through the trigger counter) depended on
-  pre-run process history, moving the crossing point for channel/goroutine-heavy SUTs (the same noise
-  DST-MEMALLOC-DET documents on the sibling counter). `dstActivate` flushes the per-P sudog/defer
-  caches and `gFree` to a fixed empty state, so refill points are a function of the schedule alone.
-  The per-cycle discovery test gains a channel/goroutine-heavy regime to pin this.
-- **The crossing fires on the bubble's own allocation.** The trigger test is evaluated (and the GC it
-  arms is started) only for allocations by bubble goroutines — a crossing latched by a bubble
-  allocation that cannot start GC at that point (e.g. `m.locks > 1`) must not leak the *start* to
-  whichever process-wide allocation happens next (a foreign/infra goroutine at an unseeded point). The set-level test (`numGC` + total finalizers,
+- **Internal-pooled allocations are excluded from the trigger (M4).** `clearpools` leaves per-P sudog/
+  defer caches alone and per-P `gFree` lists survive across runs — so whether a bubble channel op or
+  `go` statement *refills* from a cache or *allocates* a fresh `sudog`/`_defer`/`g` (a heap allocation
+  through the trigger counter) depended on pre-run process history, moving the crossing point for
+  channel/goroutine-heavy SUTs. The fix is **not** a cache flush — flushing `gFree` would LEAK (`allgs`
+  pins every `g` forever and only reuses them via `gFree`, so emptying it strands them unboundedly
+  across a test's many runs). Instead the DST heap trigger **excludes** the three runtime-internal
+  pooled structs `g`, `sudog`, `_defer` from `dstHeapAlloc` (`dstIsInternalPooledType`, keyed off the
+  cached type descriptors): whether one is allocated or reused is a pooling artifact, not SUT heap
+  growth, and stacks are already excluded (`stackalloc`, not `mallocgc`), so this makes the trigger
+  consistently reflect the SUT's own objects with no leak. Pinned by `TestDSTGCPoolCarryoverDeterministic`
+  (two in-process runs at one seed whose inherited `g`/`sudog` pools would otherwise shift the crossing).
+- **The crossing fires on the bubble's own allocation.** The trigger test is evaluated **and the GC it
+  arms is started inside the bubble-allocation gate** — a crossing latched by a bubble allocation that
+  cannot start GC at that point (e.g. `m.locks > 1`) must not leak the *start* to whichever process-wide
+  allocation happens next (a foreign/infra goroutine at an unseeded point). The set-level test (`numGC` + total finalizers,
 `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial discovery for the
 floored, GOGC-scaled, and `MemoryLimit` regimes, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in
 all builds.

@@ -20,9 +20,31 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/atomic"
 	_ "unsafe" // for go:linkname
 )
+
+// dstInternalPooledTypes caches the type descriptors of the runtime-internal pooled
+// structs the DST heap trigger EXCLUDES from its per-object counter (dstHeapAlloc):
+// whether one is freshly allocated or reused from its cross-run-surviving cache
+// (g→gFree, sudog→sudogcache, _defer→deferpool) is a pooling artifact of pre-run
+// process history, not the SUT's heap growth, so counting it would move the GC cycle
+// boundary run-to-run for channel/goroutine-heavy SUTs (gc.md M4). Set once per run in
+// dstActivate (before any bubble allocation), read in mallocgc's DST gate; the values
+// are the same every run, and a run is single-P, so there is no race.
+var dstInternalPooledTypes struct {
+	g, sudog, defr *_type
+}
+
+// dstIsInternalPooledType reports whether typ is one of the pooled internal structs
+// the DST heap trigger excludes (see dstInternalPooledTypes). A nil typ (untyped raw
+// allocation) is a SUT allocation and counts.
+func dstIsInternalPooledType(typ *_type) bool {
+	return typ != nil && (typ == dstInternalPooledTypes.g ||
+		typ == dstInternalPooledTypes.sudog ||
+		typ == dstInternalPooledTypes.defr)
+}
 
 // dstSeed is the process DST seed: 0 means DST is off, non-zero means on and is
 // the root seed. It is set at runtime by dstActivate (not at startup), read by
@@ -32,6 +54,18 @@ var dstSeed atomic.Uint64
 // dstRunEpoch is a monotonic counter bumped once per run (dstActivate), so a
 // consumer can detect a new run and reset per-run in-memory state.
 var dstRunEpoch atomic.Uint64
+
+// dstCallbackSeq is a per-run registration sequence stamped on each finalizer/cleanup
+// at SetFinalizer/AddCleanup by a bubble goroutine (dstNextCallbackSeq), by which the
+// synchronous drain orders its queued callbacks before running them (gc.md D4). Reset
+// to 0 each run in dstActivate. Discovery hands the drain a SET in heap-address-
+// dependent sweep order; executing in that order would make two same-cycle callbacks
+// with interacting side effects an unseeded schedule fork. Registration order is a
+// pure function of the run's own activity, so it is the replay-stable execution order.
+// uintptr (not uint64) so it is exactly ONE word on every arch: finalizer.dstSeq rides
+// in the layout-masked finalizer array the GC scan assumes is 6 words, and a run cannot
+// register 2^32 callbacks.
+var dstCallbackSeq atomic.Uintptr
 
 // dstPreparing is true during dstActivate's pre-active GC queue-detach pass.
 // It suppresses ordinary async finalizer/cleanup workers while dstActive is still
@@ -159,6 +193,13 @@ func dstActivate(seed uint64) {
 	dstDiscardAbandonedDrainChains()
 	dstResetFinqRunCounters()
 	dstResetCleanupRunCounters()
+	dstCallbackSeq.Store(0) // per-run registration sequence for the drain's reg-order sort
+	// Cache the internal pooled-struct type descriptors the heap trigger excludes,
+	// BEFORE dstSeed.Store makes dstActive() true — so mallocgc's DST gate never reads a
+	// nil cache (a nil would wrongly COUNT a g/sudog/_defer alloc).
+	dstInternalPooledTypes.g = abi.TypeFor[g]()
+	dstInternalPooledTypes.sudog = abi.TypeFor[sudog]()
+	dstInternalPooledTypes.defr = abi.TypeFor[_defer]()
 	dstSeed.Store(seed)
 	// Establish the per-bubble heap baseline: a full GC here (STW now that DST is
 	// active) collects pre-bubble garbage so gcController.heapMarked is the
@@ -1592,6 +1633,21 @@ func dstCallbackEpoch() uint64 {
 	}
 	if gp := getg().m.curg; gp != nil && gp.bubble != nil && gp.bubble == dstSimBubble {
 		return dstRunEpoch.Load()
+	}
+	return 0
+}
+
+// dstNextCallbackSeq returns the next per-run registration sequence for a finalizer or
+// cleanup being registered by THIS run's bubble — the sibling of dstCallbackEpoch: same
+// ownership gate, but a strictly increasing per-registration value the drain sorts by.
+// Returns 0 for a foreign/pre-bubble registration (it is deferred, never drained, so
+// its seq is unused); the run's own seqs start at 1 (dstActivate resets the counter).
+func dstNextCallbackSeq() uintptr {
+	if !dstActive() {
+		return 0
+	}
+	if gp := getg().m.curg; gp != nil && gp.bubble != nil && gp.bubble == dstSimBubble {
+		return dstCallbackSeq.Add(1)
 	}
 	return 0
 }

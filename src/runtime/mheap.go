@@ -2110,6 +2110,12 @@ type specialfinalizer struct {
 	// bubble, else 0. queuefinalizer defers entries whose stamp is not the
 	// current run's so only the run's own finalizers reach the bubble drain.
 	dstEpoch uint64
+	// dstSeq is the DST per-run registration sequence (dstNextCallbackSeq at
+	// registration): the drain sorts its batch by it so execution order is
+	// registration order, not heap-address sweep order (gc.md D4). Carried onto the
+	// queued finalizer by queuefinalizer, since the special is freed at sweep. uintptr
+	// to match finalizer.dstSeq (1 word on every arch).
+	dstSeq uintptr
 }
 
 // Adds a finalizer to the object p. Returns true if it succeeded.
@@ -2123,6 +2129,7 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s.fint = fint
 	s.ot = ot
 	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
+	s.dstSeq = dstNextCallbackSeq() // per-run registration sequence for the drain's reg-order sort
 	if addspecial(p, &s.special, false) {
 		// This is responsible for maintaining the same
 		// GC-related invariants as markrootSpans in any
@@ -2797,7 +2804,7 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 	switch s.kind {
 	case _KindSpecialFinalizer:
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
-		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot, sf.dstEpoch)
+		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot, sf.dstEpoch, sf.dstSeq)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
 		unlock(&mheap_.speciallock)

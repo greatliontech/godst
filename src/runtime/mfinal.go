@@ -76,39 +76,32 @@ var allfin *finBlock // list of all blocks
 
 // NOTE: Layout known to queuefinalizer.
 type finalizer struct {
-	fn   *funcval       // function to call (may be a heap pointer)
-	arg  unsafe.Pointer // ptr to object (may be a heap pointer)
-	nret uintptr        // bytes of return values from fn
-	fint *_type         // type of first argument of fn
-	ot   *ptrtype       // type of ptr to object (may be a heap pointer)
+	fn     *funcval       // function to call (may be a heap pointer)
+	arg    unsafe.Pointer // ptr to object (may be a heap pointer)
+	nret   uintptr        // bytes of return values from fn
+	fint   *_type         // type of first argument of fn
+	ot     *ptrtype       // type of ptr to object (may be a heap pointer)
+	dstSeq uintptr        // DST per-run registration sequence (from specialfinalizer.dstSeq); the bubble drain sorts by it. 0 for non-DST/foreign. uintptr = 1 word on every arch (finalizer1 assumes 6 words).
 }
 
 var finalizer1 = [...]byte{
-	// Each Finalizer is 5 words, ptr ptr INT ptr ptr (INT = uintptr here)
-	// Each byte describes 8 words.
-	// Need 8 Finalizers described by 5 bytes before pattern repeats:
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
-	//	ptr ptr INT ptr ptr
+	// Each Finalizer is 6 words, ptr ptr INT ptr ptr INT (INT = uintptr here; the
+	// trailing INT is DST's non-pointer dstSeq). Each byte describes 8 words.
+	// Need 4 Finalizers described by 3 bytes before the pattern repeats (24 words):
+	//	ptr ptr INT ptr ptr INT
+	//	ptr ptr INT ptr ptr INT
+	//	ptr ptr INT ptr ptr INT
+	//	ptr ptr INT ptr ptr INT
 	// aka
 	//
-	//	ptr ptr INT ptr ptr ptr ptr INT
-	//	ptr ptr ptr ptr INT ptr ptr ptr
-	//	ptr INT ptr ptr ptr ptr INT ptr
-	//	ptr ptr ptr INT ptr ptr ptr ptr
-	//	INT ptr ptr ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr INT ptr ptr
+	//	INT ptr ptr INT ptr ptr INT ptr
+	//	ptr INT ptr ptr INT ptr ptr INT
 	//
 	// Assumptions about Finalizer layout checked below.
-	1<<0 | 1<<1 | 0<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 0<<7,
-	1<<0 | 1<<1 | 1<<2 | 1<<3 | 0<<4 | 1<<5 | 1<<6 | 1<<7,
-	1<<0 | 0<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 0<<6 | 1<<7,
-	1<<0 | 1<<1 | 1<<2 | 0<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
-	0<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 0<<5 | 1<<6 | 1<<7,
+	1<<0 | 1<<1 | 0<<2 | 1<<3 | 1<<4 | 0<<5 | 1<<6 | 1<<7,
+	0<<0 | 1<<1 | 1<<2 | 0<<3 | 1<<4 | 1<<5 | 0<<6 | 1<<7,
+	1<<0 | 0<<1 | 1<<2 | 1<<3 | 0<<4 | 1<<5 | 1<<6 | 0<<7,
 }
 
 // lockRankMayQueueFinalizer records the lock ranking effects of a
@@ -117,7 +110,7 @@ func lockRankMayQueueFinalizer() {
 	lockWithRankMayAcquire(&finlock, getLockRank(&finlock))
 }
 
-func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64) {
+func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64, dstSeq uintptr) {
 	if gcphase != _GCoff {
 		// Currently we assume that the finalizer queue won't
 		// grow during marking so we don't have to rescan it
@@ -158,6 +151,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 	f.fint = fint
 	f.ot = ot
 	f.arg = p
+	f.dstSeq = dstSeq // carried from the special; the bubble drain sorts its batch by it
 	finqueued++
 	unlock(&finlock)
 	if !deferred {
@@ -178,12 +172,13 @@ func finAllocBlockLocked() *finBlock {
 		if finptrmask[0] == 0 {
 			// Build pointer mask for Finalizer array in block.
 			// Check assumptions made in finalizer1 array above.
-			if (unsafe.Sizeof(finalizer{}) != 5*goarch.PtrSize ||
+			if (unsafe.Sizeof(finalizer{}) != 6*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.fn) != 0 ||
 				unsafe.Offsetof(finalizer{}.arg) != goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.nret) != 2*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.fint) != 3*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize) {
+				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.dstSeq) != 5*goarch.PtrSize) {
 				throw("finalizer out of sync")
 			}
 			for i := range finptrmask {
@@ -511,10 +506,94 @@ func dstDrainFinq() {
 		if fb == nil {
 			return
 		}
+		// Order the batch by registration sequence before running it, so two
+		// same-cycle finalizers with interacting side effects run in a replay-stable
+		// order (gc.md D4) rather than heap-address sweep order.
+		dstSortFinqBySeq(fb)
 		// Ledger (finexecuted and dstFinqRunExecuted) is kept per-entry inside
 		// runFinqBlocks on the drain path, so a callback panic or Goexit cannot
 		// lose a block's worth of accounting.
 		runFinqBlocks(fb)
+	}
+}
+
+// dstSortFinqBySeq reorders the detached finalizer chain fb IN PLACE so runFinqBlocks —
+// which executes reverse-LIFO within each block, blocks in chain order — runs the
+// finalizers in ASCENDING registration sequence (finalizer.dstSeq), the replay-stable
+// order (gc.md D4). It preserves the block structure (same blocks, same per-block
+// counts), so the discard/ledger machinery in runFinqBlocks is untouched. Its scratch
+// slices are the drain goroutine's own (SUT-external) allocations of the deterministic
+// batch size, so they add a deterministic, replay-safe amount to the heap trigger.
+func dstSortFinqBySeq(fb *finBlock) {
+	n := 0
+	for b := fb; b != nil; b = b.next {
+		n += int(b.cnt)
+	}
+	if n <= 1 {
+		return
+	}
+	all := make([]finalizer, n)
+	k := 0
+	for b := fb; b != nil; b = b.next {
+		for i := 0; i < int(b.cnt); i++ {
+			all[k] = b.fin[i]
+			k++
+		}
+	}
+	dstSortFinalizersBySeq(all)
+	// Re-lay so runFinqBlocks's reverse-per-block-in-chain-order traversal is ascending:
+	// filling fin[cnt-1], fin[cnt-2], … with consecutive ascending entries makes the
+	// block execute them fin[cnt-1] first (ascending), and blocks run in chain order.
+	k = 0
+	for b := fb; b != nil; b = b.next {
+		cnt := int(b.cnt)
+		for i := 0; i < cnt; i++ {
+			b.fin[cnt-1-i] = all[k]
+			k++
+		}
+	}
+}
+
+// dstSortFinalizersBySeq sorts a ascending by dstSeq — a stable, non-recursive
+// bottom-up merge sort (package runtime cannot import sort). O(n log n), deterministic.
+func dstSortFinalizersBySeq(a []finalizer) {
+	n := len(a)
+	if n <= 1 {
+		return
+	}
+	buf := make([]finalizer, n)
+	src, dst := a, buf
+	for width := 1; width < n; width *= 2 {
+		for i := 0; i < n; i += 2 * width {
+			lo := i
+			mid := min(i+width, n)
+			hi := min(i+2*width, n)
+			l, r, k := lo, mid, lo
+			for l < mid && r < hi {
+				if src[l].dstSeq <= src[r].dstSeq {
+					dst[k] = src[l]
+					l++
+				} else {
+					dst[k] = src[r]
+					r++
+				}
+				k++
+			}
+			for l < mid {
+				dst[k] = src[l]
+				l++
+				k++
+			}
+			for r < hi {
+				dst[k] = src[r]
+				r++
+				k++
+			}
+		}
+		src, dst = dst, src
+	}
+	if &src[0] != &a[0] {
+		copy(a, src)
 	}
 }
 

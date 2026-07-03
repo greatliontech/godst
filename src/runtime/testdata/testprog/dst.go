@@ -40,6 +40,7 @@ func init() {
 	register("DSTGCAllocBound", DSTGCAllocBound)
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
 	register("DSTGCPerCycle", DSTGCPerCycle)
+	register("DSTGCPoolCarryover", DSTGCPoolCarryover)
 	register("DSTMemLimitPerCycle", DSTMemLimitPerCycle)
 	register("DSTFinChanOp", DSTFinChanOp)
 	register("DSTFinRunSet", DSTFinRunSet)
@@ -367,6 +368,48 @@ func DSTGCPerCycle() {
 		strconv.FormatUint(total, 10) + "\n")
 }
 
+// DSTGCPoolCarryover pins M4 (internal-pooled-alloc exclusion from the DST heap
+// trigger): it runs the SAME goroutine+channel+finalizer-heavy program TWICE in one
+// process at the same seed and prints both runs' mid-run per-cycle finalizer discovery.
+// The goroutine/channel churn fills the g (gFree) and sudog pools, so the SECOND run
+// inherits them; if g/sudog allocations counted toward the trigger, run 2 would reuse
+// the pool (no allocation) where run 1 allocated, shifting dstHeapAlloc by ~MB and
+// moving which cycle discovers each finalizer — so partial1 != partial2. With the
+// exclusion the trigger reflects only SUT objects, so the two runs are identical.
+func DSTGCPoolCarryover() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	run := func() (uint64, uint64) {
+		var partial, total uint64
+		simulation.Run(n, func() {
+			// Fill the g/sudog pools: each goroutine blocks on a rendezvous (a sudog
+			// cycle) then exits (a g onto gFree). Run 2 inherits ~3000 free g's.
+			for r := 0; r < 3000; r++ {
+				ch := make(chan int)
+				go func() { ch <- 1 }()
+				<-ch
+			}
+			const N, K = 60000, 512
+			ring := make([]*dstFinObj, K)
+			for i := 0; i < N; i++ {
+				o := &dstFinObj{}
+				o.b[0] = byte(i)
+				runtime.SetFinalizer(o, func(p *dstFinObj) { _ = p.b[0] })
+				ring[i%K] = o
+				if i == N/2 {
+					partial = dstBubbleFinqFP() // per-cycle: discovered by the mid-run cycles
+				}
+			}
+			total = dstBubbleFinqFP()
+			runtime.KeepAlive(ring)
+		})
+		return partial, total
+	}
+	p1, t1 := run()
+	p2, t2 := run()
+	os.Stdout.WriteString(strconv.FormatUint(p1, 10) + " " + strconv.FormatUint(p2, 10) + " " +
+		strconv.FormatUint(t1, 10) + " " + strconv.FormatUint(t2, 10) + "\n")
+}
+
 // dstSliceSink forces the allocations in DSTGCAllocBound to escape to the heap
 // (storing the whole slice, not just an element), so the loop produces real heap
 // churn that drives the GC trigger. It is indexed per goroutine so concurrent
@@ -600,28 +643,26 @@ func dstFinReadLedger() (queued, executed uint64) {
 	return samples[0].Value.Uint64(), samples[1].Value.Uint64()
 }
 
-// dstMakeFinGoexitBatch allocates count finalizable objects in one batch (one
-// GC cycle, one finBlock): the FIRST allocated gets a finalizer that calls
-// runtime.Goexit, the rest are plain. Sequential allocation of same-sized
-// objects fills a span in address order, and finalizer discovery walks specials
-// in address order, so the Goexit entry sits first in the block — and
-// runFinqBlocks runs entries last-to-first, so the plain finalizers run BEFORE
-// the Goexit one. That ordering gives the ledger test its teeth: entries
-// already run when the drain dies must already be accounted (per-entry), or
-// queued != executed forever.
+// dstMakeFinGoexitBatch allocates count finalizable objects in one batch (one GC
+// cycle, one finBlock): count-1 plain finalizers are registered FIRST, then one that
+// calls runtime.Goexit is registered LAST. The DST bubble drain runs its batch in
+// REGISTRATION-sequence order (finalizer.dstSeq — heap-address-independent), so the
+// plain finalizers run BEFORE the Goexit one. That ordering gives the ledger test its
+// teeth: entries already run when the drain dies must already be accounted (per-entry),
+// or queued != executed forever.
 //
 //go:noinline
 func dstMakeFinGoexitBatch(count int, ran *atomic.Int64) {
-	o := &dstFinObj{}
-	runtime.SetFinalizer(o, func(*dstFinObj) {
-		runtime.Goexit()
-	})
 	for i := 1; i < count; i++ {
 		p := &dstFinObj{}
 		runtime.SetFinalizer(p, func(*dstFinObj) {
 			ran.Add(1)
 		})
 	}
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(*dstFinObj) {
+		runtime.Goexit()
+	})
 }
 
 // DSTFinGoexitLedger verifies the drain's finalizer queue ledger stays exact
@@ -652,10 +693,13 @@ func DSTFinGoexitLedger() {
 	}
 	if ran.Load() != batch-1 {
 		// The scenario's teeth require the plain finalizers to run BEFORE the
-		// Goexit one (mid-block death with already-run entries). The ledger
-		// check alone is order-independent; if the allocation/discovery order
-		// assumption in dstMakeFinGoexitBatch ever drifts, fail loudly here
-		// instead of letting the test go vacuous.
+		// Goexit one (mid-block death with already-run entries). The ledger check
+		// alone is order-independent; ran==batch-1 also pins the drain's
+		// REGISTRATION-SEQUENCE sort (gc.md D4 / H6): the plain finalizers are
+		// registered first, the Goexit one last, so reg order runs the plain ones
+		// first (ran=batch-1). Without the sort the drain runs heap-address sweep
+		// order — the last-allocated Goexit object is highest-addressed, so it runs
+		// FIRST (ran=0) — and this fails loudly instead of going vacuous.
 		os.Stdout.WriteString("order drift: ran " + strconv.FormatInt(ran.Load(), 10) +
 			", want " + strconv.Itoa(batch-1) + "\n")
 		return

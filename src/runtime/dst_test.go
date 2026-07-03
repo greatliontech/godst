@@ -501,6 +501,31 @@ func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTGCPoolCarryoverDeterministic is the M4 regression: the DST heap trigger
+// excludes runtime-internal pooled allocations (g, sudog, _defer), so a second
+// in-process run's inherited g/sudog pools do not shift the GC cycle boundary. The
+// testprog runs the same goroutine+channel+finalizer program twice at one seed; both
+// runs' mid-run per-cycle finalizer discovery (and total) must match. Teeth: without
+// the exclusion, run 2 reuses ~3000 pooled g's where run 1 allocated, moving
+// dstHeapAlloc by ~MB so the per-cycle count diverges.
+func TestDSTGCPoolCarryoverDeterministic(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTGCPoolCarryover", "DSTSEED=12345", "GOGC=100"))
+	f := strings.Fields(out)
+	if len(f) != 4 {
+		t.Fatalf("DSTGCPoolCarryover: want 4 fields (partial1 partial2 total1 total2), got %q", out)
+	}
+	if f[0] == "0" {
+		t.Fatalf("no mid-run per-cycle discovery recorded (%q)", out)
+	}
+	if f[0] != f[1] {
+		t.Errorf("per-cycle discovery differs between two in-process runs (%s vs %s): an inherited g/sudog "+
+			"pool shifted the trigger — internal pooled allocations are not excluded from dstHeapAlloc", f[0], f[1])
+	}
+	if f[2] != f[3] {
+		t.Errorf("total finalizer discovery differs between two in-process runs (%s vs %s)", f[2], f[3])
+	}
+}
+
 // TestDSTFinalizerBlockedDrainQuiescence verifies the drain wake guard:
 // when a finalizer blocks on a bubble channel, the drain is parked inside the
 // channel wait, and a later quiescence with finalizer work still pending must

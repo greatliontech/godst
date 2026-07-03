@@ -157,7 +157,13 @@ tolerate*, so it cannot be a single global clock.
   (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is unchanged.
 - **Memory accounting** — **landed**. Per-process **allocation accounting** extends the existing
   per-object hook (`malloc.go`, inside the simulation-bubble gate where `cur` and `elemsize` are already in
-  hand) to also attribute `elemsize` to `cur.dstProc` — deterministic, `-race`-invariant, ~free. The
+  hand) to also attribute `elemsize` to `cur.dstProc` — deterministic, `-race`-invariant, ~free. Like the
+  heap trigger (gc.md M4), it **excludes** the runtime-internal pooled structs `g`/`sudog`/`_defer`
+  (`dstIsInternalPooledType`): whether a `go`/channel op allocates one or reuses a pooled cache entry is a
+  cross-run pooling artifact, not the process's own heap growth, and counting it would make the OOM fault
+  fire at a pool-history-dependent allocation — the same determinism rationale, and consistent with this
+  metric already being *allocation flow, not RSS* (stacks, the bulk of a goroutine, are likewise uncounted).
+  The
   counters live in a **fixed-size** per-run vector keyed by process id (`dstProcAlloc`), allocated once on
   the first `Process` declaration and never grown — a stable backing array, so the hot path is a single
   atomic add with no table copy to race (a grow-on-demand table would race the copy against concurrent
