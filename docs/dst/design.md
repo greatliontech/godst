@@ -258,9 +258,10 @@ everywhere is load-bearing for soundness: a rendezvous pipe (writes blocking unt
 two co-located processes that each write before reading — an execution real TCP, whose send buffer
 is never zero, cannot produce (the Soundness invariant's false-positive class).
 
-**Transport model (contract).** The byte-stream and no-lost-wakeup legs are landed; the
-flow-control, retransmission-horizon, connect-cost, and FIN/RST legs land with the
-network-flow-control chunk. The wire models a TCP socket pair, not a message queue:
+**Transport model (contract).** The byte-stream, no-lost-wakeup, flow-control,
+retransmission-horizon, and connect-cost legs are landed; the FIN/RST leg and the
+no-declared-host connect timeout land with a follow-on (both marked below). The wire
+models a TCP socket pair, not a message queue:
 
 - **Byte stream, not messages.** The receive side is a byte buffer: one `Read` returns delivered
   contiguous bytes, up to the buffer's length — reads **coalesce across write
@@ -279,26 +280,56 @@ network-flow-control chunk. The wire models a TCP socket pair, not a message que
 - **Bounded send buffer / backpressure.** Each connection direction has a fixed send-buffer
   capacity (`Options.Network.SendBuffer`, default 1 MiB): a write fills it and **blocks durably**
   when full, resuming as the link drains it. Writes never succeed unboundedly into a partition.
-- **Retransmission horizon.** Bytes that stay undeliverable (partition, dead peer) error the
-  connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
+- **Retransmission horizon.** Bytes that stay undeliverable because the link is **partitioned**
+  error the connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
   default 2 minutes of bubble time — kernel-shaped: ~15 retries), on the blocked or subsequent
-  operation. A deadline-less write into a permanent partition therefore fails in bounded virtual
-  time, as it does on a real kernel — it never succeeds-and-forgets.
+  operation (`TestDSTNetWriteHorizonTimesOut`, `TestDSTNetDialPartitionHorizonTimesOut`). A
+  deadline-less write or dial into a permanent partition therefore fails in bounded virtual time, as
+  it does on a real kernel — it never succeeds-and-forgets. The horizon is **partition-gated**: a
+  full send buffer behind a **live** peer that has merely stopped reading is TCP *zero-window
+  persist*, not retransmit exhaustion — the write blocks (backpressure) with **no** horizon and
+  resumes when the peer drains (`TestDSTNetWritePersistsWithoutPartition`). Firing `ETIMEDOUT` on
+  live-peer backpressure would be a sim-only failure a live peer cannot produce — the false-positive
+  class Soundness forbids. A **heal resets** the horizon window (the timer restarts on the next cut),
+  approximating "the retransmit timer resets on ACK progress" — exact only when the heal is long
+  enough to deliver a byte; a sub-latency partition *flap* resets it with no real progress, so the
+  sim keeps a conn alive a real stack's RTO would eventually kill. That errs toward *fewer* ETIMEDOUTs
+  (a false negative — never a false-positive bug report), the soundness-safe direction; exact
+  ACK-progress tracking is a deferred refinement. (Timer note: the horizon window is a base-time
+  delta, skew-invariant, but the timer fires on the sender's host clock, so under a `DriftClock` rate
+  change "2 minutes of base time" shifts slightly — faithful to a real retransmit timer, which runs
+  on the sender's own clock.)
 - **Connect cost.** Establishing a cross-host connection completes after one round trip of the
-  link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + jitter;
-  throttle exempts the zero-payload control segments). Same-host connects are instant. A dial to a
-  **declared** host with no listener on the port is `ECONNREFUSED` (a live kernel answers with RST);
-  a dial to an address **no declared host owns** blackholes and fails `ETIMEDOUT` at the horizon
-  (nothing answers SYNs) — the peer-down/unreachable split a real network exhibits.
-- **Peer close (FIN) semantics.** Reads after a peer's graceful close drain buffered data, then
-  `io.EOF`. The **first write after the peer's full close succeeds locally** (the FIN closed the
-  peer's send direction; the write is accepted into the send buffer and elicits the peer's RST);
-  the reset then errors **subsequent** operations with `ECONNRESET` — matching the RST round trip
-  of a real stack, rather than failing the first write instantly (which no kernel does). One
-  recorded simplification: real stacks report the reset *once* (`SO_ERROR` consumed) and surface
-  `EPIPE`/EOF on later ops; the simulation keeps the stable `ECONNRESET` identity on every
-  subsequent op so reset-handling paths keying on it never miss — a SUT distinguishing `EPIPE`
-  from `ECONNRESET` post-reset is outside the model (recorded, not hidden).
+  link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + a jitter draw;
+  throttle exempts the zero-payload control segments) — the SYN half is paid before the server's
+  Accept unblocks and is context-interruptible (a connect deadline shorter than the RTT fails
+  mid-handshake); the SYN-ACK half then delays the dialer's return, so the server sees the conn at
+  ½ RTT and the dialer returns at one full RTT (`TestDSTNetConnectPaysRTT`). Same-host connects are
+  instant. A dial across a **partition** blackholes: it blocks until the link heals, the
+  context/deadline expires, or the retransmit horizon fires `ETIMEDOUT`
+  (`TestDSTNetDialPartitionHorizonTimesOut`) — so a deadline-less dial into a permanent cut fails in
+  bounded virtual time rather than hanging. A dial to a **declared** host with no listener on the
+  port is `ECONNREFUSED` (a live kernel answers with RST); one recorded timing simplification: this
+  refusal returns immediately rather than after the SYN's ½-RTT traversal, so a connect deadline
+  shorter than ½ RTT that would *time out* before the RST in production instead observes
+  `ECONNREFUSED` here (a narrow adversarial-deadline case; recorded, not hidden). **Pending (lands
+  with the FIN/RST follow-on):** a dial to an address **no declared host owns** should blackhole and
+  fail `ETIMEDOUT` (nothing answers SYNs) — the peer-down/unreachable split; today it also returns
+  `ECONNREFUSED`. This case is reachable only via a hand-constructed literal `10.x` IP (`HostIP`
+  panics on an undeclared host), so it needs net to learn the declared-host set (a query hook like
+  the partition hook) before it can distinguish refuse from blackhole.
+- **Peer close (FIN) semantics — pending (lands with the FIN/RST follow-on).** Reads after a peer's
+  graceful close drain buffered data, then `io.EOF` (landed). The intended write side: the **first
+  write after the peer's full close succeeds locally** (the FIN closed the peer's send direction; the
+  write is accepted into the send buffer and elicits the peer's RST); the reset then errors
+  **subsequent** operations with `ECONNRESET` — matching the RST round trip of a real stack, rather
+  than failing the first write instantly (which no kernel does). **Today the first write after a peer
+  close fails instantly with `ECONNRESET`** (the wire rejects a write whose peer end is gone); the
+  succeed-then-RST round trip is the follow-on's work. One recorded simplification of the target
+  shape: real stacks report the reset *once* (`SO_ERROR` consumed) and surface `EPIPE`/EOF on later
+  ops; the simulation keeps the stable `ECONNRESET` identity on every subsequent op so reset-handling
+  paths keying on it never miss — a SUT distinguishing `EPIPE` from `ECONNRESET` post-reset is
+  outside the model (recorded, not hidden).
 
 `DialContext` keeps the public context contract (nil panics,
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set —

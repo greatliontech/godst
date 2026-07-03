@@ -488,8 +488,8 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   than B (DST-NET-THROTTLE). Deterministic (no fault-RNG draw) and FIFO-preserving (`linkFreeAt` monotone +
   head-of-line). The transmit-time arithmetic (`S·1e9/B`) is overflow-safe for any in-spec segment (the
   bounded send buffer caps S, and the mul/div is guarded like the clock-drift conversions — a wrapped
-  negative transmit time would corrupt `linkFreeAt` and break the rate bound; the guard and the cap land
-  with the network-registry and network-flow-control chunks). Default 0 = unlimited;
+  negative transmit time would corrupt `linkFreeAt` and break the rate bound; the guard (`dstTransmitNanos`,
+  the `q·1e9 + ceil(r·1e9/B)` split) and the cap (`Options.Network.SendBuffer`) are landed). Default 0 = unlimited;
   same-host always unlimited. Shared-link contention (one budget
   across a host-pair's flows) is the L4 per-link refinement; this is per-flow (each direction an
   independent B-capacity link, so executions stay ⊆ real).

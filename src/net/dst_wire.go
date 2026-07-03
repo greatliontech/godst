@@ -8,11 +8,20 @@ package net
 
 import (
 	"io"
+	"math/bits"
 	"os"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	_ "unsafe" // for go:linkname
 )
+
+//go:linkname dstNetSendBufferBytes runtime.dstNetSendBufferBytes
+func dstNetSendBufferBytes() int64
+
+//go:linkname dstNetRetransmitTimeoutNs runtime.dstNetRetransmitTimeoutNs
+func dstNetRetransmitTimeoutNs() int64
 
 // A dstWire is the delay-bearing transport under a simulated connection. It backs
 // EVERY connection — cross-host with the configured latency/jitter/bandwidth,
@@ -95,17 +104,32 @@ type dstStream struct {
 	linkFreeAt int64         // base-time when the bandwidth-limited link finishes transmitting all queued bytes
 	closed     bool          // writer end closed: the reader drains, then sees EOF
 	closeAt    int64         // base-time the writer closed (the FIN's arrival); valid iff closed
-	ready      chan struct{} // buffered(1) wakeup, pinged on append/close
+	ready      chan struct{} // buffered(1) wakeup, pinged on append/close (wakes the READER)
+	space      chan struct{} // buffered(1) wakeup, pinged on pop (wakes a blocked WRITER)
+	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
+	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
 }
 
-func newDstStream() *dstStream {
-	return &dstStream{ready: make(chan struct{}, 1)}
+func newDstStream(capacity int64) *dstStream {
+	return &dstStream{
+		ready:    make(chan struct{}, 1),
+		space:    make(chan struct{}, 1),
+		capacity: capacity,
+	}
 }
 
 // wake signals a (possibly) blocked reader without blocking the signaler.
 func (s *dstStream) wake() {
 	select {
 	case s.ready <- struct{}{}:
+	default:
+	}
+}
+
+// wakeWriter signals a (possibly) blocked writer that send-buffer space freed.
+func (s *dstStream) wakeWriter() {
+	select {
+	case s.space <- struct{}{}:
 	default:
 	}
 }
@@ -119,8 +143,17 @@ func (s *dstStream) wake() {
 // head-of-line bunches it instead. bandwidthBps<=0 is unlimited; jitterNs<=0 draws
 // nothing (so an inactive jitter fault leaves the fault stream untouched).
 func (s *dstStream) push(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
-	data := append([]byte(nil), b...)
 	s.mu.Lock()
+	s.pushLocked(b, latencyNs, jitterNs, bandwidthBps)
+	s.mu.Unlock()
+	s.wake()
+}
+
+// pushLocked is push's body with the caller holding s.mu (and not signaling the reader —
+// the caller does). The bounded-buffer write path uses it to check capacity and append
+// atomically under one lock hold.
+func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
+	data := append([]byte(nil), b...)
 	transmitEnd := dstBaseNanos()
 	if bandwidthBps > 0 {
 		// Serialize transmission at bandwidthBps bytes/sec: this segment starts when
@@ -132,13 +165,31 @@ func (s *dstStream) push(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
 		if s.linkFreeAt > transmitEnd {
 			transmitEnd = s.linkFreeAt
 		}
-		transmitEnd += (int64(len(b))*1_000_000_000 + bandwidthBps - 1) / bandwidthBps
+		transmitEnd += dstTransmitNanos(int64(len(b)), bandwidthBps)
 		s.linkFreeAt = transmitEnd
 	}
 	at := transmitEnd + latencyNs + dstFaultRandN(jitterNs)
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
-	s.mu.Unlock()
-	s.wake()
+	s.buffered += int64(len(data))
+}
+
+// dstTransmitNanos returns ceil(nbytes * 1e9 / bps) — the base-time a bandwidth-limited
+// link occupies transmitting nbytes at bps bytes/sec — overflow-safe for any in-spec
+// nbytes and bps (a wrapped negative transmit time would corrupt linkFreeAt and break
+// the rate bound). Two int64 overflows are avoided: nbytes*1e9 wraps for nbytes ≳ 9.2 GB
+// (reachable with an unbounded send buffer and a giant Write), so the whole seconds q
+// are split off and only the remainder r<bps carries the ×1e9; and r*1e9 itself wraps
+// for bps ≳ 9.2e9 B/s (~73 Gbit/s, reached by a high-bandwidth link when r is large), so
+// r*1e9 is formed in 128 bits and ceil-divided by bps (the fractional quotient is <1e9,
+// so it fits, and the 128-bit high word is ≪ bps, so bits.Div64 never overflows).
+func dstTransmitNanos(nbytes, bps int64) int64 {
+	q := nbytes / bps
+	r := nbytes % bps
+	hi, lo := bits.Mul64(uint64(r), 1_000_000_000)
+	lo, carry := bits.Add64(lo, uint64(bps)-1, 0) // + (bps-1) before the divide = ceil
+	hi += carry
+	frac, _ := bits.Div64(hi, lo, uint64(bps))
+	return q*1_000_000_000 + int64(frac)
 }
 
 // closeWrite marks the writer end gracefully closed at the current base time (the
@@ -187,6 +238,7 @@ func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wa
 		}
 		c := copy(b[n:], head.data)
 		n += c
+		s.buffered -= int64(c) // consumed by the reader: frees the peer's send-buffer space (unread for capacity==0/unbounded, where the writer never consults it)
 		if c < len(head.data) {
 			head.data = head.data[c:]
 			return n, true, false, 0 // b full mid-segment, bytes remain: signal another reader
@@ -222,6 +274,9 @@ type dstWireEnd struct {
 	bandwidthBps        int64  // link transmit rate in bytes/sec; 0 = unlimited
 	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
 
+	retransNs int64        // send-into-a-dead-peer retransmit horizon (0 = none)
+	timedOut  atomic.Bool  // a write hit the retransmit horizon: the conn is dead (ETIMEDOUT)
+
 	once       sync.Once
 	localDone  chan struct{}
 	remoteDone chan struct{} // the peer's localDone
@@ -231,18 +286,19 @@ type dstWireEnd struct {
 }
 
 // dstWirePair builds the two ends of a cross-host connection between dialerHost
-// (the a/dialer end) and listenHost (the b/server end).
-func dstWirePair(latencyNs, jitterNs, bandwidthBps int64, dialerHost, listenHost uint32) (Conn, Conn) {
-	ab, ba := newDstStream(), newDstStream()
+// (the a/dialer end) and listenHost (the b/server end). Each direction gets a send
+// buffer of capacity bytes (0 = unbounded) and the retransmit horizon retransNs.
+func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32) (Conn, Conn) {
+	ab, ba := newDstStream(capacity), newDstStream(capacity)
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	a := &dstWireEnd{
-		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
+		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: dialerHost, peerHost: listenHost,
 		localDone: doneA, remoteDone: doneB,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
-		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps,
+		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
 		localDone: doneB, remoteDone: doneA,
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
@@ -255,9 +311,11 @@ func (*dstWireEnd) RemoteAddr() Addr { return pipeAddr{} }
 
 func (e *dstWireEnd) Read(b []byte) (int, error) {
 	n, err := e.read(b)
-	if err != nil && err != io.EOF && err != io.ErrClosedPipe {
+	if err != nil && err != io.EOF && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {
 		err = &OpError{Op: "read", Net: "pipe", Err: err}
 	}
+	// io.EOF / io.ErrClosedPipe / syscall.ETIMEDOUT pass raw for the dstConn wrapper to
+	// map to production identity (a pipe-OpError here would double-wrap and leak "pipe").
 	return n, err
 }
 
@@ -267,6 +325,8 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 	}
 	for {
 		switch {
+		case e.timedOut.Load():
+			return 0, syscall.ETIMEDOUT
 		case isClosedChan(e.localDone):
 			return 0, io.ErrClosedPipe
 		case isClosedChan(e.rdDead.wait()):
@@ -296,6 +356,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		}
 		n, remain, eof, wait := e.in.pop(b, maxArrival)
 		if n > 0 {
+			e.in.wakeWriter() // freed send-buffer space: wake the peer's blocked writer
 			if remain {
 				e.in.wake() // a segment remains; re-signal so a second blocked reader wakes
 			}
@@ -343,14 +404,18 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 
 func (e *dstWireEnd) Write(b []byte) (int, error) {
 	n, err := e.write(b)
-	if err != nil && err != io.ErrClosedPipe {
+	if err != nil && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {
 		err = &OpError{Op: "write", Net: "pipe", Err: err}
 	}
+	// io.ErrClosedPipe / syscall.ETIMEDOUT pass raw for the dstConn wrapper to map (a
+	// pipe-OpError here would double-wrap and leak "pipe" into the error identity).
 	return n, err
 }
 
 func (e *dstWireEnd) write(b []byte) (int, error) {
 	switch {
+	case e.timedOut.Load():
+		return 0, syscall.ETIMEDOUT
 	case isClosedChan(e.localDone):
 		return 0, io.ErrClosedPipe
 	case isClosedChan(e.remoteDone):
@@ -358,14 +423,99 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	case isClosedChan(e.wrDead.wait()):
 		return 0, os.ErrDeadlineExceeded
 	}
-	// Buffered: the bytes are queued for delivery (transmission + latency + jitter)
-	// and the call returns immediately (a TCP send buffer the propagation delay
-	// drains). The buffer is unbounded so a write never blocks — even under
-	// throttle, which paces delivery, not the sender; a write deadline therefore
-	// only gates entry. Sender backpressure (a bounded send buffer whose fill blocks
-	// Write) is a deferred refinement.
-	e.out.push(b, e.latencyNs, e.jitterNs, e.bandwidthBps)
-	return len(b), nil
+	// Bounded send buffer with backpressure: the bytes queue for delivery
+	// (transmission + latency + jitter) into a send buffer of capacity e.out.capacity
+	// bytes. A write that would overrun the buffer BLOCKS until the reader drains
+	// enough (the peer consuming bytes frees space, wakeWriter), so a program cannot
+	// outrun a slow peer with unbounded buffering. capacity 0 = unbounded (same-host,
+	// or SendBuffer<0): the fast path, a write never blocks.
+	//
+	// The retransmit horizon fires ONLY while the link is PARTITIONED — bytes held at
+	// a cut are genuinely undeliverable, so a permanent cut kills the conn ETIMEDOUT
+	// (kernel retransmit exhaustion, the sound direction: a real deadline-less write
+	// into a permanent partition also fails in bounded time). A full buffer behind a
+	// LIVE peer that is merely slow or has stopped reading is TCP zero-window persist,
+	// NOT retransmit exhaustion: the write blocks with no horizon and resumes when the
+	// peer drains — firing ETIMEDOUT there would be a sim-only failure a live peer
+	// cannot produce (the false-positive class Soundness forbids).
+	total := 0
+	cutStart := int64(-1) // base-time the current partition-block began; -1 = not counting
+	for len(b) > 0 {
+		e.out.mu.Lock()
+		for e.out.capacity > 0 && e.out.buffered >= e.out.capacity {
+			e.out.mu.Unlock()
+			// Fetch the partition wake channel before reading the cut state, so a cut
+			// that begins (or heals) while we block still re-evaluates the horizon.
+			wake := dstPartWakeCh()
+			var horizonC <-chan time.Time
+			var horizonT *time.Timer
+			if e.retransNs > 0 && dstPartitioned(e.localHost, e.peerHost) {
+				if cutStart < 0 {
+					cutStart = dstBaseNanos() // the cut-block began; a heal resets it, restarting the timer on ACK progress
+				}
+				// The window is a base-time delta (skew-invariant); the timer fires on
+				// the writer's host clock, so under a DriftClock rate change "retransNs
+				// of base time" shifts slightly — deterministic, and faithful to a real
+				// retransmit timer running on the sender's own clock.
+				remaining := e.retransNs - (dstBaseNanos() - cutStart)
+				if remaining <= 0 {
+					e.timedOut.Store(true)
+					return total, syscall.ETIMEDOUT
+				}
+				horizonT = time.NewTimer(time.Duration(remaining))
+				horizonC = horizonT.C
+			} else {
+				cutStart = -1 // live peer (or no horizon): persist, reset the cut window
+			}
+			select {
+			case <-e.out.space:
+			case <-wake: // partition began or healed: re-evaluate the horizon
+			case <-horizonC:
+				e.timedOut.Store(true)
+				return total, syscall.ETIMEDOUT
+			case <-e.wrDead.wait():
+				if horizonT != nil {
+					horizonT.Stop()
+				}
+				return total, os.ErrDeadlineExceeded
+			case <-e.localDone:
+				if horizonT != nil {
+					horizonT.Stop()
+				}
+				return total, io.ErrClosedPipe
+			case <-e.remoteDone:
+				if horizonT != nil {
+					horizonT.Stop()
+				}
+				return total, io.ErrClosedPipe
+			}
+			if horizonT != nil {
+				horizonT.Stop()
+			}
+			e.out.mu.Lock()
+		}
+		room := int64(len(b))
+		if e.out.capacity > 0 {
+			if avail := e.out.capacity - e.out.buffered; avail < room {
+				room = avail
+			}
+		}
+		e.out.pushLocked(b[:room], e.latencyNs, e.jitterNs, e.bandwidthBps)
+		roomRemains := e.out.capacity > 0 && e.out.buffered < e.out.capacity
+		e.out.mu.Unlock()
+		e.out.wake()
+		if roomRemains {
+			// Chain-wake another writer blocked on this direction: one drain frees one
+			// cap-1 space token, so a woken writer that leaves room must pass the baton —
+			// mirroring the reader's `remain` re-signal (pop → wake). Without it,
+			// concurrent writers strand with buffer space free (a lost wakeup / hang).
+			e.out.wakeWriter()
+		}
+		total += int(room)
+		b = b[room:]
+		cutStart = -1 // progress: reset the cut window
+	}
+	return total, nil
 }
 
 func (e *dstWireEnd) Close() error {

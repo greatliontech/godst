@@ -294,6 +294,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
+		dialed := make(chan struct{})
 		doWrite := make(chan struct{})
 		wrote := make(chan struct{})
 		readDone := make(chan struct{})
@@ -322,6 +323,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 				if err != nil {
 					panic(err)
 				}
+				close(dialed) // Dial has paid its full connect RTT and returned
 				<-doWrite
 				c.Write([]byte("ping")) // deliverAt = base now + L (B is unstepped)
 				close(wrote)
@@ -330,6 +332,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 			}()
 		})
 		<-accepted                         // the server is blocked in Read with no data yet
+		<-dialed                           // the client's Dial has returned (connect RTT paid)
 		simulation.StepClock("A", bigStep) // step the RECEIVER before the send is gated
 		startBase = time.Now()             // root (host 0) = base, after the step
 		close(doWrite)                     // let the client write; the server's gate eval is now post-step

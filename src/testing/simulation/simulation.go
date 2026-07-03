@@ -184,6 +184,12 @@ func dstSetNetCrossHostJitter(ns int64)
 //go:linkname dstSetNetCrossHostBandwidth runtime.dstSetNetCrossHostBandwidth
 func dstSetNetCrossHostBandwidth(bytesPerSec int64)
 
+//go:linkname dstSetNetSendBuffer runtime.dstSetNetSendBuffer
+func dstSetNetSendBuffer(bytes int64)
+
+//go:linkname dstSetNetRetransmitTimeout runtime.dstSetNetRetransmitTimeout
+func dstSetNetRetransmitTimeout(ns int64)
+
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
 
@@ -332,6 +338,23 @@ type NetworkConfig struct {
 	// always unlimited). Shared-link contention (one budget across a host-pair's
 	// flows) is the L4 per-link refinement; this is per-flow.
 	CrossHostBandwidth int64
+
+	// SendBuffer is the per-direction send-buffer capacity in bytes on every
+	// connection (a TCP socket's send buffer). A Write blocks once this many bytes
+	// are written but not yet delivered to and consumed by the peer, resuming as the
+	// link drains — so a program that outruns a slow or partitioned peer feels
+	// backpressure instead of buffering unbounded data the peer will never receive.
+	// The zero value uses a 1 MiB default; a negative value means unbounded (writes
+	// never block, the pre-backpressure behavior).
+	SendBuffer int
+
+	// RetransmitTimeout is the virtual-time horizon after which a connection whose
+	// data cannot be delivered — a Write blocked on a full send buffer that never
+	// drains (a permanent partition), or a deadline-less Dial across a cut — fails
+	// with ETIMEDOUT, modeling a real kernel's ~15 retransmissions. The zero value
+	// uses a 2-minute default; a negative value disables the horizon (blocked writes
+	// and dials wait forever, subject only to their own deadlines).
+	RetransmitTimeout time.Duration
 }
 
 // default simulated process identity (see Options.Hostname/PID/NumCPU).
@@ -460,7 +483,8 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, nil, f)
+	sendBuf, retransNs := resolveNetConfig(opts.Network)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -478,7 +502,8 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	var ok bool
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, nil, true, func() {
+	sendBuf, retransNs := resolveNetConfig(opts.Network)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	if !ok {
@@ -529,19 +554,43 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 	return kind, depth, steps, hostname, pid, numcpu
 }
 
+// resolveNetConfig applies the SendBuffer/RetransmitTimeout defaults, returning the
+// values the runtime globals want: sendBuf 0 = unbounded (default 1 MiB when the field
+// is 0, unbounded when it is negative); retransNs 0 = no horizon (default 2 minutes
+// when the field is 0, disabled when it is negative).
+func resolveNetConfig(n NetworkConfig) (sendBuf, retransNs int64) {
+	switch {
+	case n.SendBuffer == 0:
+		sendBuf = 1 << 20 // default 1 MiB
+	case n.SendBuffer < 0:
+		sendBuf = 0 // unbounded
+	default:
+		sendBuf = int64(n.SendBuffer)
+	}
+	switch {
+	case n.RetransmitTimeout == 0:
+		retransNs = (2 * time.Minute).Nanoseconds() // default 2 minutes
+	case n.RetransmitTimeout < 0:
+		retransNs = 0 // disabled
+	default:
+		retransNs = n.RetransmitTimeout.Nanoseconds()
+	}
+	return
+}
+
 // run sets the determinism preconditions, activates DST, and runs f in a synctest
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, prefix, true, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
 }
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps int64, prefix []uint64, propagateGoexit bool, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
 	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
 	// keeps the sysmon container-aware auto-updater from resizing P count
 	// mid-run); remember whether the process was in auto mode so the restore
@@ -559,6 +608,8 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	dstSetNetCrossHostLatency(netLatencyNs)
 	dstSetNetCrossHostJitter(netJitterNs)
 	dstSetNetCrossHostBandwidth(netBandwidthBps)
+	dstSetNetSendBuffer(netSendBuf)
+	dstSetNetRetransmitTimeout(netRetransNs)
 	dstActivate(seed)
 	defer func() {
 		dstDeactivate()
@@ -568,6 +619,8 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetNetCrossHostLatency(0)
 		dstSetNetCrossHostJitter(0)
 		dstSetNetCrossHostBandwidth(0)
+		dstSetNetSendBuffer(0)
+		dstSetNetRetransmitTimeout(0)
 		dstSetAsyncPreemptOff(oldPreempt)
 		if autoProcs {
 			runtime.SetDefaultGOMAXPROCS()

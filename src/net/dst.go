@@ -510,6 +510,10 @@ func (c *dstConn) mapConnErr(op string, err error) error {
 	switch {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		return c.opError(op, os.ErrDeadlineExceeded)
+	case err == syscall.ETIMEDOUT:
+		// The retransmit horizon: a write/read into a permanently undeliverable conn
+		// (a cut outlasting the horizon). Production identity is OpError{ETIMEDOUT}.
+		return c.opError(op, syscall.ETIMEDOUT)
 	case c.closed.Load():
 		return c.opError(op, errClosed)
 	case err == io.EOF:
@@ -784,6 +788,43 @@ func dstAnyListenerConflict(scope, network string, ip IP, keys []string, port in
 	return dstListenerConflict(scope, network, ip, keys[0], port, wildcard)
 }
 
+// dstConnectSYN sleeps out one one-way link traversal of a connect control segment
+// (the SYN, before the server sees the connection): the base latency plus a jitter
+// draw. Control segments are zero-payload, so throttle/bandwidth is exempt — only
+// latency + jitter apply. A zero-latency, zero-jitter link (same-host, or a cross-host
+// link with no delay configured) returns instantly and draws nothing. It is
+// ctx-interruptible: a connect deadline shorter than the traversal fails here, before
+// anything is established, exactly as a real connect(2) times out mid-handshake. The
+// partition table is checked BEFORE this (the dial's blackhole loop); a cut that begins
+// mid-flight is not re-checked, so the connect still completes — the safe direction (the
+// sim succeeds where production might drop the SYN), a narrow race not worth the reload.
+func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
+	d := latencyNs + dstFaultRandN(jitterNs)
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(time.Duration(d))
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return mapErr(ctx.Err())
+	}
+}
+
+// dstConnectSYNACK sleeps out the second half of the connect round trip (the SYN-ACK
+// travelling back to the dialer), so a cross-host dial returns one full RTT after it
+// began. It runs AFTER the accept handoff, where establishment commits (the existing
+// model treats the handoff as the commit point), so it only delays the dialer's return
+// and is not ctx-interruptible — like the buffered wire delays that follow. Same-host
+// (zero latency/jitter) returns instantly and draws nothing.
+func dstConnectSYNACK(latencyNs, jitterNs int64) {
+	if d := latencyNs + dstFaultRandN(jitterNs); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
+}
+
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
 func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn Conn, retErr error) {
@@ -827,21 +868,47 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 
 	dialerHost, dialerProc := dstNetCurrentNode()
 	// Partition (blackhole connect): a Dial across a cut link drops the SYN — it
-	// blocks until the link heals or the context/deadline expires. The target host
-	// is the routable IP's owner; a loopback/own-host target is never partitioned.
+	// blocks until the link heals, the context/deadline expires, or the retransmit
+	// horizon fires ETIMEDOUT (a real kernel's exhausted SYN retries, so a
+	// deadline-less dial into a permanent partition fails in bounded virtual time
+	// rather than hanging forever). The target host is the routable IP's owner; a
+	// loopback/own-host target is never partitioned.
 	targetHost := dialerHost
 	if h, ok := dstHostForRoutableIP(ip); ok {
 		targetHost = h
 	}
+	retransNs := dstNetRetransmitTimeoutNs()
+	blockStart := int64(-1) // base-time the dial first blocked; -1 = not yet blocked
 	for {
 		wake := dstPartWakeCh()
 		if !dstPartitioned(dialerHost, targetHost) {
 			break
 		}
+		if blockStart < 0 {
+			blockStart = dstBaseNanos()
+		}
+		var horizonC <-chan time.Time
+		var horizonT *time.Timer
+		if retransNs > 0 {
+			remaining := retransNs - (dstBaseNanos() - blockStart)
+			if remaining <= 0 {
+				return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+			}
+			horizonT = time.NewTimer(time.Duration(remaining))
+			horizonC = horizonT.C
+		}
 		select {
 		case <-ctx.Done():
+			if horizonT != nil {
+				horizonT.Stop()
+			}
 			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: mapErr(ctx.Err())}
 		case <-wake:
+			if horizonT != nil {
+				horizonT.Stop()
+			}
+		case <-horizonC:
+			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 		}
 	}
 	scope := dstDialScope(ip, dialerHost)
@@ -909,10 +976,19 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	// instantly, a false positive the Soundness invariant forbids. The wire's
 	// buffered write is the faithful TCP shape (a send buffer the link drains).
 	latency, jitter, bandwidth := int64(0), int64(0), int64(0)
+	capacity, retrans := int64(0), int64(0) // same-host: unbounded buffer (instant drain), no horizon
 	if l.host != dialerHost {
 		latency, jitter, bandwidth = dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps()
+		capacity, retrans = dstNetSendBufferBytes(), dstNetRetransmitTimeoutNs()
 	}
-	p1, p2 := dstWirePair(latency, jitter, bandwidth, dialerHost, l.host)
+	// SYN: the first half of the connect round trip travels to the server. A connect
+	// deadline shorter than this traversal fails now, before anything is established —
+	// a zero-RTT connect would instead let a SUT's connect timeout pass under
+	// simulation on a link where it fails in production (unsound).
+	if err := dstConnectSYN(ctx, latency, jitter); err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
+	}
+	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host)
 	reset := new(atomic.Bool)
 	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc}
 	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc}
@@ -941,12 +1017,15 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 			// the failure paths above never register, so a reset never over-fires.
 			dstConnRegister(dialer) // accepted before teardown: a live conn
 			dstConnRegister(server)
-			return dialer, nil
 		default:
 			dstConnRegister(dialer) // queued: a live conn
 			dstConnRegister(server)
-			return dialer, nil
 		}
+		// SYN-ACK: the acknowledgment travels back; the connect completes one full RTT
+		// after it began. Committed at the handoff above, so this only delays the
+		// dialer's return (not ctx-interruptible), like the wire delays that follow.
+		dstConnectSYNACK(latency, jitter)
+		return dialer, nil
 	case <-l.done:
 		p1.Close()
 		p2.Close()

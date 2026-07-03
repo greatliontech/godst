@@ -1409,6 +1409,29 @@ func dstSetNetCrossHostBandwidth(bytesPerSec int64) { dstNetCrossHostBandwidth =
 //go:linkname dstNetCrossHostBandwidthBps
 func dstNetCrossHostBandwidthBps() int64 { return dstNetCrossHostBandwidth }
 
+// dstNetSendBuffer is the per-run per-direction send-buffer capacity in bytes: a Write
+// blocks once this many written-but-undelivered bytes are outstanding (backpressure).
+// 0 means unbounded (writes never block; same-host always). dstNetRetransmitNs is the
+// virtual-time horizon after which an undeliverable write/dial fails ETIMEDOUT; 0 means
+// no horizon. Both resolved (defaults applied) by testing/simulation before the bubble
+// and reset after, like the latency/jitter/bandwidth globals.
+var (
+	dstNetSendBuffer   int64
+	dstNetRetransmitNs int64
+)
+
+//go:linkname dstSetNetSendBuffer
+func dstSetNetSendBuffer(bytes int64) { dstNetSendBuffer = bytes }
+
+//go:linkname dstNetSendBufferBytes
+func dstNetSendBufferBytes() int64 { return dstNetSendBuffer }
+
+//go:linkname dstSetNetRetransmitTimeout
+func dstSetNetRetransmitTimeout(ns int64) { dstNetRetransmitNs = ns }
+
+//go:linkname dstNetRetransmitTimeoutNs
+func dstNetRetransmitTimeoutNs() int64 { return dstNetRetransmitNs }
+
 // dstNetPartitionHook is net's handler for partition targeting (Partition / Heal /
 // Isolate / HealHost), registered by net at init when built with -tags dst. The
 // partition state and its blocked-reader wakeups live in net (next to the conns
