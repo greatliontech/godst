@@ -153,7 +153,8 @@ func TestDSTNodeHostFS(t *testing.T) {
 			ns = append(ns, e.Name())
 		}
 		listing = strings.Join(ns, ",")
-		// Host hB never touched its filesystem: baseline is /tmp only.
+		// Host hB exists but never touched its filesystem: baseline is /tmp only.
+		simulation.Host("hB", simulation.HostConfig{}, func() {}) // declared: inspectors fail loud on undeclared names
 		bents, _ := fs.ReadDir(simulation.HostFS("hB"), ".")
 		for _, e := range bents {
 			bList = append(bList, e.Name())

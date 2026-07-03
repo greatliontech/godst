@@ -167,3 +167,25 @@ func TestDSTNodeConcurrentDeterministic(t *testing.T) {
 		t.Errorf("non-deterministic concurrent node ids:\n a=%+v\n b=%+v", a, b)
 	}
 }
+
+// TestDSTNodeDeclareBeforeAnyRun: Host before the first Run in the process must be
+// inert (the documented outside-a-run behavior), not a nil-map panic — the registry
+// maps are created by the run envelope's nodeRegReset, which has not run yet. The
+// pre-first-Run state is recreated directly (tests in this binary may already have
+// run).
+func TestDSTNodeDeclareBeforeAnyRun(t *testing.T) {
+	nodeReg.mu.Lock()
+	saveH, saveP := nodeReg.hosts, nodeReg.procs
+	nodeReg.hosts, nodeReg.procs = nil, nil
+	nodeReg.mu.Unlock()
+	defer func() {
+		nodeReg.mu.Lock()
+		nodeReg.hosts, nodeReg.procs = saveH, saveP
+		nodeReg.mu.Unlock()
+	}()
+	ran := false
+	Host("pre-run-host", HostConfig{}, func() { ran = true })
+	if !ran {
+		t.Fatal("Host outside any run did not run its body")
+	}
+}

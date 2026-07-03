@@ -20,7 +20,7 @@ import (
 // untouched, so they still fire at the same base time. Calls outside a run are no-ops.
 
 //go:linkname dstStepHostClock runtime.dstStepHostClock
-func dstStepHostClock(host uint32, delta int64)
+func dstStepHostClock(host uint32, delta int64) bool
 
 //go:linkname dstDriftHostClock runtime.dstDriftHostClock
 func dstDriftHostClock(host uint32, ppb int64)
@@ -37,9 +37,16 @@ func dstDriftHostClock(host uint32, ppb int64)
 // duration computed by subtracting two wall readings (time.Since across the step)
 // reflects the step, as it would for code that reads the wall clock on real hardware;
 // for step-immune deadlines use a timer or context, which the step does not move.
-// Steps accumulate. Calls outside a run are no-ops. Call from within a Run.
+// Steps accumulate. Panics during a run on a host name no Host declaration has
+// established (a typo'd victim must fail loud, never silently test nothing).
+// Calls outside a run are no-ops. Call from within a Run.
+// A step that would take the host's wall before the epoch panics: settimeofday
+// rejects a pre-epoch wall clock, so no real machine can hold one (the
+// wall-representability boundary, docs/dst/faults.md "Clock faults").
 func StepClock(host string, delta time.Duration) {
-	dstStepHostClock(internHost(host), int64(delta))
+	if !dstStepHostClock(lookupHost(host), int64(delta)) {
+		panic("testing/simulation: StepClock takes the host's wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
+	}
 }
 
 // DriftClock changes the named host's clock rate to a departure of ppb parts-per-billion
@@ -51,10 +58,11 @@ func StepClock(host string, delta time.Duration) {
 // and every timer already pending on the host is re-mapped so it still fires after the
 // host-perceived time it was set for. ppb must be in (-1e9, 1e9] (rate in (0, 2]);
 // DriftClock panics otherwise (a non-positive or reversed rate is a step, not drift).
-// Affects exactly the named host. Calls outside a run are no-ops. Call from within a Run.
+// Affects exactly the named host, panicking during a run on an undeclared host name.
+// Calls outside a run are no-ops. Call from within a Run.
 func DriftClock(host string, ppb int64) {
 	if ppb <= -driftPPBBase || ppb > maxDriftPPB {
 		panic("testing/simulation: DriftClock ppb out of range (-1e9, 1e9]; rate must be in (0, 2]")
 	}
-	dstDriftHostClock(internHost(host), ppb)
+	dstDriftHostClock(lookupHost(host), ppb)
 }

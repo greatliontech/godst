@@ -213,3 +213,14 @@ func slicesEqualInt(a, b []int) bool {
 	}
 	return true
 }
+
+// TestDSTIdentityNegativePIDDefaults: a negative Options.PID falls back to the default
+// (mirroring NumCPU's <=0 rule) — os.Getpid() must never report a pid no real process
+// can observe.
+func TestDSTIdentityNegativePIDDefaults(t *testing.T) {
+	var pid int
+	RunWith(1, Options{PID: -5}, func() { pid = os.Getpid() })
+	if pid != 1 {
+		t.Errorf("Options{PID: -5}: os.Getpid() = %d, want the default 1 (negative pids are not real identities)", pid)
+	}
+}

@@ -246,6 +246,7 @@ func TestDSTNetIsolateVictim(t *testing.T) {
 				c.Close()
 			}()
 		})
+		simulation.Host("A", simulation.HostConfig{}, func() {}) // declared: victims fail loud on undeclared names
 		simulation.Host("B", simulation.HostConfig{}, func() {
 			pc := <-portC
 			cc, _ := Dial("tcp", simulation.HostIP("C")+":"+pc)

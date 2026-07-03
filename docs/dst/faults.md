@@ -222,11 +222,11 @@ tolerate*, so it cannot be a single global clock.
   "timer before its deadline" false positive at non-dividing rates. *Enforced:* the
   wall split adds `(base−t0)·ppb/1e9` (truncated integer division — Go semantics; for a negative ppb
   truncation adds *less* negative drift, so the ≥ d composition holds a fortiori) and the single timer
-  choke `(*timer).modify` converts `d→⌈d·1e9/(1e9+ppb)⌉` (overflow-safe; the ceil, the arm-addition
-  clamp, and a Sleep-elapsed ≥ d property sweep at non-dividing rates land with the clock-fault chunk —
-  the landed conversion floors, and its `big.Int` oracle validates the floor it replaces);
-  `TestDSTClockDrift{Wall,TimerConversion,Ticker,SelfConsistent,Property}`
-  (`testing/simulation/clock_drift_test.go`).
+  choke `(*timer).modify` converts `d→⌈d·1e9/(1e9+ppb)⌉` (overflow-safe ceil, `dstMulDivClampCeil`,
+  mutation-tested against a `big.Int` ceiling oracle; the arm ADDITION clamps to `maxWhen` too —
+  `TestDSTClockDriftHugeSleepFires`); `TestDSTClockDrift{Wall,TimerConversion,Ticker,SelfConsistent,
+  Property}` plus the never-early property sweep at non-dividing rates
+  (`TestDSTClockDriftSleepNeverEarly`, `testing/simulation/clock_drift_test.go`).
 - **DST-CLOCK-DRIFT-MONOTONIC (entailed: a drifting clock still moves forward).** A drift rate is strictly
   positive (`ppb > -1e9`, rate in (0, 2]); a clock that stops or reverses is a *step* (a discontinuous wall
   jump), not drift. So a drifting host's `time.Now` advances monotonically across base advances, fast or slow.
@@ -368,9 +368,10 @@ the per-process/zone forms and the `Link`/`Crash`/`OOM`/… sugar extend it as t
 declaration has established** — it never interns a fresh host id as a side effect. A typo'd victim
 would otherwise mutate state no goroutine observes: the fault silently tests nothing, the run stays
 green, and the SUT's fault handling goes unexercised — a silent no-op at odds with the fail-loud
-posture everywhere else (undeclared-host panics, the `-tags dst` panic). (Enforcement lands with the
-clock-fault chunk, at the one name→id intern choke point in `testing/simulation` that every
-victim-name intake — clock, HostIP/HostFS, partition, reset — shares.)
+posture everywhere else (undeclared-host panics, the `-tags dst` panic). Enforced at the one name→id
+lookup choke point in `testing/simulation` (`lookupHost`/`lookupProc`) that every victim-name intake —
+clock, HostIP/HostFS, partition, reset, disk — shares; outside a run the calls stay documented no-ops.
+`TestDSTFaultVictimUnknownPanics` / `TestDSTFaultVictimOutsideRunNoop`.
 
 ### The fault model: policies at existing seams
 
@@ -610,19 +611,37 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   so a held `NewTimer`/`NewTicker` or a ticker between ticks is re-mapped too; the re-map is in place under the
   timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). **Host
   re-declaration re-establishes the clock completely**: declaring `Host(name, config)` for an
-  already-declared name applies the declared clock exactly as `DriftClock`+`StepClock` would — fold
-  drift-so-far into the offset, set the new rate (zero `HostConfig` = rate 1, in sync with base, as
-  the `HostConfig` doc promises), re-anchor, and re-map the host's armed timers on any rate change.
+  already-declared name applies the declared clock in full:
+  re-map the host's armed timers from the surviving rate to the declared one, overwrite the offset
+  to the declared value (a restarted clock is the declared clock, not a continuation — prior steps
+  and accumulated drift are discarded, so no fold is needed), re-anchor, and set the declared rate
+  (zero `HostConfig` = rate 1, in sync with base, as the `HostConfig` doc promises). An
+  implicit-host `Process` restart does **not** re-establish its host's clock: a process restart
+  leaves the machine up — its clock, including applied steps, survives (only `Host` models the
+  reboot). Cross-run freshness needs no re-establishment at all: the per-host clock table is
+  per-run state, reset at run entry (`dstSetSimEnv`), so a host id reused by a later run starts
+  in sync by construction (`TestDSTClockTableFreshPerRun`).
   Setting only the offset while a stale rate and anchor survive leaves a "restarted, in-sync" host
   reading ahead of base and sleeping at the old rate — self-consistent to its own probes (the
   strongest-counterexample shape DST-CLOCK-DURATION warns about), so only a base-clock-relative test
   catches it. Enforced by
   `TestDSTClockDrift*` / `TestDSTClockDriftClock*` (`testing/simulation/clock_drift_test.go`,
   `clock_drift_dynamic_test.go`), mutation-tested, incl. a `big.Int` oracle for the conversion, a direct
-  overflow-clamp regression, and the unheaped-timer re-map; the ceil-rounding, arm-addition-overflow,
-  and re-declaration contracts land with the clock-fault chunk. **Deferred**
+  overflow-clamp regression, and the unheaped-timer re-map; the re-declaration contract is enforced by
+  `TestDSTClockDrift{ResetByRedeclare,RedeclareSameRate}` and `TestDSTClockRedeclareRemapsPendingTimer`
+  (`runtime.dstReestablishHostClock` — re-map at the old rate, overwrite the offset, reset the anchor). **Deferred**
   (`docs/issues/clock-drift-dynamic.md`): the fault-RNG-drawn (seeded) rate. The `wall = f_h(base)`
   representation does not change for it.
+
+**Wall representability (recorded boundary).** The bubble wall is int64 nanoseconds. A skew or
+step that would take a host's wall before the **epoch** is rejected with a panic at application —
+`settimeofday` rejects a pre-epoch wall, so no real machine can hold one, and a silently clamped
+wall would freeze the host's clock (its `Sleep` observably consuming zero host time — the
+timer-early false-positive class); with every application point validated, the wall is non-negative
+by construction (it grows from a valid anchor at the host's strictly positive rate). At the far
+end the composition **saturates** at the largest representable wall (year ~2262): real kernels
+accept later times, this representation cannot — deterministic, never a sign wrap.
+`TestDSTClockSkewBoundary`.
 
 **Soundness boundary (recorded, contractual).** In a simulation bubble `time.Now()` carries no monotonic
 component (the synctest design — it returns `mono = 0`), so a *duration* is a wall-clock subtraction. A

@@ -8,6 +8,7 @@ package simulation
 
 import (
 	"context"
+	"math"
 	"math/big"
 	"math/rand"
 	"testing"
@@ -33,7 +34,7 @@ const maxWhen = 1<<63 - 1 // runtime/time.go maxWhen
 //
 // Exact rates (2x = ppb 1e9, 1/2 = -5e8, 1/10 = -9e8) give exact assertions; the
 // property test (TestDSTClockDriftProperty) covers arbitrary rates against a big.Int
-// oracle of the same integer-floor conversion the runtime uses.
+// oracle of the same integer-ceiling conversion the runtime uses (the rounding contract).
 
 // driftBaseAdvance runs fn on a goroutine of a host with the given clock config and
 // returns the base-time advance fn caused, measured on the root. Nothing blocks on a
@@ -196,11 +197,13 @@ func driftSince(t *testing.T, ppb int64, d time.Duration) time.Duration {
 
 // TestDSTClockDriftSelfConsistent: a host cannot detect its own drift — its time.Since
 // over its own Sleep(d) reads d back (it slept d/r of base, and its wall advanced r
-// times that = d). For exact-dividing rates this is exact; for an arbitrary rate it
-// holds within the integer-floor rounding — the timer conversion and the wall
-// accumulation each floor independently, so the round trip can differ from d by at most
-// ~rate+1 ns (deterministic and far below any observable resolution). The strongest
-// internal-consistency invariant.
+// times that = d). For exact-dividing rates this is exact; for an arbitrary rate the
+// rounding contract (docs/dst/faults.md "Clock faults") bounds the round trip to
+// [d, d + ~rate+1 ns]: the arm conversion rounds UP and the wall accumulation rounds
+// down, composing to floor(ceil(d/r)·r) ≥ d — NEVER below d, because Sleep returning
+// with Since < d is real Go's documented "at least d" broken, the Soundness invariant's
+// "timer before its deadline" false positive. The strongest internal-consistency
+// invariant.
 func TestDSTClockDriftSelfConsistent(t *testing.T) {
 	const d = 700 * time.Millisecond
 	for _, ppb := range []int64{0, 1_000_000_000, -500_000_000, -900_000_000} {
@@ -208,12 +211,33 @@ func TestDSTClockDriftSelfConsistent(t *testing.T) {
 			t.Errorf("ppb %d (exact rate): time.Since over the host's own Sleep(%v) = %v, want exactly %v", ppb, d, since, d)
 		}
 	}
-	const round = 4 * time.Nanosecond // >= rate+1 for rate <= 2
+	const over = 4 * time.Nanosecond // >= rate+1 for rate <= 2
 	for _, ppb := range []int64{250_000, -123_457, 7_777_777, -333_333_333} {
 		since := driftSince(t, ppb, d)
-		if delta := since - d; delta < -round || delta > round {
-			t.Errorf("ppb %d: time.Since over Sleep(%v) = %v, want %v ± %v (integer-floor rounding)", ppb, d, since, d, round)
+		if since < d || since > d+over {
+			t.Errorf("ppb %d: time.Since over Sleep(%v) = %v, want in [%v, %v] (never early; ceil-arm/floor-wall rounding)", ppb, d, since, d, d+over)
 		}
+	}
+}
+
+// TestDSTClockDriftSleepNeverEarly is the property sweep of the never-early half of the
+// rounding contract at non-dividing rates: for arbitrary (rate, duration), a host's own
+// time.Since over its own Sleep(d) is >= d, always. With a floor at the arm this fails
+// for most non-dividing pairs (elapsed d-1 or d-2 ns) — e.g. rate 1.5, d=100ms reads
+// 99999999ns — the "timer fires before its deadline in the host's own clock" false
+// positive verbatim.
+func TestDSTClockDriftSleepNeverEarly(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x51EE9EA871))
+	for i := 0; i < 64; i++ {
+		ppb := rng.Int63n(1_900_000_001) - 900_000_000 // rate in [0.1, 2]
+		d := time.Duration(rng.Int63n(1_000_000_000) + 1)
+		if since := driftSince(t, ppb, d); since < d {
+			t.Fatalf("ppb %d: time.Since over Sleep(%v) = %v < d — the host observed its timer fire early", ppb, d, since)
+		}
+	}
+	// The named anchor case from the audit: rate 1.5 (ppb 5e8), d = 100ms.
+	if d, since := 100*time.Millisecond, driftSince(t, 500_000_000, 100*time.Millisecond); since < d {
+		t.Fatalf("rate 1.5: time.Since over Sleep(100ms) = %v < 100ms", since)
 	}
 }
 
@@ -485,16 +509,22 @@ func TestDSTClockDriftToBaseOverflowClamp(t *testing.T) {
 	}
 }
 
-// TestDSTClockDriftToBaseExact: the conversion is the exact integer floor of
-// d*1e9/(1e9+ppb), matched against a big.Int oracle — including the d*1e9 overflow region
-// (d > ~9.2s) the quotient/remainder split exists to handle, kept below the clamp ceiling.
+// TestDSTClockDriftToBaseExact: the conversion is the exact integer CEILING of
+// d*1e9/(1e9+ppb) (the rounding contract — the arm conversion rounds up so a timer never
+// fires early in host-perceived time), matched against a big.Int oracle — including the
+// d*1e9 overflow region (d > ~9.2s) the quotient/remainder split exists to handle, kept
+// below the clamp ceiling.
 func TestDSTClockDriftToBaseExact(t *testing.T) {
 	rng := rand.New(rand.NewSource(0x0D817B45E))
 	check := func(d, ppb int64) {
-		want := new(big.Int).Mul(big.NewInt(d), big.NewInt(1_000_000_000))
-		want.Div(want, big.NewInt(1_000_000_000+ppb))
+		num := new(big.Int).Mul(big.NewInt(d), big.NewInt(1_000_000_000))
+		den := big.NewInt(1_000_000_000 + ppb)
+		want, rem := new(big.Int).QuoRem(num, den, new(big.Int))
+		if rem.Sign() != 0 {
+			want.Add(want, big.NewInt(1)) // ceil: operands are positive
+		}
 		if got := dstDriftToBase(d, ppb); got != want.Int64() {
-			t.Fatalf("dstDriftToBase(%d, %d) = %d, want %d (floor)", d, ppb, got, want.Int64())
+			t.Fatalf("dstDriftToBase(%d, %d) = %d, want %d (ceil)", d, ppb, got, want.Int64())
 		}
 	}
 	for _, d := range []int64{0, 1, 999, int64(time.Second), int64(time.Hour), int64(100 * time.Hour)} {
@@ -508,8 +538,9 @@ func TestDSTClockDriftToBaseExact(t *testing.T) {
 }
 
 // TestDSTClockDriftProperty is the property/fuzz coverage: for an arbitrary rate and
-// duration, a Sleep(d) on the drifting host advances base by exactly floor(d*1e9/(1e9+ppb))
-// — the same integer-floor the runtime computes — verified against a big.Int oracle.
+// duration, a Sleep(d) on the drifting host advances base by exactly ceil(d*1e9/(1e9+ppb))
+// — the same integer-ceiling the runtime computes at the arm (the rounding contract) —
+// verified against a big.Int oracle.
 // Inputs are seeded by a test-local PRNG (not the DST RNG), bounded so no clamp applies.
 func TestDSTClockDriftProperty(t *testing.T) {
 	rng := rand.New(rand.NewSource(0xD81F7C10C))
@@ -517,11 +548,45 @@ func TestDSTClockDriftProperty(t *testing.T) {
 		// ppb in [-9e8, 1e9] (rate in [0.1, 2]); d in [1, 1e9] ns. Then d/r <= 1e10, no clamp.
 		ppb := rng.Int63n(1_900_000_001) - 900_000_000
 		d := time.Duration(rng.Int63n(1_000_000_000) + 1)
-		want := new(big.Int).Mul(big.NewInt(int64(d)), big.NewInt(1_000_000_000))
-		want.Div(want, big.NewInt(1_000_000_000+ppb))
+		num := new(big.Int).Mul(big.NewInt(int64(d)), big.NewInt(1_000_000_000))
+		den := big.NewInt(1_000_000_000 + ppb)
+		want, rem := new(big.Int).QuoRem(num, den, new(big.Int))
+		if rem.Sign() != 0 {
+			want.Add(want, big.NewInt(1))
+		}
 		got := driftBaseAdvance(t, Drift(ppb), func() { time.Sleep(d) })
 		if int64(got) != want.Int64() {
-			t.Fatalf("ppb %d, Sleep(%v): base advance %d, want %d (floor(d*1e9/(1e9+ppb)))", ppb, d, int64(got), want.Int64())
+			t.Fatalf("ppb %d, Sleep(%v): base advance %d, want %d (ceil(d*1e9/(1e9+ppb)))", ppb, d, int64(got), want.Int64())
 		}
+	}
+}
+
+// TestDSTClockDriftHugeSleepFires is the arm-addition overflow regression
+// (docs/dst/faults.md "Clock faults", overflow contract): time.Sleep(math.MaxInt64) —
+// the standard block-forever idiom, whose when timeSleep clamps to maxWhen — on a
+// slow-drifting host converts through dstDriftToBase, whose clamp returns maxWhen; the
+// arm's `when = now + converted` then wraps negative unless the ADDITION is clamped
+// too (bubble base time is ~9.47e17 ns). A wrapped when fails needsAdd, so the timer
+// is silently never heaped and never fires: the sleeper parks forever and the run
+// reports a deadlock neither real hardware (a 1 ppm-slow crystal fires after ~292y)
+// nor the un-drifted simulation (which advances fake time to maxWhen and fires)
+// exhibits — a harness-manufactured false positive. With the clamp, fake time advances
+// to maxWhen and the sleeper wakes; without it, this test dies with the synctest
+// deadlock panic.
+func TestDSTClockDriftHugeSleepFires(t *testing.T) {
+	woke := false
+	Run(1, func() {
+		done := make(chan struct{})
+		Host("h", HostConfig{Clock: Drift(-1000)}, func() { // 1 ppm slow
+			go func() {
+				time.Sleep(math.MaxInt64)
+				woke = true
+				close(done)
+			}()
+		})
+		<-done
+	})
+	if !woke {
+		t.Fatal("Sleep(math.MaxInt64) on a slow-drifting host never fired")
 	}
 }

@@ -20,8 +20,8 @@ func dstHostRoutableIPString(host uint32) string
 // Under the per-host network, loopback (127.0.0.1) is host-private; a process
 // reaches another host only by that host's routable IP. A host listening on a
 // wildcard or its own routable IP is reachable here from any host. Must be called
-// inside a simulation (it interns the host name into the run's id space). A string
+// inside a simulation; it panics on a host name no declaration has established. A string
 // is returned rather than a net.IP so this package does not import net.
 func HostIP(name string) string {
-	return dstHostRoutableIPString(internHost(name))
+	return dstHostRoutableIPString(lookupHost(name))
 }

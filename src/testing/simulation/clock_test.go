@@ -8,6 +8,7 @@ package simulation
 
 import (
 	"math/rand"
+	_ "net" // TestDSTFaultVictimUnknownPanics reaches HostIP, whose linkname target lives in net
 	"testing"
 	"time"
 	_ "unsafe" // for go:linkname
@@ -512,7 +513,7 @@ func TestDSTClockStepWallDurationReflectsStep(t *testing.T) {
 }
 
 // TestDSTClockStepResetByRedeclare verifies the restart semantic documented on Host
-// and dstSetHostClockOffset: re-declaring a host re-establishes its configured base
+// and dstReestablishHostClock: re-declaring a host re-establishes its configured base
 // clock, discarding any step taken before the re-declaration (a reboot re-syncs to
 // config). A long-lived worker of the first declaration reads the stepped offset; the
 // re-declared host reads the reset offset. Base is frozen throughout.
@@ -572,4 +573,59 @@ func TestDSTClockHostBound(t *testing.T) {
 		}
 	}()
 	dstHostClockEnsure(1 << 20) // far beyond dstMaxSimHosts; must panic
+}
+
+// TestDSTFaultVictimUnknownPanics: every fault/inspection API that names a victim
+// panics during a run on an undeclared name instead of interning a fresh host or
+// process id whose state no goroutine observes — a typo'd victim must fail loud,
+// never silently test nothing (docs/dst/faults.md "Targeting", victim names fail
+// loud). All intake points share the lookupHost/lookupProc choke.
+func TestDSTFaultVictimUnknownPanics(t *testing.T) {
+	cases := []struct {
+		name string
+		call func()
+	}{
+		{"StepClock", func() { StepClock("no-such-host", time.Second) }},
+		{"DriftClock", func() { DriftClock("no-such-host", 1000) }},
+		{"Partition", func() { Partition("declared", "no-such-host") }},
+		{"Heal", func() { Heal("declared", "no-such-host") }},
+		{"Isolate", func() { Isolate("no-such-host") }},
+		{"HealHost", func() { HealHost("no-such-host") }},
+		{"Reset", func() { Reset("declared", "no-such-host") }},
+		{"ResetProcess", func() { ResetProcess("no-such-proc") }},
+		{"FailDisk", func() { FailDisk("no-such-host") }},
+		{"HealDisk", func() { HealDisk("no-such-host") }},
+		{"FailFile", func() { FailFile("no-such-host", "/f") }},
+		{"HealFile", func() { HealFile("no-such-host", "/f") }},
+		{"LimitDisk", func() { LimitDisk("no-such-host", 1) }},
+		{"UnlimitDisk", func() { UnlimitDisk("no-such-host") }},
+		{"SlowDisk", func() { SlowDisk("no-such-host", time.Millisecond) }},
+		{"HostFS", func() { HostFS("no-such-host") }},
+		{"HostIP", func() { HostIP("no-such-host") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var recovered any
+			Run(1, func() {
+				Host("declared", HostConfig{}, func() {})
+				func() {
+					defer func() { recovered = recover() }()
+					tc.call()
+				}()
+			})
+			if recovered == nil {
+				t.Errorf("%s on an undeclared victim name did not panic (a typo'd victim silently tests nothing)", tc.name)
+			}
+		})
+	}
+}
+
+// TestDSTFaultVictimOutsideRunNoop: the same victim-name APIs stay documented no-ops
+// outside a run — the fail-loud check applies only while a run is active (outside one,
+// the registry belongs to no run and every downstream op already discards the call).
+func TestDSTFaultVictimOutsideRunNoop(t *testing.T) {
+	StepClock("nobody", time.Second)
+	FailDisk("nobody")
+	Partition("nobody", "nobody-else")
+	ResetProcess("nobody") // none of these may panic outside a run
 }

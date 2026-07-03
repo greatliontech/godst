@@ -30,10 +30,17 @@ func time_runtimeNow() (sec int64, nsec int32, mono int64) {
 			// a step between two readings) shifts what time.Now reads, while timers
 			// still fire at the same base time. Folds away in non-dst builds (dstActive
 			// is a constant false), leaving the reading byte-identical. See
-			// runtime.dstSetHostClockOffset/dstStepHostClock and docs/dst/faults.md
+			// runtime.dstReestablishHostClock/dstStepHostClock and docs/dst/faults.md
 			// "Per-host clock" / "Clock faults". The adjustment includes a drifting
 			// host's accumulated wall departure (rate ≠ 1), a function of base time.
-			wall += dstHostWallAdjust(gp.dstHost, bubble.now)
+			// Saturating add: a far-future skew/step saturates at the farthest
+			// int64-ns-representable wall time (year ~2262 — real kernels accept
+			// later times, this representation cannot; deterministic, recorded as
+			// the wall-representability boundary). The wall can never go negative:
+			// every application point (dstStepHostClock, dstReestablishHostClock)
+			// rejects a pre-epoch wall, and it only grows from there — a negative
+			// wall would corrupt the sec/nsec split below.
+			wall = dstSatAdd(wall, dstHostWallAdjust(gp.dstHost, bubble.now))
 		}
 		sec = wall / (1000 * 1000 * 1000)
 		nsec = int32(wall % (1000 * 1000 * 1000))

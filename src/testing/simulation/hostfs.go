@@ -24,5 +24,5 @@ func dstHostFSFor(host uint32) fs.FS
 // current tree for host name; a host with no filesystem activity reports the empty
 // baseline plus /tmp).
 func HostFS(name string) fs.FS {
-	return dstHostFSFor(internHost(name))
+	return dstHostFSFor(lookupHost(name))
 }

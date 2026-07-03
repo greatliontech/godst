@@ -33,25 +33,27 @@ const (
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections
 // between them — in either direction — are blackholed and new dials across the cut
-// block, until Heal(a, b) (or HealHost on either) restores the link.
+// block, until Heal(a, b) (or HealHost on either) restores the link. Like every
+// victim-naming fault API, it panics during a run on an undeclared host or process
+// name and is a no-op outside a run.
 func Partition(a, b string) {
-	dstNetPartitionOp(partOpPartition, internHost(a), internHost(b))
+	dstNetPartitionOp(partOpPartition, lookupHost(a), lookupHost(b))
 }
 
 // Heal restores the link between hosts a and b cut by Partition.
 func Heal(a, b string) {
-	dstNetPartitionOp(partOpHeal, internHost(a), internHost(b))
+	dstNetPartitionOp(partOpHeal, lookupHost(a), lookupHost(b))
 }
 
 // Isolate cuts host from every other host at once (a full network partition of one
 // node), until HealHost(host) restores it.
 func Isolate(host string) {
-	dstNetPartitionOp(partOpIsolate, internHost(host), 0)
+	dstNetPartitionOp(partOpIsolate, lookupHost(host), 0)
 }
 
 // HealHost restores a host isolated by Isolate.
 func HealHost(host string) {
-	dstNetPartitionOp(partOpHealHost, internHost(host), 0)
+	dstNetPartitionOp(partOpHealHost, lookupHost(host), 0)
 }
 
 // Reset injects ECONNRESET on every active connection between hosts a and b (in
@@ -59,12 +61,12 @@ func HealHost(host string) {
 // from a peer crash or a middlebox. Both ends of each connection observe
 // ECONNRESET on their next operation; any in-flight buffered bytes are dropped.
 func Reset(a, b string) {
-	dstNetPartitionOp(partOpResetPair, internHost(a), internHost(b))
+	dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b))
 }
 
 // ResetProcess injects ECONNRESET on every active connection process p owns an end
 // of (as dialer or as the listening process) — modeling that process's sockets
 // being torn down (e.g. as a lighter-weight precursor to the process crash fault).
 func ResetProcess(p string) {
-	dstNetPartitionOp(partOpResetProc, internProc(p), 0)
+	dstNetPartitionOp(partOpResetProc, lookupProc(p), 0)
 }

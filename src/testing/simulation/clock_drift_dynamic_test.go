@@ -26,18 +26,24 @@ func dstDriftRemap(x, ppbOld, ppbNew int64) int64
 //     rate 1; changes compose; isolate per host; replay deterministically.
 // All base-time measurements are on the root (host 0, rate 1).
 
-// bigToBase = floor(d*1e9/(1e9+ppb)) — the arm conversion, as an independent oracle.
-func bigToBase(d, ppb int64) int64 {
-	r := new(big.Int).Mul(big.NewInt(d), big.NewInt(1_000_000_000))
-	r.Div(r, big.NewInt(1_000_000_000+ppb))
-	return r.Int64()
+// bigCeilQuo = ceil(a/b) for positive a, b — the rounding the arm/re-map conversions
+// use (the rounding contract: never early in host-perceived time).
+func bigCeilQuo(a, b *big.Int) int64 {
+	q, r := new(big.Int).QuoRem(a, b, new(big.Int))
+	if r.Sign() != 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return q.Int64()
 }
 
-// bigRemap = floor(x*(1e9+ppbOld)/(1e9+ppbNew)) — the pending-timer re-map oracle.
+// bigToBase = ceil(d*1e9/(1e9+ppb)) — the arm conversion, as an independent oracle.
+func bigToBase(d, ppb int64) int64 {
+	return bigCeilQuo(new(big.Int).Mul(big.NewInt(d), big.NewInt(1_000_000_000)), big.NewInt(1_000_000_000+ppb))
+}
+
+// bigRemap = ceil(x*(1e9+ppbOld)/(1e9+ppbNew)) — the pending-timer re-map oracle.
 func bigRemap(x, ppbOld, ppbNew int64) int64 {
-	r := new(big.Int).Mul(big.NewInt(x), big.NewInt(1_000_000_000+ppbOld))
-	r.Div(r, big.NewInt(1_000_000_000+ppbNew))
-	return r.Int64()
+	return bigCeilQuo(new(big.Int).Mul(big.NewInt(x), big.NewInt(1_000_000_000+ppbOld)), big.NewInt(1_000_000_000+ppbNew))
 }
 
 // driftClockReSleep arms a Sleep(d) on host h (initially rate ppbOld) at base ~0, lets the
@@ -484,8 +490,9 @@ func TestDSTClockDriftClockRateValidation(t *testing.T) {
 	}
 }
 
-// TestDSTClockDriftRemapExact: the re-map helper is the exact integer floor of
-// x*(1e9+ppbOld)/(1e9+ppbNew), matched against a big.Int oracle (incl. the overflow region).
+// TestDSTClockDriftRemapExact: the re-map helper is the exact integer CEILING of
+// x*(1e9+ppbOld)/(1e9+ppbNew) (the rounding contract — a re-map is never early in
+// host-perceived time), matched against a big.Int oracle (incl. the overflow region).
 func TestDSTClockDriftRemapExact(t *testing.T) {
 	rng := rand.New(rand.NewSource(0x2EFA17))
 	check := func(x, ppbOld, ppbNew int64) {
@@ -504,5 +511,123 @@ func TestDSTClockDriftRemapExact(t *testing.T) {
 	}
 	for i := 0; i < 200; i++ {
 		check(rng.Int63n(int64(time.Hour))+1, rng.Int63n(1_900_000_001)-900_000_000, rng.Int63n(1_900_000_001)-900_000_000)
+	}
+}
+
+// TestDSTClockDriftResetByRedeclare: re-declaring a drifting host with a zero clock
+// config re-establishes rate 1 and an in-sync wall (docs/dst/faults.md "Clock faults",
+// Host re-declaration) — neither the drift RATE nor its accumulated wall departure
+// survives a restart. Measured against BASE (the root): the defect this pins — an
+// offset overwrite that leaves a stale rate and anchor — is self-consistent to the
+// host's own Since-over-Sleep probes, so only a base-relative check catches it.
+func TestDSTClockDriftResetByRedeclare(t *testing.T) {
+	var atRestart, base time.Time
+	var sleepBase time.Duration
+	Run(1, func() {
+		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
+		time.Sleep(time.Second)                                       // root advances base 1s; host h accumulates +1s of wall departure
+		base = time.Now()
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() { // restart: zero config = in sync, rate 1
+			atRestart = time.Now()
+			go func() { time.Sleep(time.Second); close(done) }()
+		})
+		<-done
+		sleepBase = time.Since(base)
+	})
+	if !atRestart.Equal(base) {
+		t.Errorf("restarted zero-config host reads %v, want base %v (re-declare must clear accumulated drift and rate)", atRestart, base)
+	}
+	if sleepBase != time.Second {
+		t.Errorf("restarted host's Sleep(1s) advanced base by %v, want 1s (rate must reset to 1)", sleepBase)
+	}
+}
+
+// TestDSTClockDriftRedeclareSameRate: re-declaring the SAME nonzero rate still
+// re-anchors — drift accumulated before the restart is discarded. This is the leg a
+// fold-then-overwrite composition misses: the offset overwrite discards the fold, but
+// a surviving stale anchor keeps pre-restart accumulation in every later wall read.
+func TestDSTClockDriftRedeclareSameRate(t *testing.T) {
+	var atRestart, base time.Time
+	Run(1, func() {
+		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
+		time.Sleep(time.Second)                                       // host accumulates +1s of wall departure
+		base = time.Now()
+		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { atRestart = time.Now() })
+	})
+	if !atRestart.Equal(base) {
+		t.Errorf("same-rate re-declare kept accumulated drift: host reads %v, want base %v (anchor must reset)", atRestart, base)
+	}
+}
+
+// TestDSTClockRedeclareRemapsPendingTimer: a timer armed under the old rate is
+// re-mapped by a re-declaration that changes the rate, exactly as DriftClock re-maps
+// it — a surviving goroutine's pending Sleep must fire at the new rate's converted
+// instant, not stay converted at the dead incarnation's rate.
+func TestDSTClockRedeclareRemapsPendingTimer(t *testing.T) {
+	const d = 2 * time.Second        // armed at rate 1: fires at base 2s
+	const T = 500 * time.Millisecond // rate change instant
+	var total time.Duration
+	Run(1, func() {
+		armed := make(chan struct{})
+		done := make(chan struct{})
+		start := time.Now()
+		Host("h", HostConfig{}, func() { // rate 1
+			go func() {
+				close(armed)
+				time.Sleep(d)
+				close(done)
+			}()
+		})
+		<-armed
+		time.Sleep(T)                                                 // root: advance base to T with the sleep pending
+		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // restart at rate 2
+		<-done
+		total = time.Since(start)
+	})
+	// Remaining 1.5s of host time re-maps to 0.75s of base at rate 2: total = T + 0.75s.
+	if want := T + 750*time.Millisecond; total != want {
+		t.Errorf("pending Sleep(%v) with a rate-2 re-declare at %v fired after %v of base, want %v (re-map)", d, T, total, want)
+	}
+}
+
+// TestDSTClockTableFreshPerRun: host ids restart at 1 each run, so the per-host clock
+// table must be per-run state (reset at run entry, dstSetSimEnv) — otherwise a host id
+// reused by a later run inherits the earlier run's rate/offset and a process's timing
+// depends on which runs came before it in the binary.
+func TestDSTClockTableFreshPerRun(t *testing.T) {
+	Run(1, func() { // run 1: host id 1 gets rate 2
+		Host("a", HostConfig{Clock: Drift(1_000_000_000)}, func() {})
+	})
+	var adv time.Duration
+	Run(1, func() { // run 2: Process's implicit host also interns to id 1
+		start := time.Now()
+		done := make(chan struct{})
+		Process("p", func() {
+			go func() { time.Sleep(time.Second); close(done) }()
+		})
+		<-done
+		adv = time.Since(start)
+	})
+	if adv != time.Second {
+		t.Errorf("second run's Sleep(1s) advanced base by %v, want 1s (a previous run's clock leaked through the reused host id — the table must reset per run)", adv)
+	}
+}
+
+// TestDSTClockImplicitHostSurvivesProcessRestart: a process restart does not reboot
+// its host — a StepClock applied to a process's implicit host persists across a
+// Process re-invocation (the host stayed up; only a Host re-declaration models the
+// machine reboot and re-establishes the clock).
+func TestDSTClockImplicitHostSurvivesProcessRestart(t *testing.T) {
+	const step = 250 * time.Millisecond
+	var second, base time.Time
+	Run(1, func() {
+		Process("p", func() {})
+		StepClock("p", step) // step the implicit host's clock
+		base = time.Now()
+		Process("p", func() { second = time.Now() }) // restart on the surviving host
+	})
+	if got := second.Sub(base); got != step {
+		t.Errorf("after a process restart the implicit host reads base+%v, want base+%v (a restart must not reset the host clock)", got, step)
 	}
 }

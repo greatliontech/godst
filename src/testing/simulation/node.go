@@ -5,6 +5,7 @@
 package simulation
 
 import (
+	"strconv"
 	"sync"
 	"time"
 	_ "unsafe" // for go:linkname
@@ -28,11 +29,8 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
 //go:linkname dstCurrentNode runtime.dstCurrentNode
 func dstCurrentNode() (host, proc uint32)
 
-//go:linkname dstSetHostClockOffset runtime.dstSetHostClockOffset
-func dstSetHostClockOffset(host uint32, offset int64)
-
-//go:linkname dstSetHostDrift runtime.dstSetHostDrift
-func dstSetHostDrift(host uint32, ppb int64)
+//go:linkname dstReestablishHostClock runtime.dstReestablishHostClock
+func dstReestablishHostClock(host uint32, offset, ppb int64) bool
 
 //go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
 func dstHostSeededClockOffset(hostid uint32, bound int64) int64
@@ -105,8 +103,9 @@ const (
 // runs fast or slow, which time-sensitive distributed systems must tolerate. Build one
 // with Skew (a fixed offset), BoundedSkew (a per-host seeded offset), or Drift (a rate);
 // compose skew and drift with Skew(d).WithDrift(ppb). The zero value is an in-sync clock.
-// A step (an NTP jump) is injected mid-run by StepClock; a mid-run rate change is a
-// planned follow-on (docs/issues/clock-drift-dynamic.md).
+// A step (an NTP jump) is injected mid-run by StepClock, and a mid-run rate change by
+// DriftClock; only the fault-RNG-drawn (seeded) rate remains a follow-on
+// (docs/issues/clock-drift-dynamic.md).
 type ClockConfig struct {
 	seeded   bool          // false: fixed offset; true: offset seeded within ±bound
 	offset   time.Duration // static wall offset (when !seeded)
@@ -194,6 +193,11 @@ func nodeRegReset() {
 func internHost(name string) uint32 {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
+	if nodeReg.hosts == nil {
+		// Host/Process before the first Run ever: the registry is inert but must not
+		// nil-map-panic (the run envelope's nodeRegReset has never run).
+		nodeReg.hosts = make(map[string]uint32)
+	}
 	if id, ok := nodeReg.hosts[name]; ok {
 		return id
 	}
@@ -205,6 +209,9 @@ func internHost(name string) uint32 {
 func internProc(name string) uint32 {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
+	if nodeReg.procs == nil {
+		nodeReg.procs = make(map[string]uint32) // see internHost
+	}
 	if id, ok := nodeReg.procs[name]; ok {
 		return id
 	}
@@ -238,19 +245,60 @@ func Host(name string, config HostConfig, f func()) {
 	setHostIdent(hid, hostname, config.NumCPU)
 	_, curProc := dstCurrentNode()
 	oldH, oldP := dstSetNode(hid, curProc)
-	// Establish the host's configured clock (offset, and rate if drifting) in the
-	// per-host table (keyed by host id). No save/restore: the clock is read via
-	// g.dstHost, which dstSetNode already saves and restores, so after f returns the
-	// caller reads its own host's clock again; the table entry persists for hid's
-	// long-lived goroutines that outlive this call. A re-declaration (restart) overwrites
-	// it, re-establishing the base clock. StepClock adds to the offset mid-run (a mid-run
-	// rate change is a planned follow-on).
-	dstSetHostClockOffset(hid, config.Clock.offsetNanos(hid))
-	if config.Clock.driftPPB != 0 {
-		dstSetHostDrift(hid, config.Clock.driftPPB)
+	// Establish the host's configured clock (offset, and rate) in the per-host table
+	// (keyed by host id). No save/restore: the clock is read via g.dstHost, which
+	// dstSetNode already saves and restores, so after f returns the caller reads its
+	// own host's clock again; the table entry persists for hid's long-lived goroutines
+	// that outlive this call. A re-declaration (restart) re-establishes the clock
+	// COMPLETELY (docs/dst/faults.md "Clock faults", Host re-declaration): the rate is
+	// applied through the DriftClock path unconditionally — including rate 1 for a
+	// zero config — so a surviving stale rate/anchor is folded and cleared and the
+	// host's armed timers are re-mapped to the declared rate; then the offset is
+	// overwritten to the declared value, discarding prior steps and folded drift.
+	// Setting only the offset (the earlier shape) left a "restarted, in-sync" host
+	// reading ahead of base and sleeping at the old rate — self-consistent to its own
+	// probes, wrong against the base clock.
+	if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPB) {
+		dstSetNode(oldH, oldP)
+		panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 	}
 	defer dstSetNode(oldH, oldP)
 	f()
+}
+
+// lookupHost resolves an already-declared host name for a fault or inspection API,
+// panicking during a run on a name no Host (or implicit-host Process) declaration has
+// established — a typo'd victim must fail loud, never intern a fresh host id whose
+// state no goroutine observes (a fault that silently tests nothing; docs/dst/faults.md
+// "Targeting", victim names fail loud). Outside a run it returns 0 for an unknown name
+// — the mutating fault ops all discard host 0 / no-bubble calls, preserving their
+// documented outside-a-run no-op — while a name declared by a PREVIOUS run still
+// resolves to that run's id: the value-returning inspectors (HostFS, HostIP) then
+// serve the finished run's view, which is the post-run-inspection reading of the
+// leaked-handle stance (deterministic, host-isolated), not a live contract.
+func lookupHost(name string) uint32 {
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	if id, ok := nodeReg.hosts[name]; ok {
+		return id
+	}
+	if runActive.Load() {
+		panic("testing/simulation: unknown host " + strconv.Quote(name) + " (no Host declaration; fault victims must name a declared host)")
+	}
+	return 0
+}
+
+// lookupProc is lookupHost's process leg (ResetProcess and later process faults).
+func lookupProc(name string) uint32 {
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	if id, ok := nodeReg.procs[name]; ok {
+		return id
+	}
+	if runActive.Load() {
+		panic("testing/simulation: unknown process " + strconv.Quote(name) + " (no Process declaration; fault victims must name a declared process)")
+	}
+	return 0
 }
 
 // Process runs f as the named process — the unit of crash/restart and memory
@@ -268,6 +316,11 @@ func Process(name string, f func()) {
 	if host == 0 {
 		host = internHost(name)
 		setHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
+		// Deliberately NO clock re-establishment here: a process restart does not
+		// reboot its host — the host's clock (rate, offset, applied StepClock
+		// faults) survives Process re-invocation; only a Host re-declaration models
+		// the reboot. A first-ever implicit host reads the per-run table's zero
+		// entry (in-sync, rate 1) with no call needed.
 	}
 	pid := internProc(name)
 	dstProcAllocEnsure(pid) // per-process allocation counter exists before the body allocates

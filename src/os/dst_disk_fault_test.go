@@ -663,6 +663,7 @@ func TestDSTDiskENOSPCReadUnaffected(t *testing.T) {
 // disk; another host writing the same data is unaffected.
 func TestDSTDiskENOSPCVictim(t *testing.T) {
 	simulation.Run(1, func() {
+		onHost("hA", func() {})       // declare the victim first: fault victims fail loud on undeclared names
 		simulation.LimitDisk("hA", 0) // full: even a new file's create fails
 		onHost("hA", func() {
 			if err := os.WriteFile("/f", []byte("abcd"), 0o644); !errors.Is(err, syscall.ENOSPC) {

@@ -42,6 +42,10 @@ const (
 	diskOpSlow
 )
 
+// The victim-naming rule for every fault below: an undeclared host name panics
+// during a run (a typo'd victim must fail loud, never silently test nothing);
+// calls outside a run are no-ops.
+//
 // FailDisk makes every read, write, and fsync on the named host's disk fail with
 // EIO, modeling a failing disk or controller, until HealDisk(host) restores it. It
 // targets exactly the host's disk: another host's I/O, and metadata-only operations
@@ -49,13 +53,13 @@ const (
 // a heal resumes normal I/O — so a SUT can test how it tolerates and recovers from a
 // disk that returns errors.
 func FailDisk(host string) {
-	dstDiskFaultOp(diskOpFailDisk, internHost(host), 0, "")
+	dstDiskFaultOp(diskOpFailDisk, lookupHost(host), 0, "")
 }
 
 // HealDisk clears the host-wide EIO fault set by FailDisk; the host's reads, writes,
 // and fsyncs succeed again. Per-file faults set by FailFile are unaffected.
 func HealDisk(host string) {
-	dstDiskFaultOp(diskOpHealDisk, internHost(host), 0, "")
+	dstDiskFaultOp(diskOpHealDisk, lookupHost(host), 0, "")
 }
 
 // FailFile makes reads, writes, and fsyncs of one regular file on the named host
@@ -65,12 +69,12 @@ func HealDisk(host string) {
 // removed-but-open handle keeps failing; faulting a path that does not exist, or that
 // names a directory, is a no-op (there is no file's I/O to fail).
 func FailFile(host, path string) {
-	dstDiskFaultOp(diskOpFailFile, internHost(host), 0, path)
+	dstDiskFaultOp(diskOpFailFile, lookupHost(host), 0, path)
 }
 
 // HealFile clears the per-file EIO fault set by FailFile on the named host's file.
 func HealFile(host, path string) {
-	dstDiskFaultOp(diskOpHealFile, internHost(host), 0, path)
+	dstDiskFaultOp(diskOpHealFile, lookupHost(host), 0, path)
 }
 
 // LimitDisk caps the named host's disk at bytes total of regular-file content,
@@ -86,13 +90,13 @@ func LimitDisk(host string, bytes int64) {
 	if bytes < 0 {
 		panic("testing/simulation: LimitDisk bytes must be >= 0")
 	}
-	dstDiskFaultOp(diskOpLimit, internHost(host), bytes, "")
+	dstDiskFaultOp(diskOpLimit, lookupHost(host), bytes, "")
 }
 
 // UnlimitDisk removes the capacity set by LimitDisk on the named host's disk; writes
 // and creates stop failing with ENOSPC.
 func UnlimitDisk(host string) {
-	dstDiskFaultOp(diskOpUnlimit, internHost(host), 0, "")
+	dstDiskFaultOp(diskOpUnlimit, lookupHost(host), 0, "")
 }
 
 // SlowDisk models a slow disk: every disk-touching filesystem operation on the named
@@ -111,5 +115,5 @@ func SlowDisk(host string, perOp time.Duration) {
 	if perOp < 0 {
 		panic("testing/simulation: SlowDisk perOp must be >= 0")
 	}
-	dstDiskFaultOp(diskOpSlow, internHost(host), int64(perOp), "")
+	dstDiskFaultOp(diskOpSlow, lookupHost(host), int64(perOp), "")
 }

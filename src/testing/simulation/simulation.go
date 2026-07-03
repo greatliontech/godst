@@ -504,7 +504,10 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 		hostname = defaultHostname
 	}
 	pid = opts.PID
-	if pid == 0 {
+	if pid <= 0 {
+		// <= 0, not == 0, mirroring NumCPU below: a negative PID must not surface as
+		// os.Getpid() < 0, an identity no real process can observe. Both 0 and
+		// negative mean "use the default".
 		pid = defaultPID
 	}
 	numcpu = opts.NumCPU

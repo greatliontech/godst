@@ -7,6 +7,7 @@
 package simulation
 
 import (
+	"math"
 	"os"
 	"strconv"
 	"testing"
@@ -82,4 +83,79 @@ func TestDSTMemColocatedIndependent(t *testing.T) {
 	if bBytes >= aBytes {
 		t.Errorf("co-located process b (%d) >= a (%d); counters must stay independent on a shared host", bBytes, aBytes)
 	}
+}
+
+// TestDSTClockSkewBoundary pins the wall-representability boundary (docs/dst/faults.md
+// "Clock faults"): a far-FUTURE skew saturates at the farthest int64-ns-representable
+// wall time (real kernels accept post-2262 times; this representation cannot — the
+// saturation is deterministic and never wraps the sign), while a skew or step that
+// would take the wall before the EPOCH is rejected with a panic at application, as
+// settimeofday rejects a pre-epoch wall clock — no real machine can hold one, and a
+// silently floored wall would freeze the host's clock (Sleep observably taking zero
+// host time, the timer-early false-positive class).
+func TestDSTClockSkewBoundary(t *testing.T) {
+	Run(1, func() {
+		base := time.Now()
+		var fwd time.Time
+		Host("far-future", HostConfig{Clock: Skew(time.Duration(math.MaxInt64))}, func() { fwd = time.Now() })
+		if fwd.Before(base) {
+			t.Errorf("Skew(MaxInt64) host reads %v, before base %v — the wall wrapped negative instead of saturating", fwd, base)
+		}
+		var hostPanic, stepPanic any
+		func() {
+			defer func() { hostPanic = recover() }()
+			Host("far-past", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() {})
+		}()
+		if hostPanic == nil {
+			t.Errorf("Skew(MinInt64) did not panic — a pre-epoch wall must be rejected at application")
+		}
+		func() {
+			defer func() { stepPanic = recover() }()
+			Host("stepped", HostConfig{}, func() {})
+			StepClock("stepped", time.Duration(math.MinInt64))
+		}()
+		if stepPanic == nil {
+			t.Errorf("StepClock(MinInt64) did not panic — a pre-epoch wall must be rejected at application")
+		}
+		// A rejected step applies nothing: the host still reads base.
+		var after time.Time
+		Host("stepped", HostConfig{}, func() { after = time.Now() })
+		if !after.Equal(time.Now()) {
+			t.Errorf("rejected StepClock left partial state: host reads %v, want base %v", after, time.Now())
+		}
+	})
+}
+
+// TestDSTClockDriftFoldSaturates: DriftClock's fold of drift-so-far into the offset is
+// a wall-application point like any other — with an extreme accepted skew (far-future,
+// stored raw) plus accumulated drift, a plain add would wrap the offset negative and
+// resurrect the pre-epoch wall the representability boundary forbids. The fold
+// saturates instead: the host stays pinned at the far representable end.
+func TestDSTClockDriftFoldSaturates(t *testing.T) {
+	Run(1, func() {
+		read := make(chan struct{})
+		done := make(chan struct{})
+		var got time.Time
+		Host("h", HostConfig{Clock: Skew(time.Duration(math.MaxInt64)).WithDrift(1_000_000_000)}, func() {
+			go func() { // survives the fold; reads through the SAME incarnation's offset
+				<-read
+				got = time.Now()
+				close(done)
+			}()
+		})
+		time.Sleep(time.Second) // root: accumulate drift on h
+		DriftClock("h", 0)      // fold drift-so-far into the already-extreme offset
+		base := time.Now()
+		close(read)
+		<-done
+		_ = base
+		// Exact pin: the saturated wall is the farthest int64-ns-representable time,
+		// sec = MaxInt64/1e9, nsec = MaxInt64%1e9. A wrapped offset instead produces a
+		// corrupted sec/nsec encoding (observed: a bogus year-2157 reading) — merely
+		// asserting got.After(base) would let that corruption pass.
+		const ns = int64(1_000_000_000)
+		if got.Unix() != math.MaxInt64/ns || int64(got.Nanosecond()) != math.MaxInt64%ns {
+			t.Errorf("far-future host reads %v (unix %d/%d), want the saturated wall (unix %d/%d) — the fold must saturate, never wrap", got, got.Unix(), got.Nanosecond(), int64(math.MaxInt64)/ns, int64(math.MaxInt64)%ns)
+		}
+	})
 }
