@@ -141,6 +141,17 @@ var zeroProcAttr ProcAttr
 var zeroSysProcAttr SysProcAttr
 
 func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) {
+	// Interception-boundary fence: a bubble goroutine spawning a real child is a
+	// simulation escape (the child is wall-clock, host-visible work no seed
+	// controls), refused with the standard unsupported shape. Fencing here — at
+	// the single choke point before the fork — means only a non-bubble goroutine
+	// ever reaches forkAndExecInChild, so the post-fork child's raw syscalls
+	// (which bypass the Go trampolines via asm) are never mis-fenced. Folds away
+	// in stock builds. See design.md "The interception boundary".
+	if dstSimFenced && dstFenceActive() {
+		return 0, dstErrUnsupported
+	}
+
 	var p [2]int
 	var n int
 	var err1 Errno
@@ -269,6 +280,13 @@ var execveLibc func(path *byte, argv **byte, envp **byte) error
 
 // Exec invokes the execve(2) system call.
 func Exec(argv0 string, argv []string, envv []string) (err error) {
+	// Fence a bubble goroutine from replacing the process image (see forkExec).
+	// The bare execve would also be caught by the RawSyscall trampoline fence,
+	// but refusing here returns the clean error shape and skips the pre-exec
+	// teardown (runtime_BeforeExec, rlimit restore). Folds away in stock builds.
+	if dstSimFenced && dstFenceActive() {
+		return dstErrUnsupported
+	}
 	argv0p, err := BytePtrFromString(argv0)
 	if err != nil {
 		return err

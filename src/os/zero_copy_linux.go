@@ -16,9 +16,18 @@ var (
 )
 
 func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {
-	// A simulated file has no real descriptor; the generic copy loop routes
-	// through the gated Read/Write funnels (DST).
-	if dstSimEnabled && f.dstf != nil {
+	// Skip zero-copy under a run when either the file is simulated (no real
+	// descriptor) or the caller is a bubble goroutine, falling back to the
+	// generic copy loop, which routes through the gated Read/Write funnels (DST).
+	// This side's optimization is sendfile(2), which is off the interception-
+	// boundary allowlist, so a bubble taking it would fence-panic; routing to the
+	// generic write (allowlisted) makes the sanctioned copy work instead. This is
+	// the symmetric arm to readFrom's; the process-global-sync.Once poisoning that
+	// makes the fence load-bearing lives on readFrom's copy_file_range probe (see
+	// there and os/pidfd_linux.go) — sendfile has no such Once, so this arm is
+	// defense-in-depth. A non-bubble goroutine keeps the optimization. See
+	// design.md "The interception boundary".
+	if dstSimEnabled && (f.dstf != nil || dstFenceActive()) {
 		return 0, false, nil
 	}
 	pfd, network := getPollFDAndNetwork(w)
@@ -54,11 +63,16 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 		return 0, false, nil
 	}
 
-	// A simulated destination has no real descriptor; fall back to the
-	// generic copy loop, which routes through the gated funnels (DST). The
-	// source side is checked in copyFileRange, after the unwrap — the only
-	// point that sees through fileWithoutWriteTo/LimitedReader wrappers.
-	if dstSimEnabled && f.dstf != nil {
+	// Fall back to the generic copy loop, which routes through the gated funnels
+	// (DST), when the destination is simulated (no real descriptor) OR the caller
+	// is a bubble goroutine. A bubble must not take the copy_file_range/splice
+	// path: those syscalls are off the interception-boundary allowlist (so they
+	// would be fenced) and the copy_file_range support probe reads the kernel
+	// version via uname, which — fenced inside a process-global sync.Once — would
+	// poison it host-wide (same hazard class as os/pidfd_linux.go). The simulated
+	// source is also checked in copyFileRange, after the unwrap — the only point
+	// that sees through fileWithoutWriteTo/LimitedReader wrappers.
+	if dstSimEnabled && (f.dstf != nil || dstFenceActive()) {
 		return 0, false, nil
 	}
 

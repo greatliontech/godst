@@ -664,6 +664,44 @@ func TestDSTForeignBubbleIsolation(t *testing.T) {
 	}
 }
 
+// TestDSTProcessFencePidfd verifies the interception-boundary fence does not
+// poison process-global host state via os's pidfd probe (checkPidfdOnce, a
+// sync.OnceValue). A bubble goroutine touching an os process op must not run
+// the probe — whose raw syscalls the fence would panic on, caching the panic in
+// the Once and re-panicking forever on the host after the run. Run in a fresh
+// process so the bubble op is the first-ever pidfd probe (the only ordering
+// under which poisoning shows).
+//
+// Teeth: without the pidfdWorks() bubble short-circuit (os/pidfd_linux.go), the
+// bubble's os.FindProcess runs checkPidfd -> pidfd_open -> fenced panic, so
+// bubblePanicked flips true AND the host op re-panics (hostOK false).
+func TestDSTProcessFencePidfd(t *testing.T) {
+	// The testprog hardcodes Run(1, …); no DSTSEED is read.
+	out := runTestProgDST(t, "DSTProcessFencePidfd")
+	if strings.TrimSpace(out) != "bubblePanicked=false hostOK=true" {
+		t.Fatalf("pidfd probe poisoned by bubble fence (got %q, want \"bubblePanicked=false hostOK=true\")", out)
+	}
+}
+
+// TestDSTZeroCopyFence verifies the interception fence does not poison the
+// process-global copy_file_range support probe (internal/poll.supportCopyFileRange,
+// a sync.OnceValue whose body reads the kernel version via a fenced uname). A
+// bubble goroutine's io.Copy between two real host files must route to the
+// generic read/write loop, not the zero-copy path — so it neither panics nor
+// runs (and poisons) that Once. Run in a fresh process so the bubble copy is the
+// first-ever copy_file_range probe.
+//
+// Teeth: without the bubble arm of the zero_copy_linux.go gate, the bubble's
+// io.Copy hits copy_file_range -> uname -> fenced panic (bubblePanicked=true,
+// copyOK=false) AND poisons the Once so the post-run host copy re-panics
+// (hostOK=false).
+func TestDSTZeroCopyFence(t *testing.T) {
+	out := runTestProgDST(t, "DSTZeroCopyFence")
+	if strings.TrimSpace(out) != "bubblePanicked=false copyOK=true hostOK=true" {
+		t.Fatalf("zero-copy fence poisoned or mis-fenced (got %q, want \"bubblePanicked=false copyOK=true hostOK=true\")", out)
+	}
+}
+
 // TestDSTNonBubbleAllocTrigger verifies that non-bubble allocations do not
 // advance the deterministic GC trigger: NumGC deltas are identical with and
 // without an outside allocator churning.

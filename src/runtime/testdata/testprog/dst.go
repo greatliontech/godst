@@ -8,6 +8,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"internal/synctest"
+	"io"
 	"math/rand/v2"
 	"os"
 	"runtime"
@@ -53,6 +54,8 @@ func init() {
 	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
 	register("DSTBubbleStreamIsolation", DSTBubbleStreamIsolation)
 	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
+	register("DSTProcessFencePidfd", DSTProcessFencePidfd)
+	register("DSTZeroCopyFence", DSTZeroCopyFence)
 	register("DSTPCTNonBubbleCreation", DSTPCTNonBubbleCreation)
 	register("DSTCryptoUnseededGoroutine", DSTCryptoUnseededGoroutine)
 	register("DSTPCTMainDrawsPriority", DSTPCTMainDrawsPriority)
@@ -1862,6 +1865,99 @@ func dstPanicText(v any) string {
 	default:
 		return "non-string panic"
 	}
+}
+
+// DSTProcessFencePidfd checks that a bubble goroutine touching an os process
+// operation never poisons the process-global pidfd probe (os.checkPidfdOnce, a
+// sync.OnceValue). The probe makes raw syscalls the interception boundary
+// fences (pidfd_open mints a host resource; checkClonePidfd forks a CLONE_VM
+// child that runs a fenced exit_group); run from a bubble, a fence panic would
+// be cached by the Once and re-panic forever on the host — a bubble refusal
+// leaking into process-global host state.
+//
+// This runs in a fresh process, so the bubble's os.FindProcess below is the
+// program's first-ever pidfd probe — the only ordering under which the
+// poisoning is observable (the Once resolves exactly once). Expected output:
+// "bubblePanicked=false hostOK=true" — the bubble op does not run the probe (so
+// does not panic), and the post-run host op then resolves it cleanly.
+func DSTProcessFencePidfd() {
+	var bubblePanicked bool
+	simulation.Run(1, func() {
+		// os.FindProcess routes through pidfdWorks -> checkPidfdOnce. The fence
+		// keeps the probe off this bubble goroutine, so this must not panic.
+		bubblePanicked = dstPanicContains("unsupported under deterministic simulation", func() {
+			_, _ = os.FindProcess(1)
+		})
+	})
+	// Post-run, on a non-bubble goroutine, the probe runs for real. If a bubble
+	// had poisoned checkPidfdOnce, this re-panics with the cached refusal.
+	hostOK := !dstPanicContains("unsupported under deterministic simulation", func() {
+		_, _ = os.FindProcess(os.Getpid())
+	})
+	os.Stdout.WriteString("bubblePanicked=" + strconv.FormatBool(bubblePanicked) +
+		" hostOK=" + strconv.FormatBool(hostOK) + "\n")
+}
+
+// DSTZeroCopyFence checks that a bubble goroutine copying between two real host
+// files does not trip the interception boundary via the zero-copy optimization.
+// io.Copy between two real *os.File dispatches src.WriteTo(dst) first; writeTo is
+// not-handled for a regular-file dst (no net PollFD), so genericWriteTo re-enters
+// io.Copy, which then takes dst.ReadFrom -> readFrom -> copyFileRange. That path
+// both issues a fenced copy_file_range syscall AND, first, runs the support probe
+// — which reads the kernel version via a fenced uname inside a process-global
+// sync.OnceValue (internal/poll.supportCopyFileRange). A bubble reaching it would
+// panic and poison that Once host-wide (same class as os/pidfd_linux.go). The
+// readFrom bubble arm of the zero_copy_linux.go gate must route the copy to the
+// generic read/write loop (allowlisted), so the copy succeeds and the probe is
+// never run from a bubble. (The symmetric writeTo/sendfile arm guards the
+// file->real-socket case — a contained panic, no process-global Once — and is not
+// exercised here.)
+//
+// Run in a fresh process so the bubble's io.Copy is the first-ever
+// copy_file_range probe. Expected: "bubblePanicked=false copyOK=true hostOK=true".
+func DSTZeroCopyFence() {
+	const payload = "deterministic zero-copy payload bytes"
+
+	mkfile := func(name, content string) *os.File {
+		f, err := os.CreateTemp("", name)
+		if err != nil {
+			os.Stdout.WriteString("CreateTemp: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		if content != "" {
+			f.WriteString(content)
+			f.Seek(0, io.SeekStart)
+		}
+		return f
+	}
+
+	// Real regular files (created outside the run, so they have real fds).
+	src := mkfile("dst-zc-src", payload)
+	dst := mkfile("dst-zc-dst", "")
+	defer func() { src.Close(); dst.Close(); os.Remove(src.Name()); os.Remove(dst.Name()) }()
+
+	var (
+		bubblePanicked bool
+		copied         int64
+	)
+	simulation.Run(1, func() {
+		bubblePanicked = dstPanicContains("unsupported under deterministic simulation", func() {
+			copied, _ = io.Copy(dst, src)
+		})
+	})
+
+	// Post-run, non-bubble: zero-copy between two real files must still work —
+	// the bubble must not have poisoned supportCopyFileRange.
+	src2 := mkfile("dst-zc-src2", payload)
+	dst2 := mkfile("dst-zc-dst2", "")
+	defer func() { src2.Close(); dst2.Close(); os.Remove(src2.Name()); os.Remove(dst2.Name()) }()
+	hostOK := !dstPanicContains("unsupported under deterministic simulation", func() {
+		io.Copy(dst2, src2)
+	})
+
+	os.Stdout.WriteString("bubblePanicked=" + strconv.FormatBool(bubblePanicked) +
+		" copyOK=" + strconv.FormatBool(copied == int64(len(payload))) +
+		" hostOK=" + strconv.FormatBool(hostOK) + "\n")
 }
 
 func dstPanicContains(want string, f func()) (ok bool) {

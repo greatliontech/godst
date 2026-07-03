@@ -38,3 +38,12 @@ func dstSimGeteuid() (int, bool)
 
 //go:linkname dstSimGetegid runtime.dstSimGetegid
 func dstSimGetegid() (int, bool)
+
+// dstFenceActive reports whether the caller is a bubble goroutine of the active
+// simulation — the interception-boundary predicate (see runtime.dstFenceActive).
+// os uses it to keep the process-global pidfd probe (checkPidfdOnce) off bubble
+// goroutines, whose fenced raw syscalls would otherwise panic inside a
+// process-global sync.Once and poison it host-wide. See pidfd_linux.go.
+//
+//go:linkname dstFenceActive runtime.dstFenceActive
+func dstFenceActive() bool

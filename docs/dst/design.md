@@ -618,6 +618,18 @@ including **iteration order of a pointer-keyed map** (`map[*T]V`, `map[unsafe.Po
 nondeterminism even under a fixed seed. DST's own substrate contains no observable pointer-keyed
 iteration (the reset registry iterates in registration order — see faults.md); a SUT's is its own.
 
+One raw-syscall path is deliberately outside the fence: the `syscall` package's `rawSyscallNoError`
+(a fifth, asm-implemented raw entry that bypasses the four generic trampolines) backs
+`Getpid`/`Getuid`/`Getppid`/`Gettid`/`Getegid` and `Umask`. The identity reads are the same
+program-discipline stance as the ⛔ rows — `os.Getpid` and friends are intercepted to the simulated
+identity, but a *direct* `syscall.Getpid` reads the host value; that is a host-state read that mints
+nothing. `syscall.Umask` is the one *mutation* in this set: called directly from a bubble it changes
+the process-global umask (nothing simulated observes it, but a later host file create would). It is
+left to program discipline for the same reason the reads are — the fence's choke point is the four
+generic trampolines (which catch `golang.org/x/sys/unix`, whose asm never routes through the
+unexported `rawSyscallNoError`) plus the resource-minting wrappers, not this asm path. A SUT that
+needs process identity or umask under a run uses the `os` API, which is modeled or fenced.
+
 ### Enforcing test configurations
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are

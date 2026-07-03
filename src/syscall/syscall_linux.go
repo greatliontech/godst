@@ -61,6 +61,14 @@ func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:norace
 //go:linkname RawSyscall6
 func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
+	// Interception-boundary fence: a bubble goroutine minting a host resource
+	// (open/socket/pipe/dup/mmap/execve) or otherwise leaving the sandbox is
+	// refused; I/O on an inherited host fd (the allowlist) is not. This is the
+	// choke point that also catches golang.org/x/sys/unix, whose asm calls this
+	// directly. Folds away in stock builds (dstSimFenced const). See design.md.
+	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
+		dstSyscallRefuse(trap)
+	}
 	var errno uintptr
 	r1, r2, errno = linux.Syscall6(trap, a1, a2, a3, a4, a5, a6)
 	err = Errno(errno)
@@ -71,6 +79,11 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 //go:nosplit
 //go:linkname Syscall
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
+	// Fence before entersyscall so the refusal panics in a clean scheduling
+	// state (see RawSyscall6). Folds away in stock builds.
+	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
+		dstSyscallRefuse(trap)
+	}
 	runtime_entersyscall()
 	// N.B. Calling RawSyscall here is unsafe with atomic coverage
 	// instrumentation and race mode.
@@ -93,6 +106,10 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:nosplit
 //go:linkname Syscall6
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
+	// Fence before entersyscall (see Syscall). Folds away in stock builds.
+	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
+		dstSyscallRefuse(trap)
+	}
 	runtime_entersyscall()
 	r1, r2, err = RawSyscall6(trap, a1, a2, a3, a4, a5, a6)
 	runtime_exitsyscall()

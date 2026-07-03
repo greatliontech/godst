@@ -1652,6 +1652,46 @@ func dstNextCallbackSeq() uintptr {
 	return 0
 }
 
+// dstFenceActive reports whether the calling goroutine is a bubble goroutine of
+// the active simulation — the predicate for the interception-boundary fences
+// (raw syscalls, process spawn, signals, cgo; see design.md "The interception
+// boundary"). It is true only while a run is active AND the goroutine executing
+// right now belongs to the run's bubble. Everything else reads false and keeps
+// full host access: the harness goroutines around the run, a foreign bubble, and
+// — critically — two contexts that must never be fenced:
+//
+//   - A post-fork exec child. syscall.forkExec is fenced at entry, so only a
+//     non-bubble goroutine ever reaches THAT fork; the child inherits that
+//     goroutine's g, whose bubble is nil, so its post-fork RawSyscalls (execve,
+//     dup3, close — asm and unfenced-by-construction paths aside) read false.
+//     forkExec is not the only fork site — os.checkPidfd's checkClonePidfd
+//     forks a CLONE_VFORK|CLONE_VM probe child whose exit_group is a fenced
+//     trampoline; os keeps that probe off bubble goroutines entirely (a bubble
+//     never runs the process-global pidfd sync.Once — see os/pidfd_linux.go
+//     pidfdWorks), so no bubble g ever reaches it.
+//   - A signal handler. getg() there is gsignal, whose bubble is nil, so the
+//     runtime's own signal-context RawSyscalls are never fenced. This is why the
+//     predicate reads getg() directly, not getg().m.curg (which would resolve to
+//     the interrupted bubble goroutine and mis-fence the signal machinery).
+//
+// nosplit + alloc-free + lock-free (reads getg() and two globals only) so the
+// nosplit/uintptrkeepalive raw-syscall trampolines may call it without growing
+// their stack, and so it is safe from the norace post-fork child. Folds to
+// constant false in non-dst builds (dstActive folds via dstBuild).
+//
+// The push linkname lets the syscall package pull it to fence the trampolines
+// and process spawn.
+//
+//go:nosplit
+//go:linkname dstFenceActive
+func dstFenceActive() bool {
+	if !dstActive() {
+		return false
+	}
+	gp := getg()
+	return gp.bubble != nil && gp.bubble == dstSimBubble
+}
+
 // dstBubbleMainRoot derives bubble.main's per-bubble re-root from the seed,
 // salted to be independent of dstBubbleRoot's activation root for the same
 // seed. Without the salt, bubble.main replays the run caller's draw sequence —

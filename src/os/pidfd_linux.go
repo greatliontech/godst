@@ -138,6 +138,24 @@ func (p *Process) pidfdSendSignal(s syscall.Signal) error {
 
 // pidfdWorks returns whether we can use pidfd on this system.
 func pidfdWorks() bool {
+	if dstSimEnabled && dstFenceActive() {
+		// A bubble goroutine must never run the pidfd probe (checkPidfd). The
+		// probe makes raw syscalls that the interception boundary fences —
+		// pidfd_open mints a host resource, and checkClonePidfd forks a
+		// CLONE_VFORK|CLONE_VM child that then executes a (fenced) exit_group —
+		// and it runs inside a process-global sync.Once. A fence panic there
+		// would be cached by the Once and re-panic on every later call from the
+		// *host* (the harness, after the run), leaking a bubble's refusal into
+		// process-global host state: the worst soundness break. All five pidfd
+		// entry points (ensurePidfd/getPidfd/pidfdFind/pidfdWait/
+		// pidfdSendSignal) funnel through here, so reporting "no pidfd" for
+		// bubble goroutines keeps the probe host-only. The process operation the
+		// bubble attempted is still refused — by the syscall fence on its
+		// forkExec/wait4/kill fallback (see design.md "The interception
+		// boundary"). checkPidfdOnce is thus only ever run by non-bubble
+		// goroutines and can never be poisoned.
+		return false
+	}
 	return checkPidfdOnce() == nil
 }
 
