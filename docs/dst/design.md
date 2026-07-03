@@ -167,7 +167,7 @@ memberships), and anything else is the deterministic production unknown-error id
 host-database read
 (`TestDSTIdentityGroups`).
 
-**Environment surface (contract; enforcement lands with the interception-boundary chunk).** The
+**Environment surface (enforced).** The
 process environment is per-**process** state on a real machine, so under a run it is per-simulated-
 process state here: `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clearenv` operate on a
 per-process copy-on-write view, initialized from the host environment at `Run` entry. Writes are
@@ -583,8 +583,7 @@ including `golang.org/x/sys/unix` (its wrappers invoke `syscall.Syscall*`) — c
 modeled' never means 'reaches the host'" applies to the whole boundary, not just the `os`
 namespace. Without the fence, a dependency calling `syscall.Open` or `unix.Getrandom` mid-run does
 real host I/O and reads real entropy silently — same seed, different run, no error — which
-falsifies host isolation as an *enforced* invariant. Contract (enforcement lands with the
-interception-boundary chunk); every fence below fires only for **bubble goroutines while a run is
+falsifies host isolation as an *enforced* invariant. Every fence below fires only for **bubble goroutines while a run is
 active** — non-bubble goroutines keep full host access, so the harness around the run is untouched:
 
 - **Resource-minting `syscall` entry points** (`Open`/`Openat`/`Creat`, `Socket`/`Socketpair`,
@@ -652,12 +651,14 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   enforces that `runtime/testdata/testprog` stays cgo-free — a cgo-pulling import there (net,
   os/user — DST fixtures needing those live in `testprognet`) disables the runtime's deadlock
   detection and hangs the crash tests loudly.
-- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net os`,
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net os syscall os/exec os/signal`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
   `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
   build-constraint panic is covered by `TestDSTRunRequiresBuildTag`, which builds its own untagged
-  testprog.
+  testprog. `syscall`/`os/exec`/`os/signal` are in the list because the interception-boundary
+  fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
+  fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
 - **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation`): the dst-race
   sync-hook encodings. The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
   intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via
@@ -799,14 +800,14 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
 | standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture); syscall-retake gated so a blocked host write serializes, never reorders | ⛔ (program discipline) |
-| environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ⏳ (interception-boundary chunk) |
+| environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash/restart, OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
-| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ⏳ (interception-boundary chunk) |
-| processes (`os/exec`, `os.StartProcess`) | fenced (loud "unsupported under deterministic simulation") | ⏳ (interception-boundary chunk) |
-| signals (`os/signal.Notify`) | fenced for bubble goroutines | ⏳ (interception-boundary chunk) |
-| `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ⏳ (interception-boundary chunk) |
-| cgo | fenced at `cgocall` for bubble goroutines (a binary may link cgo it never calls in-run) | ⏳ (interception-boundary chunk) |
+| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ✅ |
+| processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
+| signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
+| `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ✅ |
+| cgo | fenced at `cgocall` for bubble goroutines (a binary may link cgo it never calls in-run) | ✅ |
 | runtime introspection (`NumGoroutine`, `runtime/metrics`, `ReadMemStats`, `Stack(all)`) | process-wide, history/wall-time-dependent readings (see "The interception boundary") | ⛔ (program discipline) |
 | raw pointer addresses (ASLR, `%p`, `uintptr`, **pointer-keyed map iteration order**) | — | ⛔ (program discipline) |
 
@@ -854,11 +855,14 @@ the canonical spec; the companions are lower-tier designs that collapse from it.
 
 ## Roadmap
 
-The runtime substrate is **landed**: the per-g RNG + scheduling (Seq 1, Seq 5), the
-`testing/simulation` API, and — beyond the original sequence — deterministic process identity,
-crypto/rand, GC, memory bounding, and a hardening pass (each documented in its own section). The
-remaining work is the **I/O and fault** features (the ⏳ rows of the source table). Each step respects
-the fixed seams, so later steps add, never rewrite.
+The runtime substrate and the **I/O surface** are **landed**: the per-g RNG + scheduling (Seq 1,
+Seq 5), the `testing/simulation` API, and — beyond the original sequence — deterministic process
+identity, crypto/rand, GC, memory bounding, a hardening pass, the in-memory filesystem and network,
+and the **interception boundary** (raw syscalls, processes, signals, `os.Executable`, cgo, and the
+per-process environment) — each documented in its own section. The remaining work is the
+**fault-orchestration** layer (crash/restart, OOM kill, scheduling stragglers, seeded drift — the
+one ⏳ row of the source table, see [faults.md](./faults.md)). Each step respects the fixed seams, so
+later steps add, never rewrite.
 
 > Note: Seq 1a/1b originally enabled DST via `GODEBUG=dstseed`; that was pivoted to the public
 > `testing/simulation` API (see Enablement). The per-g mechanism is unchanged. The bullets below record
