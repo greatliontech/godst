@@ -188,9 +188,18 @@ func gcinit() {
 	// Use the environment variable GOMEMLIMIT for the initial memoryLimit value.
 	gcController.init(readGOGC(), readGOMEMLIMIT())
 
-	// Set up the cleanup block ptr mask.
+	// Set up the cleanup block ptr mask. Each cleanupFn is 4 words — call,fn,arg
+	// (pointers) then dstSeq (DST non-pointer tail) — so two cleanupFns per byte give
+	// 0b01110111 (0x77). Check the layout the mask assumes (like finalizer1's assertion).
+	if unsafe.Sizeof(cleanupFn{}) != 4*goarch.PtrSize ||
+		unsafe.Offsetof(cleanupFn{}.call) != 0 ||
+		unsafe.Offsetof(cleanupFn{}.fn) != goarch.PtrSize ||
+		unsafe.Offsetof(cleanupFn{}.arg) != 2*goarch.PtrSize ||
+		unsafe.Offsetof(cleanupFn{}.dstSeq) != 3*goarch.PtrSize {
+		throw("cleanupFn out of sync")
+	}
 	for i := range cleanupBlockPtrMask {
-		cleanupBlockPtrMask[i] = 0xff
+		cleanupBlockPtrMask[i] = 0b01110111
 	}
 
 	work.startSema = 1

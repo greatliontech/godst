@@ -2197,6 +2197,7 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	unlock(&mheap_.speciallock)
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
+	s.cleanup.dstSeq = dstNextCallbackSeq() // per-run registration sequence; carried into the queue for the drain's reg-order sort
 	s.id = id
 	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
 

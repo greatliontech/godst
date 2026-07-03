@@ -501,6 +501,18 @@ func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTGCCleanupOrderRegistration is the H6 cleanup regression: the bubble drain runs
+// its cleanup batch in registration-sequence order (cleanupFn.dstSeq), so the id-0
+// cleanup runs first. Teeth: without the cross-block reg-seq sort the drain runs blocks
+// in `full`-stack LIFO order, so the last-registered (highest-id) block runs first and
+// the first-run id is far from 0.
+func TestDSTGCCleanupOrderRegistration(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTCleanupOrder", "DSTSEED=12345"))
+	if out != "0" {
+		t.Errorf("first cleanup to run was id %s, want 0: the cleanup drain is not running in registration order (sweep/block-LIFO order)", out)
+	}
+}
+
 // TestDSTGCPoolCarryoverDeterministic is the M4 regression: the DST heap trigger
 // excludes runtime-internal pooled allocations (g, sudog, _defer), so a second
 // in-process run's inherited g/sudog pools do not shift the GC cycle boundary. The

@@ -301,7 +301,9 @@ type cleanupBlock struct {
 	cleanups [(cleanupBlockSize - unsafe.Sizeof(cleanupBlockHeader{})) / unsafe.Sizeof(cleanupFn{})]cleanupFn
 }
 
-var cleanupFnPtrMask = [...]uint8{0b111}
+// cleanupFn is 4 words: call,fn,arg (pointers) then dstSeq (non-pointer). cleanupFnPtrMask
+// scans a single cleanupFn; cleanupBlockPtrMask (built in gcinit) is 0x77 (two per byte).
+var cleanupFnPtrMask = [...]uint8{0b0111}
 
 // cleanupFn represents a cleanup function with it's argument, yet to be called.
 type cleanupFn struct {
@@ -309,6 +311,10 @@ type cleanupFn struct {
 	call func(*funcval, unsafe.Pointer)
 	fn   *funcval       // cleanup function passed to AddCleanup.
 	arg  unsafe.Pointer // pointer to argument to pass to cleanup function.
+	// dstSeq is the DST per-run registration sequence (dstNextCallbackSeq at AddCleanup);
+	// the bubble drain sorts its batch by it (gc.md D4). uintptr = 1 word on every arch;
+	// a non-pointer tail, so cleanupFnPtrMask/cleanupBlockPtrMask mark it 0.
+	dstSeq uintptr
 }
 
 var cleanupBlockPtrMask [cleanupBlockSize / goarch.PtrSize / 8]byte
@@ -877,6 +883,10 @@ func runCleanupBlock(b *cleanupBlock) {
 // has already flushed per-P partial blocks into the full queue (mgcsweep.go), so
 // the full queue holds every cleanup queued up to this quiescence.
 func dstDrainCleanups() {
+	// Order the whole queued batch by registration sequence before running it, so two
+	// same-cycle cleanups with interacting side effects run in a replay-stable order
+	// (gc.md D4) rather than the heap-address sweep order the blocks are queued in.
+	dstSortCleanupsBySeq()
 	for gcCleanups.tryTakeWork() {
 		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
 		n := uint64(b.n)
@@ -898,6 +908,92 @@ func dstDrainCleanups() {
 		if dstActive() {
 			dstCleanupRunExecuted.Add(int64(n))
 		}
+	}
+}
+
+// dstSortCleanupsBySeq reorders the queued cleanup batch so the drain runs it in
+// ASCENDING registration sequence (cleanupFn.dstSeq), the replay-stable order (gc.md
+// D4), rather than the heap-address sweep order the per-P blocks + `full` LIFO stack
+// produce. It pops every full block, sorts all their cleanupFns ACROSS blocks, re-lays
+// them into the same blocks (forward, same counts), and re-pushes so `full`'s LIFO pop
+// yields the lowest-seq block first — leaving the block structure on `full` so the
+// existing drain loop and its discard/ledger machinery are untouched. Safe with no
+// concurrency: the async cleanup workers are gated off during a DST run and the drain is
+// single-P. Its scratch slices are the drain goroutine's own allocations of the
+// deterministic batch size.
+func dstSortCleanupsBySeq() {
+	var blocks []*cleanupBlock
+	for gcCleanups.tryTakeWork() {
+		blocks = append(blocks, (*cleanupBlock)(gcCleanups.full.pop()))
+	}
+	if len(blocks) == 0 {
+		return
+	}
+	n := 0
+	for _, b := range blocks {
+		n += int(b.n)
+	}
+	all := make([]cleanupFn, 0, n)
+	for _, b := range blocks {
+		for i := uint32(0); i < b.n; i++ {
+			all = append(all, b.cleanups[i])
+		}
+	}
+	dstSortCleanupFnsBySeq(all)
+	k := 0
+	for _, b := range blocks {
+		for i := uint32(0); i < b.n; i++ {
+			b.cleanups[i] = all[k]
+			k++
+		}
+	}
+	// Re-push in REVERSE order so full's LIFO pop yields blocks[0] (lowest seqs) first.
+	for i := len(blocks) - 1; i >= 0; i-- {
+		gcCleanups.full.push(&blocks[i].lfnode)
+	}
+	gcCleanups.addWork(len(blocks))
+}
+
+// dstSortCleanupFnsBySeq sorts the slice a ascending by dstSeq — a stable, non-recursive
+// bottom-up merge sort (package runtime cannot import sort). O(n log n), deterministic.
+func dstSortCleanupFnsBySeq(a []cleanupFn) {
+	n := len(a)
+	if n <= 1 {
+		return
+	}
+	buf := make([]cleanupFn, n)
+	src, dst := a, buf
+	for width := 1; width < n; width *= 2 {
+		for i := 0; i < n; i += 2 * width {
+			lo := i
+			mid := min(i+width, n)
+			hi := min(i+2*width, n)
+			l, r, k := lo, mid, lo
+			for l < mid && r < hi {
+				if src[l].dstSeq <= src[r].dstSeq {
+					dst[k] = src[l]
+					l++
+				} else {
+					dst[k] = src[r]
+					r++
+				}
+				k++
+			}
+			for l < mid {
+				dst[k] = src[l]
+				l++
+				k++
+			}
+			for r < hi {
+				dst[k] = src[r]
+				r++
+				k++
+			}
+		}
+		src, dst = dst, src
+	}
+	if &src[0] != &a[0] {
+		copy(a, src)
 	}
 }
 

@@ -352,10 +352,13 @@ wall-clock). So the achievable invariant is **set-at-quiescence, not per-cycle**
 > bottom-up merge sort — package `runtime` cannot import `sort`) before `runFinqBlocks` runs it, so
 > execution is ascending registration order; the block structure is preserved, so the discard/ledger
 > machinery is untouched. Pinned by `TestDSTFinalizerGoexitLedger` (the Goexit finalizer registered LAST
-> runs LAST → `ran==batch-1`; sweep order would run it FIRST → `ran==0`). **The cleanup drain leg is a
-> follow-on** (its `cleanupBlock`/`full`-stack layout needs a cross-block collect-sort-execute rather
-> than the finalizer chain re-lay); until it lands, cleanup drain order is sweep order — sound but not
-> replay-stable.
+> runs LAST → `ran==batch-1`; sweep order would run it FIRST → `ran==0`). **Landed for cleanups too:**
+> `dstDrainCleanups` calls `dstSortCleanupsBySeq`, which pops every `full` cleanup block, sorts all their
+> `cleanupFn`s ACROSS blocks by `cleanupFn.dstSeq` (`dstSortCleanupFnsBySeq`, the same merge sort), re-lays
+> them into the same blocks, and re-pushes so the `full` LIFO pop yields the lowest-seq block first —
+> leaving the blocks on `full` so the existing drain loop's discard/ledger machinery is untouched. Pinned
+> by `TestDSTGCCleanupOrderRegistration` (id-0 cleanup runs first under the sort; block-LIFO sweep order
+> would run a last-registered block first). Both drain legs now execute in registration order.
 
 Draining **at quiescence** (above) is what realizes this: by a quiescence point every mid-burst GC's
 queue plus a fresh quiescence GC have been folded in, so the drained set is the deterministic dead set.

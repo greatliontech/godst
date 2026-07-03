@@ -68,6 +68,7 @@ func init() {
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
+	register("DSTCleanupOrder", DSTCleanupOrder)
 	register("DSTCleanupRNGIsolation", DSTCleanupRNGIsolation)
 	register("DSTCleanupPreBubble", DSTCleanupPreBubble)
 	register("DSTCleanupChanOpPriorG", DSTCleanupChanOpPriorG)
@@ -1106,6 +1107,36 @@ func DSTFinRunSet() {
 	})
 	os.Stdout.WriteString(strconv.FormatUint(gotCount, 10) + " " +
 		strconv.FormatUint(gotSum, 16) + "\n")
+}
+
+// DSTCleanupOrder registers many cleanups (enough to span MULTIPLE cleanup blocks) and
+// prints the id of the FIRST cleanup to run. The bubble drain sorts its batch by
+// registration sequence (cleanupFn.dstSeq), so the id-0 cleanup runs first. Without the
+// sort the drain runs blocks in `full`-stack LIFO order — the LAST-filled block (holding
+// the highest-id, last-registered cleanups) pops first — so the first-run id is high, not
+// 0. Cross-block is the discriminator: within one block, forward execution already
+// matches registration, so a single block wouldn't distinguish.
+func DSTCleanupOrder() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var first int64
+	simulation.Run(n, func() {
+		var firstRun atomic.Int64
+		firstRun.Store(-1)
+		const N = 1000 // > 1 cleanupBlock, so block-LIFO (sweep) order != registration order
+		for i := 0; i < N; i++ {
+			o := &dstFinObj{}
+			id := int64(i)
+			runtime.AddCleanup(o, func(int) {
+				firstRun.CompareAndSwap(-1, id) // only the first cleanup to run wins
+			}, 0)
+			// o is unreachable after this iteration → all N cleanups fire at the GC below.
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: the drain runs the sorted batch
+		time.Sleep(time.Millisecond)
+		first = firstRun.Load()
+	})
+	os.Stdout.WriteString(strconv.FormatInt(first, 10) + "\n")
 }
 
 // dstMakeCleanupSender attaches a cleanup that sends on a bubble channel to a
