@@ -27,13 +27,15 @@ concurrent path requires structuring the program so exactly one goroutine is run
 fragile discipline that does not survive real concurrency. DST moves that ordering from program
 discipline to **runtime enforcement**, so determinism holds with *many* runnable goroutines.
 
-What DST does **not** virtualize today: unsupported network kinds, cgo, and — deliberately — the
-standard streams (pre-run host handles under the inherited-handle stance; see "Deterministic pipes
-and the stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
+What DST does **not** virtualize: unsupported network kinds, cgo, raw syscalls, processes, and
+signals — each **fenced** (a loud, deterministic refusal for bubble goroutines; see "The
+interception boundary") rather than silently reaching the host — and, deliberately, the standard
+streams (pre-run host handles under the inherited-handle stance; see "Deterministic pipes and the
+stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
 network below, the filesystem by the in-memory deterministic filesystem, and `os.Pipe` by the
 in-memory deterministic pipe (all per-bubble, all reset by the run epoch); what remains is modeled
-in-memory by the program under test or avoided. Fault orchestration is the main pending feature —
-see the Roadmap.
+in-memory by the program under test or avoided. The remaining pending features are the crash/restart
+and scheduling fault axes — see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
@@ -73,8 +75,10 @@ and 60/60 under GOMAXPROCS=4 M-churn). See `rand.go` `dstrandUint64`.
 globals and `sync.Pool` (all linkname'd through `runtime.rand`/`runtime.randn`), and the fake-timer
 ordering tiebreak for synctest-bubble timers with equal wake time (`time.go`). Left **per-m**
 (runtime-internal heuristics): work stealing, `trackingSeq`, GC pacer/mark, mprof/malloc sampling,
-itab and symtab cache eviction, `sema` treap ticket (same-address waiters are FIFO, so wake order is
-unaffected), and `lock_spinbit` mutex anti-starvation (runtime `lock2`, not `sync.Mutex`). Exempted
+itab and symtab cache eviction, `sema` treap ticket (the ticket only balances the treap; wake order
+among same-address waiters is upstream queue policy — FIFO for first-time waiters, requeue-to-front
+for re-waiters (`queueLifo`) — and is unaffected by the per-m draw), and `lock_spinbit` mutex
+anti-starvation (runtime `lock2`, not `sync.Mutex`). Exempted
 specially: `mrandinit` seeds a new m from `bootstrapRand` under DST rather than `rand`, because it can
 run on a *user* goroutine's stack (`ready → wakep → newm`) and would otherwise advance that
 goroutine's per-g stream by a load-dependent amount.
@@ -126,7 +130,11 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   These are reached from `testing/simulation` (and white-box tests) via `//go:linkname`.
 - **`dstActivate` is also used directly by white-box runtime tests** (via `$DSTSEED`), so they can
   exercise the per-g mechanism under `GOMAXPROCS>1` M-migration that `Run` (single-P) cannot
-  reproduce. This is the only non-`Run` entry and is not a user surface.
+  reproduce. This is the only non-`Run` entry and is not a user surface. Because this path runs at
+  `GOMAXPROCS>1`, every DST runtime structure reachable while it is active must be safe under real
+  parallelism — "in-bubble single-P cooperative access" is a `Run`-only precondition no shared DST
+  list may assume (concretely: the armed-fake-timer registration list, `dstFakeTimers`, is
+  serialized, not append-racy; lands with the scheduler-isolation chunk).
 
 ### Deterministic process identity (`Options.Hostname` / `Options.PID` / `Options.NumCPU`)
 
@@ -157,10 +165,20 @@ return the simulated records, `User.GroupIds` of the simulated user is `["7777"]
 resolves to just its primary gid, as the osusergo path does for a user with no group-file
 memberships), and anything else is the deterministic production unknown-error identity rather than a
 host-database read
-(`TestDSTIdentityGroups`). Boundaries that remain host-derived until the I/O features land: the
-environment surface (`os.Environ`/`Getenv`, and therefore `os.UserHomeDir` and `os.TempDir`) reads
-real host values inside a run — note `os.UserHomeDir` (host `$HOME`) and `user.Current().HomeDir`
-(`/home/sim`) disagree in-run; acquire identity through `os/user` for coherence. The simulated
+(`TestDSTIdentityGroups`).
+
+**Environment surface (contract; enforcement lands with the interception-boundary chunk).** The
+process environment is per-**process** state on a real machine, so under a run it is per-simulated-
+process state here: `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clearenv` operate on a
+per-process copy-on-write view, initialized from the host environment at `Run` entry. Writes are
+isolated — a `Setenv` in one process is never observable from another process or host (env must not
+be a back-channel two real machines never had; this is the environment leg of DST-NODE-ISOLATION).
+Reads of *unmodified* variables return host values: those are machine state, exactly like the
+pre-run stdio handles — deterministic per machine, and cross-machine reproducibility of a SUT that
+branches on them is program discipline (recorded, like the inherited-handle stance). Note
+`os.UserHomeDir` (host `$HOME`) and `user.Current().HomeDir` (`/home/sim`) can therefore disagree
+in-run; acquire identity through `os/user` for coherence. `os.TempDir` stays fixed at the simulated
+`/tmp` (see the filesystem section). The simulated
 identity is also process-global while set: a goroutine outside the simulation that reads identity
 during a run (or in the brief set/clear windows around it) observes simulated values — identity
 gates on the sim-env flag, not per-goroutine.
@@ -172,12 +190,11 @@ host identity — harmless, because the white-box runtime tests exercise the per
 hostname/pid/NumCPU) by deliberate choice — no SUT has needed per-run variation, and the surface stays
 lean; they are single constants in `runtime/dst.go` if that changes.
 
-One identity surface is **not yet virtualized**: `net.Interfaces`/`net.InterfaceAddrs` (interface
-MAC/IP) still report the real host's interfaces under a run. They are a follow-on of the landed
-in-memory network feature (see "In-memory deterministic network" below): a fixed synthetic interface
-set consistent with that network's addressing. In fork scope there is no per-node virtualized-network
-subsystem to source per-node identity from, so a fixed synthetic set — with per-run `Options` variation
-if ever needed — is the correct shape.
+The interface identity surface is virtualized: `net.Interfaces`/`net.InterfaceAddrs` under a run
+return a fixed synthetic set consistent with the in-memory network's addressing — a loopback `lo`
+and an `eth0` bearing the host's routable IP (`10.0.0.<host>`) and a deterministic per-host MAC —
+never the real machine's NICs (`net/dst.go` `dstInterfaces`; enforced by `TestDSTNetInterfaces`
+under DST-IDENTITY-SOUND, faults.md).
 
 ### Deterministic crypto/rand (the entropy seam)
 
@@ -203,12 +220,19 @@ latched, rather than letting `crypto/rand` go silently nondeterministic inside a
 **Invariants enforced by the identity/crypto seams:**
 
 - **INV-CRYPTO** (security-critical): `crypto/rand` returns OS cryptographic entropy in every reachable
-  state *except* inside an active run, where it returns the deterministic per-seed stream — i.e. it is
-  never predictable outside a run, and never in a non-`-tags dst` build. Enforced by
-  `TestDSTCryptoRandDeterministic` (deterministic + seed-varying inside a run; two reads *outside* a run
-  differ) and structurally by the `dstActive()` gate (`dstSeed` is never set on any production path: its
-  only setters are `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate`
-  linkname used solely by the runtime's own white-box tests).
+  state *except* on a **seeded goroutine inside an active run** — a goroutine of the simulation's own
+  tree, whose per-g stream was rooted from the seed — where it returns the deterministic per-seed
+  stream. It is never predictable outside a run, never in a non-`-tags dst` build, **and never merely
+  because a run happens to be active elsewhere in the process**: a goroutine whose per-g stream was
+  never seeded (created before activation, or outside the bubble) reads real OS entropy even while a
+  run is live — the alternative, filling from an unseeded zero-rooted stream, would hand every such
+  goroutine the same fixed, seed-independent bytes (the exact "predictable outside a run" violation
+  this invariant forbids). Enforced by `TestDSTCryptoRandDeterministic` (deterministic + seed-varying
+  inside a run; two reads *outside* a run differ) and structurally by the `dstActive()` +
+  seeded-per-g gate (`dstSeed` is never set on any production path: its only setters are
+  `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate` linkname used
+  solely by the runtime's own white-box tests). (The unseeded-goroutine leg's enforcement lands with
+  the scheduler-isolation chunk.)
 - **INV-IDENTITY**: within a run, every identity read (`pid`/`ppid`/`hostname`/`uid`/`gid`/`euid`/`egid`/
   `NumCPU`/`os/user.Current`) is a fixed function of the run config, and is restored to the real value
   outside the run. Enforced by `TestDSTProcessIdentity` and `TestDSTIdentityExtra` (the latter also
@@ -225,11 +249,66 @@ being rewired through an injected transport.
 
 Under a run, TCP `net.Dial`/`net.Listen` stop touching the OS and run on an in-process **address
 registry**: `Listen` registers a simulated listener; `Dial` looks it up and hands the dialer end of a new
-connection back while pushing the server end onto the listener's accept queue. A connection is a
-`net.Pipe` endpoint (channel I/O, already synctest-durable; deadlines on the fake clock) **wrapped** with
-the simulated local/remote `*net.TCPAddr`. `DialContext` keeps the public context contract (nil panics,
-canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set,
-`:0` listeners receive deterministic nonzero ports, listener lookup uses canonical simulated IPs
+connection back while pushing the server end onto the listener's accept queue. **Every** connection —
+cross-host, same-host, and loopback alike — is **wire-backed** (`net/dst_wire.go`: a buffered,
+synctest-durable transport; deadlines on the fake clock) wrapped with the simulated local/remote
+`*net.TCPAddr`; a same-host wire simply has zero link latency (the wire-backed-everywhere shape lands
+with the network-transport chunk; same-host conns are `net.Pipe` until then). One transport shape
+everywhere is load-bearing for soundness: a rendezvous pipe (writes blocking until the peer reads) would deadlock
+two co-located processes that each write before reading — an execution real TCP, whose send buffer
+is never zero, cannot produce (the Soundness invariant's false-positive class).
+
+**Transport model (contract; the byte-stream and wakeup legs land with the network-transport chunk,
+the flow-control, horizon, connect-cost, and FIN/RST legs with the network-flow-control chunk).**
+The wire models a TCP socket pair, not a message queue:
+
+- **Byte stream, not messages.** The receive side is a byte buffer: one `Read` returns delivered
+  contiguous bytes, up to the buffer's length — reads **coalesce across write
+  boundaries** exactly as TCP does. Write-boundary framing is *not* a guarantee the harness gives
+  (real TCP does not give it; preserving it would let a SUT that assumes 1-write-per-read pass under
+  simulation and fail in production). The inverse is not promised either: a `Read` MAY return fewer
+  bytes than are delivered (a future read-boundary exploration axis splits reads deliberately), so
+  "all delivered bytes in one read" is not a contract a SUT may grow against.
+- **No lost wakeups.** Blocked readers and writers are woken whenever their condition can progress:
+  a delivery that leaves further deliverable bytes behind (or a drain that leaves buffer space) while
+  another waiter is still blocked re-signals until no waiter can progress — concurrent readers on one
+  conn (legal: `net.Conn` is documented concurrency-safe) never strand a goroutine blocked while its
+  data sits delivered — a hang no real kernel (which wakes readers while data remains) can produce.
+  *Which* eligible waiter proceeds first is the deterministic
+  scheduler's choice, as everywhere.
+- **Bounded send buffer / backpressure.** Each connection direction has a fixed send-buffer
+  capacity (`Options.Network.SendBuffer`, default 1 MiB): a write fills it and **blocks durably**
+  when full, resuming as the link drains it. Writes never succeed unboundedly into a partition.
+- **Retransmission horizon.** Bytes that stay undeliverable (partition, dead peer) error the
+  connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
+  default 2 minutes of bubble time — kernel-shaped: ~15 retries), on the blocked or subsequent
+  operation. A deadline-less write into a permanent partition therefore fails in bounded virtual
+  time, as it does on a real kernel — it never succeeds-and-forgets.
+- **Connect cost.** Establishing a cross-host connection completes after one round trip of the
+  link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + jitter;
+  throttle exempts the zero-payload control segments). Same-host connects are instant. A dial to a
+  **declared** host with no listener on the port is `ECONNREFUSED` (a live kernel answers with RST);
+  a dial to an address **no declared host owns** blackholes and fails `ETIMEDOUT` at the horizon
+  (nothing answers SYNs) — the peer-down/unreachable split a real network exhibits.
+- **Peer close (FIN) semantics.** Reads after a peer's graceful close drain buffered data, then
+  `io.EOF`. The **first write after the peer's full close succeeds locally** (the FIN closed the
+  peer's send direction; the write is accepted into the send buffer and elicits the peer's RST);
+  the reset then errors **subsequent** operations with `ECONNRESET` — matching the RST round trip
+  of a real stack, rather than failing the first write instantly (which no kernel does). One
+  recorded simplification: real stacks report the reset *once* (`SO_ERROR` consumed) and surface
+  `EPIPE`/EOF on later ops; the simulation keeps the stable `ECONNRESET` identity on every
+  subsequent op so reset-handling paths keying on it never miss — a SUT distinguishing `EPIPE`
+  from `ECONNRESET` post-reset is outside the model (recorded, not hidden).
+
+`DialContext` keeps the public context contract (nil panics,
+canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set —
+checked against live local bindings on a **2-tuple** (local addr:port) basis, as the real path refuses:
+Go binds an explicit `LocalAddr` without `SO_REUSEADDR`, so `bind(2)` fails `EADDRINUSE` on a local
+collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes;
+lands with the network-registry chunk) —
+`:0` listeners receive deterministic nonzero ports (dialer ephemeral ports allocate deterministically
+and stay within the valid port range, wrapping past 65535 to the next free 4-tuple rather than minting
+impossible port numbers; lands with the network-registry chunk), listener lookup uses canonical simulated IPs
 (`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6
 wildcard address and accepts dials of both families, conflicting with either family's listeners on the
 port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family, and a single-family wildcard listen reports
@@ -237,8 +316,9 @@ the family wildcard form — `0.0.0.0:p` / `[::]:p`, dialable back to the listen
 maps to internally), and error identity is production-shaped
 throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listens `EADDRINUSE`; every
 operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
-reads from a gracefully closed peer return `io.EOF` while writes to a closed peer and any operation on
-a reset connection carry `ECONNRESET`; deadline failures are `*net.OpError` wrapping
+reads from a gracefully closed peer drain buffered data then return `io.EOF`, writes after a peer's
+close follow the FIN/RST shape above (first accepted, subsequent `ECONNRESET`), and any operation on
+a reset connection carries `ECONNRESET`; deadline failures are `*net.OpError` wrapping
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
 the bubble's virtual clock. Closing a listener resets the connections still in its accept backlog
 (production's RST), so a dialer that already succeeded observes `ECONNRESET` instead of blocking
@@ -298,7 +378,14 @@ reports the fixed simulated `/tmp` during a run rather than the host's `$TMPDIR`
 random names draw from the seeded runtime stream. A program needing other fixture files creates
 them inside the run.
 Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
-per-bubble). The working directory is a PATH, not a node reference: renaming a directory out from
+per-bubble). **Resolution is component-wise (physical), as the kernel walks (lands with the
+filesystem-fidelity chunk; resolution is lexical until then):** every intermediate
+component must exist and be a directory — `/missing/../tmp` is `ENOENT` (the walk reaches `missing`
+first), `/file/../other` and `/file/sub` are `ENOTDIR`, and a trailing slash asserts directory-ness
+(`open("/regularfile/")` is `ENOTDIR`). `..` is evaluated against the tree during the walk, never
+erased lexically first — a purely lexical `path.Clean` would make sim-only successes out of path
+bugs a real kernel rejects. (`..` at the root stays at the root, as POSIX resolves it.) The working
+directory is a PATH, not a node reference: renaming a directory out from
 under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,
 recorded here as contractual (the host's fchdir-tracked inode semantics are not promised). A
 `DirEntry` from a listing carries its listing-time `Info` snapshot rather than re-statting lazily
@@ -307,9 +394,19 @@ chunked `n > 0` reads against a stable cursor) are **sorted by name** — determ
 consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubble's fake clock.
 Permission bits are stored and reported but not enforced in the base model (no simulated
 credential checks), and ownership is not represented at all — `Chown`/`Lchown` and `File.Chown`
-stay fenced; error identity is production-shaped throughout `errors.Is`: `*PathError`/
+stay fenced. **umask is not modeled** (recorded stance; the mode-bit, `EISDIR`, and `ENOTEMPTY`
+clauses below land with the filesystem-fidelity chunk): created files and directories store the
+requested mode verbatim — `os.Create` yields `0666` where a default-umask Linux yields `0644` —
+because a simulated umask would be one more machine-state input for no determinism gain; a SUT
+asserting host-masked modes is asserting machine state. Mode bits beyond the permission bits that
+`Chmod` can set (`setuid`/`setgid`/`sticky`) are preserved on create exactly as `Chmod` preserves
+them — create and `Chmod` never disagree about which bits are representable. Error identity is
+production-shaped throughout `errors.Is`: `*PathError`/
 `*LinkError` wrapping `syscall.ENOENT`/`EEXIST`/`ENOTDIR`/`EISDIR`/`ENOTEMPTY`/`EBADF`/`EINVAL`,
-`os.ErrClosed` on use-after-close, exactly as the host would shape them. POSIX namespace
+`os.ErrClosed` on use-after-close, exactly as the host would shape them — including `EISDIR` for
+`O_TRUNC` on a directory regardless of access mode (an open real kernels reject may not mutate
+simulated state, not even a mtime), and `os.Remove` of a non-empty directory surfacing rmdir's
+`ENOTEMPTY` (`EINVAL` is reserved for `"."`, as on the host). POSIX namespace
 semantics hold where databases depend on them: an open file removed from the namespace
 (`Remove`, or replaced by `Rename`) keeps its content readable and writable through the open
 handle until close — content lives on the node, names are references.
@@ -417,19 +514,80 @@ equality).
 init, before any run: they are pre-run host handles, covered verbatim by the recorded
 inherited-handle stance, and the fork does not swap them under a run. Writes to them are
 outbound, schedule-ordered side effects that feed no nondeterminism back into the run — DST's own
-cross-process replay fixtures print their transcripts through real stdout from inside runs —
-and a program that wants captured or deterministic stdio assigns the package variables to a
-simulated file inside the run (the backend seam makes that work with no extra machinery); reading
-the real terminal under a run is program discipline, exactly like using any inherited handle.
+cross-process replay fixtures print their transcripts through real stdout from inside runs.
+The blocked case is covered too: a host write that blocks (a full pipe, a slow terminal) delays
+the run in *wall* time but cannot reorder it, because sysmon's **syscall-handoff retake is gated
+under an active run** exactly as its preemption retake is (enforcement lands with the
+scheduler-isolation chunk) — without that gate, whether a host write returns within sysmon's 10 ms
+window would decide whether the P is handed off mid-syscall, a wall-clock-dependent schedule fork.
+A real syscall thus *serializes* the bubble for its duration: one legal execution, deterministic.
+The dual failure mode is recorded plainly: a goroutine blocked **reading** a host handle (real
+stdin) is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
+nor declare deadlock, so the run hangs until the read returns. Reading the real terminal under a
+run is program discipline, exactly like using any inherited handle; a program that wants captured
+or deterministic stdio assigns the package variables to a simulated file inside the run (the
+backend seam makes that work with no extra machinery).
 Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
 `ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
-`Getpid` are Options-pinned; env-derived APIs (`Getenv`, `UserHomeDir` and friends) read process
-memory the harness controls, not the OS; processes and signals are the `os/exec` roadmap item.
+`Getpid` are Options-pinned; env APIs operate on the per-process simulated environment (see the
+identity section); `os.Executable` is **fenced** under a run (it reads `/proc/self/exe` — a host
+path that names nothing in the simulated namespace); processes and signals are fenced (see the
+interception boundary below).
 One recorded gap: **`os.DevNull`** — the tree starts empty except `/tmp` (that contract stands),
 so opening `/dev/null` under a run is `ENOENT`; the in-sim idioms are `io.Discard` for a sink or
 an ordinary tree file, and the main host consumer of `/dev/null` (process spawning) is out of
 scope here. If a modeled `/dev/null` ever earns its place, it is a new node kind behind the same
 seam — an increment, not a retrofit.
+
+### The interception boundary (raw syscalls, processes, signals, cgo)
+
+The `os`/`net`/time/rand seams cover the surface a SUT reaches through the standard library's
+portable API. The floor below them — the `syscall` package, and everything that calls through it,
+including `golang.org/x/sys/unix` (its wrappers invoke `syscall.Syscall*`) — cannot be *simulated*
+(it is the raw kernel ABI), so it is **fenced**: the filesystem section's rule that "'not yet
+modeled' never means 'reaches the host'" applies to the whole boundary, not just the `os`
+namespace. Without the fence, a dependency calling `syscall.Open` or `unix.Getrandom` mid-run does
+real host I/O and reads real entropy silently — same seed, different run, no error — which
+falsifies host isolation as an *enforced* invariant. Contract (enforcement lands with the
+interception-boundary chunk); every fence below fires only for **bubble goroutines while a run is
+active** — non-bubble goroutines keep full host access, so the harness around the run is untouched:
+
+- **Resource-minting `syscall` entry points** (`Open`/`Openat`/`Creat`, `Socket`/`Socketpair`,
+  `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, `Mmap`, `ForkExec`/`Exec`) fail with the standard
+  "unsupported under deterministic simulation" shape — loud and deterministic, exactly like `Fd()`.
+  A minted host resource is a simulation escape; refusing it is the fence, absorbing it silently is
+  the defect.
+- **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
+  way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
+  syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
+  pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
+  operations **on pre-run host handles** keep
+  working: simulated files never expose an fd, so an fd argument can only name a host handle, and
+  I/O on those is the inherited-handle stance (stdio) — sanctioned, with its recorded wedge risk.
+  The exported named wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`) stay
+  for the same reason; anything outside the family is fenced, deliberately erring loud.
+- **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
+  wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
+  (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when
+  stdio is simulated); the fence makes the refusal designed and nameable.
+- **Signals**: `os/signal.Notify`/`NotifyContext` from a bubble goroutine are fenced (a real
+  signal delivery is an outside-bubble event on a wall clock; today it crashes the bubble only
+  *if* a signal happens to arrive — the fence makes the refusal deterministic instead of luck).
+- **cgo**: fenced at the call, not the build — `cgocall` from a bubble goroutine while a run is
+  active panics with the unsupported shape (mirroring the FIPS gate's enforced-not-documented
+  stance). Gating on `iscgo` at run entry would be too coarse: a binary may *link* cgo it never
+  calls in-run.
+
+What this fence deliberately does **not** cover, recorded as program discipline (the ⛔ rows of
+the sources table): reads of host machine state through APIs that mint nothing (`runtime`
+introspection — `NumGoroutine` counts process-wide goroutines including the harness,
+`runtime/metrics` and `ReadMemStats` carry wall-time- and history-dependent fields,
+`runtime.Stack(all=true)` dumps non-bubble goroutines), and address-derived observables —
+including **iteration order of a pointer-keyed map** (`map[*T]V`, `map[unsafe.Pointer]V`,
+`unique.Handle` keys): the fixed `-tags dst` hash key makes the *function* deterministic but the
+*addresses* are process-history-dependent, so pointer-keyed iteration order is the `%p` class of
+nondeterminism even under a fixed seed. DST's own substrate contains no observable pointer-keyed
+iteration (the reset registry iterates in registration order — see faults.md); a SUT's is its own.
 
 ### Enforcing test configurations
 
@@ -578,7 +736,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 |---|---|---|
 | Goroutine scheduling order | per-g RNG tree + single-P + sysmon neutralized + the get-side selection hook (Seq 5); system (non-bubble) goroutines isolated from the seeded RNG | ✅ |
 | `select` poll order | per-g `g.dstrand` | ✅ |
-| map iteration order | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`) | ✅ |
+| map iteration order (value-keyed) | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`); pointer-keyed maps are ⛔ — see the last row | ✅ |
 | `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
 | `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
@@ -587,10 +745,17 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
-| standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture) | ⛔ (program discipline) |
-| faults (scheduling / net / disk / clock / OOM / crash) | fault-orchestration layer: the Host/Process victim contract + policies at the existing seams (see [faults.md](./faults.md)) | ⏳ |
-| cgo | — | ⛔ |
-| raw pointer addresses (ASLR, `%p`, `uintptr`) | — | ⛔ (program discipline) |
+| standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture); syscall-retake gated so a blocked host write serializes, never reorders | ⛔ (program discipline) |
+| environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ⏳ (interception-boundary chunk) |
+| faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
+| faults: crash/restart, OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
+| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ⏳ (interception-boundary chunk) |
+| processes (`os/exec`, `os.StartProcess`) | fenced (loud "unsupported under deterministic simulation") | ⏳ (interception-boundary chunk) |
+| signals (`os/signal.Notify`) | fenced for bubble goroutines | ⏳ (interception-boundary chunk) |
+| `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ⏳ (interception-boundary chunk) |
+| cgo | fenced at `cgocall` for bubble goroutines (a binary may link cgo it never calls in-run) | ⏳ (interception-boundary chunk) |
+| runtime introspection (`NumGoroutine`, `runtime/metrics`, `ReadMemStats`, `Stack(all)`) | process-wide, history/wall-time-dependent readings (see "The interception boundary") | ⛔ (program discipline) |
+| raw pointer addresses (ASLR, `%p`, `uintptr`, **pointer-keyed map iteration order**) | — | ⛔ (program discipline) |
 
 **Library randomness — seeded for free or needs a seam?** A dependency's randomness is covered with no
 patch iff it bottoms out in the `math/rand`/`math/rand/v2` **top-level** functions (`//go:linkname`'d to
@@ -612,13 +777,13 @@ trees in the *same* bubble, all driven by the one seed. The axes:
 - **Time** — one fake clock (synctest); all timers and tickers driven from it.
 - **Random** — seeded everywhere the runtime owns it (select/map/`math/rand`/`crypto/rand`); a library
   holding a private RNG instance reseeds from a seeded source.
-- **Network / Disk / I/O** — in-memory and deterministic (I/O landed; faults pending), with sound
-  faults: on the reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole,
-  connection reset, throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a
-  reliable stream); EIO/ENOSPC; torn/lost unsynced writes on crash.
-- **Faults** — process & host crash/restart, net faults, disk faults, clock skew/drift/step, OOM, and
-  *scheduling* faults (straggler) — each anchored to a real degree of freedom, so sound (pending; see
-  [faults.md](./faults.md)).
+- **Network / Disk / I/O** — in-memory and deterministic (landed), with sound faults: on the
+  reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole, connection reset,
+  throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a reliable
+  stream); EIO/ENOSPC/disk latency (landed); torn/lost unsynced writes on crash (pending).
+- **Faults** — net, disk, and clock skew/step/drift axes landed; process & host crash/restart, OOM
+  kill, and *scheduling* faults (straggler) pending — each anchored to a real degree of freedom, so
+  sound (see [faults.md](./faults.md)).
 - Driven by a seed; replay-exact; failures shrinkable; invariants checked by the program's own
   assertions.
 
@@ -705,14 +870,15 @@ the fixed seams, so later steps add, never rewrite.
 
 - **Network (in-memory deterministic `net`). LANDED (first I/O feature).** Under DST, `net.Dial`/`Listen`
   run on an in-process address registry instead of the OS: `Dial` ↔ `Accept` hand each other a
-  `net.Pipe`-backed connection pair (channel I/O, synctest-durable, deadlines on the fake clock) wrapped
+  wire-backed connection pair (buffered byte-stream transport, synctest-durable, deadlines on the fake
+  clock — see the transport-model contract in the "In-memory deterministic network" section) wrapped
   with simulated addresses, so unmodified networked code is reproducible without modeling the network
   itself. Determinism rides the scheduler (no new seed plumbing); the registry is keyed by a per-run
   epoch so it resets between runs. The reliable, in-order base for network faults. See the "In-memory
   deterministic network" section above; tested by `TestDSTNet`. Caveat: only the `net.Conn` interface — code type-asserting
-  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/service-name ports/UDP/Unix/
-  `net.Interfaces` are follow-ons; public DNS and service-name lookups fail under DST rather than touching
-  host resolver state.
+  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/service-name ports/UDP/Unix are
+  follow-ons (`net.Interfaces` is landed — the synthetic `lo`+`eth0` set); public DNS and service-name
+  lookups fail under DST rather than touching host resolver state.
 
 - **Disk (in-memory deterministic filesystem). LANDED (second I/O feature).** Under DST the exported
   `os` surface operates on a per-bubble in-memory tree (empty root + a pre-seeded `/tmp`; fixed

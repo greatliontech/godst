@@ -100,8 +100,9 @@ per-host:
   `dstHost`/`dstProc`; server = the `Listen` caller's host/process — the process that owns the listener and
   accepts on it — stamped on the conn at Dial), so net faults target a host-pair (partition) or a process
   (reset). The **host** half is **landed** (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
-  `net/dst.go`), consumed by the base-latency link lookup; the **process** half lands with the reset/crash
-  faults that target a process, at the same Dial stamp.
+  `net/dst.go`), consumed by the base-latency link lookup; the **process** half is likewise **landed**
+  (`dstConn.localProc`/`remoteProc`, stamped at the same Dial point), consumed by the reset fault's
+  `ResetProcess` targeting.
 - **DNS by hostname is deferred.** Dial by assigned IP:port; `hostname → IP` is a planned minimal sim-DNS
   increment (until then DNS-by-name stays fenced, as today) — a thin lookup over the host IP assignment,
   same address model.
@@ -171,10 +172,15 @@ tolerate*, so it cannot be a single global clock.
 ### Project invariants (distributed model)
 
 - **DST-NODE-ISOLATION (entailed: isolation boundary).** A goroutine's FS ops resolve only against its
-  *host's* tree, and processes share no Go memory; a process observes another's state only over the
-  simulated network or a shared *host* filesystem. *violation:* process A on host hA reads a path process
+  *host's* tree, processes share no Go memory, **and no other observable channel exists between
+  processes**: a process observes another's state only over the simulated network or a shared *host*
+  filesystem. The environment surface is inside this invariant — env is per-**process** state on a real
+  machine, so `os.Setenv` in one simulated process must never be observable from another
+  (design.md, "Environment surface"; the env leg's enforcement lands with the interception-boundary
+  chunk). *violation:* process A on host hA reads a path process
   B wrote on host hB and sees B's bytes — a back-channel two separate machines never had, so a SUT passes
-  only because the nodes secretly shared a disk (a false negative) — or a crash on B corrupts A's file.
+  only because the nodes secretly shared a disk (a false negative) — or B `Setenv`s a "leader" flag A
+  `Getenv`s (the same back-channel through the process env) — or a crash on B corrupts A's file.
   *Enforced:* structural (per-host tree, resolver keyed by `g.dstHost`; per-`(host, process)` cwd) +
   `TestDSTNodeFSIsolation`/`TestDSTNodeCwdIsolation` (`os/dst_node_fs_test.go`): two hosts writing the same
   path get independent files, per-host `/tmp` is independent, and per-process cwd does not leak — *and* the
@@ -205,14 +211,22 @@ tolerate*, so it cannot be a single global clock.
 - **DST-CLOCK-DRIFT-DURATION (entailed: a *rate* scales durations and deadlines coherently).** A host whose
   clock runs at rate `r` (`Drift(ppb)`, `r = 1 + ppb/1e9`) reads `time.Now`/`time.Since` advancing `r×` base,
   *and* its relative timers fire after the rate-converted base interval — a rate-r host's `d`-timer fires
-  after `d/r` of base. The two are coherent: a host cannot detect its own drift (its `time.Since` over its own
-  `Sleep(d)` reads back `d`, exact for exact-dividing rates and within the integer-floor rounding ~`r+1` ns
-  otherwise). *violation:* drifting the wall reading but firing timers at the unconverted base `d` (a rate-2
+  after `d/r` of base. The two are coherent: a host cannot detect its own drift (its `time.Since` over its
+  own `Sleep(d)` reads back **never less than `d`** — the arm conversion rounds up, the wall accumulation
+  rounds down, and the composition `floor(ceil(d/r)·r) ≥ d` holds for every rate — and at most ~`(r+1)` ns
+  above). *violation:* drifting the wall reading but firing timers at the unconverted base `d` (a rate-2
   host's 1 s timer firing after 1 s of base = 2 s of its own time), or converting deadlines but not the wall
-  — either makes the host's own clock self-inconsistent, a state no real crystal produces. *Enforced:* the
-  wall split adds `(base−t0)·ppb/1e9` and the single timer choke `(*timer).modify` converts `d→d·1e9/(1e9+ppb)`
-  (overflow-safe integer floor, mutation-tested against a `big.Int` oracle); `TestDSTClockDrift{Wall,
-  TimerConversion,Ticker,SelfConsistent,Property}` (`testing/simulation/clock_drift_test.go`).
+  — either makes the host's own clock self-inconsistent, a state no real crystal produces — **or rounding
+  both conversions down**, whose composition reads back `d − 1..2` ns: `Sleep(d)` observably returning
+  early in the host's own clock, real Go's documented "at least d" broken, the Soundness invariant's
+  "timer before its deadline" false positive at non-dividing rates. *Enforced:* the
+  wall split adds `(base−t0)·ppb/1e9` (truncated integer division — Go semantics; for a negative ppb
+  truncation adds *less* negative drift, so the ≥ d composition holds a fortiori) and the single timer
+  choke `(*timer).modify` converts `d→⌈d·1e9/(1e9+ppb)⌉` (overflow-safe; the ceil, the arm-addition
+  clamp, and a Sleep-elapsed ≥ d property sweep at non-dividing rates land with the clock-fault chunk —
+  the landed conversion floors, and its `big.Int` oracle validates the floor it replaces);
+  `TestDSTClockDrift{Wall,TimerConversion,Ticker,SelfConsistent,Property}`
+  (`testing/simulation/clock_drift_test.go`).
 - **DST-CLOCK-DRIFT-MONOTONIC (entailed: a drifting clock still moves forward).** A drift rate is strictly
   positive (`ppb > -1e9`, rate in (0, 2]); a clock that stops or reverses is a *step* (a discontinuous wall
   jump), not drift. So a drifting host's `time.Now` advances monotonically across base advances, fast or slow.
@@ -243,9 +257,14 @@ tolerate*, so it cannot be a single global clock.
   needs* — the budget-**crossing** decision (does process P exceed budget B?) is a deterministic function
   of the seed. The *exact* byte count is **not** byte-deterministic across runs: it carries sub-observable
   runtime-pool-refill noise — a `sudog` cache refill from a channel op is charged to whichever process
-  empties the process-global, cross-run pool — the per-process analogue of the GC's `DST-MEM-1` byte-noise,
+  empties the pool — the per-process analogue of the GC's `DST-MEM-1` byte-noise,
   sound for the same reason (it cannot flip a budget-scale crossing; an OOM budget sits far above the noise
-  floor of a few KB). *violation:* an allocation attributed to the wrong process (or the root), or counts
+  floor of a few KB). The *cross-run-varying* component of that noise is closed at activation:
+  `dstActivate` **normalizes the per-P runtime pools** (sudog and defer caches, the gFree list) to a
+  fixed empty state, so refill points during the run are a function of the schedule, not of pre-run
+  process history (gc.md, layered contract; lands with the GC-determinism chunk). What remains in the
+  band is mid-run cross-consumer noise (e.g. a concurrent foreign bubble draining the global pool),
+  which stays sub-observable. *violation:* an allocation attributed to the wrong process (or the root), or counts
   that diverge at the *budget* scale (not within the sub-observable band), so the OOM fault fires
   nondeterministically or on the wrong process. *Enforced:* `elemsize` (size-class size, `-race`-invariant)
   summed per-object at the one mallocgc hook under the bubble gate, counters keyed by `g.dstProc`;
@@ -344,6 +363,15 @@ cross-host conns, and a process crash exactly that process's resources (DST-FAUL
 targeting (`Partition`/`Heal`/`Isolate`/`HealHost`) is **landed** as the imperative network-partition API;
 the per-process/zone forms and the `Link`/`Crash`/`OOM`/… sugar extend it as the later axes land.
 
+**Victim names fail loud.** A fault or configuration API that takes a host name (`StepClock`,
+`DriftClock`, `HostIP`, `HostFS`, the partition/reset targets) **panics on a name no `Host`
+declaration has established** — it never interns a fresh host id as a side effect. A typo'd victim
+would otherwise mutate state no goroutine observes: the fault silently tests nothing, the run stays
+green, and the SUT's fault handling goes unexercised — a silent no-op at odds with the fail-loud
+posture everywhere else (undeclared-host panics, the `-tags dst` panic). (Enforcement lands with the
+clock-fault chunk, at the one name→id intern choke point in `testing/simulation` that every
+victim-name intake — clock, HostIP/HostFS, partition, reset — shares.)
+
 ### The fault model: policies at existing seams
 
 A fault is a record `{kind, victim, activation}` consulted at the seam its kind owns. It adds **no new
@@ -402,25 +430,36 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   by the base latency plus a value drawn from `[0, jitter)` by the dedicated, seeded, stream-isolated fault
   RNG (`dstFaultRand`), so it replays exactly and never perturbs the schedule (DST-FAULT-REPLAY). It only
   *delays*; FIFO is preserved with no clamp because the reader is head-of-line (a smaller later draw bunches
-  behind an earlier segment, never overtakes it). The per-host-pair **matrix** (asymmetric per-link latency
+  behind an earlier segment, never overtakes it). **Connection establishment pays the link too**: a
+  cross-host dial completes after one round trip (SYN + SYN-ACK, each a one-way traversal paying base
+  latency + a jitter draw; throttle exempts the zero-payload control segments — see the transport model,
+  design.md) — a zero-RTT connect would let a SUT's connect timeout pass under simulation on a link
+  where it fails in production. The per-host-pair **matrix** (asymmetric per-link latency
   / jitter) is the L4 targeting API (`Link("h1","h2").Latency()`). DoF: a real link has variable latency.
   Sound — it is a fake timer, the contract `time` already virtualizes.
 - **Partition** — between a host-pair (symmetric or one-directional) or isolating a host, over a virtual
   window. *On connect:* a Dial across the partition either **refuses** (`ECONNREFUSED`, peer-down
   semantics) or **blackholes** (the Dial blocks until its context/deadline — packets-dropped semantics);
   the mode is **selectable per fault** (the `Fault` record carries refuse | blackhole) — both are real TCP
-  outcomes and a SUT tests against each, so the choice is the SUT's, not hardcoded. *On an established conn:* bytes across the partition are blackholed —
-  reads block durably on the fake clock, writes fill a send buffer that never drains — until the
-  partition **heals** (in-order delivery resumes; TCP buffers and recovers) or a deadline/`Close` errors
-  the conn. DoF: a transient partition. **Landed** (blackhole mode) via the imperative targeting API
+  outcomes and a SUT tests against each, so the choice is the SUT's, not hardcoded. *On an established
+  conn:* bytes **not yet delivered** at the cut — in flight, or written after it — are held: reads of
+  *those* block durably on the fake clock, and writes fill the **bounded** send buffer (the transport
+  model, design.md) then block, until the partition **heals** (held bytes flush in order; TCP buffers
+  and recovers) or the **retransmission horizon** errors the conn `ETIMEDOUT` (a cut outlasting the
+  horizon kills the connection, as ~15 kernel retries do; a deadline/`Close` still errors it sooner).
+  Bytes **already delivered** before the cut sit in the receiver's kernel buffer on a real machine, so
+  they **stay readable during the cut** — a partition severs the link, never data the receiver already
+  holds; blackholing pre-delivered bytes fails a read a real kernel serves (a sim-only failure, the
+  false-positive class the Soundness invariant forbids). DoF: a transient partition. **Landed**
+  (blackhole mode) via the imperative targeting API
   `simulation.Partition(a,b)` / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)` (the mechanism; the declarative
   `Options.Faults` + per-fault mode is L4). It drives a per-run host-pair/isolated-host table in net
   (`net/dst_partition.go`) — keyed by the conn's host attribution (`dstConn.localHost`/`remoteHost`), so a
-  cut touches exactly the targeted pair's cross-host conns (DST-FAULT-VICTIM). Cross-host conns are
-  **always wire-backed** (the buffered transport — itself the faithful TCP send-buffer shape), so writes
-  during a cut queue and **flush in order on heal with no loss** (DST-NET-FIFO + the sound buffer-and-
-  recover model). The connect **refuse** mode (`ECONNREFUSED`) is deferred (`docs/issues/`); blackhole is
-  the harder, realistic case. **"Drop" lives here**, at flow granularity — a partition window
+  cut touches exactly the targeted pair's cross-host conns (DST-FAULT-VICTIM). ALL conns are
+  **wire-backed** (the buffered transport — itself the faithful TCP send-buffer shape), so writes
+  during a cut queue up to the buffer bound and **flush in order on heal with no loss** (DST-NET-FIFO +
+  the sound buffer-and-recover model). The connect **refuse** mode (`ECONNREFUSED`) is deferred
+  (`docs/issues/`); blackhole is the harder, realistic case. **"Drop" lives here**, at flow granularity — a partition window
   drops everything between A↔B; there is *no* single-byte drop on a live stream (TCP forbids it — that is
   the UDP follow-on).
 - **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns, reusing the conn's
@@ -430,14 +469,24 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). A reset hits **both ends**, so
   each closes and a subsequent read returns `ECONNRESET` before draining — **in-flight bytes are dropped**,
-  as a real RST discards them (DST-FAULT-SOUND). This completes the network axis.
+  as a real RST discards them (DST-FAULT-SOUND). When a reset matches **several** conns, the victims are
+  reset in **connection-registration order** (a per-run sequence id recorded at establishment; lands
+  with the network-registry chunk — the landed mechanism iterates the registry map, deterministic only
+  for single-victim resets) — never in
+  map-iteration order over pointer keys, whose bucket placement hashes run-varying heap *addresses* and
+  would make the wake order of the victims' blocked readers, and thus the downstream schedule, diverge
+  across same-seed runs (DST-FAULT-REPLAY). This completes the network axis.
 - **Throttle / bandwidth** — pace delivery so ≤ B bytes cross per virtual time unit (latency
   proportional to bytes, the same fake-timer queue as latency). DoF: finite link bandwidth. **Landed** as
   `Options.Network.CrossHostBandwidth` (bytes/sec, **per connection-direction**): the wire serializes
   transmission via a per-direction `linkFreeAt` clock — a segment of S bytes occupies the link `S/B`
   (store-and-forward) before the base latency + jitter propagate it — so a receiver gets bytes no faster
   than B (DST-NET-THROTTLE). Deterministic (no fault-RNG draw) and FIFO-preserving (`linkFreeAt` monotone +
-  head-of-line). Default 0 = unlimited; same-host always unlimited. Shared-link contention (one budget
+  head-of-line). The transmit-time arithmetic (`S·1e9/B`) is overflow-safe for any in-spec segment (the
+  bounded send buffer caps S, and the mul/div is guarded like the clock-drift conversions — a wrapped
+  negative transmit time would corrupt `linkFreeAt` and break the rate bound; the guard and the cap land
+  with the network-registry and network-flow-control chunks). Default 0 = unlimited;
+  same-host always unlimited. Shared-link contention (one budget
   across a host-pair's flows) is the L4 per-link refinement; this is per-flow (each direction an
   independent B-capacity link, so executions stay ⊆ real).
 
@@ -473,9 +522,20 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   partition relay), so `testing/simulation` needs no `os` dependency.
 - **ENOSPC** — **landed**. Writes/creates on a host's disk fail `ENOSPC` past a budget, injected mid-run
   by `simulation.LimitDisk(host, bytes)` (and removed by `UnlimitDisk`). A capacity on the host's disk
-  (`dstFSDisk.capped`/`capacity`) caps total regular-file content; a write that would grow the disk past it
-  fills the remaining space (a short write — a real disk writes what it can) and the rest fails ENOSPC,
-  and a create/`mkdir` on an already-full disk fails ENOSPC. Space in use is summed on demand from the live
+  (`dstFSDisk.capped`/`capacity`) caps total regular-file content; a write that would grow the disk past
+  it fills the remaining space and returns **the partial count together with the error — `(n, ENOSPC)`
+  in one call** (the one-call surface lands with the filesystem-fidelity chunk; until then the partial
+  fill surfaces as a bare short count, which `os.File.Write` reports as `io.ErrShortWrite` — an
+  identity the real surface cannot produce) — and a create/`mkdir` on an already-full disk fails
+  ENOSPC. The one-call surface is the
+  real kernel's as Go exposes it: `write(2)` returns the short count and the *retry* gets `ENOSPC`, but
+  `internal/poll.FD.Write` **loops** until error or completion, so a real `os.File.Write` that partially
+  fills a disk returns `(n, ENOSPC)` and can never return a bare short count (`io.ErrShortWrite`). The
+  simulated backend must surface the same shape at its own layer — otherwise `Write` (whose retry loop
+  the backend replaces) reports `io.ErrShortWrite`, an error identity real `os.File.Write` cannot
+  produce for a regular file, and the SUT's `errors.Is(err, ENOSPC)` recovery path does not fire on
+  exactly the write the fault was injected to exercise (and `Write` vs `WriteAt`, which has its own
+  loop, would disagree — a state no kernel produces). Space in use is summed on demand from the live
   tree (`residentLocked`), **not** tracked incrementally, so a delete or truncate-down frees room for the
   next write with no accounting in the mutation paths — and never the false ENOSPC a budget-that-ignores-
   frees would produce (DoF: a full disk; sound because in-place overwrites consume nothing, frees are
@@ -485,9 +545,11 @@ disk feature built and froze monotonicity on precisely so crash could tear along
 - **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set
   mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
   sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op
-  that reads/writes content, traverses directories, or allocates a node (read/write/sync, open, stat,
-  mkdir, remove, rename, readdir, truncate, chmod, chtimes); pure in-memory ops (seek, `Getwd`, a closed-fd
-  read that returns EBADF without I/O) are not delayed, as a real slow disk would not delay them. The sleep
+  that reads/writes content, traverses directories, or allocates a node (read/write/sync, open, named
+  stat — the path walk touches the disk — mkdir, remove, rename, readdir, truncate, chmod, chtimes);
+  pure in-memory ops (seek, `Getwd`, a closed-fd read that returns EBADF without I/O, and an **open
+  handle's `File.Stat`** — fstat reads the in-core inode, which a slow disk does not delay) are not
+  delayed, as a real slow disk would not delay them. The sleep
   is read lock-free and taken *outside* the tree lock — so a slow disk on one host never stalls another's
   filesystem (sleeping under the shared lock would in fact deadlock the bubble, since virtual time cannot
   advance while a goroutine holds a mutex) — and a composite helper pays the latency once per backend op
@@ -527,18 +589,38 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   reading drifts (`(base−t0)·ppb/1e9` added at the wall split), and a relative timer's host-duration `d` is
   converted to base `d/rate` at the single timer arm choke `(*timer).modify` (`runtime.dstTimerArmForDrift`)
   — through which every Sleep / After / NewTimer / NewTicker / AfterFunc / context deadline funnels, the
-  periodic ticker re-arm reusing the converted period. The conversion is an overflow-safe integer floor
-  (clamped, never wrapping). So the *monotonic* clock the earlier design note anticipated is realized as the
+  periodic ticker re-arm reusing the converted period. **Rounding contract:** the arm conversion rounds
+  **up** (ceil) and the wall-drift accumulation rounds down (floor), so the two compose to a host-perceived
+  elapsed **≥ d always** — `floor(ceil(d/r)·r) ≥ d` — with at most ~`(r+1)` ns of overshoot. A floor at
+  the arm would compose to an elapsed of `d − 1..2` ns: a timer firing **before its deadline in the
+  host's own clock**, verbatim the Soundness invariant's named false-positive class (`Sleep(d)` returning
+  with `Since < d`, which real Go documents can never happen). **Overflow contract:** every arm-side
+  computation — the conversion itself AND the `when = now + converted` addition — clamps to `maxWhen`,
+  never wrapping negative: bubble base time is ~9.47e17 ns, so a converted span clamped to `maxWhen`
+  makes the *addition* wrap unless it is guarded too, and a negative `when` fails `needsAdd` — the timer
+  is silently never heaped and never fires, turning `time.Sleep(math.MaxInt64)` (the standard
+  block-forever idiom, which `timeSleep` clamps to `maxWhen`) on any slow-drifting host into a
+  harness-manufactured deadlock report neither real hardware nor the un-drifted simulation exhibits.
+  So the *monotonic* clock the earlier design note anticipated is realized as the
   wall reading itself (bubble durations are wall-based), and the "rate-aware deadline conversion at the
   synctest wake" as arm-time conversion. A **mid-run change** re-anchors the wall so it stays continuous
   (folds drift-so-far into `offset`, resets the anchor) and re-maps every *armed* timer of the host
   (`when' = T + (when−T)·r_old/r_new`). Because a channel timer is heaped only while a goroutine is blocked on
   it, the re-map enumerates a per-run list of armed fake timers (`runtime.dstFakeTimers`), not just the heap,
   so a held `NewTimer`/`NewTicker` or a ticker between ticks is re-mapped too; the re-map is in place under the
-  timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). Enforced by
+  timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). **Host
+  re-declaration re-establishes the clock completely**: declaring `Host(name, config)` for an
+  already-declared name applies the declared clock exactly as `DriftClock`+`StepClock` would — fold
+  drift-so-far into the offset, set the new rate (zero `HostConfig` = rate 1, in sync with base, as
+  the `HostConfig` doc promises), re-anchor, and re-map the host's armed timers on any rate change.
+  Setting only the offset while a stale rate and anchor survive leaves a "restarted, in-sync" host
+  reading ahead of base and sleeping at the old rate — self-consistent to its own probes (the
+  strongest-counterexample shape DST-CLOCK-DURATION warns about), so only a base-clock-relative test
+  catches it. Enforced by
   `TestDSTClockDrift*` / `TestDSTClockDriftClock*` (`testing/simulation/clock_drift_test.go`,
   `clock_drift_dynamic_test.go`), mutation-tested, incl. a `big.Int` oracle for the conversion, a direct
-  overflow-clamp regression, and the unheaped-timer re-map. **Deferred**
+  overflow-clamp regression, and the unheaped-timer re-map; the ceil-rounding, arm-addition-overflow,
+  and re-declaration contracts land with the clock-fault chunk. **Deferred**
   (`docs/issues/clock-drift-dynamic.md`): the fault-RNG-drawn (seeded) rate. The `wall = f_h(base)`
   representation does not change for it.
 

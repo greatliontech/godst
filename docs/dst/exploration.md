@@ -61,8 +61,12 @@ unified seam, `dstSchedSelect(candidates) → index`:
 - **Random** (default; `simulation.Run` and `simulation.RunWith{Strategy:Random}`): uniform pick over the runnable
   set from the scheduling RNG. Different seeds → different sound interleavings.
 - **PCT** (`simulation.RunWith{Strategy:PCT, Depth:d, Steps:K}`): Probabilistic Concurrency Testing. Each
-  goroutine gets a random base priority at creation (`g.dstPrio`, drawn from the scheduling RNG in
-  `newproc1`, well above the change-point low band); the seam runs the highest-priority runnable
+  **simulation-bubble** goroutine gets a random base priority at creation (`g.dstPrio`, drawn from the
+  scheduling RNG in `newproc1`, well above the change-point low band) — the creation-side draw is gated
+  on the creator's bubble exactly as the selection side is (system-goroutine isolation, design.md): a
+  foreign or non-bubble goroutine created mid-run consumes **no** scheduling-RNG draw, else every later
+  PCT priority would shift with process-composition noise (the gate lands with the scheduler-isolation
+  chunk). The seam runs the highest-priority runnable
   goroutine (ties by goid, for determinism). `d−1` **priority-change points** are placed at random
   steps in `[1,K]` (re-rooted per bubble); when the step counter reaches one, the goroutine scheduled
   at that step is dropped to a low priority — the priority inversion that exposes a depth-`d` bug. PCT
@@ -250,6 +254,30 @@ mutex is sound and is exactly the interleaving Gap A needs.
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
   every member (802 SUTs — the original 290 plus the atomic, atomic-plain-mixed, multi-way, and two-variable-mixed families — mutation-tested: 23 of the original family fail with `dstSyncAcquire` neutered; 411 fail with `dstAtomicYield` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
+- **Hardening clauses (land with the exploration-hardening chunk).** Four consequences of the above,
+  made explicit because each was violable in detail while the headline invariant read as satisfied:
+  1. **Every capacity that can drop recorded information reports itself.** The sync-HB-event buffer is
+     a completeness input, not only a soundness one: a *silently* dropped release/acquire event
+     under-orders the trace-HB used for **weak-initial** computation, and a spurious weak-initial can
+     early-return `addSourceBacktrack` before the genuine reversal is seeded — a dropped Mazurkiewicz
+     class while `Exhausted=true` (a DST-L2-3 violation reached through DST-L2-2's own machinery). The
+     "a missing edge only over-explores" argument holds for the reorderability gate alone, not for
+     weak-initials. So sync-event overflow folds into the trace's overflow flag exactly as access-log
+     overflow does: `Exhausted=false`, reported, test-pinned.
+  2. **Filter-capacity accounting is address-independent.** Whether the access filter degrades to
+     conservative mode must be a function of counts the schedule determines (entries, syncs, procs),
+     never of how an entry's byte range straddles pages at its run-local *address* — an
+     alignment-dependent pool exhaustion flips conservative at a different point in a fresh replay
+     process, misaligning the prefix (a DST-L2-2 abort, or silent divergence).
+  3. **A guard-failing access is recorded, not dropped** (D1's "record the access but do not yield" is
+     normative): an access that cannot *yield* can still *conflict*, and dropping it from the
+     dependency relation silently prunes its class.
+  4. **Replay divergence is detected, not assumed away**: replay cross-checks the recorded enabled
+     sets over the schedule prefix (not only "the prefix named a non-enabled seq"), and an abort is
+     attributed to SUT-panic truncation only when the abort is actually inside the panicking
+     schedule's truncated suffix — a genuine DST-L2-2 violation coinciding with a panicking schedule
+     must not be masked. Internal invariant breaches in the backtrack machinery surface as the
+     DST-L2-2 diagnostic, never a bare index panic.
 - **DST-L2-4 (clause-explicit: production untouched).** Level-2 hooks are build-mode inert outside
   `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield`,
   `dstAccessYieldRange`, or `dstAtomicYield` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under

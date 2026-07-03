@@ -252,11 +252,14 @@ The unifying invariant — the load-bearing piece of Tier 2:
 Why this is the faithful collapse, dimension by dimension:
 
 - **Determinism (3).** Async `fing` completes a nondeterministic *count* by any given point (probe: 7
-  vs 8 of 8). **[V]** Within a finq block the order is already reverse-LIFO
-  (`mfinal.go:218-220`) **[R]**; cleanups are block-LIFO and, at `GOMAXPROCS=1`,
-  `maxCleanupGs = max(GOMAXPROCS/4, 1) = 1` so the "concurrent" pool collapses to a single goroutine.
-  **[R]** Re-hosting both onto one deterministically-scheduled bubble goroutine makes *when each runs*
-  a function of the schedule, not wall-clock.
+  vs 8 of 8). **[V]** Re-hosting both queues onto one deterministically-scheduled bubble goroutine
+  makes *when each runs* a function of the schedule, not wall-clock — and the drain orders each
+  batch by the per-bubble **registration sequence** before executing (see the discovery invariant
+  below): block order as discovered is sweep order, which is heap-layout-dependent, so it must not
+  be the execution order. (Production detail for contrast: within a finq block the order is
+  reverse-LIFO (`mfinal.go:218-220`) **[R]**; cleanups are block-LIFO and, at `GOMAXPROCS=1`,
+  `maxCleanupGs = max(GOMAXPROCS/4, 1) = 1` so the "concurrent" pool collapses to a single
+  goroutine. **[R]**)
 - **Bubble-awareness (4).** A finalizer doing a channel op fatals under async `fing` because
   `fing.bubble == nil` and the check is `c.bubble != nil && getg().bubble != c.bubble → fatal`
   (`chan.go:193/319/418/540/703`); a channel adopts its maker's bubble at creation (`chan.go:116-117`).
@@ -278,8 +281,11 @@ Why this is the faithful collapse, dimension by dimension:
   callback that **panics** (recorded by Explore) or calls **runtime.Goexit** kills the drain: the death
   clears the driver's reference (a dead g must never be woken) and every callback the run queued or
   later discovers is **deterministically discarded** at quiescence and at Run-end teardown
-  (`dstDiscardQueuedFinq`/`dstDiscardQueuedCleanups`, accounted so the queue ledger stays exact) — never
-  leaked to the bubble-less async workers (DST-FIN-1/DST-CLEANUP-1). A finalizer that **spawns** a
+  (`dstDiscardQueuedFinq`/`dstDiscardQueuedCleanups`, accounted so the queue ledger stays exact — as
+  *discarded*, never as *executed*: `finexecuted` and the cleanup executed counter feed
+  `runtime/metrics`, and counting never-run callbacks there falsifies a public observable post-run;
+  the ledger-exactness check gets its own discard leg instead — lands with the GC-determinism chunk) —
+  never leaked to the bubble-less async workers (DST-FIN-1/DST-CLEANUP-1). A finalizer that **spawns** a
   goroutine: the child inherits `g.bubble` via `newproc1` (normal goroutines inherit; only system
   goroutines skip it at `proc.go:5390`), so it is bubble-accounted and deterministically scheduled.
   **[R]/[C]**
@@ -323,11 +329,25 @@ wall-clock). So the achievable invariant is **set-at-quiescence, not per-cycle**
 > **Invariant (DST finalizer discovery).** At any **quiescence point**, the set of finalizers/cleanups
 > that have run equals the set of objects unreachable from the **quiescent live set** — which is
 > deterministic (all goroutines durably blocked at deterministic points). The *cycle* in which a given
-> object was discovered during a preceding non-quiescent burst, and the *order* among finalizers in one
-> drain (discovery order across cycles + heap addresses, both heap-layout-dependent), are **not**
-> guaranteed. A SUT that observes finalizer effects only at quiescence boundaries (the natural
-> `synctest` observation points) sees a deterministic set; one that depends on per-cycle discovery
-> timing or on finalizer *order* is relying on behaviour production also leaves unspecified.
+> object was discovered during a preceding non-quiescent burst is **not** guaranteed. The *order* in
+> which one drain executes its accumulated callbacks **is deterministic**: **registration order** — a
+> per-bubble sequence number stamped at `SetFinalizer`/`AddCleanup`, by which the drain orders its
+> queued work before running it. Discovery hands the drain a *set* in heap-address-dependent sweep
+> order (span pop order + special offsets — pre-run span-fill history, not a function of the seed);
+> executing in that order would make two same-cycle callbacks with interacting side effects (shared
+> state, channel sends waking different goroutines first) an unseeded schedule fork — a violation of
+> DST-GC-1 and the top-tier determinism contract, which "production also leaves order unspecified"
+> does not excuse: unspecified-in-production makes **any** fixed order *sound* (⊆ real), while replay
+> requires the *chosen* order be a pure function of the run's own activity, which registration order
+> is. The order is deterministic-for-replay, **not** a documented ordering contract for SUTs:
+> production gives none, and a SUT depending on finalizer order is out of spec regardless. A SUT that
+> observes finalizer effects only at quiescence boundaries (the natural `synctest` observation
+> points) sees a deterministic set; one that depends on per-cycle discovery timing is relying on
+> behaviour production also leaves unspecified. Registration order is the deterministic *default*,
+> not a foreclosure: production can exhibit other orders, so a seeded/strategy-driven permutation of
+> the drain batch is a legitimate future exploration axis — it slots in at the same point (order the
+> batch before running it) with no representation change. (The registration-order leg lands with the
+> GC-determinism chunk; until then drain order is sweep order — sound but not replay-stable.)
 
 Draining **at quiescence** (above) is what realizes this: by a quiescence point every mid-burst GC's
 queue plus a fresh quiescence GC have been folded in, so the drained set is the deterministic dead set.
@@ -369,14 +389,21 @@ a channel-touching tail) fatals after teardown without the fixpoint; the long-ch
 `bgscavenge` is timer/`nanotime`-driven (`mgcscavenge.go:507` `slept = nanotime() - start`, plus the
 `s.timer` sleep) and so nondeterministic, but
 logically transparent (it returns free pages to the OS; it changes RSS, not program semantics). **[R]**
-**Mechanism:** under DST, park it permanently (gate `scavenger.wake`/`ready`, or set its goals
-unreachable). Observable only by a SUT that reads RSS — see D6. **[C]**
+**Mechanism:** under DST, park it permanently. As built: gate `scavenger.wake()` alone — outcome-
+equivalent to gating both `wake` and `ready`, because `ready()` only sets `sysmonWake` and every
+path that would run the scavenger funnels through `wake()`, where the gate sits. Observable only by
+a SUT that reads RSS — see D6. **[C]**
 
 #### D6 — Memory-pressure faithfulness & `GOMEMLIMIT` (dimension 12); upstreamability
 
 Because the per-bubble relative trigger (A.5) reuses production's GOGC ratio, a memory-pressure-adaptive
-SUT sees a **production-plausible** GOGC heap trajectory: the heap grows to the GOGC ratio of the
-bubble's live set, then STW GC. `NumGC` under GOGC is deterministic (the GC-set-level guarantee), and
+SUT sees a **production-plausible** GOGC heap trajectory *between quiescence points*: the heap grows to
+the GOGC ratio of the bubble's live set, then STW GC. The plausibility claim is bounded honestly: the
+drain machinery also runs **one full GC at every quiescence point** (D4), so a timer-driven SUT that
+blocks often sees `NumGC` far above what GOGC alone would produce and a heap that rarely approaches the
+GOGC ratio between blocks — deterministic and sound (GC timing is unspecified; an extra collection is
+always a real execution), but not the production *cadence*, and a performance cliff for long virtual
+horizons. `NumGC` under GOGC is deterministic (the GC-set-level guarantee), and
 `ReadMemStats` is deterministic at observable granularity for `NumGC`; `HeapAlloc`/`NextGC` carry the
 sub-observable byte-noise of the heap trigger (D2), so a SUT that branches coarsely on `MemStats`
 replays, one that compares them byte-exactly may see noise. Weak-pointer clearing (dimension 7) is
@@ -662,7 +689,20 @@ made deterministic" subsection below the table):
 All four layers are unconditional. Every DST heap-trigger crossing fires on `dstHeapAlloc` (per-object
 allocated bytes): the floored case (`target == heapMinimum`), the GOGC-scaled case
 (`target == (heapMarked − base)·GOGC/100`), and the `Options.MemoryLimit` case (the bubble's net heap
-`bubbleMarked + dstHeapAlloc` vs the limit). The set-level test (`numGC` + total finalizers,
+`bubbleMarked + dstHeapAlloc` vs the limit). Two closure conditions make the per-cycle row hold beyond
+the channel-light workloads that first validated it (both land with the GC-determinism chunk):
+
+- **Per-P pool normalization at activation.** `clearpools` deliberately leaves per-P caches alone
+  (sudog, defer) and per-P `gFree` lists also survive across runs — so whether a bubble channel op or
+  `go` statement must *refill* a cache (a heap allocation through the trigger counter) depended on
+  pre-run process history, moving the crossing point for channel/goroutine-heavy SUTs (the same noise
+  DST-MEMALLOC-DET documents on the sibling counter). `dstActivate` flushes the per-P sudog/defer
+  caches and `gFree` to a fixed empty state, so refill points are a function of the schedule alone.
+  The per-cycle discovery test gains a channel/goroutine-heavy regime to pin this.
+- **The crossing fires on the bubble's own allocation.** The trigger test is evaluated (and the GC it
+  arms is started) only for allocations by bubble goroutines — a crossing latched by a bubble
+  allocation that cannot start GC at that point (e.g. `m.locks > 1`) must not leak the *start* to
+  whichever process-wide allocation happens next (a foreign/infra goroutine at an unseeded point). The set-level test (`numGC` + total finalizers,
 `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial discovery for the
 floored, GOGC-scaled, and `MemoryLimit` regimes, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in
 all builds.
