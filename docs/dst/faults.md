@@ -140,8 +140,9 @@ tolerate*, so it cannot be a single global clock.
   `simulation.DriftClock(host, ppb)` changes it mid-run; the wall reading drifts, and a relative timer's
   host-duration `d` is converted to base `d/rate` at the single timer arm choke (`runtime.dstTimerArmForDrift`
   at `(*timer).modify`), so a rate-r host's `d`-timer fires after `d/r` of base. A mid-run change re-anchors
-  the wall (continuous) and re-maps every armed timer of the host. Seeded (fault-RNG-drawn) drift is deferred
-  (`docs/issues/clock-drift-dynamic.md`). See "Clock faults".
+  the wall (continuous) and re-maps every armed timer of the host. Seeded (per-run, seed-drawn) drift is
+  `simulation.BoundedDrift(maxPPB)` — a per-host rate in `[-maxPPB, +maxPPB]` ppb from a stateless hash of
+  (seed, host id), advancing no RNG stream (`TestDSTClockBoundedDriftSeeded`). See "Clock faults".
 
 ### Per-process identity and memory accounting
 
@@ -647,9 +648,12 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   `clock_drift_dynamic_test.go`), mutation-tested, incl. a `big.Int` oracle for the conversion, a direct
   overflow-clamp regression, and the unheaped-timer re-map; the re-declaration contract is enforced by
   `TestDSTClockDrift{ResetByRedeclare,RedeclareSameRate}` and `TestDSTClockRedeclareRemapsPendingTimer`
-  (`runtime.dstReestablishHostClock` — re-map at the old rate, overwrite the offset, reset the anchor). **Deferred**
-  (`docs/issues/clock-drift-dynamic.md`): the fault-RNG-drawn (seeded) rate. The `wall = f_h(base)`
-  representation does not change for it.
+  (`runtime.dstReestablishHostClock` — re-map at the old rate, overwrite the offset, reset the anchor). The
+  seed-drawn (bounded) rate is **`BoundedDrift(maxPPB)`** — a per-host ppb in `[-maxPPB, +maxPPB]` from a
+  stateless hash of (seed, host id) via `runtime.dstHostSeededDriftPPB` (an independent salt from the seeded
+  skew, advancing no RNG stream), resolved at host declaration through the same `dstReestablishHostClock`
+  choke, so the `wall = f_h(base)` representation is unchanged and it is stable across a restart
+  (`TestDSTClockBoundedDriftSeeded`).
 
 **Wall representability (recorded boundary).** The bubble wall is int64 nanoseconds. A skew or
 step that would take a host's wall before the **epoch** is rejected with a panic at application —
@@ -852,8 +856,8 @@ adversarial loop.
   uid / cwd, per-**process** allocation accounting. Establishes DST-NODE-ISOLATION and DST-CLOCK-DET. No
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
-  clock **step** — **done**, **drift** (constant rate + mid-run `DriftClock`) — **done** (seeded drift
-  deferred, `docs/issues/clock-drift-dynamic.md`); disk **EIO** / **ENOSPC** / **latency** — **done**;
+  clock **step** — **done**, **drift** (constant `Drift` + mid-run `DriftClock` + seed-drawn `BoundedDrift`)
+  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**;
   scheduling (straggler), OOM (allocation-triggered process crash), process crash + host crash, restart —
   pending. Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded

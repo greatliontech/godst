@@ -35,6 +35,9 @@ func dstReestablishHostClock(host uint32, offset, ppb int64) bool
 //go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
 func dstHostSeededClockOffset(hostid uint32, bound int64) int64
 
+//go:linkname dstHostSeededDriftPPB runtime.dstHostSeededDriftPPB
+func dstHostSeededDriftPPB(hostid uint32, maxPPB int64) int64
+
 //go:linkname dstSetHostIdent runtime.dstSetHostIdent
 func dstSetHostIdent(host uint32, hostname string, numcpu int)
 
@@ -101,16 +104,18 @@ const (
 // host. Drift (rate ≠ 1) additionally makes the host's wall advance faster/slower than
 // base and its relative timers fire after the rate-converted interval — a crystal that
 // runs fast or slow, which time-sensitive distributed systems must tolerate. Build one
-// with Skew (a fixed offset), BoundedSkew (a per-host seeded offset), or Drift (a rate);
-// compose skew and drift with Skew(d).WithDrift(ppb). The zero value is an in-sync clock.
-// A step (an NTP jump) is injected mid-run by StepClock, and a mid-run rate change by
-// DriftClock; only the fault-RNG-drawn (seeded) rate remains a follow-on
-// (docs/issues/clock-drift-dynamic.md).
+// with Skew (a fixed offset), BoundedSkew (a per-host seeded offset), Drift (a fixed
+// rate), or BoundedDrift (a per-host seeded rate); compose skew and drift with
+// Skew(d).WithDrift(ppb) or Skew(d).WithBoundedDrift(maxPPB). The zero value is an
+// in-sync clock. A step (an NTP jump) is injected mid-run by StepClock, and a mid-run
+// rate change by DriftClock.
 type ClockConfig struct {
-	seeded   bool          // false: fixed offset; true: offset seeded within ±bound
-	offset   time.Duration // static wall offset (when !seeded)
-	bound    time.Duration // seeded offset is drawn from [-bound, +bound] (when seeded)
-	driftPPB int64         // clock-rate departure in parts-per-billion (0 = rate 1)
+	seeded      bool          // false: fixed offset; true: offset seeded within ±bound
+	offset      time.Duration // static wall offset (when !seeded)
+	bound       time.Duration // seeded offset is drawn from [-bound, +bound] (when seeded)
+	driftPPB    int64         // clock-rate departure in parts-per-billion (0 = rate 1; used when !driftSeeded)
+	driftSeeded bool          // true: rate departure seeded within ±driftBound
+	driftBound  int64         // seeded rate is drawn from [-driftBound, +driftBound] ppb (when driftSeeded)
 }
 
 // Skew returns a ClockConfig that puts the host's wall clock a fixed offset ahead
@@ -152,6 +157,31 @@ func (c ClockConfig) WithDrift(ppb int64) ClockConfig {
 		panic("testing/simulation: Drift ppb out of range (-1e9, 1e9]; rate must be in (0, 2]")
 	}
 	c.driftPPB = ppb
+	c.driftSeeded = false
+	return c
+}
+
+// BoundedDrift returns a ClockConfig whose clock RATE departure is drawn
+// deterministically from the run seed within [-maxPPB, +maxPPB] parts-per-billion,
+// independently per host — the drift analogue of BoundedSkew. It is stable within a run
+// (and across a host restart) and varies with the seed, so sweeping the seed
+// (Test/Explore) sweeps the bounded rate-assignment space rather than pinning one rate
+// by hand. maxPPB must be in [0, 1e9) — every drawn rate 1 + ppb/1e9 then stays in
+// (0, 2) (a stopped or reversed clock is a step, not drift); BoundedDrift panics
+// otherwise. A zero maxPPB is no drift. Compose with a skew via Skew(d).WithBoundedDrift(maxPPB).
+func BoundedDrift(maxPPB int64) ClockConfig {
+	return ClockConfig{}.WithBoundedDrift(maxPPB)
+}
+
+// WithBoundedDrift returns a copy of c with a seeded rate departure bounded by ±maxPPB
+// (see BoundedDrift), so a skew and a seeded drift compose. It panics if maxPPB is out
+// of [0, 1e9).
+func (c ClockConfig) WithBoundedDrift(maxPPB int64) ClockConfig {
+	if maxPPB < 0 || maxPPB >= driftPPBBase {
+		panic("testing/simulation: BoundedDrift maxPPB out of range [0, 1e9); every drawn rate must stay in (0, 2)")
+	}
+	c.driftBound = maxPPB
+	c.driftSeeded = true
 	return c
 }
 
@@ -163,6 +193,16 @@ func (c ClockConfig) offsetNanos(hostid uint32) int64 {
 		return dstHostSeededClockOffset(hostid, int64(c.bound))
 	}
 	return int64(c.offset)
+}
+
+// driftPPBForHost resolves the configured clock rate to a concrete ppb for the given
+// host id. The seeded case asks the runtime, which hashes the run seed with the host id
+// (advancing no RNG stream), so a bounded drift replays and is stable across a restart.
+func (c ClockConfig) driftPPBForHost(hostid uint32) int64 {
+	if c.driftSeeded {
+		return dstHostSeededDriftPPB(hostid, c.driftBound)
+	}
+	return c.driftPPB
 }
 
 // nodeReg interns Host/Process names to the integer ids the runtime carries on each
@@ -258,7 +298,7 @@ func Host(name string, config HostConfig, f func()) {
 	// Setting only the offset (the earlier shape) left a "restarted, in-sync" host
 	// reading ahead of base and sleeping at the old rate — self-consistent to its own
 	// probes, wrong against the base clock.
-	if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPB) {
+	if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPBForHost(hid)) {
 		dstSetNode(oldH, oldP)
 		panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 	}

@@ -723,6 +723,36 @@ func dstHostSeededClockOffset(hostid uint32, bound int64) int64 {
 	return int64(x%span - uint64(bound))
 }
 
+// dstHostSeededDriftPPB returns a deterministic per-host clock-rate departure in
+// [-maxPPB, +maxPPB] parts-per-billion, a stateless function of the run seed and the
+// host id (testing/simulation.BoundedDrift) — the drift analogue of
+// dstHostSeededClockOffset. It uses an INDEPENDENT salt, so a host's seeded rate and
+// its seeded skew (BoundedSkew) are drawn independently; and it advances no RNG stream
+// — neither a per-g tree nor the scheduling RNG — so seeding a rate can neither perturb
+// the interleaving nor shift any other draw, and the rate is stable across a host
+// re-declaration (restart) because it depends only on (seed, host id). Sweeping the run
+// seed sweeps the whole bounded rate-assignment space. The caller (BoundedDrift) bounds
+// maxPPB to [0, dstDriftPPBBase) so -maxPPB > -dstDriftPPBBase and every drawn rate
+// stays positive. A non-positive maxPPB is no drift. Reached via //go:linkname.
+//
+//go:linkname dstHostSeededDriftPPB
+func dstHostSeededDriftPPB(hostid uint32, maxPPB int64) int64 {
+	if maxPPB <= 0 {
+		return 0
+	}
+	// splitmix64 finalizer over (seed, drift-salt, host id): stateless, advances nothing.
+	// The salt differs from dstHostSeededClockOffset's so rate and skew draw independently.
+	x := dstSeed.Load() ^ 0xD817D817D817D817 ^ (uint64(hostid) * 0x9e3779b97f4a7c15)
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	// Map uniformly into [-maxPPB, maxPPB]: compute the span and centering in uint64 so
+	// neither 2*maxPPB nor the subtraction overflows (maxPPB < 1e9, so the result lands
+	// in range for r < maxPPB the uint64 subtraction wraps to the correct negative).
+	span := 2*uint64(maxPPB) + 1
+	return int64(x%span - uint64(maxPPB))
+}
+
 // dstHeapBase is the process-live heap snapshot taken at bubble entry (after a
 // forced GC). The DST heap trigger (gcTrigger.test) fires on the bubble's growth
 // relative to this baseline, so the process's pre-bubble heap history — which

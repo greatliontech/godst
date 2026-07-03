@@ -8,10 +8,7 @@ deletes the resolved entry.
 
 ## Open
 
-- [clock-drift-dynamic](clock-drift-dynamic.md) — `Lands:` seeded/fault-RNG drift with
-  fault orchestration. The declared constant-rate (`Drift`) and mid-run (`DriftClock`)
-  drift legs landed; only the spec's **fault-RNG-drawn** (seeded `BoundedDrift`) leg is
-  deferred.
+_(none)_
 
-The remaining planned roadmap work (the rest of fault orchestration) is tracked in
+The remaining planned roadmap work (fault orchestration / Explore) is tracked in
 the design.md Roadmap, not here — it gets an issue doc when it is scoped into chunks.

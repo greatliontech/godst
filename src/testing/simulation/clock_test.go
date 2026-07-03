@@ -629,3 +629,55 @@ func TestDSTFaultVictimOutsideRunNoop(t *testing.T) {
 	Partition("nobody", "nobody-else")
 	ResetProcess("nobody") // none of these may panic outside a run
 }
+
+// TestDSTClockBoundedDriftSeeded checks BoundedDrift: the clock RATE departure is
+// within the bound, is a deterministic function of (seed, host) — stable across a host
+// re-declaration (restart) and reproducible at a fixed seed — and varies across seeds
+// (the permutation knob for exploring bounded drift). It is observed via base advance:
+// a rate-r host's time.Sleep(d) takes d/r of base time, so the measured base interval
+// is a pure function of the seeded rate. Drawing it advances no RNG stream, which the
+// restart-stability check exercises (mirrors TestDSTClockBoundedSeeded for skew).
+func TestDSTClockBoundedDriftSeeded(t *testing.T) {
+	const maxPPB = 100_000_000 // ±0.1 → rate in [0.9, 1.1]
+	const hostSleep = time.Second
+	// baseFor measures the BASE time a 1s host-sleep takes under the seeded rate.
+	baseFor := func(seed uint64, name string, checkRestart bool) time.Duration {
+		var base time.Duration
+		Run(seed, func() {
+			measure := func() time.Duration {
+				start := time.Now() // root = base
+				done := make(chan struct{})
+				Host(name, HostConfig{Clock: BoundedDrift(maxPPB)}, func() {
+					go func() { time.Sleep(hostSleep); close(done) }()
+				})
+				<-done
+				return time.Since(start)
+			}
+			base = measure()
+			if checkRestart {
+				if got := measure(); got != base { // restart: same seed+host → same rate
+					t.Errorf("restart of host %q changed seeded rate: base %v != %v (must depend only on seed+host)", name, got, base)
+				}
+			}
+		})
+		return base
+	}
+	// base = hostSleep/rate; rate in [1-maxPPB/1e9, 1+maxPPB/1e9] → base in [lo, hi].
+	// The runtime converts the sleep with CEIL rounding, so allow the extreme-rate base
+	// to exceed the floor-computed hi by the ≤1ns round-up (lo is safe: ceil ≥ floor).
+	lo := time.Duration(int64(hostSleep) * driftPPBBase / (driftPPBBase + maxPPB))
+	hi := time.Duration(int64(hostSleep)*driftPPBBase/(driftPPBBase-maxPPB)) + 1
+	if b := baseFor(1, "h", true); b < lo || b > hi {
+		t.Errorf("BoundedDrift base advance %v out of [%v, %v] (rate out of bound)", b, lo, hi)
+	}
+	if a, b := baseFor(7, "h", false), baseFor(7, "h", false); a != b {
+		t.Errorf("BoundedDrift rate not reproducible at same seed: %v != %v", a, b)
+	}
+	seen := map[time.Duration]bool{}
+	for seed := uint64(1); seed <= 12; seed++ {
+		seen[baseFor(seed, "h", false)] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("BoundedDrift rate identical across 12 seeds (%v); the seed must vary the rate", seen)
+	}
+}
