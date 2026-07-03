@@ -8,13 +8,6 @@ deletes the resolved entry.
 
 ## Open
 
-- [net-partition-refuse-connect](net-partition-refuse-connect.md) — `Lands:` when
-  peer-down connect semantics are needed (the next network-fault increment). The
-  partition fault implements the blackhole connect mode; the settled spec also
-  allows a selectable **refuse** (`ECONNREFUSED`) mode, deferred.
-- [net-partition-directional](net-partition-directional.md) — `Lands:` when
-  asymmetric-partition scenarios are needed. The partition fault implements
-  **symmetric** cuts; the spec also allows **one-directional** partitions, deferred.
 - [clock-drift-dynamic](clock-drift-dynamic.md) — `Lands:` seeded/fault-RNG drift with
   fault orchestration. The declared constant-rate (`Drift`) and mid-run (`DriftClock`)
   drift legs landed; only the spec's **fault-RNG-drawn** (seeded `BoundedDrift`) leg is

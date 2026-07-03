@@ -867,12 +867,15 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	}
 
 	dialerHost, dialerProc := dstNetCurrentNode()
-	// Partition (blackhole connect): a Dial across a cut link drops the SYN — it
-	// blocks until the link heals, the context/deadline expires, or the retransmit
-	// horizon fires ETIMEDOUT (a real kernel's exhausted SYN retries, so a
-	// deadline-less dial into a permanent partition fails in bounded virtual time
-	// rather than hanging forever). The target host is the routable IP's owner; a
-	// loopback/own-host target is never partitioned.
+	// Partition on connect: a Dial across a cut link either REFUSES (the peer answers
+	// RST → ECONNREFUSED, fast) or BLACKHOLES (the SYN is dropped → the dial blocks
+	// until the link heals, the context/deadline expires, or the retransmit horizon
+	// fires ETIMEDOUT — a real kernel's exhausted SYN retries, so a deadline-less dial
+	// into a permanent blackhole fails in bounded virtual time rather than hanging).
+	// The mode is selectable per fault (Partition vs PartitionRefuse); the cut is
+	// checked in BOTH handshake directions (SYN dialer→target, SYN-ACK target→dialer)
+	// so a one-directional partition of either also fails the connect. The target host
+	// is the routable IP's owner; a loopback/own-host target is never partitioned.
 	targetHost := dialerHost
 	if h, ok := dstHostForRoutableIP(ip); ok {
 		targetHost = h
@@ -881,8 +884,12 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	blockStart := int64(-1) // base-time the dial first blocked; -1 = not yet blocked
 	for {
 		wake := dstPartWakeCh()
-		if !dstPartitioned(dialerHost, targetHost) {
+		cut, refuse := dstDialCut(dialerHost, targetHost)
+		if !cut {
 			break
+		}
+		if refuse {
+			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 		}
 		if blockStart < 0 {
 			blockStart = dstBaseNanos()

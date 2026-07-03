@@ -11,12 +11,15 @@ import _ "unsafe" // for go:linkname
 // They name hosts (the same names passed to Host); the call interns the name to the
 // host id the network keys connections by, and drives the partition through
 // runtime's always-linked passthrough into net (so simulation needs no direct
-// dependency on net). Partitioning is symmetric and at flow granularity: a cut
-// link refuses new dials (they block until the link heals or the dial's
-// context/deadline expires) and blackholes established connections (reads block,
-// writes keep buffering); a heal resumes in-order delivery with no byte loss
-// (DST-FAULT-SOUND). Calls outside a run, or in a run whose binary does not link
-// net, are no-ops (there is no network to cut). Call them from within a Run.
+// dependency on net). Partitioning is at flow granularity. The default Partition is
+// symmetric and blackholes: a cut link drops new dials' SYNs (they block until the
+// link heals or the dial's context/deadline/retransmit-horizon expires) and holds
+// established connections (reads block, writes buffer then block); a heal resumes
+// in-order delivery with no byte loss (DST-FAULT-SOUND). Two mode variants: PartitionRefuse
+// makes dials fail ECONNREFUSED fast (peer-down) instead of blackholing, and
+// PartitionOneWay cuts a single direction (from→to) while the reverse still flows.
+// Calls outside a run, or in a run whose binary does not link net, are no-ops (there
+// is no network to cut). Call them from within a Run.
 
 //go:linkname dstNetPartitionOp runtime.dstNetPartitionOp
 func dstNetPartitionOp(op, a, b uint32)
@@ -29,6 +32,8 @@ const (
 	partOpHealHost
 	partOpResetPair
 	partOpResetProc
+	partOpPartitionOneWay
+	partOpPartitionRefuse
 )
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections
@@ -54,6 +59,29 @@ func Isolate(host string) {
 // HealHost restores a host isolated by Isolate.
 func HealHost(host string) {
 	dstNetPartitionOp(partOpHealHost, lookupHost(host), 0)
+}
+
+// PartitionOneWay cuts ONLY the direction from→to (asymmetric): from's writes never
+// reach to (and to's dials of from time out), while to→from still delivers. This is a
+// real failure mode — asymmetric routing, a firewall dropping one direction — and a
+// classic distributed-systems adversary. Heal(from, to) restores it (Heal clears both
+// directions). Same victim-naming rules as Partition.
+func PartitionOneWay(from, to string) {
+	dstNetPartitionOp(partOpPartitionOneWay, lookupHost(from), lookupHost(to))
+}
+
+// PartitionRefuse cuts the link between hosts a and b (symmetric) in REFUSE mode: a
+// Dial across the cut fails fast with ECONNREFUSED (the peer answers RST — "peer down"
+// semantics), where Partition instead blackholes the dial (the SYN is dropped, the
+// dial blocks). Both are real TCP outcomes a SUT tests against; the choice is the
+// SUT's. Established connections behave as under Partition (reads block, writes buffer
+// then block); the mode governs only new connects. Heal(a, b) restores it. The refuse
+// returns immediately, not after a half-RTT SYN traversal — the same recorded timing
+// simplification a direct ECONNREFUSED to a declared-but-unlistened port carries. If
+// the pair is ALSO isolated or blackhole-cut, the drop wins and the dial blackholes
+// (a dropped SYN elicits no RST), never a false ECONNREFUSED.
+func PartitionRefuse(a, b string) {
+	dstNetPartitionOp(partOpPartitionRefuse, lookupHost(a), lookupHost(b))
 }
 
 // Reset injects ECONNRESET on every active connection between hosts a and b (in

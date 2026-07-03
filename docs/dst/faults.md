@@ -452,20 +452,34 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   they **stay readable during the cut** — a partition severs the link, never data the receiver already
   holds; blackholing pre-delivered bytes fails a read a real kernel serves (a sim-only failure, the
   false-positive class the Soundness invariant forbids). The reader's arrival horizon is capped at the
-  cut-start (`dstPartCutStart`): bytes delivered strictly before the cut are readable, in-flight and
-  after-cut bytes are held (`TestDSTNetPartitionPreDeliveredReadable` / `TestDSTNetPartitionRecover`).
-  DoF: a transient partition. **Landed**
-  (blackhole mode) via the imperative targeting API
-  `simulation.Partition(a,b)` / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)` (the mechanism; the declarative
-  `Options.Faults` + per-fault mode is L4). It drives a per-run host-pair/isolated-host table in net
-  (`net/dst_partition.go`) — keyed by the conn's host attribution (`dstConn.localHost`/`remoteHost`), so a
-  cut touches exactly the targeted pair's cross-host conns (DST-FAULT-VICTIM). ALL conns are
+  cut-start of the INCOMING direction (`dstPartCutStartDir(peer→local)`): bytes delivered strictly before
+  the cut are readable, in-flight and after-cut bytes are held (`TestDSTNetPartitionPreDeliveredReadable`
+  / `TestDSTNetPartitionRecover`). DoF: a transient partition. **Landed** via the imperative targeting API
+  `simulation.Partition(a,b)` (symmetric blackhole) / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)`, plus the
+  two mode variants: `PartitionRefuse(a,b)` — a Dial across the cut fails `ECONNREFUSED` fast rather than
+  blackholing (`TestDSTNetPartitionRefuseConnect`) — and `PartitionOneWay(from,to)` — an **asymmetric** cut
+  of only `from→to` while `to→from` still flows (`TestDSTNetPartitionOneWay`). (The declarative
+  `Options.Faults` + per-fault mode is L4.) It drives a per-run **directional** cut table in net
+  (`net/dst_partition.go`, `dstPart.dirs` keyed by ordered `from→to` with a per-cut `refuse` mode; a
+  symmetric cut sets both directions) — keyed by the conn's host attribution
+  (`dstConn.localHost`/`remoteHost`), so a cut touches exactly the targeted pair's cross-host conns in the
+  cut direction (DST-FAULT-VICTIM). A dial checks BOTH handshake directions (SYN dialer→target, SYN-ACK
+  target→dialer), so a one-directional cut of either fails the connect. A refuse cut fails the dial
+  IMMEDIATELY (no ½-RTT SYN traversal), the same recorded timing simplification the direct
+  declared-host `ECONNREFUSED` carries (design.md "Connect cost"). **Blackhole dominates refuse**: if a
+  drop source (an isolated endpoint, or a blackhole-mode cut) is active on either handshake direction,
+  the dial blackholes even when a refuse cut is also present — a dropped SYN elicits no RST, so
+  reporting `ECONNREFUSED` there would be a sim-only false failure (`dstDialCut`;
+  `TestDSTNetPartitionRefuseWithIsolateBlackholes`). ALL conns are
   **wire-backed** (the buffered transport — itself the faithful TCP send-buffer shape), so writes
   during a cut queue up to the buffer bound and **flush in order on heal with no loss** (DST-NET-FIFO +
-  the sound buffer-and-recover model). The connect **refuse** mode (`ECONNREFUSED`) is deferred
-  (`docs/issues/`); blackhole is the harder, realistic case. **"Drop" lives here**, at flow granularity — a partition window
+  the sound buffer-and-recover model). **"Drop" lives here**, at flow granularity — a partition window
   drops everything between A↔B; there is *no* single-byte drop on a live stream (TCP forbids it — that is
-  the UDP follow-on).
+  the UDP follow-on). *Recorded flow-level abstraction:* under a **permanent** one-directional cut the
+  reverse direction keeps delivering indefinitely — the sim models the cut at flow granularity and does
+  not reproduce ACK-starvation (a real sender stalls and eventually `ETIMEDOUT`s when its ACKs travel the
+  cut direction). This is a *completeness* limit (the sim MISSES a real fault — the safe, ⊆-real
+  direction), never a false failure; ACK-level reverse death is a possible finer-grained follow-on.
 - **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns, reusing the conn's
   existing `resetConn()` (already wired for backlog teardown: peer reads & writes then carry `ECONNRESET`).
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and

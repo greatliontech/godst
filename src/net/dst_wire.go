@@ -342,7 +342,10 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		// in order once the link heals — the sound buffer-and-recover model.
 		wake := dstPartWakeCh()
 		maxArrival := dstBaseNanos()
-		cutStart, cut := dstPartCutStart(e.localHost, e.peerHost)
+		// Reads receive data flowing peer→local, so the INCOMING direction governs the
+		// hold: a one-directional cut of peer→local blocks these reads while local→peer
+		// (this end's writes) still flows.
+		cutStart, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost)
 		if cut {
 			// A byte counts as arrived-before-the-cut only if it was delivered
 			// STRICTLY before the cut began: cutStart-1 is the inclusive horizon.
@@ -449,7 +452,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			wake := dstPartWakeCh()
 			var horizonC <-chan time.Time
 			var horizonT *time.Timer
-			if e.retransNs > 0 && dstPartitioned(e.localHost, e.peerHost) {
+			if e.retransNs > 0 && dstPartitionedDir(e.localHost, e.peerHost) { // outgoing local→peer is where a write's bytes are held
 				if cutStart < 0 {
 					cutStart = dstBaseNanos() // the cut-block began; a heal resets it, restarting the timer on ACK progress
 				}
