@@ -1224,6 +1224,20 @@ func TestDSTCryptoRandDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTCryptoUnseededGoroutine is the INV-CRYPTO unseeded-leg regression: a
+// goroutine started before the run (dstrand==0) that reads crypto/rand DURING the run
+// must get real OS entropy, not the fixed zero-rooted stream — so its bytes differ
+// across processes. The bug fills from the zero-rooted (seed-independent, deterministic)
+// stream, making them identical. Mutation: removing the gp.dstrand==0 gate in
+// dstReadRandom makes the two runs' bytes identical.
+func TestDSTCryptoUnseededGoroutine(t *testing.T) {
+	a := strings.TrimSpace(runTestProgDST(t, "DSTCryptoUnseededGoroutine", "DSTSEED=1"))
+	b := strings.TrimSpace(runTestProgDST(t, "DSTCryptoUnseededGoroutine", "DSTSEED=1"))
+	if a == "" || a == b {
+		t.Fatalf("a pre-run (unseeded) goroutine's in-run crypto/rand is deterministic across processes (predictable entropy — the zero-rooted stream leak):\na=%q\nb=%q", a, b)
+	}
+}
+
 // TestDSTIdentityGroups verifies the simulated group list and the minimal
 // simulated user/group database (the simulated user and its group resolve by
 // name and id; everything else is deterministically unknown; host values
@@ -1330,6 +1344,31 @@ func TestDSTSchedSystemIsolation(t *testing.T) {
 	if rngDraws != decisions-sysScheds {
 		t.Fatalf("scheduling RNG drew for system goroutines (not isolated): rngDraws=%d, want decisions-sysScheds=%d-%d=%d",
 			rngDraws, decisions, sysScheds, decisions-sysScheds)
+	}
+}
+
+// TestDSTPCTNonBubbleCreation is the M1 regression: a goroutine creation by a
+// non-bubble goroutine must not consume a PCT priority draw (drawn from the scheduling
+// RNG at creation), or it shifts the measured goroutines' priorities and interleaving.
+// Mutation: dropping the callergp.bubble == dstSimBubble gate on dstPCTAssignPrio makes
+// the testprog print "PCT schedule perturbed by non-bubble creation".
+func TestDSTPCTNonBubbleCreation(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTPCTNonBubbleCreation", "DSTSEED=12345"))
+	if out != "done" {
+		t.Fatalf("non-bubble creation perturbed the PCT schedule (creation-side draw not isolated):\n%s", out)
+	}
+}
+
+// TestDSTPCTMainDrawsPriority is the H1 regression: bubble.main is a simulation
+// goroutine and MUST draw a PCT priority at creation, even though synctestRun creates
+// it BEFORE claiming dstSimBubble (so a naive callergp.bubble == dstSimBubble gate
+// misses it). Reads bubble.main's dstPrio inside a PCT run: it must be nonzero (drawn).
+// Mutation: gating dstPCTAssignPrio on callergp.bubble == dstSimBubble alone leaves
+// bubble.main at dstPrio 0 (always lowest in PCT selection).
+func TestDSTPCTMainDrawsPriority(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTPCTMainDrawsPriority", "DSTSEED=12345"))
+	if out != "nonzero" {
+		t.Fatalf("bubble.main PCT priority = %q, want nonzero (bubble.main did not draw a priority — it sits at 0, always lowest)", out)
 	}
 }
 

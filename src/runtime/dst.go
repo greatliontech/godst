@@ -123,7 +123,11 @@ func dstActivate(seed uint64) {
 	// goroutine creation establishing happens-before) or is the caller itself,
 	// rooted here; a synctest bubble re-roots its main independently. The store
 	// order just avoids the caller observing dstActive with an unrooted dstrand.
-	getg().dstrand = dstBubbleRoot(seed)
+	if r := dstBubbleRoot(seed); r != 0 {
+		getg().dstrand = r
+	} else {
+		getg().dstrand = 1 // keep a seeded root nonzero (dstReadRandom's unseeded sentinel is dstrand==0)
+	}
 	// Root the caller's host/process identity at the default (0,0); the bubble
 	// main re-roots to (0,0) too (synctestRun), and Host/Process stamp subtrees
 	// from there. Only bubble goroutines are attributed: a goroutine that already
@@ -429,30 +433,66 @@ func dstStepHostClock(host uint32, delta int64) bool {
 // stamped on the timer (t.dstReg), which also discards a timer object reused from a prior
 // run. The list keeps its timers alive until the run ends (bounded per run, reset by
 // epoch) — acceptable for the simulation path, where it removes the need to hook every
-// timer disarm. Accessed only from in-bubble code (modify, DriftClock) under the
-// cooperative single-P DST schedule, so it needs no lock, like the per-host clock table.
+// timer disarm.
+//
+// It is a LOCK-FREE intrusive prepend stack (head is an atomic pointer, timers linked by
+// t.dstFakeNext): the single-P Run path never contends, but the white-box dstActivate
+// path runs at GOMAXPROCS>1 (its documented purpose), where two goroutines in different
+// synctest bubbles on different Ms could arm fake timers concurrently and race a plain
+// slice append. CAS-prepend serializes it with no lock, so it adds no lock-rank edge (the
+// register path is reached from (*timer).modify BEFORE modify takes the timer's own
+// lock). A given timer is armed by one goroutine, so its own t.dstReg/t.dstFakeNext are
+// never concurrently written; only the shared head races, which the CAS handles.
 var dstFakeTimers struct {
-	epoch uint64
-	list  []*timer
+	epoch atomic.Uint64
+	head  atomic.Pointer[timer]
 }
 
-// dstFakeTimersRoll resets the list at the start of a new run (epoch change).
+// dstFakeTimersRoll resets the stack at the start of a new run (epoch change). The CAS
+// makes the reset fire exactly once across concurrent arrivals at a new epoch.
 func dstFakeTimersRoll() {
-	if e := dstRunEpoch.Load(); e != dstFakeTimers.epoch {
-		dstFakeTimers.epoch = e
-		dstFakeTimers.list = nil
+	e := dstRunEpoch.Load()
+	old := dstFakeTimers.epoch.Load()
+	if e != old && dstFakeTimers.epoch.CompareAndSwap(old, e) {
+		dstFakeTimers.head.Store(nil)
 	}
 }
 
-// dstRegisterFakeTimer records a fake timer in the current run's list on its first arm.
-// Called from (*timer).modify under dstActive && t.isFake. Idempotent within a run via
-// the epoch stamp, so re-arms (Reset, a repeated Sleep on a reused timer) do not duplicate
-// an entry — a duplicate would be re-mapped twice and corrupt its when.
+// dstFakeTimersReset drops the whole stack at a Run boundary (dstSetSimEnv/
+// dstClearSimEnv, both single-threaded), clearing each timer's dstFakeNext so a timer
+// that outlives the run does NOT transitively pin the timers registered before it in
+// the chain (a reused timer overwrites its own dstFakeNext at next registration, so
+// clearing here only matters for timers not re-armed).
+func dstFakeTimersReset() {
+	t := dstFakeTimers.head.Load()
+	dstFakeTimers.head.Store(nil) // single-threaded Run boundary: no concurrent prepend
+	for t != nil {
+		next := t.dstFakeNext
+		t.dstFakeNext = nil
+		t = next
+	}
+}
+
+// dstRegisterFakeTimer records a fake timer in the current run's stack on its first arm.
+// Called from (*timer).modify under dstActive && t.isFake (before modify takes t's own
+// lock). On the Run path, single-P cooperative scheduling serializes both the t.dstReg
+// dedup and the head prepend; the only concurrency is the white-box GOMAXPROCS>1 arm
+// path, where distinct timers race the shared head — a CAS-prepend serializes that
+// lock-free (a given timer is armed by one goroutine, so its own dstReg/dstFakeNext are
+// not concurrently written).
 func dstRegisterFakeTimer(t *timer) {
 	dstFakeTimersRoll()
-	if e := uint32(dstFakeTimers.epoch); t.dstReg != e {
-		t.dstReg = e
-		dstFakeTimers.list = append(dstFakeTimers.list, t)
+	e := uint32(dstFakeTimers.epoch.Load())
+	if t.dstReg == e {
+		return
+	}
+	t.dstReg = e
+	for {
+		head := dstFakeTimers.head.Load()
+		t.dstFakeNext = head
+		if dstFakeTimers.head.CompareAndSwap(head, t) {
+			return
+		}
 	}
 }
 
@@ -524,8 +564,12 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 		return // identity re-map
 	}
 	dstFakeTimersRoll()
-	epoch := uint32(dstFakeTimers.epoch)
-	for _, t := range dstFakeTimers.list {
+	epoch := uint32(dstFakeTimers.epoch.Load())
+	// DriftClock runs only on the single-P Run path, so the stack is not being
+	// prepended concurrently here; walk it directly from the atomic head. (The
+	// lock-free head exists for the white-box GOMAXPROCS>1 arm path, which never
+	// calls DriftClock.) Each timer is re-mapped under its own lock.
+	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
 		t.lock()
 		if t.dstReg == epoch && t.dstHost == host && t.when > now {
 			rem := dstDriftRemap(t.when-now, ppbOld, ppbNew)
@@ -867,6 +911,18 @@ func dstSchedStatsReset() {
 //go:linkname dstSchedOvfPutsFP
 func dstSchedOvfPutsFP() uint64 { return dstSchedOvfPuts }
 
+// dstSimMainPrioFP returns the active simulation bubble's main goroutine PCT priority
+// (0 if none / not PCT). A test asserts it is nonzero under PCT — bubble.main is created
+// before the bubble is claimed, so it must still be assigned a priority. Via //go:linkname.
+//
+//go:linkname dstSimMainPrioFP
+func dstSimMainPrioFP() int64 {
+	if dstSimBubble != nil && dstSimBubble.main != nil {
+		return dstSimBubble.main.dstPrio
+	}
+	return 0
+}
+
 //go:linkname dstSchedStatsFP
 func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64) {
 	return dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws
@@ -1057,7 +1113,7 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	dstSimPidNext.Store(int32(pid))
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
-	dstFakeTimers.list = nil
+	dstFakeTimersReset()
 }
 
 // dstClearSimEnv stops simulating process identity (run end).
@@ -1072,7 +1128,7 @@ func dstClearSimEnv() {
 	dstSimPidNext.Store(0)
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
-	dstFakeTimers.list = nil
+	dstFakeTimersReset()
 }
 
 // dstSetHostIdent records host's simulated hostname and NumCPU (numcpu 0 = use the

@@ -63,10 +63,10 @@ unified seam, `dstSchedSelect(candidates) → index`:
 - **PCT** (`simulation.RunWith{Strategy:PCT, Depth:d, Steps:K}`): Probabilistic Concurrency Testing. Each
   **simulation-bubble** goroutine gets a random base priority at creation (`g.dstPrio`, drawn from the
   scheduling RNG in `newproc1`, well above the change-point low band) — the creation-side draw is gated
-  on the creator's bubble exactly as the selection side is (system-goroutine isolation, design.md): a
-  foreign or non-bubble goroutine created mid-run consumes **no** scheduling-RNG draw, else every later
-  PCT priority would shift with process-composition noise (the gate lands with the scheduler-isolation
-  chunk). The seam runs the highest-priority runnable
+  on `callergp.bubble == dstSimBubble` exactly as the selection side is (system-goroutine isolation,
+  design.md): a foreign or non-bubble goroutine created mid-run consumes **no** scheduling-RNG draw,
+  else every later PCT priority would shift with process-composition noise
+  (`TestDSTPCTNonBubbleCreation`). The seam runs the highest-priority runnable
   goroutine (ties by goid, for determinism). `d−1` **priority-change points** are placed at random
   steps in `[1,K]` (re-rooted per bubble); when the step counter reaches one, the goroutine scheduled
   at that step is dropped to a low priority — the priority inversion that exposes a depth-`d` bug. PCT

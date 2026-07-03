@@ -4578,6 +4578,16 @@ func gdestroy(gp *g) {
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0
+	// Clear the DST per-g state so a recycled g cannot carry a prior run's identity
+	// or RNG root into a goroutine created BETWEEN runs (newproc1 only re-stamps
+	// these while a run is active). Otherwise a g recycled from run N's Host-5
+	// subtree, reused between runs, would report host 5 / that stream — and the
+	// unseeded-crypto gate keys on dstrand == 0, which a stale nonzero would defeat.
+	gp.dstrand = 0
+	gp.dstHost = 0
+	gp.dstProc = 0
+	gp.dstPid = 0
+	gp.dstPrio = 0
 
 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
 		// Flush assist credit to the global pool. This gives
@@ -5444,6 +5454,12 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// trackingSeq cheaprand below so the child's seed depends only on
 		// logical ancestry, not on runtime-internal per-m draws.
 		newg.dstrand = dstrandUint64(callergp)
+		if newg.dstrand == 0 {
+			// Keep a SEEDED per-g root nonzero: dstReadRandom reads dstrand == 0 as
+			// "unseeded, use real entropy", so a seeded child that happened to draw 0
+			// must not be misread. Measure-zero, but the sentinel must be unambiguous.
+			newg.dstrand = 1
+		}
 		// Inherit the host/process identity and the per-host clock offset from the
 		// parent — the labeled-subtree tree, extended exactly as dstrand extends the
 		// per-g RNG tree (testing/simulation.Host/Process stamp it on a subtree
@@ -5457,10 +5473,22 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.dstProc = callergp.dstProc
 		newg.dstPid = callergp.dstPid
 		dstClearSchedState(newg)
-		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 {
+		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 &&
+			(callergp.bubble == dstSimBubble || (callergp == dstSimRootG && dstSimBubble == nil)) {
 			// PCT: give the new goroutine a random base priority from the scheduling
 			// RNG (a scheduling property, not part of the per-g logical stream). The
-			// creation order is deterministic, so the draw sequence is too.
+			// creation order is deterministic, so the draw sequence is too. Gated on
+			// the creator being part of the SIMULATION (like the selection-side
+			// isolation, firstSystemG): a foreign or non-bubble goroutine created
+			// mid-run is scheduled RNG-free, so drawing a priority for it would let
+			// unrelated process activity consume scheduling-RNG draws and shift every
+			// later PCT priority — the exact leak the system-goroutine isolation
+			// closes on the selection side (docs/dst/design.md; exploration.md PCT).
+			// The second disjunct is bubble.main: synctestRun creates it (on the
+			// activating goroutine, dstSimRootG) BEFORE claiming dstSimBubble, so the
+			// first disjunct is not yet true, yet bubble.main IS a simulation
+			// goroutine and MUST draw a priority (synctest.go: "bubble.main drew its
+			// priority") — else it sits at dstPrio 0, always lowest in PCT selection.
 			dstPCTAssignPrio(newg)
 		}
 	}
@@ -6808,6 +6836,20 @@ func retake(now int64) uint32 {
 		// but on the other hand we want to retake them eventually
 		// because they can prevent the sysmon thread from deep sleep.
 		if runqempty(pp) && sched.nmspinning.Load()+sched.npidle.Load() > 0 && pd.syscallwhen+10*1000*1000 > now {
+			thread.resume()
+			goto done
+		}
+
+		// Under deterministic scheduling (DST active), do NOT hand off a P blocked in
+		// a real syscall: whether the handoff fires depends on the syscall's WALL-clock
+		// duration crossing sysmon's threshold, which would fork the seeded schedule
+		// (the syscalling goroutine re-enters via exitsyscall→global runq at a
+		// wall-dependent point). Resume without taking the P, so the syscall serializes
+		// the bubble — the M keeps its P and re-runs on it when the syscall returns:
+		// one deterministic execution. Mirrors the preemptone gate above; a real
+		// syscall that never returns (e.g. reading host stdin) wedges the run, the
+		// documented inherited-handle risk (docs/dst/design.md).
+		if dstActive() {
 			thread.resume()
 			goto done
 		}

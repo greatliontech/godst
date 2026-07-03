@@ -280,6 +280,15 @@ func dstReadRandom(b []byte) bool {
 		return false
 	}
 	gp := getg()
+	if gp.dstrand == 0 {
+		// This goroutine's per-g stream was never seeded — it was created before
+		// activation (a seeded goroutine roots at dstActivate/newproc1 to a nonzero
+		// value and only advances). Filling from its zero-rooted stream would hand
+		// every such goroutine the SAME fixed, seed-independent bytes: the exact
+		// "predictable outside a run" hole INV-CRYPTO forbids. Fall through to real
+		// OS entropy instead (docs/dst/design.md, INV-CRYPTO unseeded-goroutine leg).
+		return false
+	}
 	for len(b) >= 8 {
 		byteorder.BEPutUint64(b, dstrandUint64(gp))
 		b = b[8:]

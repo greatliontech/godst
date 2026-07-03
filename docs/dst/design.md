@@ -133,8 +133,8 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   reproduce. This is the only non-`Run` entry and is not a user surface. Because this path runs at
   `GOMAXPROCS>1`, every DST runtime structure reachable while it is active must be safe under real
   parallelism — "in-bubble single-P cooperative access" is a `Run`-only precondition no shared DST
-  list may assume (concretely: the armed-fake-timer registration list, `dstFakeTimers`, is
-  serialized, not append-racy; lands with the scheduler-isolation chunk).
+  list may assume (concretely: the armed-fake-timer registration list, `dstFakeTimers`, is a
+  lock-free CAS-prepend stack, not an append-racy slice).
 
 ### Deterministic process identity (`Options.Hostname` / `Options.PID` / `Options.NumCPU`)
 
@@ -231,8 +231,9 @@ latched, rather than letting `crypto/rand` go silently nondeterministic inside a
   inside a run; two reads *outside* a run differ) and structurally by the `dstActive()` +
   seeded-per-g gate (`dstSeed` is never set on any production path: its only setters are
   `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate` linkname used
-  solely by the runtime's own white-box tests). (The unseeded-goroutine leg's enforcement lands with
-  the scheduler-isolation chunk.)
+  solely by the runtime's own white-box tests). The unseeded-goroutine leg is enforced by
+  `TestDSTCryptoUnseededGoroutine` (a goroutine created before activation reads real, cross-process-
+  varying entropy while a run is live) and the `gp.dstrand == 0` gate in `dstReadRandom`.
 - **INV-IDENTITY**: within a run, every identity read (`pid`/`ppid`/`hostname`/`uid`/`gid`/`euid`/`egid`/
   `NumCPU`/`os/user.Current`) is a fixed function of the run config, and is restored to the real value
   outside the run. Enforced by `TestDSTProcessIdentity` and `TestDSTIdentityExtra` (the latter also
@@ -514,8 +515,8 @@ outbound, schedule-ordered side effects that feed no nondeterminism back into th
 cross-process replay fixtures print their transcripts through real stdout from inside runs.
 The blocked case is covered too: a host write that blocks (a full pipe, a slow terminal) delays
 the run in *wall* time but cannot reorder it, because sysmon's **syscall-handoff retake is gated
-under an active run** exactly as its preemption retake is (enforcement lands with the
-scheduler-isolation chunk) — without that gate, whether a host write returns within sysmon's 10 ms
+under an active run** exactly as its preemption retake is (`retake`, `proc.go`) — without that gate,
+whether a host write returns within sysmon's 10 ms
 window would decide whether the P is handed off mid-syscall, a wall-clock-dependent schedule fork.
 A real syscall thus *serializes* the bubble for its duration: one legal execution, deterministic.
 The dual failure mode is recorded plainly: a goroutine blocked **reading** a host handle (real

@@ -240,6 +240,9 @@ func synctestRun(f func()) {
 			// bubble.main does not replay the run caller's draw sequence,
 			// which would alias a SUT goroutine's stream with the drain's).
 			bubble.main.dstrand = dstBubbleMainRoot(dstSeed.Load())
+			if bubble.main.dstrand == 0 {
+				bubble.main.dstrand = 1 // seeded root stays nonzero (dstReadRandom sentinel)
+			}
 			// Root the bubble main's host/process identity at the default (0,0) and its
 			// pid at the run's root pid (dstSimPID, the host-0/proc-0 driver pid);
 			// Host/Process stamp subtrees from there. Explicit (not relying on

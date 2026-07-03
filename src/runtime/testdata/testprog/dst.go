@@ -52,6 +52,9 @@ func init() {
 	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
 	register("DSTBubbleStreamIsolation", DSTBubbleStreamIsolation)
 	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
+	register("DSTPCTNonBubbleCreation", DSTPCTNonBubbleCreation)
+	register("DSTCryptoUnseededGoroutine", DSTCryptoUnseededGoroutine)
+	register("DSTPCTMainDrawsPriority", DSTPCTMainDrawsPriority)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
 	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
@@ -212,10 +215,6 @@ func DSTFinLongChain() {
 		os.Stdout.WriteString("tail-missing\n")
 	}
 }
-
-
-
-
 
 // DSTCryptoRand checks that crypto/rand is deterministic inside simulation.Run
 // (seeded by the run) but real OS entropy outside it. With DSTSEED=s it prints
@@ -805,8 +804,23 @@ func DSTBubbleStreamIsolation() {
 // dstSchedFingerprint runs a fixed concurrent workload under simulation.Run
 // and returns a string derived from its goroutine interleaving.
 func dstSchedFingerprint(seed uint64) string {
+	return dstSchedFingerprintStrategy(seed, false)
+}
+
+// dstSchedFingerprintStrategy runs the fingerprint workload under the random
+// strategy (pct=false) or PCT (pct=true). The PCT form is the M1 probe: PCT assigns
+// each goroutine a priority drawn from the scheduling RNG at creation, so if a
+// foreign or non-bubble goroutine creation consumed a draw the measured fingerprint
+// would shift — the creation-side isolation this exercises.
+func dstSchedFingerprintStrategy(seed uint64, pct bool) string {
+	run := simulation.Run
+	if pct {
+		run = func(s uint64, f func()) {
+			simulation.RunWith(s, simulation.Options{Strategy: simulation.PCT, Depth: 3, Steps: 200}, f)
+		}
+	}
 	var out []byte
-	simulation.Run(seed, func() {
+	run(seed, func() {
 		ch := make(chan int, 64)
 		var wg sync.WaitGroup
 		for i := 0; i < 6; i++ {
@@ -837,6 +851,7 @@ func dstSchedFingerprint(seed uint64) string {
 // without. Prints "done" when equal.
 func DSTForeignBubbleIsolation() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	fp := dstSchedFingerprint
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -861,11 +876,11 @@ func DSTForeignBubbleIsolation() {
 			time.Sleep(200 * time.Microsecond) // real sleep: outside any bubble
 		}
 	}()
-	withForeign := dstSchedFingerprint(n)
-	withForeign2 := dstSchedFingerprint(n)
+	withForeign := fp(n)
+	withForeign2 := fp(n)
 	close(stop)
 	<-done
-	alone := dstSchedFingerprint(n)
+	alone := fp(n)
 	if withForeign != alone || withForeign2 != alone {
 		os.Stdout.WriteString("schedule perturbed by foreign bubble\nwith1= " + withForeign +
 			"\nwith2= " + withForeign2 + "\nalone= " + alone + "\n")
@@ -950,7 +965,6 @@ func DSTGOMAXPROCSAutoRestore() {
 	os.Stdout.WriteString("inrun=" + strconv.FormatBool(inRunAuto) +
 		" after=" + strconv.FormatBool(dstGOMAXPROCSAutoFP()) + "\n")
 }
-
 
 // DSTRunNoTag exercises the documented build-constraint panic: in a binary
 // built WITHOUT -tags dst, simulation.Run must refuse to start (the map hash
@@ -2456,4 +2470,117 @@ func DSTGOMAXPROCSDelayedSTW() {
 		return
 	}
 	os.Stdout.WriteString("done\n")
+}
+
+// dstOutsideGoPump creates a short-lived goroutine on a NON-bubble goroutine for
+// every ping received on an unbubbled channel. A simulation goroutine sends the pings,
+// so these non-bubble goroutine creations deterministically interleave WITH the run.
+func dstOutsideGoPump(ping chan struct{}, done *sync.WaitGroup) {
+	defer done.Done()
+	var inner sync.WaitGroup
+	for range ping {
+		inner.Add(1)
+		go func() { inner.Done() }() // a non-bubble creation: draws a PCT priority w/o the M1 gate
+	}
+	inner.Wait()
+}
+
+// DSTPCTNonBubbleCreation is the M1 regression: under PCT, each goroutine's priority
+// is drawn from the scheduling RNG AT CREATION. A goroutine creation by a NON-bubble
+// goroutine (here, a pump driven by pings from a simulation goroutine, interleaved
+// between the measured goroutines' creation rounds) must NOT consume a draw — else it
+// shifts the priorities of the measured goroutines created in later rounds, changing
+// their interleaving. Runs the measured PCT workload with the pump churning and
+// without; the fingerprints must match. Prints "done", or the differing fingerprints.
+func DSTPCTNonBubbleCreation() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	fp := func(ping chan struct{}) string {
+		var out []byte
+		var mu sync.Mutex
+		rec := func(id int) { mu.Lock(); out = append(out, byte('a'+id)); mu.Unlock() }
+		simulation.RunWith(n, simulation.Options{Strategy: simulation.PCT, Depth: 3, Steps: 300}, func() {
+			var wg sync.WaitGroup
+			// Create the measured goroutines in ROUNDS; between rounds, ping the
+			// non-bubble pump so its creation lands between the measured creations.
+			for round := 0; round < 6; round++ {
+				for g := 0; g < 2; g++ {
+					wg.Add(1)
+					id := round*2 + g
+					go func(id int) {
+						defer wg.Done()
+						for r := 0; r < 4; r++ {
+							rec(id)
+							time.Sleep(time.Duration(id+1) * time.Microsecond)
+						}
+					}(id)
+				}
+				if ping != nil {
+					ping <- struct{}{} // non-bubble goroutine creation between rounds
+				}
+				time.Sleep(time.Microsecond) // yield so the pump runs before the next round
+			}
+			wg.Wait()
+		})
+		return string(out)
+	}
+	ping := make(chan struct{}, 64)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go dstOutsideGoPump(ping, &wg)
+	withPump := fp(ping)
+	withPump2 := fp(ping)
+	close(ping)
+	wg.Wait()
+	alone := fp(nil)
+	if withPump != alone || withPump2 != alone {
+		os.Stdout.WriteString("PCT schedule perturbed by non-bubble creation\nwith1= " + withPump +
+			"\nwith2= " + withPump2 + "\nalone= " + alone + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTCryptoUnseededGoroutine reads crypto/rand on a goroutine started BEFORE the run
+// (so its per-g stream was never seeded, dstrand==0) WHILE the run is active, and
+// prints the bytes. A simulation goroutine pings it (unbubbled buffered channel) then
+// sleeps so it reads during the active window. Per INV-CRYPTO's unseeded leg, such a
+// goroutine must get REAL OS entropy, not the fixed zero-rooted stream: the parent runs
+// this twice and the bytes must DIFFER across processes. The bug (filling from the
+// zero-rooted stream) makes every such goroutine's bytes identical and deterministic.
+func DSTCryptoUnseededGoroutine() {
+	ping := make(chan struct{}, 1)   // unbubbled: made before the run
+	result := make(chan [16]byte, 1) // unbubbled
+	go func() {                      // started before Run: dstrand == 0 (unseeded)
+		<-ping
+		var buf [16]byte
+		crand.Read(buf[:]) // read DURING the run (dstActive true) on an unseeded goroutine
+		result <- buf
+	}()
+	simulation.Run(1, func() {
+		ping <- struct{}{} // non-durable op on an unbubbled buffered channel
+		for i := 0; i < 50; i++ {
+			time.Sleep(time.Millisecond) // yield so the pre-run goroutine reads while active
+		}
+	})
+	buf := <-result
+	os.Stdout.WriteString(hex.EncodeToString(buf[:]) + "\n")
+}
+
+//go:linkname dstSimMainPrioFP runtime.dstSimMainPrioFP
+func dstSimMainPrioFP() int64
+
+// DSTPCTMainDrawsPriority runs an (empty) PCT simulation and prints whether bubble.main
+// drew a PCT priority (its dstPrio is nonzero). bubble.main is created before the
+// simulation claims dstSimBubble, so a naive bubble-membership gate misses it — this
+// pins that it is nevertheless assigned a priority.
+func DSTPCTMainDrawsPriority() {
+	var prio int64
+	simulation.RunWith(1, simulation.Options{Strategy: simulation.PCT, Depth: 2, Steps: 100}, func() {
+		prio = dstSimMainPrioFP()
+	})
+	if prio != 0 {
+		os.Stdout.WriteString("nonzero\n")
+	} else {
+		os.Stdout.WriteString("zero\n")
+	}
 }
