@@ -58,7 +58,22 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	// access under -race (so any -tags dst -race run, not just Explore, reaches here).
 	// Gating to dstSchedScheduled confines access yields to Explore; non-scheduled
 	// strategies are byte-for-byte unaffected.
-	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil || gp != gp.m.curg || gp.m.locks != 0 {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil {
+		return
+	}
+	if gp != gp.m.curg || gp.m.locks != 0 {
+		// Safe-point guard failed: yielding here is unsound, but the access is still
+		// a real transition of a bubble goroutine and its conflicts prune classes if
+		// dropped — record it without yielding (D1's "record the access but do not
+		// yield" is normative; exploration.md, hardening clause 3). dstCommitAccess
+		// is pool-allocating and lock-free by design (it already runs under
+		// sched.lock from the scheduled-select commit), so it is safe in this
+		// restricted context. A replay-promoted force landing here is intentionally
+		// not honored: yielding is unsound in this context regardless, and
+		// promoteAccessForces cannot loop on it (it grows only on a NEW force).
+		seq := dstEnsureSeq(gp)
+		gp.dstAccCount++
+		dstCommitAccess(gp, seq, addr, size, write, dstAccessPCKey(pc), gp.dstAccCount, filter && raceenabled, dstScheduleStep)
 		return
 	}
 	seq := dstEnsureSeq(gp)
@@ -234,6 +249,13 @@ var dstSchedulePrefix []uint64
 var (
 	dstScheduleStep    int
 	dstScheduleAborted bool
+	// dstScheduleAbortStep/dstExplorePanicStep (-1 = unset) locate the abort and the
+	// first recorded SUT panic in decision steps, so the harness can attribute an
+	// abort to panic truncation ONLY when the abort lies at/after the panic point —
+	// a divergence BEFORE the panic is a genuine DST-L2-2 violation a coinciding
+	// panic must not mask (exploration.md, hardening clause 4).
+	dstScheduleAbortStep int32
+	dstExplorePanicStep  int32
 )
 
 var (
@@ -301,6 +323,13 @@ var (
 	dstEdgeN        int
 	dstEdgeOverflow bool
 	dstHBEventN     int32
+	// dstSyncEventOverflow reports a dropped release/acquire sync event. NOT merely a
+	// pruning loss: the offline trace-HB the sync-event log feeds computes the
+	// WEAK-INITIAL sets, and an under-ordered trace-HB produces spurious weak-initials
+	// that can early-return addSourceBacktrack before the genuine reversal is seeded —
+	// a dropped Mazurkiewicz class while Exhausted reads true (exploration.md,
+	// hardening clause 1). Folded into the trace overflow exactly as dstEdgeOverflow.
+	dstSyncEventOverflow bool
 )
 
 const (
@@ -405,8 +434,13 @@ var (
 	dstAccPageNodeNext []int32
 	dstAccPageNodePage []uintptr
 	dstAccPageNodeN    int
-	dstAccLargeEnt     [dstAccLargeMax]int32
-	dstAccLargeN       int
+	// dstAccPageChargeN is the deterministic budget counter: the sum of worst-case
+	// per-entry charges (dstAccPageCharge), against which capacity is decided —
+	// dstAccPageNodeN is the physical consumption, always <= the charge, never a
+	// capacity input (it is address-dependent).
+	dstAccPageChargeN int
+	dstAccLargeEnt    [dstAccLargeMax]int32
+	dstAccLargeN      int
 )
 
 const (
@@ -580,24 +614,59 @@ func dstAccPageBucket(page uintptr) int {
 	return int(h % uintptr(len(dstAccPageTab)))
 }
 
+// dstAccPageCharge is the deterministic worst-case page-node cost of a size-S
+// range: the EXACT maximum number of dstAccPageShift-pages a range of S bytes can
+// cover over all start alignments — ceil((S-1)/page) + 1. The capacity accounting
+// charges THIS, never the actual page count, because the actual count is a function
+// of the entry's run-local *address alignment* — and an alignment-dependent pool
+// exhaustion flips dstFilterConservative at a different decision in a fresh process
+// (explorer-side allocations and per-launch arena placement move addresses),
+// misaligning a replayed schedule prefix: the DST-L2-2 abort, or silent divergence
+// (exploration.md, hardening clause 2 — filter capacity is a function of counts the
+// schedule determines, never of addresses). Exact, not merely an upper bound, so the
+// filter degrades to conservative no sooner than a real alignment forces it to.
+//go:linkname dstAccPageCharge
+func dstAccPageCharge(size uintptr) uintptr {
+	if size == 0 {
+		size = 1
+	}
+	// Saturate only at the genuine uintptr wrap boundary of the ceil arithmetic
+	// below (size-1 + page-1): a size within page-1 of the address-space top would
+	// wrap the addition to a tiny value → small-class → the loop then walks a
+	// clamped ~2^56-page range and hits the "unreachable" throw. Such a size is
+	// astronomically unreachable in-spec; saturating it to a large-class charge is
+	// exact for every realistic size (the threshold is ~2^64, far above any real
+	// range, so e.g. 65537 still computes its true 257).
+	if size-1 > ^uintptr(0)-(1<<dstAccPageShift-1) {
+		return dstAccPageMaxSpan + 2 // > dstAccPageMaxSpan: large class
+	}
+	// ceil((size-1)/page) + 1, page = 1<<dstAccPageShift, all powers of two.
+	return (size-1+(1<<dstAccPageShift)-1)>>dstAccPageShift + 1
+}
+
 // dstAccPageInsert indexes a freshly created access entry under the pages its
 // range covers (or the large-entry list). Called on the dstFindAccessEntry
 // create path — under sched.lock from dstScheduledSelect's commit, lock-free
 // from dstYieldAccess's inline filtered commit — and pool-allocating only,
 // never the heap, which is what both contexts require. The pool is sized for
 // two pages per entry on average (2x the entry budget): a workload averaging
-// wider ranges exhausts it sooner and flips dstFilterConservative — trading
-// pruning, never a class, exactly as the filter's overflow contract
-// authorizes; size the dstExploreInit budgets up if such a workload needs the
-// pruning.
+// wider ranges exhausts the deterministic budget sooner and flips
+// dstFilterConservative — trading pruning, never a class, exactly as the
+// filter's overflow contract authorizes; size the dstExploreInit budgets up if
+// such a workload needs the pruning. Every capacity decision here — the
+// large-entry classification and the budget exhaustion — is address-independent
+// (size-classified, worst-case-charged; see dstAccPageCharge), decided BEFORE
+// anything is inserted so no entry is ever partially indexed.
 func dstAccPageInsert(e int, addr, size uintptr) {
 	if len(dstAccPageTab) == 0 {
 		dstFilterConservative = true
 		return
 	}
-	start := addr >> dstAccPageShift
-	end := (dstAccessRangeEnd(addr, size) - 1) >> dstAccPageShift
-	if end-start >= dstAccPageMaxSpan {
+	charge := dstAccPageCharge(size)
+	if charge > dstAccPageMaxSpan {
+		// Large-class by SIZE: a span-based test (end-start) would classify the
+		// same size differently depending on whether the range happens to straddle
+		// one extra boundary at its address.
 		if dstAccLargeN >= len(dstAccLargeEnt) {
 			dstFilterConservative = true
 			return
@@ -606,10 +675,20 @@ func dstAccPageInsert(e int, addr, size uintptr) {
 		dstAccLargeN++
 		return
 	}
+	if uintptr(dstAccPageChargeN)+charge > uintptr(len(dstAccPageNodeEnt)) {
+		dstFilterConservative = true
+		return
+	}
+	dstAccPageChargeN += int(charge)
+	start := addr >> dstAccPageShift
+	end := (dstAccessRangeEnd(addr, size) - 1) >> dstAccPageShift
 	for p := start; p <= end; p++ {
 		if dstAccPageNodeN >= len(dstAccPageNodeEnt) {
-			dstFilterConservative = true
-			return
+			// Unreachable: actual consumption <= the budget charged above, and the
+			// budget is capped at the pool size. Reaching here is accounting
+			// corruption, not a capacity condition — fail loud, never a silent
+			// (and address-dependent) conservative flip.
+			throw("dst: page-node pool exhausted under budget")
 		}
 		b := dstAccPageBucket(p)
 		n := dstAccPageNodeN
@@ -882,10 +961,13 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	}
 	seq := dstEnsureSeq(gp)
 	dstApplyLiveSyncEvent(kind, id, aux, seq)
-	// Buffer overflow below drops the event SILENTLY — sound, asymmetric with
-	// dstEdgeOverflow on purpose: the live clocks were already applied above,
-	// and a missing OFFLINE edge only enlarges the computed concurrent set
-	// (more backtracks/forces — over-exploration), never prunes a class.
+	// Buffer overflow below is REPORTED (dstSyncEventOverflow), never silent. The
+	// "a missing offline edge only enlarges the computed concurrent set" argument
+	// holds for the reorderability gate (dporConcurrent) alone — over-exploration —
+	// but the same under-ordered trace-HB also feeds the WEAK-INITIAL computation,
+	// where a spurious weak-initial can early-return addSourceBacktrack before the
+	// genuine reversal is seeded: a dropped class while Exhausted reads true. The
+	// live clocks above were already applied either way.
 	if dstSyncEventN < len(dstSyncEventKind) {
 		dstSyncEventKind[dstSyncEventN] = kind
 		dstSyncEventID[dstSyncEventN] = id
@@ -896,6 +978,8 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 		dstSyncEventOrd[dstSyncEventN] = dstHBEventN
 		dstHBEventN++
 		dstSyncEventN++
+	} else {
+		dstSyncEventOverflow = true
 	}
 }
 
@@ -930,6 +1014,7 @@ func dstExploreRecordUncaughtPanic(v any) bool {
 	if !dstExplorePanicSet {
 		dstExplorePanicValue = v
 		dstExplorePanicSet = true
+		dstExplorePanicStep = int32(dstScheduleStep)
 	}
 	return true
 }
@@ -1046,6 +1131,9 @@ func dstScheduleReset() {
 	dstEdgeOverflow = false
 	dstHBEventN = 0
 	dstSyncEventN = 0
+	dstSyncEventOverflow = false
+	dstScheduleAbortStep = -1
+	dstExplorePanicStep = -1
 	dstAccLogN = 0
 	dstAccLogOverflow = false
 	for i := range dstClock {
@@ -1059,6 +1147,7 @@ func dstScheduleReset() {
 		dstAccPageTab[i] = 0
 	}
 	dstAccPageNodeN = 0
+	dstAccPageChargeN = 0
 	dstAccLargeN = 0
 	for i := 0; i < dstSyncClockN*dstClockProcs; i++ {
 		dstSyncClock[i] = 0
@@ -1089,7 +1178,10 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 			}
 		}
 		if sel == ^uint32(0) {
-			dstScheduleAborted = true
+			if !dstScheduleAborted {
+				dstScheduleAborted = true
+				dstScheduleAbortStep = int32(dstScheduleStep)
+			}
 			sel = dstLowestSeqIdx(c, total)
 		}
 	} else {
@@ -1305,3 +1397,16 @@ func dstRaceEnabledFP() bool { return raceenabled }
 //
 //go:linkname dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool { return dstScheduleAborted }
+
+// dstScheduleAbortStepFP / dstExplorePanicStepFP report the decision step of the
+// prefix abort and of the first recorded SUT panic (-1 = none) for the harness's
+// panic-truncation attribution (a pre-panic abort is a real DST-L2-2 violation).
+//
+//go:linkname dstScheduleAbortStepFP
+func dstScheduleAbortStepFP() int32 { return dstScheduleAbortStep }
+
+//go:linkname dstExplorePanicStepFP
+func dstExplorePanicStepFP() int32 { return dstExplorePanicStep }
+
+//go:linkname dstSyncEventOverflowFP
+func dstSyncEventOverflowFP() bool { return dstSyncEventOverflow }

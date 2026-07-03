@@ -40,6 +40,9 @@ func dstRunningPanicDefersFP() uint32
 //go:linkname dstCurrentSeqFP runtime.dstCurrentSeqFP
 func dstCurrentSeqFP() uint64
 
+//go:linkname dstSyncEventOverflowProbe runtime.dstSyncEventOverflowFP
+func dstSyncEventOverflowProbe() bool
+
 func assertUniqueEnabledSeqs(t *testing.T, tr exploreTrace) {
 	t.Helper()
 	for i, enabled := range tr.enabled {
@@ -2077,5 +2080,82 @@ func TestExploreFilterPageIndexExhaustionConservative(t *testing.T) {
 	}
 	if got := yields(8); got == 0 {
 		t.Errorf("exhausted pool: 0 yields — node-pool exhaustion did not set the conservative fallback, the filter can silently lose conflicts")
+	}
+}
+
+// TestExploreSyncEventOverflowReportsIncomplete: a run that drops offline sync-HB
+// events (the buffer is sized by maxEdges) must mark the trace incomplete — the
+// dropped events under-order the trace-HB the weak-initial computation reads, so a
+// silent overflow could drop a Mazurkiewicz class while Exhausted read true
+// (exploration.md, hardening clause 1). Mirrors the access-log overflow test.
+func TestExploreSyncEventOverflowReportsIncomplete(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		// Sync-HB events are recorded only under -race (chan/mutex hooks gate on
+		// dstBuild && raceenabled) — the offline DPOR that reads them runs in the
+		// auto-instrument regime, which is the race leg.
+		t.Skip("requires -race (sync-HB events are recorded only under -race)")
+	}
+	// maxEdges=4 sizes BOTH the edge and sync-event buffers at 4; every OTHER budget
+	// is roomy. A SINGLE goroutine hammering a buffered channel records a sync event
+	// per send/recv (the slot HB) but creates NO goready edges (no waiter to wake),
+	// few decisions, and — with a large maxAccesses — no access-log overflow. So the
+	// sync-event buffer is the ONLY one that overflows: tr.overflow can then come
+	// only from the sync-event fold, which is what this test pins (a many-goroutine
+	// or small-maxAccesses SUT trips edge/access-log overflow and passes vacuously —
+	// the mutation that deletes the fold must FAIL here).
+	dstExploreInit(1<<14, 1<<18, 4, 1<<20)
+	dstAccessYieldReset()
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		ch := make(chan int, 1)
+		for i := 0; i < 32; i++ {
+			ch <- i
+			<-ch
+		}
+		return false
+	})
+	if !dstSyncEventOverflowProbe() {
+		t.Fatalf("the SUT did not overflow the sync-event buffer — test is vacuous, raise the op count or lower maxEdges")
+	}
+	// Isolation: every non-sync overflow contributor must be off, or tr.overflow
+	// would be true regardless of the fold under test.
+	if dstEdgeOverflowFP() || dstTraceOverflowFP() || dstAccLogOverflowFP() {
+		t.Fatalf("a non-sync buffer overflowed (edge=%v trace=%v accLog=%v) — tr.overflow no longer isolates the sync-event fold (vacuous)",
+			dstEdgeOverflowFP(), dstTraceOverflowFP(), dstAccLogOverflowFP())
+	}
+	if !tr.overflow {
+		t.Fatalf("sync-event overflow did not mark the trace incomplete — a dropped HB event can silently lose a class")
+	}
+}
+
+//go:linkname dstAccPageCharge runtime.dstAccPageCharge
+func dstAccPageCharge(size uintptr) uintptr
+
+// TestExploreAccPageChargeAddressIndependent pins the M17 fix: the access-filter's
+// page-node capacity charge is a function of the access SIZE alone — the exact
+// worst-case page count over all address alignments — never of the run-local address.
+// An alignment-dependent charge would flip dstFilterConservative at a different point
+// in a fresh process (addresses shift with explorer allocations and arena placement),
+// misaligning a replayed schedule and breaking DST-L2-2 (exploration.md, hardening
+// clause 2). Verified against a brute-force max over every alignment within a page.
+func TestExploreAccPageChargeAddressIndependent(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	const page = 1 << 8 // dstAccPageShift = 8
+	for _, size := range []uintptr{1, 2, 255, 256, 257, 511, 512, 513, 1000, 4096, 65537} {
+		var worst uintptr
+		for a := uintptr(0); a < page; a++ {
+			start := a >> 8
+			end := (a + size - 1) >> 8
+			if n := end - start + 1; n > worst {
+				worst = n
+			}
+		}
+		if got := dstAccPageCharge(size); got != worst {
+			t.Errorf("dstAccPageCharge(%d) = %d, want %d (exact alignment-worst-case page count)", size, got, worst)
+		}
 	}
 }

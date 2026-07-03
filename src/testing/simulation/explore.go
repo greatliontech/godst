@@ -219,6 +219,15 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 type exploreTrace struct {
 	procs   []uint64   // [decision] chosen goroutine (stable per-bubble index, dstSeq)
 	enabled [][]uint64 // [decision] enabled goroutine set (dstSeq indices)
+	// abortStep/panicStep (-1 = unset): decision step of a prefix abort and of the
+	// first runtime-recorded SUT panic, for panic-truncation attribution — an abort
+	// BEFORE the panic step is a genuine DST-L2-2 violation, not truncation fallout.
+	abortStep int32
+	panicStep int32
+	// syncEventOverflow: the offline sync-event log dropped events; weak-initial
+	// precision is compromised for this trace, so source-backtracking degrades to
+	// the all-enabled over-approximation (sound: over-explore, never prune).
+	syncEventOverflow bool
 	// Access log: EVERY instrumented access in execution order, decoupled from the
 	// decision trace (a single-owner access records here without yielding, so it is
 	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
@@ -388,15 +397,21 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 			}
 		}
 		out.deadlock = dstExploreDeadlockFP()
-		// The out.panic == "" guard is load-bearing, not a masking bug: a
-		// recorded SUT panic legitimately truncates the run (the panicking
-		// goroutine dies, so later prefix entries naming it are not enabled)
-		// and the abort flag is then expected. The recorded Failure replays —
-		// the panic fires at the same point, before the truncated tail. Only
-		// an abort with NO panic signals a determinism violation.
-		if out.tr.aborted && out.panic == "" {
-			panic("testing/simulation: internal error: schedule prefix diverged on replay " +
-				"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
+		// A recorded SUT panic legitimately truncates the run (the panicking
+		// goroutine dies, so later prefix entries naming it are not enabled) and
+		// the abort flag is then expected — but ONLY for an abort at or after the
+		// panic's decision step: a divergence BEFORE the panic point is a genuine
+		// determinism violation a coinciding panic must not mask (exploration.md,
+		// hardening clause 4). A harness-recovered panic with no runtime-recorded
+		// step (panicStep < 0, e.g. a root-goroutine panic) keeps the lenient
+		// attribution: its truncation point is unknown.
+		if out.tr.aborted {
+			excused := out.panic != "" &&
+				(out.tr.panicStep < 0 || out.tr.abortStep < 0 || out.tr.abortStep >= out.tr.panicStep)
+			if !excused {
+				panic("testing/simulation: internal error: schedule prefix diverged on replay " +
+					"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
+			}
 		}
 	}()
 	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, 0, 0, 0, prefix, false, func() {
@@ -417,8 +432,11 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
 	traceOverflow := dstTraceOverflowFP()
 	tr.budgetHit = stepBudget && traceOverflow
-	tr.overflow = (traceOverflow && !tr.budgetHit) || dstEdgeOverflowFP()
+	tr.syncEventOverflow = dstSyncEventOverflowFP()
+	tr.overflow = (traceOverflow && !tr.budgetHit) || dstEdgeOverflowFP() || tr.syncEventOverflow
 	tr.aborted = dstScheduleAbortedFP()
+	tr.abortStep = dstScheduleAbortStepFP()
+	tr.panicStep = dstExplorePanicStepFP()
 	if tr.aborted {
 		// The prefix named a goroutine not enabled at its decision: this replay
 		// diverged from the run that produced the prefix. Since every prefix is
@@ -509,6 +527,53 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 	}
 }
 
+// checkReplayPrefix verifies DST-L2-2 over a replayed schedule prefix: each frame's
+// recorded decision and enabled set must match the replay's, over the part of the
+// prefix that actually ran (a recorded panic legitimately truncates the tail; the
+// truncated part was never replayed, so there is nothing to compare there — the
+// panic-attribution check in runOnceResult covers the abort semantics).
+func checkReplayPrefix(stack []*dporFrame, tr exploreTrace) {
+	n := len(stack)
+	if len(tr.procs) < n {
+		n = len(tr.procs)
+	}
+	for d := 0; d < n; d++ {
+		if tr.procs[d] != stack[d].proc || !equalSeqSets(tr.enabled[d], stack[d].enabled) {
+			panic("testing/simulation: internal error: replay diverged from the recorded prefix " +
+				"(decision or enabled set changed at a followed step) — DST-L2-2 violation (nondeterministic SUT?)")
+		}
+	}
+}
+
+// checkReplayEnabled is checkReplayPrefix's form for a prefix whose parent enabled
+// sets were carried explicitly (the exhaustive pass). The final prefix entry is the
+// forced flip g — the enabled set there must still match the parent's; the chosen
+// procs before it must equal the prefix (the runtime follows it or aborts).
+func checkReplayEnabled(prefix []uint64, parentEnabled [][]uint64, tr exploreTrace) {
+	n := len(parentEnabled)
+	if len(tr.procs) < n {
+		n = len(tr.procs)
+	}
+	for d := 0; d < n; d++ {
+		if (d < len(prefix) && tr.procs[d] != prefix[d]) || !equalSeqSets(tr.enabled[d], parentEnabled[d]) {
+			panic("testing/simulation: internal error: replay diverged from the recorded prefix " +
+				"(decision or enabled set changed at a followed step) — DST-L2-2 violation (nondeterministic SUT?)")
+		}
+	}
+}
+
+func equalSeqSets(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func explorePassConfig(cfg exploreConfig, schedules int) (exploreConfig, bool) {
 	if cfg.maxSchedules <= 0 {
 		return cfg, true
@@ -524,21 +589,31 @@ func explorePassConfig(cfg exploreConfig, schedules int) (exploreConfig, bool) {
 func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	var res ExploreResult
 	visited := map[string]bool{}
-	stack := [][]uint64{nil}
+	// Each queued prefix carries the parent trace's enabled sets over its length
+	// (aliasing the parent's copied slices), so the replay can be cross-checked
+	// against the recorded decisions — the divergence that keeps the named seqs
+	// enabled slips the runtime's non-enabled abort (hardening clause 4).
+	type queued struct {
+		prefix        []uint64
+		parentEnabled [][]uint64
+	}
+	stack := []queued{{nil, nil}}
 	for len(stack) > 0 {
 		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
 			res.BudgetHit = true
 			break
 		}
-		prefix := stack[len(stack)-1]
+		q := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if k := encodePrefix(prefix); visited[k] {
+		if k := encodePrefix(q.prefix); visited[k] {
 			continue
 		} else {
 			visited[k] = true
 		}
+		prefix := q.prefix
 		r := runOnceResultLocked(seed, prefix, forces, sut, cfg)
 		tr := r.tr
+		checkReplayEnabled(prefix, q.parentEnabled, tr)
 		res.Schedules++
 		if tr.budgetHit {
 			res.BudgetHit = true
@@ -561,7 +636,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 				child := make([]uint64, i+1)
 				copy(child, tr.procs[:i])
 				child[i] = g
-				stack = append(stack, child)
+				stack = append(stack, queued{child, tr.enabled[:i+1]})
 			}
 		}
 	}
@@ -822,8 +897,13 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		if promoteAccessForces(tr, forces) {
 			return res, true
 		}
-		// runOnceResult panics on a divergent (aborted) replay, so the trace here is
-		// always a faithful replay of the followed prefix.
+		// runOnceResult panics on a divergent (aborted) replay whose named seq was
+		// not enabled. The complementary divergence — the SUT behaving differently
+		// while the named seqs HAPPEN to stay enabled — slips that check, so verify
+		// the replayed prefix against the frames' recorded decisions and enabled
+		// sets too (exploration.md, hardening clause 4). A prefix truncated by a
+		// recorded panic is checked over the part that ran.
+		checkReplayPrefix(stack, tr)
 		n := len(tr.procs)
 		// Per-decision interval access-set: decision d's transition is the SET of
 		// accesses performed in its interval — the access-log entries with
@@ -883,7 +963,13 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 				if accessConflict(tr, i, j) {
 					if dporConcurrent(clk, pidx, tr, i, j) {
 						if d := tr.accStep[i] - 1; d >= 0 && d < n {
-							if raceEnabled {
+							if raceEnabled || tr.syncEventOverflow {
+								// All-enabled over-approximation. For a sync-event overflow
+								// trace the weak-initial computation is under-ordered (a
+								// spurious weak-initial can seed the WRONG backtrack and drop
+								// a class), so precision degrades to soundness: backtrack
+								// everything enabled. The overflow is still reported
+								// (Exhausted=false).
 								for _, g := range tr.enabled[d] {
 									stack[d].backtrack[g] = true
 								}
@@ -905,6 +991,13 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 			d := len(stack) - 1
 			top := stack[d]
 			top.done[top.proc] = true
+			if d >= len(intervalSet) {
+				// The stack is deeper than the last replay's decision trace: only SUT
+				// nondeterminism (or state corruption) can shrink a replayed prefix's
+				// tree below frames already explored — surface the DST-L2-2 diagnostic,
+				// not a bare index panic.
+				panic("testing/simulation: internal error: DPOR stack deeper than the replayed trace — DST-L2-2 violation (nondeterministic SUT?)")
+			}
 			top.doneTrans[top.proc] = intervalSet[d]
 			for _, g := range top.enabled {
 				if top.backtrack[g] && !top.done[g] {

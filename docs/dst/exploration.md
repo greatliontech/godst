@@ -254,30 +254,42 @@ mutex is sound and is exactly the interleaving Gap A needs.
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
   every member (802 SUTs — the original 290 plus the atomic, atomic-plain-mixed, multi-way, and two-variable-mixed families — mutation-tested: 23 of the original family fail with `dstSyncAcquire` neutered; 411 fail with `dstAtomicYield` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
-- **Hardening clauses (land with the exploration-hardening chunk).** Four consequences of the above,
-  made explicit because each was violable in detail while the headline invariant read as satisfied:
+- **Hardening clauses.** Four consequences of the above, made explicit because each was violable in
+  detail while the headline invariant read as satisfied (enforcement noted per clause):
   1. **Every capacity that can drop recorded information reports itself.** The sync-HB-event buffer is
      a completeness input, not only a soundness one: a *silently* dropped release/acquire event
      under-orders the trace-HB used for **weak-initial** computation, and a spurious weak-initial can
      early-return `addSourceBacktrack` before the genuine reversal is seeded — a dropped Mazurkiewicz
      class while `Exhausted=true` (a DST-L2-3 violation reached through DST-L2-2's own machinery). The
      "a missing edge only over-explores" argument holds for the reorderability gate alone, not for
-     weak-initials. So sync-event overflow folds into the trace's overflow flag exactly as access-log
-     overflow does: `Exhausted=false`, reported, test-pinned.
+     weak-initials. So sync-event overflow sets `dstSyncEventOverflow`, folded into the trace overflow
+     flag exactly as access-log overflow (`Exhausted=false`), AND the overflowing trace's
+     source-backtracking degrades to the all-enabled over-approximation (sound: never prunes) rather
+     than trusting the under-ordered weak-initials. Enforced by
+     `TestExploreSyncEventOverflowReportsIncomplete` (the `-race` leg — sync-HB events record only
+     under `-race`).
   2. **Filter-capacity accounting is address-independent.** Whether the access filter degrades to
      conservative mode must be a function of counts the schedule determines (entries, syncs, procs),
      never of how an entry's byte range straddles pages at its run-local *address* — an
      alignment-dependent pool exhaustion flips conservative at a different point in a fresh replay
-     process, misaligning the prefix (a DST-L2-2 abort, or silent divergence).
+     process, misaligning the prefix (a DST-L2-2 abort, or silent divergence). Enforced: the page-node
+     budget charges `dstAccPageCharge(size)` — the exact alignment-worst-case page count, a pure
+     function of size — never the actual address-dependent span
+     (`TestExploreAccPageChargeAddressIndependent`).
   3. **A guard-failing access is recorded, not dropped** (D1's "record the access but do not yield" is
-     normative): an access that cannot *yield* can still *conflict*, and dropping it from the
-     dependency relation silently prunes its class.
-  4. **Replay divergence is detected, not assumed away**: replay cross-checks the recorded enabled
-     sets over the schedule prefix (not only "the prefix named a non-enabled seq"), and an abort is
-     attributed to SUT-panic truncation only when the abort is actually inside the panicking
-     schedule's truncated suffix — a genuine DST-L2-2 violation coinciding with a panicking schedule
-     must not be masked. Internal invariant breaches in the backtrack machinery surface as the
-     DST-L2-2 diagnostic, never a bare index panic.
+     normative): an access that cannot *yield* (safe-point guard fails — not on its own stack, or a
+     runtime lock held) can still *conflict*, and dropping it from the dependency relation silently
+     prunes its class, so `dstYieldAccess` commits the access before returning. Defense-in-depth: the
+     guard-fail path is near-unreachable for ordinary SUTs, so it carries no independent trigger test.
+  4. **Replay divergence is detected, not assumed away**: replay cross-checks the recorded decisions
+     and enabled sets over the schedule prefix (`checkReplayPrefix`/`checkReplayEnabled` — not only the
+     runtime's "the prefix named a non-enabled seq" abort), and an abort is attributed to SUT-panic
+     truncation only when it lies at/after the panic's decision step (`abortStep` vs `panicStep`) — a
+     genuine DST-L2-2 violation *before* the panic point is not masked. Internal backtrack-machinery
+     breaches surface as the DST-L2-2 diagnostic, never a bare index panic. These fire only on SUT
+     nondeterminism (a "must never happen" condition), so they are defense-in-depth without an
+     injected-nondeterminism trigger test; the legitimate panic-truncation path they preserve is
+     covered by the sweep's panicking SUTs.
 - **DST-L2-4 (clause-explicit: production untouched).** Level-2 hooks are build-mode inert outside
   `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield`,
   `dstAccessYieldRange`, or `dstAtomicYield` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under

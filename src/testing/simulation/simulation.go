@@ -157,6 +157,15 @@ func dstRaceEnabledFP() bool
 //go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool
 
+//go:linkname dstScheduleAbortStepFP runtime.dstScheduleAbortStepFP
+func dstScheduleAbortStepFP() int32
+
+//go:linkname dstExplorePanicStepFP runtime.dstExplorePanicStepFP
+func dstExplorePanicStepFP() int32
+
+//go:linkname dstSyncEventOverflowFP runtime.dstSyncEventOverflowFP
+func dstSyncEventOverflowFP() bool
+
 //go:linkname dstSetSimEnv runtime.dstSetSimEnv
 func dstSetSimEnv(hostname string, pid, numcpu int)
 
