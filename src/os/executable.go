@@ -16,5 +16,13 @@ package os
 // The main use case is finding resources located relative to an
 // executable.
 func Executable() (string, error) {
+	// Interception-boundary fence: from a bubble goroutine this reads a host
+	// path (e.g. /proc/self/exe) that names nothing in the simulated namespace
+	// and varies per machine — refused with the standard unsupported shape. A
+	// non-bubble goroutine keeps host access. See design.md "The interception
+	// boundary". Folds away in stock builds.
+	if dstSimEnabled && dstFenceActive() {
+		return "", errDSTUnsupported
+	}
 	return executable()
 }

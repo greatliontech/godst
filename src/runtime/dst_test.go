@@ -702,6 +702,25 @@ func TestDSTZeroCopyFence(t *testing.T) {
 	}
 }
 
+// TestDSTCgoFence verifies the interception boundary fences cgo at cgocall: a
+// bubble goroutine's C call panics with the unsupported shape, while a non-bubble
+// C call in the same process is unaffected. Uses testprogcgo built with -tags=dst
+// and cgo.
+//
+// Teeth: without the cgocall fence, the bubble's C.dstCgoNoop() runs normally
+// (no panic) → bubblePanicked=false.
+func TestDSTCgoFence(t *testing.T) {
+	testenv.MustHaveCGO(t)
+	exe, err := buildTestProg(t, "testprogcgo", "-tags=dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := strings.TrimSpace(runBuiltTestProg(t, exe, "DSTCgoFence"))
+	if out != "bubblePanicked=true hostOK=true" {
+		t.Fatalf("cgo fence mis-fenced (got %q, want \"bubblePanicked=true hostOK=true\")", out)
+	}
+}
+
 // TestDSTNonBubbleAllocTrigger verifies that non-bubble allocations do not
 // advance the deterministic GC trigger: NumGC deltas are identical with and
 // without an outside allocator churning.

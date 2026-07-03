@@ -140,6 +140,16 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 		throw("cgocall nil")
 	}
 
+	// Interception-boundary fence: a bubble goroutine calling into cgo is
+	// refused (a real C call is host-visible, wall-clock work no seed controls;
+	// gating on iscgo at run entry would be too coarse — a binary may link cgo it
+	// never calls in-run). Here getg() is the calling user goroutine (cgocall
+	// runs on the g stack before asmcgocall switches to g0), so dstFenceActive
+	// tests the bubble directly. Folds away in stock builds (dstBuild const).
+	if dstBuild && dstFenceActive() {
+		dstCgoRefuse()
+	}
+
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(&racecgosync))
 	}

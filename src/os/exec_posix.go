@@ -24,6 +24,18 @@ var (
 )
 
 func startProcess(name string, argv []string, attr *ProcAttr) (p *Process, err error) {
+	// Interception-boundary fence: a bubble goroutine spawning a real child is a
+	// simulation escape (a real process is wall-clock, host-visible work no seed
+	// controls). Refuse it here, before ensurePidfd probes pidfd and before the
+	// attr.Files f.Fd() loop — so the refusal is designed and nameable rather
+	// than an accidental simulated-file Fd() panic. syscall.forkExec is fenced
+	// too (the syscall.StartProcess/ForkExec entry), but fencing at the os choke
+	// gives the clean error and keeps a bubble off the pidfd probe. See
+	// design.md "The interception boundary".
+	if dstSimEnabled && dstFenceActive() {
+		return nil, &PathError{Op: "fork/exec", Path: name, Err: errDSTUnsupported}
+	}
+
 	// If there is no SysProcAttr (ie. no Chroot or changed
 	// UID/GID), double-check existence of the directory we want
 	// to chdir into. We can make the error clearer this way.

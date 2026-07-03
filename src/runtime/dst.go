@@ -1692,6 +1692,27 @@ func dstFenceActive() bool {
 	return gp.bubble != nil && gp.bubble == dstSimBubble
 }
 
+// dstCgoRefuse panics with the interception-boundary unsupported shape for a
+// bubble goroutine calling into cgo (a real C call is wall-clock, host-visible
+// work no seed controls; see design.md). It is deliberately NOT nosplit and NOT
+// inlined: the cold refusal path, so cgocall's nosplit fast path is unaffected
+// and the panic — which grows the stack — runs only after the decision to refuse.
+// Reached only from a genuine bubble goroutine (dstFenceActive gated it), which
+// always has a healthy stack and a P.
+//
+// The panic can grow the stack (morestack), which copies cgocall's frame. On
+// linux — the only platform DST supports (design.md sources table) — cgocall
+// carries only typed cgo pointer args, so the copy is safe. On the platforms
+// where cgocall also backs raw syscalls (Windows/solaris/illumos) its frame may
+// hold untyped syscall args that must not be adjusted; DST is not active there,
+// so this path is unreachable — but if DST ever targets them, this refuse-path
+// stack growth must be revisited.
+//
+//go:noinline
+func dstCgoRefuse() {
+	panic("runtime: cgo call unsupported under deterministic simulation")
+}
+
 // dstBubbleMainRoot derives bubble.main's per-bubble re-root from the seed,
 // salted to be independent of dstBubbleRoot's activation root for the same
 // seed. Without the salt, bubble.main replays the run caller's draw sequence —

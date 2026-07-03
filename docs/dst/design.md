@@ -599,9 +599,15 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
   (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when
   stdio is simulated); the fence makes the refusal designed and nameable.
-- **Signals**: `os/signal.Notify`/`NotifyContext` from a bubble goroutine are fenced (a real
-  signal delivery is an outside-bubble event on a wall clock; today it crashes the bubble only
-  *if* a signal happens to arrive — the fence makes the refusal deterministic instead of luck).
+- **Signals**: the `os/signal` operations that touch the process's signal machinery from a bubble
+  goroutine are fenced — `Notify`/`NotifyContext` (subscribe: a real signal delivery is an
+  outside-bubble event on a wall clock; today it crashes the bubble only *if* a signal happens to
+  arrive — the fence makes the refusal deterministic instead of luck), and `Ignore`/`Reset`/`Stop`
+  (which mutate the process-global signal *disposition* via `rt_sigaction` — `Ignore`/`Reset`
+  unconditionally, even with no subscribers — so a bubble's `Ignore(SIGINT)` would set the whole
+  host process, harness included, to ignore the signal: a bubble effect leaking into host state).
+  `Ignored` is a host-state *read* that mints and mutates nothing, so like the other ⛔ reads it is
+  program discipline, not fenced.
 - **cgo**: fenced at the call, not the build — `cgocall` from a bubble goroutine while a run is
   active panics with the unsupported shape (mirroring the FIPS gate's enforced-not-documented
   stance). Gating on `iscgo` at run entry would be too coarse: a binary may *link* cgo it never

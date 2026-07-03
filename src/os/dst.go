@@ -47,3 +47,15 @@ func dstSimGetegid() (int, bool)
 //
 //go:linkname dstFenceActive runtime.dstFenceActive
 func dstFenceActive() bool
+
+// errDSTUnsupported is the refusal for os operations fenced by the interception
+// boundary whose signature carries an error channel — process spawn
+// (startProcess) and os.Executable — the standard "unsupported under
+// deterministic simulation" shape (cf. dstErrUnsupportedFS for the filesystem).
+var errDSTUnsupported error = dstUnsupportedError{}
+
+type dstUnsupportedError struct{}
+
+func (dstUnsupportedError) Error() string {
+	return "unsupported under deterministic simulation"
+}

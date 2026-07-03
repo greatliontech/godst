@@ -85,6 +85,14 @@ func cancel(sigs []os.Signal, action func(int)) {
 // calls to [Notify] for the provided signals.
 // If no signals are provided, all incoming signals will be ignored.
 func Ignore(sig ...os.Signal) {
+	// Interception-boundary fence: Ignore mutates the process-global signal
+	// disposition (cancel -> ignoreSignal -> rt_sigaction, unconditionally, even
+	// with no subscribers), so from a bubble goroutine it would leak into
+	// host-global state — the whole process ignores the signal, harness included.
+	// Refused like Notify. Folds away in stock builds. See design.md.
+	if dstSimEnabled && dstFenceActive() {
+		panic("os/signal: Ignore unsupported under deterministic simulation")
+	}
 	cancel(sig, ignoreSignal)
 }
 
@@ -122,6 +130,16 @@ var (
 func Notify(c chan<- os.Signal, sig ...os.Signal) {
 	if c == nil {
 		panic("os/signal: Notify using nil channel")
+	}
+
+	// Interception-boundary fence: a bubble goroutine subscribing to OS signals
+	// is refused. A real signal delivery is an outside-bubble event on a wall
+	// clock; without the fence the bubble only crashes IF a signal happens to
+	// arrive — the fence makes the refusal deterministic. NotifyContext routes
+	// through here too. No error channel, so the refusal is a panic (like Fd).
+	// Folds away in stock builds. See design.md "The interception boundary".
+	if dstSimEnabled && dstFenceActive() {
+		panic("os/signal: Notify unsupported under deterministic simulation")
 	}
 
 	handlers.Lock()
@@ -172,6 +190,12 @@ func Notify(c chan<- os.Signal, sig ...os.Signal) {
 // signals.
 // If no signals are provided, all signal handlers will be reset.
 func Reset(sig ...os.Signal) {
+	// Fence: Reset mutates the process-global signal disposition (cancel ->
+	// disableSignal -> rt_sigaction, unconditionally), a host-global effect a
+	// bubble must not have. Refused like Ignore. Folds away in stock builds.
+	if dstSimEnabled && dstFenceActive() {
+		panic("os/signal: Reset unsupported under deterministic simulation")
+	}
 	cancel(sig, disableSignal)
 }
 
@@ -179,6 +203,15 @@ func Reset(sig ...os.Signal) {
 // It undoes the effect of all prior calls to [Notify] using c.
 // When Stop returns, it is guaranteed that c will receive no more signals.
 func Stop(c chan<- os.Signal) {
+	// Fence: a bubble goroutine must not touch the host signal machinery. If c
+	// was subscribed by a non-bubble goroutine and shared into the run, Stop
+	// would disableSignal (rt_sigaction) it out from under the host; on a
+	// never-subscribed channel it is a no-op today, and the loud refusal keeps
+	// the contract uniform. Refused like Notify. Folds away in stock builds.
+	if dstSimEnabled && dstFenceActive() {
+		panic("os/signal: Stop unsupported under deterministic simulation")
+	}
+
 	handlers.Lock()
 
 	h := handlers.m[c]

@@ -7,6 +7,8 @@
 package simulation
 
 import (
+	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -119,6 +121,77 @@ func TestDSTFenceIsBubbleScoped(t *testing.T) {
 
 	if nonBubblePanicked.Load() {
 		t.Errorf("non-bubble goroutine's raw SYS_SOCKET was fenced during an active run; the fence must be bubble-scoped, not run-scoped")
+	}
+}
+
+// TestDSTOSProcessFence checks the os-level interception fences (design.md "The
+// interception boundary"): from a bubble goroutine, os.StartProcess is refused
+// with the error shape (before the pidfd probe and the attr.Files Fd() loop),
+// os.Executable is refused (a host path naming nothing in the simulated
+// namespace), and os/signal.Notify is refused with a panic (no error channel).
+func TestDSTOSProcessFence(t *testing.T) {
+	var (
+		startErr       error
+		startPanicked  bool
+		execPath       string
+		execErr        error
+		notifyPanicked bool
+		ignorePanicked bool
+		resetPanicked  bool
+		stopPanicked   bool
+	)
+
+	Run(1, func() {
+		// Pass a simulated file in attr.Files. The os-level fence must refuse
+		// before the attr.Files f.Fd() loop — a simulated file has no honest
+		// descriptor, so f.Fd() panics ("os: Fd on a simulated file"). This gives
+		// the os.startProcess fence teeth distinct from syscall.forkExec's (which
+		// only refuses after the Fd loop, past the accidental panic).
+		sf, err := os.CreateTemp("", "dst-proc-fence")
+		if err != nil {
+			t.Errorf("CreateTemp in bubble: %v", err)
+			return
+		}
+		defer sf.Close()
+		startPanicked = dstDidPanic(func() {
+			_, startErr = os.StartProcess("/nonexistent/dst-fence-probe", []string{"probe"},
+				&os.ProcAttr{Files: []*os.File{sf}})
+		})
+		execPath, execErr = os.Executable()
+		notifyPanicked = dstDidPanic(func() {
+			signal.Notify(make(chan os.Signal, 1), os.Interrupt)
+		})
+		ignorePanicked = dstDidPanic(func() { signal.Ignore(os.Interrupt) })
+		resetPanicked = dstDidPanic(func() { signal.Reset(os.Interrupt) })
+		stopPanicked = dstDidPanic(func() { signal.Stop(make(chan os.Signal, 1)) })
+	})
+
+	if startPanicked {
+		t.Errorf("os.StartProcess in bubble panicked: the os-level fence must refuse before the attr.Files Fd() loop")
+	}
+	if startErr == nil || !strings.Contains(startErr.Error(), "unsupported under deterministic simulation") {
+		t.Errorf("os.StartProcess in bubble = %v, want unsupported-under-simulation refusal", startErr)
+	}
+	// Exact match: the os.Executable fence returns errDSTUnsupported directly,
+	// before the /proc/self/exe readlink. Without the fence, executable() reaches
+	// that readlink and the simulated FS refuses it too — but with a *PathError
+	// ("readlink /proc/self/exe: filesystem operation unsupported…"), a different
+	// string. Asserting the exact fence message keeps this test's teeth on the
+	// os.Executable fence rather than the FS refusal that would otherwise mask it.
+	if execErr == nil || execErr.Error() != "unsupported under deterministic simulation" {
+		t.Errorf("os.Executable in bubble = (%q, %v), want the os.Executable fence error exactly", execPath, execErr)
+	}
+	if !notifyPanicked {
+		t.Errorf("os/signal.Notify in bubble did not panic: the signal fence is inactive")
+	}
+	if !ignorePanicked {
+		t.Errorf("os/signal.Ignore in bubble did not panic: it mutates host signal disposition and must be fenced")
+	}
+	if !resetPanicked {
+		t.Errorf("os/signal.Reset in bubble did not panic: it mutates host signal disposition and must be fenced")
+	}
+	if !stopPanicked {
+		t.Errorf("os/signal.Stop in bubble did not panic: it touches host signal machinery and must be fenced")
 	}
 }
 
