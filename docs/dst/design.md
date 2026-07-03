@@ -303,11 +303,10 @@ network-flow-control chunk. The wire models a TCP socket pair, not a message que
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set —
 checked against live local bindings on a **2-tuple** (local addr:port) basis, as the real path refuses:
 Go binds an explicit `LocalAddr` without `SO_REUSEADDR`, so `bind(2)` fails `EADDRINUSE` on a local
-collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes;
-lands with the network-registry chunk) —
+collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes) —
 `:0` listeners receive deterministic nonzero ports (dialer ephemeral ports allocate deterministically
-and stay within the valid port range, wrapping past 65535 to the next free 4-tuple rather than minting
-impossible port numbers; lands with the network-registry chunk), listener lookup uses canonical simulated IPs
+and stay within the valid port range [40000, 65535], wrapping and skipping live local bindings rather
+than minting impossible port numbers), listener lookup uses canonical simulated IPs
 (`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6
 wildcard address and accepts dials of both families, conflicting with either family's listeners on the
 port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family, and a single-family wildcard listen reports

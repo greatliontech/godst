@@ -474,9 +474,9 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). A reset hits **both ends**, so
   each closes and a subsequent read returns `ECONNRESET` before draining — **in-flight bytes are dropped**,
   as a real RST discards them (DST-FAULT-SOUND). When a reset matches **several** conns, the victims are
-  reset in **connection-registration order** (a per-run sequence id recorded at establishment; lands
-  with the network-registry chunk — the landed mechanism iterates the registry map, deterministic only
-  for single-victim resets) — never in
+  reset in **connection-registration order** (a per-run sequence id recorded at establishment,
+  `dstConn.regSeq`; the victims are collected from the registry and sorted by it —
+  `TestDSTNetResetVictimOrderByRegSeq`) — never in
   map-iteration order over pointer keys, whose bucket placement hashes run-varying heap *addresses* and
   would make the wake order of the victims' blocked readers, and thus the downstream schedule, diverge
   across same-seed runs (DST-FAULT-REPLAY). This completes the network axis.

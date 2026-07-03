@@ -6,7 +6,10 @@
 
 package net
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // Connection-reset targeting. The imperative API in testing/simulation
 // (Reset / ResetProcess) drives this through runtime's passthrough into
@@ -29,18 +32,26 @@ var dstConns struct {
 	mu    sync.Mutex
 	epoch uint64
 	set   map[*dstConn]struct{}
+	seq   uint64 // per-run monotonic registration counter (see dstConn.regSeq)
 }
 
 func dstConnsRoll() { // caller holds mu
 	if e := dstNetEpoch(); e != dstConns.epoch || dstConns.set == nil {
 		dstConns.epoch = e
 		dstConns.set = make(map[*dstConn]struct{})
+		dstConns.seq = 0
 	}
 }
 
 func dstConnRegister(c *dstConn) {
 	dstConns.mu.Lock()
 	dstConnsRoll()
+	// Stamp a per-run registration sequence so a multi-victim reset can order its
+	// victims deterministically. Both ends of one conn register, so each gets its
+	// own seq; the reset iterates the whole registry, and ordering by seq is a pure
+	// function of Dial order (schedule-determined), never of pointer/heap address.
+	dstConns.seq++
+	c.regSeq = dstConns.seq
 	dstConns.set[c] = struct{}{}
 	dstConns.mu.Unlock()
 }
@@ -54,20 +65,59 @@ func dstConnDeregister(c *dstConn) {
 
 // dstResetMatching resets every registered conn for which match reports true. The
 // victims are collected under the lock and reset outside it, so resetConn's own
-// deregister does not re-enter the lock.
+// deregister does not re-enter the lock. They are reset in registration-SEQUENCE
+// order — never the registry map's iteration order, which hashes run-varying pointer
+// addresses (the fixed -tags dst hash key does not make addresses reproducible), so
+// with several victims the wake order of their blocked readers, and thus the whole
+// downstream schedule, would diverge across same-seed runs (DST-FAULT-REPLAY).
 func dstResetMatching(match func(*dstConn) bool) {
+	for _, c := range dstMatchedVictims(match) {
+		c.resetConn()
+	}
+}
+
+// dstMatchedVictims collects the registered conns satisfying match and returns them
+// in registration-SEQUENCE order (never the registry map's pointer-address iteration
+// order — see dstResetMatching's note). Factored out so the ordering is directly
+// testable without resetConn's side effects.
+func dstMatchedVictims(match func(*dstConn) bool) []*dstConn {
 	dstConns.mu.Lock()
-	dstConnsRoll()
 	var victims []*dstConn
+	dstConnsRoll()
 	for c := range dstConns.set {
 		if match(c) {
 			victims = append(victims, c)
 		}
 	}
 	dstConns.mu.Unlock()
-	for _, c := range victims {
-		c.resetConn()
+	sort.Slice(victims, func(i, j int) bool { return victims[i].regSeq < victims[j].regSeq })
+	return victims
+}
+
+// dstLocalBindInUse reports whether a live conn on host already occupies the local
+// binding ip:port — a 2-tuple, which is what the real path checks: Go binds an
+// explicit LocalAddr without SO_REUSEADDR, so bind(2) fails EADDRINUSE on a local
+// addr:port collision even when the destinations differ, and an ephemeral allocator
+// must skip a still-live port. Scans the per-run conn registry by the dialer end's
+// attribution (localHost + local address). Deterministic (a set-membership test, no
+// iteration order observed).
+func dstLocalBindInUse(host uint32, ip IP, port int) bool {
+	dstConns.mu.Lock()
+	defer dstConns.mu.Unlock()
+	dstConnsRoll()
+	for c := range dstConns.set {
+		if c.localHost != host {
+			continue
+		}
+		la, ok := c.local.(*TCPAddr)
+		if !ok || la.Port != port {
+			continue
+		}
+		if la.IP.Equal(ip) {
+			return true
+		}
 	}
+	return false
 }
 
 // dstResetPair resets every conn between hosts a and b (either direction).

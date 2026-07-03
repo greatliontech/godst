@@ -58,8 +58,31 @@ var dstNet struct {
 
 const (
 	dstDialEphemeralStart   = 40000
+	dstDialEphemeralEnd     = 65535 // the last valid TCP port; the ephemeral range wraps within [start, end]
 	dstListenEphemeralStart = 10000
 )
+
+// dstAllocEphemeralPort returns the next free ephemeral local port for a dialer on
+// host with source IP localIP, advancing the per-run counter and WRAPPING within
+// [dstDialEphemeralStart, dstDialEphemeralEnd] — so it never returns a port above
+// 65535 (the bare counter reached impossible numbers after ~25k dials) and never
+// duplicates a still-live local addr:port (a real ephemeral allocator skips live
+// ports). Returns 0 when the whole range is live (EADDRNOTAVAIL). Caller holds
+// dstNet.mu; the collision probe nests dstConns.mu under it (a fixed lock order).
+func dstAllocEphemeralPort(host uint32, localIP IP) int {
+	const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
+	for tried := 0; tried < span; tried++ {
+		p := dstNet.nextPort
+		dstNet.nextPort++
+		if dstNet.nextPort > dstDialEphemeralEnd {
+			dstNet.nextPort = dstDialEphemeralStart
+		}
+		if !dstLocalBindInUse(host, localIP, p) {
+			return p
+		}
+	}
+	return 0
+}
 
 // dstNetRoll resets the registry when the run epoch advances. Caller holds the mu.
 func dstNetRoll() {
@@ -450,6 +473,11 @@ type dstConn struct {
 	localHost, remoteHost uint32
 	localProc, remoteProc uint32
 
+	// regSeq is the per-run registration sequence, stamped at dstConnRegister, so a
+	// multi-victim reset orders its victims deterministically (registration order =
+	// Dial order, schedule-determined) rather than by pointer-map iteration order.
+	regSeq uint64
+
 	// acceptState tracks a server-end connection through the accept backlog:
 	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
 	// 0→1; the backlog teardown and the dialer's post-send listener-closed
@@ -817,6 +845,18 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		}
 	}
 	scope := dstDialScope(ip, dialerHost)
+	// The dialer's source IP is known without the registry lock.
+	localIP := IPv4(127, 0, 0, 1)
+	if _, routable := dstHostForRoutableIP(ip); routable {
+		// Cross-host dial: the source address is the dialer's own routable IP.
+		localIP = dstHostRoutableIP(dialerHost)
+	} else if dstAddrFamily(network, ip) == "tcp6" {
+		localIP = IPv6loopback
+	}
+	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {
+		localIP = localTCPAddr.IP
+	}
+
 	dstNet.mu.Lock()
 	dstNetRoll()
 	l := dstNet.listeners[scope+dstListenerKey(network, ip, portnum, false)]
@@ -827,24 +867,32 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	if localTCPAddr != nil {
 		localPort = localTCPAddr.Port
 	}
-	if localPort == 0 {
-		localPort = dstNet.nextPort
-		dstNet.nextPort++
+	if localPort != 0 {
+		// An explicit LocalAddr binds without SO_REUSEADDR: bind(2) fails EADDRINUSE
+		// on a live local addr:port collision (a 2-tuple, whatever the destination).
+		if dstLocalBindInUse(dialerHost, localIP, localPort) {
+			dstNet.mu.Unlock()
+			src := &TCPAddr{IP: localIP, Port: localPort}
+			if localTCPAddr != nil {
+				src.Zone = localTCPAddr.Zone
+			}
+			return nil, &OpError{Op: "dial", Net: network, Source: src, Addr: serverAddr, Err: syscall.EADDRINUSE}
+		}
+	} else {
+		// Ephemeral: advance the per-run counter, wrapping within the valid port
+		// range and skipping any port still live on the dialer's IP — so a port
+		// never exceeds 65535 (an impossible number the bare counter reached after
+		// ~25k dials) and a live 4-tuple is never duplicated.
+		localPort = dstAllocEphemeralPort(dialerHost, localIP)
+		if localPort == 0 {
+			dstNet.mu.Unlock()
+			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.EADDRNOTAVAIL}
+		}
 	}
 	dstNet.mu.Unlock()
 
 	if l == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
-	}
-	localIP := IPv4(127, 0, 0, 1)
-	if _, routable := dstHostForRoutableIP(ip); routable {
-		// Cross-host dial: the source address is the dialer's own routable IP.
-		localIP = dstHostRoutableIP(dialerHost)
-	} else if dstAddrFamily(network, ip) == "tcp6" {
-		localIP = IPv6loopback
-	}
-	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {
-		localIP = localTCPAddr.IP
 	}
 	localAddr := &TCPAddr{IP: localIP, Port: localPort}
 	if localTCPAddr != nil {
