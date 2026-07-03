@@ -412,10 +412,11 @@ func TestDSTDiskENOSPCBasic(t *testing.T) {
 }
 
 // TestDSTDiskENOSPCPartialFill (DST-FAULT-SOUND): a write that would exceed the cap
-// fills the remaining space (a short write, io.ErrShortWrite) rather than failing
-// outright — a real disk writes what it can; the next write, with nothing left, gets
-// ENOSPC. An all-or-nothing implementation (0 bytes + ENOSPC when room > 0) fails
-// here.
+// fills the remaining space and returns the partial count together with ENOSPC in one
+// call — mirroring internal/poll.FD.Write's loop, which is what a real os.File.Write
+// returns (never a bare io.ErrShortWrite for a regular file). The next write, with
+// nothing left, also gets ENOSPC. An all-or-nothing implementation (0 bytes + ENOSPC
+// when room > 0), or one returning a bare short count, fails here.
 func TestDSTDiskENOSPCPartialFill(t *testing.T) {
 	simulation.Run(1, func() {
 		onHost("h", func() {
@@ -424,8 +425,8 @@ func TestDSTDiskENOSPCPartialFill(t *testing.T) {
 			mustOK(t, "Create", err)
 
 			n, err := f.Write([]byte("abcdefghij")) // 10 bytes, room for 5
-			if n != 5 || !errors.Is(err, io.ErrShortWrite) {
-				t.Fatalf("filling write = %d, %v; want 5, io.ErrShortWrite", n, err)
+			if n != 5 || !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("filling write = %d, %v; want 5, ENOSPC (partial fill + error in one call)", n, err)
 			}
 			if _, err := f.Write([]byte("Z")); !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("write on full disk: %v, want ENOSPC", err)
@@ -455,9 +456,9 @@ func TestDSTDiskENOSPCFillsToExactlyCapacity(t *testing.T) {
 				n, err := f.Write(chunk)
 				total += n
 				if errors.Is(err, syscall.ENOSPC) {
-					break
+					break // a partial fill returns (n, ENOSPC) in one call, counted above
 				}
-				if err != nil && !errors.Is(err, io.ErrShortWrite) {
+				if err != nil {
 					t.Fatalf("unexpected write error: %v", err)
 				}
 			}
@@ -580,8 +581,8 @@ func TestDSTDiskENOSPCSyncPartialDurable(t *testing.T) {
 			f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_SYNC, 0o644)
 			mustOK(t, "OpenFile O_SYNC", err)
 			n, err := f.Write([]byte("abcde")) // room 3, only 3 fit
-			if n != 3 || !errors.Is(err, io.ErrShortWrite) {
-				t.Fatalf("O_SYNC partial write = %d, %v; want 3, io.ErrShortWrite", n, err)
+			if n != 3 || !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("O_SYNC partial write = %d, %v; want 3, ENOSPC (partial fill + error in one call)", n, err)
 			}
 			f.Close()
 			_, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")

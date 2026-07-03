@@ -231,41 +231,100 @@ func dstFSFencedLink(op, oldname, newname string) (error, bool) {
 	return &LinkError{Op: op, Old: oldname, New: newname, Err: dstErrUnsupportedFS}, true
 }
 
-// dstFSResolve walks cleaned absolute path name (resolved against the calling
-// host's tree root and the calling process's working directory) and returns the
-// parent directory node, the base name, and the target node (nil if absent).
-// Caller holds dstFS.mu. Errors are bare errnos; callers wrap.
+// dstFSResolve resolves name against the calling host's tree root and the calling
+// process's working directory by a COMPONENT-WISE PHYSICAL walk — the way the kernel
+// walks a path, not a lexical `path.Clean`. Every intermediate component must exist
+// and be a directory (ENOENT / ENOTDIR), `..` is evaluated against the tree during
+// the walk (never erased lexically first — so `/missing/../x` is ENOENT, not a
+// silent success on `/x`), and a trailing slash asserts the final component is a
+// directory (`open("/regularfile/")` is ENOTDIR). Returns the parent directory node,
+// the base name, and the target node (nil if absent). Caller holds dstFS.mu. Errors
+// are bare errnos; callers wrap.
 func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
-	clean := dstFSAbs(name)
 	root := dstFSDiskHere().root
-	if clean == "/" {
-		return nil, "/", root, nil
+	comps, trailingSlash := dstFSComponents(name)
+	// stack holds the directory chain from root; names[i] is stack[i]'s name in its
+	// parent (names[0] is the sentinel "/"). A `..` pops toward root; at root it
+	// stays (POSIX: `/..` == `/`).
+	stack := []*dstFSNode{root}
+	names := []string{"/"}
+	terminalDir := func() (parent *dstFSNode, base string, node *dstFSNode, errno error) {
+		// A path ending in `.`/`..` (or all-slashes) resolves to the current dir. A
+		// trailing slash on a directory is fine.
+		cur := stack[len(stack)-1]
+		if len(stack) == 1 {
+			return nil, "/", cur, nil
+		}
+		return stack[len(stack)-2], names[len(names)-1], cur, nil
 	}
-	dir := root
-	rest := clean[1:]
-	for {
-		i := 0
-		for i < len(rest) && rest[i] != '/' {
-			i++
+	for i, elem := range comps {
+		last := i == len(comps)-1
+		cur := stack[len(stack)-1]
+		switch elem {
+		case ".":
+			if last {
+				return terminalDir()
+			}
+		case "..":
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+				names = names[:len(names)-1]
+			}
+			if last {
+				return terminalDir()
+			}
+		default:
+			if last {
+				n := cur.entries[elem]
+				if trailingSlash && n != nil && !n.isDir {
+					return nil, "", nil, syscall.ENOTDIR
+				}
+				return cur, elem, n, nil
+			}
+			n := cur.entries[elem]
+			if n == nil {
+				return nil, "", nil, syscall.ENOENT
+			}
+			if !n.isDir {
+				return nil, "", nil, syscall.ENOTDIR
+			}
+			stack = append(stack, n)
+			names = append(names, elem)
 		}
-		elem := rest[:i]
-		if i == len(rest) {
-			return dir, elem, dir.entries[elem], nil
-		}
-		next := dir.entries[elem]
-		if next == nil {
-			return nil, "", nil, syscall.ENOENT
-		}
-		if !next.isDir {
-			return nil, "", nil, syscall.ENOTDIR
-		}
-		dir = next
-		rest = rest[i+1:]
 	}
+	// No components (root, or all trailing slashes) → the root directory.
+	return terminalDir()
 }
 
-// dstFSAbs resolves name against the calling process's working directory and
-// cleans it. Caller holds dstFS.mu.
+// dstFSComponents joins name against the calling process's working directory (if
+// relative) and splits it into path components WITHOUT collapsing `.`/`..` (those
+// are resolved physically by the walk in dstFSResolve) — only redundant slashes are
+// dropped. It reports whether the path had a trailing slash (which asserts the target
+// is a directory). Caller holds dstFS.mu.
+func dstFSComponents(name string) (comps []string, trailingSlash bool) {
+	full := name
+	if len(name) == 0 || name[0] != '/' {
+		full = dstFSCwdHere() + "/" + name
+	}
+	trailingSlash = len(full) > 1 && full[len(full)-1] == '/'
+	start := 0
+	for i := 0; i <= len(full); i++ {
+		if i == len(full) || full[i] == '/' {
+			if i > start {
+				comps = append(comps, full[start:i])
+			}
+			start = i + 1
+		}
+	}
+	return comps, trailingSlash
+}
+
+// dstFSAbs resolves name against the calling process's working directory and cleans
+// it LEXICALLY (`path.Clean`) — the canonical path STRING for the stored handle path,
+// the working directory, and rename same-path comparison. Path RESOLUTION against the
+// tree is dstFSResolve's physical walk, not this; the cwd is stored clean and contains
+// no `..`, so joining a clean cwd with a name preserves any `..` in the name for that
+// walk. Caller holds dstFS.mu.
 func dstFSAbs(name string) string {
 	if len(name) > 0 && name[0] == '/' {
 		return path.Clean(name)
@@ -680,7 +739,10 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	}
 
 	accWrite := flag&(O_WRONLY|O_RDWR) != 0
-	if node != nil && node.isDir && accWrite {
+	if node != nil && node.isDir && (accWrite || flag&O_TRUNC != 0) {
+		// A directory rejects write access AND O_TRUNC (regardless of access mode):
+		// real Linux returns EISDIR for open(dir, O_TRUNC) before any mutation, so
+		// the truncate below must never run on — nor bump the mtime of — a directory.
 		return wrap(syscall.EISDIR)
 	}
 
@@ -690,6 +752,12 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	case node != nil && flag&(O_CREATE|O_EXCL) == O_CREATE|O_EXCL:
 		return wrap(syscall.EEXIST)
 	case node == nil:
+		if len(name) > 1 && name[len(name)-1] == '/' {
+			// A trailing slash asserts a directory; O_CREAT cannot mint a regular
+			// file through one (real Linux: EISDIR). The resolver already rejects a
+			// trailing slash on an existing non-dir (ENOTDIR); this is its create leg.
+			return wrap(syscall.EISDIR)
+		}
 		if dstFSDiskHere().diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
@@ -959,13 +1027,19 @@ func (d *dstFile) write(b []byte) (int, error) {
 		d.off = int64(len(d.node.data))
 	}
 	allowed := d.enospcAllowed(d.off, int64(len(b)))
-	if allowed == 0 && len(b) > 0 {
-		return 0, syscall.ENOSPC
-	}
 	n := d.writeAtLocked(b[:allowed], d.off)
 	d.off += int64(n)
 	if d.osync {
 		d.node.commitLocked()
+	}
+	if n < len(b) {
+		// The disk filled: the remaining bytes fail ENOSPC, reported together with
+		// the partial count in ONE call — mirroring internal/poll.FD.Write's loop,
+		// which retries a short kernel write and surfaces (n, ENOSPC). Returning a
+		// bare short count instead would let os.File.Write report io.ErrShortWrite,
+		// an error identity a real regular-file write cannot produce, so the SUT's
+		// errors.Is(err, ENOSPC) recovery would miss exactly the faulted write.
+		return n, syscall.ENOSPC
 	}
 	return n, nil
 }
@@ -982,6 +1056,11 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
+	// pwrite models a SINGLE pwrite(2): os.File.WriteAt loops over it and adds the
+	// count only after the error check, so a partial fill must return (n, nil) here
+	// and let the loop surface ENOSPC on the next zero-byte call — returning a
+	// combined (n, ENOSPC) would make WriteAt discard the n. (The single-call Write
+	// path, by contrast, needs the combined return — see write.)
 	allowed := d.enospcAllowed(off, int64(len(b)))
 	if allowed == 0 && len(b) > 0 {
 		return 0, syscall.ENOSPC

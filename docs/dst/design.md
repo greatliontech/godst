@@ -377,11 +377,11 @@ reports the fixed simulated `/tmp` during a run rather than the host's `$TMPDIR`
 random names draw from the seeded runtime stream. A program needing other fixture files creates
 them inside the run.
 Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
-per-bubble). **Resolution is component-wise (physical), as the kernel walks (lands with the
-filesystem-fidelity chunk; resolution is lexical until then):** every intermediate
+per-bubble). **Resolution is component-wise (physical), as the kernel walks:** every intermediate
 component must exist and be a directory — `/missing/../tmp` is `ENOENT` (the walk reaches `missing`
 first), `/file/../other` and `/file/sub` are `ENOTDIR`, and a trailing slash asserts directory-ness
-(`open("/regularfile/")` is `ENOTDIR`). `..` is evaluated against the tree during the walk, never
+(`open("/regularfile/")` is `ENOTDIR`; `open("/new/", O_CREATE)` is `EISDIR` — a trailing slash cannot
+mint a regular file). `..` is evaluated against the tree during the walk, never
 erased lexically first — a purely lexical `path.Clean` would make sim-only successes out of path
 bugs a real kernel rejects. (`..` at the root stays at the root, as POSIX resolves it.) The working
 directory is a PATH, not a node reference: renaming a directory out from
@@ -393,8 +393,7 @@ chunked `n > 0` reads against a stable cursor) are **sorted by name** — determ
 consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubble's fake clock.
 Permission bits are stored and reported but not enforced in the base model (no simulated
 credential checks), and ownership is not represented at all — `Chown`/`Lchown` and `File.Chown`
-stay fenced. **umask is not modeled** (recorded stance; the mode-bit, `EISDIR`, and `ENOTEMPTY`
-clauses below land with the filesystem-fidelity chunk): created files and directories store the
+stay fenced. **umask is not modeled** (recorded stance): created files and directories store the
 requested mode verbatim — `os.Create` yields `0666` where a default-umask Linux yields `0644` —
 because a simulated umask would be one more machine-state input for no determinism gain; a SUT
 asserting host-masked modes is asserting machine state. Mode bits beyond the permission bits that

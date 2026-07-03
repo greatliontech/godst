@@ -528,10 +528,11 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   by `simulation.LimitDisk(host, bytes)` (and removed by `UnlimitDisk`). A capacity on the host's disk
   (`dstFSDisk.capped`/`capacity`) caps total regular-file content; a write that would grow the disk past
   it fills the remaining space and returns **the partial count together with the error — `(n, ENOSPC)`
-  in one call** (the one-call surface lands with the filesystem-fidelity chunk; until then the partial
-  fill surfaces as a bare short count, which `os.File.Write` reports as `io.ErrShortWrite` — an
-  identity the real surface cannot produce) — and a create/`mkdir` on an already-full disk fails
-  ENOSPC. The one-call surface is the
+  in one call** — and a create/`mkdir` on an already-full disk fails ENOSPC. `Write` (a single backend
+  call) surfaces the combined `(n, ENOSPC)` directly; `WriteAt` reaches the same shape through
+  `os.File.WriteAt`'s own retry loop, so the backend's `pwrite` returns partials as `(n, nil)` and the
+  loop surfaces ENOSPC on the following zero-byte call (`TestDSTDiskENOSPCPartialFill`,
+  `TestDSTDiskENOSPCStraddleOverQuota`). The one-call surface is the
   real kernel's as Go exposes it: `write(2)` returns the short count and the *retry* gets `ENOSPC`, but
   `internal/poll.FD.Write` **loops** until error or completion, so a real `os.File.Write` that partially
   fills a disk returns `(n, ENOSPC)` and can never return a bare short count (`io.ErrShortWrite`). The
