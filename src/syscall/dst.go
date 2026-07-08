@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dst
+//go:build dst && unix
 
 package syscall
 
@@ -36,4 +36,97 @@ type dstUnsupportedError struct{}
 
 func (dstUnsupportedError) Error() string {
 	return "operation unsupported under deterministic simulation"
+}
+
+type dstReadHook func(fd int, p []byte) (n int, err Errno, handled bool)
+type dstWriteHook func(fd int, p []byte) (n int, err Errno, handled bool)
+type dstPreadHook func(fd int, p []byte, offset int64) (n int, err Errno, handled bool)
+type dstPwriteHook func(fd int, p []byte, offset int64) (n int, err Errno, handled bool)
+type dstCloseHook func(fd int) (err Errno, handled bool)
+type dstFstatHook func(fd int, stat *Stat_t) (err Errno, handled bool)
+type dstSeekHook func(fd int, offset int64, whence int) (off int64, err Errno, handled bool)
+
+var dstReadHookFn dstReadHook
+var dstWriteHookFn dstWriteHook
+var dstPreadHookFn dstPreadHook
+var dstPwriteHookFn dstPwriteHook
+var dstCloseHookFn dstCloseHook
+var dstFstatHookFn dstFstatHook
+var dstSeekHookFn dstSeekHook
+
+//go:linkname dstSetReadHook
+func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
+
+//go:linkname dstSetWriteHook
+func dstSetWriteHook(fn dstWriteHook) { dstWriteHookFn = fn }
+
+//go:linkname dstSetPreadHook
+func dstSetPreadHook(fn dstPreadHook) { dstPreadHookFn = fn }
+
+//go:linkname dstSetPwriteHook
+func dstSetPwriteHook(fn dstPwriteHook) { dstPwriteHookFn = fn }
+
+//go:linkname dstSetCloseHook
+func dstSetCloseHook(fn dstCloseHook) { dstCloseHookFn = fn }
+
+//go:linkname dstSetFstatHook
+func dstSetFstatHook(fn dstFstatHook) { dstFstatHookFn = fn }
+
+//go:linkname dstSetSeekHook
+func dstSetSeekHook(fn dstSeekHook) { dstSeekHookFn = fn }
+
+func dstHookActive() bool {
+	if !dstFenceActive() {
+		return false
+	}
+	return true
+}
+
+func dstTryRead(fd int, p []byte) (n int, err Errno, handled bool) {
+	if !dstHookActive() || dstReadHookFn == nil {
+		return 0, 0, false
+	}
+	return dstReadHookFn(fd, p)
+}
+
+func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool) {
+	if !dstHookActive() || dstWriteHookFn == nil {
+		return 0, 0, false
+	}
+	return dstWriteHookFn(fd, p)
+}
+
+func dstTryPread(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {
+	if !dstHookActive() || dstPreadHookFn == nil {
+		return 0, 0, false
+	}
+	return dstPreadHookFn(fd, p, offset)
+}
+
+func dstTryPwrite(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {
+	if !dstHookActive() || dstPwriteHookFn == nil {
+		return 0, 0, false
+	}
+	return dstPwriteHookFn(fd, p, offset)
+}
+
+func dstTryClose(fd int) (err Errno, handled bool) {
+	if !dstHookActive() || dstCloseHookFn == nil {
+		return 0, false
+	}
+	return dstCloseHookFn(fd)
+}
+
+func dstTryFstat(fd int, stat *Stat_t) (err Errno, handled bool) {
+	if !dstHookActive() || dstFstatHookFn == nil {
+		return 0, false
+	}
+	return dstFstatHookFn(fd, stat)
+}
+
+func dstTrySeek(fd int, offset int64, whence int) (off int64, err Errno, handled bool) {
+	if !dstHookActive() || dstSeekHookFn == nil {
+		return 0, 0, false
+	}
+	return dstSeekHookFn(fd, offset, whence)
 }

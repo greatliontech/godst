@@ -296,17 +296,10 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 			pw.Close()
 		}
 
-		// Fd panics loud on a simulated file; SyscallConn fails with the
-		// fence shape.
-		func() {
-			defer func() {
-				r := recover()
-				if r == nil || !strings.Contains(fmt.Sprint(r), "unsupported under deterministic simulation") {
-					t.Fatalf("Fd panic = %v, want the unsupported shape", r)
-				}
-			}()
-			dst.Fd()
-		}()
+		// Fd on a tree file is virtual; SyscallConn is still fenced.
+		if fd := int(dst.Fd()); fd < 1<<30 {
+			t.Fatalf("Fd = %d, want virtual descriptor", fd)
+		}
 		if _, err := dst.SyscallConn(); !isDSTUnsupportedFS(err) {
 			t.Fatalf("SyscallConn = %v, want unsupported", err)
 		}
@@ -335,6 +328,267 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 			t.Fatalf("File.Chdir on file = %v, want ENOTDIR", err)
 		}
 		mf.Close()
+	})
+}
+
+func TestDSTFSVirtualFDSyscalls(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.OpenFile("/fd", os.O_CREATE|os.O_RDWR, 0o640)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		fd := int(f.Fd())
+		if fd < 1<<30 {
+			t.Fatalf("Fd = %d, want virtual descriptor", fd)
+		}
+		if fd2 := int(f.Fd()); fd2 != fd {
+			t.Fatalf("second Fd = %d, want stable %d", fd2, fd)
+		}
+
+		if n, err := syscall.Write(fd, []byte("hello")); n != 5 || err != nil {
+			t.Fatalf("syscall.Write = %d, %v", n, err)
+		}
+		if off, err := syscall.Seek(fd, 0, io.SeekStart); off != 0 || err != nil {
+			t.Fatalf("syscall.Seek = %d, %v", off, err)
+		}
+		buf := make([]byte, 5)
+		if n, err := syscall.Read(fd, buf); n != 5 || err != nil || string(buf) != "hello" {
+			t.Fatalf("syscall.Read = %d, %v, %q", n, err, buf)
+		}
+
+		buf = make([]byte, 3)
+		if n, err := syscall.Pread(fd, buf, 1); n != 3 || err != nil || string(buf) != "ell" {
+			t.Fatalf("syscall.Pread = %d, %v, %q", n, err, buf)
+		}
+		if n, err := syscall.Pread(fd, make([]byte, 1), -1); n != -1 || !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("negative syscall.Pread = %d, %v, want -1, EINVAL", n, err)
+		}
+		if n, err := syscall.Pread(fd, nil, -1); n != -1 || !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("zero-length negative syscall.Pread = %d, %v, want -1, EINVAL", n, err)
+		}
+		if n, err := syscall.Pwrite(fd, []byte("Y"), 1); n != 1 || err != nil {
+			t.Fatalf("syscall.Pwrite = %d, %v", n, err)
+		}
+		if n, err := syscall.Pwrite(fd, nil, -1); n != -1 || !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("zero-length negative syscall.Pwrite = %d, %v, want -1, EINVAL", n, err)
+		}
+		if n, err := syscall.Pwrite(fd, nil, 1<<20); n != 0 || err != nil {
+			t.Fatalf("zero-length syscall.Pwrite = %d, %v; want no-op", n, err)
+		}
+		var stNoop syscall.Stat_t
+		if err := syscall.Fstat(fd, &stNoop); err != nil || stNoop.Size != 5 {
+			t.Fatalf("Fstat after zero-length pwrite = size %d, %v; want size 5", stNoop.Size, err)
+		}
+		buf = make([]byte, 5)
+		if n, err := syscall.Pread(fd, buf, 0); n != 5 || err != nil || string(buf) != "hYllo" {
+			t.Fatalf("second syscall.Pread = %d, %v, %q; want hYllo", n, err, buf)
+		}
+
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err != nil {
+			t.Fatalf("syscall.Fstat: %v", err)
+		}
+		if st.Size != 5 || st.Mode&syscall.S_IFREG == 0 || st.Mode&0o777 != 0o640 {
+			t.Fatalf("Fstat = size %d mode %#o, want size 5 regular 0640", st.Size, st.Mode)
+		}
+		tmp, err := os.Open("/tmp")
+		if err != nil {
+			t.Fatalf("Open /tmp: %v", err)
+		}
+		var tmpSt syscall.Stat_t
+		if err := syscall.Fstat(int(tmp.Fd()), &tmpSt); err != nil {
+			t.Fatalf("Fstat /tmp: %v", err)
+		}
+		if tmpSt.Mode&syscall.S_ISVTX == 0 {
+			t.Fatalf("Fstat /tmp mode %#o, want sticky bit", tmpSt.Mode)
+		}
+		tmp.Close()
+		if err := syscall.Close(fd); err != nil {
+			t.Fatalf("syscall.Close: %v", err)
+		}
+		if _, err := syscall.Read(fd, make([]byte, 1)); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("read after raw close = %v, want EBADF", err)
+		}
+		if got := f.Fd(); got != ^uintptr(0) {
+			t.Fatalf("Fd after raw close = %#x, want invalid", got)
+		}
+		if err := f.Close(); err == nil {
+			t.Fatalf("File.Close after raw close = nil, want closed error")
+		}
+		if err := syscall.Close(-1); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("syscall.Close(-1) = %v, want EBADF", err)
+		}
+
+		wo, err := os.OpenFile("/write-only", os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("OpenFile write-only: %v", err)
+		}
+		wofd := int(wo.Fd())
+		if n, err := syscall.Read(wofd, nil); n != -1 || !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("zero-length syscall.Read on write-only fd = %d, %v; want -1, EBADF", n, err)
+		}
+		if n, err := syscall.Pread(wofd, nil, 0); n != -1 || !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("zero-length syscall.Pread on write-only fd = %d, %v; want -1, EBADF", n, err)
+		}
+		wo.Close()
+
+		ro, err := os.Open("/fd")
+		if err != nil {
+			t.Fatalf("Open read-only: %v", err)
+		}
+		rofd := int(ro.Fd())
+		if n, err := syscall.Write(rofd, nil); n != -1 || !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("zero-length syscall.Write on read-only fd = %d, %v; want -1, EBADF", n, err)
+		}
+		if n, err := syscall.Pwrite(rofd, nil, 0); n != -1 || !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("zero-length syscall.Pwrite on read-only fd = %d, %v; want -1, EBADF", n, err)
+		}
+		ro.Close()
+	})
+}
+
+func TestDSTFSVirtualFDWritePartialENOSPC(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 5)
+			f, err := os.Create("/fd")
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			fd := int(f.Fd())
+			if n, err := syscall.Write(fd, []byte("abcdef")); n != 5 || err != nil {
+				t.Fatalf("partial syscall.Write = %d, %v; want 5, nil", n, err)
+			}
+			if n, err := syscall.Write(fd, []byte("z")); n != -1 || !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("full syscall.Write = %d, %v; want -1, ENOSPC", n, err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			b, err := os.ReadFile("/fd")
+			if err != nil || string(b) != "abcde" {
+				t.Fatalf("content after partial syscall.Write = %q, %v; want abcde", b, err)
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDClosedFileDoesNotMint(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.Create("/fd")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if fd := f.Fd(); fd == ^uintptr(0) {
+			t.Fatalf("open Fd = invalid")
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if fd := f.Fd(); fd != ^uintptr(0) {
+			t.Fatalf("closed Fd = %#x, want invalid", fd)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDStaleEpochDoesNotReleaseLiveFD(t *testing.T) {
+	var leaked *os.File
+	simulation.Run(1, func() {
+		var err error
+		leaked, err = os.Create("/old")
+		if err != nil {
+			t.Fatalf("Create old: %v", err)
+		}
+		_ = leaked.Fd()
+	})
+	simulation.Run(1, func() {
+		live, err := os.Create("/new")
+		if err != nil {
+			t.Fatalf("Create new: %v", err)
+		}
+		fd := int(live.Fd())
+		if err := leaked.Close(); err != nil {
+			t.Fatalf("close leaked old file: %v", err)
+		}
+		if n, err := syscall.Write(fd, []byte("x")); n != 1 || err != nil {
+			t.Fatalf("write live fd after leaked close = %d, %v; want live fd intact", n, err)
+		}
+		live.Close()
+	})
+}
+
+func TestDSTFSVirtualFDRawSyscallFenced(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(fd uintptr)
+	}{
+		{"Syscall", func(fd uintptr) { syscall.Syscall(syscall.SYS_READ, fd, 0, 0) }},
+		{"RawSyscall", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_READ, fd, 0, 0) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			simulation.Run(1, func() {
+				f, err := os.Create("/fd")
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				fd := f.Fd()
+				defer f.Close()
+
+				defer func() {
+					r := recover()
+					if r == nil || !strings.Contains(fmt.Sprint(r), "unsupported under deterministic simulation") {
+						t.Fatalf("raw syscall panic = %v, want unsupported-under-simulation", r)
+					}
+				}()
+				tt.call(fd)
+			})
+		})
+	}
+}
+
+func TestDSTFSVirtualFDRawSyscallStaleFDFenced(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.Create("/fd")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		fd := f.Fd()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		defer func() {
+			r := recover()
+			if r == nil || !strings.Contains(fmt.Sprint(r), "unsupported under deterministic simulation") {
+				t.Fatalf("stale raw syscall panic = %v, want unsupported-under-simulation", r)
+			}
+		}()
+		syscall.RawSyscall(syscall.SYS_READ, fd, 0, 0)
+	})
+}
+
+func TestDSTFSVirtualFDProcessIsolation(t *testing.T) {
+	simulation.Run(1, func() {
+		var fd int
+		var f *os.File
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("p1", func() {
+				var err error
+				f, err = os.Create("/fd")
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				fd = int(f.Fd())
+			})
+			simulation.Process("p2", func() {
+				if _, err := syscall.Read(fd, make([]byte, 1)); !errors.Is(err, syscall.EBADF) {
+					t.Fatalf("cross-process read = %v, want EBADF", err)
+				}
+			})
+			if err := f.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
 	})
 }
 

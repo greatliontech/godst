@@ -475,20 +475,26 @@ and named Truncate all leave the durable image untouched, and that Chmod does no
 path is ENOENT even with both times zero — Linux's utimensat both-OMIT-succeeds quirk is not
 reproduced.
 
-**The file handle is a backend, not an fd.** `os.File` gains a dst backing chosen when the File
-is created: the tree-file backend here, and the pipe feature's `os.Pipe` landed exactly there — a
-stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than a
-retrofit, validating the Non-foreclosure invariant this paragraph recorded for that slot when
-the seam was built. `Fd()` on a simulated
-file has no honest answer and **panics** with the standard "unsupported under deterministic
-simulation" shape — loud, deterministic — rather than returning a host fd that would leak the
-simulation; everything `Fd()` feeds (mmap, raw `syscall`, locking) is out of the base model.
-Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced until then** —
-"not yet modeled" never means "reaches the host": within this feature's surface (the os file and
+**The file handle is a backend with a virtual fd.** `os.File` gains a dst backing chosen when the
+File is created: the tree-file backend here, and the pipe feature's `os.Pipe` landed exactly there
+— a stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than
+a retrofit, validating the Non-foreclosure invariant this paragraph recorded for that slot when the
+  seam was built. On Linux, a tree file or directory's `Fd()` returns a **virtual descriptor** owned by the
+  calling simulated process; non-Linux simulated file `Fd()` remains fenced until its raw-syscall boundary
+  can fence virtual fd numbers before host dispatch. A virtual descriptor is only meaningful to the DST
+  syscall boundary: selected split-safe Linux `syscall` package wrappers dispatch it back to the file backend,
+  and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. A virtual fd never allocates or names a
+host descriptor, and the raw-syscall fence still catches host-resource minting and unsupported
+syscalls before they can reach the host. Direct generic raw syscalls (`syscall.Syscall*` and
+`golang.org/x/sys/unix` wrappers that bottom out there) remain fenced for virtual fd numbers until a
+split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
+descriptor and any process-owned resources later attached to it (locks, mappings).
+Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced until then** — "not
+yet modeled" never means "reaches the host": within this feature's surface (the os file and
 namespace API; `os/exec`'s process surface is its own roadmap item), every handle-producing or
-namespace-touching entry point is either implemented in-sim or fails with the unsupported shape
-while a run is active (`os.OpenRoot` included; `os.Pipe` is simulated — see "Deterministic pipes
-and the stdio stance"). A `File` or `Root` opened BEFORE the run is a host-backed
+namespace-touching entry point is either implemented in-sim or fails with the unsupported shape while
+a run is active (`os.OpenRoot` included; `os.Pipe` is simulated — see "Deterministic pipes and the
+stdio stance"). A `File` or `Root` opened BEFORE the run is a host-backed
 handle and stays outside the base model, exactly as inherited fds are for the network — program
 discipline, recorded here as the inherited-handle stance — and symmetrically, a simulated `File`
 leaked OUT of its run keeps operating on its run's orphaned tree in later runs: deterministic,
@@ -501,10 +507,11 @@ takes the generic loop — the zero-copy fast paths bail whenever either side is
 
 `os.Pipe` under a run is **owned by the fork**: it returns a pair of Files backed by one
 in-memory byte stream — the stream-shaped second implementation of the `dstFileBackend` seam —
-and never allocates a host descriptor (enforced by a /proc/self/fd census across a run). All the
-seam-generic stances apply unchanged because they ride the seam, not the backend: `Fd()` panics,
-`SyscallConn` is fenced, zero-copy fast paths bail, `net.FileConn` rejects, and a simulated pipe
-handed to `os/exec` hits the `Fd()` panic (loud; the process surface is its own roadmap item).
+and never allocates a host descriptor (enforced by a /proc/self/fd census across a run). The virtual
+fd surface is deliberately file-tree-only until a pipe fd contract is settled: `Fd()` on a simulated
+pipe still panics, `SyscallConn` is fenced, zero-copy fast paths bail, `net.FileConn` rejects, and a
+simulated pipe handed to `os/exec` hits the `Fd()` panic (loud; the process surface is its own roadmap
+item).
 Determinism rides the schedule as everywhere else; blocking operations wait on channels created
 inside the bubble, so a blocked pipe read or write is **synctest-durably blocked** — the bubble
 clock advances over it and deadlock detection stays sound.
@@ -595,11 +602,10 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
-  operations **on pre-run host handles** keep
-  working: simulated files never expose an fd, so an fd argument can only name a host handle, and
-  I/O on those is the inherited-handle stance (stdio) — sanctioned, with its recorded wedge risk.
-  The exported named wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`) stay
-  for the same reason; anything outside the family is fenced, deliberately erring loud.
+  operations **on pre-run host handles** keep working. Virtual fd numbers are recognized separately
+  and refused at this raw boundary before they can reach the host; selected split-safe named
+  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`) dispatch them to the
+  simulated backend. Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
   (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when
@@ -946,7 +952,8 @@ later steps add, never rewrite.
   isolation is an enforced invariant, not a convention. See the "In-memory deterministic filesystem"
   section above; tested by the `TestDSTFS*` family, the durability white-box, and the cross-process
   `TestDSTDiskReplay`. Caveats: no symlinks/`os.Root`/locking yet (fenced follow-ons), no ownership
-  model (`Chown` fenced; permission bits stored, not enforced), `Fd()` panics, `Sys()` is nil.
+  model (`Chown` fenced; permission bits stored, not enforced), tree-file `Fd()` is virtual on Linux and only
+  selected syscall wrappers consume it, `Sys()` is nil.
 
 - **I/O (deterministic pipes + the stdio stance). LANDED (third I/O feature).** `os.Pipe` under DST
   is an in-memory stream behind the `os.File` backend seam the disk feature built — Linux anonymous
@@ -1005,4 +1012,3 @@ itself and depends only on the landed Seq-5 seam + `-race`.
   full scope and tiers are written up so the depth of fix is a deliberate choice, not a default.
 - **Upstreamability**: whether the runtime knobs are kept as a fork patch or shaped to be proposable
   upstream (the `randomizeScheduler`-as-knob framing is the most upstream-friendly).
-

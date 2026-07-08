@@ -66,8 +66,10 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 	// refused; I/O on an inherited host fd (the allowlist) is not. This is the
 	// choke point that also catches golang.org/x/sys/unix, whose asm calls this
 	// directly. Folds away in stock builds (dstSimFenced const). See design.md.
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
-		dstSyscallRefuse(trap)
+	if dstSimFenced && dstFenceActive() {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+			dstSyscallRefuse(trap)
+		}
 	}
 	var errno uintptr
 	r1, r2, errno = linux.Syscall6(trap, a1, a2, a3, a4, a5, a6)
@@ -81,8 +83,10 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall so the refusal panics in a clean scheduling
 	// state (see RawSyscall6). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
-		dstSyscallRefuse(trap)
+	if dstSimFenced && dstFenceActive() {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+			dstSyscallRefuse(trap)
+		}
 	}
 	runtime_entersyscall()
 	// N.B. Calling RawSyscall here is unsafe with atomic coverage
@@ -107,8 +111,10 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:linkname Syscall6
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall (see Syscall). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(trap) {
-		dstSyscallRefuse(trap)
+	if dstSimFenced && dstFenceActive() {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+			dstSyscallRefuse(trap)
+		}
 	}
 	runtime_entersyscall()
 	r1, r2, err = RawSyscall6(trap, a1, a2, a3, a4, a5, a6)
@@ -1067,7 +1073,7 @@ func Mount(source string, target string, fstype string, flags uintptr, data stri
 //sys	Adjtimex(buf *Timex) (state int, err error)
 //sys	Chdir(path string) (err error)
 //sys	Chroot(path string) (err error)
-//sys	Close(fd int) (err error)
+//sys	closeFD(fd int) (err error) = SYS_CLOSE
 //sys	Dup(oldfd int) (fd int, err error)
 //sys	Dup3(oldfd int, newfd int, flags int) (err error)
 //sysnb	EpollCreate1(flag int) (fd int, err error)

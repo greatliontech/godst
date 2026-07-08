@@ -36,9 +36,8 @@ func TestDSTSyscallFence(t *testing.T) {
 			syscall.RawSyscall(syscall.SYS_SOCKET, uintptr(syscall.AF_INET), uintptr(syscall.SOCK_STREAM), 0)
 		})
 
-		// close() is on the allowlist: an fd argument can only name a real host
-		// handle (a simulated file never exposes one), so I/O on it is the
-		// sanctioned inherited-handle stance, not fenced. A bogus fd returns
+		// close() is on the allowlist for inherited host handles. Active virtual
+		// fd numbers are fenced separately; this bogus non-virtual fd returns
 		// EBADF; the point is that it does not panic.
 		allowedPanicked = dstDidPanic(func() {
 			syscall.RawSyscall(syscall.SYS_CLOSE, 0x7fffffff, 0, 0)

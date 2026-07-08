@@ -25,7 +25,7 @@ func setTimeval(sec, usec int64) Timeval {
 // (386 default is 32-bit file system and 16-bit uid).
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error) = SYS_FCHOWN32
-//sys	Fstat(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
+//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_FSTATAT64
 //sys	Ftruncate(fd int, length int64) (err error) = SYS_FTRUNCATE64
 //sysnb	Getegid() (egid int) = SYS_GETEGID32
@@ -76,7 +76,7 @@ func mmap(addr uintptr, length uintptr, prot int, flags int, fd int, offset int6
 // Implemented in assembly to avoid allocation.
 func seek(fd int, offset int64, whence int) (newoffset int64, err Errno)
 
-func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
+func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
 	newoffset, errno := seek(fd, offset, whence)
 	if errno != 0 {
 		return 0, errno

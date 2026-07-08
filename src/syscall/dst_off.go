@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !dst
+//go:build !dst && unix
 
 package syscall
 
@@ -14,3 +14,23 @@ const dstSimFenced = false
 func dstFenceActive() bool { return false }
 
 var dstErrUnsupported error
+
+func dstTryRead(fd int, p []byte) (n int, err Errno, handled bool) { return 0, 0, false }
+
+func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool) { return 0, 0, false }
+
+func dstTryPread(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {
+	return 0, 0, false
+}
+
+func dstTryPwrite(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {
+	return 0, 0, false
+}
+
+func dstTryClose(fd int) (err Errno, handled bool) { return 0, false }
+
+func dstTryFstat(fd int, stat *Stat_t) (err Errno, handled bool) { return 0, false }
+
+func dstTrySeek(fd int, offset int64, whence int) (off int64, err Errno, handled bool) {
+	return 0, 0, false
+}

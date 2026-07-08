@@ -25,7 +25,7 @@ func setTimeval(sec, usec int64) Timeval {
 // Implemented in assembly to avoid allocation.
 func seek(fd int, offset int64, whence int) (newoffset int64, err Errno)
 
-func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
+func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
 	newoffset, errno := seek(fd, offset, whence)
 	if errno != 0 {
 		return 0, errno
@@ -52,7 +52,7 @@ func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
 // (16-bit uid calls are not always supported in newer kernels)
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error) = SYS_FCHOWN32
-//sys	Fstat(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
+//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_FSTATAT64
 //sysnb	Getegid() (egid int) = SYS_GETEGID32
 //sysnb	Geteuid() (euid int) = SYS_GETEUID32

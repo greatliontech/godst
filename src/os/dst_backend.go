@@ -6,6 +6,12 @@ package os
 
 import "time"
 
+type dstFDKey struct {
+	epoch uint64
+	host  uint32
+	proc  uint32
+}
+
 // dstFileBackend is the seam between *os.File and its simulated backing
 // under deterministic simulation (-tags dst): the in-memory tree file
 // (dstFile) and the in-memory pipe end (dstPipeEnd) implement it. The

@@ -70,6 +70,7 @@ type file struct {
 	appendMode  bool                    // whether file is opened for appending
 	inRoot      bool                    // whether file is opened in a Root
 	dstf        dstFileBackend          // simulated backing under DST; nil otherwise (inert untagged)
+	dstfds      map[dstFDKey]int        // simulated descriptors registered with the DST syscall boundary
 }
 
 // fd is the Unix implementation of Fd.
@@ -78,10 +79,7 @@ func (f *File) fd() uintptr {
 		return ^(uintptr(0))
 	}
 	if dstSimEnabled && f.dstf != nil {
-		// A simulated file has no honest descriptor; returning one would
-		// leak the simulation into raw syscalls. Loud and deterministic
-		// (see design.md "In-memory deterministic filesystem").
-		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
+		return uintptr(dstFD(f.file))
 	}
 
 	// If we put the file descriptor into nonblocking mode,
@@ -335,6 +333,7 @@ func (file *file) close() error {
 		if e := file.dstf.closeFile(); e != nil {
 			err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
 		}
+		dstReleaseFD(file)
 		runtime.SetFinalizer(file, nil)
 		return err
 	}

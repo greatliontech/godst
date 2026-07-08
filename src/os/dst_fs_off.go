@@ -43,6 +43,10 @@ func dstChtimes(name string, atime, mtime time.Time) (bool, error) { return fals
 
 func dstNewPipe() (*File, *File, bool) { return nil, nil, false }
 
+func dstFD(file *file) int { return -1 }
+
+func dstReleaseFD(file *file) {}
+
 // dstErrUnsupportedFS exists untagged only so fence gates type-check; every
 // reference is behind the folded dstSimEnabled constant.
 var dstErrUnsupportedFS error

@@ -6,10 +6,12 @@
 
 package syscall
 
+import _ "unsafe" // for go:linkname
+
 // dstSyscallAllowedTrap reports whether trap is in the I/O-on-an-existing-fd
-// allowlist: the family that can only name a pre-run host handle, so it is the
-// sanctioned inherited-handle stance (a simulated file never exposes an fd, so
-// an fd argument can only be a real host descriptor — stdio and the like). See
+// allowlist: the family that may name a pre-run host handle, so it is the
+// sanctioned inherited-handle stance. Active virtual fd numbers are checked
+// separately and refused at the raw boundary before host dispatch. See
 // design.md "The interception boundary". Everything outside the family is
 // fenced: read/write/close on inherited handles keep working, but a bubble
 // goroutine minting a new host resource (open, socket, pipe, dup, mmap, execve)
@@ -25,7 +27,46 @@ func dstSyscallAllowedTrap(trap uintptr) bool {
 		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
 		return true
 	}
-	return false
+	return dstSyscallAllowedArchTrap(trap)
+}
+
+const dstVirtualFDBase = 1 << 30
+const dstVirtualFDCount = 1 << 20
+
+// dstVirtualFDActive records fd numbers issued as virtual fds in the current
+// epoch. Entries stay set after close so stale raw syscalls cannot fall through
+// to the host; the registry decides live named-wrapper operations, and epoch
+// rollover clears the bitmap.
+var dstVirtualFDActive [dstVirtualFDCount]uint8
+
+//go:linkname dstSetVirtualFDActive
+func dstSetVirtualFDActive(fd uintptr, active bool) {
+	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
+		return
+	}
+	if active {
+		dstVirtualFDActive[fd-dstVirtualFDBase] = 1
+	} else {
+		dstVirtualFDActive[fd-dstVirtualFDBase] = 0
+	}
+}
+
+//go:linkname dstClearVirtualFDs
+func dstClearVirtualFDs() {
+	clear(dstVirtualFDActive[:])
+}
+
+//go:nosplit
+func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
+	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount || dstVirtualFDActive[fd-dstVirtualFDBase] == 0 {
+		return false
+	}
+	switch trap {
+	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK, SYS_FSTAT,
+		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
+		return true
+	}
+	return dstSyscallVirtualFDArchTrap(trap)
 }
 
 // dstSyscallRefuse panics with the standard unsupported-under-simulation shape,
