@@ -479,16 +479,31 @@ reproduced.
 File is created: the tree-file backend here, and the pipe feature's `os.Pipe` landed exactly there
 — a stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than
 a retrofit, validating the Non-foreclosure invariant this paragraph recorded for that slot when the
-  seam was built. On Linux, a tree file or directory's `Fd()` returns a **virtual descriptor** owned by the
-  calling simulated process; non-Linux simulated file `Fd()` remains fenced until its raw-syscall boundary
-  can fence virtual fd numbers before host dispatch. A virtual descriptor is only meaningful to the DST
-  syscall boundary: selected split-safe Linux `syscall` package wrappers dispatch it back to the file backend,
-  and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. A virtual fd never allocates or names a
+seam was built. On Linux, a tree file or directory's `Fd()` returns a **virtual descriptor** owned by the
+calling simulated process; non-Linux simulated file `Fd()` remains fenced until its raw-syscall boundary
+can fence virtual fd numbers before host dispatch. A virtual descriptor is only meaningful to the DST
+syscall boundary: selected split-safe Linux `syscall` package wrappers dispatch it back to the file backend,
+and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. A virtual fd never allocates or names a
 host descriptor, and the raw-syscall fence still catches host-resource minting and unsupported
 syscalls before they can reach the host. Direct generic raw syscalls (`syscall.Syscall*` and
 `golang.org/x/sys/unix` wrappers that bottom out there) remain fenced for virtual fd numbers until a
 split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
-descriptor and any process-owned resources later attached to it (locks, mappings).
+descriptor.
+
+Linux virtual fds support read-only shared file mappings for database page readers:
+`syscall.Mmap(fd, offset, length, PROT_READ, MAP_SHARED)` on a readable regular tree file returns a
+process-owned mapping over that file's current bytes without allocating or naming a host mapping. The
+mapping lifetime is independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap`
+unregisters it, and the run epoch resets any residue. Reads through the mapping observe the bytes at map
+time and later normal writes to the same simulated file node update the overlapping mapped bytes, matching
+the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; attempts to request writable
+protection or writable/private mappings return deterministic kernel-shaped errors. `Madvise` on such
+mappings accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
+`MADV_COLD`) without touching the host; unsupported advice values fail deterministically. Mapping slices
+are process-owned capabilities, not an IPC channel: passing one to another simulated process is outside the
+model, while file writes by any process on the same simulated host update mappings through the shared file
+node.
+
 Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced until then** — "not
 yet modeled" never means "reaches the host": within this feature's surface (the os file and
 namespace API; `os/exec`'s process surface is its own roadmap item), every handle-producing or
@@ -594,7 +609,7 @@ falsifies host isolation as an *enforced* invariant. Every fence below fires onl
 active** — non-bubble goroutines keep full host access, so the harness around the run is untouched:
 
 - **Resource-minting `syscall` entry points** (`Open`/`Openat`/`Creat`, `Socket`/`Socketpair`,
-  `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, `Mmap`, `ForkExec`/`Exec`) fail with the standard
+  `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, host-backed `Mmap`, `ForkExec`/`Exec`) fail with the standard
   "unsupported under deterministic simulation" shape — loud and deterministic, exactly like `Fd()`.
   A minted host resource is a simulation escape; refusing it is the fence, absorbing it silently is
   the defect.
@@ -604,8 +619,9 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
   operations **on pre-run host handles** keep working. Virtual fd numbers are recognized separately
   and refused at this raw boundary before they can reach the host; selected split-safe named
-  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`) dispatch them to the
-  simulated backend. Anything outside the family is fenced, deliberately erring loud.
+  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, plus the supported
+  `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations) dispatch them to the simulated backend.
+  Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
   (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when

@@ -1299,15 +1299,27 @@ var mapper = &mmapper{
 }
 
 func Mmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err error) {
+	if data, e1, handled := dstTryMmap(fd, offset, length, prot, flags); handled {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		}
+		return data, err
+	}
 	return mapper.Mmap(fd, offset, length, prot, flags)
 }
 
 func Munmap(b []byte) (err error) {
+	if e1, handled := dstTryMunmap(b); handled {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		}
+		return err
+	}
 	return mapper.Munmap(b)
 }
 
-//sys	Madvise(b []byte, advice int) (err error)
-//sys	Mprotect(b []byte, prot int) (err error)
+//sys	madvise(b []byte, advice int) (err error) = SYS_MADVISE
+//sys	mprotect(b []byte, prot int) (err error) = SYS_MPROTECT
 //sys	Mlock(b []byte) (err error)
 //sys	Munlock(b []byte) (err error)
 //sys	Mlockall(flags int) (err error)

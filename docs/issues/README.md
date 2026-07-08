@@ -10,9 +10,6 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb virtual fd syscall foundation](./dst-gmdb-virtual-fd-syscall-foundation.md) | 1 |
-| [DST gmdb read-only file mmap](./dst-gmdb-readonly-file-mmap.md) | 2 |
-| [DST gmdb madvise handling](./dst-gmdb-madvise.md) | 2 |
 | [DST gmdb fdatasync durability boundary](./dst-gmdb-fdatasync.md) | 3 |
 | [DST gmdb directory fsync durability](./dst-gmdb-directory-fsync.md) | 3 |
 | [DST gmdb OpenRoot support](./dst-gmdb-openroot.md) | 4 |

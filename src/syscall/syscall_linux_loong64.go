@@ -4,7 +4,10 @@
 
 package syscall
 
-import "unsafe"
+import (
+	"internal/runtime/syscall/linux"
+	"unsafe"
+)
 
 const (
 	_SYS_setgroups  = SYS_SETGROUPS
@@ -56,7 +59,11 @@ func fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) {
 	if err = statx(dirfd, path, _AT_NO_AUTOMOUNT|flags, _STATX_BASIC_STATS, &r); err != nil {
 		return err
 	}
+	statFromStatx(stat, &r)
+	return nil
+}
 
+func statFromStatx(stat *Stat_t, r *statx_t) {
 	stat.Dev = makedev(r.Dev_major, r.Dev_minor)
 	stat.Ino = r.Ino
 	stat.Mode = uint32(r.Mode)
@@ -72,8 +79,6 @@ func fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) {
 	stat.Atim = timespecFromStatxTimestamp(r.Atime)
 	stat.Mtim = timespecFromStatxTimestamp(r.Mtime)
 	stat.Ctim = timespecFromStatxTimestamp(r.Ctime)
-
-	return nil
 }
 
 func Fstatat(fd int, path string, stat *Stat_t, flags int) (err error) {
@@ -81,7 +86,24 @@ func Fstatat(fd int, path string, stat *Stat_t, flags int) (err error) {
 }
 
 func fstatFD(fd int, stat *Stat_t) (err error) {
+	if dstSimFenced && dstFenceActive() {
+		return fstatFDDST(fd, stat)
+	}
 	return fstatat(fd, "", stat, _AT_EMPTY_PATH)
+}
+
+var emptyStatXPath [1]byte
+
+func fstatFDDST(fd int, stat *Stat_t) (err error) {
+	var r statx_t
+	runtime_entersyscall()
+	_, _, errno := linux.Syscall6(SYS_STATX, uintptr(fd), uintptr(unsafe.Pointer(&emptyStatXPath[0])), uintptr(_AT_NO_AUTOMOUNT|_AT_EMPTY_PATH), uintptr(_STATX_BASIC_STATS), uintptr(unsafe.Pointer(&r)), 0)
+	runtime_exitsyscall()
+	if errno != 0 {
+		return errnoErr(Errno(errno))
+	}
+	statFromStatx(stat, &r)
+	return nil
 }
 
 func Stat(path string, stat *Stat_t) (err error) {

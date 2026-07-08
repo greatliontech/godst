@@ -45,6 +45,10 @@ type dstPwriteHook func(fd int, p []byte, offset int64) (n int, err Errno, handl
 type dstCloseHook func(fd int) (err Errno, handled bool)
 type dstFstatHook func(fd int, stat *Stat_t) (err Errno, handled bool)
 type dstSeekHook func(fd int, offset int64, whence int) (off int64, err Errno, handled bool)
+type dstMmapHook func(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool)
+type dstMunmapHook func(data []byte) (err Errno, handled bool)
+type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
+type dstMadviseHook func(data []byte, advice int) (err Errno, handled bool)
 
 var dstReadHookFn dstReadHook
 var dstWriteHookFn dstWriteHook
@@ -53,6 +57,10 @@ var dstPwriteHookFn dstPwriteHook
 var dstCloseHookFn dstCloseHook
 var dstFstatHookFn dstFstatHook
 var dstSeekHookFn dstSeekHook
+var dstMmapHookFn dstMmapHook
+var dstMunmapHookFn dstMunmapHook
+var dstMprotectHookFn dstMprotectHook
+var dstMadviseHookFn dstMadviseHook
 
 //go:linkname dstSetReadHook
 func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
@@ -74,6 +82,18 @@ func dstSetFstatHook(fn dstFstatHook) { dstFstatHookFn = fn }
 
 //go:linkname dstSetSeekHook
 func dstSetSeekHook(fn dstSeekHook) { dstSeekHookFn = fn }
+
+//go:linkname dstSetMmapHook
+func dstSetMmapHook(fn dstMmapHook) { dstMmapHookFn = fn }
+
+//go:linkname dstSetMunmapHook
+func dstSetMunmapHook(fn dstMunmapHook) { dstMunmapHookFn = fn }
+
+//go:linkname dstSetMprotectHook
+func dstSetMprotectHook(fn dstMprotectHook) { dstMprotectHookFn = fn }
+
+//go:linkname dstSetMadviseHook
+func dstSetMadviseHook(fn dstMadviseHook) { dstMadviseHookFn = fn }
 
 func dstHookActive() bool {
 	if !dstFenceActive() {
@@ -129,4 +149,32 @@ func dstTrySeek(fd int, offset int64, whence int) (off int64, err Errno, handled
 		return 0, 0, false
 	}
 	return dstSeekHookFn(fd, offset, whence)
+}
+
+func dstTryMmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool) {
+	if !dstHookActive() || dstMmapHookFn == nil {
+		return nil, 0, false
+	}
+	return dstMmapHookFn(fd, offset, length, prot, flags)
+}
+
+func dstTryMunmap(data []byte) (err Errno, handled bool) {
+	if !dstHookActive() || dstMunmapHookFn == nil {
+		return 0, false
+	}
+	return dstMunmapHookFn(data)
+}
+
+func dstTryMprotect(data []byte, prot int) (err Errno, handled bool) {
+	if !dstHookActive() || dstMprotectHookFn == nil {
+		return 0, false
+	}
+	return dstMprotectHookFn(data, prot)
+}
+
+func dstTryMadvise(data []byte, advice int) (err Errno, handled bool) {
+	if !dstHookActive() || dstMadviseHookFn == nil {
+		return 0, false
+	}
+	return dstMadviseHookFn(data, advice)
 }

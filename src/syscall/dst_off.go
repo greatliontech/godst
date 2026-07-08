@@ -34,3 +34,13 @@ func dstTryFstat(fd int, stat *Stat_t) (err Errno, handled bool) { return 0, fal
 func dstTrySeek(fd int, offset int64, whence int) (off int64, err Errno, handled bool) {
 	return 0, 0, false
 }
+
+func dstTryMmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool) {
+	return nil, 0, false
+}
+
+func dstTryMunmap(data []byte) (err Errno, handled bool) { return 0, false }
+
+func dstTryMprotect(data []byte, prot int) (err Errno, handled bool) { return 0, false }
+
+func dstTryMadvise(data []byte, advice int) (err Errno, handled bool) { return 0, false }

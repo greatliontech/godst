@@ -586,6 +586,7 @@ func (node *dstFSNode) truncateLocked(size int64) {
 		copy(grown, node.data)
 		node.data = grown
 	}
+	dstMMapTruncateLocked(node, size)
 	node.modTime = time.Now()
 }
 
@@ -772,8 +773,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		// Linux truncates even for O_RDONLY|O_TRUNC; match the host's shape.
 		// Truncation mutates current content only; the durable image moves
 		// on Sync, never on a mutation (the durability contract).
-		node.data = nil
-		node.modTime = time.Now()
+		node.truncateLocked(0)
 	}
 
 	d := &dstFile{
@@ -1090,6 +1090,7 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) int {
 		}
 	}
 	n := copy(node.data[off:], b)
+	dstMMapWriteLocked(node, off, b[:n])
 	node.modTime = time.Now()
 	return n
 }

@@ -2,16 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dst && linux && !(386 || arm || mips || mipsle)
+//go:build dst && linux && !(386 || arm || loong64 || mips || mipsle)
 
 package syscall
 
 //go:nosplit
 func dstSyscallAllowedArchTrap(trap uintptr) bool {
-	return false
+	return trap == SYS_FSTAT
 }
 
 //go:nosplit
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
-	return false
+	return trap == SYS_FSTAT
 }

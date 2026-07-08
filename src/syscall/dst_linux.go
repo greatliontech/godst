@@ -23,7 +23,7 @@ import _ "unsafe" // for go:linkname
 //go:nosplit
 func dstSyscallAllowedTrap(trap uintptr) bool {
 	switch trap {
-	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK, SYS_FSTAT,
+	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
 		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
 		return true
 	}
@@ -62,7 +62,7 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
 		return false
 	}
 	switch trap {
-	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK, SYS_FSTAT,
+	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
 		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
 		return true
 	}
