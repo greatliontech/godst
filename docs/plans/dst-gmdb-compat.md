@@ -1,0 +1,14 @@
+- [ ] 1. DST gmdb compatibility: settle the virtual fd/syscall contract and add the selected-call dispatch foundation.
+- [ ] 2. DST gmdb compatibility: add read-only file-backed `MAP_SHARED` mmap, `Munmap`, `Mprotect(PROT_READ)`, and safe `Madvise` handling.
+- [ ] 3. DST gmdb compatibility: add virtual-fd `Fdatasync`, virtual-fd `Fsync`, and directory-entry durability through directory fsync.
+- [ ] 4. DST gmdb compatibility: implement `os.OpenRoot` and rooted file operations over the in-memory filesystem.
+- [ ] 5. DST gmdb compatibility: implement process-owned `Flock` over shared host files.
+- [ ] 6. DST gmdb compatibility: add shared writable lock-file mmap with cross-process visibility and scheduler-visible atomic races.
+- [ ] 7. DST gmdb compatibility: implement simulated `Kill(pid, 0)` liveness over DST process identities.
+- [ ] 8. DST gmdb compatibility: add synthetic `/proc/<pid>/stat` starttime and `/proc/self/ns/pid` identity.
+- [ ] 9. DST gmdb compatibility: virtualize `ClockGettime(CLOCK_MONOTONIC)` and `ClockGettime(CLOCK_BOOTTIME)`.
+- [ ] 10. DST gmdb compatibility: add crash-time resource teardown for fds, flocks, mappings, conns, goroutines, and pid liveness.
+- [ ] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
+- [ ] 12. DST gmdb compatibility: add host crash and restart with durable-image filesystem restore.
+- [ ] 13. DST gmdb compatibility: add unsynced write history for subset, reorder, and intra-page tear crash fidelity.
+- [ ] 14. DST gmdb compatibility: add gmdb end-to-end compatibility coverage for open, locking, liveness, mmap, and crash recovery.
