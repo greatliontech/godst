@@ -1236,6 +1236,22 @@ func (d *dstFile) sync() error {
 	return nil
 }
 
+func (d *dstFile) datasync() error {
+	d.diskDelay()
+	if err := d.enter(); err != nil {
+		return err
+	}
+	defer d.leave()
+	if d.node.isDir {
+		return syscall.EINVAL
+	}
+	if err := d.diskEIO(); err != nil {
+		return err
+	}
+	d.node.commitDataLocked()
+	return nil
+}
+
 // commitLocked advances the node's durable image to its current state.
 // Caller holds dstFS.mu.
 func (node *dstFSNode) commitLocked() {
@@ -1245,10 +1261,14 @@ func (node *dstFSNode) commitLocked() {
 			node.syncedEntries[name] = child
 		}
 	} else {
-		node.synced = append([]byte(nil), node.data...)
+		node.commitDataLocked()
 	}
 	node.syncedMode = node.mode
 	node.syncedModTime = node.modTime
+}
+
+func (node *dstFSNode) commitDataLocked() {
+	node.synced = append([]byte(nil), node.data...)
 }
 
 func (d *dstFile) stat() (FileInfo, error) {

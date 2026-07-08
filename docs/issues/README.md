@@ -10,8 +10,6 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb fdatasync durability boundary](./dst-gmdb-fdatasync.md) | 3 |
-| [DST gmdb directory fsync durability](./dst-gmdb-directory-fsync.md) | 3 |
 | [DST gmdb OpenRoot support](./dst-gmdb-openroot.md) | 4 |
 | [DST gmdb flock single-writer discipline](./dst-gmdb-flock.md) | 5 |
 | [DST gmdb shared writable lock-file mmap](./dst-gmdb-shared-writable-mmap.md) | 6 |

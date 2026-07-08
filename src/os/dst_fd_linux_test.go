@@ -167,3 +167,97 @@ func TestDSTFSVirtualFDMmapUnsupportedShapes(t *testing.T) {
 		}
 	})
 }
+
+func TestDSTFSVirtualFDFdatasyncCommitsFile(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.OpenFile("/sync-file", os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString("abc"); err != nil {
+			t.Fatalf("WriteString: %v", err)
+		}
+		if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-file"); !ok || synced != "" {
+			t.Fatalf("pre-Fdatasync synced = %q, ok=%v; want empty durable image", synced, ok)
+		}
+		if err := syscall.Fdatasync(int(f.Fd())); err != nil {
+			t.Fatalf("Fdatasync: %v", err)
+		}
+		if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-file"); !ok || synced != "abc" {
+			t.Fatalf("post-Fdatasync synced = %q, ok=%v; want abc", synced, ok)
+		}
+		if _, err := f.WriteAt([]byte("Z"), 0); err != nil {
+			t.Fatalf("WriteAt: %v", err)
+		}
+		if err := os.Chmod("/sync-file", 0o600); err != nil {
+			t.Fatalf("Chmod: %v", err)
+		}
+		if _, synced, _, _, _, _, _ := os.DSTFSNodeState("/sync-file"); synced != "abc" {
+			t.Fatalf("post-write synced = %q, want abc", synced)
+		}
+		if err := syscall.Fsync(int(f.Fd())); err != nil {
+			t.Fatalf("Fsync: %v", err)
+		}
+		if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-file"); !ok || synced != "Zbc" {
+			t.Fatalf("post-Fsync synced = %q, ok=%v; want Zbc", synced, ok)
+		}
+		_, _, _, _, _, syncedModeBefore, _ := os.DSTFSNodeState("/sync-file")
+		if err := os.Chmod("/sync-file", 0o400); err != nil {
+			t.Fatalf("Chmod after Fsync: %v", err)
+		}
+		if _, err := f.WriteAt([]byte("Y"), 0); err != nil {
+			t.Fatalf("WriteAt after Fsync: %v", err)
+		}
+		if err := syscall.Fdatasync(int(f.Fd())); err != nil {
+			t.Fatalf("Fdatasync after Chmod: %v", err)
+		}
+		if _, synced, _, _, mode, syncedMode, ok := os.DSTFSNodeState("/sync-file"); !ok || synced != "Ybc" || mode != 0o400 || syncedMode != syncedModeBefore {
+			t.Fatalf("post-Fdatasync state synced=%q mode=%v syncedMode=%v ok=%v; want Ybc/0400/%v", synced, mode, syncedMode, ok, syncedModeBefore)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFsyncCommitsDirectoryEntries(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/sync-dir", 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		if err := os.WriteFile("/sync-dir/one", nil, 0o644); err != nil {
+			t.Fatalf("WriteFile one: %v", err)
+		}
+		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "one" || len(synced) != 0 {
+			t.Fatalf("pre-Fsync entries = %v/%v, ok=%v; want one/empty", cur, synced, ok)
+		}
+
+		dir, err := os.Open("/sync-dir")
+		if err != nil {
+			t.Fatalf("Open dir: %v", err)
+		}
+		defer dir.Close()
+		if err := syscall.Fdatasync(int(dir.Fd())); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("Fdatasync dir = %v, want EINVAL", err)
+		}
+		if err := syscall.Fsync(int(dir.Fd())); err != nil {
+			t.Fatalf("Fsync dir: %v", err)
+		}
+		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "one" || len(synced) != 1 || synced[0] != "one" {
+			t.Fatalf("post-Fsync entries = %v/%v, ok=%v; want one/one", cur, synced, ok)
+		}
+		if err := os.Remove("/sync-dir/one"); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		if err := os.WriteFile("/sync-dir/two", nil, 0o644); err != nil {
+			t.Fatalf("WriteFile two: %v", err)
+		}
+		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "two" || len(synced) != 1 || synced[0] != "one" {
+			t.Fatalf("post-mutation entries = %v/%v, ok=%v; want two/one", cur, synced, ok)
+		}
+		if err := syscall.Fsync(int(dir.Fd())); err != nil {
+			t.Fatalf("Fsync dir again: %v", err)
+		}
+		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "two" || len(synced) != 1 || synced[0] != "two" {
+			t.Fatalf("post-second-Fsync entries = %v/%v, ok=%v; want two/two", cur, synced, ok)
+		}
+	})
+}

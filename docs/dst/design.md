@@ -448,12 +448,15 @@ handle until close — content lives on the node, names are references.
 
 **Durability contract (spec tier — governs the fault feature; settled here so the write path
 cannot foreclose it).** Every mutation — file write, truncate, create, remove, rename, metadata
-change — enters the tree as **unsynced**. `File.Sync` commits that file's content and size
-durably; a file's *name* becoming durable is a property of its **parent directory** (POSIX: data
-durability and entry durability are separate — fsync the file, fsync the directory), committed by
-syncing an open handle on the directory. `Rename` is atomic in the namespace (observers see old
-or new, never neither/both); its durability rides the parent directories' sync state like any
-other entry change. A simulated **crash** (fault feature) restores exactly the durable image:
+change — enters the tree as **unsynced**. `File.Sync` and Linux virtual-fd `syscall.Fsync` commit a
+regular file's content and size durably; Linux virtual-fd `syscall.Fdatasync` is a distinct modeled
+regular-file barrier, and currently commits the same gmdb-relevant durable image. A file's *name*
+becoming durable is a property of its **parent directory** (POSIX: data durability and entry durability
+are separate — fsync the file, fsync the directory), committed by syncing an open handle on the
+directory (`File.Sync` or Linux virtual-fd `syscall.Fsync`). `Fdatasync` on a simulated directory is a
+deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` is atomic in the namespace
+(observers see old or new, never neither/both); its durability rides the parent directories' sync state
+like any other entry change. A simulated **crash** (fault feature) restores exactly the durable image:
 synced state survives byte-exactly; unsynced data and entries MAY be lost or, for file content,
 torn at arbitrary byte granularity — no atomicity of individual `Write` calls is promised beyond
 what was synced. The base (no-fault) model is the collapse of this contract where crash never
@@ -619,8 +622,9 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
   operations **on pre-run host handles** keep working. Virtual fd numbers are recognized separately
   and refused at this raw boundary before they can reach the host; selected split-safe named
-  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, plus the supported
-  `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations) dispatch them to the simulated backend.
+  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
+  `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
+  dispatch them to the simulated backend.
   Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*

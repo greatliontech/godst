@@ -1083,9 +1083,9 @@ func Mount(source string, target string, fstype string, flags uintptr, data stri
 //sys	Fchmod(fd int, mode uint32) (err error)
 //sys	Fchownat(dirfd int, path string, uid int, gid int, flags int) (err error)
 //sys	fcntl(fd int, cmd int, arg int) (val int, err error)
-//sys	Fdatasync(fd int) (err error)
+//sys	fdatasync(fd int) (err error) = SYS_FDATASYNC
 //sys	Flock(fd int, how int) (err error)
-//sys	Fsync(fd int) (err error)
+//sys	fsync(fd int) (err error) = SYS_FSYNC
 //sys	Getdents(fd int, buf []byte) (n int, err error) = SYS_GETDENTS64
 //sysnb	Getpgid(pid int) (pgid int, err error)
 

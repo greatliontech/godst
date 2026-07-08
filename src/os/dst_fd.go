@@ -39,6 +39,12 @@ func dstSetFstatHook(func(fd int, stat *syscall.Stat_t) (err syscall.Errno, hand
 //go:linkname dstSetSeekHook syscall.dstSetSeekHook
 func dstSetSeekHook(func(fd int, offset int64, whence int) (off int64, err syscall.Errno, handled bool))
 
+//go:linkname dstSetFsyncHook syscall.dstSetFsyncHook
+func dstSetFsyncHook(func(fd int) (err syscall.Errno, handled bool))
+
+//go:linkname dstSetFdatasyncHook syscall.dstSetFdatasyncHook
+func dstSetFdatasyncHook(func(fd int) (err syscall.Errno, handled bool))
+
 //go:linkname dstSetVirtualFDActive syscall.dstSetVirtualFDActive
 func dstSetVirtualFDActive(fd uintptr, active bool)
 
@@ -53,6 +59,8 @@ func init() {
 	dstSetCloseHook(dstFDClose)
 	dstSetFstatHook(dstFDFstat)
 	dstSetSeekHook(dstFDSeek)
+	dstSetFsyncHook(dstFDFsync)
+	dstSetFdatasyncHook(dstFDFdatasync)
 }
 
 type dstFDEntry struct {
@@ -305,6 +313,25 @@ func dstFDSeek(fd int, off int64, whence int) (int64, syscall.Errno, bool) {
 		return -1, errno, true
 	}
 	return newOff, 0, true
+}
+
+func dstFDFsync(fd int) (syscall.Errno, bool) {
+	entry, handled, errno := dstFDLookup(fd)
+	if !handled || errno != 0 {
+		return errno, handled
+	}
+	return dstFDErr(entry.backend.sync()), true
+}
+
+func dstFDFdatasync(fd int) (syscall.Errno, bool) {
+	entry, handled, errno := dstFDLookup(fd)
+	if !handled || errno != 0 {
+		return errno, handled
+	}
+	if file, ok := entry.backend.(*dstFile); ok {
+		return dstFDErr(file.datasync()), true
+	}
+	return dstFDErr(entry.backend.sync()), true
 }
 
 func dstFDClose(fd int) (syscall.Errno, bool) {

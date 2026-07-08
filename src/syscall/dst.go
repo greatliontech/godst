@@ -45,6 +45,8 @@ type dstPwriteHook func(fd int, p []byte, offset int64) (n int, err Errno, handl
 type dstCloseHook func(fd int) (err Errno, handled bool)
 type dstFstatHook func(fd int, stat *Stat_t) (err Errno, handled bool)
 type dstSeekHook func(fd int, offset int64, whence int) (off int64, err Errno, handled bool)
+type dstFsyncHook func(fd int) (err Errno, handled bool)
+type dstFdatasyncHook func(fd int) (err Errno, handled bool)
 type dstMmapHook func(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool)
 type dstMunmapHook func(data []byte) (err Errno, handled bool)
 type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
@@ -57,6 +59,8 @@ var dstPwriteHookFn dstPwriteHook
 var dstCloseHookFn dstCloseHook
 var dstFstatHookFn dstFstatHook
 var dstSeekHookFn dstSeekHook
+var dstFsyncHookFn dstFsyncHook
+var dstFdatasyncHookFn dstFdatasyncHook
 var dstMmapHookFn dstMmapHook
 var dstMunmapHookFn dstMunmapHook
 var dstMprotectHookFn dstMprotectHook
@@ -82,6 +86,12 @@ func dstSetFstatHook(fn dstFstatHook) { dstFstatHookFn = fn }
 
 //go:linkname dstSetSeekHook
 func dstSetSeekHook(fn dstSeekHook) { dstSeekHookFn = fn }
+
+//go:linkname dstSetFsyncHook
+func dstSetFsyncHook(fn dstFsyncHook) { dstFsyncHookFn = fn }
+
+//go:linkname dstSetFdatasyncHook
+func dstSetFdatasyncHook(fn dstFdatasyncHook) { dstFdatasyncHookFn = fn }
 
 //go:linkname dstSetMmapHook
 func dstSetMmapHook(fn dstMmapHook) { dstMmapHookFn = fn }
@@ -149,6 +159,20 @@ func dstTrySeek(fd int, offset int64, whence int) (off int64, err Errno, handled
 		return 0, 0, false
 	}
 	return dstSeekHookFn(fd, offset, whence)
+}
+
+func dstTryFsync(fd int) (err Errno, handled bool) {
+	if !dstHookActive() || dstFsyncHookFn == nil {
+		return 0, false
+	}
+	return dstFsyncHookFn(fd)
+}
+
+func dstTryFdatasync(fd int) (err Errno, handled bool) {
+	if !dstHookActive() || dstFdatasyncHookFn == nil {
+		return 0, false
+	}
+	return dstFdatasyncHookFn(fd)
 }
 
 func dstTryMmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool) {

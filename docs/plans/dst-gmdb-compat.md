@@ -1,6 +1,6 @@
 - [x] 1. DST gmdb compatibility: settle the virtual fd/syscall contract and add the selected-call dispatch foundation.
 - [x] 2. DST gmdb compatibility: add read-only file-backed `MAP_SHARED` mmap, `Munmap`, `Mprotect(PROT_READ)`, and safe `Madvise` handling.
-- [ ] 3. DST gmdb compatibility: add virtual-fd `Fdatasync`, virtual-fd `Fsync`, and directory-entry durability through directory fsync.
+- [x] 3. DST gmdb compatibility: add virtual-fd `Fdatasync`, virtual-fd `Fsync`, and directory-entry durability through directory fsync.
 - [ ] 4. DST gmdb compatibility: implement `os.OpenRoot` and rooted file operations over the in-memory filesystem.
 - [ ] 5. DST gmdb compatibility: implement process-owned `Flock` over shared host files.
 - [ ] 6. DST gmdb compatibility: add shared writable lock-file mmap with cross-process visibility and scheduler-visible atomic races.

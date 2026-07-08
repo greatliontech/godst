@@ -34,3 +34,23 @@ func Seek(fd int, offset int64, whence int) (off int64, err error) {
 	}
 	return seekFD(fd, offset, whence)
 }
+
+func Fsync(fd int) (err error) {
+	if e1, handled := dstTryFsync(fd); handled {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		}
+		return
+	}
+	return fsync(fd)
+}
+
+func Fdatasync(fd int) (err error) {
+	if e1, handled := dstTryFdatasync(fd); handled {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		}
+		return
+	}
+	return fdatasync(fd)
+}
