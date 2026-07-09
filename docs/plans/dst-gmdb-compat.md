@@ -8,7 +8,7 @@
 - [x] 8. DST gmdb compatibility: add synthetic `/proc/<pid>/stat` starttime and `/proc/self/ns/pid` identity.
 - [x] 9. DST gmdb compatibility: virtualize `ClockGettime(CLOCK_MONOTONIC)` and `ClockGettime(CLOCK_BOOTTIME)`.
 - [x] 10. DST gmdb compatibility: add crash-time resource teardown for fds, flocks, mappings, conns, goroutines, and pid liveness.
-- [ ] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
+- [x] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
 - [ ] 12. DST gmdb compatibility: add host crash and restart with durable-image filesystem restore.
 - [ ] 13. DST gmdb compatibility: add unsynced write history for subset, reorder, and intra-page tear crash fidelity.
 - [ ] 14. DST gmdb compatibility: add gmdb end-to-end compatibility coverage for open, locking, liveness, mmap, and crash recovery.

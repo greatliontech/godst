@@ -10,7 +10,6 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb process crash and restart](./dst-gmdb-process-crash-restart.md) | 11 |
 | [DST gmdb host crash and restart](./dst-gmdb-host-crash-restart.md) | 12 |
 | [DST gmdb crash tear fidelity](./dst-gmdb-crash-tear-fidelity.md) | 13 |
 | [DST gmdb end-to-end compatibility coverage](./dst-gmdb-end-to-end-coverage.md) | 14 |

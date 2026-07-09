@@ -1292,6 +1292,7 @@ const (
 	waitReasonSynctestWaitGroupWait                   // "sync.WaitGroup.Wait (durable)"
 	waitReasonCleanupWait                             // "cleanup wait"
 	waitReasonSynctestGCDrain                         // "synctest GC drain"
+	waitReasonDSTProcessCrashed                       // "dst process crashed"
 )
 
 var waitReasonStrings = [...]string{
@@ -1343,6 +1344,7 @@ var waitReasonStrings = [...]string{
 	waitReasonSynctestWaitGroupWait: "sync.WaitGroup.Wait (durable)",
 	waitReasonCleanupWait:           "cleanup wait",
 	waitReasonSynctestGCDrain:       "synctest GC drain",
+	waitReasonDSTProcessCrashed:     "dst process crashed",
 }
 
 func (w waitReason) String() string {

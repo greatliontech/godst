@@ -56,6 +56,15 @@ func dstCrashProcessPid(pid int32)
 //go:linkname dstProcessTeardown runtime.dstProcessTeardown
 func dstProcessTeardown(proc uint32)
 
+//go:linkname dstSelfCrashed runtime.dstSelfCrashed
+func dstSelfCrashed() bool
+
+//go:linkname dstParkCrashedSelf runtime.dstParkCrashedSelf
+func dstParkCrashedSelf()
+
+//go:linkname dstPidAliveSim runtime.dstPidAlive
+func dstPidAliveSim(pid int32) bool
+
 //go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
 func dstProcAllocEnsure(procid uint32)
 
@@ -441,6 +450,32 @@ func crashProcess(name string) {
 	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 }
 
+// Crash kills the named process — the process-crash fault (docs/dst/faults.md
+// "Crash / restart faults"). Every goroutine of the process's live invocations
+// is descheduled permanently (no defers run — a killed process does not
+// unwind), its pids read dead (Kill(pid, 0) answers ESRCH and the /proc
+// entries disappear), its open simulated files and virtual fds close, fd-owned
+// flocks release, writable shared mappings copy back to file state (page cache
+// belongs to the kernel) and unregister, its connections RESET — the peer
+// observes ECONNRESET — and its listeners close. The host filesystem survives
+// untouched, unsynced writes included: a process crash does not tear the disk;
+// only the host-crash fault restores the durable image. If the calling
+// goroutine itself belongs to the victim (a self-crash — the OOM shape), Crash
+// does not return. A subsequent same-name Process call is the restart: fresh
+// pid, inheriting nothing but host state. Crash panics during a run on an
+// undeclared or not-live process name (a typo'd victim must fail loud, never
+// silently fault nothing), and on a process whose goroutine set includes the
+// run's own main goroutine — a Process declared inline in the run body rather
+// than on a goroutine of its own (`go Process(name, f)`): killing it would
+// leave the simulation with no driver, so the crash is refused before anything
+// is torn down. Crash is a no-op outside a run.
+func Crash(name string) {
+	crashProcess(name)
+	if dstSelfCrashed() {
+		dstParkCrashedSelf()
+	}
+}
+
 // Process runs f as the named process — the unit of crash/restart and memory
 // isolation. A Process declared inside a Host body runs on that host; a Process
 // outside any Host gets an implicit dedicated host named after the process (the
@@ -482,6 +517,20 @@ func Process(name string, f func()) {
 	procTeardownMu.Lock()
 	activeProcSet(proc, simPid)
 	procTeardownMu.Unlock()
+	// Registered FIRST so it runs LAST — after the exit-teardown defer below
+	// has completed and released procTeardownMu (parking while holding it
+	// would strand every later teardown). If the ENCLOSING invocation died
+	// while this body ran — crash and exit both mark goroutines by pid, which
+	// this goroutine did not carry inside the nested body — the pid restore
+	// below would hand a dead invocation a running goroutine: a thread
+	// outliving its process, which no kernel shows. Park it forever instead
+	// (during a panic unwind too: the enclosing process is dead, so the
+	// unwind is forfeit exactly like a crash victim's defers).
+	defer func() {
+		if runActive.Load() && oldPid > 0 && !dstPidAliveSim(oldPid) {
+			dstParkCrashedSelf()
+		}
+	}()
 	live := false
 	defer func() {
 		if live {

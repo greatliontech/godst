@@ -1386,6 +1386,76 @@ func dstCrashProcessPid(pid int32) {
 	dstMarkProcessGoroutinesCrashed(pid)
 }
 
+// dstSelfCrashed reports whether the CALLING goroutine belongs to a crashed
+// process invocation (the crash mark flipped its pid negative). A self-crash
+// — the OOM shape: the victim's own goroutine triggers the fault — leaves the
+// caller running past the mark; it must park forever instead of returning
+// (dstParkCrashedSelf). Reached from testing/simulation.Crash by //go:linkname.
+//
+//go:linkname dstSelfCrashed
+func dstSelfCrashed() bool {
+	return getg().dstPid < 0
+}
+
+// dstParkCrashedSelf parks the calling goroutine forever: it belongs to a
+// crashed (or exited) simulated process invocation, whose threads never run
+// again — and never unwind (a killed process runs no defers; the caller
+// forfeits its own by parking here). The scheduler never selects a crashed
+// goroutine (dstFindRunnable drops them; the chan and sema dequeues skip
+// them), so the park is permanent by construction.
+//
+// The caller may or may not already carry the crash mark: a self-crash was
+// marked by dstMarkProcessGoroutinesCrashed (which also settled its bubble
+// accounting), while a goroutine that ESCAPED the mark inside a nested
+// Process body still carries a positive pid. Mark and de-count the latter
+// here, mirroring the mark path exactly — otherwise the bubble counts a
+// goroutine that can never run again as running, and the run never completes.
+// Reached from testing/simulation by //go:linkname.
+//
+//go:linkname dstParkCrashedSelf
+func dstParkCrashedSelf() {
+	gp := getg()
+	if gp.dstPid > 0 {
+		gp.dstPid = -gp.dstPid
+		dstUncountCrashedRunningG(gp)
+	}
+	gopark(nil, nil, waitReasonDSTProcessCrashed, traceBlockForever, 1)
+	throw("dst: a crashed process's goroutine resumed")
+}
+
+// dstUncountCrashedRunningG removes a just-marked, currently-RUNNING goroutine
+// from its bubble's liveness accounting — the mark-then-uncount sequence
+// dstMarkProcessGoroutinesCrashed performs in bulk, here for a single g. The
+// mark is a PRECONDITION, asserted rather than assumed: an unmarked goroutine
+// is one changegstatus still counts and the scheduler and wait-queue filters
+// (dstFindRunnable, the chan and sema dequeues) still treat as live, so
+// uncounting it silently would desynchronize the bubble's ledger from the set
+// of goroutines that can actually run.
+func dstUncountCrashedRunningG(gp *g) {
+	if gp.dstPid >= 0 {
+		throw("dst: uncounting a goroutine that carries no crash mark")
+	}
+	bubble := gp.bubble
+	if bubble == nil {
+		return
+	}
+	// The caller is running, so it counted in both totals.
+	lock(&bubble.mu)
+	bubble.total--
+	bubble.running--
+	if bubble.total < 0 {
+		fatal("total < 0")
+	}
+	if bubble.running < 0 {
+		fatal("running < 0")
+	}
+	wake := bubble.maybeWakeLocked()
+	unlock(&bubble.mu)
+	if wake != nil {
+		goready(wake, 0)
+	}
+}
+
 func dstSynctestRunningStatus(gp *g, status uint32) bool {
 	if status == _Gdead || status == _Gdeadextra {
 		return false
@@ -1396,18 +1466,39 @@ func dstSynctestRunningStatus(gp *g, status uint32) bool {
 	return true
 }
 
+// dstCrashKillsBubbleMain reports whether pid's goroutine set includes the
+// bubble's main goroutine — the one running the simulation body. Killing it
+// leaves the universe with no driver: the body's remaining statements (a
+// test's assertions among them) never run and the bubble never completes, so
+// the crash must be refused BEFORE any goroutine is marked, not diagnosed as a
+// hang afterwards. It happens when a Process body runs directly on the run's
+// own goroutine (`Run(f)` calling `Process(name, …)` inline) and that process
+// is crashed; declaring such a process on a child goroutine
+// (`go Process(name, …)`) models a crashable process faithfully.
+func dstCrashKillsBubbleMain(bubble *synctestBubble, pid int32) bool {
+	main := bubble.main
+	return main != nil && (main.dstPid == pid || main.dstPid == -pid)
+}
+
 func dstMarkProcessGoroutinesCrashed(pid int32) {
 	bubble := dstSimBubble
 	if bubble == nil {
 		return
 	}
+	if dstCrashKillsBubbleMain(bubble, pid) {
+		panic("testing/simulation: Crash would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
+	}
 	var total, running int
+	var waiterCrashed bool
 	forEachG(func(gp *g) {
 		if gp.bubble != bubble || gp.dstPid != pid {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
 		gp.dstPid = -pid
+		if gp == bubble.waiter {
+			waiterCrashed = true
+		}
 		if status == _Gdead || status == _Gdeadextra {
 			return
 		}
@@ -1416,10 +1507,18 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 			running++
 		}
 	})
-	if total == 0 {
+	if total == 0 && !waiterCrashed {
 		return
 	}
 	lock(&bubble.mu)
+	if waiterCrashed {
+		// The victim was blocked in synctest.Wait. maybeWakeLocked would hand
+		// the wake to it and bump bubble.active, but the scheduler drops
+		// crashed goroutines (dstFindRunnable), so nothing would ever decrement
+		// active again and the bubble could never idle. A crashed waiter is not
+		// waiting for anything: clear it, and let the wake fall to the root.
+		bubble.waiter = nil
+	}
 	bubble.total -= total
 	bubble.running -= running
 	if bubble.total < 0 {

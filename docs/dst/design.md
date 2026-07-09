@@ -914,7 +914,8 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture); syscall-retake gated so a blocked host write serializes, never reorders | ⛔ (program discipline) |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
-| faults: crash/restart, OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
+| faults: process crash + restart | pid-keyed goroutine death + proc-keyed resource teardown (see [faults.md](./faults.md)) | ✅ |
+| faults: host crash/restart, OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
 | raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
 | signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
@@ -947,7 +948,7 @@ trees in the *same* bubble, all driven by the one seed. The axes:
   reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole, connection reset,
   throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a reliable
   stream); EIO/ENOSPC/disk latency (landed); torn/lost unsynced writes on crash (pending).
-- **Faults** — net, disk, and clock skew/step/drift axes landed; process & host crash/restart, OOM
+- **Faults** — net, disk, clock skew/step/drift, and process crash+restart axes landed; host crash/restart, OOM
   kill, and *scheduling* faults (straggler) pending — each anchored to a real degree of freedom, so
   sound (see [faults.md](./faults.md)).
 - Driven by a seed; replay-exact; failures shrinkable; invariants checked by the program's own

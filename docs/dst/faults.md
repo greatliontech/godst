@@ -734,6 +734,20 @@ when the LAST live invocation dies. The logical process id remains stable for ta
 and resource registries, while the pid is the invocation generation; a same-name restart gets a fresh pid and
 does not revive the crashed goroutines.
 
+Two consequences of pid-keyed goroutine death, both contractual. **A goroutine cannot outlive its
+process.** One that escaped the pid-keyed mark because it was inside a NESTED `Process` body when its
+enclosing invocation died (it carried the inner pid) is permanently parked the moment it leaves that
+body — a thread of a dead process never resumes. **A crashed goroutine never unwinds:** its deferred
+functions do not run, exactly as a killed process's threads abandon their stacks. So a `Crash` whose
+caller belongs to the victim (a **self-crash** — the shape an allocation-triggered OOM takes, the victim
+dying where its own workload takes it) never returns, and the code after it is unreachable.
+
+One process is not crashable: the one whose goroutine set contains the run's **main** goroutine — a
+`Process` declared inline in the run body rather than on a goroutine of its own. Killing it would leave
+the universe with no driver (the body's remaining statements never run; the bubble never completes), so
+the crash is **refused loudly before anything is torn down**, naming the fix (`go Process(name, f)`).
+Silently ending the run instead would let a test's post-crash assertions vanish unexecuted.
+
 **OOM** is a **process crash** whose *trigger* is the per-process allocation counter crossing a budget
 (cgroup-style per-process budget by default; a host-total kernel-OOM with victim selection is a recordable
 variant). The budget must sit above the counter's **noise floor** (a few KB — the counter carries
@@ -825,7 +839,15 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   disk: it only *delays* a disk-touching op (the result is unchanged), never an in-memory op (seek/`Getwd`)
   or a closed-fd EBADF, and the delay sleeps outside the tree lock so it never stalls another host — the
   only behaviours it surfaces are a real slow device's (`TestDSTDiskLatencyInMemoryOpsUnaffected` /
-  `…ClosedFdNoDelay` / `…HostIndependence`).
+  `…ClosedFdNoDelay` / `…HostIndependence`). A **process crash** is what `kill -9` does: the victim's
+  threads stop where they are and never unwind, its fds close and its flocks release (the kernel's
+  exit_files), its sockets RST — and the *kernel survives*, so the host filesystem, un-fsync'd bytes
+  included, is exactly what a restart reopens. The only failures it surfaces are a real process death's:
+  never a torn disk (that is the host crash), never a resumed thread, never a defer that ran
+  (`TestDSTCrashAndRestartOverLiveHostFS` pins the surviving unsynced write and the released lock;
+  `TestDSTCrashSelf` the no-unwind, no-return self-crash; `TestDSTCrashNestedInvocationParked` that no
+  goroutine outlives its process; `TestDSTCrashProcessBlockedInSynctestWait` that a victim holding the
+  bubble's waiter registration does not strand the run).
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -865,7 +887,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   mutation-tested (a check ignoring the host id, or the node, fails it). The **ENOSPC** capacity is keyed
   the same way, so `LimitDisk(hA, …)` caps exactly hA's disk while hB writes the same data unimpeded
   (`TestDSTDiskENOSPCVictim`), and `SlowDisk(hA, …)` delays exactly hA's ops while hB's identical read is
-  instant (`TestDSTDiskLatencyVictim`).
+  instant (`TestDSTDiskLatencyVictim`). The **process-crash leg** keys goroutine death by the victim's
+  per-invocation pids and resource death by its logical process id, so `Crash("p")` takes exactly p's
+  goroutines, fds, flocks, mappings, conns, and listeners — a host-sibling's lock on the same file node
+  and the host filesystem itself are untouched (`TestDSTCrashProcessReleasesFileResources`,
+  `TestDSTCrashProcessResetsConnections`, `TestDSTCrashAndRestartOverLiveHostFS`).
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
@@ -892,9 +918,10 @@ adversarial loop.
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
   clock **step** — **done**, **drift** (constant `Drift` + mid-run `DriftClock` + seed-drawn `BoundedDrift`)
-  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**;
-  scheduling (straggler), OOM (allocation-triggered process crash), process crash + host crash, restart —
-  pending. Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
+  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**; **process crash** (`Crash`, incl. the
+  self-crash form) + **restart** over the live host filesystem — **done**;
+  scheduling (straggler), OOM (allocation-triggered process crash), host crash — pending.
+  Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded
   exploration (`Options.FaultPolicy`) as the `Explore`/`Failure` fault dimension; `Replay` of a fault set;
   failure shrinking.
