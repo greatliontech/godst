@@ -1150,6 +1150,19 @@ var dstHostIdent atomic.Pointer[dstHostIdentTable]
 // to the root pid (dstSimPID) at dstSetSimEnv, so the first process is root pid + 1.
 var dstSimPidNext atomic.Int32
 
+// dstPidLive is the simulated pid liveness table consulted by syscall.Kill(pid, 0).
+// The root pid is live for the run; Process pids are live for the dynamic extent of
+// their body. Pids are allocated monotonically and never reused within a run, so a
+// completed process's old pid cannot become live again by accident. The map is
+// copy-on-write: readers get an immutable snapshot and writers publish a new table.
+type dstPidLiveTable struct {
+	live map[int32]bool
+}
+
+var dstPidLive atomic.Pointer[dstPidLiveTable]
+
+const dstMaxSimPID = 1<<31 - 1
+
 // Fixed simulated identity returned during a run for the parts testing/simulation
 // does not make configurable. Deterministic constants so a SUT that derives state
 // from them (file modes, default config/data dirs, uid-keyed maps) replays
@@ -1182,6 +1195,7 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	// was skipped.
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(int32(pid))
+	dstPidLiveReset(int32(pid))
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
 	dstFakeTimersReset()
@@ -1197,9 +1211,18 @@ func dstClearSimEnv() {
 	dstSimNumCPU = 0
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(0)
+	dstPidLiveReset(0)
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
 	dstFakeTimersReset()
+}
+
+func dstPidLiveReset(root int32) {
+	if root > 0 {
+		dstPidLive.Store(&dstPidLiveTable{live: map[int32]bool{root: true}})
+	} else {
+		dstPidLive.Store(nil)
+	}
 }
 
 // dstSetHostIdent records host's simulated hostname and NumCPU (numcpu 0 = use the
@@ -1245,7 +1268,58 @@ func dstHostIdentFor(host uint32) (dstHostIdentity, bool) {
 //
 //go:linkname dstAllocPid
 func dstAllocPid() int32 {
-	return dstSimPidNext.Add(1)
+	for {
+		old := dstSimPidNext.Load()
+		if old == dstMaxSimPID {
+			panic("testing/simulation: simulated pid allocation overflows OS pid field")
+		}
+		if dstSimPidNext.CompareAndSwap(old, old+1) {
+			return old + 1
+		}
+	}
+}
+
+// dstSetPidLive marks a simulated pid live or dead for Kill(pid, 0). Reached from
+// testing/simulation.Process by //go:linkname.
+//
+//go:linkname dstSetPidLive
+func dstSetPidLive(pid int32, live bool) {
+	if pid <= 0 {
+		return
+	}
+	for {
+		old := dstPidLive.Load()
+		if old == nil {
+			return
+		}
+		if old.live[pid] == live {
+			return
+		}
+		next := make(map[int32]bool, len(old.live)+1)
+		for p := range old.live {
+			next[p] = true
+		}
+		if live {
+			next[pid] = true
+		} else {
+			delete(next, pid)
+		}
+		if dstPidLive.CompareAndSwap(old, &dstPidLiveTable{live: next}) {
+			return
+		}
+	}
+}
+
+// dstPidAlive reports whether pid is live in the current simulated pid registry.
+// Reached from syscall.Kill's DST hook by //go:linkname.
+//
+//go:linkname dstPidAlive
+func dstPidAlive(pid int32) bool {
+	if pid <= 0 || !dstSimEnvSet {
+		return false
+	}
+	t := dstPidLive.Load()
+	return t != nil && t.live[pid]
 }
 
 // dstSetProcessPid stamps the calling goroutine's pid and returns the previous

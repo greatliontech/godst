@@ -150,13 +150,22 @@ publishes them to the bubble, and cleared on return).
 
 Three values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), and `NumCPU` (default `8`,
 reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
-real concurrency for the schedule to explore). The rest are fixed deterministic constants documented
-on `Options`: `ppid=1`, `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the
-simulated identity is observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
+real concurrency for the schedule to explore). A custom positive `PID` must fit in the OS pid field
+(`int32`); non-positive values select the default, oversized values panic rather than wrapping, and a run
+that exhausts the finite pid field while allocating `Process` pids panics instead of reusing or wrapping
+pids. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
+`uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the simulated identity is
+observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
 `Run`, `RunWith`, `Test`, and `TestWith` fix the identity, so even plain `Run` or `Test` is reproducible here. This
 and the crypto/rand seam below are the only places the fork patches packages other than
 `runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
 The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.
+
+`syscall.Kill(pid, 0)` is the liveness probe over that simulated identity. During a run it consults only
+the simulated pid registry: the root pid is live for the whole run, each `simulation.Process` pid is live
+for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. It never probes a host
+process. Non-zero signals remain fenced until a signal-delivery model is settled; generic raw `SYS_KILL`
+remains fenced like other unsupported raw syscalls.
 
 The group and user-database surface is simulated to match: `os.Getgroups` is exactly `[7777]`, and
 the `os/user` lookup functions resolve against a minimal database containing exactly the simulated

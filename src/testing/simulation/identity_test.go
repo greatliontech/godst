@@ -9,6 +9,7 @@ package simulation
 import (
 	"os"
 	"runtime"
+	"strconv"
 	"testing"
 )
 
@@ -223,4 +224,29 @@ func TestDSTIdentityNegativePIDDefaults(t *testing.T) {
 	if pid != 1 {
 		t.Errorf("Options{PID: -5}: os.Getpid() = %d, want the default 1 (negative pids are not real identities)", pid)
 	}
+}
+
+func TestDSTIdentityOversizedPIDPanics(t *testing.T) {
+	if strconv.IntSize == 32 {
+		t.Skip("int cannot hold a pid larger than the runtime pid field")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("RunWith with oversized Options.PID did not panic")
+		}
+	}()
+	pid := int64(maxPID)
+	pid++
+	RunWith(1, Options{PID: int(pid)}, func() {})
+}
+
+func TestDSTIdentityPIDAllocatorOverflowPanics(t *testing.T) {
+	dstSetSimEnv(defaultHostname, maxPID, defaultNumCPU)
+	defer dstClearSimEnv()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("pid allocation after max Options.PID did not panic")
+		}
+	}()
+	_ = dstAllocPid()
 }

@@ -50,3 +50,5 @@ func dstTryMunmap(data []byte) (err Errno, handled bool) { return 0, false }
 func dstTryMprotect(data []byte, prot int) (err Errno, handled bool) { return 0, false }
 
 func dstTryMadvise(data []byte, advice int) (err Errno, handled bool) { return 0, false }
+
+func dstTryKill(pid int, sig Signal) (err Errno, handled bool) { return 0, false }

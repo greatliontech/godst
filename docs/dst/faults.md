@@ -153,8 +153,10 @@ tolerate*, so it cannot be a single global clock.
   a lock-free copy-on-write `atomic.Pointer` table keyed by `g.dstHost` (the string stays off `g`).
   Per-**process**: `os.Getpid`/`Getppid` (a fresh per-*invocation* pid on `g.dstPid`, so a restart gets a
   new pid — no stable-pid), cwd; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
-  (per-process possible later, non-foreclosing). Host 0 / unconfigured uses the run defaults
-  (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is unchanged.
+  (per-process possible later, non-foreclosing). `Kill(pid, 0)` is the simulated liveness query over those
+  pids: live process pids succeed, completed or unknown pids return `ESRCH`, and host pids are never probed.
+  Host 0 / unconfigured uses the run defaults (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is
+  unchanged.
 - **Memory accounting** — **landed**. Per-process **allocation accounting** extends the existing
   per-object hook (`malloc.go`, inside the simulation-bubble gate where `cur` and `elemsize` are already in
   hand) to also attribute `elemsize` to `cur.dstProc` — deterministic, `-race`-invariant, ~free. Like the
@@ -252,12 +254,14 @@ tolerate*, so it cannot be a single global clock.
   (`testing/simulation/identity_test.go`), mutation-tested.
 - **DST-IDENTITY-SOUND (entailed: simulated replaces real).** Under an active run the simulated identity
   fully replaces the real machine's — `os.Hostname`/`Getpid`/`runtime.NumCPU`/`net.Interfaces` never leak
-  the developer's box. *violation:* a real hostname/pid/interface leaks into a run → behavior depends on
-  the dev machine and is unreproducible elsewhere (a soundness break — an execution the simulated universe
-  could not produce identically on another machine). *Enforced:* the accessors gate on the run being active
-  (`dstSimEnvSet` / `dstActive`) and return only synthetic values; `TestDSTIdentitySound`
-  (`testing/simulation`, for hostname/NumCPU/pid) and `TestDSTNetInterfaces` (`net`, the synthetic
-  `lo`+`eth0` set replacing the real NICs).
+  the developer's box, and `Kill(pid, 0)` never probes host pid liveness. *violation:* a real hostname/pid/
+  interface leaks into a run, or a host pid-zero probe succeeds → behavior depends on the dev machine and is
+  unreproducible elsewhere (a soundness break — an execution the simulated universe could not produce
+  identically on another machine). *Enforced:* the accessors gate on the run being active (`dstSimEnvSet` /
+  `dstActive`) and return only synthetic values; the pid-zero hook consults the runtime simulated pid table;
+  `TestDSTIdentitySound`, `TestDSTKillPidZeroLiveness` (`testing/simulation`, for hostname/NumCPU/pid and
+  pid-zero liveness) and `TestDSTNetInterfaces` (`net`, the synthetic `lo`+`eth0` set replacing the real
+  NICs).
 - **DST-MEMALLOC-DET (entailed: OOM-relevant determinism + attribution).** Each heap allocation accrues to
   the *allocating* goroutine's process (`cur.dstProc`, inherited by its subtree); distinct processes have
   independent counters; and the per-process counter is deterministic *to the granularity the OOM fault

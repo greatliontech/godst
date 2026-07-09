@@ -33,7 +33,7 @@ func TestDSTSyscallFence(t *testing.T) {
 	Run(1, func() {
 		// Minting a socket is a simulation escape: fenced (panic).
 		socketPanicked = dstDidPanic(func() {
-			syscall.RawSyscall(syscall.SYS_SOCKET, uintptr(syscall.AF_INET), uintptr(syscall.SOCK_STREAM), 0)
+			rawSocketSyscall(syscall.SOCK_STREAM)
 		})
 
 		// close() is on the allowlist for inherited host handles. Active virtual
@@ -102,7 +102,7 @@ func TestDSTFenceIsBubbleScoped(t *testing.T) {
 		// fenced. Create then close a real UDP socket; a wrongly-firing fence
 		// would panic instead. (A sandbox that blocks socket() returns an errno,
 		// which is fine — the assertion is only about the absence of a panic.)
-		fd, _, errno := syscall.RawSyscall(syscall.SYS_SOCKET, uintptr(syscall.AF_INET), uintptr(syscall.SOCK_DGRAM), 0)
+		fd, errno := rawSocketSyscall(syscall.SOCK_DGRAM)
 		if errno == 0 {
 			syscall.RawSyscall(syscall.SYS_CLOSE, fd, 0, 0)
 		}

@@ -47,6 +47,9 @@ func dstAllocPid() int32
 //go:linkname dstSetProcessPid runtime.dstSetProcessPid
 func dstSetProcessPid(pid int32) (old int32)
 
+//go:linkname dstSetPidLive runtime.dstSetPidLive
+func dstSetPidLive(pid int32, live bool)
+
 //go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
 func dstProcAllocEnsure(procid uint32)
 
@@ -365,10 +368,17 @@ func Process(name string, f func()) {
 	pid := internProc(name)
 	dstProcAllocEnsure(pid) // per-process allocation counter exists before the body allocates
 	oldH, oldP := dstSetNode(host, pid)
-	oldPid := dstSetProcessPid(dstAllocPid())
+	simPid := dstAllocPid()
+	oldPid := dstSetProcessPid(simPid)
+	live := false
 	defer func() {
+		if live {
+			dstSetPidLive(simPid, false)
+		}
 		dstSetProcessPid(oldPid)
 		dstSetNode(oldH, oldP)
 	}()
+	dstSetPidLive(simPid, true)
+	live = true
 	f()
 }

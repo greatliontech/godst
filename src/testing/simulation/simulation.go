@@ -257,7 +257,10 @@ type Options struct {
 	// Hostname is os.Hostname() for the root (no Host declared); a Host reports its
 	// declared name by default, or HostConfig.Hostname. PID is the root pid; each
 	// Process gets a fresh, deterministic pid (a restart gets a new one), so distinct
-	// processes have distinct pids.
+	// processes have distinct pids. A custom PID must fit in the OS pid_t-sized
+	// runtime identity field; values <= 0 select the default, and oversized values
+	// panic instead of wrapping. A run that exhausts that finite pid field while
+	// allocating Process pids also panics instead of reusing or wrapping pids.
 	//
 	// The rest of the process-identity surface is fixed to deterministic
 	// constants during a simulation (not configurable): os.Getppid is 1;
@@ -362,6 +365,7 @@ const (
 	defaultHostname = "sim"
 	defaultPID      = 1
 	defaultNumCPU   = 8
+	maxPID          = 1<<31 - 1
 )
 
 // runActive protects the process-global DST knobs that Run mutates. DST state is
@@ -543,6 +547,8 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 		// os.Getpid() < 0, an identity no real process can observe. Both 0 and
 		// negative mean "use the default".
 		pid = defaultPID
+	} else if pid > maxPID {
+		panic("testing/simulation: " + api + " Options.PID overflows OS pid field")
 	}
 	numcpu = opts.NumCPU
 	if numcpu <= 0 {

@@ -52,6 +52,7 @@ type dstMmapHook func(fd int, offset int64, length int, prot int, flags int) (da
 type dstMunmapHook func(data []byte) (err Errno, handled bool)
 type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
 type dstMadviseHook func(data []byte, advice int) (err Errno, handled bool)
+type dstKillHook func(pid int, sig Signal) (err Errno, handled bool)
 
 var dstReadHookFn dstReadHook
 var dstWriteHookFn dstWriteHook
@@ -67,6 +68,7 @@ var dstMmapHookFn dstMmapHook
 var dstMunmapHookFn dstMunmapHook
 var dstMprotectHookFn dstMprotectHook
 var dstMadviseHookFn dstMadviseHook
+var dstKillHookFn dstKillHook
 
 //go:linkname dstSetReadHook
 func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
@@ -109,6 +111,9 @@ func dstSetMprotectHook(fn dstMprotectHook) { dstMprotectHookFn = fn }
 
 //go:linkname dstSetMadviseHook
 func dstSetMadviseHook(fn dstMadviseHook) { dstMadviseHookFn = fn }
+
+//go:linkname dstSetKillHook
+func dstSetKillHook(fn dstKillHook) { dstKillHookFn = fn }
 
 func dstHookActive() bool {
 	if !dstFenceActive() {
@@ -213,4 +218,14 @@ func dstTryMadvise(data []byte, advice int) (err Errno, handled bool) {
 		return 0, false
 	}
 	return dstMadviseHookFn(data, advice)
+}
+
+func dstTryKill(pid int, sig Signal) (err Errno, handled bool) {
+	if dstKillHookFn == nil {
+		return 0, false
+	}
+	if _, ok := dstSimEnvProc(); !ok {
+		return 0, false
+	}
+	return dstKillHookFn(pid, sig)
 }
