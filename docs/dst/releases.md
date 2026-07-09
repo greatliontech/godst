@@ -44,7 +44,14 @@ clean-cache-after-compiler-change rule stands unchanged.
    resolutions replay across repeated rebases; conflicts concentrate in the
    handful of shared upstream files the fork patches (`proc.go`, `select.go`,
    `chan.go`, `synctest.go`, `syscall_linux.go`, `file_unix.go`, …) — the bulk
-   of the stack is additive `dst_*` files upstream never touches.
+   of the stack is additive `dst_*` files upstream never touches. At every
+   conflict stop AND at the rebased tip, build BOTH modes — `go build std`
+   and `go build -tags dst std`: make.bash and the untagged build never
+   compile the `dst_*` files, so an upstream signature change breaking only a
+   tagged consumer is invisible until the tagged build runs (the 1.26.5 port
+   hit exactly this: `splitPathInRoot`'s return-type change broke a
+   `dst && unix`-only file no untagged build touches). Format resolutions
+   with the repo's own `bin/gofmt` — the system gofmt may disagree.
 3. Resolve the `VERSION` conflict to the new base + `-dst.1`.
 4. Rebuild the toolchain and clean the build cache (upstream may have touched
    cmd/compile; the tool-ID trap makes a stale compiler silently pass).
