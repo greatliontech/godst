@@ -746,7 +746,30 @@ One process is not crashable: the one whose goroutine set contains the run's **m
 `Process` declared inline in the run body rather than on a goroutine of its own. Killing it would leave
 the universe with no driver (the body's remaining statements never run; the bubble never completes), so
 the crash is **refused loudly before anything is torn down**, naming the fix (`go Process(name, f)`).
-Silently ending the run instead would let a test's post-crash assertions vanish unexecuted.
+Silently ending the run instead would let a test's post-crash assertions vanish unexecuted. The same
+refusal guards `CrashHost` for the machine the run's main goroutine runs on, and — because a host crash
+has many victims — both faults pre-scan every victim and refuse *before* the first teardown step, so a
+refused fault never leaves half a universe destroyed.
+
+**A host is not a process.** `CrashHost` kills the union of two goroutine sets: every goroutine of a
+process declared on the host (pid-keyed — which also catches a goroutine of that process momentarily
+stamped with another host, inside a nested `Host` body: it is still a thread of a process on the dying
+machine), and every goroutine stamped with the host (host-keyed — which catches the ROOT process's
+goroutines running the machine's `Host` body; proc 0 is the driver's own process, shared by every host,
+so no pid names "the threads on this machine"). The root process's pid therefore stays live while the
+declared processes' pids die. Correspondingly, **one logical process lives on one machine at a time**:
+a same-name invocation live on a second host is refused, because a host crash would otherwise scope its
+victims by whichever home was recorded last and silently spare a pid on the machine that lost power.
+
+What a reboot keeps is what the *hardware* keeps. The durable image is the disk; the **disk faults** — a
+bad sector (`FailDisk`/`FailFile`), a full disk (`LimitDisk`), a slow device (`SlowDisk`) — are physical
+properties of the media, not of the dead kernel, so a bad disk stays bad across the crash. Metadata
+durability is an **inode** property: once the parent directory's `fsync` makes a file's name durable, the
+crash recovers the file with the mode and timestamp it was *created* with, even if the file itself was
+never `fsync`ed; a later unsynced `chmod` reverts, like any unsynced change. For the same reason the kernel-state teardown is
+keyed by **host** — open file descriptions, descriptors, advisory locks, mappings, sockets, listeners,
+and the per-process working directories of that machine — since a proc-keyed sweep would either miss the
+root process's resources on the victim or reach its resources on a sibling host (DST-FAULT-VICTIM).
 
 **OOM** is a **process crash** whose *trigger* is the per-process allocation counter crossing a budget
 (cgroup-style per-process budget by default; a host-total kernel-OOM with victim selection is a recordable
@@ -847,7 +870,16 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   (`TestDSTCrashAndRestartOverLiveHostFS` pins the surviving unsynced write and the released lock;
   `TestDSTCrashSelf` the no-unwind, no-return self-crash; `TestDSTCrashNestedInvocationParked` that no
   goroutine outlives its process; `TestDSTCrashProcessBlockedInSynctestWait` that a victim holding the
-  bubble's waiter registration does not strand the run).
+  bubble's waiter registration does not strand the run). A **host crash** is power loss: the machine
+  stops, and what remains on its disk is exactly what `fsync` put there — a file's data if the file was
+  synced, a name if its parent directory was synced, and neither otherwise, so an unsynced removal is
+  *undone* by the crash exactly as it is by a real one (`TestDSTCrashHostRestoresDurableImage`,
+  `TestDSTCrashHostResurrectsUnsyncedRemoval`). Dirty shared mappings die with the page cache rather
+  than reaching the disk (`TestDSTCrashHostLosesDirtyMappedBytes` — the same store SURVIVES a process
+  crash, which is the whole host/process split), and the failures it surfaces are the real ones of a
+  machine losing power: never a torn sibling (`TestDSTCrashHostVictimScoping`), never a resource of the
+  dead kernel surviving into the reboot (`TestDSTCrashHostRestartFreshResources`,
+  `TestDSTCrashHostClosesRootProcessResources`).
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -891,7 +923,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   per-invocation pids and resource death by its logical process id, so `Crash("p")` takes exactly p's
   goroutines, fds, flocks, mappings, conns, and listeners — a host-sibling's lock on the same file node
   and the host filesystem itself are untouched (`TestDSTCrashProcessReleasesFileResources`,
-  `TestDSTCrashProcessResetsConnections`, `TestDSTCrashAndRestartOverLiveHostFS`).
+  `TestDSTCrashProcessResetsConnections`, `TestDSTCrashAndRestartOverLiveHostFS`). The **host-crash leg**
+  keys goroutine death by `dstHost` and kernel-state death by the host id, so `CrashHost(h)` takes exactly
+  h's threads, disk, locks, mappings, sockets, and listeners while a sibling host's unsynced bytes, held
+  lock, and connections among other hosts survive (`TestDSTCrashHostVictimScoping`,
+  `TestDSTCrashHostClosesRootProcessResources`).
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
   fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
   packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
@@ -919,8 +955,9 @@ adversarial loop.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
   clock **step** — **done**, **drift** (constant `Drift` + mid-run `DriftClock` + seed-drawn `BoundedDrift`)
   — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**; **process crash** (`Crash`, incl. the
-  self-crash form) + **restart** over the live host filesystem — **done**;
-  scheduling (straggler), OOM (allocation-triggered process crash), host crash — pending.
+  self-crash form) + **restart** over the live host filesystem — **done**; **host crash** (`CrashHost`,
+  power loss) + **reboot** onto the restored durable image — **done**;
+  scheduling (straggler), OOM (allocation-triggered process crash) — pending.
   Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded
   exploration (`Options.FaultPolicy`) as the `Explore`/`Failure` fault dimension; `Replay` of a fault set;

@@ -40,6 +40,8 @@ const (
 	dstPartOpPartitionRefuse                       // cut host-pair (a,b), symmetric, refuse (ECONNREFUSED) connect
 	dstFaultOpCloseProcListeners                   // close all listeners owned by process a (crash teardown)
 	dstFaultOpCloseProcConns                       // gracefully close conn ends owned by process a (exit teardown)
+	dstFaultOpResetHost                            // reset every conn an end of which lives on host a (host crash)
+	dstFaultOpCloseHostListeners                   // close every listener on host a (host crash)
 )
 
 func init() { dstSetNetPartitionHook(dstApplyNetFaultOp) }
@@ -56,6 +58,10 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstCloseProcListeners(a)
 	case dstFaultOpCloseProcConns:
 		dstCloseProcConns(a)
+	case dstFaultOpResetHost:
+		dstResetHost(a)
+	case dstFaultOpCloseHostListeners:
+		dstCloseHostListeners(a)
 	default:
 		dstApplyPartitionOp(op, a, b)
 	}

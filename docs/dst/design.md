@@ -479,10 +479,17 @@ are separate — fsync the file, fsync the directory), committed by syncing an o
 directory (`File.Sync` or Linux virtual-fd `syscall.Fsync`). `Fdatasync` on a simulated directory is a
 deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` is atomic in the namespace
 (observers see old or new, never neither/both); its durability rides the parent directories' sync state
-like any other entry change. A simulated **crash** (fault feature) restores exactly the durable image:
-synced state survives byte-exactly; unsynced data and entries MAY be lost or, for file content,
-torn at arbitrary byte granularity — no atomicity of individual `Write` calls is promised beyond
-what was synced. The base (no-fault) model is the collapse of this contract where crash never
+like any other entry change. A simulated **host crash** (`CrashHost`, power loss) restores exactly the durable image:
+synced state survives byte-exactly; unsynced data and entries are lost — including an unsynced
+REMOVAL, which the crash undoes, since the removal itself was never on the disk. (A process crash
+tears nothing: the kernel survives it, so its page cache does.) Today the tear is all-or-nothing per
+node; the contract permits less — unsynced data MAY instead be lost in part, reordered, or torn at
+arbitrary byte granularity — which the write-history increment will exploit. No atomicity of
+individual `Write` calls is promised beyond what was synced. Metadata durability is an inode property:
+a node reaches the disk with the mode and mtime it was created with, so a file whose parent directory was
+synced recovers with its creation mode even if the file itself was never synced (a later unsynced `Chmod`
+reverts, like any unsynced change). Disk FAULTS are properties of the media, not of the kernel: a bad
+sector, a full disk, and a slow device all survive a host crash. The base (no-fault) model is the collapse of this contract where crash never
 fires: everything survives, and `Sync` is *not* a no-op — it moves the synced/unsynced boundary,
 which the representation carries from day one (per-node durable image + pending state). The fault
 feature later adds crash/EIO/ENOSPC/latency as **policies over this representation**, never new
@@ -915,7 +922,8 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: process crash + restart | pid-keyed goroutine death + proc-keyed resource teardown (see [faults.md](./faults.md)) | ✅ |
-| faults: host crash/restart, OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
+| faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
+| faults: OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
 | raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
 | signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
@@ -947,10 +955,11 @@ trees in the *same* bubble, all driven by the one seed. The axes:
 - **Network / Disk / I/O** — in-memory and deterministic (landed), with sound faults: on the
   reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole, connection reset,
   throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a reliable
-  stream); EIO/ENOSPC/disk latency (landed); torn/lost unsynced writes on crash (pending).
-- **Faults** — net, disk, clock skew/step/drift, and process crash+restart axes landed; host crash/restart, OOM
-  kill, and *scheduling* faults (straggler) pending — each anchored to a real degree of freedom, so
-  sound (see [faults.md](./faults.md)).
+  stream); EIO/ENOSPC/disk latency (landed); lost unsynced writes on host crash (landed — the
+  all-or-nothing collapse; per-write subset/reorder/tear fidelity is the next increment).
+- **Faults** — net, disk, clock skew/step/drift, process crash+restart, and host crash+reboot axes
+  landed; OOM kill and *scheduling* faults (straggler) pending — each anchored to a real degree of
+  freedom, so sound (see [faults.md](./faults.md)).
 - Driven by a seed; replay-exact; failures shrinkable; invariants checked by the program's own
   assertions.
 

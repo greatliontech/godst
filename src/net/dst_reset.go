@@ -120,6 +120,21 @@ func dstLocalBindInUse(host uint32, ip IP, port int) bool {
 	return false
 }
 
+// dstResetHost resets every conn an end of which lives on host h — the machine
+// lost power, so each of its sockets emits an RST (resetConn tears down both
+// ends, so a surviving peer on another host sees ECONNRESET). Matching the
+// LOCAL end keys the fault to exactly the victim's connections
+// (DST-FAULT-VICTIM); a conn between two other hosts is untouched.
+func dstResetHost(h uint32) {
+	dstResetMatching(func(c *dstConn) bool { return c.localHost == h })
+}
+
+// dstCloseHostListeners closes every listener on host h — the whole port space
+// dies with the machine, whichever of its processes bound it.
+func dstCloseHostListeners(h uint32) {
+	dstCloseListeners(func(l *dstListener) bool { return l.host == h })
+}
+
 // dstResetPair resets every conn between hosts a and b (either direction).
 func dstResetPair(a, b uint32) {
 	key := dstPartKey(a, b)
@@ -160,6 +175,10 @@ func dstCloseProcConns(p uint32) {
 }
 
 func dstCloseProcListeners(p uint32) {
+	dstCloseListeners(func(l *dstListener) bool { return l.proc == p })
+}
+
+func dstCloseListeners(match func(*dstListener) bool) {
 	type victim struct {
 		key string
 		l   *dstListener
@@ -168,7 +187,7 @@ func dstCloseProcListeners(p uint32) {
 	dstNetRoll()
 	var victims []victim
 	for key, l := range dstNet.listeners {
-		if l.proc == p {
+		if match(l) {
 			victims = append(victims, victim{key: key, l: l})
 		}
 	}

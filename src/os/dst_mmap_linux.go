@@ -306,6 +306,36 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 	return 0, false
 }
 
+// dstMMapReleaseHost unregisters every mapping made on host WITHOUT copying
+// writable bytes back into the file state. That asymmetry with
+// dstMMapReleaseProc is the host/process crash split itself: a dying process
+// leaves its dirty MAP_SHARED pages in the kernel's page cache (so they are
+// visible to survivors and to a restart), while a dying KERNEL loses them —
+// they were never on the disk. Copying back here would hand a rebooted host
+// data that power loss destroyed, the exact false-negative the durability
+// contract exists to prevent.
+func dstMMapReleaseHost(host uint32) {
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstMMapRegistry.mu.Lock()
+	defer dstMMapRegistry.mu.Unlock()
+	dstMMapRollLocked()
+	for key, bucket := range dstMMapRegistry.maps {
+		out := bucket[:0]
+		for _, entry := range bucket {
+			if entry.epoch == dstFSEpoch() && entry.host == host {
+				continue // dropped: no write-back
+			}
+			out = append(out, entry)
+		}
+		if len(out) == 0 {
+			delete(dstMMapRegistry.maps, key)
+		} else {
+			dstMMapRegistry.maps[key] = out
+		}
+	}
+}
+
 func dstMMapReleaseProc(proc uint32) {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()

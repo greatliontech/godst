@@ -1480,6 +1480,93 @@ func dstCrashKillsBubbleMain(bubble *synctestBubble, pid int32) bool {
 	return main != nil && (main.dstPid == pid || main.dstPid == -pid)
 }
 
+// dstPidOwnsBubbleMain reports whether pid's goroutine set contains the run's
+// main goroutine. Callers pre-scan every victim with it and refuse BEFORE any
+// teardown, so a multi-victim fault (a host crash) cannot tear part of the
+// universe down and only then panic. The mark path keeps its own check as a
+// backstop. Reached from testing/simulation by //go:linkname.
+//
+//go:linkname dstPidOwnsBubbleMain
+func dstPidOwnsBubbleMain(pid int32) bool {
+	bubble := dstSimBubble
+	return bubble != nil && dstCrashKillsBubbleMain(bubble, pid)
+}
+
+// dstHostOwnsBubbleMain reports whether the run's main goroutine runs on host.
+// Crashing that host would destroy the machine the simulation driver runs on —
+// its filesystem, locks, and sockets would go while the driver kept running, a
+// state no power loss produces. Reached from testing/simulation by //go:linkname.
+//
+//go:linkname dstHostOwnsBubbleMain
+func dstHostOwnsBubbleMain(host uint32) bool {
+	bubble := dstSimBubble
+	return bubble != nil && bubble.main != nil && bubble.main.dstHost == host
+}
+
+// dstMarkHostGoroutinesCrashed deschedules permanently every goroutine running
+// on host — the machine lost power, so every thread on it stops, whichever
+// process it belonged to. That includes the ROOT process's goroutines running a
+// Host body: they are threads on the dead machine, even though the root process
+// itself lives on (its pid stays live; it has goroutines on other hosts). The
+// pid-keyed kill cannot express this — a host is not a process — so the host
+// crash marks by host. Reached from testing/simulation.CrashHost by //go:linkname.
+//
+//go:linkname dstMarkHostGoroutinesCrashed
+func dstMarkHostGoroutinesCrashed(host uint32) {
+	bubble := dstSimBubble
+	if bubble == nil {
+		return
+	}
+	if bubble.main != nil && bubble.main.dstHost == host {
+		panic("testing/simulation: CrashHost would kill the run's main goroutine")
+	}
+	var total, running int
+	var waiterCrashed bool
+	forEachG(func(gp *g) {
+		if gp.bubble != bubble || gp.dstHost != host || gp.dstPid < 0 {
+			return
+		}
+		status := readgstatus(gp) &^ _Gscan
+		gp.dstPid = -gp.dstPid
+		if gp.dstPid == 0 {
+			// A goroutine that never carried a pid still must never run again;
+			// the scheduler filter keys on dstPid < 0, so give it the sentinel
+			// the root pid can never take (pids are positive).
+			gp.dstPid = -1
+		}
+		if gp == bubble.waiter {
+			waiterCrashed = true
+		}
+		if status == _Gdead || status == _Gdeadextra {
+			return
+		}
+		total++
+		if dstSynctestRunningStatus(gp, status) {
+			running++
+		}
+	})
+	if total == 0 && !waiterCrashed {
+		return
+	}
+	lock(&bubble.mu)
+	if waiterCrashed {
+		bubble.waiter = nil // see dstMarkProcessGoroutinesCrashed
+	}
+	bubble.total -= total
+	bubble.running -= running
+	if bubble.total < 0 {
+		fatal("total < 0")
+	}
+	if bubble.running < 0 {
+		fatal("running < 0")
+	}
+	wake := bubble.maybeWakeLocked()
+	unlock(&bubble.mu)
+	if wake != nil {
+		goready(wake, 0)
+	}
+}
+
 func dstMarkProcessGoroutinesCrashed(pid int32) {
 	bubble := dstSimBubble
 	if bubble == nil {

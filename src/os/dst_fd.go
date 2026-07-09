@@ -175,6 +175,10 @@ func dstReleaseBackendFDs(backend dstFileBackend) {
 // minting goroutine's node, open-file entries by the opener's). Sweeping those
 // keeps the attribution invariant: no fd of a dead process survives teardown.
 func dstReleaseProcFDs(proc uint32) {
+	dstReleaseFDs(func(e dstFDEntry) bool { return e.proc == proc })
+}
+
+func dstReleaseFDs(match func(dstFDEntry) bool) {
 	type release struct {
 		fd    int
 		entry dstFDEntry
@@ -183,7 +187,7 @@ func dstReleaseProcFDs(proc uint32) {
 	dstFDRegistry.mu.Lock()
 	dstFDRollLocked()
 	for fd, entry := range dstFDRegistry.fds {
-		if entry.proc == proc {
+		if match(entry) {
 			delete(dstFDRegistry.fds, fd)
 			releases = append(releases, release{fd: fd, entry: entry})
 		}

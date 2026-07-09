@@ -71,6 +71,13 @@ var dstOpenFiles struct {
 }
 
 type dstOpenFileEntry struct {
+	// host and proc attribute the open file description to its owning machine
+	// and process. A process crash closes a PROCESS's files; a host crash
+	// closes a HOST's — different sets, because a Host body with no Process
+	// declaration runs as the root process (proc 0), which every host shares.
+	// Keying host teardown by proc would close a sibling host's files
+	// (DST-FAULT-VICTIM).
+	host uint32
 	proc uint32
 	// seq stamps each registration in open order — a pure function of the
 	// schedule — so teardown closes a victim's files in that order, never the
@@ -89,11 +96,11 @@ func dstOpenFilesRollLocked() {
 	}
 }
 
-func dstRegisterOpenFile(f *file, proc uint32) {
+func dstRegisterOpenFile(f *file, host, proc uint32) {
 	dstOpenFiles.mu.Lock()
 	dstOpenFilesRollLocked()
 	dstOpenFiles.seq++
-	dstOpenFiles.files[f] = dstOpenFileEntry{proc: proc, seq: dstOpenFiles.seq}
+	dstOpenFiles.files[f] = dstOpenFileEntry{host: host, proc: proc, seq: dstOpenFiles.seq}
 	dstOpenFiles.mu.Unlock()
 }
 
@@ -104,7 +111,19 @@ func dstUnregisterOpenFile(f *file) {
 	dstOpenFiles.mu.Unlock()
 }
 
+// dstCloseProcFiles closes the files a PROCESS opened (process crash, or exit).
 func dstCloseProcFiles(proc uint32) {
+	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.proc == proc })
+}
+
+// dstCloseHostFiles closes every file opened on a HOST, whichever process
+// opened it (host crash: the kernel that held the open file descriptions is
+// gone). See dstOpenFileEntry for why this cannot key on proc.
+func dstCloseHostFiles(host uint32) {
+	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.host == host })
+}
+
+func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {
 	dstOpenFiles.mu.Lock()
 	dstOpenFilesRollLocked()
 	type victim struct {
@@ -113,7 +132,7 @@ func dstCloseProcFiles(proc uint32) {
 	}
 	var victims []victim
 	for f, entry := range dstOpenFiles.files {
-		if entry.proc == proc {
+		if match(entry) {
 			victims = append(victims, victim{f: f, seq: entry.seq})
 			delete(dstOpenFiles.files, f)
 		}
@@ -188,6 +207,33 @@ func dstFSRoll() {
 	}
 }
 
+// dstFSNewNode allocates a node with its inode number and its metadata durable
+// image already at the birth values. Metadata durability is an INODE property,
+// and an inode reaches the disk with the mode and timestamp it was created
+// with: once the parent directory's fsync makes the NAME durable, a crash
+// recovers a file with its creation mode — not mode 0. (Later chmod/utimes
+// still move only current state; the image advances on the node's own sync,
+// per the durability contract's monotonicity invariant.) Content and entry
+// images stay empty: no bytes and no children were ever committed.
+//
+// Every node-creation site goes through here, so the rule cannot be forgotten
+// at one of them. Caller holds dstFS.mu.
+func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
+	now := time.Now()
+	node := &dstFSNode{
+		isDir:         isDir,
+		ino:           dstFSAllocIno(),
+		mode:          mode,
+		modTime:       now,
+		syncedMode:    mode,
+		syncedModTime: now,
+	}
+	if isDir {
+		node.entries = make(map[string]*dstFSNode)
+	}
+	return node
+}
+
 // dstFSAllocIno returns the next synthetic inode number — a per-run monotonic
 // counter shared by every host disk (st_dev separates hosts, so cross-host
 // uniqueness is free and harmless). Allocation order rides the schedule, so
@@ -214,20 +260,8 @@ func dstFSDiskHere() *dstFSDisk {
 // empty-tree clause). Every host gets its own /tmp; os.TempDir reports the fixed
 // path "/tmp" during a run.
 func newDstFSDisk() *dstFSDisk {
-	root := &dstFSNode{
-		isDir:   true,
-		ino:     dstFSAllocIno(),
-		entries: make(map[string]*dstFSNode),
-		mode:    ModeDir | 0o755,
-		modTime: time.Now(),
-	}
-	root.entries["tmp"] = &dstFSNode{
-		isDir:   true,
-		ino:     dstFSAllocIno(),
-		entries: make(map[string]*dstFSNode),
-		mode:    ModeDir | ModeSticky | 0o777,
-		modTime: time.Now(),
-	}
+	root := dstFSNewNode(true, ModeDir|0o755)
+	root.entries["tmp"] = dstFSNewNode(true, ModeDir|ModeSticky|0o777)
 	return &dstFSDisk{root: root}
 }
 
@@ -475,13 +509,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if dstFSDiskHere().diskFullForCreate() {
 		return wrap(syscall.ENOSPC)
 	}
-	parent.entries[base] = &dstFSNode{
-		isDir:   true,
-		ino:     dstFSAllocIno(),
-		entries: make(map[string]*dstFSNode),
-		mode:    ModeDir | perm&ModePerm,
-		modTime: time.Now(),
-	}
+	parent.entries[base] = dstFSNewNode(true, ModeDir|perm&ModePerm)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -958,11 +986,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		if dstFSDiskHere().diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = &dstFSNode{
-			ino:     dstFSAllocIno(),
-			mode:    perm & ModePerm,
-			modTime: time.Now(),
-		}
+		node = dstFSNewNode(false, perm&ModePerm)
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
@@ -1026,8 +1050,8 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 func dstNewFile(d dstFileBackend, name string) *File {
 	f := &File{&file{name: name, dstf: d}}
 	f.pfd.Sysfd = -1
-	_, proc := dstFSCurrentNode()
-	dstRegisterOpenFile(f.file, proc)
+	host, proc := dstFSCurrentNode()
+	dstRegisterOpenFile(f.file, host, proc)
 	runtime.SetFinalizer(f.file, (*file).close)
 	return f
 }

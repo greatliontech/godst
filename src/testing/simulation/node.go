@@ -5,6 +5,7 @@
 package simulation
 
 import (
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -64,6 +65,21 @@ func dstParkCrashedSelf()
 
 //go:linkname dstPidAliveSim runtime.dstPidAlive
 func dstPidAliveSim(pid int32) bool
+
+//go:linkname dstPidOwnsBubbleMain runtime.dstPidOwnsBubbleMain
+func dstPidOwnsBubbleMain(pid int32) bool
+
+//go:linkname dstHostOwnsBubbleMain runtime.dstHostOwnsBubbleMain
+func dstHostOwnsBubbleMain(host uint32) bool
+
+//go:linkname dstMarkHostGoroutinesCrashed runtime.dstMarkHostGoroutinesCrashed
+func dstMarkHostGoroutinesCrashed(host uint32)
+
+//go:linkname dstRestoreHostDiskFor os.dstRestoreHostDiskFor
+func dstRestoreHostDiskFor(host uint32)
+
+//go:linkname dstCloseHostFilesFor os.dstCloseHostFilesFor
+func dstCloseHostFilesFor(host uint32)
 
 //go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
 func dstProcAllocEnsure(procid uint32)
@@ -242,6 +258,11 @@ var nodeReg struct {
 var activeProcs struct {
 	mu   sync.Mutex
 	pids map[uint32][]int32
+	// host records which machine each live process runs on, so a host crash
+	// can enumerate its victims. Process names are a global namespace (one
+	// name interns to one process id), so a process lives on exactly one host
+	// at a time; a restart on another host overwrites the entry.
+	host map[uint32]uint32
 }
 
 // procTeardownMu spans a process's liveness bookkeeping and the resource
@@ -265,16 +286,51 @@ func nodeRegReset() {
 	nodeReg.nextProc = 0
 	activeProcs.mu.Lock()
 	activeProcs.pids = make(map[uint32][]int32)
+	activeProcs.host = make(map[uint32]uint32)
 	activeProcs.mu.Unlock()
 }
 
-func activeProcSet(proc uint32, pid int32) {
+func activeProcSet(proc, host uint32, pid int32) {
 	activeProcs.mu.Lock()
 	if activeProcs.pids == nil {
 		activeProcs.pids = make(map[uint32][]int32)
 	}
+	if activeProcs.host == nil {
+		activeProcs.host = make(map[uint32]uint32)
+	}
 	activeProcs.pids[proc] = append(activeProcs.pids[proc], pid)
+	activeProcs.host[proc] = host
 	activeProcs.mu.Unlock()
+}
+
+// activeProcLivesElsewhere reports whether the logical process already has a
+// live invocation on a DIFFERENT machine. One logical process lives on exactly
+// one machine at a time: two homes would give a host crash two candidate victim
+// sets, and it would scope by whichever was recorded last — silently sparing a
+// pid on the machine that lost power. Checked before a Process stamps anything,
+// so the refusal mutates no state.
+func activeProcLivesElsewhere(proc, host uint32) bool {
+	activeProcs.mu.Lock()
+	defer activeProcs.mu.Unlock()
+	old, ok := activeProcs.host[proc]
+	return ok && old != host && len(activeProcs.pids[proc]) > 0
+}
+
+// activeProcsOnHost returns the live processes running on host, in process-id
+// order — a deterministic function of declaration order, never the map's
+// iteration order, so a host crash tears its victims down reproducibly
+// (DST-FAULT-REPLAY).
+func activeProcsOnHost(host uint32) []uint32 {
+	activeProcs.mu.Lock()
+	var procs []uint32
+	for proc, h := range activeProcs.host {
+		if h == host && len(activeProcs.pids[proc]) > 0 {
+			procs = append(procs, proc)
+		}
+	}
+	activeProcs.mu.Unlock()
+	slices.Sort(procs)
+	return procs
 }
 
 // activeProcClear removes one invocation's pid and reports whether it was the
@@ -309,6 +365,7 @@ func activeProcPIDs(proc uint32) []int32 {
 func activeProcClearAll(proc uint32) {
 	activeProcs.mu.Lock()
 	delete(activeProcs.pids, proc)
+	delete(activeProcs.host, proc)
 	activeProcs.mu.Unlock()
 }
 
@@ -476,6 +533,99 @@ func Crash(name string) {
 	}
 }
 
+// crashHost is CrashHost's body, without the self-crash park (so the park
+// happens after procTeardownMu is released — parking while holding it would
+// strand every later teardown).
+func crashHost(name string) {
+	host := lookupHost(name)
+	if host == 0 {
+		return
+	}
+	// Refuse before anything is torn down (a multi-victim fault must not tear
+	// half the universe down and only then panic): the driver's machine cannot
+	// lose power while the driver runs. This also catches a host whose only
+	// activity is the root process (no Process declared), whose goroutines the
+	// pid-keyed kill below would never reach.
+	if runActive.Load() && dstHostOwnsBubbleMain(host) {
+		panic("testing/simulation: CrashHost would destroy the machine the run's main goroutine runs on — declare crashable hosts and processes on their own goroutines (go Process(name, f) inside Host)")
+	}
+	procTeardownMu.Lock()
+	// defer, not a trailing Unlock: a panic between here and the end — the
+	// pid pre-scan's refusal, or the mark path's backstop — must not strand the
+	// mutex and deadlock every later teardown.
+	defer procTeardownMu.Unlock()
+	victims := activeProcsOnHost(host)
+	for _, proc := range victims {
+		for _, pid := range activeProcPIDs(proc) {
+			if dstPidOwnsBubbleMain(pid) {
+				panic("testing/simulation: CrashHost would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
+			}
+		}
+	}
+	// The machine's threads stop. That set is the UNION of two things, because
+	// neither alone is the machine:
+	//
+	//   - every goroutine of a process declared on the host (pid-keyed), which
+	//     also marks those pids dead for Kill and procfs. This leg matters for a
+	//     goroutine of the host's process that is momentarily stamped with
+	//     ANOTHER host (it entered a nested Host body): it is still a thread of
+	//     a process on the dying machine, and must die with it.
+	//   - every goroutine stamped with this host (host-keyed), which catches the
+	//     ROOT process's goroutines running the machine's Host body. The root
+	//     process's own pid stays live — it is the driver, with goroutines on
+	//     other hosts — so the pid-keyed leg cannot reach them. A host is not a
+	//     process.
+	//
+	// One residual, recorded: a ROOT-process goroutine that is inside a nested
+	// Host body of ANOTHER machine at the instant this one dies is stamped with
+	// that other host and has no pid to key on, so it survives. It is a thread
+	// of the driver, not of any declared process, and reaching it would require
+	// nesting Host declarations on the driver's own goroutine.
+	for _, proc := range victims {
+		for _, pid := range activeProcPIDs(proc) {
+			dstCrashProcessPid(pid)
+		}
+		activeProcClearAll(proc)
+	}
+	dstMarkHostGoroutinesCrashed(host)
+	// Kernel order, as in a process crash: the threads stop, then the kernel's
+	// own structures go. Here the kernel itself is gone, so what dies is
+	// host-scoped: every open file description and descriptor table on the
+	// machine, every advisory lock, every mapping (WITHOUT write-back — dirty
+	// pages were never on the disk), every socket (RST) and listener.
+	dstCloseHostFilesFor(host)
+	dstNetPartitionOp(partOpResetHost, host, 0)
+	dstNetPartitionOp(partOpCloseHostListeners, host, 0)
+	// Finally the disk: what survives is exactly what was committed to it. The
+	// host's disk FAULTS (a bad sector, a full disk, a slow device) are physical
+	// properties of the hardware, not kernel state: they survive the reboot.
+	dstRestoreHostDiskFor(host)
+}
+
+// CrashHost kills the named host — the power-loss / kernel-panic fault
+// (docs/dst/faults.md "Crash / restart faults"). Every process on the host dies
+// as under Crash (goroutines descheduled permanently, no defers, pids dead),
+// every connection an end of which lives on the host is RESET at its peer, and
+// every listener closes. Then the machine's kernel state is gone: its
+// filesystem TEARS BACK TO ITS DURABLE IMAGE — data a file's Fsync committed
+// survives byte-exactly, a name its parent directory's Fsync committed survives,
+// and everything else (unsynced writes, unsynced creates and removes, dirty
+// shared mappings) is lost, exactly as power loss loses the page cache. A
+// process crash, whose kernel survives, tears nothing.
+//
+// Restart is a fresh Host declaration (which reboots the machine's clock) with
+// its processes started inside it; they reopen the recovered on-disk image with
+// clean process-owned resources. Other hosts are untouched — their disks,
+// locks, and connections among themselves survive. CrashHost panics during a
+// run on an undeclared host name, and on a host owning the run's main goroutine
+// (see Crash); it is a no-op outside a run.
+func CrashHost(name string) {
+	crashHost(name)
+	if dstSelfCrashed() {
+		dstParkCrashedSelf()
+	}
+}
+
 // Process runs f as the named process — the unit of crash/restart and memory
 // isolation. A Process declared inside a Host body runs on that host; a Process
 // outside any Host gets an implicit dedicated host named after the process (the
@@ -507,6 +657,9 @@ func Process(name string, f func()) {
 		// entry (in-sync, rate 1) with no call needed.
 	}
 	proc := internProc(name)
+	if runActive.Load() && activeProcLivesElsewhere(proc, host) {
+		panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
+	}
 	dstProcAllocEnsure(proc) // per-process allocation counter exists before the body allocates
 	oldH, oldP := dstSetNode(host, proc)
 	simPid := dstAllocPid()
@@ -515,7 +668,7 @@ func Process(name string, f func()) {
 	// process (procTeardownMu): a restart must not become live — nor open
 	// resources — while its predecessor's exit/crash teardown is mid-flight.
 	procTeardownMu.Lock()
-	activeProcSet(proc, simPid)
+	activeProcSet(proc, host, simPid)
 	procTeardownMu.Unlock()
 	// Registered FIRST so it runs LAST — after the exit-teardown defer below
 	// has completed and released procTeardownMu (parking while holding it
