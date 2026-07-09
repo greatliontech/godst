@@ -74,3 +74,19 @@ tasks:
     cmds:
       - '{{.RUN}} install cmd/compile'
       - '{{.RUN}} clean -cache'
+
+  # Porting: docs/dst/releases.md is the contract (branches, tags, VERSION
+  # scheme); this task is the executable rebase step. CUR names the base the
+  # stack currently sits on, NEW the base to move to — passing both explicitly
+  # keeps the replayed range exactly the dst stack, never upstream's own
+  # backports. rerere is enabled repo-locally, so conflict resolutions replay.
+  # After a port: resolve VERSION to the new base + -dst.1, run `task compiler`
+  # (upstream may have touched cmd/compile), then the full test matrix, then tag.
+  port:
+    desc: 'Rebase the dst stack onto a new upstream base: task port CUR=upstream/release-branch.go1.26 NEW=upstream/release-branch.go1.27'
+    preconditions:
+      - sh: test -n "{{.CUR}}" && test -n "{{.NEW}}"
+        msg: 'usage: task port CUR=<current-base-ref> NEW=<new-base-ref>'
+    cmds:
+      - git fetch upstream
+      - git rebase --onto {{.NEW}} $(git merge-base HEAD {{.CUR}})
