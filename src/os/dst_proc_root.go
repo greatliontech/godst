@@ -6,8 +6,6 @@
 
 package os
 
-import "strings"
-
 func dstRootProcAbsLocked(r *dstRoot, name string) string {
 	parts, endsInSlash, err := splitPathInRoot(name, nil, nil)
 	if err != nil {
@@ -61,15 +59,17 @@ func dstRootProcAbsLocked(r *dstRoot, name string) string {
 	if len(stack) == 0 || stack[0] != "proc" {
 		return ""
 	}
-	var b strings.Builder
+	// []byte append rather than strings.Builder — see dstProcAbs (os sits
+	// below strings in the dependency policy).
+	b := make([]byte, 0, len(name)+1)
 	for _, part := range stack {
-		b.WriteByte('/')
-		b.WriteString(part)
+		b = append(b, '/')
+		b = append(b, part...)
 	}
 	if endsInSlash {
-		b.WriteByte('/')
+		b = append(b, '/')
 	}
-	return b.String()
+	return string(b)
 }
 
 func dstRootMkdirAllProcReservedLocked(r *dstRoot, name string) bool {

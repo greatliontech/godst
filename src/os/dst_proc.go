@@ -8,9 +8,9 @@ package os
 
 import (
 	"internal/poll"
+	"internal/strconv"
+	"internal/stringslite"
 	"io"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -81,11 +81,14 @@ func dstProcStatData(name string) (data []byte, ident string, handled bool, errn
 }
 
 func dstProcStatDataAbs(abs string) (data []byte, ident string, handled bool, errno error) {
-	if strings.HasSuffix(abs, "/") {
+	if stringslite.HasSuffix(abs, "/") {
 		// A trailing slash asserts directory-ness; on a proc LEAF that exists the
 		// host answers ENOTDIR (the filesystem section's trailing-slash clause),
 		// and ENOENT elsewhere on the unsupported surface.
-		trimmed := strings.TrimRight(abs, "/")
+		trimmed := abs
+		for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+			trimmed = trimmed[:len(trimmed)-1]
+		}
 		if _, ok := dstProcStatPID(trimmed); ok || trimmed == "/proc/self/ns/pid" {
 			return nil, abs, true, syscall.ENOTDIR
 		}
@@ -112,11 +115,11 @@ func dstProcStatDataAbs(abs string) (data []byte, ident string, handled bool, er
 func dstProcStatPID(abs string) (string, bool) {
 	const prefix = "/proc/"
 	const suffix = "/stat"
-	if !strings.HasPrefix(abs, prefix) || !strings.HasSuffix(abs, suffix) {
+	if !stringslite.HasPrefix(abs, prefix) || !stringslite.HasSuffix(abs, suffix) {
 		return "", false
 	}
 	pid := abs[len(prefix) : len(abs)-len(suffix)]
-	if pid == "" || strings.IndexByte(pid, '/') >= 0 {
+	if pid == "" || stringslite.IndexByte(pid, '/') >= 0 {
 		return "", false
 	}
 	return pid, true
@@ -216,15 +219,18 @@ func dstProcAbs(name string) string {
 	if len(stack) == 0 || stack[0] != "proc" {
 		return ""
 	}
-	var b strings.Builder
+	// []byte append rather than strings.Builder: os sits below the strings
+	// package in the dependency policy (go/build's TestDependencies scans
+	// tag-excluded files too, so dst files conform like os's own code).
+	b := make([]byte, 0, len(name)+1)
 	for _, c := range stack {
-		b.WriteByte('/')
-		b.WriteString(c)
+		b = append(b, '/')
+		b = append(b, c...)
 	}
 	if trailing {
-		b.WriteByte('/')
+		b = append(b, '/')
 	}
-	return b.String()
+	return string(b)
 }
 
 func dstProcStackIsLeaf(stack []string) bool {
