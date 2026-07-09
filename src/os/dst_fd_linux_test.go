@@ -9,6 +9,7 @@ package os_test
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"syscall"
@@ -23,6 +24,17 @@ const (
 	dstTestMadvPopulateRead = 22
 )
 
+func expectDSTRawSyscallPanic(t *testing.T, call func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil || !strings.Contains(fmt.Sprint(r), "unsupported under deterministic simulation") {
+			t.Fatalf("raw syscall panic = %v, want unsupported-under-simulation", r)
+		}
+	}()
+	call()
+}
+
 func TestDSTRawSyscallNoErrorIdentityNotFenced(t *testing.T) {
 	simulation.Run(1, func() {
 		if pid := syscall.Getpid(); pid <= 0 {
@@ -35,6 +47,31 @@ func TestDSTRawSyscallNoErrorIdentityNotFenced(t *testing.T) {
 		_ = syscall.Geteuid()
 		_ = syscall.Getegid()
 	})
+}
+
+func TestDSTFSVirtualFDRawSelectedSyscallsFenced(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(fd uintptr)
+	}{
+		{"Syscall_Fsync", func(fd uintptr) { syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0) }},
+		{"RawSyscall_Fdatasync", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_FDATASYNC, fd, 0, 0) }},
+		{"Syscall6_Mmap", func(fd uintptr) {
+			syscall.Syscall6(syscall.SYS_MMAP, 0, uintptr(syscall.Getpagesize()), syscall.PROT_READ, syscall.MAP_SHARED, fd, 0)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			simulation.Run(1, func() {
+				f, err := os.Create("/fd")
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				fd := f.Fd()
+				defer f.Close()
+				expectDSTRawSyscallPanic(t, func() { tt.call(fd) })
+			})
+		})
+	}
 }
 
 func TestDSTFSVirtualFDMmapReadOnlyShared(t *testing.T) {
@@ -118,6 +155,96 @@ func TestDSTFSVirtualFDMmapRangeOperations(t *testing.T) {
 		}
 		if err := syscall.Munmap(b); err != nil {
 			t.Fatalf("Munmap: %v", err)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDMmapCrossProcessWriteUpdates(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/m", []byte("hello"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			mapped := make(chan struct{})
+			written := make(chan struct{})
+			done := make(chan error, 1)
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.Open("/m")
+					if err != nil {
+						done <- err
+						return
+					}
+					b, err := syscall.Mmap(int(f.Fd()), 0, 5, syscall.PROT_READ, syscall.MAP_SHARED)
+					if closeErr := f.Close(); err == nil {
+						err = closeErr
+					}
+					if err != nil {
+						done <- err
+						return
+					}
+					close(mapped)
+					<-written
+					if got := string(b); got != "hYllo" {
+						done <- fmt.Errorf("mapped bytes after cross-process WriteAt = %q, want hYllo", got)
+						return
+					}
+					done <- syscall.Munmap(b)
+				}()
+			})
+			select {
+			case err := <-done:
+				t.Fatalf("p1 map setup: %v", err)
+			case <-mapped:
+			}
+			writtenClosed := false
+			defer func() {
+				if !writtenClosed {
+					close(written)
+				}
+			}()
+
+			simulation.Process("p2", func() {
+				f, err := os.OpenFile("/m", os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatalf("p2 OpenFile: %v", err)
+				}
+				defer f.Close()
+				if _, err := f.WriteAt([]byte("Y"), 1); err != nil {
+					t.Fatalf("p2 WriteAt: %v", err)
+				}
+			})
+			close(written)
+			writtenClosed = true
+			if err := <-done; err != nil {
+				t.Fatalf("p1 mapped observation: %v", err)
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDMunmapRequiresExactMapping(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/m", []byte("hello"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f, err := os.Open("/m")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer f.Close()
+		b, err := syscall.Mmap(int(f.Fd()), 0, 5, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("Mmap: %v", err)
+		}
+		if errno, handled := os.DSTMunmapResult(b[:1:1]); !handled || errno != syscall.EINVAL {
+			t.Fatalf("dstMunmap partial slice = errno %v handled %v, want EINVAL true", errno, handled)
+		}
+		if err := syscall.Mprotect(b, syscall.PROT_READ); err != nil {
+			t.Fatalf("Mprotect after failed partial Munmap: %v", err)
+		}
+		if err := syscall.Munmap(b); err != nil {
+			t.Fatalf("full Munmap after partial failure: %v", err)
 		}
 	})
 }
@@ -262,6 +389,73 @@ func TestDSTFSVirtualFDFsyncCommitsDirectoryEntries(t *testing.T) {
 		}
 		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "two" || len(synced) != 1 || synced[0] != "two" {
 			t.Fatalf("post-second-Fsync entries = %v/%v, ok=%v; want two/two", cur, synced, ok)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDSyncFrontDoorsFailWithoutCommitting(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			f, err := os.OpenFile("/sync-eio", os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			defer f.Close()
+			if _, err := f.WriteString("dirty"); err != nil {
+				t.Fatalf("WriteString: %v", err)
+			}
+			fd := int(f.Fd())
+			simulation.FailDisk("h")
+			if err := syscall.Fdatasync(fd); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("Fdatasync under FailDisk = %v, want EIO", err)
+			}
+			if err := syscall.Fsync(fd); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("Fsync under FailDisk = %v, want EIO", err)
+			}
+			if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-eio"); !ok || synced != "" {
+				t.Fatalf("synced image after failed syncs = %q, ok=%v; want empty", synced, ok)
+			}
+			simulation.HealDisk("h")
+			if err := syscall.Fdatasync(fd); err != nil {
+				t.Fatalf("Fdatasync after HealDisk: %v", err)
+			}
+			if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-eio"); !ok || synced != "dirty" {
+				t.Fatalf("synced image after heal = %q, ok=%v; want dirty", synced, ok)
+			}
+		})
+	})
+}
+
+func TestDSTFSOpenRootVirtualFDSyscalls(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/root", 0o755); err != nil {
+			t.Fatalf("Mkdir root: %v", err)
+		}
+		r, err := os.OpenRoot("/root")
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		defer r.Close()
+		f, err := r.OpenFile("viafd", os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatalf("Root.OpenFile viafd: %v", err)
+		}
+		fd := int(f.Fd())
+		if fd < 1<<30 {
+			t.Fatalf("rooted Fd = %d, want virtual descriptor", fd)
+		}
+		if n, err := syscall.Write(fd, []byte("fd")); n != 2 || err != nil {
+			t.Fatalf("syscall.Write rooted fd = %d, %v; want 2, nil", n, err)
+		}
+		if off, err := syscall.Seek(fd, 0, io.SeekStart); off != 0 || err != nil {
+			t.Fatalf("syscall.Seek rooted fd = %d, %v; want 0, nil", off, err)
+		}
+		buf := make([]byte, 2)
+		if n, err := syscall.Read(fd, buf); n != 2 || err != nil || string(buf) != "fd" {
+			t.Fatalf("syscall.Read rooted fd = %d, %v, %q; want 2, nil, fd", n, err, buf)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("rooted fd Close: %v", err)
 		}
 	})
 }

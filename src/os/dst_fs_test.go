@@ -1055,6 +1055,72 @@ func TestDSTFSOpenRoot(t *testing.T) {
 	})
 }
 
+func TestDSTFSOpenRootAdditionalEdges(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/root", 0o755); err != nil {
+			t.Fatalf("Mkdir root: %v", err)
+		}
+		if err := os.WriteFile("/root/file", []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile file: %v", err)
+		}
+		r, err := os.OpenRoot("/root")
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		defer r.Close()
+
+		if _, err := r.OpenRoot("file"); err == nil {
+			t.Fatalf("Root.OpenRoot on file succeeded")
+		}
+		if _, err := r.OpenRoot("missing"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Root.OpenRoot missing = %v, want ENOENT", err)
+		}
+		if _, err := r.OpenRoot("/root"); err == nil {
+			t.Fatalf("Root.OpenRoot absolute path succeeded")
+		}
+
+		fi, err := r.Stat("file")
+		if err != nil {
+			t.Fatalf("Root.Stat file: %v", err)
+		}
+		lfi, err := r.Lstat("file")
+		if err != nil {
+			t.Fatalf("Root.Lstat file: %v", err)
+		}
+		if !os.SameFile(fi, lfi) {
+			t.Fatalf("Root.Stat/Lstat SameFile = false, want true")
+		}
+
+		if err := r.WriteFile("append", []byte("a"), 0o644); err != nil {
+			t.Fatalf("Root.WriteFile append: %v", err)
+		}
+		f, err := r.OpenFile("append", os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatalf("Root.OpenFile append: %v", err)
+		}
+		if _, err := f.Write([]byte("b")); err != nil {
+			t.Fatalf("append Write: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("append Close: %v", err)
+		}
+		if got, err := r.ReadFile("append"); err != nil || string(got) != "ab" {
+			t.Fatalf("Root.ReadFile append = %q, %v; want ab", got, err)
+		}
+		f, err = r.OpenFile("append", os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			t.Fatalf("Root.OpenFile truncate: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("truncate Close: %v", err)
+		}
+		if got, err := r.ReadFile("append"); err != nil || len(got) != 0 {
+			t.Fatalf("Root.ReadFile after truncate = %q, %v; want empty", got, err)
+		}
+
+	})
+}
+
 func TestDSTFSOpenRootDurability(t *testing.T) {
 	simulation.Run(1, func() {
 		must := func(what string, err error) {

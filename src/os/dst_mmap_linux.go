@@ -186,6 +186,14 @@ func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
 func dstMunmap(data []byte) (syscall.Errno, bool) {
 	entry, errno, handled := dstMMapLookupExact(data)
 	if !handled || errno != 0 {
+		if !handled {
+			if _, rangeErrno, rangeHandled := dstMMapLookupRange(data); rangeHandled {
+				if rangeErrno != 0 {
+					return rangeErrno, true
+				}
+				return syscall.EINVAL, true
+			}
+		}
 		return errno, handled
 	}
 	key := &entry.data[cap(entry.data)-1]
