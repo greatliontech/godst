@@ -163,14 +163,21 @@ The white-box `dstActivate` path leaves identity unset (real values), as it is n
 
 `syscall.Kill(pid, 0)` is the liveness probe over that simulated identity. During a run it consults only
 the simulated pid registry: the root pid is live for the whole run, each `simulation.Process` pid is live
-for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. It never probes a host
-process. Non-zero signals remain fenced until a signal-delivery model is settled; generic raw `SYS_KILL`
-remains fenced like other unsupported raw syscalls.
+for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. `Kill(0, 0)` and
+`Kill(-1, 0)` succeed (the caller's own group and self always exist on Linux); other negative pids name
+process groups the simulation does not model — unknown, so `ESRCH`. It never probes a host
+process. The liveness READ gates process-globally like the other identity reads; non-zero signals remain
+fenced until a signal-delivery model is settled — and, being a fence, only for bubble goroutines (a
+non-bubble harness goroutine's `Kill` reaches the host kernel mid-run, per the interception boundary).
+Generic raw `SYS_KILL` remains fenced like other unsupported raw syscalls.
 
 The simulated filesystem also owns the procfs identity surface needed for pid-liveness recovery:
 `/proc/<pid>/stat` and `/proc/self/stat` are generated for live simulated pids and include a deterministic
 field-22 starttime derived from that pid identity; completed, unknown, host, or unrepresentable pids are
-not visible. `/proc/self/ns/pid` readlink returns the stable deterministic namespace identity `pid:[1]`.
+not visible, and a zero-padded pid is not a procfs name (Linux's `name_to_int` rejects leading zeros).
+`/proc/self/stat` and `/proc/<own-pid>/stat` are one file to `SameFile` (one inode on the host); a
+trailing slash on a proc leaf is `ENOTDIR` (the filesystem section's trailing-slash clause).
+`/proc/self/ns/pid` readlink returns the stable deterministic namespace identity `pid:[1]`.
 Unsupported `/proc` paths stay deterministic simulated results (unsupported or not-exist), never host
 passthrough.
 
@@ -502,12 +509,23 @@ seam was built. On Linux, a tree file or directory's `Fd()` returns a **virtual 
 calling simulated process; non-Linux simulated file `Fd()` remains fenced until its raw-syscall boundary
 can fence virtual fd numbers before host dispatch. A virtual descriptor is only meaningful to the DST
 syscall boundary: selected split-safe Linux `syscall` package wrappers dispatch it back to the file backend,
-and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. A virtual fd never allocates or names a
+and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. Virtual
+descriptors live in a **reserved number range** ([2³⁰, 2³⁰+2²⁰)) the simulation owns outright: the named
+wrappers answer `EBADF` for any in-range number not in the live table, and the raw boundary refuses the
+whole range — issued or not — so no in-range number can reach the host (a genuine host fd there would need
+`fs.nr_open` raised beyond 2³⁰; the range is the simulation's namespace). Virtual-fd `Fstat` carries a
+synthetic file identity: `st_dev` derives from the owning host's id and `st_ino` is a per-node inode
+assigned at creation from a schedule-deterministic counter — stable across rename and while
+unlinked-but-open — so `(st_dev, st_ino)`-keyed SUTs (the SQLite/LMDB per-file lock-dedup pattern)
+distinguish files; directories report `Nlink` 2 (per-subdirectory increments are not modeled), regular
+files 1. Proc-overlay fds carry no tree node and report zero `(st_dev, st_ino)` — synthetic procfs
+stats are not an identity surface (recorded; no SUT keys file identity on procfs entries). A virtual fd never allocates or names a
 host descriptor, and the raw-syscall fence still catches host-resource minting and unsupported
 syscalls before they can reach the host. Direct generic raw syscalls (`syscall.Syscall*` and
 `golang.org/x/sys/unix` wrappers that bottom out there) remain fenced for virtual fd numbers until a
 split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
-descriptor. Process teardown closes every simulated file owned by the victim process and releases its
+descriptor. Process teardown — on crash AND on normal body return, which models process **exit** (see
+the crash contract in faults.md) — closes every simulated file owned by the victim process and releases its
 virtual descriptors, so stale fd capabilities fail as closed/bad-fd and any fd-owned kernel state is
 dropped with the process.
 
@@ -515,7 +533,11 @@ Linux virtual fds support BSD-style `syscall.Flock` on regular tree files and di
 operations are `LOCK_EX`, `LOCK_SH`, `LOCK_UN`, and `LOCK_NB`. Locks are scoped to the simulated host and
 file node, owned by the simulated process and fd, and released when that fd closes. An incompatible
 nonblocking lock returns `EWOULDBLOCK`; an incompatible blocking lock waits until the lock becomes
-compatible. Crash-time release is part of process resource teardown in the fault contract. Other file-lock
+compatible. Lock **conversions** follow Linux's remove-then-try semantics (`fs/locks.c`): the holder's
+existing lock of the other type is dropped before the conflict scan, so a successful conversion is atomic
+and a FAILED nonblocking conversion has lost the old lock — `EWOULDBLOCK` leaves the caller holding
+nothing (retaining it would keep executions no real kernel produces). Exit- and crash-time release are
+part of process resource teardown in the fault contract. Other file-lock
 front doors remain fenced until they have a split-safe virtual-fd dispatch.
 
 Linux virtual fds support shared file mappings for database page readers and lock-file coordination:
@@ -532,9 +554,21 @@ bytes at map time and later normal writes to the same simulated file node update
 matching the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; `Mprotect` preserving
 read/write protection succeeds for writable mappings. Attempts to create writable private mappings, map
 without the required fd access mode, overlap a live mapping in a way that would require moving that mapping,
-or unmap only a subrange fail deterministically. Process teardown unregisters the victim process's mappings;
+or unmap only a subrange fail deterministically. Offsets validate against a **fixed simulated page size of
+4096** — never the host's page geometry, which is machine state (every 16K-aligned offset is also
+4K-aligned, so host-derived offsets stay valid) — and mapping past EOF is `EINVAL` (a recorded divergence:
+real mmap allows it within the last page, delivering SIGBUS on access — an outcome the model cannot
+produce). For the same reason, **truncating a file to a smaller size under a live overlapping mapping is
+fenced** (the unsupported shape): real Linux keeps the pages mapped and SIGBUSes access past the new EOF,
+and silently zero-filling instead would hand a DB page reader zeros where production dies. Growth and
+shrinks clear of every live mapping stay allowed. `Mprotect` is bookkeeping, not hardware protection — it
+validates and records the request but cannot make a write through a protected slice fault; `Mprotect` and
+`Madvise` on a subrange whose file offset is not 4096-aligned are `EINVAL` (the deterministic analog of
+the kernel's page-aligned-address requirement — heap addresses vary run to run and cannot carry it).
+Process teardown unregisters the victim process's mappings;
 writable shared mappings first copy their bytes back to the host file state, because the mapped file contents
-are page-cache state, not process memory. `Madvise` on such
+are page-cache state, not process memory — and that write-back never advances the durable image (exit and
+crash move no durability boundary). `Madvise` on such
 mappings accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
 `MADV_COLD`) without touching the host; unsupported advice values fail deterministically. Mapping slices
 are process-owned capabilities, not an IPC channel: passing one to another simulated process is outside the
@@ -543,7 +577,10 @@ node.
 
 `os.OpenRoot` and rooted `Root` operations are modeled over the same tree. Opening a root captures
 the directory node identity, so a `Root` keeps addressing that node across namespace renames rather
-than re-resolving the path string passed to `OpenRoot`. Root-relative paths are walked component-wise
+than re-resolving the path string passed to `OpenRoot`. A captured node REMOVED from the namespace
+(`Remove`/`RemoveAll`, or replaced by `Rename`) is an rmdir'd directory: entry creation in it —
+create, mkdir, rename-into — fails `ENOENT` through the still-open `Root`, as openat(2) answers on
+the host; reads of the (empty) node itself keep working. Root-relative paths are walked component-wise
 from that captured node; absolute paths and `..` walks above the opened root fail instead of resolving
 against the process cwd, the tree root, or the host filesystem. Rooted file, directory, metadata,
 removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
@@ -662,12 +699,17 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
-  operations **on pre-run host handles** keep working. Virtual fd numbers are recognized separately
-  and refused at this raw boundary before they can reach the host; selected split-safe named
+  operations **on pre-run host handles** keep working. The fcntl allowlisting is
+  **argument-aware**: its descriptor-MINTING commands (`F_DUPFD`/`F_DUPFD_CLOEXEC`) are refused —
+  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed. The reserved virtual-fd number range is refused
+  outright at this raw boundary — issued or not — before it can reach the host (see the virtual-fd
+  paragraph in the filesystem section); selected split-safe named
   Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
   dispatch them to the simulated backend. Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
-  `CLOCK_BOOTTIME` is also selected and split-safe: it returns the DST virtual base clock, and
+  `CLOCK_BOOTTIME` is also selected and split-safe — at the 32-bit-time trap on every arch AND the
+  time64 trap (`clock_gettime64`, `__kernel_timespec`) on the 32-bit arches that have one: it
+  returns the DST virtual base clock, and
   boottime coincides with monotonic time until a suspend model exists.
   Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is

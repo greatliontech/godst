@@ -35,6 +35,7 @@ const (
 	partOpPartitionOneWay
 	partOpPartitionRefuse
 	partOpCloseProcListeners
+	partOpCloseProcConns
 )
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections

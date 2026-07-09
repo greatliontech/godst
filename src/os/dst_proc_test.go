@@ -165,8 +165,8 @@ func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
 	if !isDSTUnsupportedFS(openRootProcErr) {
 		t.Fatalf("OpenRoot(/proc) = %v, want deterministic unsupported", openRootProcErr)
 	}
-	if aliasWriteErr == nil {
-		t.Fatalf("WriteFile(proc alias) succeeded, want proc overlay reserved from mutable tree state")
+	if !errors.Is(aliasWriteErr, syscall.EACCES) {
+		t.Fatalf("WriteFile(proc alias) = %v, want EACCES (write access to a proc stat is refused before any write)", aliasWriteErr)
 	}
 	if !errors.Is(unsupportedWriteErr, syscall.ENOENT) {
 		t.Fatalf("WriteFile(unsupported proc path) = %v, want ENOENT", unsupportedWriteErr)
@@ -192,11 +192,11 @@ func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
 	if !isDSTUnsupportedFS(rootUnsupportedProcReadlinkWalkErr) {
 		t.Fatalf("Root.Readlink(unsupported proc walk) = %v, want deterministic unsupported", rootUnsupportedProcReadlinkWalkErr)
 	}
-	if rootWriteErr == nil {
-		t.Fatalf("Root.WriteFile(proc stat) succeeded, want proc overlay reserved from mutable tree state")
+	if !errors.Is(rootWriteErr, syscall.EACCES) {
+		t.Fatalf("Root.WriteFile(proc stat) = %v, want EACCES (write access to a proc stat is refused before any write)", rootWriteErr)
 	}
-	if rootAliasWriteErr == nil {
-		t.Fatalf("Root.WriteFile(proc alias) succeeded, want proc overlay reserved from mutable tree state")
+	if !errors.Is(rootAliasWriteErr, syscall.EACCES) {
+		t.Fatalf("Root.WriteFile(proc alias) = %v, want EACCES (write access to a proc stat is refused before any write)", rootAliasWriteErr)
 	}
 }
 

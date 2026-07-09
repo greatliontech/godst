@@ -136,6 +136,29 @@ func dstResetProc(p uint32) {
 	})
 }
 
+// dstCloseProcConns closes the connection ENDS process p owns — the exit-time
+// close (the kernel closes a dying process's sockets on normal exit). The
+// kernel's own conditional applies per end: a socket whose receive queue holds
+// unread data answers the peer with RST (ECONNRESET), otherwise the close FINs
+// and the peer drains buffered bytes then reads io.EOF. (Crash resets
+// unconditionally — a different fault, see faults.md.) Each end of a
+// connection registers its own dstConn whose localProc is that end's owner, so
+// matching localProc alone covers every end p owns; the victims close in
+// registration-sequence order (DST-FAULT-REPLAY, as dstResetMatching).
+func dstCloseProcConns(p uint32) {
+	for _, c := range dstMatchedVictims(func(c *dstConn) bool { return c.localProc == p }) {
+		// Every simulated connection is wire-backed (the transport contract),
+		// so the assertion always holds today; a future non-wire Conn wrapper
+		// must extend the unread-inbound probe or it silently degrades the RST
+		// arm to a graceful close.
+		if e, ok := c.Conn.(*dstWireEnd); ok && e.unreadInbound() {
+			c.resetConn()
+			continue
+		}
+		c.Close()
+	}
+}
+
 func dstCloseProcListeners(p uint32) {
 	type victim struct {
 		key string

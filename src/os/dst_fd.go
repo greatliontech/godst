@@ -48,12 +48,6 @@ func dstSetFdatasyncHook(func(fd int) (err syscall.Errno, handled bool))
 //go:linkname dstSetFlockHook syscall.dstSetFlockHook
 func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
 
-//go:linkname dstSetVirtualFDActive syscall.dstSetVirtualFDActive
-func dstSetVirtualFDActive(fd uintptr, active bool)
-
-//go:linkname dstClearVirtualFDs syscall.dstClearVirtualFDs
-func dstClearVirtualFDs()
-
 func init() {
 	dstSetReadHook(dstFDRead)
 	dstSetWriteHook(dstFDWrite)
@@ -86,7 +80,6 @@ func dstFDRollLocked() {
 		dstFDRegistry.epoch = e
 		dstFDRegistry.next = dstVirtualFDBase
 		dstFDRegistry.fds = make(map[int]dstFDEntry)
-		dstClearVirtualFDs()
 	}
 }
 
@@ -127,7 +120,6 @@ func dstFD(file *file) int {
 	}
 	file.dstfds[key] = fd
 	dstFDRegistry.fds[fd] = dstFDEntry{backend: file.dstf, epoch: epoch, host: host, proc: proc}
-	dstSetVirtualFDActive(uintptr(fd), true)
 	return fd
 }
 
@@ -176,6 +168,12 @@ func dstReleaseBackendFDs(backend dstFileBackend) {
 	}
 }
 
+// dstReleaseProcFDs sweeps the fd registry for entries ATTRIBUTED to proc.
+// dstCloseProcFiles already released the fds of every file proc opened; what
+// remains is the out-of-model residue of a *File shared across processes — an
+// fd minted by proc on a file some OTHER process opened (fd entries key by the
+// minting goroutine's node, open-file entries by the opener's). Sweeping those
+// keeps the attribution invariant: no fd of a dead process survives teardown.
 func dstReleaseProcFDs(proc uint32) {
 	type release struct {
 		fd    int

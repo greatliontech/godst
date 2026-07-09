@@ -17,6 +17,14 @@ const (
 	dstMadvPopulateRead = 22
 )
 
+// dstMMapPageSize is the SIMULATED page size: a fixed constant, not the host's
+// syscall.Getpagesize(), so a seed accepts exactly the same offsets on a
+// 4K-page x86 machine and a 16K-page arm64 one — page geometry is machine
+// state, and validating against it would make run outcomes machine-dependent.
+// 4096 is the ubiquitous value; every 16K-aligned offset is also 4K-aligned,
+// so host-derived offsets stay valid.
+const dstMMapPageSize = 4096
+
 //go:linkname dstSetMmapHook syscall.dstSetMmapHook
 func dstSetMmapHook(func(fd int, offset int64, length int, prot int, flags int) (data []byte, err syscall.Errno, handled bool))
 
@@ -41,6 +49,7 @@ type dstMMapEntry struct {
 	base     []byte
 	node     *dstFSNode
 	epoch    uint64
+	seq      uint64 // per-run registration sequence (see dstMMapRegistry.seq)
 	host     uint32
 	proc     uint32
 	off      int64
@@ -51,12 +60,18 @@ var dstMMapRegistry struct {
 	mu    sync.Mutex
 	epoch uint64
 	maps  map[*byte][]*dstMMapEntry
+	// seq stamps each registration in Mmap-call order — a pure function of the
+	// schedule — so any tie among candidates is broken by seq, never by heap
+	// address (allocation addresses vary run to run; the fixed -tags dst hash
+	// key does not make them reproducible).
+	seq uint64
 }
 
 func dstMMapRollLocked() {
 	if e := dstFSEpoch(); e != dstMMapRegistry.epoch || dstMMapRegistry.maps == nil {
 		dstMMapRegistry.epoch = e
 		dstMMapRegistry.maps = make(map[*byte][]*dstMMapEntry)
+		dstMMapRegistry.seq = 0
 	}
 }
 
@@ -87,7 +102,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	if length <= 0 || offset < 0 {
 		return nil, syscall.EINVAL, true
 	}
-	if offset%int64(syscall.Getpagesize()) != 0 {
+	if offset%dstMMapPageSize != 0 {
 		return nil, syscall.EINVAL, true
 	}
 	if prot != syscall.PROT_READ && prot != syscall.PROT_READ|syscall.PROT_WRITE {
@@ -131,11 +146,13 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		dstMMapRegistry.mu.Unlock()
 		return nil, errno, true
 	}
+	dstMMapRegistry.seq++
 	dstMMapRegistry.maps[key] = append(dstMMapRegistry.maps[key], &dstMMapEntry{
 		data:     data,
 		base:     base,
 		node:     file.node,
 		epoch:    dstFSEpoch(),
+		seq:      dstMMapRegistry.seq,
 		host:     host,
 		proc:     proc,
 		off:      offset,
@@ -150,6 +167,7 @@ func dstMMapDataLocked(node *dstFSNode, offset int64, length int) ([]byte, []byt
 	start := int(offset)
 	stop := int(end)
 	var overlapCandidate, spareCandidate []byte
+	var spareSeq uint64
 	for _, bucket := range dstMMapRegistry.maps {
 		for _, entry := range bucket {
 			if entry.node != node || entry.epoch != dstFSEpoch() {
@@ -167,8 +185,15 @@ func dstMMapDataLocked(node *dstFSNode, offset int64, length int) ([]byte, []byt
 				} else if &overlapCandidate[0] != &entry.base[0] {
 					return nil, nil, syscall.EINVAL
 				}
-			} else if int64(cap(entry.base)) >= end && dstMMapPreferSpare(entry.base, spareCandidate) {
-				spareCandidate = entry.base
+			} else if int64(cap(entry.base)) >= end {
+				// Spare-base choice: largest capacity, ties by earliest
+				// registration (seq) — order-independent over the registry map's
+				// nondeterministic iteration, and never by heap address.
+				if spareCandidate == nil || cap(entry.base) > cap(spareCandidate) ||
+					(cap(entry.base) == cap(spareCandidate) && entry.seq < spareSeq) {
+					spareCandidate = entry.base
+					spareSeq = entry.seq
+				}
 			}
 		}
 	}
@@ -184,58 +209,19 @@ func dstMMapDataLocked(node *dstFSNode, offset int64, length int) ([]byte, []byt
 	return base[start:stop:stop], base, 0
 }
 
-func dstMMapPreferSpare(candidate, current []byte) bool {
-	if current == nil || cap(candidate) > cap(current) {
-		return true
-	}
-	if cap(candidate) < cap(current) {
-		return false
-	}
-	return uintptr(unsafe.Pointer(&candidate[0])) < uintptr(unsafe.Pointer(&current[0]))
-}
-
 func dstMMapNewBase(node *dstFSNode, size int64) []byte {
 	reserve := int(size)
 	if reserve < len(node.data) {
 		reserve = len(node.data)
 	}
-	if page := syscall.Getpagesize(); reserve < page {
-		reserve = page
-	} else if rem := reserve % page; rem != 0 {
-		reserve += page - rem
+	if reserve < dstMMapPageSize {
+		reserve = dstMMapPageSize
+	} else if rem := reserve % dstMMapPageSize; rem != 0 {
+		reserve += dstMMapPageSize - rem
 	}
 	base := make([]byte, reserve)
 	copy(base, node.data)
 	return base
-}
-
-func dstMMapLookupExact(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
-	key, errno := dstMMapKey(data)
-	if errno != 0 {
-		return nil, errno, true
-	}
-	host, proc := dstFSCurrentNode()
-	dstMMapRegistry.mu.Lock()
-	dstMMapRollLocked()
-	bucket := dstMMapRegistry.maps[key]
-	defer dstMMapRegistry.mu.Unlock()
-	if len(bucket) == 0 {
-		return nil, 0, false
-	}
-	for _, entry := range bucket {
-		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
-			return entry, 0, true
-		}
-	}
-	for _, entry := range bucket {
-		if entry.epoch == dstFSEpoch() && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
-			return nil, syscall.EINVAL, true
-		}
-	}
-	if len(bucket) != 0 {
-		return nil, syscall.EINVAL, true
-	}
-	return nil, 0, false
 }
 
 func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
@@ -351,12 +337,19 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	var foundCurrent, foundOther, foundWritable bool
+	var foundCurrent, foundOther, foundWritable, misaligned bool
 	for _, bucket := range dstMMapRegistry.maps {
 		for _, entry := range bucket {
 			mapStart, mapEnd, errno := dstMMapRange(entry.data)
 			if errno != 0 || start < mapStart || end > mapEnd || entry.epoch != dstFSEpoch() {
 				continue
+			}
+			// mprotect(2) requires a page-aligned start address. The model's
+			// deterministic analog is the FILE offset the subrange starts at
+			// (base[0] is file byte 0, so it is the same for every containing
+			// entry) — heap addresses would vary run to run.
+			if (entry.off+(int64(start)-int64(mapStart)))%dstMMapPageSize != 0 {
+				misaligned = true
 			}
 			if entry.host == host && entry.proc == proc {
 				foundCurrent = true
@@ -369,6 +362,9 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		}
 	}
 	dstMMapRegistry.mu.Unlock()
+	if (foundCurrent || foundOther) && misaligned {
+		return syscall.EINVAL, true
+	}
 	if foundCurrent {
 		if prot == syscall.PROT_READ {
 			return 0, true
@@ -385,9 +381,22 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 }
 
 func dstMadvise(data []byte, advice int) (syscall.Errno, bool) {
-	_, errno, handled := dstMMapLookupRange(data)
+	entry, errno, handled := dstMMapLookupRange(data)
 	if !handled || errno != 0 {
 		return errno, handled
+	}
+	// madvise(2) requires a page-aligned start address; the deterministic
+	// analog is the subrange's file offset (see dstMprotect).
+	start, _, errno := dstMMapRange(data)
+	if errno != 0 {
+		return errno, true
+	}
+	entryStart, _, errno := dstMMapRange(entry.data)
+	if errno != 0 {
+		return errno, true
+	}
+	if (entry.off+(int64(start)-int64(entryStart)))%dstMMapPageSize != 0 {
+		return syscall.EINVAL, true
 	}
 	switch advice {
 	case dstMadvPopulateRead, syscall.MADV_HUGEPAGE, dstMadvCold:
@@ -459,24 +468,24 @@ func dstMMapSyncEntryLocked(entry *dstMMapEntry) {
 	copy(node.data[start:end], entry.data[start-entry.off:end-entry.off])
 }
 
-func dstMMapTruncateLocked(node *dstFSNode, size int64) {
+// dstMMapShrinkFencedLocked reports whether truncating node to size would cut
+// bytes out from under a live mapping. Real Linux keeps the pages mapped and
+// delivers SIGBUS on access wholly past the new EOF — an outcome the model
+// cannot produce (no VM) — and silently zero-filling instead would hand a DB
+// page reader zeros where production dies, masking exactly the torn-file bug
+// class DST hunts. So the shrink is fenced loudly (the unsupported shape);
+// growth and shrinks clear of every live mapping stay allowed. Caller holds
+// dstFS.mu.
+func dstMMapShrinkFencedLocked(node *dstFSNode, size int64) bool {
 	dstMMapRegistry.mu.Lock()
+	defer dstMMapRegistry.mu.Unlock()
 	dstMMapRollLocked()
 	for _, bucket := range dstMMapRegistry.maps {
 		for _, entry := range bucket {
-			if entry.node != node {
-				continue
+			if entry.node == node && entry.off+int64(len(entry.data)) > size {
+				return true
 			}
-			mapEnd := entry.off + int64(len(entry.data))
-			if size >= mapEnd {
-				continue
-			}
-			clearStart := size - entry.off
-			if clearStart < 0 {
-				clearStart = 0
-			}
-			clear(entry.data[clearStart:])
 		}
 	}
-	dstMMapRegistry.mu.Unlock()
+	return false
 }

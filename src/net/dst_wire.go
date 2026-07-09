@@ -309,6 +309,17 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 func (*dstWireEnd) LocalAddr() Addr  { return pipeAddr{} }
 func (*dstWireEnd) RemoteAddr() Addr { return pipeAddr{} }
 
+// unreadInbound reports whether this end's receive direction still holds bytes
+// the end never consumed — the close(2)-sends-RST predicate: a socket closed
+// with a non-empty receive queue answers the peer with RST, not FIN (delivered
+// and still-in-flight bytes alike; data arriving after the close elicits the
+// same RST).
+func (e *dstWireEnd) unreadInbound() bool {
+	e.in.mu.Lock()
+	defer e.in.mu.Unlock()
+	return e.in.buffered > 0
+}
+
 func (e *dstWireEnd) Read(b []byte) (int, error) {
 	n, err := e.read(b)
 	if err != nil && err != io.EOF && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {

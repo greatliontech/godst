@@ -33,6 +33,13 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			return 0, true
 		}
 		exclusive := op == syscall.LOCK_EX
+		// Linux (fs/locks.c flock_lock_inode) removes the caller's existing
+		// holding of the OTHER type before scanning for conflicts, all under one
+		// spinlock: a conversion is atomic when it succeeds, and a FAILED
+		// nonblocking conversion has already lost the old lock — EWOULDBLOCK
+		// leaves the caller holding nothing. Retaining the old lock across a
+		// failed conversion would keep executions no real kernel produces.
+		file.node.flock.removeForConversion(owner, exclusive)
 		if file.node.flock.canLock(owner, exclusive) {
 			file.node.flock.lock(owner, exclusive)
 			file.leave()
@@ -41,10 +48,6 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 		if nonblock {
 			file.leave()
 			return syscall.EWOULDBLOCK, true
-		}
-		if exclusive && file.node.flock.unlockShared(owner) {
-			file.leave()
-			continue
 		}
 		wait := file.node.flock.waiter()
 		file.leave()
@@ -80,11 +83,25 @@ func (s *dstFlockState) lock(owner dstFlockOwner, exclusive bool) {
 	if s.holders == nil {
 		s.holders = make(map[dstFlockOwner]bool)
 	}
-	oldExclusive, had := s.holders[owner]
+	// A conversion's old holding was already dropped by removeForConversion (as
+	// the kernel deletes before its conflict scan), so this only grants or
+	// re-grants the same type — no waiter can be unblocked by it.
 	s.holders[owner] = exclusive
-	if had && oldExclusive && !exclusive {
-		s.broadcast()
+}
+
+// removeForConversion drops owner's existing holding when it is of the OTHER
+// type than the requested one — the kernel deletes the old flock before its
+// conflict scan, so both the successful atomic conversion and the failed
+// nonblocking conversion (which loses the lock) fall out of this one step. A
+// same-type request is a re-grant and removes nothing. Dropping an exclusive
+// (or shared) holding can make a blocked waiter compatible, hence the broadcast.
+func (s *dstFlockState) removeForConversion(owner dstFlockOwner, wantExclusive bool) {
+	held, ok := s.holders[owner]
+	if !ok || held == wantExclusive {
+		return
 	}
+	delete(s.holders, owner)
+	s.broadcast()
 }
 
 func (s *dstFlockState) unlock(owner dstFlockOwner) {
@@ -93,16 +110,6 @@ func (s *dstFlockState) unlock(owner dstFlockOwner) {
 	}
 	delete(s.holders, owner)
 	s.broadcast()
-}
-
-func (s *dstFlockState) unlockShared(owner dstFlockOwner) bool {
-	exclusive, ok := s.holders[owner]
-	if !ok || exclusive {
-		return false
-	}
-	delete(s.holders, owner)
-	s.broadcast()
-	return true
 }
 
 func (s *dstFlockState) waiter() chan struct{} {

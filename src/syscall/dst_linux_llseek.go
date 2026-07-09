@@ -8,10 +8,18 @@ package syscall
 
 //go:nosplit
 func dstSyscallAllowedArchTrap(trap uintptr) bool {
-	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64
+	// SYS_FCNTL64 is these arches' fcntl: allowlisted for the same probe
+	// commands as SYS_FCNTL, with the same argument-aware minting refusal
+	// (dstSyscallFcntlArchTrap feeds dstSyscallMintingFcntl).
+	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64 || trap == SYS_FCNTL64
 }
 
 //go:nosplit
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
-	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64
+	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64 || trap == SYS_FCNTL64
+}
+
+//go:nosplit
+func dstSyscallFcntlArchTrap(trap uintptr) bool {
+	return trap == SYS_FCNTL64
 }

@@ -7,10 +7,12 @@
 package os
 
 import (
+	"cmp"
 	"internal/poll"
 	"io"
 	"path"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -56,31 +58,42 @@ func dstFSEpoch() uint64
 var dstFS struct {
 	mu    sync.Mutex
 	epoch uint64
-	disks map[uint32]*dstFSDisk // host id -> the host's in-memory tree
-	cwds  map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
+	disks   map[uint32]*dstFSDisk // host id -> the host's in-memory tree
+	cwds    map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
+	nextIno uint64                // last synthetic inode number handed out (dstFSAllocIno)
 }
 
 var dstOpenFiles struct {
 	mu    sync.Mutex
 	epoch uint64
 	files map[*file]dstOpenFileEntry
+	seq   uint64 // per-run registration counter (see dstOpenFileEntry.seq)
 }
 
 type dstOpenFileEntry struct {
 	proc uint32
+	// seq stamps each registration in open order — a pure function of the
+	// schedule — so teardown closes a victim's files in that order, never the
+	// pointer-keyed map's iteration order (run-varying even under the fixed
+	// -tags dst hash key: addresses aren't reproducible). Close order is
+	// observable: each close's flock release can wake blocked waiters, so a
+	// varying order would fork the schedule (DST-FAULT-REPLAY).
+	seq uint64
 }
 
 func dstOpenFilesRollLocked() {
 	if e := dstFSEpoch(); e != dstOpenFiles.epoch || dstOpenFiles.files == nil {
 		dstOpenFiles.epoch = e
 		dstOpenFiles.files = make(map[*file]dstOpenFileEntry)
+		dstOpenFiles.seq = 0
 	}
 }
 
 func dstRegisterOpenFile(f *file, proc uint32) {
 	dstOpenFiles.mu.Lock()
 	dstOpenFilesRollLocked()
-	dstOpenFiles.files[f] = dstOpenFileEntry{proc: proc}
+	dstOpenFiles.seq++
+	dstOpenFiles.files[f] = dstOpenFileEntry{proc: proc, seq: dstOpenFiles.seq}
 	dstOpenFiles.mu.Unlock()
 }
 
@@ -94,14 +107,25 @@ func dstUnregisterOpenFile(f *file) {
 func dstCloseProcFiles(proc uint32) {
 	dstOpenFiles.mu.Lock()
 	dstOpenFilesRollLocked()
-	var files []*file
+	type victim struct {
+		f   *file
+		seq uint64
+	}
+	var victims []victim
 	for f, entry := range dstOpenFiles.files {
 		if entry.proc == proc {
-			files = append(files, f)
+			victims = append(victims, victim{f: f, seq: entry.seq})
 			delete(dstOpenFiles.files, f)
 		}
 	}
 	dstOpenFiles.mu.Unlock()
+	// Registration (open) order, never the pointer-keyed map's iteration order
+	// — see dstOpenFileEntry.seq.
+	slices.SortFunc(victims, func(a, b victim) int { return cmp.Compare(a.seq, b.seq) })
+	files := make([]*file, len(victims))
+	for i, v := range victims {
+		files[i] = v.f
+	}
 	for _, f := range files {
 		if f.dstf == nil {
 			continue
@@ -157,10 +181,20 @@ func dstFSRoll() {
 		dstFS.epoch = e
 		dstFS.disks = make(map[uint32]*dstFSDisk)
 		dstFS.cwds = make(map[[2]uint32]string)
+		dstFS.nextIno = 1
 		// New run: no host is slow until a SlowDisk fault re-arms the gate (the
 		// per-disk latency resets with the disks above).
 		dstDiskSlow.Store(false)
 	}
+}
+
+// dstFSAllocIno returns the next synthetic inode number — a per-run monotonic
+// counter shared by every host disk (st_dev separates hosts, so cross-host
+// uniqueness is free and harmless). Allocation order rides the schedule, so
+// inode numbers are a deterministic function of the seed. Caller holds dstFS.mu.
+func dstFSAllocIno() uint64 {
+	dstFS.nextIno++
+	return dstFS.nextIno
 }
 
 // dstFSDiskHere returns the calling goroutine's host disk, creating it (with the
@@ -182,12 +216,14 @@ func dstFSDiskHere() *dstFSDisk {
 func newDstFSDisk() *dstFSDisk {
 	root := &dstFSNode{
 		isDir:   true,
+		ino:     dstFSAllocIno(),
 		entries: make(map[string]*dstFSNode),
 		mode:    ModeDir | 0o755,
 		modTime: time.Now(),
 	}
 	root.entries["tmp"] = &dstFSNode{
 		isDir:   true,
+		ino:     dstFSAllocIno(),
 		entries: make(map[string]*dstFSNode),
 		mode:    ModeDir | ModeSticky | 0o777,
 		modTime: time.Now(),
@@ -235,6 +271,20 @@ func dstFSIsRoot(node *dstFSNode) bool {
 // the durability increment wires its commit points.
 type dstFSNode struct {
 	isDir bool
+
+	// ino is the node's synthetic inode number, allocated at creation from the
+	// per-run counter (dstFSAllocIno) — schedule-deterministic, never reused
+	// within a run. It is the file-identity half of fstat(2)'s (st_dev, st_ino)
+	// pair (st_dev derives from the host id), which inode-keyed SUTs (the
+	// SQLite/LMDB per-file lock-dedup pattern) require to distinguish files. It
+	// rides the node: stable across rename and while unlinked-but-open.
+	ino uint64
+
+	// unlinked marks a directory removed from the namespace (Remove/RemoveAll,
+	// or replaced by Rename). The kernel fails entry CREATION in an rmdir'd
+	// directory with ENOENT even through a still-open handle (a Root captured
+	// before the removal); lookups need no flag — an unlinked dir is empty.
+	unlinked bool
 
 	// Regular file state.
 	data   []byte
@@ -427,12 +477,32 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	}
 	parent.entries[base] = &dstFSNode{
 		isDir:   true,
+		ino:     dstFSAllocIno(),
 		entries: make(map[string]*dstFSNode),
 		mode:    ModeDir | perm&ModePerm,
 		modTime: time.Now(),
 	}
 	parent.modTime = time.Now()
 	return true, nil
+}
+
+// dstFSMarkUnlinked marks a node removed from the namespace — and, for a
+// directory subtree (RemoveAll), every directory under it — so entry creation
+// through a still-open handle (a captured Root) fails ENOENT as the kernel's
+// does in an rmdir'd directory. The entries clear too: the host's RemoveAll
+// unlinks bottom-up, so a removed directory reads EMPTY through a surviving
+// handle — leaving the detached children visible would be a sim-only listing.
+// (Unlinked-but-open file CONTENT is untouched: it lives on the node, and
+// open handles keep it per the POSIX contract.) Caller holds dstFS.mu.
+func dstFSMarkUnlinked(node *dstFSNode) {
+	if !node.isDir {
+		return
+	}
+	node.unlinked = true
+	for _, child := range node.entries {
+		dstFSMarkUnlinked(child)
+	}
+	clear(node.entries)
 }
 
 // dstRemove implements Remove: files and empty directories. The node outlives
@@ -470,6 +540,7 @@ func dstRemove(name string) (handled bool, err error) {
 	if node.isDir && len(node.entries) > 0 {
 		return wrap(syscall.ENOTEMPTY)
 	}
+	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
 	return true, nil
@@ -511,6 +582,7 @@ func dstRemoveAll(name string) (handled bool, err error) {
 		// Match RemoveAll("/"): refuse to destroy the root.
 		return true, &PathError{Op: "removeall", Path: name, Err: syscall.EBUSY}
 	}
+	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
 	return true, nil
@@ -575,6 +647,12 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 		case newNode.isDir && len(newNode.entries) > 0:
 			return wrap(syscall.ENOTEMPTY)
 		}
+	}
+	if newNode != nil {
+		// The replaced target leaves the namespace exactly as a Remove would
+		// (rename-over is atomic replace); an empty replaced directory becomes
+		// unlinked for any Root still holding it.
+		dstFSMarkUnlinked(newNode)
 	}
 	delete(oldParent.entries, oldBase)
 	newParent.entries[newBase] = oldNode
@@ -660,13 +738,20 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 	if node.isDir {
 		return wrap(syscall.EISDIR)
 	}
-	node.truncateLocked(size)
+	if err := node.truncateLocked(size); err != nil {
+		return wrap(err)
+	}
 	return true, nil
 }
 
 // truncateLocked clamps or zero-extends current content. Caller holds
-// dstFS.mu. Shared by handle and named truncate.
-func (node *dstFSNode) truncateLocked(size int64) {
+// dstFS.mu. Shared by handle and named truncate. Fails with the unsupported
+// shape when the shrink would cut bytes under a live mapping (see
+// dstMMapShrinkFencedLocked); callers must not have mutated anything first.
+func (node *dstFSNode) truncateLocked(size int64) error {
+	if dstMMapShrinkFencedLocked(node, size) {
+		return dstErrUnsupportedFS
+	}
 	dstMMapSyncLocked(node)
 	switch {
 	case size <= int64(len(node.data)):
@@ -676,8 +761,8 @@ func (node *dstFSNode) truncateLocked(size int64) {
 		copy(grown, node.data)
 		node.data = grown
 	}
-	dstMMapTruncateLocked(node, size)
 	node.modTime = time.Now()
+	return nil
 }
 
 // chmodLocked applies a mode change to a resolved node: permission plus the
@@ -842,11 +927,20 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	}
 
 	accWrite := flag&(O_WRONLY|O_RDWR) != 0
-	if node != nil && node.isDir && (accWrite || flag&O_TRUNC != 0) {
-		// A directory rejects write access AND O_TRUNC (regardless of access mode):
-		// real Linux returns EISDIR for open(dir, O_TRUNC) before any mutation, so
-		// the truncate below must never run on — nor bump the mtime of — a directory.
-		return wrap(syscall.EISDIR)
+	if node != nil && node.isDir {
+		// do_open's ordering: the O_CREAT|O_EXCL existence check precedes BOTH
+		// may_open's EISDIR and the write/O_TRUNC access checks — an existing
+		// directory answers EEXIST for any O_CREAT|O_EXCL open regardless of
+		// access mode or O_TRUNC (kernel-verified). Only then does the
+		// directory reject write access, O_TRUNC (regardless of access mode),
+		// and plain O_CREAT — before any mutation, so the truncate below must
+		// never run on — nor bump the mtime of — a directory.
+		if flag&(O_CREATE|O_EXCL) == O_CREATE|O_EXCL {
+			return wrap(syscall.EEXIST)
+		}
+		if accWrite || flag&(O_TRUNC|O_CREATE) != 0 {
+			return wrap(syscall.EISDIR)
+		}
 	}
 
 	switch {
@@ -865,6 +959,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 			return wrap(syscall.ENOSPC)
 		}
 		node = &dstFSNode{
+			ino:     dstFSAllocIno(),
 			mode:    perm & ModePerm,
 			modTime: time.Now(),
 		}
@@ -875,7 +970,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		// Linux truncates even for O_RDONLY|O_TRUNC; match the host's shape.
 		// Truncation mutates current content only; the durable image moves
 		// on Sync, never on a mutation (the durability contract).
-		node.truncateLocked(0)
+		if err := node.truncateLocked(0); err != nil {
+			return wrap(err)
+		}
 	}
 
 	d := &dstFile{
@@ -1323,8 +1420,7 @@ func (d *dstFile) truncate(size int64) error {
 	if size < 0 {
 		return syscall.EINVAL
 	}
-	d.node.truncateLocked(size)
-	return nil
+	return d.node.truncateLocked(size)
 }
 
 // sync commits the durable image (the durability contract's commit points):

@@ -227,5 +227,15 @@ func dstTryKill(pid int, sig Signal) (err Errno, handled bool) {
 	if _, ok := dstSimEnvProc(); !ok {
 		return 0, false
 	}
+	if sig != 0 {
+		// The signal-delivery fence is a fence, not an identity read: fences fire
+		// only for bubble goroutines of the active run (design.md "The interception
+		// boundary"), so a non-bubble harness goroutine keeps host kill(2) access
+		// mid-run. The sig==0 liveness probe below is an identity READ and stays
+		// process-global like the other identity reads (design.md, identity gating).
+		if !dstFenceActive() {
+			return 0, false
+		}
+	}
 	return dstKillHookFn(pid, sig)
 }

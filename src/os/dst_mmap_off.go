@@ -10,4 +10,4 @@ func dstMMapWriteLocked(node *dstFSNode, off int64, p []byte) {}
 
 func dstMMapSyncLocked(node *dstFSNode) {}
 
-func dstMMapTruncateLocked(node *dstFSNode, size int64) {}
+func dstMMapShrinkFencedLocked(node *dstFSNode, size int64) bool { return false }

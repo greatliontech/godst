@@ -605,8 +605,8 @@ func TestDSTClockTableFreshPerRun(t *testing.T) {
 		done := make(chan struct{})
 		Process("p", func() {
 			go func() { time.Sleep(time.Second); close(done) }()
+			<-done // body return is process exit: the sleeper must finish inside
 		})
-		<-done
 		adv = time.Since(start)
 	})
 	if adv != time.Second {

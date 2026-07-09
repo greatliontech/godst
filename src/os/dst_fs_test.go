@@ -564,23 +564,40 @@ func TestDSTFSVirtualFDRawSyscallStaleFDFenced(t *testing.T) {
 
 func TestDSTFSVirtualFDProcessIsolation(t *testing.T) {
 	simulation.Run(1, func() {
-		var fd int
-		var f *os.File
 		simulation.Host("h", simulation.HostConfig{}, func() {
-			simulation.Process("p1", func() {
-				var err error
-				f, err = os.Create("/fd")
+			opened := make(chan int, 1)
+			release := make(chan struct{})
+			p1err := make(chan error, 1)
+			go simulation.Process("p1", func() {
+				f, err := os.Create("/fd")
 				if err != nil {
-					t.Fatalf("Create: %v", err)
+					p1err <- err
+					return
 				}
-				fd = int(f.Fd())
+				opened <- int(f.Fd())
+				<-release
+				p1err <- f.Close()
 			})
+			var fd int
+			select {
+			case err := <-p1err:
+				t.Fatalf("Create: %v", err)
+			case fd = <-opened:
+			}
+			releaseClosed := false
+			defer func() {
+				if !releaseClosed {
+					close(release)
+				}
+			}()
 			simulation.Process("p2", func() {
 				if _, err := syscall.Read(fd, make([]byte, 1)); !errors.Is(err, syscall.EBADF) {
 					t.Fatalf("cross-process read = %v, want EBADF", err)
 				}
 			})
-			if err := f.Close(); err != nil {
+			close(release)
+			releaseClosed = true
+			if err := <-p1err; err != nil {
 				t.Fatalf("Close: %v", err)
 			}
 		})

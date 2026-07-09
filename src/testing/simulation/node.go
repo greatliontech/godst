@@ -235,6 +235,18 @@ var activeProcs struct {
 	pids map[uint32][]int32
 }
 
+// procTeardownMu spans a process's liveness bookkeeping and the resource
+// teardown it triggers — exit's last-invocation decision plus the teardown
+// itself, crash's clear-all plus its teardown, and a starting invocation's
+// registration. Without it, a same-name restart interleaved between the
+// "last invocation died" decision and the teardown could register and open
+// resources that the predecessor's teardown then closes — a state a real
+// kernel (per-process fd tables) cannot show. At plain P=1 the exit defer
+// runs without park points and the lock is uncontended; the lock exists for
+// Level 2 exploration, whose access-granularity scheduling can yield inside
+// this package's instrumented accesses.
+var procTeardownMu sync.Mutex
+
 func nodeRegReset() {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
@@ -256,7 +268,12 @@ func activeProcSet(proc uint32, pid int32) {
 	activeProcs.mu.Unlock()
 }
 
-func activeProcClear(proc uint32, pid int32) {
+// activeProcClear removes one invocation's pid and reports whether it was the
+// process's LAST live invocation — the point at which proc-keyed resources can be
+// torn down (concurrent same-name invocations share the logical proc id, so
+// resource teardown must wait for the last; the goroutine half is pid-keyed and
+// per-invocation regardless).
+func activeProcClear(proc uint32, pid int32) (last bool) {
 	activeProcs.mu.Lock()
 	pids := activeProcs.pids[proc]
 	for i, p := range pids {
@@ -271,6 +288,7 @@ func activeProcClear(proc uint32, pid int32) {
 		activeProcs.pids[proc] = pids
 	}
 	activeProcs.mu.Unlock()
+	return len(pids) == 0
 }
 
 func activeProcPIDs(proc uint32) []int32 {
@@ -401,6 +419,8 @@ func crashProcess(name string) {
 	if proc == 0 {
 		return
 	}
+	procTeardownMu.Lock()
+	defer procTeardownMu.Unlock()
 	pids := activeProcPIDs(proc)
 	if len(pids) == 0 {
 		if runActive.Load() {
@@ -409,12 +429,16 @@ func crashProcess(name string) {
 		return
 	}
 	activeProcClearAll(proc)
-	dstProcessTeardown(proc)
-	dstNetPartitionOp(partOpResetProc, proc, 0)
-	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+	// Kernel teardown order: the threads die first, then exit_files closes fds
+	// (releasing flocks, unmapping with page-cache write-back) and the sockets
+	// reset. Killing the goroutines first also closes the window in which a
+	// victim could observe its own resources half-torn-down.
 	for _, pid := range pids {
 		dstCrashProcessPid(pid)
 	}
+	dstProcessTeardown(proc)
+	dstNetPartitionOp(partOpResetProc, proc, 0)
+	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 }
 
 // Process runs f as the named process — the unit of crash/restart and memory
@@ -424,9 +448,18 @@ func crashProcess(name string) {
 // address it; its os.Hostname is the process name). Process stamps the running
 // goroutine's process identity (and host, if it allocated an implicit one) and a
 // fresh per-process pid (os.Getpid) for the dynamic extent of f and restores them on
-// return, labeling the whole subtree. A process is restarted by calling Process
-// again with the same name — it keeps the logical name but gets a new pid, as a real
-// restart does.
+// return, labeling the whole subtree. The body's return (or panic) is the process's
+// EXIT: goroutines it started that are still running are killed, its open simulated
+// files and virtual fds close (releasing flocks; writable shared mappings write back
+// and unregister — page-cache contents survive the exit), its listeners close, and
+// its connections close with the kernel's conditional — an end holding unread
+// received data answers the peer with RST (ECONNRESET), otherwise the peer drains
+// buffered bytes then reads io.EOF — so a
+// process that needs its work observed synchronizes before returning, exactly as a
+// real main must. A process is restarted by calling Process again with the same
+// name — it keeps the logical name but gets a new pid, as a real restart does, and
+// the restart inherits nothing from the exited invocation but the shared host state
+// (filesystem, page cache).
 func Process(name string, f func()) {
 	host, _ := dstCurrentNode()
 	if host == 0 {
@@ -443,15 +476,51 @@ func Process(name string, f func()) {
 	oldH, oldP := dstSetNode(host, proc)
 	simPid := dstAllocPid()
 	oldPid := dstSetProcessPid(simPid)
+	// Registration serializes with any in-flight teardown of this logical
+	// process (procTeardownMu): a restart must not become live — nor open
+	// resources — while its predecessor's exit/crash teardown is mid-flight.
+	procTeardownMu.Lock()
 	activeProcSet(proc, simPid)
+	procTeardownMu.Unlock()
 	live := false
 	defer func() {
 		if live {
 			dstSetPidLive(simPid, false)
 		}
-		activeProcClear(proc, simPid)
+		// Restore identity BEFORE parking on the teardown mutex: a goroutine
+		// waiting here carries its caller's pid, not the dying invocation's,
+		// so a concurrent crash of this logical process cannot mark the parked
+		// waiter (the sema dequeue additionally skips crashed waiters).
 		dstSetProcessPid(oldPid)
 		dstSetNode(oldH, oldP)
+		// The last-invocation decision and the teardown it triggers are one
+		// critical section (procTeardownMu): a same-name restart cannot
+		// register between the two and have its fresh resources closed by the
+		// predecessor's teardown.
+		procTeardownMu.Lock()
+		defer procTeardownMu.Unlock()
+		last := activeProcClear(proc, simPid)
+		// A returning (or panicking) body models process EXIT: the kernel kills
+		// the invocation's remaining threads, then closes its fds — releasing
+		// flocks, unmapping (writable MAP_SHARED bytes persist: page cache
+		// belongs to the kernel) — and closes its sockets gracefully (the peer
+		// drains then reads io.EOF; RST is the crash fault's shape, not exit's).
+		// Without this the pid reads dead (Kill → ESRCH, procfs gone) while the
+		// invocation's goroutines, fds, and locks live on — a half-dead state no
+		// real kernel exhibits. The caller's own pid/node were restored above, so
+		// the pid-keyed goroutine kill never marks the returning goroutine; the
+		// proc-keyed resource half waits for the process's LAST live invocation.
+		// Outside an active run there is nothing to exit — the registries hold a
+		// finished run's leaked state (deterministic, host-isolated, meaningless),
+		// which teardown must not disturb.
+		if runActive.Load() {
+			dstCrashProcessPid(simPid)
+			if last {
+				dstProcessTeardown(proc)
+				dstNetPartitionOp(partOpCloseProcConns, proc, 0)
+				dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+			}
+		}
 	}()
 	dstSetPidLive(simPid, true)
 	live = true

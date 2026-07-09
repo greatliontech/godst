@@ -14,8 +14,6 @@ func dstSyscallAllowedTrap(trap uintptr) bool { return true }
 
 func dstSyscallVirtualFDTrap(trap, fd uintptr) bool { return false }
 
-func dstSetVirtualFDActive(fd uintptr, active bool) {}
-
-func dstClearVirtualFDs() {}
+func dstSyscallMintingFcntl(trap, cmd uintptr) bool { return false }
 
 func dstSyscallRefuse(trap uintptr) {}

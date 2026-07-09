@@ -81,6 +81,16 @@ func dstProcStatData(name string) (data []byte, ident string, handled bool, errn
 }
 
 func dstProcStatDataAbs(abs string) (data []byte, ident string, handled bool, errno error) {
+	if strings.HasSuffix(abs, "/") {
+		// A trailing slash asserts directory-ness; on a proc LEAF that exists the
+		// host answers ENOTDIR (the filesystem section's trailing-slash clause),
+		// and ENOENT elsewhere on the unsupported surface.
+		trimmed := strings.TrimRight(abs, "/")
+		if _, ok := dstProcStatPID(trimmed); ok || trimmed == "/proc/self/ns/pid" {
+			return nil, abs, true, syscall.ENOTDIR
+		}
+		return nil, abs, true, syscall.ENOENT
+	}
 	pidText, ok := dstProcStatPID(abs)
 	if !ok {
 		return nil, abs, true, syscall.ENOENT
@@ -93,7 +103,10 @@ func dstProcStatDataAbs(abs string) (data []byte, ident string, handled bool, er
 	if !ok {
 		return nil, abs, true, syscall.ENOENT
 	}
-	return []byte(dstProcStatContents(pid, start)), abs, true, nil
+	// The identity is the CANONICAL pid form, so /proc/self/stat and
+	// /proc/<own-pid>/stat are one file to SameFile, as they are one inode on
+	// the host.
+	return []byte(dstProcStatContents(pid, start)), "/proc/" + strconv.Itoa(pid) + "/stat", true, nil
 }
 
 func dstProcStatPID(abs string) (string, bool) {
@@ -113,6 +126,11 @@ func dstProcResolvePID(pidText string) (int, bool) {
 	if pidText == "self" {
 		pid, ok := dstSimGetpid()
 		return pid, ok && pid > 0
+	}
+	// Linux procfs's name_to_int rejects a leading zero ("0424242" is not a pid
+	// entry), so a zero-padded alias never names a live pid here either.
+	if pidText[0] == '0' {
+		return 0, false
 	}
 	for i := 0; i < len(pidText); i++ {
 		if pidText[i] < '0' || pidText[i] > '9' {

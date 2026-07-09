@@ -15,3 +15,8 @@ func dstSyscallAllowedArchTrap(trap uintptr) bool {
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
 	return false
 }
+
+//go:nosplit
+func dstSyscallFcntlArchTrap(trap uintptr) bool {
+	return false // loong64 has no fcntl64 trap
+}

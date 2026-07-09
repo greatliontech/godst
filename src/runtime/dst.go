@@ -22,7 +22,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/runtime/atomic"
-	_ "unsafe" // for go:linkname
+	"unsafe" // race annotations + go:linkname
 )
 
 // dstInternalPooledTypes caches the type descriptors of the runtime-internal pooled
@@ -1227,7 +1227,27 @@ func dstClearSimEnv() {
 	dstFakeTimersReset()
 }
 
+// dstPidLivePublishRace and dstPidLiveLoadRace bracket every publish/load of
+// dstPidLive for the race detector: the table pointer moves through
+// runtime-internal atomics, which carry no TSan happens-before annotation,
+// while the Go-map operations INSIDE the table do fire the map runtime's race
+// hooks — so without an explicit release edge at each publish, matched by an
+// acquire at each load, TSan reports every cross-goroutine publish/read pair
+// as a race the CPU-level atomics have already ordered.
+func dstPidLivePublishRace() {
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(&dstPidLive))
+	}
+}
+
+func dstPidLiveLoadRace() {
+	if raceenabled {
+		raceacquire(unsafe.Pointer(&dstPidLive))
+	}
+}
+
 func dstPidLiveReset(root int32) {
+	dstPidLivePublishRace()
 	if root > 0 {
 		dstPidLive.Store(&dstPidLiveTable{live: map[int32]bool{root: true}})
 	} else {
@@ -1302,6 +1322,7 @@ func dstSetPidLive(pid int32, live bool) {
 		if old == nil {
 			return
 		}
+		dstPidLiveLoadRace()
 		if old.live[pid] == live {
 			return
 		}
@@ -1314,6 +1335,7 @@ func dstSetPidLive(pid int32, live bool) {
 		} else {
 			delete(next, pid)
 		}
+		dstPidLivePublishRace()
 		if dstPidLive.CompareAndSwap(old, &dstPidLiveTable{live: next}) {
 			return
 		}
@@ -1329,7 +1351,11 @@ func dstPidAlive(pid int32) bool {
 		return false
 	}
 	t := dstPidLive.Load()
-	return t != nil && t.live[pid]
+	if t == nil {
+		return false
+	}
+	dstPidLiveLoadRace()
+	return t.live[pid]
 }
 
 // dstPidStarttime reports the deterministic procfs starttime for a live simulated

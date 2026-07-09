@@ -714,11 +714,23 @@ ops are abandoned — a crash does not, cannot in Go, force-unwind a goroutine m
 model is *they never run again*, what a killed process's threads do), conns RST, fds drop, memory is gone.
 The host crash additionally tears the host disk; the process crash leaves it intact.
 
-Process resource teardown is the shared substrate for process crash, OOM, and restart: the active process
-invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines are removed from
-the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close, fd-owned `flock`s
-release, process-owned mappings unregister after writable `MAP_SHARED` bytes are copied into host file state,
-and connections owned by either process endpoint reset. The logical process id remains stable for targeting
+Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit: the
+active process invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines
+are removed from the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close,
+fd-owned `flock`s release, process-owned mappings unregister after writable `MAP_SHARED` bytes are copied
+into host file state (never advancing the durable image — page cache is volatile), and the process's
+connections go down. Teardown follows the kernel's order: the goroutines (threads) die first, then the
+resources close. A `Process` body's normal return (or panic unwind) IS the process's exit and routes
+through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn
+ends (the kernel close()s a dying process's sockets) with the kernel's own conditional per end — an end
+whose receive queue holds unread data answers the peer with RST (ECONNRESET), otherwise the close FINs
+and the peer drains buffered bytes then reads EOF — while crash RESETS them unconditionally, and both
+close its listeners. One recorded collapse of the conditional: bytes still in flight count as queued —
+the sim RSTs immediately, which is one of the two orderings a real close-vs-arrival race produces (the
+kernel FINs first and RSTs when the data lands; a peer racing its read can observe either); the
+FIN-then-RST arm is not generated. Goroutine teardown is per-invocation (pid-keyed);
+resource teardown is per logical process (proc-keyed), so with concurrent same-name invocations it runs
+when the LAST live invocation dies. The logical process id remains stable for targeting
 and resource registries, while the pid is the invocation generation; a same-name restart gets a fresh pid and
 does not revive the crashed goroutines.
 

@@ -227,6 +227,19 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	if s != nil {
 		root.nwait.Add(-1)
 	}
+	if dstBuild {
+		// A crashed simulated process's goroutine (dstPid < 0) never runs
+		// again: waking it loses the wakeup, and a starvation-mode mutex
+		// HANDOFF to it would strand the mutex with no owner. Skip crashed
+		// waiters at dequeue, exactly as chan.go's rendezvous dequeue does —
+		// the next live waiter (or none) receives the release.
+		for s != nil && s.g.dstPid < 0 {
+			s, t0, tailtime = root.dequeue(addr)
+			if s != nil {
+				root.nwait.Add(-1)
+			}
+		}
+	}
 	unlock(&root.lock)
 	if s != nil { // May be slow or even yield, so unlock first
 		acquiretime := s.acquiretime

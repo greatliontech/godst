@@ -183,8 +183,15 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		return wrap(errno)
 	}
 	accWrite := flag&(O_WRONLY|O_RDWR) != 0
-	if node != nil && node.isDir && (accWrite || flag&O_TRUNC != 0) {
-		return wrap(syscall.EISDIR)
+	if node != nil && node.isDir {
+		// do_open's ordering — see dstOpenFile: O_CREAT|O_EXCL's EEXIST
+		// precedes EISDIR and the write/O_TRUNC checks on an existing dir.
+		if flag&(O_CREATE|O_EXCL) == O_CREATE|O_EXCL {
+			return wrap(syscall.EEXIST)
+		}
+		if accWrite || flag&(O_TRUNC|O_CREATE) != 0 {
+			return wrap(syscall.EISDIR)
+		}
 	}
 	switch {
 	case node == nil && flag&O_CREATE == 0:
@@ -195,18 +202,22 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		if trailingSlash {
 			return wrap(syscall.EISDIR)
 		}
-		if parent == nil {
-			return wrap(syscall.EISDIR)
+		if parent.unlinked {
+			// Creation in an rmdir'd directory (addressed through the captured
+			// Root node) is ENOENT, as openat(2) answers on the host.
+			return wrap(syscall.ENOENT)
 		}
 		if r.disk.diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = &dstFSNode{mode: perm & ModePerm, modTime: time.Now()}
+		node = &dstFSNode{ino: dstFSAllocIno(), mode: perm & ModePerm, modTime: time.Now()}
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
 	if flag&O_TRUNC != 0 {
-		node.truncateLocked(0)
+		if err := node.truncateLocked(0); err != nil {
+			return wrap(err)
+		}
 	}
 	d := &dstFile{
 		node:  node,
@@ -341,10 +352,13 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	if node != nil || parent == nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.EEXIST}
 	}
+	if parent.unlinked {
+		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOENT}
+	}
 	if r.disk.diskFullForCreate() {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
 	}
-	parent.entries[base] = &dstFSNode{isDir: true, entries: make(map[string]*dstFSNode), mode: ModeDir | perm&ModePerm, modTime: time.Now()}
+	parent.entries[base] = &dstFSNode{isDir: true, ino: dstFSAllocIno(), entries: make(map[string]*dstFSNode), mode: ModeDir | perm&ModePerm, modTime: time.Now()}
 	parent.modTime = time.Now()
 	return nil
 }
@@ -384,10 +398,13 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 		}
 		child := cur.entries[part]
 		if child == nil {
+			if cur.unlinked {
+				return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOENT}
+			}
 			if r.disk.diskFullForCreate() {
 				return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
 			}
-			child = &dstFSNode{isDir: true, entries: make(map[string]*dstFSNode), mode: ModeDir | perm&ModePerm, modTime: time.Now()}
+			child = &dstFSNode{isDir: true, ino: dstFSAllocIno(), entries: make(map[string]*dstFSNode), mode: ModeDir | perm&ModePerm, modTime: time.Now()}
 			cur.entries[part] = child
 			cur.modTime = time.Now()
 		} else if !child.isDir {
@@ -424,6 +441,7 @@ func dstRootRemove(root *Root, name string) error {
 	if node.isDir && len(node.entries) > 0 {
 		return &PathError{Op: "removeat", Path: name, Err: syscall.ENOTEMPTY}
 	}
+	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
 	return nil
@@ -460,6 +478,7 @@ func dstRootRemoveAll(root *Root, name string) error {
 	if parent == nil {
 		return &PathError{Op: "RemoveAll", Path: name, Err: syscall.EBUSY}
 	}
+	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
 	return nil
@@ -512,6 +531,12 @@ func dstRootRename(root *Root, oldname, newname string) error {
 		case newNode.isDir && len(newNode.entries) > 0:
 			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTEMPTY}
 		}
+	}
+	// (No unlinked check needed here: a rooted rename's SOURCE must resolve
+	// inside this root, and an unlinked root is empty — the source lookup
+	// already answered ENOENT.)
+	if newNode != nil {
+		dstFSMarkUnlinked(newNode) // replaced target leaves the namespace (see dstRename)
 	}
 	delete(oldParent.entries, oldBase)
 	newParent.entries[newBase] = oldNode

@@ -171,29 +171,27 @@ func TestDSTFSVirtualFDMmapCrossProcessWriteUpdates(t *testing.T) {
 			mapped := make(chan struct{})
 			written := make(chan struct{})
 			done := make(chan error, 1)
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.Open("/m")
-					if err != nil {
-						done <- err
-						return
-					}
-					b, err := syscall.Mmap(int(f.Fd()), 0, 5, syscall.PROT_READ, syscall.MAP_SHARED)
-					if closeErr := f.Close(); err == nil {
-						err = closeErr
-					}
-					if err != nil {
-						done <- err
-						return
-					}
-					close(mapped)
-					<-written
-					if got := string(b); got != "hYllo" {
-						done <- fmt.Errorf("mapped bytes after cross-process WriteAt = %q, want hYllo", got)
-						return
-					}
-					done <- syscall.Munmap(b)
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.Open("/m")
+				if err != nil {
+					done <- err
+					return
+				}
+				b, err := syscall.Mmap(int(f.Fd()), 0, 5, syscall.PROT_READ, syscall.MAP_SHARED)
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					done <- err
+					return
+				}
+				close(mapped)
+				<-written
+				if got := string(b); got != "hYllo" {
+					done <- fmt.Errorf("mapped bytes after cross-process WriteAt = %q, want hYllo", got)
+					return
+				}
+				done <- syscall.Munmap(b)
 			})
 			select {
 			case err := <-done:
@@ -258,23 +256,44 @@ func TestDSTFSVirtualFDMmapWritableShared(t *testing.T) {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
-			var p1Map []byte
-			var p1Addr uintptr
-			simulation.Process("p1", func() {
+			p1Mapped := make(chan uintptr, 1)
+			p2Done := make(chan struct{})
+			p1err := make(chan error, 1)
+			go simulation.Process("p1", func() {
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
 				if err != nil {
-					t.Fatalf("p1 OpenFile: %v", err)
+					p1err <- err
+					return
 				}
-				p1Map, err = syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				p1Map, err := syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 				if closeErr := f.Close(); err == nil {
 					err = closeErr
 				}
 				if err != nil {
-					t.Fatalf("p1 Mmap: %v", err)
+					p1err <- err
+					return
 				}
 				atomic.StoreUint32((*uint32)(unsafe.Pointer(&p1Map[0])), 1)
-				p1Addr = uintptr(unsafe.Pointer(&p1Map[0]))
+				p1Mapped <- uintptr(unsafe.Pointer(&p1Map[0]))
+				<-p2Done
+				if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&p1Map[0]))); got != 2 {
+					p1err <- fmt.Errorf("p1 atomic load after p2 CAS = %d, want 2", got)
+					return
+				}
+				p1err <- syscall.Munmap(p1Map)
 			})
+			var p1Addr uintptr
+			select {
+			case err := <-p1err:
+				t.Fatalf("p1 map setup: %v", err)
+			case p1Addr = <-p1Mapped:
+			}
+			p2DoneClosed := false
+			defer func() {
+				if !p2DoneClosed {
+					close(p2Done)
+				}
+			}()
 
 			simulation.Process("p2", func() {
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
@@ -298,14 +317,11 @@ func TestDSTFSVirtualFDMmapWritableShared(t *testing.T) {
 					t.Fatalf("p2 Munmap: %v", err)
 				}
 			})
-			simulation.Process("p1", func() {
-				if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&p1Map[0]))); got != 2 {
-					t.Fatalf("p1 atomic load after p2 CAS = %d, want 2", got)
-				}
-				if err := syscall.Munmap(p1Map); err != nil {
-					t.Fatalf("p1 Munmap: %v", err)
-				}
-			})
+			close(p2Done)
+			p2DoneClosed = true
+			if err := <-p1err; err != nil {
+				t.Fatalf("p1 mapped observation: %v", err)
+			}
 			got, err := os.ReadFile("/lock")
 			if err != nil {
 				t.Fatalf("ReadFile: %v", err)
@@ -634,20 +650,41 @@ func TestDSTFSVirtualFDMmapReadOnlyAndWritableShareRange(t *testing.T) {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
-			var ro []byte
-			var roAddr uintptr
-			simulation.Process("reader", func() {
+			roMapped := make(chan uintptr, 1)
+			writerDone := make(chan struct{})
+			readerErr := make(chan error, 1)
+			go simulation.Process("reader", func() {
 				f, err := os.Open("/lock")
 				if err != nil {
-					t.Fatalf("Open reader: %v", err)
+					readerErr <- err
+					return
 				}
 				defer f.Close()
-				ro, err = syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ, syscall.MAP_SHARED)
+				ro, err := syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ, syscall.MAP_SHARED)
 				if err != nil {
-					t.Fatalf("read-only Mmap: %v", err)
+					readerErr <- err
+					return
 				}
-				roAddr = uintptr(unsafe.Pointer(&ro[0]))
+				roMapped <- uintptr(unsafe.Pointer(&ro[0]))
+				<-writerDone
+				if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&ro[0]))); got != 11 {
+					readerErr <- fmt.Errorf("read-only mapping after writable store = %d, want 11", got)
+					return
+				}
+				readerErr <- syscall.Munmap(ro)
 			})
+			var roAddr uintptr
+			select {
+			case err := <-readerErr:
+				t.Fatalf("reader map setup: %v", err)
+			case roAddr = <-roMapped:
+			}
+			writerDoneClosed := false
+			defer func() {
+				if !writerDoneClosed {
+					close(writerDone)
+				}
+			}()
 			simulation.Process("writer", func() {
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
 				if err != nil {
@@ -666,14 +703,11 @@ func TestDSTFSVirtualFDMmapReadOnlyAndWritableShareRange(t *testing.T) {
 					t.Fatalf("writable Munmap: %v", err)
 				}
 			})
-			simulation.Process("reader", func() {
-				if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&ro[0]))); got != 11 {
-					t.Fatalf("read-only mapping after writable store = %d, want 11", got)
-				}
-				if err := syscall.Munmap(ro); err != nil {
-					t.Fatalf("read-only Munmap: %v", err)
-				}
-			})
+			close(writerDone)
+			writerDoneClosed = true
+			if err := <-readerErr; err != nil {
+				t.Fatalf("reader mapped observation: %v", err)
+			}
 		})
 	})
 }
@@ -681,22 +715,42 @@ func TestDSTFSVirtualFDMmapReadOnlyAndWritableShareRange(t *testing.T) {
 func TestDSTFSVirtualFDMmapCrossHostCapabilityRejected(t *testing.T) {
 	simulation.Run(1, func() {
 		var b []byte
+		mapped := make(chan struct{})
+		release := make(chan struct{})
+		p1err := make(chan error, 1)
 		simulation.Host("h1", simulation.HostConfig{}, func() {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
-			simulation.Process("p1", func() {
+			go simulation.Process("p1", func() {
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
 				if err != nil {
-					t.Fatalf("OpenFile: %v", err)
+					p1err <- err
+					return
 				}
 				defer f.Close()
-				b, err = syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-				if err != nil {
-					t.Fatalf("Mmap: %v", err)
+				var mmapErr error
+				b, mmapErr = syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				if mmapErr != nil {
+					p1err <- mmapErr
+					return
 				}
+				close(mapped)
+				<-release
+				p1err <- syscall.Munmap(b)
 			})
 		})
+		select {
+		case err := <-p1err:
+			t.Fatalf("p1 map setup: %v", err)
+		case <-mapped:
+		}
+		releaseClosed := false
+		defer func() {
+			if !releaseClosed {
+				close(release)
+			}
+		}()
 		simulation.Host("h2", simulation.HostConfig{}, func() {
 			simulation.Process("p2", func() {
 				if err := syscall.Mprotect(b, syscall.PROT_READ); !errors.Is(err, syscall.EINVAL) {
@@ -707,13 +761,11 @@ func TestDSTFSVirtualFDMmapCrossHostCapabilityRejected(t *testing.T) {
 				}
 			})
 		})
-		simulation.Host("h1", simulation.HostConfig{}, func() {
-			simulation.Process("p1", func() {
-				if err := syscall.Munmap(b); err != nil {
-					t.Fatalf("Munmap: %v", err)
-				}
-			})
-		})
+		close(release)
+		releaseClosed = true
+		if err := <-p1err; err != nil {
+			t.Fatalf("p1 Munmap: %v", err)
+		}
 	})
 }
 
@@ -1020,21 +1072,19 @@ func TestDSTFSVirtualFDFlockExclusiveBlocksUntilClose(t *testing.T) {
 			locked := make(chan struct{})
 			release := make(chan struct{})
 			p1err := make(chan error, 1)
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.OpenFile("/lock", os.O_RDWR, 0)
-					if err != nil {
-						p1err <- err
-						return
-					}
-					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-						p1err <- err
-						return
-					}
-					close(locked)
-					<-release
-					p1err <- f.Close()
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+				if err != nil {
+					p1err <- err
+					return
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+					p1err <- err
+					return
+				}
+				close(locked)
+				<-release
+				p1err <- f.Close()
 			})
 			select {
 			case err := <-p1err:
@@ -1049,21 +1099,20 @@ func TestDSTFSVirtualFDFlockExclusiveBlocksUntilClose(t *testing.T) {
 			}()
 
 			attempting := make(chan struct{})
+			nbRes := make(chan error, 1)
 			done := make(chan error, 1)
-			var nbErr error
-			simulation.Process("p2", func() {
+			go simulation.Process("p2", func() {
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
 				if err != nil {
-					t.Fatalf("p2 OpenFile: %v", err)
+					nbRes <- fmt.Errorf("p2 OpenFile: %w", err)
+					return
 				}
-				nbErr = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-				go func() {
-					close(attempting)
-					done <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-					f.Close()
-				}()
+				nbRes <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				close(attempting)
+				done <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+				f.Close()
 			})
-			if !errors.Is(nbErr, syscall.EWOULDBLOCK) {
+			if nbErr := <-nbRes; !errors.Is(nbErr, syscall.EWOULDBLOCK) {
 				t.Fatalf("p2 LOCK_EX|LOCK_NB = %v, want EWOULDBLOCK", nbErr)
 			}
 			<-attempting
@@ -1095,21 +1144,19 @@ func TestDSTFSVirtualFDFlockSharedAndFDOwnership(t *testing.T) {
 			locked := make(chan struct{})
 			release := make(chan struct{})
 			p1err := make(chan error, 1)
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.Open("/lock")
-					if err != nil {
-						p1err <- err
-						return
-					}
-					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-						p1err <- err
-						return
-					}
-					close(locked)
-					<-release
-					p1err <- f.Close()
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					p1err <- err
+					return
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+					p1err <- err
+					return
+				}
+				close(locked)
+				<-release
+				p1err <- f.Close()
 			})
 			select {
 			case err := <-p1err:
@@ -1204,23 +1251,21 @@ func TestDSTFSVirtualFDFlockDowngradeWakesSharedWaiter(t *testing.T) {
 			downgraded := make(chan error, 1)
 			release := make(chan struct{})
 			p1err := make(chan error, 1)
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.Open("/lock")
-					if err != nil {
-						p1err <- err
-						return
-					}
-					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-						p1err <- err
-						return
-					}
-					close(locked)
-					<-downgrade
-					downgraded <- syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
-					<-release
-					p1err <- f.Close()
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					p1err <- err
+					return
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+					p1err <- err
+					return
+				}
+				close(locked)
+				<-downgrade
+				downgraded <- syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+				<-release
+				p1err <- f.Close()
 			})
 			select {
 			case err := <-p1err:
@@ -1240,21 +1285,24 @@ func TestDSTFSVirtualFDFlockDowngradeWakesSharedWaiter(t *testing.T) {
 
 			attempting := make(chan struct{})
 			done := make(chan error, 1)
-			simulation.Process("p2", func() {
+			go simulation.Process("p2", func() {
 				f, err := os.Open("/lock")
 				if err != nil {
-					t.Fatalf("p2 Open: %v", err)
+					done <- fmt.Errorf("p2 Open: %w", err)
+					return
 				}
-				go func() {
-					close(attempting)
-					err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
-					if closeErr := f.Close(); err == nil {
-						err = closeErr
-					}
-					done <- err
-				}()
+				close(attempting)
+				err = syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
+				done <- err
 			})
-			<-attempting
+			select {
+			case err := <-done:
+				t.Fatalf("p2 setup: %v", err)
+			case <-attempting:
+			}
 			synctest.Wait()
 			select {
 			case err := <-done:
@@ -1290,26 +1338,24 @@ func TestDSTFSVirtualFDFlockConcurrentSharedUpgradesMakeProgress(t *testing.T) {
 			start := make(chan struct{})
 			done := make(chan error, 2)
 			startUpgrader := func(name string) {
-				simulation.Process(name, func() {
-					go func() {
-						f, err := os.Open("/lock")
-						if err != nil {
-							done <- err
-							return
-						}
-						if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-							done <- err
-							return
-						}
-						ready <- struct{}{}
-						<-start
-						if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-							done <- err
-							f.Close()
-							return
-						}
-						done <- f.Close()
-					}()
+				go simulation.Process(name, func() {
+					f, err := os.Open("/lock")
+					if err != nil {
+						done <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+						done <- err
+						return
+					}
+					ready <- struct{}{}
+					<-start
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+						done <- err
+						f.Close()
+						return
+					}
+					done <- f.Close()
 				})
 			}
 			startUpgrader("p1")
@@ -1348,21 +1394,19 @@ func TestDSTFSVirtualFDFlockScopesByHostAndFileNode(t *testing.T) {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("h1 WriteFile: %v", err)
 			}
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.Open("/lock")
-					if err != nil {
-						p1err <- err
-						return
-					}
-					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-						p1err <- err
-						return
-					}
-					close(locked)
-					<-release
-					p1err <- f.Close()
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					p1err <- err
+					return
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+					p1err <- err
+					return
+				}
+				close(locked)
+				<-release
+				p1err <- f.Close()
 			})
 		})
 		select {
@@ -1410,21 +1454,19 @@ func TestDSTFSVirtualFDFlockFollowsFileNodeAcrossRename(t *testing.T) {
 			locked := make(chan struct{})
 			release := make(chan struct{})
 			p1err := make(chan error, 1)
-			simulation.Process("p1", func() {
-				go func() {
-					f, err := os.Open("/lock")
-					if err != nil {
-						p1err <- err
-						return
-					}
-					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-						p1err <- err
-						return
-					}
-					close(locked)
-					<-release
-					p1err <- f.Close()
-				}()
+			go simulation.Process("p1", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					p1err <- err
+					return
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+					p1err <- err
+					return
+				}
+				close(locked)
+				<-release
+				p1err <- f.Close()
 			})
 			select {
 			case err := <-p1err:

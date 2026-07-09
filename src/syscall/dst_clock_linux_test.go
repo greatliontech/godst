@@ -7,6 +7,8 @@
 package syscall_test
 
 import (
+	"fmt"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/simulation"
@@ -97,8 +99,8 @@ func TestDSTClockGettimeVirtualMonotonic(t *testing.T) {
 	if nilErr != syscall.EFAULT {
 		t.Fatalf("CLOCK_MONOTONIC nil timespec err = %v, want EFAULT", nilErr)
 	}
-	if realtimePanic == nil {
-		t.Fatalf("CLOCK_REALTIME did not hit the raw-syscall fence")
+	if realtimePanic == nil || !strings.Contains(fmt.Sprint(realtimePanic), "unsupported under deterministic simulation") {
+		t.Fatalf("CLOCK_REALTIME panic = %v, want the raw-syscall fence's unsupported-under-simulation shape", realtimePanic)
 	}
 	if got := wallAfter - wallBefore; got != int64(step) {
 		t.Fatalf("host wall delta after StepClock = %d, want %d", got, step)

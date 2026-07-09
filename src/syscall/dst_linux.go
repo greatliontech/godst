@@ -33,32 +33,20 @@ func dstSyscallAllowedTrap(trap uintptr) bool {
 const dstVirtualFDBase = 1 << 30
 const dstVirtualFDCount = 1 << 20
 
-// dstVirtualFDActive records fd numbers issued as virtual fds in the current
-// epoch. Entries stay set after close so stale raw syscalls cannot fall through
-// to the host; the registry decides live named-wrapper operations, and epoch
-// rollover clears the bitmap.
-var dstVirtualFDActive [dstVirtualFDCount]uint8
-
-//go:linkname dstSetVirtualFDActive
-func dstSetVirtualFDActive(fd uintptr, active bool) {
-	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
-		return
-	}
-	if active {
-		dstVirtualFDActive[fd-dstVirtualFDBase] = 1
-	} else {
-		dstVirtualFDActive[fd-dstVirtualFDBase] = 0
-	}
-}
-
-//go:linkname dstClearVirtualFDs
-func dstClearVirtualFDs() {
-	clear(dstVirtualFDActive[:])
-}
-
+// dstSyscallVirtualFDTrap reports whether an allowlisted fd-carrying trap names
+// a number in the reserved virtual-fd range [dstVirtualFDBase,
+// dstVirtualFDBase+dstVirtualFDCount). The WHOLE range is refused at the raw
+// boundary — issued or not — matching the named-wrapper side, which owns the
+// range outright (an unknown in-range number is EBADF there, never a host fd).
+// A pure range check needs no cross-package issued-fd state, so there is
+// nothing for a racing raw syscall to read stale: the refusal is a function of
+// the number alone. (A genuine host fd in this range would need fs.nr_open
+// raised beyond 2^30 — the reserved range is the simulation's namespace,
+// recorded in the spec.)
+//
 //go:nosplit
 func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
-	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount || dstVirtualFDActive[fd-dstVirtualFDBase] == 0 {
+	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
 		return false
 	}
 	switch trap {
@@ -67,6 +55,21 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
 		return true
 	}
 	return dstSyscallVirtualFDArchTrap(trap)
+}
+
+// dstSyscallMintingFcntl reports whether an allowlisted raw fcntl carries a
+// descriptor-MINTING command: F_DUPFD/F_DUPFD_CLOEXEC duplicate a host fd — a
+// minted host resource, the class the interception boundary refuses — while
+// the probe commands (F_GETFL-style, the reason fcntl is allowlisted at all)
+// stay allowed on inherited handles. Argument-aware because the trap alone
+// cannot separate probe from mint.
+//
+//go:nosplit
+func dstSyscallMintingFcntl(trap, cmd uintptr) bool {
+	if trap != SYS_FCNTL && !dstSyscallFcntlArchTrap(trap) {
+		return false
+	}
+	return cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC
 }
 
 // dstSyscallRefuse panics with the standard unsupported-under-simulation shape,

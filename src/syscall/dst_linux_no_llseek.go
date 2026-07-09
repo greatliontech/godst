@@ -15,3 +15,8 @@ func dstSyscallAllowedArchTrap(trap uintptr) bool {
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
 	return trap == SYS_FSTAT
 }
+
+//go:nosplit
+func dstSyscallFcntlArchTrap(trap uintptr) bool {
+	return false // no separate fcntl64 trap on these arches
+}

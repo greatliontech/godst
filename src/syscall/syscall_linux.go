@@ -70,7 +70,7 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
 			dstSyscallRefuse(trap)
 		}
 	}
@@ -90,7 +90,7 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
 			dstSyscallRefuse(trap)
 		}
 	}
@@ -121,7 +121,7 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) 
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
+		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
 			dstSyscallRefuse(trap)
 		}
 	}
