@@ -9,7 +9,7 @@ package os
 import "strings"
 
 func dstRootProcAbsLocked(r *dstRoot, name string) string {
-	parts, suffix, err := splitPathInRoot(name, nil, nil)
+	parts, endsInSlash, err := splitPathInRoot(name, nil, nil)
 	if err != nil {
 		return ""
 	}
@@ -66,8 +66,8 @@ func dstRootProcAbsLocked(r *dstRoot, name string) string {
 		b.WriteByte('/')
 		b.WriteString(part)
 	}
-	if suffix != "" {
-		b.WriteString(suffix)
+	if endsInSlash {
+		b.WriteByte('/')
 	}
 	return b.String()
 }
