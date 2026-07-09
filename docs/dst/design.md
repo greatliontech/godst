@@ -507,19 +507,27 @@ are process-owned capabilities, not an IPC channel: passing one to another simul
 model, while file writes by any process on the same simulated host update mappings through the shared file
 node.
 
-Symlinks, `os.Root`, and file locking are follow-on increments **and are fenced until then** — "not
-yet modeled" never means "reaches the host": within this feature's surface (the os file and
-namespace API; `os/exec`'s process surface is its own roadmap item), every handle-producing or
-namespace-touching entry point is either implemented in-sim or fails with the unsupported shape while
-a run is active (`os.OpenRoot` included; `os.Pipe` is simulated — see "Deterministic pipes and the
-stdio stance"). A `File` or `Root` opened BEFORE the run is a host-backed
-handle and stays outside the base model, exactly as inherited fds are for the network — program
-discipline, recorded here as the inherited-handle stance — and symmetrically, a simulated `File`
-leaked OUT of its run keeps operating on its run's orphaned tree in later runs: deterministic,
-host-isolated, and meaningless, the same discipline applied in reverse. An operation pairing a simulated handle
-with a pre-run host handle behaves as its two halves: the simulated side goes through the gated
-funnels and the host side does real I/O (`io.Copy` from a simulated file to an inherited stdout
-takes the generic loop — the zero-copy fast paths bail whenever either side is simulated).
+`os.OpenRoot` and rooted `Root` operations are modeled over the same tree. Opening a root captures
+the directory node identity, so a `Root` keeps addressing that node across namespace renames rather
+than re-resolving the path string passed to `OpenRoot`. Root-relative paths are walked component-wise
+from that captured node; absolute paths and `..` walks above the opened root fail instead of resolving
+against the process cwd, the tree root, or the host filesystem. Rooted file, directory, metadata,
+removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
+contracts as the named `os` surface.
+
+Symlinks and file locking are follow-on increments **and are fenced until then** — "not yet modeled"
+never means "reaches the host": within this feature's surface (the os file and namespace API;
+`os/exec`'s process surface is its own roadmap item), every handle-producing or namespace-touching
+entry point is either implemented in-sim or fails with the unsupported shape while a run is active
+(`os.Pipe` is simulated — see "Deterministic pipes and the stdio stance"). A `File` or `Root` opened
+BEFORE the run is a host-backed handle and stays outside the base model, exactly as inherited fds are
+for the network — program discipline, recorded here as the inherited-handle stance — and
+symmetrically, a simulated `File` leaked OUT of its run keeps operating on its run's orphaned tree in
+later runs: deterministic, host-isolated, and meaningless, the same discipline applied in reverse. An
+operation pairing a simulated handle with a pre-run host handle behaves as its two halves: the
+simulated side goes through the gated funnels and the host side does real I/O (`io.Copy` from a
+simulated file to an inherited stdout takes the generic loop — the zero-copy fast paths bail whenever
+either side is simulated).
 
 ### Deterministic pipes and the stdio stance (the third I/O feature)
 
@@ -971,7 +979,7 @@ later steps add, never rewrite.
   synced/unsynced split crash faults will tear along). Everything not modeled is fenced — host
   isolation is an enforced invariant, not a convention. See the "In-memory deterministic filesystem"
   section above; tested by the `TestDSTFS*` family, the durability white-box, and the cross-process
-  `TestDSTDiskReplay`. Caveats: no symlinks/`os.Root`/locking yet (fenced follow-ons), no ownership
+  `TestDSTDiskReplay`. Caveats: no symlinks/locking yet (fenced follow-ons), no ownership
   model (`Chown` fenced; permission bits stored, not enforced), tree-file `Fd()` is virtual on Linux and only
   selected syscall wrappers consume it, `Sys()` is nil.
 

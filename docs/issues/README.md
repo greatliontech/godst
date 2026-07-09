@@ -10,7 +10,6 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb OpenRoot support](./dst-gmdb-openroot.md) | 4 |
 | [DST gmdb flock single-writer discipline](./dst-gmdb-flock.md) | 5 |
 | [DST gmdb shared writable lock-file mmap](./dst-gmdb-shared-writable-mmap.md) | 6 |
 | [DST gmdb Kill pid-zero liveness](./dst-gmdb-kill-pid0.md) | 7 |

@@ -469,9 +469,13 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if oldNode == nil {
 		return wrap(syscall.ENOENT)
 	}
+	_, newTrailingSlash := dstFSComponents(newname)
 	newParent, newBase, newNode, errno := dstFSResolve(newname)
 	if errno != nil {
 		return wrap(errno)
+	}
+	if newTrailingSlash && newNode == nil {
+		return wrap(syscall.ENOTDIR)
 	}
 	if dstFSIsRoot(oldNode) || dstFSIsRoot(newNode) {
 		return wrap(syscall.EBUSY)

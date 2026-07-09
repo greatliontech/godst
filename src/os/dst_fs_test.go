@@ -211,8 +211,8 @@ func TestDSTFSFences(t *testing.T) {
 // simulated files takes the generic loop (the zero-copy fast paths bail), a
 // zero-length read at EOF is (0, nil), O_RDONLY|O_TRUNC truncates as Linux
 // does, SameFile keys on node identity, empty paths are ENOENT, the
-// metadata round-trips (fake-clock ModTime, stored perm), and os.OpenRoot
-// plus the unmodeled handle methods carry the fence shape.
+// metadata round-trips (fake-clock ModTime, stored perm), and the remaining
+// unmodeled handle methods carry the fence shape.
 func TestDSTFSCopyAndIdentity(t *testing.T) {
 	simulation.Run(1, func() {
 		// io.Copy sim -> sim (upstream zero-copy would EBADF without the bail).
@@ -302,11 +302,6 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 		}
 		if _, err := dst.SyscallConn(); !isDSTUnsupportedFS(err) {
 			t.Fatalf("SyscallConn = %v, want unsupported", err)
-		}
-
-		// os.OpenRoot is fenced (the H1 host-leak class).
-		if _, err := os.OpenRoot("/tmp"); !isDSTUnsupportedFS(err) {
-			t.Fatalf("OpenRoot = %v, want unsupported-under-simulation", err)
 		}
 
 		// Readdir on a regular file: the production ENOTDIR shape (the
@@ -862,6 +857,319 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 	simulation.Run(1, func() {
 		if wd, _ := os.Getwd(); wd != "/" {
 			t.Fatalf("fresh run Getwd = %q, want / (cwd leaked across runs)", wd)
+		}
+	})
+}
+
+func TestDSTFSOpenRoot(t *testing.T) {
+	simulation.Run(1, func() {
+		mustErrIs := func(what string, err, target error) {
+			t.Helper()
+			if !errors.Is(err, target) {
+				t.Fatalf("%s = %v, want %v", what, err, target)
+			}
+		}
+		mustNotExist := func(name string) {
+			t.Helper()
+			if _, err := os.Stat(name); !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("Stat(%q) = %v, want ENOENT", name, err)
+			}
+		}
+
+		if err := os.Mkdir("/root", 0o755); err != nil {
+			t.Fatalf("Mkdir root: %v", err)
+		}
+		if err := os.WriteFile("/outside", []byte("outside"), 0o644); err != nil {
+			t.Fatalf("WriteFile outside: %v", err)
+		}
+		r, err := os.OpenRoot("/root")
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		defer r.Close()
+
+		if err := r.MkdirAll("sub/dir", 0o755); err != nil {
+			t.Fatalf("Root.MkdirAll: %v", err)
+		}
+		if err := r.WriteFile("sub/dir/file", []byte("in-root"), 0o640); err != nil {
+			t.Fatalf("Root.WriteFile: %v", err)
+		}
+		if got, err := os.ReadFile("/root/sub/dir/file"); err != nil || string(got) != "in-root" {
+			t.Fatalf("ReadFile rooted result = %q, %v", got, err)
+		}
+		if err := r.Chmod("sub/dir/file", 0o600); err != nil {
+			t.Fatalf("Root.Chmod: %v", err)
+		}
+		mtime := time.Unix(123, 0)
+		if err := r.Chtimes("sub/dir/file", time.Time{}, mtime); err != nil {
+			t.Fatalf("Root.Chtimes: %v", err)
+		}
+		fi, err := r.Stat("sub/dir/file")
+		if err != nil {
+			t.Fatalf("Root.Stat: %v", err)
+		}
+		if fi.Name() != "file" || fi.Mode().Perm() != 0o600 || !fi.ModTime().Equal(mtime) {
+			t.Fatalf("Root.Stat = name %q mode %v mtime %v", fi.Name(), fi.Mode().Perm(), fi.ModTime())
+		}
+		_, err = r.OpenFile("sub/dir/file", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		mustErrIs("Root.OpenFile O_EXCL existing", err, syscall.EEXIST)
+		_, err = r.OpenFile("new/", os.O_WRONLY|os.O_CREATE, 0o600)
+		mustErrIs("Root.OpenFile create trailing slash", err, syscall.EISDIR)
+		_, err = r.OpenFile("sub/dir", os.O_RDONLY|os.O_TRUNC, 0)
+		mustErrIs("Root.OpenFile truncate dir", err, syscall.EISDIR)
+		if err := r.Chown("sub/dir/file", 1, 1); !isDSTUnsupportedFS(err) {
+			t.Fatalf("Root.Chown = %v, want unsupported-under-simulation", err)
+		}
+		if err := r.Lchown("sub/dir/file", 1, 1); !isDSTUnsupportedFS(err) {
+			t.Fatalf("Root.Lchown = %v, want unsupported-under-simulation", err)
+		}
+		if _, err := r.Readlink("sub/dir/file"); !isDSTUnsupportedFS(err) {
+			t.Fatalf("Root.Readlink = %v, want unsupported-under-simulation", err)
+		}
+		if err := r.Link("sub/dir/file", "sub/dir/link"); !isDSTUnsupportedFS(err) {
+			t.Fatalf("Root.Link = %v, want unsupported-under-simulation", err)
+		}
+		if err := r.Symlink("sub/dir/file", "sub/dir/symlink"); !isDSTUnsupportedFS(err) {
+			t.Fatalf("Root.Symlink = %v, want unsupported-under-simulation", err)
+		}
+		if err := r.MkdirAll("dot/child", 0o755); err != nil {
+			t.Fatalf("Root.MkdirAll dot: %v", err)
+		}
+		fi, err = r.Stat("dot/.")
+		if err != nil {
+			t.Fatalf(`Root.Stat("dot/."): %v`, err)
+		}
+		if fi.Name() != "dot" {
+			t.Fatalf(`Root.Stat("dot/.") name = %q, want dot`, fi.Name())
+		}
+		if err := r.Rename("dot/child/..", "dot-renamed"); err != nil {
+			t.Fatalf(`Root.Rename("dot/child/..", "dot-renamed"): %v`, err)
+		}
+		mustNotExist("/root/dot")
+		if _, err := r.Stat("dot-renamed/child"); err != nil {
+			t.Fatalf("Root.Stat renamed terminal dotdot child: %v", err)
+		}
+
+		if _, err := r.Open("../outside"); err == nil {
+			t.Fatalf("Root.Open escape succeeded")
+		}
+		if err := r.Mkdir("../escape", 0o755); err == nil {
+			t.Fatalf("Root.Mkdir escape succeeded")
+		}
+		if err := r.MkdirAll("../escape", 0o755); err == nil {
+			t.Fatalf("Root.MkdirAll escape succeeded")
+		}
+		if err := r.WriteFile("../outside", []byte("escaped"), 0o644); err == nil {
+			t.Fatalf("Root.WriteFile escape succeeded")
+		}
+		if err := r.Remove("../outside"); err == nil {
+			t.Fatalf("Root.Remove escape succeeded")
+		}
+		if err := r.RemoveAll("../outside"); err == nil {
+			t.Fatalf("Root.RemoveAll escape succeeded")
+		}
+		if got, _ := os.ReadFile("/outside"); string(got) != "outside" {
+			t.Fatalf("outside file = %q, want unchanged", got)
+		}
+		if _, err := r.Open("/outside"); err == nil {
+			t.Fatalf("Root.Open absolute path succeeded")
+		}
+
+		sub, err := r.OpenRoot("sub")
+		if err != nil {
+			t.Fatalf("Root.OpenRoot: %v", err)
+		}
+		defer sub.Close()
+		if got, err := sub.ReadFile("dir/file"); err != nil || string(got) != "in-root" {
+			t.Fatalf("nested Root.ReadFile = %q, %v", got, err)
+		}
+		if err := sub.Rename("dir/file", "dir/renamed"); err != nil {
+			t.Fatalf("nested Root.Rename: %v", err)
+		}
+		if got, err := r.ReadFile("sub/dir/renamed"); err != nil || string(got) != "in-root" {
+			t.Fatalf("Root.ReadFile renamed = %q, %v", got, err)
+		}
+		if err := r.Rename("sub", "sub/dir/child"); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("Root.Rename ancestor = %v, want EINVAL", err)
+		}
+		if err := r.Rename("sub/dir/renamed", "missing/"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf(`Root.Rename("sub/dir/renamed", "missing/") = %v, want ENOTDIR`, err)
+		}
+		mustNotExist("/root/missing")
+		if err := r.Rename("sub/dir/renamed", "../outside"); err == nil {
+			t.Fatalf("Root.Rename escape succeeded")
+		}
+		if got, err := r.ReadFile("sub/dir/renamed"); err != nil || string(got) != "in-root" {
+			t.Fatalf("Root.ReadFile after failed rename = %q, %v", got, err)
+		}
+
+		if err := r.Mkdir("empty", 0o755); err != nil {
+			t.Fatalf("Root.Mkdir: %v", err)
+		}
+		if err := r.Remove("empty"); err != nil {
+			t.Fatalf("Root.Remove empty: %v", err)
+		}
+		if err := r.MkdirAll("trash/a/b", 0o755); err != nil {
+			t.Fatalf("Root.MkdirAll trash: %v", err)
+		}
+		if err := r.WriteFile("trash/a/b/file", []byte("trash"), 0o644); err != nil {
+			t.Fatalf("Root.WriteFile trash: %v", err)
+		}
+		if err := r.RemoveAll("trash"); err != nil {
+			t.Fatalf("Root.RemoveAll trash: %v", err)
+		}
+		mustNotExist("/root/trash")
+		mustErrIs(`Root.RemoveAll(".")`, r.RemoveAll("."), syscall.EINVAL)
+
+		if err := os.Rename("/root", "/moved"); err != nil {
+			t.Fatalf("Rename root: %v", err)
+		}
+		if err := os.Mkdir("/root", 0o755); err != nil {
+			t.Fatalf("recreate root path: %v", err)
+		}
+		if err := r.WriteFile("after-rename", []byte("still-rooted"), 0o644); err != nil {
+			t.Fatalf("Root.WriteFile after rename: %v", err)
+		}
+		if got, err := os.ReadFile("/moved/after-rename"); err != nil || string(got) != "still-rooted" {
+			t.Fatalf("ReadFile after root rename = %q, %v", got, err)
+		}
+		mustNotExist("/root/after-rename")
+		if got, err := sub.ReadFile("dir/renamed"); err != nil || string(got) != "in-root" {
+			t.Fatalf("nested Root.ReadFile after parent rename = %q, %v", got, err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("Root.Close: %v", err)
+		}
+		var pe *os.PathError
+		if _, err := r.Open("sub/dir/renamed"); !errors.Is(err, os.ErrClosed) || !errors.As(err, &pe) || pe.Op != "openat" {
+			t.Fatalf("Root.Open after Close = %v, want openat PathError wrapping ErrClosed", err)
+		}
+		pe = nil
+		if err := r.Chown("sub/dir/renamed", 1, 1); !errors.Is(err, os.ErrClosed) || !errors.As(err, &pe) || pe.Op != "chownat" {
+			t.Fatalf("Root.Chown after Close = %v, want chownat PathError wrapping ErrClosed", err)
+		}
+		var le *os.LinkError
+		if err := r.Link("sub/dir/renamed", "linked"); !errors.Is(err, os.ErrClosed) || !errors.As(err, &le) || le.Op != "linkat" {
+			t.Fatalf("Root.Link after Close = %v, want linkat LinkError wrapping ErrClosed", err)
+		}
+	})
+}
+
+func TestDSTFSOpenRootDurability(t *testing.T) {
+	simulation.Run(1, func() {
+		must := func(what string, err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		}
+		state := func(name string) (curData, syncedData, curEntries, syncedEntries string, mode, syncedMode os.FileMode) {
+			t.Helper()
+			cur, synced, ce, se, m, sm, ok := os.DSTFSNodeState(name)
+			if !ok {
+				t.Fatalf("DSTFSNodeState(%q) not ok", name)
+			}
+			return cur, synced, strings.Join(ce, ","), strings.Join(se, ","), m, sm
+		}
+		syncRoot := func(r *os.Root, name string) {
+			t.Helper()
+			f, err := r.Open(name)
+			must("Root.Open "+name, err)
+			must("File.Sync "+name, f.Sync())
+			must("File.Close "+name, f.Close())
+		}
+
+		must("Mkdir root", os.Mkdir("/root", 0o755))
+		r, err := os.OpenRoot("/root")
+		must("OpenRoot", err)
+		defer r.Close()
+
+		must("Root.Mkdir durability", r.Mkdir("durability", 0o755))
+		syncRoot(r, ".")
+		_, _, rootCur, rootSynced, _, _ := state("/root")
+		if rootCur != "durability" || rootSynced != "durability" {
+			t.Fatalf("/root entries = current %q synced %q, want durability/durability", rootCur, rootSynced)
+		}
+		must("Root.Mkdir mkbase", r.Mkdir("mkbase", 0o755))
+		syncRoot(r, ".")
+		syncRoot(r, "mkbase")
+		must("Root.MkdirAll mkbase/a/b", r.MkdirAll("mkbase/a/b", 0o755))
+		_, _, mkCur, mkSynced, _, _ := state("/root/mkbase")
+		if mkCur != "a" || mkSynced != "" {
+			t.Fatalf("mkbase entries after MkdirAll = current %q synced %q, want a/empty", mkCur, mkSynced)
+		}
+		must("Root.RemoveAll mkbase", r.RemoveAll("mkbase"))
+		_, _, rootCur, rootSynced, _, _ = state("/root")
+		if rootCur != "durability" || rootSynced != "durability,mkbase" {
+			t.Fatalf("/root entries after mkbase RemoveAll = current %q synced %q, want durability/durability,mkbase", rootCur, rootSynced)
+		}
+		syncRoot(r, "durability")
+
+		must("Root.WriteFile durability/file", r.WriteFile("durability/file", []byte("data"), 0o644))
+		cur, synced, _, _, _, _ := state("/root/durability/file")
+		if cur != "data" || synced != "" {
+			t.Fatalf("file data = current %q synced %q, want data/empty", cur, synced)
+		}
+		_, _, dirCur, dirSynced, _, _ := state("/root/durability")
+		if dirCur != "file" || dirSynced != "" {
+			t.Fatalf("durability entries after create = current %q synced %q, want file/empty", dirCur, dirSynced)
+		}
+
+		f, err := r.OpenFile("durability/file", os.O_RDWR, 0)
+		must("Root.OpenFile durability/file", err)
+		must("file Sync", f.Sync())
+		must("file Close", f.Close())
+		must("Root.WriteFile durability/trunc", r.WriteFile("durability/trunc", []byte("keep"), 0o644))
+		f, err = r.OpenFile("durability/trunc", os.O_RDWR, 0)
+		must("Root.OpenFile durability/trunc", err)
+		must("trunc Sync", f.Sync())
+		must("trunc Close", f.Close())
+		f, err = r.OpenFile("durability/trunc", os.O_WRONLY|os.O_TRUNC, 0)
+		must("Root.OpenFile durability/trunc O_TRUNC", err)
+		must("trunc Close after O_TRUNC", f.Close())
+		cur, synced, _, _, _, _ = state("/root/durability/trunc")
+		if cur != "" || synced != "keep" {
+			t.Fatalf("trunc data = current %q synced %q, want empty/keep", cur, synced)
+		}
+		must("Root.WriteFile durability/timefile", r.WriteFile("durability/timefile", []byte("time"), 0o644))
+		f, err = r.OpenFile("durability/timefile", os.O_RDWR, 0)
+		must("Root.OpenFile durability/timefile", err)
+		must("timefile Sync", f.Sync())
+		must("timefile Close", f.Close())
+		_, syncedModTime0, ok := os.DSTFSNodeTimes("/root/durability/timefile")
+		if !ok {
+			t.Fatalf("DSTFSNodeTimes(timefile) not ok")
+		}
+		mtime := time.Unix(456, 0)
+		must("Root.Chtimes durability/timefile", r.Chtimes("durability/timefile", time.Time{}, mtime))
+		modTime1, syncedModTime1, ok := os.DSTFSNodeTimes("/root/durability/timefile")
+		if !ok {
+			t.Fatalf("DSTFSNodeTimes(timefile after Chtimes) not ok")
+		}
+		if modTime1 != mtime.UnixNano() || syncedModTime1 != syncedModTime0 {
+			t.Fatalf("timefile times after Chtimes = mod %d synced %d, want %d/%d", modTime1, syncedModTime1, mtime.UnixNano(), syncedModTime0)
+		}
+		syncRoot(r, "durability")
+		must("Root.Chmod durability/file", r.Chmod("durability/file", 0o600))
+		_, synced, _, _, mode, syncedMode := state("/root/durability/file")
+		if synced != "data" || mode.Perm() != 0o600 || syncedMode.Perm() != 0o644 {
+			t.Fatalf("after chmod = synced data %q mode %v syncedMode %v, want data 0600 0644", synced, mode.Perm(), syncedMode.Perm())
+		}
+
+		must("Root.Rename durability/file", r.Rename("durability/file", "durability/renamed"))
+		_, _, dirCur, dirSynced, _, _ = state("/root/durability")
+		if dirCur != "renamed,timefile,trunc" || dirSynced != "file,timefile,trunc" {
+			t.Fatalf("durability entries after rename = current %q synced %q, want renamed,timefile,trunc/file,timefile,trunc", dirCur, dirSynced)
+		}
+		must("Root.Remove durability/renamed", r.Remove("durability/renamed"))
+		_, _, dirCur, dirSynced, _, _ = state("/root/durability")
+		if dirCur != "timefile,trunc" || dirSynced != "file,timefile,trunc" {
+			t.Fatalf("durability entries after remove = current %q synced %q, want timefile,trunc/file,timefile,trunc", dirCur, dirSynced)
+		}
+		must("Root.RemoveAll durability", r.RemoveAll("durability"))
+		_, _, rootCur, rootSynced, _, _ = state("/root")
+		if rootCur != "" || rootSynced != "durability,mkbase" {
+			t.Fatalf("/root entries after RemoveAll = current %q synced %q, want empty/durability,mkbase", rootCur, rootSynced)
 		}
 	})
 }

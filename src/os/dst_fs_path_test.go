@@ -128,3 +128,17 @@ func TestDSTFSCreateTrailingSlashEISDIR(t *testing.T) {
 		}
 	})
 }
+
+func TestDSTFSRenameTrailingSlashMissing(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/file", []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := os.Rename("/file", "/new/"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf(`Rename("/file", "/new/") = %v, want ENOTDIR`, err)
+		}
+		if _, err := os.Stat("/new"); err == nil {
+			t.Fatalf("a file was created despite the trailing slash")
+		}
+	})
+}
