@@ -455,6 +455,9 @@ func Rename(oldpath, newpath string) error {
 // without resolving it to an absolute one.
 func Readlink(name string) (string, error) {
 	if dstSimEnabled {
+		if target, handled, err := dstProcReadlink(name); handled {
+			return target, err
+		}
 		if err, fenced := dstFSFenced("readlink", name); fenced {
 			return "", err
 		}

@@ -33,6 +33,9 @@ func dstOpenRoot(name string) (*Root, bool, error) {
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	if dstProcReserved(name) {
+		return nil, true, &PathError{Op: "open", Path: name, Err: dstErrUnsupportedFS}
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -137,6 +140,9 @@ func dstRootOpenRoot(root *Root, name string) (*Root, error) {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return nil, &PathError{Op: "openat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	_, _, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return nil, &PathError{Op: "openat", Path: name, Err: errno}
@@ -160,6 +166,18 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	wrap := func(e error) (*File, error) { return nil, &PathError{Op: "openat", Path: name, Err: e} }
+	if abs := dstRootProcAbsLocked(r, name); abs != "" {
+		data, ident, _, errno := dstProcStatDataAbs(abs)
+		if errno != nil {
+			return wrap(errno)
+		}
+		if flag&(O_WRONLY|O_RDWR|O_CREATE|O_TRUNC) != 0 {
+			return wrap(syscall.EACCES)
+		}
+		f := dstNewFile(&dstProcFile{data: data, name: joinPath(root.Name(), name), ident: ident}, joinPath(root.Name(), name))
+		f.inRoot = true
+		return f, nil
+	}
 	parent, base, node, trailingSlash, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return wrap(errno)
@@ -213,6 +231,13 @@ func dstRootStat(root *Root, name string, lstat bool) (FileInfo, error) {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if abs := dstRootProcAbsLocked(r, name); abs != "" {
+		_, ident, _, errno := dstProcStatDataAbs(abs)
+		if errno != nil {
+			return nil, &PathError{Op: "statat", Path: name, Err: errno}
+		}
+		return &dstFileInfo{name: "stat", mode: 0o444, ident: ident}, nil
+	}
 	_, base, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return nil, &PathError{Op: "statat", Path: name, Err: errno}
@@ -226,6 +251,28 @@ func dstRootStat(root *Root, name string, lstat bool) (FileInfo, error) {
 	return &dstFileInfo{name: base, size: int64(len(node.data)), mode: node.mode, modTime: node.modTime, isDir: node.isDir, ident: node}, nil
 }
 
+func dstRootReadlink(root *Root, name string) (string, error) {
+	r, err := dstRootEnter(root)
+	if err != nil {
+		return "", &PathError{Op: "readlinkat", Path: name, Err: err}
+	}
+	defer root.root.decref()
+	dstRootDelay(r)
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	abs := dstRootProcAbsLocked(r, name)
+	if abs == "" {
+		return "", &PathError{Op: "readlinkat", Path: name, Err: dstErrUnsupportedFS}
+	}
+	if abs != "/proc/self/ns/pid" {
+		return "", &PathError{Op: "readlinkat", Path: name, Err: dstErrUnsupportedFS}
+	}
+	if _, ok := dstSimGetpid(); !ok {
+		return "", &PathError{Op: "readlinkat", Path: name, Err: syscall.ENOENT}
+	}
+	return dstProcPIDNamespace, nil
+}
+
 func dstRootChmod(root *Root, name string, mode FileMode) error {
 	r, err := dstRootEnter(root)
 	if err != nil {
@@ -235,6 +282,9 @@ func dstRootChmod(root *Root, name string, mode FileMode) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return &PathError{Op: "chmodat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	_, _, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return &PathError{Op: "chmodat", Path: name, Err: errno}
@@ -255,6 +305,9 @@ func dstRootChtimes(root *Root, name string, atime, mtime time.Time) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return &PathError{Op: "chtimesat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	_, _, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return &PathError{Op: "chtimesat", Path: name, Err: errno}
@@ -278,6 +331,9 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return &PathError{Op: "mkdirat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	parent, base, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: errno}
@@ -302,6 +358,9 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" || dstRootMkdirAllProcReservedLocked(r, name) {
+		return &PathError{Op: "mkdirat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	parts, _, err := splitPathInRoot(name, nil, nil)
 	if err != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: err}
@@ -349,6 +408,9 @@ func dstRootRemove(root *Root, name string) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return &PathError{Op: "removeat", Path: name, Err: dstErrUnsupportedFS}
+	}
 	parent, base, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		return &PathError{Op: "removeat", Path: name, Err: errno}
@@ -382,6 +444,9 @@ func dstRootRemoveAll(root *Root, name string) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, name) != "" {
+		return &PathError{Op: "RemoveAll", Path: name, Err: dstErrUnsupportedFS}
+	}
 	parent, base, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
 		if errno == syscall.ENOENT {
@@ -409,6 +474,9 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	dstRootDelay(r)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {
+		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
+	}
 	oldParent, oldBase, oldNode, _, errno := dstRootResolveLocked(r, oldname)
 	if errno != nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: errno}

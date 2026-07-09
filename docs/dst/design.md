@@ -167,6 +167,13 @@ for that process body's dynamic extent, and completed or unknown pids return `ES
 process. Non-zero signals remain fenced until a signal-delivery model is settled; generic raw `SYS_KILL`
 remains fenced like other unsupported raw syscalls.
 
+The simulated filesystem also owns the procfs identity surface needed for pid-liveness recovery:
+`/proc/<pid>/stat` and `/proc/self/stat` are generated for live simulated pids and include a deterministic
+field-22 starttime derived from that pid identity; completed, unknown, host, or unrepresentable pids are
+not visible. `/proc/self/ns/pid` readlink returns the stable deterministic namespace identity `pid:[1]`.
+Unsupported `/proc` paths stay deterministic simulated results (unsupported or not-exist), never host
+passthrough.
+
 The group and user-database surface is simulated to match: `os.Getgroups` is exactly `[7777]`, and
 the `os/user` lookup functions resolve against a minimal database containing exactly the simulated
 user and its group — `Lookup("sim")`/`LookupId("7777")`/`LookupGroup("sim")`/`LookupGroupId("7777")`

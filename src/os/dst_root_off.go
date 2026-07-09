@@ -22,6 +22,8 @@ func dstRootOpenFile(r *Root, name string, flag int, perm FileMode) (*File, erro
 
 func dstRootStat(r *Root, name string, lstat bool) (FileInfo, error) { panic("unreachable") }
 
+func dstRootReadlink(r *Root, name string) (string, error) { panic("unreachable") }
+
 func dstRootChmod(r *Root, name string, mode FileMode) error { panic("unreachable") }
 
 func dstRootChtimes(r *Root, name string, atime, mtime time.Time) error { panic("unreachable") }

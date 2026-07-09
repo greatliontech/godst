@@ -1322,6 +1322,19 @@ func dstPidAlive(pid int32) bool {
 	return t != nil && t.live[pid]
 }
 
+// dstPidStarttime reports the deterministic procfs starttime for a live simulated
+// pid. The value is derived from the pid itself because pids are monotonic and never
+// reused within a run; completed pids have no procfs entry. Reached from os's
+// synthetic /proc support by //go:linkname.
+//
+//go:linkname dstPidStarttime
+func dstPidStarttime(pid int32) (start uint64, ok bool) {
+	if !dstPidAlive(pid) {
+		return 0, false
+	}
+	return uint64(pid), true
+}
+
 // dstSetProcessPid stamps the calling goroutine's pid and returns the previous
 // value, so testing/simulation.Process can restore it when its body returns. The
 // pid inherits to child goroutines at newproc1 (the labeled subtree), so the whole

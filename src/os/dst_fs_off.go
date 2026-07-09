@@ -20,6 +20,8 @@ func dstOpenFile(name string, flag int, perm FileMode) (*File, bool, error) {
 
 func dstFSFenced(op, name string) (error, bool) { return nil, false }
 
+func dstProcReadlink(name string) (string, bool, error) { return "", false, nil }
+
 func dstFSFencedLink(op, oldname, newname string) (error, bool) { return nil, false }
 
 func dstSameFile(fi1, fi2 FileInfo) (same, handled bool) { return false, false }

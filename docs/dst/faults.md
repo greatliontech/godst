@@ -155,6 +155,9 @@ tolerate*, so it cannot be a single global clock.
   new pid — no stable-pid), cwd; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
   (per-process possible later, non-foreclosing). `Kill(pid, 0)` is the simulated liveness query over those
   pids: live process pids succeed, completed or unknown pids return `ESRCH`, and host pids are never probed.
+  Procfs identity follows the same pid registry: `/proc/<pid>/stat` exposes a deterministic field-22
+  starttime only for live simulated pids, and `/proc/self/ns/pid` readlink exposes a stable deterministic
+  namespace identity with no host `/proc` passthrough.
   Host 0 / unconfigured uses the run defaults (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is
   unchanged.
 - **Memory accounting** — **landed**. Per-process **allocation accounting** extends the existing

@@ -352,6 +352,9 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "mkdir", Path: name, Err: dstErrUnsupportedFS}
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -385,6 +388,9 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 func dstRemove(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
+	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "remove", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
@@ -425,6 +431,9 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "removeall", Path: name, Err: dstErrUnsupportedFS}
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -462,6 +471,9 @@ func dstRemoveAll(name string) (handled bool, err error) {
 func dstRename(oldname, newname string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
+	}
+	if dstProcReserved(oldname) || dstProcReserved(newname) {
+		return true, &LinkError{Op: "rename", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
@@ -526,6 +538,9 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	if fi, handled, err := dstProcStatName(op, name); handled {
+		return fi, true, err
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -568,6 +583,9 @@ func dstTempDir() (string, bool) {
 func dstTruncateName(name string, size int64) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
+	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "truncate", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
@@ -624,6 +642,9 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "chmod", Path: name, Err: dstErrUnsupportedFS}
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -661,6 +682,9 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	if dstProcReserved(name) {
+		return true, &PathError{Op: "chtimes", Path: name, Err: dstErrUnsupportedFS}
+	}
 	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -697,6 +721,9 @@ func dstGetwd() (string, bool, error) {
 func dstChdir(dir string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
+	}
+	if dstProcReserved(dir) {
+		return true, &PathError{Op: "chdir", Path: dir, Err: dstErrUnsupportedFS}
 	}
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -741,6 +768,9 @@ type dstFile struct {
 func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, err error) {
 	if !dstFSActive() {
 		return nil, false, nil
+	}
+	if f, handled, err := dstProcOpenFile(name, flag); handled {
+		return f, true, err
 	}
 	wrap := func(e error) (*File, bool, error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: e}
@@ -813,6 +843,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 func dstOpenDir(name string) (f *File, handled bool, err error) {
 	if !dstFSActive() {
 		return nil, false, nil
+	}
+	if dstProcReserved(name) {
+		return nil, true, &PathError{Op: "open", Path: name, Err: dstErrUnsupportedFS}
 	}
 	wrap := func(e error) (*File, bool, error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: e}

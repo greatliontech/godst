@@ -210,11 +210,7 @@ func rootMkdirAll(r *Root, fullname string, perm FileMode) error {
 
 func rootReadlink(r *Root, name string) (string, error) {
 	if dstRootActive(r) {
-		if err := r.root.incref(); err != nil {
-			return "", &PathError{Op: "readlinkat", Path: name, Err: err}
-		}
-		r.root.decref()
-		return "", &PathError{Op: "readlinkat", Path: name, Err: dstErrUnsupportedFS}
+		return dstRootReadlink(r, name)
 	}
 	target, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (string, error) {		return readlinkat(parent, name)
 	})
