@@ -199,6 +199,21 @@ type dstFSNode struct {
 	// image); a future simulated crash restores these alongside synced.
 	syncedMode    FileMode
 	syncedModTime time.Time
+
+	// Advisory flock state. This is host file-node state, not durable file
+	// content; fd and process ownership live in the lock owner key.
+	flock dstFlockState
+}
+
+type dstFlockOwner struct {
+	host uint32
+	proc uint32
+	fd   int
+}
+
+type dstFlockState struct {
+	holders map[dstFlockOwner]bool // true means exclusive, false means shared
+	wait    chan struct{}
 }
 
 // dstErrUnsupportedFS is the inner error of every fenced operation; the same
@@ -1314,8 +1329,15 @@ func (d *dstFile) closeFile() error {
 		return poll.ErrFileClosing
 	}
 	d.closed = true
-	d.node = nil
 	return nil
+}
+
+func (d *dstFile) dropClosedNode() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		d.node = nil
+	}
 }
 
 // dstFileInfo is the FileInfo for simulated nodes. Sys() is nil: there is no

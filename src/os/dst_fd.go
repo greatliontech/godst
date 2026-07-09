@@ -45,6 +45,9 @@ func dstSetFsyncHook(func(fd int) (err syscall.Errno, handled bool))
 //go:linkname dstSetFdatasyncHook syscall.dstSetFdatasyncHook
 func dstSetFdatasyncHook(func(fd int) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetFlockHook syscall.dstSetFlockHook
+func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
+
 //go:linkname dstSetVirtualFDActive syscall.dstSetVirtualFDActive
 func dstSetVirtualFDActive(fd uintptr, active bool)
 
@@ -61,6 +64,7 @@ func init() {
 	dstSetSeekHook(dstFDSeek)
 	dstSetFsyncHook(dstFDFsync)
 	dstSetFdatasyncHook(dstFDFdatasync)
+	dstSetFlockHook(dstFDFlock)
 }
 
 type dstFDEntry struct {
@@ -131,27 +135,51 @@ func dstReleaseFD(file *file) {
 	if file.dstfds == nil {
 		return
 	}
+	type release struct {
+		fd    int
+		entry dstFDEntry
+	}
+	var releases []release
 	dstFDRegistry.mu.Lock()
 	dstFDRollLocked()
 	for key, fd := range file.dstfds {
 		entry, ok := dstFDRegistry.fds[fd]
 		if ok && entry.backend == file.dstf && entry.epoch == key.epoch && entry.host == key.host && entry.proc == key.proc {
 			delete(dstFDRegistry.fds, fd)
+			releases = append(releases, release{fd: fd, entry: entry})
 		}
 		delete(file.dstfds, key)
 	}
 	dstFDRegistry.mu.Unlock()
+	for _, rel := range releases {
+		dstFlockReleaseFD(rel.entry, rel.fd)
+	}
 }
 
 func dstReleaseBackendFDs(backend dstFileBackend) {
+	type release struct {
+		fd    int
+		entry dstFDEntry
+	}
+	var releases []release
 	dstFDRegistry.mu.Lock()
 	dstFDRollLocked()
 	for fd, entry := range dstFDRegistry.fds {
 		if entry.backend == backend {
 			delete(dstFDRegistry.fds, fd)
+			releases = append(releases, release{fd: fd, entry: entry})
 		}
 	}
 	dstFDRegistry.mu.Unlock()
+	for _, rel := range releases {
+		dstFlockReleaseFD(rel.entry, rel.fd)
+	}
+}
+
+func dstDropClosedNode(backend dstFileBackend) {
+	if file, ok := backend.(*dstFile); ok {
+		file.dropClosedNode()
+	}
 }
 
 func dstFDLookup(fd int) (entry dstFDEntry, handled bool, errno syscall.Errno) {
@@ -340,9 +368,10 @@ func dstFDClose(fd int) (syscall.Errno, bool) {
 		return errno, handled
 	}
 	errno = dstFDErr(entry.backend.closeFile())
-	dstReleaseBackendFDs(entry.backend)
 	if errno != 0 {
 		return errno, true
 	}
+	dstReleaseBackendFDs(entry.backend)
+	dstDropClosedNode(entry.backend)
 	return 0, true
 }

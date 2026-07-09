@@ -11,3 +11,5 @@ func dstFD(file *file) int {
 }
 
 func dstReleaseFD(file *file) {}
+
+func dstDropClosedNode(backend dstFileBackend) {}

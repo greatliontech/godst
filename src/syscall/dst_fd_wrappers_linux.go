@@ -54,3 +54,13 @@ func Fdatasync(fd int) (err error) {
 	}
 	return fdatasync(fd)
 }
+
+func Flock(fd int, how int) (err error) {
+	if e1, handled := dstTryFlock(fd, how); handled {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		}
+		return
+	}
+	return flock(fd, how)
+}

@@ -728,9 +728,9 @@ SUT shares an in-process `sync.Mutex` (or channel, or Go memory) *across* `Proce
 it abandoned and another process may block on it forever — but that coupling is not two processes; it is
 out of model (program discipline, the concurrent dual of the inherited-handle stance, and the very reason
 a process is the memory-isolation unit). Within the model a crashed process holds no in-memory resource a
-sibling waits on, so abandonment is sound. (When file locking lands as its net/fs follow-on, a process
-crash must also release that process's `flock`s — the kernel does on process death — which the per-process
-fd table makes clean.)
+sibling waits on, so abandonment is sound. File locks are modeled as per-process fd-owned resources;
+process crash must also release that process's `flock`s — the kernel does on process death — and the
+per-process fd table provides that ownership boundary.
 
 **The load-bearing mechanism (the crash chunk's work, contained, non-foreclosing).** synctest tears down a
 *whole* bubble; **per-victim teardown** — descheduling one process's (or host's) goids, abandoning their
@@ -872,4 +872,3 @@ adversarial loop.
 
 The UDP/`PacketConn` net increment (which unlocks packet-granular drop/reorder/duplicate) stays a
 net-feature follow-on, not a fault chunk; when it lands, its packet faults reuse this contract.
-

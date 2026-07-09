@@ -8,10 +8,14 @@ package os_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/simulation"
+	"testing/synctest"
+	"time"
 )
 
 const (
@@ -258,6 +262,652 @@ func TestDSTFSVirtualFDFsyncCommitsDirectoryEntries(t *testing.T) {
 		}
 		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "two" || len(synced) != 1 || synced[0] != "two" {
 			t.Fatalf("post-second-Fsync entries = %v/%v, ok=%v; want two/two", cur, synced, ok)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFlockExclusiveBlocksUntilClose(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			locked := make(chan struct{})
+			release := make(chan struct{})
+			p1err := make(chan error, 1)
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+					if err != nil {
+						p1err <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+						p1err <- err
+						return
+					}
+					close(locked)
+					<-release
+					p1err <- f.Close()
+				}()
+			})
+			select {
+			case err := <-p1err:
+				t.Fatalf("p1 lock setup: %v", err)
+			case <-locked:
+			}
+			releaseClosed := false
+			defer func() {
+				if !releaseClosed {
+					close(release)
+				}
+			}()
+
+			attempting := make(chan struct{})
+			done := make(chan error, 1)
+			var nbErr error
+			simulation.Process("p2", func() {
+				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("p2 OpenFile: %v", err)
+				}
+				nbErr = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				go func() {
+					close(attempting)
+					done <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+					f.Close()
+				}()
+			})
+			if !errors.Is(nbErr, syscall.EWOULDBLOCK) {
+				t.Fatalf("p2 LOCK_EX|LOCK_NB = %v, want EWOULDBLOCK", nbErr)
+			}
+			<-attempting
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("blocking Flock returned before release: %v", err)
+			default:
+			}
+			close(release)
+			releaseClosed = true
+			if err := <-done; err != nil {
+				t.Fatalf("blocking Flock after close release: %v", err)
+			}
+			if err := <-p1err; err != nil {
+				t.Fatalf("p1 Close: %v", err)
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockSharedAndFDOwnership(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			locked := make(chan struct{})
+			release := make(chan struct{})
+			p1err := make(chan error, 1)
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.Open("/lock")
+					if err != nil {
+						p1err <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+						p1err <- err
+						return
+					}
+					close(locked)
+					<-release
+					p1err <- f.Close()
+				}()
+			})
+			select {
+			case err := <-p1err:
+				t.Fatalf("p1 shared lock setup: %v", err)
+			case <-locked:
+			}
+			releaseClosed := false
+			defer func() {
+				if !releaseClosed {
+					close(release)
+				}
+			}()
+
+			simulation.Process("p2", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p2 Open: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+					t.Fatalf("p2 LOCK_SH|LOCK_NB: %v", err)
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("p2 upgrade while p1 shared = %v, want EWOULDBLOCK", err)
+				}
+			})
+
+			simulation.Process("p3", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p3 Open: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("p3 LOCK_EX|LOCK_NB while shared held = %v, want EWOULDBLOCK", err)
+				}
+			})
+
+			close(release)
+			releaseClosed = true
+			if err := <-p1err; err != nil {
+				t.Fatalf("p1 Close: %v", err)
+			}
+			simulation.Process("p3", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p3 reopen: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("p3 LOCK_EX after shared release: %v", err)
+				}
+			})
+
+			simulation.Process("p4", func() {
+				f1, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p4 Open f1: %v", err)
+				}
+				defer f1.Close()
+				f2, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p4 Open f2: %v", err)
+				}
+				defer f2.Close()
+				if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX); err != nil {
+					t.Fatalf("p4 f1 LOCK_EX: %v", err)
+				}
+				if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("p4 f2 LOCK_EX|LOCK_NB with f1 held = %v, want EWOULDBLOCK", err)
+				}
+				if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+					t.Fatalf("p4 f1 LOCK_UN: %v", err)
+				}
+				if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("p4 f2 LOCK_EX after f1 unlock: %v", err)
+				}
+			})
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockDowngradeWakesSharedWaiter(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			locked := make(chan struct{})
+			downgrade := make(chan struct{})
+			downgraded := make(chan error, 1)
+			release := make(chan struct{})
+			p1err := make(chan error, 1)
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.Open("/lock")
+					if err != nil {
+						p1err <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+						p1err <- err
+						return
+					}
+					close(locked)
+					<-downgrade
+					downgraded <- syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+					<-release
+					p1err <- f.Close()
+				}()
+			})
+			select {
+			case err := <-p1err:
+				t.Fatalf("p1 lock setup: %v", err)
+			case <-locked:
+			}
+			downgradeClosed := false
+			releaseClosed := false
+			defer func() {
+				if !downgradeClosed {
+					close(downgrade)
+				}
+				if !releaseClosed {
+					close(release)
+				}
+			}()
+
+			attempting := make(chan struct{})
+			done := make(chan error, 1)
+			simulation.Process("p2", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("p2 Open: %v", err)
+				}
+				go func() {
+					close(attempting)
+					err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+					if closeErr := f.Close(); err == nil {
+						err = closeErr
+					}
+					done <- err
+				}()
+			})
+			<-attempting
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("shared Flock returned before downgrade: %v", err)
+			default:
+			}
+
+			close(downgrade)
+			downgradeClosed = true
+			if err := <-downgraded; err != nil {
+				t.Fatalf("p1 downgrade: %v", err)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("shared Flock after downgrade: %v", err)
+			}
+			close(release)
+			releaseClosed = true
+			if err := <-p1err; err != nil {
+				t.Fatalf("p1 Close: %v", err)
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockConcurrentSharedUpgradesMakeProgress(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			ready := make(chan struct{}, 2)
+			start := make(chan struct{})
+			done := make(chan error, 2)
+			startUpgrader := func(name string) {
+				simulation.Process(name, func() {
+					go func() {
+						f, err := os.Open("/lock")
+						if err != nil {
+							done <- err
+							return
+						}
+						if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+							done <- err
+							return
+						}
+						ready <- struct{}{}
+						<-start
+						if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+							done <- err
+							f.Close()
+							return
+						}
+						done <- f.Close()
+					}()
+				})
+			}
+			startUpgrader("p1")
+			startUpgrader("p2")
+			startClosed := false
+			defer func() {
+				if !startClosed {
+					close(start)
+				}
+			}()
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-done:
+					t.Fatalf("shared lock setup: %v", err)
+				case <-ready:
+				}
+			}
+
+			close(start)
+			startClosed = true
+			for i := 0; i < 2; i++ {
+				if err := <-done; err != nil {
+					t.Fatalf("upgrade %d: %v", i, err)
+				}
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockScopesByHostAndFileNode(t *testing.T) {
+	simulation.Run(1, func() {
+		locked := make(chan struct{})
+		release := make(chan struct{})
+		p1err := make(chan error, 1)
+		simulation.Host("h1", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("h1 WriteFile: %v", err)
+			}
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.Open("/lock")
+					if err != nil {
+						p1err <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+						p1err <- err
+						return
+					}
+					close(locked)
+					<-release
+					p1err <- f.Close()
+				}()
+			})
+		})
+		select {
+		case err := <-p1err:
+			t.Fatalf("h1 lock setup: %v", err)
+		case <-locked:
+		}
+		releaseClosed := false
+		defer func() {
+			if !releaseClosed {
+				close(release)
+			}
+		}()
+
+		simulation.Host("h2", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("h2 WriteFile: %v", err)
+			}
+			simulation.Process("p2", func() {
+				f, err := os.Open("/lock")
+				if err != nil {
+					t.Fatalf("h2 Open: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("h2 same-path LOCK_EX|LOCK_NB: %v", err)
+				}
+			})
+		})
+		close(release)
+		releaseClosed = true
+		if err := <-p1err; err != nil {
+			t.Fatalf("h1 Close: %v", err)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFlockFollowsFileNodeAcrossRename(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			locked := make(chan struct{})
+			release := make(chan struct{})
+			p1err := make(chan error, 1)
+			simulation.Process("p1", func() {
+				go func() {
+					f, err := os.Open("/lock")
+					if err != nil {
+						p1err <- err
+						return
+					}
+					if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+						p1err <- err
+						return
+					}
+					close(locked)
+					<-release
+					p1err <- f.Close()
+				}()
+			})
+			select {
+			case err := <-p1err:
+				t.Fatalf("p1 lock setup: %v", err)
+			case <-locked:
+			}
+			releaseClosed := false
+			defer func() {
+				if !releaseClosed {
+					close(release)
+				}
+			}()
+
+			if err := os.Rename("/lock", "/renamed"); err != nil {
+				t.Fatalf("Rename: %v", err)
+			}
+			simulation.Process("p2", func() {
+				f, err := os.Open("/renamed")
+				if err != nil {
+					t.Fatalf("p2 Open renamed: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("LOCK_EX|LOCK_NB on renamed node = %v, want EWOULDBLOCK", err)
+				}
+			})
+			close(release)
+			releaseClosed = true
+			if err := <-p1err; err != nil {
+				t.Fatalf("p1 Close: %v", err)
+			}
+			simulation.Process("p2", func() {
+				f, err := os.Open("/renamed")
+				if err != nil {
+					t.Fatalf("p2 reopen renamed: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatalf("LOCK_EX after original fd close: %v", err)
+				}
+			})
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockDirectory(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/dir", 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		d1, err := os.Open("/dir")
+		if err != nil {
+			t.Fatalf("Open d1: %v", err)
+		}
+		defer d1.Close()
+		if err := syscall.Flock(int(d1.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatalf("d1 LOCK_EX: %v", err)
+		}
+		d2, err := os.Open("/dir")
+		if err != nil {
+			t.Fatalf("Open d2: %v", err)
+		}
+		defer d2.Close()
+		if err := syscall.Flock(int(d2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Fatalf("d2 LOCK_EX|LOCK_NB while d1 held = %v, want EWOULDBLOCK", err)
+		}
+		if err := syscall.Flock(int(d1.Fd()), syscall.LOCK_UN); err != nil {
+			t.Fatalf("d1 LOCK_UN: %v", err)
+		}
+		if err := syscall.Flock(int(d2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Fatalf("d2 LOCK_EX after unlock: %v", err)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFlockSyscallCloseReleases(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f, err := os.Open("/lock")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		fd := int(f.Fd())
+		if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+			t.Fatalf("LOCK_EX: %v", err)
+		}
+		if err := syscall.Close(fd); err != nil {
+			t.Fatalf("syscall.Close: %v", err)
+		}
+		if err := f.Close(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("File.Close after syscall.Close = %v, want ErrClosed", err)
+		}
+
+		g, err := os.Open("/lock")
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer g.Close()
+		if err := syscall.Flock(int(g.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Fatalf("LOCK_EX after syscall.Close release: %v", err)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFlockUnlockWakesBlockedExclusive(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f1, err := os.Open("/lock")
+		if err != nil {
+			t.Fatalf("Open f1: %v", err)
+		}
+		defer f1.Close()
+		if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatalf("f1 LOCK_EX: %v", err)
+		}
+
+		attempting := make(chan struct{})
+		done := make(chan error, 1)
+		f2, err := os.Open("/lock")
+		if err != nil {
+			t.Fatalf("Open f2: %v", err)
+		}
+		go func() {
+			close(attempting)
+			err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX)
+			if closeErr := f2.Close(); err == nil {
+				err = closeErr
+			}
+			done <- err
+		}()
+		<-attempting
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("blocking Flock returned before unlock: %v", err)
+		default:
+		}
+		if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+			t.Fatalf("f1 LOCK_UN: %v", err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("blocking Flock after unlock: %v", err)
+		}
+	})
+}
+
+func TestDSTFSVirtualFDFlockRawSyscallFenced(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(fd uintptr)
+	}{
+		{"Syscall", func(fd uintptr) { syscall.Syscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0) }},
+		{"RawSyscall", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			simulation.Run(1, func() {
+				f, err := os.Create("/lock")
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				fd := f.Fd()
+				defer f.Close()
+
+				defer func() {
+					r := recover()
+					if r == nil || !strings.Contains(fmt.Sprint(r), "unsupported under deterministic simulation") {
+						t.Fatalf("raw flock panic = %v, want unsupported-under-simulation", r)
+					}
+				}()
+				tt.call(fd)
+			})
+		})
+	}
+}
+
+func TestDSTFSVirtualFDFlockSlowDiskNoDelay(t *testing.T) {
+	const lat = 50 * time.Millisecond
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			f, err := os.Open("/lock")
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer f.Close()
+
+			simulation.SlowDisk("h", lat)
+			t0 := time.Now()
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+				t.Fatalf("LOCK_EX: %v", err)
+			}
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+				t.Fatalf("LOCK_UN: %v", err)
+			}
+			if d := time.Since(t0); d != 0 {
+				t.Fatalf("Flock under SlowDisk took %v, want 0", d)
+			}
+		})
+	})
+}
+
+func TestDSTFSVirtualFDFlockErrors(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.OpenFile("/lock", os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		fd := int(f.Fd())
+		if err := syscall.Flock(fd, syscall.LOCK_UN); err != nil {
+			t.Fatalf("Flock(LOCK_UN without holder): %v", err)
+		}
+		if err := syscall.Flock(fd, syscall.LOCK_NB); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("Flock(LOCK_NB only) = %v, want EINVAL", err)
+		}
+		if err := syscall.Flock(fd, syscall.LOCK_SH|syscall.LOCK_EX); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("Flock(LOCK_SH|LOCK_EX) = %v, want EINVAL", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := syscall.Flock(fd, syscall.LOCK_UN); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("Flock after close = %v, want EBADF", err)
 		}
 	})
 }

@@ -332,8 +332,10 @@ func (file *file) close() error {
 		var err error
 		if e := file.dstf.closeFile(); e != nil {
 			err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
+		} else {
+			dstReleaseFD(file)
+			dstDropClosedNode(file.dstf)
 		}
-		dstReleaseFD(file)
 		runtime.SetFinalizer(file, nil)
 		return err
 	}

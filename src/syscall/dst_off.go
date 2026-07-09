@@ -39,6 +39,8 @@ func dstTryFsync(fd int) (err Errno, handled bool) { return 0, false }
 
 func dstTryFdatasync(fd int) (err Errno, handled bool) { return 0, false }
 
+func dstTryFlock(fd int, how int) (err Errno, handled bool) { return 0, false }
+
 func dstTryMmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool) {
 	return nil, 0, false
 }

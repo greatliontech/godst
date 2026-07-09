@@ -493,6 +493,13 @@ syscalls before they can reach the host. Direct generic raw syscalls (`syscall.S
 split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
 descriptor.
 
+Linux virtual fds support BSD-style `syscall.Flock` on regular tree files and directories. Supported
+operations are `LOCK_EX`, `LOCK_SH`, `LOCK_UN`, and `LOCK_NB`. Locks are scoped to the simulated host and
+file node, owned by the simulated process and fd, and released when that fd closes. An incompatible
+nonblocking lock returns `EWOULDBLOCK`; an incompatible blocking lock waits until the lock becomes
+compatible. Crash-time release is part of process resource teardown in the fault contract. Other file-lock
+front doors remain fenced until they have a split-safe virtual-fd dispatch.
+
 Linux virtual fds support read-only shared file mappings for database page readers:
 `syscall.Mmap(fd, offset, length, PROT_READ, MAP_SHARED)` on a readable regular tree file returns a
 process-owned mapping over that file's current bytes without allocating or naming a host mapping. The
@@ -515,10 +522,10 @@ against the process cwd, the tree root, or the host filesystem. Rooted file, dir
 removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
 contracts as the named `os` surface.
 
-Symlinks and file locking are follow-on increments **and are fenced until then** — "not yet modeled"
-never means "reaches the host": within this feature's surface (the os file and namespace API;
-`os/exec`'s process surface is its own roadmap item), every handle-producing or namespace-touching
-entry point is either implemented in-sim or fails with the unsupported shape while a run is active
+Symlinks and unsupported file-locking surfaces are fenced until modeled — "not yet modeled" never means
+"reaches the host": within this feature's surface (the os file and namespace API; `os/exec`'s process
+surface is its own roadmap item), every handle-producing or namespace-touching entry point is either
+implemented in-sim or fails with the unsupported shape while a run is active
 (`os.Pipe` is simulated — see "Deterministic pipes and the stdio stance"). A `File` or `Root` opened
 BEFORE the run is a host-backed handle and stays outside the base model, exactly as inherited fds are
 for the network — program discipline, recorded here as the inherited-handle stance — and

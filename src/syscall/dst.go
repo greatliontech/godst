@@ -47,6 +47,7 @@ type dstFstatHook func(fd int, stat *Stat_t) (err Errno, handled bool)
 type dstSeekHook func(fd int, offset int64, whence int) (off int64, err Errno, handled bool)
 type dstFsyncHook func(fd int) (err Errno, handled bool)
 type dstFdatasyncHook func(fd int) (err Errno, handled bool)
+type dstFlockHook func(fd int, how int) (err Errno, handled bool)
 type dstMmapHook func(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool)
 type dstMunmapHook func(data []byte) (err Errno, handled bool)
 type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
@@ -61,6 +62,7 @@ var dstFstatHookFn dstFstatHook
 var dstSeekHookFn dstSeekHook
 var dstFsyncHookFn dstFsyncHook
 var dstFdatasyncHookFn dstFdatasyncHook
+var dstFlockHookFn dstFlockHook
 var dstMmapHookFn dstMmapHook
 var dstMunmapHookFn dstMunmapHook
 var dstMprotectHookFn dstMprotectHook
@@ -92,6 +94,9 @@ func dstSetFsyncHook(fn dstFsyncHook) { dstFsyncHookFn = fn }
 
 //go:linkname dstSetFdatasyncHook
 func dstSetFdatasyncHook(fn dstFdatasyncHook) { dstFdatasyncHookFn = fn }
+
+//go:linkname dstSetFlockHook
+func dstSetFlockHook(fn dstFlockHook) { dstFlockHookFn = fn }
 
 //go:linkname dstSetMmapHook
 func dstSetMmapHook(fn dstMmapHook) { dstMmapHookFn = fn }
@@ -173,6 +178,13 @@ func dstTryFdatasync(fd int) (err Errno, handled bool) {
 		return 0, false
 	}
 	return dstFdatasyncHookFn(fd)
+}
+
+func dstTryFlock(fd int, how int) (err Errno, handled bool) {
+	if !dstHookActive() || dstFlockHookFn == nil {
+		return 0, false
+	}
+	return dstFlockHookFn(fd, how)
 }
 
 func dstTryMmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err Errno, handled bool) {
