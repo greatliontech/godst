@@ -30,14 +30,15 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32))
 // which passes the same codes through runtime.dstNetPartitionOp. b is ignored for
 // the host/process-level ops.
 const (
-	dstPartOpPartition       uint32 = iota + 1 // cut host-pair (a,b), symmetric, blackhole connect
-	dstPartOpHeal                              // restore host-pair (a,b), both directions
-	dstPartOpIsolate                           // cut host a from all others
-	dstPartOpHealHost                          // restore host a
-	dstFaultOpResetPair                        // reset all conns between hosts a and b
-	dstFaultOpResetProc                        // reset all conns owned by process a
-	dstPartOpPartitionOneWay                   // cut ONLY direction a→b (asymmetric), blackhole connect
-	dstPartOpPartitionRefuse                   // cut host-pair (a,b), symmetric, refuse (ECONNREFUSED) connect
+	dstPartOpPartition           uint32 = iota + 1 // cut host-pair (a,b), symmetric, blackhole connect
+	dstPartOpHeal                                  // restore host-pair (a,b), both directions
+	dstPartOpIsolate                               // cut host a from all others
+	dstPartOpHealHost                              // restore host a
+	dstFaultOpResetPair                            // reset all conns between hosts a and b
+	dstFaultOpResetProc                            // reset all conns owned by process a
+	dstPartOpPartitionOneWay                       // cut ONLY direction a→b (asymmetric), blackhole connect
+	dstPartOpPartitionRefuse                       // cut host-pair (a,b), symmetric, refuse (ECONNREFUSED) connect
+	dstFaultOpCloseProcListeners                   // close all listeners owned by process a (crash teardown)
 )
 
 func init() { dstSetNetPartitionHook(dstApplyNetFaultOp) }
@@ -50,6 +51,8 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstResetPair(a, b)
 	case dstFaultOpResetProc:
 		dstResetProc(a)
+	case dstFaultOpCloseProcListeners:
+		dstCloseProcListeners(a)
 	default:
 		dstApplyPartitionOp(op, a, b)
 	}

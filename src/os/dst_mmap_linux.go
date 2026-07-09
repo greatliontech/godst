@@ -320,6 +320,29 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 	return 0, false
 }
 
+func dstMMapReleaseProc(proc uint32) {
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstMMapRegistry.mu.Lock()
+	defer dstMMapRegistry.mu.Unlock()
+	dstMMapRollLocked()
+	for key, bucket := range dstMMapRegistry.maps {
+		out := bucket[:0]
+		for _, entry := range bucket {
+			if entry.epoch == dstFSEpoch() && entry.proc == proc {
+				dstMMapSyncEntryLocked(entry)
+				continue
+			}
+			out = append(out, entry)
+		}
+		if len(out) == 0 {
+			delete(dstMMapRegistry.maps, key)
+		} else {
+			dstMMapRegistry.maps[key] = out
+		}
+	}
+}
+
 func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 	start, end, errno := dstMMapRange(data)
 	if errno != 0 {

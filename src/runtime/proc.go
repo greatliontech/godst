@@ -7861,16 +7861,25 @@ func runqget(pp *p) (gp *g, inheritTime bool) {
 // the local ring is P-owned and uncontended at P=1.
 func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	lock(&sched.lock)
-	c := dstCandidates{pp: pp, hasNext: pp.runnext != 0, h: pp.runqhead}
-	c.ringN = pp.runqtail - c.h
-	c.ovfN = uint32(pp.dstRunqOvf.size)
-	total := c.ringN + c.ovfN + uint32(sched.runq.size)
-	if c.hasNext {
-		total++
-	}
-	if total == 0 {
-		unlock(&sched.lock)
-		return nil, false
+	var c dstCandidates
+	var total uint32
+	for {
+		c = dstCandidates{pp: pp, hasNext: pp.runnext != 0, h: pp.runqhead}
+		c.ringN = pp.runqtail - c.h
+		c.ovfN = uint32(pp.dstRunqOvf.size)
+		total = c.ringN + c.ovfN + uint32(sched.runq.size)
+		if c.hasNext {
+			total++
+		}
+		if total == 0 {
+			unlock(&sched.lock)
+			return nil, false
+		}
+		if k, ok := c.firstCrashedG(total); ok {
+			c.removeAt(k)
+			continue
+		}
+		break
 	}
 	dstSchedDecisions++
 	// Runtime-internal goroutines outside any bubble (g.bubble == nil — the
@@ -7984,6 +7993,16 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 			return k, true
 		}
 		if dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+func (c *dstCandidates) firstCrashedG(total uint32) (uint32, bool) {
+	for k := uint32(0); k < total; k++ {
+		gp := c.at(k)
+		if gp != nil && gp.dstPid < 0 {
 			return k, true
 		}
 	}

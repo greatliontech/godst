@@ -49,6 +49,8 @@ func dstFD(file *file) int { return -1 }
 
 func dstReleaseFD(file *file) {}
 
+func dstUnregisterOpenFile(file *file) {}
+
 func dstDropClosedNode(backend dstFileBackend) {}
 
 // dstErrUnsupportedFS exists untagged only so fence gates type-check; every

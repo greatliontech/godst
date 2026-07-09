@@ -1345,6 +1345,70 @@ func dstPidStarttime(pid int32) (start uint64, ok bool) {
 	return uint64(pid), true
 }
 
+// dstCrashProcessPid marks one process invocation dead and removes its goroutine
+// subtree from synctest liveness accounting. The logical process id (dstProc) is
+// stable across restarts, so crash scheduling keys by the per-invocation pid: a
+// restarted process gets a fresh pid and must not be suppressed with the old one.
+// Reached from testing/simulation's process-teardown path by //go:linkname.
+//
+//go:linkname dstCrashProcessPid
+func dstCrashProcessPid(pid int32) {
+	if pid <= 0 {
+		return
+	}
+	dstSetPidLive(pid, false)
+	dstMarkProcessGoroutinesCrashed(pid)
+}
+
+func dstSynctestRunningStatus(gp *g, status uint32) bool {
+	if status == _Gdead || status == _Gdeadextra {
+		return false
+	}
+	if status == _Gwaiting && gp.waitreason.isIdleInSynctest() {
+		return false
+	}
+	return true
+}
+
+func dstMarkProcessGoroutinesCrashed(pid int32) {
+	bubble := dstSimBubble
+	if bubble == nil {
+		return
+	}
+	var total, running int
+	forEachG(func(gp *g) {
+		if gp.bubble != bubble || gp.dstPid != pid {
+			return
+		}
+		status := readgstatus(gp) &^ _Gscan
+		gp.dstPid = -pid
+		if status == _Gdead || status == _Gdeadextra {
+			return
+		}
+		total++
+		if dstSynctestRunningStatus(gp, status) {
+			running++
+		}
+	})
+	if total == 0 {
+		return
+	}
+	lock(&bubble.mu)
+	bubble.total -= total
+	bubble.running -= running
+	if bubble.total < 0 {
+		fatal("total < 0")
+	}
+	if bubble.running < 0 {
+		fatal("running < 0")
+	}
+	wake := bubble.maybeWakeLocked()
+	unlock(&bubble.mu)
+	if wake != nil {
+		goready(wake, 0)
+	}
+}
+
 // dstSetProcessPid stamps the calling goroutine's pid and returns the previous
 // value, so testing/simulation.Process can restore it when its body returns. The
 // pid inherits to child goroutines at newproc1 (the labeled subtree), so the whole
@@ -1637,6 +1701,28 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32)) { dstNetPartitionHook = fn
 func dstNetPartitionOp(op, a, b uint32) {
 	if dstNetPartitionHook != nil {
 		dstNetPartitionHook(op, a, b)
+	}
+}
+
+// dstProcessTeardownHook is os's handler for process-owned resource teardown
+// (open simulated Files, virtual fds/flocks, and mmap registrations). Runtime is
+// the dependency-free relay so testing/simulation can drive process death without
+// importing os.
+var dstProcessTeardownHook func(proc uint32)
+
+// dstSetProcessTeardownHook registers os's process resource teardown handler.
+// Reached via //go:linkname from os's init.
+//
+//go:linkname dstSetProcessTeardownHook
+func dstSetProcessTeardownHook(fn func(proc uint32)) { dstProcessTeardownHook = fn }
+
+// dstProcessTeardown invokes os's resource teardown handler. Reached via
+// //go:linkname from testing/simulation's process-teardown path.
+//
+//go:linkname dstProcessTeardown
+func dstProcessTeardown(proc uint32) {
+	if dstProcessTeardownHook != nil {
+		dstProcessTeardownHook(proc)
 	}
 }
 

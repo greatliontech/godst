@@ -714,6 +714,14 @@ ops are abandoned — a crash does not, cannot in Go, force-unwind a goroutine m
 model is *they never run again*, what a killed process's threads do), conns RST, fds drop, memory is gone.
 The host crash additionally tears the host disk; the process crash leaves it intact.
 
+Process resource teardown is the shared substrate for process crash, OOM, and restart: the active process
+invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines are removed from
+the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close, fd-owned `flock`s
+release, process-owned mappings unregister after writable `MAP_SHARED` bytes are copied into host file state,
+and connections owned by either process endpoint reset. The logical process id remains stable for targeting
+and resource registries, while the pid is the invocation generation; a same-name restart gets a fresh pid and
+does not revive the crashed goroutines.
+
 **OOM** is a **process crash** whose *trigger* is the per-process allocation counter crossing a budget
 (cgroup-style per-process budget by default; a host-total kernel-OOM with victim selection is a recordable
 variant). The budget must sit above the counter's **noise floor** (a few KB — the counter carries
@@ -741,11 +749,11 @@ sibling waits on, so abandonment is sound. File locks are modeled as per-process
 process crash must also release that process's `flock`s — the kernel does on process death — and the
 per-process fd table provides that ownership boundary.
 
-**The load-bearing mechanism (the crash chunk's work, contained, non-foreclosing).** synctest tears down a
-*whole* bubble; **per-victim teardown** — descheduling one process's (or host's) goids, abandoning their
-durable blocks without tripping the bubble's deadlock detector (crashed goroutines are *permanently
-parked, not deadlocked*), and resetting their resources — is the crash axis's hard part. It is scoped to
-the crash chunk and depends on nothing the network/disk/clock axes defer; those axes do not need it.
+**The load-bearing mechanism (contained, non-foreclosing).** synctest tears down a *whole* bubble; the
+process-scoped substrate now handles **per-victim teardown** for one process invocation — descheduling its
+goids, abandoning their durable blocks without tripping the bubble's deadlock detector (crashed goroutines are
+*permanently parked, not deadlocked*), and resetting process-owned resources. Host-wide process enumeration,
+host disk tear, and public crash/restart orchestration build on that same substrate.
 
 ### Scheduling faults (Seq 5's deferred 5c, folded in here)
 

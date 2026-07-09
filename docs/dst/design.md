@@ -507,7 +507,9 @@ host descriptor, and the raw-syscall fence still catches host-resource minting a
 syscalls before they can reach the host. Direct generic raw syscalls (`syscall.Syscall*` and
 `golang.org/x/sys/unix` wrappers that bottom out there) remain fenced for virtual fd numbers until a
 split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
-descriptor.
+descriptor. Process teardown closes every simulated file owned by the victim process and releases its
+virtual descriptors, so stale fd capabilities fail as closed/bad-fd and any fd-owned kernel state is
+dropped with the process.
 
 Linux virtual fds support BSD-style `syscall.Flock` on regular tree files and directories. Supported
 operations are `LOCK_EX`, `LOCK_SH`, `LOCK_UN`, and `LOCK_NB`. Locks are scoped to the simulated host and
@@ -530,7 +532,9 @@ bytes at map time and later normal writes to the same simulated file node update
 matching the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; `Mprotect` preserving
 read/write protection succeeds for writable mappings. Attempts to create writable private mappings, map
 without the required fd access mode, overlap a live mapping in a way that would require moving that mapping,
-or unmap only a subrange fail deterministically. `Madvise` on such
+or unmap only a subrange fail deterministically. Process teardown unregisters the victim process's mappings;
+writable shared mappings first copy their bytes back to the host file state, because the mapped file contents
+are page-cache state, not process memory. `Madvise` on such
 mappings accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
 `MADV_COLD`) without touching the host; unsupported advice values fail deterministically. Mapping slices
 are process-owned capabilities, not an IPC channel: passing one to another simulated process is outside the

@@ -60,6 +60,58 @@ var dstFS struct {
 	cwds  map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
 }
 
+var dstOpenFiles struct {
+	mu    sync.Mutex
+	epoch uint64
+	files map[*file]dstOpenFileEntry
+}
+
+type dstOpenFileEntry struct {
+	proc uint32
+}
+
+func dstOpenFilesRollLocked() {
+	if e := dstFSEpoch(); e != dstOpenFiles.epoch || dstOpenFiles.files == nil {
+		dstOpenFiles.epoch = e
+		dstOpenFiles.files = make(map[*file]dstOpenFileEntry)
+	}
+}
+
+func dstRegisterOpenFile(f *file, proc uint32) {
+	dstOpenFiles.mu.Lock()
+	dstOpenFilesRollLocked()
+	dstOpenFiles.files[f] = dstOpenFileEntry{proc: proc}
+	dstOpenFiles.mu.Unlock()
+}
+
+func dstUnregisterOpenFile(f *file) {
+	dstOpenFiles.mu.Lock()
+	dstOpenFilesRollLocked()
+	delete(dstOpenFiles.files, f)
+	dstOpenFiles.mu.Unlock()
+}
+
+func dstCloseProcFiles(proc uint32) {
+	dstOpenFiles.mu.Lock()
+	dstOpenFilesRollLocked()
+	var files []*file
+	for f, entry := range dstOpenFiles.files {
+		if entry.proc == proc {
+			files = append(files, f)
+			delete(dstOpenFiles.files, f)
+		}
+	}
+	dstOpenFiles.mu.Unlock()
+	for _, f := range files {
+		if f.dstf == nil {
+			continue
+		}
+		_ = f.dstf.closeFile()
+		dstReleaseFD(f)
+		dstDropClosedNode(f.dstf)
+	}
+}
+
 // dstFSDisk is one host's tree (its filesystem). The durability state lives on the
 // nodes; a host's disk is what a host (power-loss) crash later restores.
 //
@@ -877,6 +929,8 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 func dstNewFile(d dstFileBackend, name string) *File {
 	f := &File{&file{name: name, dstf: d}}
 	f.pfd.Sysfd = -1
+	_, proc := dstFSCurrentNode()
+	dstRegisterOpenFile(f.file, proc)
 	runtime.SetFinalizer(f.file, (*file).close)
 	return f
 }

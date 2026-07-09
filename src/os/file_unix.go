@@ -333,6 +333,7 @@ func (file *file) close() error {
 		if e := file.dstf.closeFile(); e != nil {
 			err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
 		} else {
+			dstUnregisterOpenFile(file)
 			dstReleaseFD(file)
 			dstDropClosedNode(file.dstf)
 		}

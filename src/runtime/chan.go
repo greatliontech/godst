@@ -994,6 +994,9 @@ func (q *waitq) dequeue() *sudog {
 				continue
 			}
 		}
+		if dstBuild && sgp.g.dstPid < 0 {
+			continue
+		}
 
 		return sgp
 	}

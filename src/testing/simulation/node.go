@@ -50,6 +50,12 @@ func dstSetProcessPid(pid int32) (old int32)
 //go:linkname dstSetPidLive runtime.dstSetPidLive
 func dstSetPidLive(pid int32, live bool)
 
+//go:linkname dstCrashProcessPid runtime.dstCrashProcessPid
+func dstCrashProcessPid(pid int32)
+
+//go:linkname dstProcessTeardown runtime.dstProcessTeardown
+func dstProcessTeardown(proc uint32)
+
 //go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
 func dstProcAllocEnsure(procid uint32)
 
@@ -224,6 +230,11 @@ var nodeReg struct {
 	nextProc uint32
 }
 
+var activeProcs struct {
+	mu   sync.Mutex
+	pids map[uint32][]int32
+}
+
 func nodeRegReset() {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
@@ -231,6 +242,47 @@ func nodeRegReset() {
 	nodeReg.procs = make(map[string]uint32)
 	nodeReg.nextHost = 0
 	nodeReg.nextProc = 0
+	activeProcs.mu.Lock()
+	activeProcs.pids = make(map[uint32][]int32)
+	activeProcs.mu.Unlock()
+}
+
+func activeProcSet(proc uint32, pid int32) {
+	activeProcs.mu.Lock()
+	if activeProcs.pids == nil {
+		activeProcs.pids = make(map[uint32][]int32)
+	}
+	activeProcs.pids[proc] = append(activeProcs.pids[proc], pid)
+	activeProcs.mu.Unlock()
+}
+
+func activeProcClear(proc uint32, pid int32) {
+	activeProcs.mu.Lock()
+	pids := activeProcs.pids[proc]
+	for i, p := range pids {
+		if p == pid {
+			pids = append(pids[:i], pids[i+1:]...)
+			break
+		}
+	}
+	if len(pids) == 0 {
+		delete(activeProcs.pids, proc)
+	} else {
+		activeProcs.pids[proc] = pids
+	}
+	activeProcs.mu.Unlock()
+}
+
+func activeProcPIDs(proc uint32) []int32 {
+	activeProcs.mu.Lock()
+	defer activeProcs.mu.Unlock()
+	return append([]int32(nil), activeProcs.pids[proc]...)
+}
+
+func activeProcClearAll(proc uint32) {
+	activeProcs.mu.Lock()
+	delete(activeProcs.pids, proc)
+	activeProcs.mu.Unlock()
 }
 
 func internHost(name string) uint32 {
@@ -344,6 +396,27 @@ func lookupProc(name string) uint32 {
 	return 0
 }
 
+func crashProcess(name string) {
+	proc := lookupProc(name)
+	if proc == 0 {
+		return
+	}
+	pids := activeProcPIDs(proc)
+	if len(pids) == 0 {
+		if runActive.Load() {
+			panic("testing/simulation: process " + strconv.Quote(name) + " is not live")
+		}
+		return
+	}
+	activeProcClearAll(proc)
+	dstProcessTeardown(proc)
+	dstNetPartitionOp(partOpResetProc, proc, 0)
+	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+	for _, pid := range pids {
+		dstCrashProcessPid(pid)
+	}
+}
+
 // Process runs f as the named process — the unit of crash/restart and memory
 // isolation. A Process declared inside a Host body runs on that host; a Process
 // outside any Host gets an implicit dedicated host named after the process (the
@@ -365,16 +438,18 @@ func Process(name string, f func()) {
 		// the reboot. A first-ever implicit host reads the per-run table's zero
 		// entry (in-sync, rate 1) with no call needed.
 	}
-	pid := internProc(name)
-	dstProcAllocEnsure(pid) // per-process allocation counter exists before the body allocates
-	oldH, oldP := dstSetNode(host, pid)
+	proc := internProc(name)
+	dstProcAllocEnsure(proc) // per-process allocation counter exists before the body allocates
+	oldH, oldP := dstSetNode(host, proc)
 	simPid := dstAllocPid()
 	oldPid := dstSetProcessPid(simPid)
+	activeProcSet(proc, simPid)
 	live := false
 	defer func() {
 		if live {
 			dstSetPidLive(simPid, false)
 		}
+		activeProcClear(proc, simPid)
 		dstSetProcessPid(oldPid)
 		dstSetNode(oldH, oldP)
 	}()

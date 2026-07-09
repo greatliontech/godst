@@ -135,3 +135,28 @@ func dstResetProc(p uint32) {
 		return c.localProc == p || c.remoteProc == p
 	})
 }
+
+func dstCloseProcListeners(p uint32) {
+	type victim struct {
+		key string
+		l   *dstListener
+	}
+	dstNet.mu.Lock()
+	dstNetRoll()
+	var victims []victim
+	for key, l := range dstNet.listeners {
+		if l.proc == p {
+			victims = append(victims, victim{key: key, l: l})
+		}
+	}
+	dstNet.mu.Unlock()
+	sort.Slice(victims, func(i, j int) bool { return victims[i].key < victims[j].key })
+	seen := make(map[*dstListener]bool)
+	for _, v := range victims {
+		if seen[v.l] {
+			continue
+		}
+		seen[v.l] = true
+		v.l.Close()
+	}
+}

@@ -58,6 +58,9 @@ type synctestBubble struct {
 // changegstatus is called when the non-lock status of a g changes.
 // It is never called with a Gscanstatus.
 func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
+	if gp.dstPid < 0 {
+		return
+	}
 	// Determine whether this change in status affects the idleness of the bubble.
 	// If this isn't a goroutine starting, stopping, durably blocking,
 	// or waking up after durably blocking, then return immediately without

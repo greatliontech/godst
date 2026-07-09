@@ -176,6 +176,26 @@ func dstReleaseBackendFDs(backend dstFileBackend) {
 	}
 }
 
+func dstReleaseProcFDs(proc uint32) {
+	type release struct {
+		fd    int
+		entry dstFDEntry
+	}
+	var releases []release
+	dstFDRegistry.mu.Lock()
+	dstFDRollLocked()
+	for fd, entry := range dstFDRegistry.fds {
+		if entry.proc == proc {
+			delete(dstFDRegistry.fds, fd)
+			releases = append(releases, release{fd: fd, entry: entry})
+		}
+	}
+	dstFDRegistry.mu.Unlock()
+	for _, rel := range releases {
+		dstFlockReleaseFD(rel.entry, rel.fd)
+	}
+}
+
 func dstDropClosedNode(backend dstFileBackend) {
 	if file, ok := backend.(*dstFile); ok {
 		file.dropClosedNode()

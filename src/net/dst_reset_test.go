@@ -202,6 +202,42 @@ func TestDSTNetResetProcess(t *testing.T) {
 	}
 }
 
+func TestDSTNetResetProcessLeavesListenerOpen(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var dialErr, acceptErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		simulation.Process("worker", func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			simulation.ResetProcess("worker")
+			accepted := make(chan struct{})
+			go func() {
+				c, err := ln.Accept()
+				acceptErr = err
+				if err == nil {
+					c.Close()
+				}
+				close(accepted)
+			}()
+			c, err := Dial("tcp", "127.0.0.1:"+p)
+			dialErr = err
+			if err == nil {
+				c.Close()
+			}
+			<-accepted
+			ln.Close()
+		})
+	})
+	if dialErr != nil {
+		t.Fatalf("Dial after ResetProcess on listener owner = %v, want nil", dialErr)
+	}
+	if acceptErr != nil {
+		t.Fatalf("Accept after ResetProcess on listener owner = %v, want nil", acceptErr)
+	}
+}
+
 // TestDSTNetResetDeterminism: reset runs replay exactly for a given seed.
 func TestDSTNetResetDeterminism(t *testing.T) {
 	if !dstNetEnabled {
