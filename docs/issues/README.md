@@ -10,7 +10,6 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb shared writable lock-file mmap](./dst-gmdb-shared-writable-mmap.md) | 6 |
 | [DST gmdb Kill pid-zero liveness](./dst-gmdb-kill-pid0.md) | 7 |
 | [DST gmdb proc starttime and namespace identity](./dst-gmdb-proc-starttime-namespace.md) | 8 |
 | [DST gmdb clock_gettime virtualization](./dst-gmdb-clockgettime.md) | 9 |

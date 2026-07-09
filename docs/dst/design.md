@@ -500,14 +500,21 @@ nonblocking lock returns `EWOULDBLOCK`; an incompatible blocking lock waits unti
 compatible. Crash-time release is part of process resource teardown in the fault contract. Other file-lock
 front doors remain fenced until they have a split-safe virtual-fd dispatch.
 
-Linux virtual fds support read-only shared file mappings for database page readers:
+Linux virtual fds support shared file mappings for database page readers and lock-file coordination:
 `syscall.Mmap(fd, offset, length, PROT_READ, MAP_SHARED)` on a readable regular tree file returns a
-process-owned mapping over that file's current bytes without allocating or naming a host mapping. The
-mapping lifetime is independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap`
-unregisters it, and the run epoch resets any residue. Reads through the mapping observe the bytes at map
-time and later normal writes to the same simulated file node update the overlapping mapped bytes, matching
-the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; attempts to request writable
-protection or writable/private mappings return deterministic kernel-shaped errors. `Madvise` on such
+process-owned mapping over that file's current bytes without allocating or naming a host mapping.
+`syscall.Mmap(fd, offset, length, PROT_READ|PROT_WRITE, MAP_SHARED)` on a read/write regular tree file
+returns a writable mapping backed by the simulated host's shared file state. Co-located processes mapping
+the same file range, or overlapping bytes of supported shared ranges, observe each other's writes through
+that mapped file state; `sync/atomic` operations on shared mapped bytes announce the same file-byte identity
+to DST's access scheduler. The mapping lifetime is
+independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap` unregisters exactly the
+mapping passed to it, and the run epoch resets any residue. Reads through read-only mappings observe the
+bytes at map time and later normal writes to the same simulated file node update overlapping mapped bytes,
+matching the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; `Mprotect` preserving
+read/write protection succeeds for writable mappings. Attempts to create writable private mappings, map
+without the required fd access mode, overlap a live mapping in a way that would require moving that mapping,
+or unmap only a subrange fail deterministically. `Madvise` on such
 mappings accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
 `MADV_COLD`) without touching the host; unsupported advice values fail deterministically. Mapping slices
 are process-owned capabilities, not an IPC channel: passing one to another simulated process is outside the

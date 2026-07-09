@@ -3,7 +3,7 @@
 - [x] 3. DST gmdb compatibility: add virtual-fd `Fdatasync`, virtual-fd `Fsync`, and directory-entry durability through directory fsync.
 - [x] 4. DST gmdb compatibility: implement `os.OpenRoot` and rooted file operations over the in-memory filesystem.
 - [x] 5. DST gmdb compatibility: implement process-owned `Flock` over shared host files.
-- [ ] 6. DST gmdb compatibility: add shared writable lock-file mmap with cross-process visibility and scheduler-visible atomic races.
+- [x] 6. DST gmdb compatibility: add shared writable lock-file mmap with cross-process visibility and scheduler-visible atomic races.
 - [ ] 7. DST gmdb compatibility: implement simulated `Kill(pid, 0)` liveness over DST process identities.
 - [ ] 8. DST gmdb compatibility: add synthetic `/proc/<pid>/stat` starttime and `/proc/self/ns/pid` identity.
 - [ ] 9. DST gmdb compatibility: virtualize `ClockGettime(CLOCK_MONOTONIC)` and `ClockGettime(CLOCK_BOOTTIME)`.

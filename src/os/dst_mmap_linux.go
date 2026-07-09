@@ -37,24 +37,26 @@ func init() {
 }
 
 type dstMMapEntry struct {
-	data  []byte
-	node  *dstFSNode
-	epoch uint64
-	host  uint32
-	proc  uint32
-	off   int64
+	data     []byte
+	base     []byte
+	node     *dstFSNode
+	epoch    uint64
+	host     uint32
+	proc     uint32
+	off      int64
+	writable bool
 }
 
 var dstMMapRegistry struct {
 	mu    sync.Mutex
 	epoch uint64
-	maps  map[*byte]*dstMMapEntry
+	maps  map[*byte][]*dstMMapEntry
 }
 
 func dstMMapRollLocked() {
 	if e := dstFSEpoch(); e != dstMMapRegistry.epoch || dstMMapRegistry.maps == nil {
 		dstMMapRegistry.epoch = e
-		dstMMapRegistry.maps = make(map[*byte]*dstMMapEntry)
+		dstMMapRegistry.maps = make(map[*byte][]*dstMMapEntry)
 	}
 }
 
@@ -88,9 +90,10 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	if offset%int64(syscall.Getpagesize()) != 0 {
 		return nil, syscall.EINVAL, true
 	}
-	if prot != syscall.PROT_READ {
+	if prot != syscall.PROT_READ && prot != syscall.PROT_READ|syscall.PROT_WRITE {
 		return nil, syscall.EACCES, true
 	}
+	writable := prot&syscall.PROT_WRITE != 0
 	if flags != syscall.MAP_SHARED {
 		return nil, syscall.EINVAL, true
 	}
@@ -104,7 +107,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		return nil, dstFDErr(err), true
 	}
 	defer file.leave()
-	if !file.rd {
+	if !file.rd || writable && !file.wr {
 		return nil, syscall.EACCES, true
 	}
 	if err := file.diskEIO(); err != nil {
@@ -114,25 +117,96 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		return nil, syscall.EINVAL, true
 	}
 
-	data := make([]byte, length)
-	copy(data, file.node.data[offset:offset+int64(length)])
-	key, errno := dstMMapKey(data)
-	if errno != 0 {
-		return nil, errno, true
-	}
+	dstMMapSyncLocked(file.node)
 	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	dstMMapRegistry.maps[key] = &dstMMapEntry{
-		data:  data,
-		node:  file.node,
-		epoch: dstFSEpoch(),
-		host:  host,
-		proc:  proc,
-		off:   offset,
+	data, base, errno := dstMMapDataLocked(file.node, offset, length)
+	if errno != 0 {
+		dstMMapRegistry.mu.Unlock()
+		return nil, errno, true
 	}
+	key, errno := dstMMapKey(data)
+	if errno != 0 {
+		dstMMapRegistry.mu.Unlock()
+		return nil, errno, true
+	}
+	dstMMapRegistry.maps[key] = append(dstMMapRegistry.maps[key], &dstMMapEntry{
+		data:     data,
+		base:     base,
+		node:     file.node,
+		epoch:    dstFSEpoch(),
+		host:     host,
+		proc:     proc,
+		off:      offset,
+		writable: writable,
+	})
 	dstMMapRegistry.mu.Unlock()
 	return data, 0, true
+}
+
+func dstMMapDataLocked(node *dstFSNode, offset int64, length int) ([]byte, []byte, syscall.Errno) {
+	end := offset + int64(length)
+	start := int(offset)
+	stop := int(end)
+	var overlapCandidate, spareCandidate []byte
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.node != node || entry.epoch != dstFSEpoch() {
+				continue
+			}
+			mapStart := entry.off
+			mapEnd := entry.off + int64(len(entry.data))
+			overlaps := offset < mapEnd && end > mapStart
+			if overlaps {
+				if int64(cap(entry.base)) < end {
+					return nil, nil, syscall.EINVAL
+				}
+				if overlapCandidate == nil {
+					overlapCandidate = entry.base
+				} else if &overlapCandidate[0] != &entry.base[0] {
+					return nil, nil, syscall.EINVAL
+				}
+			} else if int64(cap(entry.base)) >= end && dstMMapPreferSpare(entry.base, spareCandidate) {
+				spareCandidate = entry.base
+			}
+		}
+	}
+	candidate := overlapCandidate
+	if candidate == nil {
+		candidate = spareCandidate
+	}
+	if candidate != nil {
+		copy(candidate, node.data)
+		return candidate[start:stop:stop], candidate, 0
+	}
+	base := dstMMapNewBase(node, end)
+	return base[start:stop:stop], base, 0
+}
+
+func dstMMapPreferSpare(candidate, current []byte) bool {
+	if current == nil || cap(candidate) > cap(current) {
+		return true
+	}
+	if cap(candidate) < cap(current) {
+		return false
+	}
+	return uintptr(unsafe.Pointer(&candidate[0])) < uintptr(unsafe.Pointer(&current[0]))
+}
+
+func dstMMapNewBase(node *dstFSNode, size int64) []byte {
+	reserve := int(size)
+	if reserve < len(node.data) {
+		reserve = len(node.data)
+	}
+	if page := syscall.Getpagesize(); reserve < page {
+		reserve = page
+	} else if rem := reserve % page; rem != 0 {
+		reserve += page - rem
+	}
+	base := make([]byte, reserve)
+	copy(base, node.data)
+	return base
 }
 
 func dstMMapLookupExact(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
@@ -143,15 +217,25 @@ func dstMMapLookupExact(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
 	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	entry := dstMMapRegistry.maps[key]
-	dstMMapRegistry.mu.Unlock()
-	if entry == nil {
+	bucket := dstMMapRegistry.maps[key]
+	defer dstMMapRegistry.mu.Unlock()
+	if len(bucket) == 0 {
 		return nil, 0, false
 	}
-	if entry.epoch != dstFSEpoch() || entry.host != host || entry.proc != proc || len(entry.data) == 0 || &entry.data[0] != &data[0] {
+	for _, entry := range bucket {
+		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
+			return entry, 0, true
+		}
+	}
+	for _, entry := range bucket {
+		if entry.epoch == dstFSEpoch() && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
+			return nil, syscall.EINVAL, true
+		}
+	}
+	if len(bucket) != 0 {
 		return nil, syscall.EINVAL, true
 	}
-	return entry, 0, true
+	return nil, 0, false
 }
 
 func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
@@ -162,56 +246,119 @@ func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
 	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	var entry *dstMMapEntry
-	for _, candidate := range dstMMapRegistry.maps {
-		mapStart, mapEnd, errno := dstMMapRange(candidate.data)
-		if errno != 0 {
-			continue
-		}
-		if start >= mapStart && end <= mapEnd {
-			entry = candidate
-			break
+	var foundOther bool
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, candidate := range bucket {
+			mapStart, mapEnd, errno := dstMMapRange(candidate.data)
+			if errno != 0 {
+				continue
+			}
+			if start < mapStart || end > mapEnd {
+				continue
+			}
+			if candidate.epoch == dstFSEpoch() && candidate.host == host && candidate.proc == proc {
+				dstMMapRegistry.mu.Unlock()
+				return candidate, 0, true
+			}
+			if candidate.epoch == dstFSEpoch() {
+				foundOther = true
+			}
 		}
 	}
 	dstMMapRegistry.mu.Unlock()
-	if entry == nil {
-		return nil, 0, false
-	}
-	if entry.epoch != dstFSEpoch() || entry.host != host || entry.proc != proc {
+	if foundOther {
 		return nil, syscall.EINVAL, true
 	}
-	return entry, 0, true
+	return nil, 0, false
 }
 
 func dstMunmap(data []byte) (syscall.Errno, bool) {
-	entry, errno, handled := dstMMapLookupExact(data)
-	if !handled || errno != 0 {
-		if !handled {
-			if _, rangeErrno, rangeHandled := dstMMapLookupRange(data); rangeHandled {
-				if rangeErrno != 0 {
-					return rangeErrno, true
-				}
+	key, errno := dstMMapKey(data)
+	if errno != 0 {
+		return errno, true
+	}
+	start, end, errno := dstMMapRange(data)
+	if errno != 0 {
+		return errno, true
+	}
+	host, proc := dstFSCurrentNode()
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstMMapRegistry.mu.Lock()
+	defer dstMMapRegistry.mu.Unlock()
+	dstMMapRollLocked()
+	bucket := dstMMapRegistry.maps[key]
+	for i := len(bucket) - 1; i >= 0; i-- {
+		entry := bucket[i]
+		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
+			dstMMapSyncEntryLocked(entry)
+			bucket = append(bucket[:i], bucket[i+1:]...)
+			if len(bucket) == 0 {
+				delete(dstMMapRegistry.maps, key)
+			} else {
+				dstMMapRegistry.maps[key] = bucket
+			}
+			return 0, true
+		}
+	}
+	for _, entry := range bucket {
+		if entry.epoch == dstFSEpoch() && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
+			return syscall.EINVAL, true
+		}
+	}
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			mapStart, mapEnd, errno := dstMMapRange(entry.data)
+			if errno != 0 {
+				continue
+			}
+			if start >= mapStart && end <= mapEnd && entry.epoch == dstFSEpoch() {
 				return syscall.EINVAL, true
 			}
 		}
-		return errno, handled
 	}
-	key := &entry.data[cap(entry.data)-1]
-	dstMMapRegistry.mu.Lock()
-	delete(dstMMapRegistry.maps, key)
-	dstMMapRegistry.mu.Unlock()
-	return 0, true
+	return 0, false
 }
 
 func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
-	_, errno, handled := dstMMapLookupRange(data)
-	if !handled || errno != 0 {
-		return errno, handled
+	start, end, errno := dstMMapRange(data)
+	if errno != 0 {
+		return errno, true
 	}
-	if prot != syscall.PROT_READ {
+	host, proc := dstFSCurrentNode()
+	dstMMapRegistry.mu.Lock()
+	dstMMapRollLocked()
+	var foundCurrent, foundOther, foundWritable bool
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			mapStart, mapEnd, errno := dstMMapRange(entry.data)
+			if errno != 0 || start < mapStart || end > mapEnd || entry.epoch != dstFSEpoch() {
+				continue
+			}
+			if entry.host == host && entry.proc == proc {
+				foundCurrent = true
+				if entry.writable {
+					foundWritable = true
+				}
+			} else {
+				foundOther = true
+			}
+		}
+	}
+	dstMMapRegistry.mu.Unlock()
+	if foundCurrent {
+		if prot == syscall.PROT_READ {
+			return 0, true
+		}
+		if prot == syscall.PROT_READ|syscall.PROT_WRITE && foundWritable {
+			return 0, true
+		}
 		return syscall.EACCES, true
 	}
-	return 0, true
+	if foundOther {
+		return syscall.EINVAL, true
+	}
+	return 0, false
 }
 
 func dstMadvise(data []byte, advice int) (syscall.Errno, bool) {
@@ -232,44 +379,81 @@ func dstMMapWriteLocked(node *dstFSNode, off int64, p []byte) {
 	}
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	for _, entry := range dstMMapRegistry.maps {
-		if entry.node != node {
-			continue
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.node != node {
+				continue
+			}
+			start := off
+			end := off + int64(len(p))
+			mapStart := entry.off
+			mapEnd := entry.off + int64(len(entry.data))
+			if end <= mapStart || start >= mapEnd {
+				continue
+			}
+			if start < mapStart {
+				start = mapStart
+			}
+			if end > mapEnd {
+				end = mapEnd
+			}
+			copy(entry.data[start-mapStart:end-mapStart], p[start-off:end-off])
 		}
-		start := off
-		end := off + int64(len(p))
-		mapStart := entry.off
-		mapEnd := entry.off + int64(len(entry.data))
-		if end <= mapStart || start >= mapEnd {
-			continue
-		}
-		if start < mapStart {
-			start = mapStart
-		}
-		if end > mapEnd {
-			end = mapEnd
-		}
-		copy(entry.data[start-mapStart:end-mapStart], p[start-off:end-off])
 	}
 	dstMMapRegistry.mu.Unlock()
+}
+
+func dstMMapSyncLocked(node *dstFSNode) {
+	dstMMapRegistry.mu.Lock()
+	dstMMapRollLocked()
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.node != node {
+				continue
+			}
+			dstMMapSyncEntryLocked(entry)
+		}
+	}
+	dstMMapRegistry.mu.Unlock()
+}
+
+func dstMMapSyncEntryLocked(entry *dstMMapEntry) {
+	if !entry.writable {
+		return
+	}
+	node := entry.node
+	start := entry.off
+	end := entry.off + int64(len(entry.data))
+	if end <= 0 || start >= int64(len(node.data)) {
+		return
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > int64(len(node.data)) {
+		end = int64(len(node.data))
+	}
+	copy(node.data[start:end], entry.data[start-entry.off:end-entry.off])
 }
 
 func dstMMapTruncateLocked(node *dstFSNode, size int64) {
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	for _, entry := range dstMMapRegistry.maps {
-		if entry.node != node {
-			continue
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.node != node {
+				continue
+			}
+			mapEnd := entry.off + int64(len(entry.data))
+			if size >= mapEnd {
+				continue
+			}
+			clearStart := size - entry.off
+			if clearStart < 0 {
+				clearStart = 0
+			}
+			clear(entry.data[clearStart:])
 		}
-		mapEnd := entry.off + int64(len(entry.data))
-		if size >= mapEnd {
-			continue
-		}
-		clearStart := size - entry.off
-		if clearStart < 0 {
-			clearStart = 0
-		}
-		clear(entry.data[clearStart:])
 	}
 	dstMMapRegistry.mu.Unlock()
 }

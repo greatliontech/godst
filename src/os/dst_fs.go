@@ -597,6 +597,7 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 // truncateLocked clamps or zero-extends current content. Caller holds
 // dstFS.mu. Shared by handle and named truncate.
 func (node *dstFSNode) truncateLocked(size int64) {
+	dstMMapSyncLocked(node)
 	switch {
 	case size <= int64(len(node.data)):
 		node.data = node.data[:size]
@@ -999,6 +1000,7 @@ func (d *dstFile) read(b []byte) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
+	dstMMapSyncLocked(d.node)
 	if d.off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -1024,6 +1026,7 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
+	dstMMapSyncLocked(d.node)
 	if off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -1095,17 +1098,18 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 // holds both locks. Mutates current content only (never the durable image).
 func (d *dstFile) writeAtLocked(b []byte, off int64) int {
 	node := d.node
+	dstMMapSyncLocked(node)
 	if need := off + int64(len(b)); need > int64(len(node.data)) {
-		if need > int64(cap(node.data)) {
-			// append for amortized growth (an exact-size make would copy
-			// O(n^2) over append-heavy workloads).
-			node.data = append(node.data, make([]byte, need-int64(len(node.data)))...)
-		} else {
+		if need <= int64(cap(node.data)) {
 			// Re-extending within capacity: zero the gap, or bytes from a
 			// previous longer state resurrect (truncate-down then extend).
 			oldLen := len(node.data)
 			node.data = node.data[:need]
 			clear(node.data[oldLen:])
+		} else {
+			// append for amortized growth (an exact-size make would copy
+			// O(n^2) over append-heavy workloads).
+			node.data = append(node.data, make([]byte, need-int64(len(node.data)))...)
 		}
 	}
 	n := copy(node.data[off:], b)
@@ -1287,6 +1291,7 @@ func (node *dstFSNode) commitLocked() {
 }
 
 func (node *dstFSNode) commitDataLocked() {
+	dstMMapSyncLocked(node)
 	node.synced = append([]byte(nil), node.data...)
 }
 
