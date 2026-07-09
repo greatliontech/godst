@@ -56,8 +56,8 @@ func dstFSEpoch() uint64
 // node state is guarded by mu; per-handle state by the handle's own mutex, acquired
 // before mu where both are needed.
 var dstFS struct {
-	mu    sync.Mutex
-	epoch uint64
+	mu      sync.Mutex
+	epoch   uint64
 	disks   map[uint32]*dstFSDisk // host id -> the host's in-memory tree
 	cwds    map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
 	nextIno uint64                // last synthetic inode number handed out (dstFSAllocIno)

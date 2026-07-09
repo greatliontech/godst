@@ -274,8 +274,8 @@ type dstWireEnd struct {
 	bandwidthBps        int64  // link transmit rate in bytes/sec; 0 = unlimited
 	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
 
-	retransNs int64        // send-into-a-dead-peer retransmit horizon (0 = none)
-	timedOut  atomic.Bool  // a write hit the retransmit horizon: the conn is dead (ETIMEDOUT)
+	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none)
+	timedOut  atomic.Bool // a write hit the retransmit horizon: the conn is dead (ETIMEDOUT)
 
 	once       sync.Once
 	localDone  chan struct{}

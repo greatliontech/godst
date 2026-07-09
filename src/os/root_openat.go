@@ -71,7 +71,8 @@ func rootChmod(r *Root, name string, mode FileMode) error {
 	if dstRootActive(r) {
 		return dstRootChmod(r, name, mode)
 	}
-	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, chmodat(parent, name, mode)
+	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, chmodat(parent, name, mode)
 	})
 	if err != nil {
 		return &PathError{Op: "chmodat", Path: name, Err: err}
@@ -87,7 +88,8 @@ func rootChown(r *Root, name string, uid, gid int) error {
 		r.root.decref()
 		return &PathError{Op: "chownat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, chownat(parent, name, uid, gid)
+	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, chownat(parent, name, uid, gid)
 	})
 	if err != nil {
 		return &PathError{Op: "chownat", Path: name, Err: err}
@@ -103,7 +105,8 @@ func rootLchown(r *Root, name string, uid, gid int) error {
 		r.root.decref()
 		return &PathError{Op: "lchownat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, lchownat(parent, name, uid, gid)
+	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, lchownat(parent, name, uid, gid)
 	})
 	if err != nil {
 		return &PathError{Op: "lchownat", Path: name, Err: err}
@@ -115,7 +118,8 @@ func rootChtimes(r *Root, name string, atime time.Time, mtime time.Time) error {
 	if dstRootActive(r) {
 		return dstRootChtimes(r, name, atime, mtime)
 	}
-	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, chtimesat(parent, name, atime, mtime)
+	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, chtimesat(parent, name, atime, mtime)
 	})
 	if err != nil {
 		return &PathError{Op: "chtimesat", Path: name, Err: err}
@@ -136,7 +140,8 @@ func rootMkdir(r *Root, name string, perm FileMode) error {
 		// platform semantics, not implement POSIX.)
 		flags = doInRootNoHandleTerminalSlash
 	}
-	_, err := doInRoot(r, name, flags, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, mkdirat(parent, name, perm)
+	_, err := doInRoot(r, name, flags, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, mkdirat(parent, name, perm)
 	})
 	if err != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: err}
@@ -212,7 +217,8 @@ func rootReadlink(r *Root, name string) (string, error) {
 	if dstRootActive(r) {
 		return dstRootReadlink(r, name)
 	}
-	target, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (string, error) {		return readlinkat(parent, name)
+	target, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (string, error) {
+		return readlinkat(parent, name)
 	})
 	if err != nil {
 		return "", &PathError{Op: "readlinkat", Path: name, Err: err}
@@ -224,7 +230,8 @@ func rootRemove(r *Root, name string) error {
 	if dstRootActive(r) {
 		return dstRootRemove(r, name)
 	}
-	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {		return struct{}{}, removeat(parent, name)
+	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
+		return struct{}{}, removeat(parent, name)
 	})
 	if err != nil {
 		return &PathError{Op: "removeat", Path: name, Err: err}
