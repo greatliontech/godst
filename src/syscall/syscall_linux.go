@@ -67,6 +67,9 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 	// choke point that also catches golang.org/x/sys/unix, whose asm calls this
 	// directly. Folds away in stock builds (dstSimFenced const). See design.md.
 	if dstSimFenced && dstFenceActive() {
+		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
+			return r1, r2, err
+		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
 			dstSyscallRefuse(trap)
 		}
@@ -84,6 +87,9 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall so the refusal panics in a clean scheduling
 	// state (see RawSyscall6). Folds away in stock builds.
 	if dstSimFenced && dstFenceActive() {
+		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
+			return r1, r2, err
+		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
 			dstSyscallRefuse(trap)
 		}
@@ -112,6 +118,9 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall (see Syscall). Folds away in stock builds.
 	if dstSimFenced && dstFenceActive() {
+		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
+			return r1, r2, err
+		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) {
 			dstSyscallRefuse(trap)
 		}

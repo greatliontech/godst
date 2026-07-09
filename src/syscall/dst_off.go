@@ -52,3 +52,7 @@ func dstTryMprotect(data []byte, prot int) (err Errno, handled bool) { return 0,
 func dstTryMadvise(data []byte, advice int) (err Errno, handled bool) { return 0, false }
 
 func dstTryKill(pid int, sig Signal) (err Errno, handled bool) { return 0, false }
+
+func dstTryClockGettime(trap, clockid, ts uintptr) (r1, r2 uintptr, err Errno, handled bool) {
+	return 0, 0, 0, false
+}

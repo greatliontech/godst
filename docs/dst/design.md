@@ -662,7 +662,9 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   and refused at this raw boundary before they can reach the host; selected split-safe named
   Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
-  dispatch them to the simulated backend.
+  dispatch them to the simulated backend. Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
+  `CLOCK_BOOTTIME` is also selected and split-safe: it returns the DST virtual base clock, and
+  boottime coincides with monotonic time until a suspend model exists.
   Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*

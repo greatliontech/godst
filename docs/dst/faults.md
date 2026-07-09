@@ -126,7 +126,9 @@ tolerate*, so it cannot be a single global clock.
   folds away in non-dst builds). `bubble.now`, monotonic time (`time_runtimeNano`), timer deadlines, and the
   synctest "advance to next deadline" machinery are untouched — an offset shifts what `time.Now()` *reads*,
   not durations, so relative timers fire at the same base time on every host (only the rare absolute-wall-time
-  timer shifts by the offset). Storing the offset **per host** (not per goroutine) is what lets a *step* move
+  timer shifts by the offset). Raw Linux `clock_gettime(CLOCK_MONOTONIC)` reads the same virtual base clock;
+  `CLOCK_BOOTTIME` reads that base too until suspend is modeled, so neither leaks the host clock nor moves
+  under wall-clock skew/step. Storing the offset **per host** (not per goroutine) is what lets a *step* move
   a whole host's subtree at once mid-run — a per-g snapshot, fixed at goroutine creation, could not. A nil
   table / unconfigured host reads 0: the N=1 collapse, byte-identical to the universe-global clock.
 - **Step and drift are landed.** *Step* (an NTP jump) and *drift* (`rate ≠ 1`) perturb `offset_h(t)`

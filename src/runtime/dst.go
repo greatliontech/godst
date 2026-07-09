@@ -239,6 +239,16 @@ func dstCurrentNode() (host, proc uint32) {
 	return gp.dstHost, gp.dstProc
 }
 
+//go:linkname dstVirtualMonotonicNow
+//go:nosplit
+func dstVirtualMonotonicNow() (int64, bool) {
+	gp := getg()
+	if gp.bubble == nil {
+		return 0, false
+	}
+	return gp.bubble.now, true
+}
+
 // dstMaxSimHosts bounds the distinct hosts (Host names) a single run may declare
 // for per-host clock state. Like dstMaxSimProcs it fixes the clock table's size so
 // the time.Now read path never races a table growth; a run that declares more panics

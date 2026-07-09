@@ -6,7 +6,7 @@
 - [x] 6. DST gmdb compatibility: add shared writable lock-file mmap with cross-process visibility and scheduler-visible atomic races.
 - [x] 7. DST gmdb compatibility: implement simulated `Kill(pid, 0)` liveness over DST process identities.
 - [x] 8. DST gmdb compatibility: add synthetic `/proc/<pid>/stat` starttime and `/proc/self/ns/pid` identity.
-- [ ] 9. DST gmdb compatibility: virtualize `ClockGettime(CLOCK_MONOTONIC)` and `ClockGettime(CLOCK_BOOTTIME)`.
+- [x] 9. DST gmdb compatibility: virtualize `ClockGettime(CLOCK_MONOTONIC)` and `ClockGettime(CLOCK_BOOTTIME)`.
 - [ ] 10. DST gmdb compatibility: add crash-time resource teardown for fds, flocks, mappings, conns, goroutines, and pid liveness.
 - [ ] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
 - [ ] 12. DST gmdb compatibility: add host crash and restart with durable-image filesystem restore.
