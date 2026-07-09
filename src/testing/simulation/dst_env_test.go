@@ -24,11 +24,11 @@ func TestDSTEnvPerProcessCOW(t *testing.T) {
 	defer os.Unsetenv(hostKey)
 
 	var (
-		p1ReadHost  string
+		p1ReadHost   string
 		p1ReadHostOK bool
-		p1AfterSet  string
-		p2SeesP1Set bool
-		p2ReadHost  string
+		p1AfterSet   string
+		p2SeesP1Set  bool
+		p2ReadHost   string
 	)
 
 	Run(1, func() {
@@ -39,8 +39,8 @@ func TestDSTEnvPerProcessCOW(t *testing.T) {
 			os.Unsetenv(hostKey)                             // shadow the host var in p1's copy only
 		})
 		Process("p2", func() {
-			_, p2SeesP1Set = os.LookupEnv("DST_ENV_P1")     // must NOT see p1's write
-			p2ReadHost, _ = os.LookupEnv(hostKey)            // p1's Unsetenv must not reach p2
+			_, p2SeesP1Set = os.LookupEnv("DST_ENV_P1") // must NOT see p1's write
+			p2ReadHost, _ = os.LookupEnv(hostKey)       // p1's Unsetenv must not reach p2
 		})
 	})
 
@@ -84,8 +84,8 @@ func TestDSTEnvResetBetweenRuns(t *testing.T) {
 	})
 	Run(1, func() {
 		Process("p", func() {
-			_, run2SeesRun1 = os.LookupEnv("DST_ENV_RESET")  // run 1's write must be gone
-			run2ReadHostAfterClear = os.Getenv(hostKey)       // run 1's Clearenv must not persist
+			_, run2SeesRun1 = os.LookupEnv("DST_ENV_RESET") // run 1's write must be gone
+			run2ReadHostAfterClear = os.Getenv(hostKey)     // run 1's Clearenv must not persist
 		})
 	})
 

@@ -203,7 +203,7 @@ func TestDSTNetConcurrentWritersChainWake(t *testing.T) {
 			port <- p
 			go func() {
 				c, _ := ln.Accept()
-				<-drain // wait until the buffer is full and both writers are blocked
+				<-drain                           // wait until the buffer is full and both writers are blocked
 				io.ReadFull(c, make([]byte, cap)) // one drain of the whole buffer, freeing both writers at once
 				<-done
 				c.Close()

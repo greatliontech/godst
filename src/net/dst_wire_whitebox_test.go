@@ -59,14 +59,14 @@ func TestDSTWirePopRemainNothingLeft(t *testing.T) {
 func TestDSTTransmitNanosOverflowSafe(t *testing.T) {
 	const maxI64 = int64(1<<63 - 1)
 	cases := []struct{ nbytes, bps int64 }{
-		{0, 100},                          // no bytes → 0
-		{1, 1},                            // 1 s
-		{4, 800},                          // 5 ms (the throttle tests' shape)
-		{1, 1_000_000_000},                // sub-ns → rounds up to 1 ns
-		{10_000_000_000, 12_500_000_000},  // 100 Gbit/s, r large: r*1e9 overflows int64
-		{9_999_999_999, 10_000_000_000},   // r just below bps, high bandwidth
-		{20_000_000_000, 1_000_000_000},   // 20 GB push: nbytes*1e9 overflows, q carries it
-		{maxI64 - 1, maxI64},              // r ≈ maxI64 (stresses the 128-bit high word < bps invariant)
+		{0, 100},                           // no bytes → 0
+		{1, 1},                             // 1 s
+		{4, 800},                           // 5 ms (the throttle tests' shape)
+		{1, 1_000_000_000},                 // sub-ns → rounds up to 1 ns
+		{10_000_000_000, 12_500_000_000},   // 100 Gbit/s, r large: r*1e9 overflows int64
+		{9_999_999_999, 10_000_000_000},    // r just below bps, high bandwidth
+		{20_000_000_000, 1_000_000_000},    // 20 GB push: nbytes*1e9 overflows, q carries it
+		{maxI64 - 1, maxI64},               // r ≈ maxI64 (stresses the 128-bit high word < bps invariant)
 		{1_000_000_000_000, 9_200_000_000}, // ~73 Gbit/s boundary, multi-second q
 	}
 	for _, c := range cases {
