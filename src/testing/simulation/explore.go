@@ -409,6 +409,10 @@ func panicString(v any) string {
 func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
+	// Admitted: publish the crash policy like every entry point — the default,
+	// as this internal entry carries no options — so it never inherits the
+	// previous run's setting.
+	setCrashTear(false)
 	return runOnceResultLocked(seed, prefix, forces, sut, cfg)
 }
 

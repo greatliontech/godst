@@ -8,8 +8,10 @@ package simulation
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -442,5 +444,78 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// dstTearPolicySeed: a seed whose two-dirty-page tear draw is MIXED (one page
+// live, one durable) — the strongest anchor: it proves the page-granular tear
+// ran, not merely that the policy stayed true.
+const dstTearPolicySeed = 3
+
+// TestDSTRejectedNestedRunKeepsCrashTearPolicy: a rejected Run (nested inside
+// an active run) leaves every process-global policy untouched — options apply
+// only after the run is admitted. Before the guard-then-publish ordering, the
+// nested attempt flipped the ACTIVE run's crash-tear policy before its panic,
+// and a CrashTear seed sweep silently swept untorn crashes for the rest of the
+// run.
+func TestDSTRejectedNestedRunKeepsCrashTearPolicy(t *testing.T) {
+	var nestedPanicked bool
+	var recovered string
+	TestWith(t, dstTearPolicySeed, Options{CrashTear: true}, func(t *testing.T) {
+		func() {
+			defer func() {
+				r := recover()
+				nestedPanicked = r != nil && strings.Contains(fmt.Sprint(r), "testing/simulation:")
+			}()
+			RunWith(1, Options{CrashTear: false}, func() {})
+		}()
+
+		Host("h", HostConfig{}, func() {
+			go Process("db", func() {
+				f, err := os.Create("/tmp/state")
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				durable := make([]byte, 8<<10)
+				for i := range durable {
+					durable[i] = 'd'
+				}
+				f.Write(durable)
+				f.Sync()
+				syncDir(t, "/tmp")
+				unsynced := make([]byte, 8<<10)
+				for i := range unsynced {
+					unsynced[i] = 'u'
+				}
+				f.WriteAt(unsynced, 0) // live diverges from durable: tear material
+				f.Close()
+				select {} // dies with the machine
+			})
+			for range 30 {
+				runtime.Gosched()
+			}
+		})
+
+		CrashHost("h")
+
+		Host("h", HostConfig{}, func() {
+			Process("db", func() {
+				b, err := os.ReadFile("/tmp/state")
+				if err != nil {
+					t.Fatalf("read after crash: %v", err)
+				}
+				recovered = string(b)
+			})
+		})
+	})
+	if !nestedPanicked {
+		t.Fatal("nested RunWith inside an active run did not panic")
+	}
+	if !strings.Contains(recovered, "u") {
+		t.Fatalf("no torn (live) bytes survived the crash — the rejected nested Run flipped the active run's CrashTear policy to false")
+	}
+	if !strings.Contains(recovered, "d") {
+		t.Fatalf("no durable bytes present after the torn crash — unexpected image %.16q...", recovered)
 	}
 }

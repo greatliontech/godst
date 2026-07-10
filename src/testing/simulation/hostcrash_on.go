@@ -19,7 +19,7 @@ func dstSetCrashTear(on bool)
 
 // The os-side simulated filesystem exists only in a -tags dst build, so its
 // symbols cannot be named from the untagged files of this package: CrashHost
-// and runOptions compile in EVERY build (Run's missing-tag panic is what a
+// and run/TestWith compile in EVERY build (Run's missing-tag panic is what a
 // stock binary is supposed to hit), and a direct linkname there makes an
 // untagged program that merely calls them fail to LINK — a relocation error
 // naming an internal symbol, instead of the documented panic. These shims keep

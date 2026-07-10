@@ -118,7 +118,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Simulation API (src/testing/simulation)
 
-- [ ] 26. run options apply only after `enterSimulation` admits the run: a
+- [x] 26. run options apply only after `enterSimulation` admits the run: a
   rejected Run/RunWith/Test/TestWith leaves every process-global policy
   untouched, matching Explore/Replay. Test: nested run attempt inside a
   CrashTear run, torn outcomes still occur. (dst-audit-sim-crash-tear-guard)

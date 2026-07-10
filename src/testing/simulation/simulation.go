@@ -473,7 +473,10 @@ func leaveSimulation() {
 //
 // Run, RunWith, Test, TestWith, Explore, ExploreWith, and Replay are
 // process-global simulation operations: they must not overlap in one process,
-// and must not be called from within a synctest bubble. Attempts to change
+// and must not be called from within a synctest bubble. A rejected attempt
+// (nested, concurrent, missing build tag) panics with NO side effect — every
+// process-global policy, the active run's crash-tear setting included, is
+// untouched; options publish only after the run is admitted. Attempts to change
 // GOMAXPROCS with runtime.GOMAXPROCS or runtime.SetDefaultGOMAXPROCS inside the
 // simulation are ignored; the run stays pinned to GOMAXPROCS=1 until it returns.
 // A process whose GOMAXPROCS was in container-aware auto mode before the run
@@ -523,7 +526,7 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
 	sendBuf, retransNs := resolveNetConfig(opts.Network)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, nil, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, opts.CrashTear, nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -540,6 +543,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	}
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
+	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
 	var ok bool
 	sendBuf, retransNs := resolveNetConfig(opts.Network)
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, nil, true, func() {
@@ -550,13 +554,14 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	}
 }
 
+// runOptions validates and resolves opts into the run parameters. It is PURE —
+// no process-global state moves here: a rejected entry (nested/concurrent run,
+// missing build tag) must leave every global policy untouched, so publication
+// happens only after enterSimulation admits the run (run/TestWith for the
+// crash-tear policy, runLocked for the runtime knobs); Explore and Replay
+// publish after their own guards the same way. Panics (invalid options) are
+// fine here — they mutate nothing.
 func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostname string, pid, numcpu int) {
-	// Publish the crash-tear policy for this run, before the bubble exists. Every
-	// entry point sets it explicitly — RunWith and TestWith here (Run and Test
-	// wrap them), ExploreWith from its own options, Replay from the failure it is
-	// reproducing — so no run can inherit the previous run's policy, and none has
-	// to be cleared on the way out.
-	setCrashTear(opts.CrashTear)
 	kind = kindRandom
 	switch opts.Strategy {
 	case Random:
@@ -629,9 +634,16 @@ func resolveNetConfig(n NetworkConfig) (sendBuf, retransNs int64) {
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
+	// Admitted: publish the run's crash-tear policy. Every admitted entry point
+	// sets it explicitly — here, TestWith after its own enterSimulation,
+	// ExploreWith from its options, Replay from the failure it reproduces — so
+	// no run inherits the previous run's policy and none clears it on the way
+	// out. A REJECTED entry never reaches this line and leaves the active
+	// run's policy untouched.
+	setCrashTear(crashTear)
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
 }
 

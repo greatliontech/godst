@@ -613,7 +613,9 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   default policy restores a host's disk to **exactly its durable image** (synced survives byte-exact,
   everything unsynced is lost): one legal outcome, deterministic, and the simplest to reason about. With
   `Options.CrashTear` the policy instead explores the outcomes the contract permits, drawn from the fault
-  RNG: each dirty **page** of a file independently reached the platter, did not, or was caught in flight
+  RNG (the policy is per-run, published only after the run is ADMITTED: a rejected nested/concurrent
+  attempt panics with no side effect on the active run's policy —
+  `TestDSTRejectedNestedRunKeepsCrashTearPolicy`): each dirty **page** of a file independently reached the platter, did not, or was caught in flight
   and **tore at a byte boundary** (the physical torn-write shape: the bytes that went out before the cut
   landed, the rest did not — a strict subset of the arbitrary byte mixes the contract permits, which is
   the sound direction to be incomplete in); each unsynced directory-entry change (a create, a remove, a

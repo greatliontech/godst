@@ -14,7 +14,6 @@ chunk(s) there.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
 | [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunks 4, 9, 11–17, 24, 25, 28, 29 |
