@@ -37,13 +37,31 @@
 // debug.SetPanicOnFault cannot recover from a fault the kernel would not have
 // let it recover from either.
 //
-// Nothing address-derived is observable: mapping addresses vary run to run and
-// never reach the system under test as a value. A fault is attributed to a
-// process, and the file offset it lands on is a pure function of the schedule.
+// Mapping addresses ARE observable: the system under test holds the returned
+// slice, and a pointer is a value — it can key a map, whose iteration order
+// then hangs on its bits. Replay-exactness therefore demands that addresses be
+// a pure function of the schedule, the same property the fork already gives
+// the heap base (rand.go seeds bootstrapRand deterministically, so the
+// randomized-heap-base experiment lands every invocation at the same address).
+// Kernel-chosen mmap addresses would break it: mmap_base is randomized per
+// exec. So mappings never let the kernel choose. A canonical region is
+// reserved once — MAP_FIXED_NOREPLACE, so occupancy refuses loudly rather
+// than relocating silently — and every mapping is carved from it MAP_FIXED at
+// a bump-allocated offset. Carve order is mmap order is the schedule, and the
+// bump pointer resets when a run ends, so one seed yields one address, within
+// a process and across invocations alike.
+//
+// The base must dodge what the address space already holds: the dst heap
+// lands near 0x33be27e (deterministic, see above), a PIE text segment inside
+// [0x5555.., 0x5655..], the kernel's unhinted descent from mmap_base near the
+// 0x7fff.. ceiling — and TSAN's Go shadow must cover it for the -race legs
+// (verified empirically for 0x5a00_0000_0000, along with three-invocation
+// address stability).
 
 package runtime
 
 import (
+	"internal/goarch"
 	"internal/runtime/atomic"
 	"internal/runtime/syscall/linux"
 	"unsafe"
@@ -118,13 +136,90 @@ func dstSpanRemove(base uintptr) {
 }
 
 func dstPageCacheCheckHost() {
+	if goarch.PtrSize == 4 {
+		throw("dst: memory mappings need a 64-bit host (the canonical mapping region does not fit a 32-bit address space)")
+	}
 	if physPageSize > dstPageCachePageSize || dstPageCachePageSize%physPageSize != 0 {
 		throw("dst: host page size is coarser than the simulated 4096-byte page")
 	}
 }
 
+// The runtime maps only private anonymous memory, so it defines none of these.
+// They live here rather than in upstream's per-arch defs so a port never
+// conflicts. MAP_SHARED and MAP_FIXED are identical on every Linux
+// architecture; MAP_FIXED_NOREPLACE is asm-generic, adopted unchanged by mips
+// and power; MAP_NORESERVE is per-arch (dst_pagecache_region_*.go).
+const (
+	_dstMapFixed          = 0x10
+	_dstMapFixedNoReplace = 0x100000
+)
+
+// dstMapRegion is the carve state. reserved flips once; next is the bump
+// pointer, in bytes from dstMapRegionBase. Plain atomics suffice for the
+// consistency they must provide: under dst there is a single P and no
+// asynchronous preemption, so two carves never interleave mid-flight, and
+// dstPageCacheResetRegion's stronger requirement — no live carve at all — is
+// the caller's run-boundary guarantee, not something a lock here could add.
+var dstMapRegion struct {
+	reserved atomic.Uint32
+	next     atomic.Uintptr
+}
+
+func dstMapRegionReserve() {
+	if dstMapRegion.reserved.Load() != 0 {
+		return
+	}
+	dstPageCacheCheckHost()
+	p, err := mmap(unsafe.Pointer(uintptr(dstMapRegionBase)), dstMapRegionSize, _PROT_NONE,
+		_MAP_ANON|_MAP_PRIVATE|_dstMapFixedNoReplace|_dstMapNoReserve, -1, 0)
+	if err != 0 || uintptr(p) != dstMapRegionBase {
+		print("dst: cannot reserve the mapping region at ", hex(dstMapRegionBase), " (errno ", err, ")\n")
+		throw("dst: the canonical mapping region is unavailable on this host")
+	}
+	dstMapRegion.reserved.Store(1)
+}
+
+// dstMapRegionCarve hands out the next n bytes of the region, or ^uintptr(0)
+// when the region is exhausted — a deterministic outcome, since the bump
+// pointer is a pure function of the run's mapping sequence.
+func dstMapRegionCarve(n uintptr) uintptr {
+	dstMapRegionReserve()
+	for {
+		off := dstMapRegion.next.Load()
+		if n > dstMapRegionSize-off {
+			return ^uintptr(0)
+		}
+		if dstMapRegion.next.CompareAndSwap(off, off+n) {
+			return dstMapRegionBase + off
+		}
+	}
+}
+
+// dstPageCacheResetRegion rewinds the region for the next run: every carve is
+// re-covered inaccessible in one stroke and the bump pointer returns to zero,
+// so the next run's first mapping lands at the same address the last run's
+// did. The caller guarantees the old run's mappings are all dead — this runs
+// at the run boundary, after the page caches are released.
+//
+//go:linkname dstPageCacheResetRegion
+func dstPageCacheResetRegion() {
+	used := dstMapRegion.next.Load()
+	if used == 0 {
+		return
+	}
+	p, err := mmap(unsafe.Pointer(uintptr(dstMapRegionBase)), used, _PROT_NONE,
+		_MAP_ANON|_MAP_PRIVATE|_dstMapFixed|_dstMapNoReserve, -1, 0)
+	if err != 0 || uintptr(p) != dstMapRegionBase {
+		throw("dst: mapping region reset failed")
+	}
+	dstMapRegion.next.Store(0)
+	dstSpans.Store(&dstSpanSet{})
+}
+
 // dstPageCacheNew creates an empty page cache. The descriptor is the harness's,
 // never the simulated process's: no simulated file descriptor ever names it.
+//
+//go:linkname dstPageCacheNew
 func dstPageCacheNew() int32 {
 	dstPageCacheCheckHost()
 	fd, _, errno := linux.Syscall6(dstSysMemfdCreate,
@@ -138,6 +233,8 @@ func dstPageCacheNew() int32 {
 // dstPageCacheResize sets the file's length: the one operation behind both
 // growth and truncation, including the partial page's tail zeroing and the
 // trapping of pages that fall past the new end while still mapped.
+//
+//go:linkname dstPageCacheResize
 func dstPageCacheResize(fd int32, size int64) {
 	if size < 0 {
 		throw("dst: negative page cache size")
@@ -158,15 +255,27 @@ func dstPageCacheResize(fd int32, size int64) {
 // every in-tree caller passes 0, so the divergence is untested. Passing a file
 // offset through it would map the wrong bytes on some architectures and the
 // right ones on the machine we happen to test on.
+//
+// It returns 0 when the region cannot hold the mapping — the caller's
+// deterministic ENOMEM — and throws on any other failure, which inside our own
+// reservation is a harness bug, not an outcome production has.
+//
+//go:linkname dstPageCacheMap
 func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr {
 	if n == 0 {
 		throw("dst: empty page cache mapping")
 	}
-	p, err := mmap(nil, n, prot, _dstMapShared, fd, 0)
-	if err != 0 {
+	if rem := n % dstPageCachePageSize; rem != 0 {
+		n += dstPageCachePageSize - rem
+	}
+	base := dstMapRegionCarve(n)
+	if base == ^uintptr(0) {
+		return 0
+	}
+	p, err := mmap(unsafe.Pointer(base), n, prot, _dstMapShared|_dstMapFixed, fd, 0)
+	if err != 0 || uintptr(p) != base {
 		throw("dst: page cache mapping failed")
 	}
-	base := uintptr(p)
 	dstSpanAdd(base, n)
 	return base
 }
@@ -176,13 +285,39 @@ func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr {
 // registered would be attributed to a simulated process that no longer has the
 // mapping. Unregistering first means such a fault is reported as the harness
 // bug it is.
+//
+// The address space is re-covered inaccessible rather than unmapped: a hole in
+// the region is space the kernel may hand to an unrelated mmap, and a foreign
+// mapping inside the region would turn its faults into simulated process
+// deaths. Covered space stays ours; adjacent PROT_NONE anonymous mappings
+// merge, so the cover does not accumulate VMAs.
+//
+//go:linkname dstPageCacheUnmap
 func dstPageCacheUnmap(base, n uintptr) {
 	dstSpanRemove(base)
-	munmap(unsafe.Pointer(base), n)
+	if rem := n % dstPageCachePageSize; rem != 0 {
+		n += dstPageCachePageSize - rem
+	}
+	p, err := mmap(unsafe.Pointer(base), n, _PROT_NONE,
+		_MAP_ANON|_MAP_PRIVATE|_dstMapFixed|_dstMapNoReserve, -1, 0)
+	if err != 0 || uintptr(p) != base {
+		throw("dst: page cache unmap failed")
+	}
 }
 
+//go:linkname dstPageCacheClose
 func dstPageCacheClose(fd int32) {
 	closefd(fd)
+}
+
+// dstPageCacheProtect changes a live mapping's protection in place: the
+// mprotect(2) a system under test asked for, applied to the hardware rather
+// than recorded in a ledger. The mapping's bytes are untouched.
+//
+//go:linkname dstPageCacheProtect
+func dstPageCacheProtect(base, n uintptr, prot int32) bool {
+	ret, _ := mprotect(unsafe.Pointer(base), n, prot)
+	return ret == 0
 }
 
 // dstMappingFaultAddr reports whether addr lies inside a live mapping, i.e.

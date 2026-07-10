@@ -15,7 +15,11 @@ var (
 	DSTPageCacheUnmap   = dstPageCacheUnmap
 	DSTPageCacheClose   = dstPageCacheClose
 	DSTMappingFaultAddr = dstMappingFaultAddr
+	DSTPageCacheReset   = dstPageCacheResetRegion
 )
+
+const DSTMapRegionBase = dstMapRegionBase
+const DSTMapRegionSize = dstMapRegionSize
 
 const (
 	DSTProtRead  = _PROT_READ

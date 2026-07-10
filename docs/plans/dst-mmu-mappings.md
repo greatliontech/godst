@@ -43,7 +43,11 @@ is attributed to a process, and the simulated page size stays 4096.
       `SIGSEGV`/`SIGBUS` inside a mapping into the death of the current simulated
       process (crash mark + park forever, unrecoverable — checked before
       `paniconfault`, so a SUT's `SetPanicOnFault` cannot swallow it). Refuse a
-      host whose page size exceeds the simulated 4096, loudly.
+      host whose page size exceeds the simulated 4096, loudly. Mapping addresses
+      are a pure function of the schedule: every mapping is carved MAP_FIXED from
+      a canonical region at bump-allocated offsets, the bump resetting per run —
+      the SUT holds the slice, so its address is observable, and replay demands
+      it be reproducible across invocations (64-bit hosts only).
 - [ ] 2. A node's bytes live in its page cache. `data` aliases a writable mapping
       of the `memfd` on first `Mmap`; growth and shrink become `ftruncate` plus a
       reslice rather than a reallocation. Mappings hand out real subslices.

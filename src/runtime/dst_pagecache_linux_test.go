@@ -7,9 +7,11 @@
 package runtime_test
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -233,5 +235,76 @@ func TestDSTMappingFaultReadOnlyWrite(t *testing.T) {
 	}
 	if !peerRan {
 		t.Errorf("the peer process did not run")
+	}
+}
+
+// TestDSTMappingAddressDeterministicAcrossInvocations is DST-FAULT-REPLAY for
+// addresses: the system under test holds the slice a mapping returns, so its
+// address is observable — it can key a map and steer iteration — and replay
+// therefore requires it be a pure function of the schedule, across process
+// invocations, exactly as the fork already pins the heap base. Kernel-chosen
+// mmap addresses fail this: mmap_base is randomized per exec.
+func TestDSTMappingAddressDeterministicAcrossInvocations(t *testing.T) {
+	got1 := runTestProgDST(t, "DSTMappingAddr")
+	got2 := runTestProgDST(t, "DSTMappingAddr")
+	if got1 != got2 {
+		t.Fatalf("one mapping sequence, two invocations, two address sets:\n%q\n%q", got1, got2)
+	}
+	if !strings.HasPrefix(got1, fmt.Sprintf("%#x", uintptr(runtime.DSTMapRegionBase))) {
+		t.Fatalf("first mapping = %q, want the region base %#x", got1, uintptr(runtime.DSTMapRegionBase))
+	}
+}
+
+// TestDSTPageCacheCarveResetDeterminism pins the within-process half of the
+// same property: after a run-boundary reset, an identical mapping sequence
+// lands at identical addresses, so one seed yields one address however many
+// runs precede it in the process.
+func TestDSTPageCacheCarveResetDeterminism(t *testing.T) {
+	sequence := func() [2]uintptr {
+		fd := runtime.DSTPageCacheNew()
+		runtime.DSTPageCacheResize(fd, pcPage)
+		a := runtime.DSTPageCacheMap(fd, 64<<10, runtime.DSTProtRead|runtime.DSTProtWrite)
+		b := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
+		runtime.DSTPageCacheUnmap(b, pcPage)
+		runtime.DSTPageCacheUnmap(a, 64<<10)
+		runtime.DSTPageCacheClose(fd)
+		return [2]uintptr{a, b}
+	}
+	runtime.DSTPageCacheReset()
+	r1 := sequence()
+	runtime.DSTPageCacheReset()
+	r2 := sequence()
+	runtime.DSTPageCacheReset()
+	if r1 != r2 {
+		t.Fatalf("one sequence, two runs, two address sets: %#x vs %#x", r1, r2)
+	}
+	if r1[0] != uintptr(runtime.DSTMapRegionBase) {
+		t.Errorf("first carve = %#x, want the region base %#x", r1[0], uintptr(runtime.DSTMapRegionBase))
+	}
+}
+
+// TestDSTPageCacheRegionExhaustionIsDeterministicENOMEM: the region is the
+// resource, so running out of it is a pure function of the run's mapping
+// sequence — unlike kernel ENOMEM, which is host state. The sentinel is 0,
+// which the os layer hands to the system under test as ENOMEM.
+func TestDSTPageCacheRegionExhaustionIsDeterministicENOMEM(t *testing.T) {
+	runtime.DSTPageCacheReset()
+	defer runtime.DSTPageCacheReset()
+	fd := runtime.DSTPageCacheNew()
+	defer runtime.DSTPageCacheClose(fd)
+	runtime.DSTPageCacheResize(fd, pcPage)
+	almost := uintptr(runtime.DSTMapRegionSize) - 64<<10
+	a := runtime.DSTPageCacheMap(fd, almost, runtime.DSTProtRead)
+	if a == 0 {
+		t.Fatalf("a %d-byte reservation did not fit an empty region", almost)
+	}
+	defer runtime.DSTPageCacheUnmap(a, almost)
+	if b := runtime.DSTPageCacheMap(fd, 128<<10, runtime.DSTProtRead); b != 0 {
+		t.Fatalf("a carve past the region's end returned %#x, want the 0 sentinel", b)
+	}
+	if c := runtime.DSTPageCacheMap(fd, 64<<10, runtime.DSTProtRead); c == 0 {
+		t.Fatalf("a carve that fits the remainder was refused")
+	} else {
+		runtime.DSTPageCacheUnmap(c, 64<<10)
 	}
 }
