@@ -24,15 +24,6 @@ verified, none blocking:
   deadlock in production but succeed in sim (masks a real deadlock, unbounded
   sim memory). Recorded in a code comment, not the spec — spec-amend candidate.
 
-- **16K-page / VA-39 hosts refused at first file creation, not first mapping.**
-  `dstPageCacheCheckHost` runs in `dstPageCacheNew` at every regular-file
-  creation (dst_pagecache_linux.go:162-169; os/dst_pagecache_linux.go:93), so
-  on Asahi/Apple-VM (16K pages) or Raspberry Pi OS (VA_BITS=39, reservation at
-  0x5a00_0000_0000 > 2^39) the first `os.Create` throws. Loud and
-  deterministic, but the spec words the refusal inside the mapping paragraph;
-  the effective scope is every dst file op — surface it so the capability claim
-  matches reality.
-
 - **nits:** Explore misattributes
   fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455).
 

@@ -83,7 +83,7 @@ Audit reproducers (ephemeral, from the audit session):
 - [x] 16. the proc-overlay fd identity contract is reachable and holds:
   `Fd()`/fstat over a proc-overlay file agree with the spec's zero
   `(st_dev, st_ino)` contract. (dst-audit-low-fidelity-cluster)
-- [ ] 17. the 16K-page / VA-39 host refusal is stated at its true scope —
+- [x] 17. the 16K-page / VA-39 host refusal is stated at its true scope —
   every dst file op, not just mappings — so the capability claim matches
   reality. (dst-audit-low-fidelity-cluster)
 

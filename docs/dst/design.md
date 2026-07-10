@@ -601,8 +601,14 @@ included), killing exactly the touching process while peers and the harness run 
 does. **Mapping addresses are a pure function of the schedule**: every mapping is carved `MAP_FIXED` from
 a canonical reserved region at bump-allocated offsets, reset at the run boundary, so one seed yields one
 address within a process and across invocations — the address is observable (the SUT holds the slice), so
-replay-exactness owns it; region exhaustion is therefore also deterministic and reports `ENOMEM`
-(64-bit hosts only; a coarser-than-4096-page or 32-bit host is refused loudly at first use). The mapping
+replay-exactness owns it; region exhaustion is therefore also deterministic and reports `ENOMEM`.
+**Host capability floor — and its true scope**: the page-cache backing is universal (every regular
+file's bytes live in a memfd from birth), so a 64-bit host with 4096-divisible pages and address
+space for the canonical region is a requirement of the simulated FILESYSTEM as a whole, not of the
+mapping feature: on a 32-bit host, a coarser-than-4096-page host (e.g. 16K-page Apple-silicon VMs),
+or a VA-39 host whose address space cannot hold the region (e.g. default Raspberry Pi OS), the FIRST
+regular-file creation — any `os.Create` — throws loudly and deterministically, before any mapping
+exists. The mapping
 lifetime is independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap` unregisters
 exactly the mapping passed to it — and a later touch of the unmapped range is the toucher's own death,
 as production SIGSEGV delivers it. The run epoch resets any residue, closing every page cache and
