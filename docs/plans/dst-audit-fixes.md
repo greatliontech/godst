@@ -93,7 +93,7 @@ Audit reproducers (ephemeral, from the audit session):
   with RST semantics: queued and in-flight bytes discarded, the peer's next
   read returns ECONNRESET without draining. Test: crash the writer host with
   bytes in flight, peer's first read fails. (dst-audit-net-crash-drain)
-- [ ] 19. dialing a crashed declared host blackholes (connect ETIMEDOUT), not
+- [x] 19. dialing a crashed declared host blackholes (connect ETIMEDOUT), not
   instant ECONNREFUSED — refusal requires a live kernel to answer RST.
   (dst-audit-net-kernel-shape, item 2)
 - [ ] 20. the retransmission horizon arms on any write against an unhealable

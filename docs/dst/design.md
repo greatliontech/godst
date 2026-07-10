@@ -355,7 +355,16 @@ models a TCP socket pair, not a message queue:
   port is `ECONNREFUSED` (a live kernel answers with RST); one recorded timing simplification: this
   refusal returns immediately rather than after the SYN's ½-RTT traversal, so a connect deadline
   shorter than ½ RTT that would *time out* before the RST in production instead observes
-  `ECONNREFUSED` here (a narrow adversarial-deadline case; recorded, not hidden). **Pending (lands
+  `ECONNREFUSED` here (a narrow adversarial-deadline case; recorded, not hidden). Refusal requires
+  that live kernel: a dial to a **crashed** declared host (powered off, not yet rebooted by a Host
+  re-declaration) blackholes exactly like a partition — the SYN is dropped, the dial blocks until
+  the context/deadline expires, the retransmit horizon fires `ETIMEDOUT`, or the machine reboots
+  and its kernel answers again (`ECONNREFUSED` until a listener is up, then connect)
+  (`TestDSTCrashHostDialBlackholes`). The same holds for a dial already mid-handshake when the
+  power fails — it re-enters the blackhole wait instead of surfacing the dead listener's teardown
+  as a refusal (`TestDSTCrashHostMidHandshakeDialTimesOut`). The machine-off mark is distinct from a network cut: a
+  `HealHost` cannot make a powered-off machine reachable, and a reboot does not heal an injected
+  isolation. **Pending (lands
   with the FIN/RST follow-on):** a dial to an address **no declared host owns** should blackhole and
   fail `ETIMEDOUT` (nothing answers SYNs) — the peer-down/unreachable split; today it also returns
   `ECONNREFUSED`. This case is reachable only via a hand-constructed literal `10.x` IP (`HostIP`

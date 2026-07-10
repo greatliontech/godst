@@ -435,6 +435,14 @@ func Host(name string, config HostConfig, f func()) {
 		dstSetNode(oldH, oldP)
 		panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 	}
+	// The declaration boots (or reboots) the machine: if it was crashed, it is
+	// reachable again — dials find its kernel (ECONNREFUSED until a listener is
+	// up, then connect), and any dial blocked blackholing on the dead machine
+	// wakes to retry. In-run only: outside a run there is no network state and
+	// Host has no effect beyond running f.
+	if runActive.Load() {
+		dstNetPartitionOp(partOpHostUp, hid, 0)
+	}
 	defer dstSetNode(oldH, oldP)
 	f()
 }
@@ -588,6 +596,12 @@ func crashHost(name string) {
 	// machine, every advisory lock, every mapping (WITHOUT write-back — dirty
 	// pages were never on the disk), every socket (RST) and listener.
 	closeHostFiles(host)
+	// The machine is off: dials to it blackhole (a dead kernel answers no SYN —
+	// connect times out at the deadline or retransmit horizon, never
+	// ECONNREFUSED) until a Host re-declaration reboots it. Marked down BEFORE
+	// the listeners close so no teardown ordering can expose a
+	// listener-closed-but-still-alive refusal window.
+	dstNetPartitionOp(partOpHostDown, host, 0)
 	dstNetPartitionOp(partOpResetHost, host, 0)
 	dstNetPartitionOp(partOpCloseHostListeners, host, 0)
 	// Finally the disk: what survives is exactly what was committed to it. The
@@ -603,7 +617,9 @@ func crashHost(name string) {
 // the peer's next read fails ECONNRESET without draining, except a conn the
 // victim's application had already closed, whose peer still drains and reads
 // io.EOF (power loss emits no packet; bytes on the wire survive) — and
-// every listener closes. Then the machine's kernel state is gone: its
+// every listener closes. Until the machine reboots, dialing it blackholes:
+// the connect times out (deadline or retransmit horizon, ETIMEDOUT), never
+// ECONNREFUSED — refusal needs a live kernel to answer RST. Then the machine's kernel state is gone: its
 // filesystem TEARS BACK TO ITS DURABLE IMAGE — data a file's Fsync committed
 // survives byte-exactly, a name its parent directory's Fsync committed survives,
 // and everything else (unsynced writes, unsynced creates and removes, dirty
@@ -656,6 +672,14 @@ func Process(name string, f func()) {
 	proc := internProc(name)
 	if runActive.Load() && activeProcLivesElsewhere(proc, host) {
 		panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
+	}
+	if runActive.Load() && dstNetHostDead(host) {
+		// A process cannot run on a powered-off machine. A process restart does
+		// not reboot the host (only a Host re-declaration does — it also
+		// re-establishes the clock), so restarting a CrashHost victim's process
+		// without the reboot would yield a half-alive machine: its server
+		// running and listening while every dial to it blackholes.
+		panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
 	}
 	dstProcAllocEnsure(proc) // per-process allocation counter exists before the body allocates
 	oldH, oldP := dstSetNode(host, proc)

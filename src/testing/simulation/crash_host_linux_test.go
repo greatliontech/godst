@@ -512,7 +512,8 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 		close(crashed)
 		<-readDone
 
-		// The victim's whole port space died with it.
+		// The victim's machine is off: a dial to it blackholes to the
+		// retransmit horizon (only a live kernel could answer RST).
 		Host("sibling", HostConfig{}, func() {
 			Process("dialer", func() {
 				_, victimDialErr = net.Dial("tcp", addr)
@@ -547,8 +548,8 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 	if !errors.Is(victimPeerReadErr, syscall.ECONNRESET) {
 		t.Fatalf("peer of the crashed host = %v, want ECONNRESET", victimPeerReadErr)
 	}
-	if !errors.Is(victimDialErr, syscall.ECONNREFUSED) {
-		t.Fatalf("dial to the crashed host = %v, want ECONNREFUSED (its listeners died)", victimDialErr)
+	if !errors.Is(victimDialErr, syscall.ETIMEDOUT) {
+		t.Fatalf("dial to the crashed host = %v, want ETIMEDOUT (the machine is off — nothing answers the SYN)", victimDialErr)
 	}
 }
 
@@ -1151,5 +1152,262 @@ func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 	})
 	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
 		t.Fatalf("first read after the dialing writer's host crashed = (%d, %v), want (0, ECONNRESET): in-flight bytes must be dropped, not drained", n, readErr)
+	}
+}
+
+// TestDSTCrashHostDialBlackholes: dialing a crashed declared host blackholes —
+// a powered-off machine drops SYNs and no kernel exists to answer RST, so a
+// deadline-less dial fails ETIMEDOUT at the retransmit horizon (2 virtual
+// minutes by default), never instant ECONNREFUSED. A Host re-declaration
+// reboots the machine: dials reach its kernel again and connect once a
+// listener is up.
+func TestDSTCrashHostDialBlackholes(t *testing.T) {
+	var deadErr, rebootErr error
+	var deadElapsed time.Duration
+	Test(t, 1, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		Host("victim", HostConfig{}, func() {
+			go Process("server", func() {
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				select {} // dies with the machine
+			})
+		})
+		addr := <-addrCh
+
+		CrashHost("victim")
+
+		dialDone := make(chan struct{})
+		Host("survivor", HostConfig{}, func() {
+			go Process("dialer", func() {
+				defer close(dialDone)
+				start := time.Now()
+				_, deadErr = net.Dial("tcp", addr)
+				deadElapsed = time.Since(start)
+			})
+		})
+		<-dialDone
+
+		// Reboot: fresh Host declaration; its restarted server listens anew.
+		addr2Ch := make(chan string, 1)
+		lnCh := make(chan net.Listener, 1)
+		serverExited := make(chan struct{})
+		Host("victim", HostConfig{}, func() {
+			go Process("server", func() {
+				defer close(serverExited)
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("rebooted victim listen: %v", err)
+					return
+				}
+				lnCh <- l
+				addr2Ch <- l.Addr().String()
+				for {
+					if _, err := l.Accept(); err != nil {
+						return
+					}
+				}
+			})
+		})
+		ln := <-lnCh
+		addr2 := <-addr2Ch
+
+		redialDone := make(chan struct{})
+		Host("survivor", HostConfig{}, func() {
+			go Process("dialer2", func() {
+				defer close(redialDone)
+				_, rebootErr = net.Dial("tcp", addr2)
+			})
+		})
+		<-redialDone
+		ln.Close()
+		<-serverExited
+	})
+	if !errors.Is(deadErr, syscall.ETIMEDOUT) {
+		t.Fatalf("dial to the crashed host = %v, want ETIMEDOUT: a powered-off machine blackholes, only a live kernel refuses", deadErr)
+	}
+	if deadElapsed != 2*time.Minute {
+		t.Fatalf("dial to the crashed host returned after %v, want the 2m retransmit horizon (the SYN blackholes until exhausted retries)", deadElapsed)
+	}
+	if rebootErr != nil {
+		t.Fatalf("dial after the host rebooted = %v, want success: the reboot restores reachability", rebootErr)
+	}
+}
+
+// TestDSTCrashHostProcessRestartRefused: a process cannot be restarted on a
+// powered-off machine — Process on a crashed, not-yet-rebooted host panics,
+// naming the fix (a Host re-declaration models the reboot). Allowing it would
+// yield a half-alive machine: its server running and listening while every
+// dial to it blackholes — a state reality cannot produce. After the reboot,
+// the restart succeeds.
+func TestDSTCrashHostProcessRestartRefused(t *testing.T) {
+	var panicMsg string
+	var rebootRestartOK bool
+	Test(t, 1, func(t *testing.T) {
+		started := make(chan struct{})
+		go Process("node", func() { // implicit dedicated host "node"
+			close(started)
+			select {} // dies with the machine
+		})
+		<-started
+
+		CrashHost("node")
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicMsg = r.(string)
+				}
+			}()
+			Process("node", func() {})
+		}()
+
+		// The reboot: an explicit Host declaration of the same machine.
+		Host("node", HostConfig{}, func() {
+			Process("node", func() { rebootRestartOK = true })
+		})
+	})
+	if !strings.Contains(panicMsg, "powered off") {
+		t.Fatalf("restarting a process on a crashed host panicked with %q, want a powered-off refusal naming the Host re-declaration", panicMsg)
+	}
+	if !rebootRestartOK {
+		t.Fatal("process restart after the Host re-declaration did not run")
+	}
+}
+
+// TestDSTCrashHostMidHandshakeDialTimesOut: a dial already mid-handshake
+// (sleeping in the SYN traversal) when the target host loses power blackholes
+// like any dial to a dead machine — power loss emits no RST, so the connect
+// fails ETIMEDOUT at the retransmit horizon, never ECONNREFUSED from the
+// closed listener's teardown.
+func TestDSTCrashHostMidHandshakeDialTimesOut(t *testing.T) {
+	var dialErr error
+	var elapsed time.Duration
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		Host("victim", HostConfig{}, func() {
+			go Process("server", func() {
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				select {} // dies with the machine
+			})
+		})
+		addr := <-addrCh
+
+		dialDone := make(chan struct{})
+		Host("survivor", HostConfig{}, func() {
+			go Process("dialer", func() {
+				defer close(dialDone)
+				start := time.Now()
+				_, dialErr = net.Dial("tcp", addr)
+				elapsed = time.Since(start)
+			})
+		})
+
+		// Let the dial enter its 50ms SYN traversal, then cut the power at
+		// half-flight.
+		time.Sleep(25 * time.Millisecond)
+		CrashHost("victim")
+		<-dialDone
+	})
+	if !errors.Is(dialErr, syscall.ETIMEDOUT) {
+		t.Fatalf("mid-handshake dial to the crashing host = %v, want ETIMEDOUT: power loss emits no RST", dialErr)
+	}
+	if want := 50*time.Millisecond + 2*time.Minute; elapsed != want {
+		t.Fatalf("mid-handshake dial returned after %v, want %v (the SYN traversal, then the full retransmit horizon)", elapsed, want)
+	}
+}
+
+// TestDSTCrashHostHealHostCannotResurrect: machine power and network faults
+// are distinct facts — HealHost (a network heal) does not make a powered-off
+// machine reachable; the dial still blackholes to ETIMEDOUT. Only a Host
+// re-declaration reboots it.
+func TestDSTCrashHostHealHostCannotResurrect(t *testing.T) {
+	var dialErr error
+	Test(t, 1, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		Host("victim", HostConfig{}, func() {
+			go Process("server", func() {
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				select {} // dies with the machine
+			})
+		})
+		addr := <-addrCh
+
+		CrashHost("victim")
+		HealHost("victim") // heals network cuts; cannot power a machine on
+
+		dialDone := make(chan struct{})
+		Host("survivor", HostConfig{}, func() {
+			go Process("dialer", func() {
+				defer close(dialDone)
+				_, dialErr = net.Dial("tcp", addr)
+			})
+		})
+		<-dialDone
+	})
+	if !errors.Is(dialErr, syscall.ETIMEDOUT) {
+		t.Fatalf("dial to a crashed host after HealHost = %v, want ETIMEDOUT: a network heal cannot power a machine on", dialErr)
+	}
+}
+
+// TestDSTHostRebootKeepsIsolation: the converse separation — a Host
+// re-declaration (reboot) does not heal an injected network isolation. The
+// rebooted machine's listener is up, but the dial still blackholes to
+// ETIMEDOUT until HealHost.
+func TestDSTHostRebootKeepsIsolation(t *testing.T) {
+	var dialErr error
+	Test(t, 1, func(t *testing.T) {
+		lnCh := make(chan net.Listener, 1)
+		serverExited := make(chan struct{})
+		Host("island", HostConfig{}, func() {
+			go Process("server", func() {
+				defer close(serverExited)
+				l, err := net.Listen("tcp", HostIP("island")+":0")
+				if err != nil {
+					t.Errorf("island listen: %v", err)
+					return
+				}
+				lnCh <- l
+				for {
+					if _, err := l.Accept(); err != nil {
+						return
+					}
+				}
+			})
+		})
+		ln := <-lnCh
+		addr := ln.Addr().String()
+
+		Isolate("island")
+		Host("island", HostConfig{}, func() {}) // reboot: must NOT heal the isolation
+
+		dialDone := make(chan struct{})
+		Host("survivor", HostConfig{}, func() {
+			go Process("dialer", func() {
+				defer close(dialDone)
+				_, dialErr = net.Dial("tcp", addr)
+			})
+		})
+		<-dialDone
+		HealHost("island")
+		ln.Close()
+		<-serverExited
+	})
+	if !errors.Is(dialErr, syscall.ETIMEDOUT) {
+		t.Fatalf("dial to an isolated host after its reboot = %v, want ETIMEDOUT: a reboot does not heal an injected network cut", dialErr)
 	}
 }

@@ -26,6 +26,9 @@ import (
 //go:linkname dstSetNetPartitionHook runtime.dstSetNetPartitionHook
 func dstSetNetPartitionHook(fn func(op, a, b uint32))
 
+//go:linkname dstSetNetHostDeadHook runtime.dstSetNetHostDeadHook
+func dstSetNetHostDeadHook(fn func(host uint32) bool)
+
 // Net-fault op codes — net's contract with testing/simulation's targeting API,
 // which passes the same codes through runtime.dstNetPartitionOp. b is ignored for
 // the host/process-level ops.
@@ -42,9 +45,14 @@ const (
 	dstFaultOpCloseProcConns                       // gracefully close conn ends owned by process a (exit teardown)
 	dstFaultOpResetHost                            // reset every conn an end of which lives on host a (host crash)
 	dstFaultOpCloseHostListeners                   // close every listener on host a (host crash)
+	dstFaultOpHostDown                             // host a lost power: dials to it blackhole until it reboots
+	dstFaultOpHostUp                               // host a rebooted (Host re-declaration): dials reach its kernel again
 )
 
-func init() { dstSetNetPartitionHook(dstApplyNetFaultOp) }
+func init() {
+	dstSetNetPartitionHook(dstApplyNetFaultOp)
+	dstSetNetHostDeadHook(dstHostDead) // simulation's Process guard queries the same mark dials consult
+}
 
 // dstApplyNetFaultOp dispatches a net-fault targeting op (from testing/simulation
 // via runtime's passthrough) to the partition table or the connection registry.
@@ -62,6 +70,8 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstResetHost(a)
 	case dstFaultOpCloseHostListeners:
 		dstCloseHostListeners(a)
+	case dstFaultOpHostDown, dstFaultOpHostUp:
+		dstApplyPartitionOp(op, a, b)
 	default:
 		dstApplyPartitionOp(op, a, b)
 	}
@@ -85,7 +95,15 @@ var dstPart struct {
 	epoch    uint64
 	dirs     map[uint64]dstCut // ordered from→to → cut record
 	isolated map[uint32]int64  // host → cut-start (isolated from all others, both directions)
-	wake     chan struct{}
+	// dead is the set of powered-off hosts (CrashHost'd, not yet rebooted by a
+	// Host re-declaration). Distinct from isolated — machine power and network
+	// faults are different physical facts: a user's HealHost must not make a
+	// powered-off machine reachable, and a reboot must not heal a user's
+	// injected isolation. Consulted ONLY at dial (a dead kernel answers no
+	// SYN); never in the read-side arrival horizon — bytes a host transmitted
+	// before dying still propagate through the network and deliver.
+	dead map[uint32]struct{}
+	wake chan struct{}
 }
 
 // dstCut is one directional cut: the base time it began and the connect mode a Dial
@@ -118,6 +136,7 @@ func dstPartRoll() {
 		dstPart.epoch = e
 		dstPart.dirs = make(map[uint64]dstCut)
 		dstPart.isolated = make(map[uint32]int64)
+		dstPart.dead = make(map[uint32]struct{})
 		dstPart.wake = make(chan struct{})
 	}
 }
@@ -149,6 +168,10 @@ func dstApplyPartitionOp(op, a, b uint32) {
 		}
 	case dstPartOpHealHost:
 		delete(dstPart.isolated, a)
+	case dstFaultOpHostDown:
+		dstPart.dead[a] = struct{}{}
+	case dstFaultOpHostUp:
+		delete(dstPart.dead, a)
 	}
 	close(dstPart.wake)
 	dstPart.wake = make(chan struct{})
@@ -219,11 +242,27 @@ func dstPartitionedDir(from, to uint32) bool {
 // packet path never delivers an ECONNREFUSED, and reporting one would be a sim-only
 // false failure (the false-positive class Soundness forbids).
 func dstDialCut(dialer, target uint32) (cut, refuse bool) {
+	if dstHostDead(target) {
+		// The target machine is powered off: the SYN is dropped, and no kernel
+		// exists to answer RST, so the dial can only blackhole — whatever any
+		// refuse-mode cut on the path would otherwise do. ECONNREFUSED requires
+		// a live kernel (design.md, Connect cost).
+		return true, false
+	}
 	_, c1, bh1 := dstPartCutStartDir(dialer, target)
 	_, c2, bh2 := dstPartCutStartDir(target, dialer)
 	cut = c1 || c2
 	refuse = cut && !bh1 && !bh2
 	return
+}
+
+// dstHostDead reports whether host is powered off (crashed, not yet rebooted).
+func dstHostDead(host uint32) bool {
+	dstPart.mu.Lock()
+	defer dstPart.mu.Unlock()
+	dstPartRoll()
+	_, dead := dstPart.dead[host]
+	return dead
 }
 
 // dstPartWakeCh returns the channel closed on the next partition change, so a

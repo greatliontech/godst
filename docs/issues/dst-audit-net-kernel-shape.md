@@ -1,10 +1,10 @@
-# DST audit: net divergences from kernel shape (retransmit horizon, refuse-vs-blackhole, bind, backlog, close-RST)
+# DST audit: net divergences from kernel shape (retransmit horizon, bind, backlog, close-RST)
 
-Lands: chunks 19–23 of docs/plans/dst-audit-fixes.md (item 1 → 20, 2 → 19, 3 → 21, 4 → 22, 5 → 23)
+Lands: chunks 20–23 of docs/plans/dst-audit-fixes.md (item 1 → 20, 3 → 21, 4 → 22, 5 → 23; item 2 landed in 19)
 
 ## Gap
 
-Severity M (full-surface audit, 2026-07-10; each reproduced). Five kernel-shape
+Severity M (full-surface audit, 2026-07-10; each reproduced). Kernel-shape
 divergences in the virtual wire, all in the false-negative direction (a SUT
 that keys on the real behavior is misled or a real failure is masked):
 
@@ -15,13 +15,6 @@ that keys on the real behavior is misled or a real failure is masked):
    horizon): undeliverable bytes "error the connection with ETIMEDOUT … on the
    blocked or subsequent operation … it never succeeds-and-forgets."
    `TestDSTNetWriteHorizonTimesOut` pins only the buffer-full path.
-
-2. **Dial to a crashed declared host returns instant ECONNREFUSED**
-   (`src/net/dst.go:968-970`). `CrashHost` closes listeners (`node.go:592`) but
-   does not cut the link; a later dial finds no listener and refuses. design.md
-   conditions refusal on "a live kernel answers with RST"; a powered-off machine
-   blackholes → connect ETIMEDOUT. A SUT keying failover on refused ("process
-   down") vs timeout ("host unreachable") is misled.
 
 3. **`Dialer.LocalAddr` / ephemeral allocation ignores listener bindings**
    (`dstLocalBindInUse`, `src/net/dst_reset.go:104-121`; `dstAllocateListenPort`,

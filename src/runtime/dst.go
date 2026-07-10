@@ -1946,6 +1946,26 @@ func dstNetPartitionOp(op, a, b uint32) {
 	}
 }
 
+// dstNetHostDeadHook is net's dead-host query: whether host is powered off
+// (CrashHost'd, not yet rebooted by a Host re-declaration). Nil when net is
+// not linked — then no dial exists to observe the mark, and the query reports
+// alive.
+var dstNetHostDeadHook func(host uint32) bool
+
+// dstSetNetHostDeadHook registers net's dead-host query. Reached via
+// //go:linkname from net's init.
+//
+//go:linkname dstSetNetHostDeadHook
+func dstSetNetHostDeadHook(fn func(host uint32) bool) { dstNetHostDeadHook = fn }
+
+// dstNetHostDead invokes net's dead-host query (false if net is not linked).
+// Reached via //go:linkname from testing/simulation's Process guard.
+//
+//go:linkname dstNetHostDead
+func dstNetHostDead(host uint32) bool {
+	return dstNetHostDeadHook != nil && dstNetHostDeadHook(host)
+}
+
 // dstProcessTeardownHook is os's handler for process-owned resource teardown
 // (open simulated Files, virtual fds/flocks, and mmap registrations). Runtime is
 // the dependency-free relay so testing/simulation can drive process death without

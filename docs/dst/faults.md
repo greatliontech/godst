@@ -766,7 +766,10 @@ app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns
 the connections the victim still holds open, at the surviving peer's own end — its next read fails
 `ECONNRESET` **without draining**, queued and in-flight bytes alike, as a real RST destroys the
 receive queue. *Enforced:* `TestDSTCrashHostDropsInFlightBytes`, `TestDSTCrashHostFreesVictimPorts`
-(the victim's port space clears with the machine).
+(the victim's port space clears with the machine). And until a Host re-declaration reboots the
+machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so the connect times
+out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect cost; *enforced:*
+`TestDSTCrashHostDialBlackholes`).
 
 Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit: the
 active process invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines

@@ -24,6 +24,9 @@ import _ "unsafe" // for go:linkname
 //go:linkname dstNetPartitionOp runtime.dstNetPartitionOp
 func dstNetPartitionOp(op, a, b uint32)
 
+//go:linkname dstNetHostDead runtime.dstNetHostDead
+func dstNetHostDead(host uint32) bool
+
 // Net-fault op codes — must match net's dst_partition.go.
 const (
 	partOpPartition uint32 = iota + 1
@@ -38,6 +41,8 @@ const (
 	partOpCloseProcConns
 	partOpResetHost
 	partOpCloseHostListeners
+	partOpHostDown
+	partOpHostUp
 )
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections

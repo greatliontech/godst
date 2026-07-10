@@ -881,6 +881,19 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		targetHost = h
 	}
 	retransNs := dstNetRetransmitTimeoutNs()
+	// redial re-enters the blackhole wait and the listener lookup after a
+	// refusal point discovers the target host is powered off: a crash landing
+	// while this dial was mid-handshake (sleeping in the SYN traversal, or
+	// parked in the backlog) must blackhole like any dial to a dead machine —
+	// power loss emits no RST — and after a reboot the retransmitted SYN
+	// reaches the fresh kernel (connect if a listener is up by then, else a
+	// genuine ECONNREFUSED). Each episode restarts the horizon (blockStart) —
+	// the same soundness-safe class as the heal-resets-the-cut-window
+	// precedent: repeated crash/reboot cycles can only extend the wait, erring
+	// toward fewer/later ETIMEDOUTs, never a premature one. (Within ONE
+	// episode the loop's blockStart deliberately survives wakes — that
+	// conservative anchor is untouched.)
+redial:
 	blockStart := int64(-1) // base-time the dial first blocked; -1 = not yet blocked
 	for {
 		wake := dstPartWakeCh()
@@ -966,6 +979,13 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	dstNet.mu.Unlock()
 
 	if l == nil {
+		if dstHostDead(targetHost) {
+			// Powered off between the clear-path check and the lookup — a
+			// window no cooperative schedule reaches today (no yield between
+			// them); kept structural so a future preemption point cannot turn
+			// it into a refusal.
+			goto redial
+		}
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	}
 	localAddr := &TCPAddr{IP: localIP, Port: localPort}
@@ -1015,7 +1035,7 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 			if server.acceptState.CompareAndSwap(0, 2) {
 				server.resetConn()
 				p1.Close()
-				return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+				goto refused
 			}
 			// Register both ends once the conn is live (the dial is about to return
 			// it). Registration intentionally trails the l.accept handoff: a Reset
@@ -1036,6 +1056,16 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	case <-l.done:
 		p1.Close()
 		p2.Close()
-		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+		goto refused
 	}
+refused:
+	// The listener closed under this in-flight dial. One decision point for
+	// both handoff arms (backlog claim and pre-handoff close): a live kernel's
+	// closed listener answers RST — ECONNREFUSED — but a listener that died
+	// with its MACHINE emits nothing; the dial re-enters the blackhole wait
+	// (redial) and times out or reaches the rebooted kernel.
+	if dstHostDead(l.host) {
+		goto redial
+	}
+	return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 }
