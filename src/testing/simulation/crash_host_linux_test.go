@@ -116,6 +116,65 @@ func TestDSTCrashHostRestoresDurableImage(t *testing.T) {
 	}
 }
 
+// TestDSTCrashHostPreservesMkfsImage: the initial tree a run boots with
+// (root and /tmp) is durable from birth — the mkfs image is on the platter,
+// so a host crash preserves /tmp, and fsync-disciplined state under it
+// (fsync(file) then fsync("/tmp"), the full POSIX discipline, with NO fsync
+// of "/") survives byte-exactly. A tree born unsynced fails this: the crash
+// rebuilds root from an empty durable set, "tmp" vanishes, and the read
+// fails ENOENT.
+func TestDSTCrashHostPreservesMkfsImage(t *testing.T) {
+	for _, tear := range []bool{false, true} {
+		t.Run(map[bool]string{false: "untorn", true: "torn"}[tear], func(t *testing.T) {
+			testCrashHostPreservesMkfsImage(t, tear)
+		})
+	}
+}
+
+// The torn variant pins that a page-granular tear cannot drop the mkfs
+// image either: a durable, unchanged entry is kept deterministically, never
+// coin-flipped.
+func testCrashHostPreservesMkfsImage(t *testing.T, tear bool) {
+	var readErr error
+	var readData string
+	var tmpStatErr error
+	TestWith(t, 1, Options{CrashTear: tear}, func(t *testing.T) {
+		Host("h", HostConfig{}, func() {
+			go Process("db", func() {
+				f, err := os.Create("/tmp/state")
+				if err != nil {
+					t.Errorf("create /tmp/state: %v", err)
+					return
+				}
+				f.Write([]byte("checkpoint"))
+				f.Sync()
+				f.Close()
+				syncDir(t, "/tmp")
+				select {} // stay alive until the machine dies
+			})
+			for range 30 {
+				runtime.Gosched()
+			}
+		})
+
+		CrashHost("h")
+
+		Host("h", HostConfig{}, func() {
+			Process("db", func() {
+				_, tmpStatErr = os.Stat("/tmp")
+				b, err := os.ReadFile("/tmp/state")
+				readErr, readData = err, string(b)
+			})
+		})
+	})
+	if tmpStatErr != nil {
+		t.Fatalf("/tmp after reboot: %v, want present (the mkfs image is durable from birth)", tmpStatErr)
+	}
+	if readErr != nil || readData != "checkpoint" {
+		t.Fatalf("fsync-disciplined /tmp/state after reboot = %q, %v; want %q, nil", readData, readErr, "checkpoint")
+	}
+}
+
 // TestDSTCrashHostResurrectsUnsyncedRemoval: a removal whose parent directory
 // was never fsynced is not on the disk, so power loss brings the entry back —
 // and the resurrected node must be a usable directory, not a husk that still

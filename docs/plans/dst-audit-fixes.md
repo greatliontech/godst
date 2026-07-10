@@ -47,7 +47,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Filesystem & durability (src/os)
 
-- [ ] 7. the initial tree a run boots with (root, `/tmp`) is durable from
+- [x] 7. the initial tree a run boots with (root, `/tmp`) is durable from
   birth — the mkfs image is part of the durable image. Test: crash test with
   files under `/tmp` and directory fsync on `/tmp`, not `/`.
   (dst-audit-fs-tmp-durability)

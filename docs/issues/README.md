@@ -15,7 +15,6 @@ chunk(s) there.
 | Issue | Severity | Lands |
 |---|---|---|
 | [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
-| [pre-seeded /tmp born unsynced, erased by crash](./dst-audit-fs-tmp-durability.md) | H | chunk 7 |
 | [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
@@ -37,3 +36,4 @@ Found during plan execution:
 | [foreign runtime.GC() shifts the trigger stream](./dst-gc-foreign-runtime-gc.md) | M | foreign GC cannot perturb the bubble's accounting, or fails loudly |
 | [overdue ticker crossing DriftClock has a phase error](./dst-clock-overdue-ticker-phase.md) | M | backwards remap honors the spec formula's negative remainder, sentinel-safe |
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
+| [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |

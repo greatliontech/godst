@@ -449,7 +449,12 @@ a host path is machine state, and reading it would make runs machine-dependent),
 reports the fixed simulated `/tmp` during a run rather than the host's `$TMPDIR`-derived string
 (itself machine state), so `CreateTemp`/`MkdirTemp` work unmodified and deterministically — their
 random names draw from the seeded runtime stream. A program needing other fixture files creates
-them inside the run.
+them inside the run. **The mkfs image is part of the durable image**: the initial tree (root and
+`/tmp`) is on the platter from birth, so a host crash preserves it and fsync-disciplined state
+under `/tmp` — fsync(file) then fsync(`/tmp`), with no fsync of `/` — survives byte-exactly
+(`TestDSTCrashHostPreservesMkfsImage`, torn variant included); a tree born unsynced would erase
+`/tmp` at the first crash, recoverable only by fsyncing `/` — which no POSIX-disciplined program
+does for a pre-existing directory.
 Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
 per-bubble). **Resolution is component-wise (physical), as the kernel walks:** every intermediate
 component must exist and be a directory — `/missing/../tmp` is `ENOENT` (the walk reaches `missing`

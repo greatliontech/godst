@@ -274,6 +274,16 @@ func dstFSDiskHere() *dstFSDisk {
 func newDstFSDisk() *dstFSDisk {
 	root := dstFSNewNode(true, ModeDir|0o755)
 	root.entries["tmp"] = dstFSNewNode(true, ModeDir|ModeSticky|0o777)
+	// The mkfs image is part of the durable image: a filesystem is born with
+	// its initial tree ON THE PLATTER, so a host crash preserves root and
+	// /tmp. Without this commit the tree is born unsynced and the first crash
+	// erases "tmp" — unrecoverable short of fsyncing "/", which no
+	// POSIX-disciplined program does for a pre-existing directory, so
+	// fsync-disciplined state under the one directory the spec guarantees
+	// exists would vanish (a false-positive generator for every
+	// crash-recovery SUT).
+	root.commitLocked()
+	root.entries["tmp"].commitLocked()
 	return &dstFSDisk{root: root}
 }
 
