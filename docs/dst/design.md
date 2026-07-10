@@ -630,6 +630,11 @@ re-growth. The mapping region is also the model's capability ceiling: a file siz
 region cannot hold (2^40 bytes on the wide architectures, per-run, views and reservations together) is a
 loud deterministic refusal — a harness limit stated here so it is never mistaken for a modeled errno.
 `Mprotect` and `Madvise` on a subrange whose file offset is not 4096-aligned are `EINVAL` (the deterministic analog of the kernel's page-aligned-address requirement).
+`Mprotect` may set any R/W protection the mapping's file DESCRIPTOR allowed at map time —
+VM_MAYWRITE follows the fd's access mode, not the map-time prot, so an `O_RDWR`-backed read-only
+mapping may upgrade to `PROT_READ|PROT_WRITE` and `PROT_NONE` is always permitted, while an
+`O_RDONLY`-backed mapping may never gain write (`TestDSTFSVirtualFDMmapReadOnlyShared`); protections
+beyond the R/W bits are unmodeled, refused as at map time.
 Process teardown unmaps the victim process's mappings — no write-back exists or is needed, since the
 bytes were the page cache's all along, visible to survivors and to a restart; a HOST crash instead
 rewinds the page cache to the durable image (exit and crash move no durability boundary). `Madvise`

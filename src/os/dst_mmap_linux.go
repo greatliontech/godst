@@ -52,31 +52,29 @@ type dstMMapEntry struct {
 	data     []byte
 	mapBase  uintptr
 	mapLen   uintptr
-	node     *dstFSNode
-	epoch    uint64
-	seq      uint64 // per-run registration sequence (see dstMMapRegistry.seq)
-	host     uint32
-	proc     uint32
-	off      int64
-	writable bool
+	node    *dstFSNode
+	epoch   uint64
+	host    uint32
+	proc    uint32
+	off     int64
+	// writable is the map-time prot's write bit; fdWritable is the backing
+	// descriptor's access mode at map time — the model's VM_MAYWRITE, which
+	// caps what mprotect may grant later (an O_RDWR-backed read-only mapping
+	// may upgrade to PROT_READ|PROT_WRITE; an O_RDONLY-backed one may not).
+	writable   bool
+	fdWritable bool
 }
 
 var dstMMapRegistry struct {
 	mu    sync.Mutex
 	epoch uint64
 	maps  map[*byte][]*dstMMapEntry
-	// seq stamps each registration in Mmap-call order — a pure function of the
-	// schedule — so any tie among candidates is broken by seq, never by heap
-	// address (allocation addresses vary run to run; the fixed -tags dst hash
-	// key does not make them reproducible).
-	seq uint64
 }
 
 func dstMMapRollLocked() {
 	if e := dstFSEpoch(); e != dstMMapRegistry.epoch || dstMMapRegistry.maps == nil {
 		dstMMapRegistry.epoch = e
 		dstMMapRegistry.maps = make(map[*byte][]*dstMMapEntry)
-		dstMMapRegistry.seq = 0
 	}
 }
 
@@ -173,18 +171,17 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		dstMMapRegistry.mu.Unlock()
 		return nil, errno, true
 	}
-	dstMMapRegistry.seq++
 	dstMMapRegistry.maps[key] = append(dstMMapRegistry.maps[key], &dstMMapEntry{
-		data:     data,
-		mapBase:  mapBase,
-		mapLen:   mapLen,
-		node:     file.node,
-		epoch:    dstFSEpoch(),
-		seq:      dstMMapRegistry.seq,
-		host:     host,
-		proc:     proc,
-		off:      offset,
-		writable: writable,
+		data:       data,
+		mapBase:    mapBase,
+		mapLen:     mapLen,
+		node:       file.node,
+		epoch:      dstFSEpoch(),
+		host:       host,
+		proc:       proc,
+		off:        offset,
+		writable:   writable,
+		fdWritable: file.wr,
 	})
 	dstMMapRegistry.mu.Unlock()
 	return data, 0, true
@@ -332,7 +329,8 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
-	var foundCurrent, foundOther, foundWritable, misaligned bool
+	var foundCurrent, foundOther, misaligned bool
+	fdWritable := true // all matched current mappings must be fd-writable for a write upgrade
 	for _, bucket := range dstMMapRegistry.maps {
 		for _, entry := range bucket {
 			mapStart, mapEnd, errno := dstMMapRange(entry.data)
@@ -348,9 +346,7 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 			}
 			if entry.host == host && entry.proc == proc {
 				foundCurrent = true
-				if entry.writable {
-					foundWritable = true
-				}
+				fdWritable = fdWritable && entry.fdWritable
 			} else {
 				foundOther = true
 			}
@@ -361,9 +357,17 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		return syscall.EINVAL, true
 	}
 	if foundCurrent {
-		// A mapping may not gain a permission its file descriptor never had:
-		// the page cache is opened read-write, so only the model knows this.
-		if prot != syscall.PROT_READ && !(prot == syscall.PROT_READ|syscall.PROT_WRITE && foundWritable) {
+		// A mapping may not gain a permission its file DESCRIPTOR never had:
+		// VM_MAYWRITE follows the fd's access mode at map time, not the
+		// map-time prot — so an O_RDWR-backed read-only mapping may upgrade
+		// to PROT_READ|PROT_WRITE, and PROT_NONE is always permitted, as
+		// Linux gives. Only the R/W bits are modeled (as at map time); the
+		// page cache itself is opened read-write, so only the model knows
+		// the descriptor's mode.
+		if prot&^(syscall.PROT_READ|syscall.PROT_WRITE) != 0 {
+			return syscall.EACCES, true
+		}
+		if prot&syscall.PROT_WRITE != 0 && !fdWritable {
 			return syscall.EACCES, true
 		}
 		if !dstPageCacheProtect(start, end-start, int32(prot)) {

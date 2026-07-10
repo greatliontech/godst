@@ -158,11 +158,40 @@ func TestDSTFSVirtualFDMmapReadOnlyShared(t *testing.T) {
 		if got := string(b); got != "hYllo" {
 			t.Fatalf("mapped bytes after WriteAt = %q, want hYllo", got)
 		}
-		if err := syscall.Mprotect(b, syscall.PROT_READ|syscall.PROT_WRITE); !errors.Is(err, syscall.EACCES) {
-			t.Fatalf("Mprotect(PROT_READ|PROT_WRITE) = %v, want EACCES", err)
+		// VM_MAYWRITE follows the DESCRIPTOR's access mode at map time, not
+		// the map-time prot: this read-only mapping is backed by an O_RDWR
+		// fd, so upgrading to PROT_READ|PROT_WRITE succeeds, exactly as
+		// Linux gives — and PROT_NONE is always permitted.
+		if err := syscall.Mprotect(b, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
+			t.Fatalf("Mprotect(PROT_READ|PROT_WRITE) on an O_RDWR-backed mapping: %v", err)
+		}
+		b[0] = 'H' // writable now; the store lands in the shared page cache
+		if got, err := os.ReadFile("/m"); err != nil || string(got) != "HYllo" {
+			t.Fatalf("file after mapped store = %q, %v; want HYllo", got, err)
+		}
+		if err := syscall.Mprotect(b, syscall.PROT_NONE); err != nil {
+			t.Fatalf("Mprotect(PROT_NONE): %v", err)
 		}
 		if err := syscall.Mprotect(b, syscall.PROT_READ); err != nil {
 			t.Fatalf("Mprotect(PROT_READ): %v", err)
+		}
+		if got := string(b); got != "HYllo" {
+			t.Fatalf("mapped bytes after protection round-trip = %q, want HYllo", got)
+		}
+		// The refusal that REMAINS is the descriptor's: an O_RDONLY-backed
+		// mapping may never gain write.
+		rf, err := os.Open("/m")
+		if err != nil {
+			t.Fatalf("Open read-only: %v", err)
+		}
+		defer rf.Close()
+		rb, err := syscall.Mmap(int(rf.Fd()), 0, 5, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("Mmap read-only fd: %v", err)
+		}
+		defer syscall.Munmap(rb)
+		if err := syscall.Mprotect(rb, syscall.PROT_READ|syscall.PROT_WRITE); !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("Mprotect(RW) on an O_RDONLY-backed mapping = %v, want EACCES", err)
 		}
 		for _, advice := range []int{dstTestMadvPopulateRead, syscall.MADV_HUGEPAGE, dstTestMadvCold} {
 			if err := syscall.Madvise(b, advice); err != nil {
@@ -663,7 +692,7 @@ func TestDSTFSVirtualFDMmapWindowsCohereAfterGrowth(t *testing.T) {
 	})
 }
 
-func TestDSTFSMprotectUnsupportedProtOnNonMappingFallsThrough(t *testing.T) {
+func TestDSTFSMprotectNonMappingFallsThrough(t *testing.T) {
 	simulation.Run(1, func() {
 		b := make([]byte, syscall.Getpagesize())
 		expectDSTRawSyscallPanic(t, func() {
@@ -911,8 +940,16 @@ func TestDSTFSVirtualFDMmapMixedProtectionDuplicateRegistrations(t *testing.T) {
 		if err := syscall.Munmap(rw); err != nil {
 			t.Fatalf("Munmap writable duplicate: %v", err)
 		}
-		if err := syscall.Mprotect(ro, syscall.PROT_READ|syscall.PROT_WRITE); !errors.Is(err, syscall.EACCES) {
-			t.Fatalf("Mprotect read-only duplicate after writable Munmap = %v, want EACCES", err)
+		// The surviving duplicate is still resolvable in the registry after
+		// the writable one unmapped — and, backed by the same O_RDWR fd, it
+		// may upgrade (VM_MAYWRITE follows the descriptor, not the map-time
+		// prot).
+		if err := syscall.Mprotect(ro, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
+			t.Fatalf("Mprotect read-only duplicate after writable Munmap: %v", err)
+		}
+		ro[1] = 7
+		if b, err := os.ReadFile("/lock"); err != nil || b[1] != 7 {
+			t.Fatalf("file after upgraded-duplicate store = %v, %v; want byte1==7", b, err)
 		}
 		if err := syscall.Munmap(ro); err != nil {
 			t.Fatalf("Munmap read-only duplicate: %v", err)
@@ -2163,3 +2200,47 @@ func TestDSTFSMappingFaultShapes(t *testing.T) {
 // pcSinkOS keeps a load from being optimized away: an elided load is an
 // elided fault, and the test would pass for the wrong reason.
 var pcSinkOS atomic.Uint32
+
+// TestDSTFSMprotectNoneIsEnforcedByHardware: PROT_NONE is applied to the
+// real page tables, not just acknowledged — a read through a NONE-protected
+// mapping faults, killing exactly the touching simulated process, as
+// production SIGSEGV does.
+func TestDSTFSMprotectNoneIsEnforcedByHardware(t *testing.T) {
+	faultShapeInProcess(t,
+		func(t *testing.T) func() {
+			f, err := os.OpenFile("/none", os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			defer f.Close()
+			if _, err := f.Write(make([]byte, 8)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			b, err := syscall.Mmap(int(f.Fd()), 0, 8, syscall.PROT_READ, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("Mmap: %v", err)
+			}
+			if err := syscall.Mprotect(b, syscall.PROT_NONE); err != nil {
+				t.Fatalf("Mprotect(PROT_NONE): %v", err)
+			}
+			return func() { // a read through PROT_NONE must fault
+				if b[0] == 42 { // the compare forces the load
+					t.Log("unreachable")
+				}
+			}
+		},
+		func(died, recovered, peerRan bool, killErr error) {
+			if !died {
+				t.Errorf("the victim survived a read through a PROT_NONE mapping")
+			}
+			if recovered {
+				t.Errorf("the victim recovered from a fault production delivers as SIGSEGV")
+			}
+			if !peerRan {
+				t.Errorf("the peer did not run: the fault took down more than its process")
+			}
+			if killErr != syscall.ESRCH {
+				t.Errorf("Kill(victim, 0) = %v, want ESRCH", killErr)
+			}
+		})
+}

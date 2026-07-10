@@ -68,7 +68,7 @@ Audit reproducers (ephemeral, from the audit session):
   the data reaching the durable image. Spec amended accordingly (user decision
   2026-07-10, supersedes the kinder model faults.md chose).
   (dst-audit-low-fidelity-cluster, fsync-EIO item)
-- [ ] 12. the mapping entry records fd writability; mprotect permits any
+- [x] 12. the mapping entry records fd writability; mprotect permits any
   protection the fd's access mode allows, including PROT_NONE — matching
   Linux and the spec's creation-time-only access checks (user decision
   2026-07-10). Also removes the dead `dstMMapEntry.seq` and its stale
