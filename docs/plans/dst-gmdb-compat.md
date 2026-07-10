@@ -11,4 +11,4 @@
 - [x] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
 - [x] 12. DST gmdb compatibility: add host crash and restart with durable-image filesystem restore.
 - [x] 13. DST gmdb compatibility: add unsynced write history for subset, reorder, and intra-page tear crash fidelity.
-- [ ] 14. DST gmdb compatibility: add gmdb end-to-end compatibility coverage for open, locking, liveness, mmap, and crash recovery.
+- [x] 14. DST gmdb compatibility: add gmdb end-to-end compatibility coverage for open, locking, liveness, mmap, and crash recovery.

@@ -10,4 +10,3 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb end-to-end compatibility coverage](./dst-gmdb-end-to-end-coverage.md) | 14 |

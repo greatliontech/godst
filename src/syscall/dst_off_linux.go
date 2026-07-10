@@ -17,3 +17,7 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool { return false }
 func dstSyscallMintingFcntl(trap, cmd uintptr) bool { return false }
 
 func dstSyscallRefuse(trap uintptr) {}
+
+func dstRawDispatch(trap, a1, a2, a3 uintptr) (r1 uintptr, err Errno, handled bool) {
+	return 0, 0, false
+}

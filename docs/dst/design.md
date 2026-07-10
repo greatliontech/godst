@@ -531,9 +531,18 @@ distinguish files; directories report `Nlink` 2 (per-subdirectory increments are
 files 1. Proc-overlay fds carry no tree node and report zero `(st_dev, st_ino)` — synthetic procfs
 stats are not an identity surface (recorded; no SUT keys file identity on procfs entries). A virtual fd never allocates or names a
 host descriptor, and the raw-syscall fence still catches host-resource minting and unsupported
-syscalls before they can reach the host. Direct generic raw syscalls (`syscall.Syscall*` and
-`golang.org/x/sys/unix` wrappers that bottom out there) remain fenced for virtual fd numbers until a
-split-safe raw-boundary dispatch is settled. The virtual fd table is per process; close releases the
+syscalls before they can reach the host. The **raw boundary dispatches a settled subset**: a SUT that
+reaches the kernel through `golang.org/x/sys/unix` (whose asm enters `syscall.Syscall`/`Syscall6`
+directly, never the named wrappers) gets the same modeled behavior for the file barriers (`fsync`,
+`fdatasync`), advisory locking (`flock`), descriptor `close`, and the mapping operations (`madvise`,
+`mprotect`, `munmap`) — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one operation, not two.
+"Split-safe" is the constraint that fixes the set: the dispatch allocates and takes locks, so it can grow
+the stack, which is fatal once a trampoline has called `entersyscall` (no P) — `Syscall`/`Syscall6` fence
+BEFORE that and therefore dispatch, while `RawSyscall`/`RawSyscall6` (reached post-`entersyscall`, and
+post-fork with no P) still refuse. Everything else on a virtual fd — `read`/`write`/`pread`/`pwrite`/
+`lseek`/`fstat`, whose argument shapes ride the 6-argument form or vary per arch — stays fenced at the
+raw boundary and is reached through `os.File`, whose named wrappers dispatch. A raw operation on a HOST
+fd, on a non-mapping address, or outside this set meets the fence exactly as before. The virtual fd table is per process; close releases the
 descriptor. Process teardown — on crash AND on normal body return, which models process **exit** (see
 the crash contract in faults.md) — closes every simulated file owned by the victim process and releases its
 virtual descriptors, so stale fd capabilities fail as closed/bad-fd and any fd-owned kernel state is
@@ -711,9 +720,13 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
   operations **on pre-run host handles** keep working. The fcntl allowlisting is
   **argument-aware**: its descriptor-MINTING commands (`F_DUPFD`/`F_DUPFD_CLOEXEC`) are refused —
-  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed. The reserved virtual-fd number range is refused
-  outright at this raw boundary — issued or not — before it can reach the host (see the virtual-fd
-  paragraph in the filesystem section); selected split-safe named
+  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed. The reserved virtual-fd number range never reaches
+  the host from this raw boundary: `Syscall`/`Syscall6` DISPATCH the settled subset (`fsync`,
+  `fdatasync`, `flock`, `close`, `madvise`, `mprotect`, `munmap` — the surface `golang.org/x/sys/unix`
+  reaches, since its asm enters these trampolines rather than the named wrappers), and every other
+  in-range number or operation is refused outright, issued or not. `RawSyscall`/`RawSyscall6` refuse the
+  range entirely: they run without a P, where the dispatch's allocation cannot grow the stack (see the
+  virtual-fd paragraph in the filesystem section); selected split-safe named
   Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
   dispatch them to the simulated backend. Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and

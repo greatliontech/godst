@@ -52,17 +52,64 @@ func TestDSTRawSyscallNoErrorIdentityNotFenced(t *testing.T) {
 	})
 }
 
-func TestDSTFSVirtualFDRawSelectedSyscallsFenced(t *testing.T) {
-	for _, tt := range []struct {
+// TestDSTFSVirtualFDRawSyscallDispatch pins the raw boundary's two halves for a
+// virtual fd. Syscall and Syscall6 fence BEFORE entersyscall, so they DISPATCH
+// the settled subset a SUT reaches through golang.org/x/sys/unix (the file
+// barriers, flock, close, and the mapping ops) to the file backend. RawSyscall
+// and RawSyscall6 run with no P (post-entersyscall, or post-fork), where the
+// dispatch's allocation could not grow the stack, so they still refuse — as does
+// any operation outside the subset, on either trampoline.
+func TestDSTFSVirtualFDRawSyscallDispatch(t *testing.T) {
+	dispatched := []struct {
+		name string
+		call func(fd uintptr) syscall.Errno
+	}{
+		{"Syscall_Fsync", func(fd uintptr) syscall.Errno {
+			_, _, e := syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0)
+			return e
+		}},
+		{"Syscall_Fdatasync", func(fd uintptr) syscall.Errno {
+			_, _, e := syscall.Syscall(syscall.SYS_FDATASYNC, fd, 0, 0)
+			return e
+		}},
+		{"Syscall_Flock", func(fd uintptr) syscall.Errno {
+			_, _, e := syscall.Syscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0)
+			return e
+		}},
+	}
+	for _, tt := range dispatched {
+		t.Run(tt.name, func(t *testing.T) {
+			simulation.Run(1, func() {
+				f, err := os.Create("/fd")
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				defer f.Close()
+				if e := tt.call(f.Fd()); e != 0 {
+					t.Fatalf("%s on a virtual fd = %v, want dispatch to the backend", tt.name, e)
+				}
+			})
+		})
+	}
+
+	fenced := []struct {
 		name string
 		call func(fd uintptr)
 	}{
-		{"Syscall_Fsync", func(fd uintptr) { syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0) }},
+		// The raw trampolines have no P for the dispatch's allocation.
 		{"RawSyscall_Fdatasync", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_FDATASYNC, fd, 0, 0) }},
+		{"RawSyscall_Flock", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0) }},
+		// Outside the settled subset: a minting op, and an fd-carrying op whose
+		// argument shape the dispatch deliberately does not decode.
 		{"Syscall6_Mmap", func(fd uintptr) {
 			syscall.Syscall6(syscall.SYS_MMAP, 0, uintptr(syscall.Getpagesize()), syscall.PROT_READ, syscall.MAP_SHARED, fd, 0)
 		}},
-	} {
+		{"Syscall_Read", func(fd uintptr) {
+			var b [1]byte
+			syscall.Syscall(syscall.SYS_READ, fd, uintptr(unsafe.Pointer(&b[0])), 1)
+		}},
+	}
+	for _, tt := range fenced {
 		t.Run(tt.name, func(t *testing.T) {
 			simulation.Run(1, func() {
 				f, err := os.Create("/fd")
@@ -1617,13 +1664,121 @@ func TestDSTFSVirtualFDFlockUnlockWakesBlockedExclusive(t *testing.T) {
 	})
 }
 
-func TestDSTFSVirtualFDFlockRawSyscallFenced(t *testing.T) {
+// TestDSTFSVirtualFDRawSyscallSemantics: the raw path is not merely "errno 0" —
+// it performs the operation. A raw flock really excludes a peer and a raw
+// LOCK_UN really releases; a raw fdatasync really commits the durable image; a
+// raw close really invalidates the descriptor.
+func TestDSTFSVirtualFDRawSyscallSemantics(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/db", []byte("old"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			held := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan error, 1)
+			go simulation.Process("holder", func() {
+				f, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					done <- err
+					return
+				}
+				// Raw LOCK_EX, the x/sys way.
+				if _, _, e := syscall.Syscall(syscall.SYS_FLOCK, f.Fd(), syscall.LOCK_EX, 0); e != 0 {
+					done <- e
+					return
+				}
+				// Raw fdatasync must move the durable image.
+				if _, err := f.WriteAt([]byte("new"), 0); err != nil {
+					done <- err
+					return
+				}
+				if _, _, e := syscall.Syscall(syscall.SYS_FDATASYNC, f.Fd(), 0, 0); e != 0 {
+					done <- e
+					return
+				}
+				close(held)
+				<-release
+				// Raw LOCK_UN really releases.
+				if _, _, e := syscall.Syscall(syscall.SYS_FLOCK, f.Fd(), syscall.LOCK_UN, 0); e != 0 {
+					done <- e
+					return
+				}
+				done <- f.Close()
+			})
+			<-held
+
+			simulation.Process("peer", func() {
+				f, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("peer open: %v", err)
+				}
+				defer f.Close()
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("peer flock while a RAW flock is held = %v, want EWOULDBLOCK", err)
+				}
+			})
+			if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/db"); !ok || string(synced) != "new" {
+				t.Fatalf("durable image after a RAW fdatasync = %q, want %q", synced, "new")
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatalf("holder: %v", err)
+			}
+
+			// Raw close really invalidates the descriptor.
+			g, err := os.Open("/db")
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			fd := g.Fd()
+			if _, _, e := syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0); e != 0 {
+				t.Fatalf("raw close: %v", e)
+			}
+			if _, _, e := syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0); e != syscall.EBADF {
+				t.Fatalf("raw fsync after raw close = %v, want EBADF", e)
+			}
+		})
+	})
+}
+
+// TestDSTRawSyscallHostFdNotDispatched: the virtual-fd range test is what keeps
+// the dispatch off host descriptors. A pre-run host handle (the inherited-handle
+// stance) must still reach the kernel through the allowlist — the dispatch's
+// helpers never fall through, so dispatching a host fd would refuse an operation
+// the boundary permits.
+func TestDSTRawSyscallHostFdNotDispatched(t *testing.T) {
+	// A real descriptor of our own, opened BEFORE the run (the inherited-handle
+	// stance) and owned by nothing else, since the raw close below really closes
+	// it: dup a descriptor rather than borrowing one the test harness tracks.
+	dup, err := syscall.Dup(0)
+	if err != nil {
+		t.Skipf("dup(0): %v", err)
+	}
+	fd := uintptr(dup)
+	simulation.Run(1, func() {
+		// close(2) is allowlisted for inherited handles: it must reach the host,
+		// not be dispatched (the dispatch's helpers never fall through, so a
+		// dispatched host fd would be refused) and not be fenced.
+		if _, _, e := syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0); e != 0 {
+			t.Fatalf("raw close of a pre-run host fd = %v, want success (host passthrough)", e)
+		}
+	})
+	// The descriptor is gone: the close reached the kernel.
+	if _, _, e := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_GETFD), 0); e != syscall.EBADF {
+		t.Fatalf("fcntl on the closed host fd = %v, want EBADF (the raw close reached the host)", e)
+	}
+}
+
+func TestDSTFSVirtualFDFlockRawTrampolinesFenced(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		call func(fd uintptr)
 	}{
-		{"Syscall", func(fd uintptr) { syscall.Syscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0) }},
+		// Syscall dispatches flock now (see TestDSTFSVirtualFDRawSyscallDispatch);
+		// the raw trampolines, which have no P for the dispatch, still refuse.
 		{"RawSyscall", func(fd uintptr) { syscall.RawSyscall(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0) }},
+		{"RawSyscall6", func(fd uintptr) { syscall.RawSyscall6(syscall.SYS_FLOCK, fd, syscall.LOCK_EX, 0, 0, 0, 0) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			simulation.Run(1, func() {
