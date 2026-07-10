@@ -253,16 +253,30 @@ latched, rather than letting `crypto/rand` go silently nondeterministic inside a
   tree, whose per-g stream was rooted from the seed — where it returns the deterministic per-seed
   stream. It is never predictable outside a run, never in a non-`-tags dst` build, **and never merely
   because a run happens to be active elsewhere in the process**: a goroutine whose per-g stream was
-  never seeded (created before activation, or outside the bubble) reads real OS entropy even while a
+  not seeded by the active run (created before activation, outside the bubble, or a survivor of a
+  PRIOR run — the caller's root is cleared at deactivation) reads real OS entropy even while a
   run is live — the alternative, filling from an unseeded zero-rooted stream, would hand every such
   goroutine the same fixed, seed-independent bytes (the exact "predictable outside a run" violation
-  this invariant forbids). Enforced by `TestDSTCryptoRandDeterministic` (deterministic + seed-varying
+  this invariant forbids), and a stale prior-run root would hand its goroutine bytes derived from
+  the previous run's seed. Enforced by `TestDSTCryptoRandDeterministic` (deterministic + seed-varying
   inside a run; two reads *outside* a run differ) and structurally by the `dstActive()` +
   seeded-per-g gate (`dstSeed` is never set on any production path: its only setters are
   `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate` linkname used
   solely by the runtime's own white-box tests). The unseeded-goroutine leg is enforced by
-  `TestDSTCryptoUnseededGoroutine` (a goroutine created before activation reads real, cross-process-
-  varying entropy while a run is live) and the `gp.dstrand == 0` gate in `dstReadRandom`.
+  the `gp.dstrand == 0` gate in `dstReadRandom` together with the **stability of that sentinel**:
+  no draw site (`runtime.rand`, select poll order, the fake-timer tie-break) advances an unseeded
+  goroutine's stream, and `newproc1` extends the seeded tree only through seeded parents — so a
+  pre-run goroutine that spawns, draws math/rand, selects, or adds a fake timer during a run stays
+  outside the deterministic stream, and so do its descendants; the one seeded goroutine that
+  survives a run and can still execute (its caller — bubble goroutines exit with the run, and the
+  goroutines a recovered in-run deadlock abandons stay permanently parked, never reaching a draw
+  site) has its root cleared at deactivation, so `g.dstrand != 0` holds only within the run that
+  seeded it. Pinned by
+  `TestDSTCryptoUnseededGoroutine` (a goroutine created before activation reads real,
+  cross-process-varying entropy while a run is live), `TestDSTCryptoUnseededVectors` (each seeding
+  vector — spawn, math/rand draw, select, fake-timer add — plus the spawned child, all still real
+  entropy), and `TestDSTCryptoPriorRunCaller` (a completed run's caller reads real entropy during a
+  later run started by another goroutine).
 - **INV-IDENTITY**: within a run, every identity read (`pid`/`ppid`/`hostname`/`uid`/`gid`/`euid`/`egid`/
   `NumCPU`/`os/user.Current`) is a fixed function of the run config, and is restored to the real value
   outside the run. Enforced by `TestDSTProcessIdentity` and `TestDSTIdentityExtra` (the latter also

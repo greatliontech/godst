@@ -16,7 +16,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Runtime core (src/runtime)
 
-- [ ] 1. crypto/rand entropy gate keys on membership in the run-seeded
+- [x] 1. crypto/rand entropy gate keys on membership in the run-seeded
   goroutine tree, not `dstrand != 0`; an unseeded root cannot taint itself or
   its subtree into the deterministic stream. Test: spawn from a
   pre-activation goroutine during a run, assert crypto/rand output varies

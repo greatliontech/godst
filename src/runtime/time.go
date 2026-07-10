@@ -795,8 +795,12 @@ func (t *timer) maybeAdd() {
 			// tie-break from the adding goroutine's per-g DST stream rather than
 			// the per-m cheaprand stream, so the firing order of fake (synctest
 			// bubble) timers that share a wake time is reproducible and immune to
-			// which m runs the goroutine. See dstrandUint64.
-			if dstActive() {
+			// which m runs the goroutine. An unseeded adder (dstrand == 0: a
+			// FOREIGN synctest bubble's goroutine, mid-run) keeps the per-m
+			// draw — its zero-rooted stream must not advance, or the sentinel
+			// dstReadRandom's entropy gate relies on is destroyed. See
+			// dstrandUint64.
+			if dstActive() && getg().dstrand != 0 {
 				t.rand = uint32(dstrandUint64(getg()))
 			} else {
 				t.rand = cheaprand()

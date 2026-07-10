@@ -1349,6 +1349,63 @@ func TestDSTCryptoUnseededGoroutine(t *testing.T) {
 	}
 }
 
+// TestDSTCryptoUnseededVectors is the INV-CRYPTO stable-sentinel regression: a
+// pre-run (unseeded) goroutine that spawns a child, draws math/rand, runs a
+// select, or adds a fake timer (in a foreign synctest bubble) DURING the run —
+// and, for the spawn, the child itself — must still read real OS entropy from
+// crypto/rand: none of those operations may advance the zero-rooted stream and
+// flip the goroutine into the run-seeded tree. Each labeled line must differ
+// across two processes; under the bug the corresponding vector's bytes are
+// seed-independent and identical. Mutation: dropping the dstrand != 0 guard at
+// runtime.rand breaks mathrand (and spawnparent, via the tainted parent); at
+// selectgo's pollorder draw, select; at the fake-timer tie-break, timer; at
+// newproc1's child seeding, spawnchild and spawnparent.
+func TestDSTCryptoUnseededVectors(t *testing.T) {
+	parse := func(out string) map[string]string {
+		if strings.Contains(out, "incomplete") {
+			t.Fatalf("unseeded readers did not run during the active window:\n%s", out)
+		}
+		m := make(map[string]string)
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			label, hex, ok := strings.Cut(line, "=")
+			if !ok || hex == "" {
+				t.Fatalf("malformed vector line %q in:\n%s", line, out)
+			}
+			m[label] = hex
+		}
+		return m
+	}
+	a := parse(runTestProgDST(t, "DSTCryptoUnseededVectors", "DSTSEED=1"))
+	b := parse(runTestProgDST(t, "DSTCryptoUnseededVectors", "DSTSEED=1"))
+	for _, label := range []string{"mathrand", "select", "spawnchild", "spawnparent", "timer"} {
+		if a[label] == "" || b[label] == "" {
+			t.Fatalf("vector %q missing:\na=%v\nb=%v", label, a, b)
+		}
+		if a[label] == b[label] {
+			t.Errorf("vector %q: identical crypto/rand bytes across processes (seed-independent deterministic stream — the %s operation seeded an unseeded goroutine): %s", label, label, a[label])
+		}
+	}
+}
+
+// TestDSTCryptoPriorRunCaller is the INV-CRYPTO cross-run leg: the goroutine
+// that called a completed run survives with a seeded per-g root; deactivation
+// must clear it, so that during a LATER run (started by another goroutine) it
+// reads real OS entropy like any outsider — not bytes derived from the
+// previous run's seed. The prog's output must differ across two processes.
+// Mutation: removing the dstrand clear in dstDeactivate makes the caller's
+// in-second-run bytes a pure function of the first run's seed, identical
+// across processes.
+func TestDSTCryptoPriorRunCaller(t *testing.T) {
+	a := strings.TrimSpace(runTestProgDST(t, "DSTCryptoPriorRunCaller", "DSTSEED=3"))
+	b := strings.TrimSpace(runTestProgDST(t, "DSTCryptoPriorRunCaller", "DSTSEED=3"))
+	if strings.Contains(a, "incomplete") || strings.Contains(b, "incomplete") {
+		t.Fatalf("prior run's caller did not read during the second run's active window:\na=%q\nb=%q", a, b)
+	}
+	if a == "" || a == b {
+		t.Fatalf("a prior run's caller reads deterministic crypto/rand during a later run (stale seeded root survived deactivation):\na=%q\nb=%q", a, b)
+	}
+}
+
 // TestDSTIdentityGroups verifies the simulated group list and the minimal
 // simulated user/group database (the simulated user and its group resolve by
 // name and id; everything else is deterministically unknown; host values

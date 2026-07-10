@@ -195,7 +195,7 @@ func rand32() uint32 {
 //go:linkname rand
 func rand() uint64 {
 	gp := getg()
-	if dstActive() {
+	if dstActive() && gp.dstrand != 0 {
 		// Under deterministic scheduling, draw from the per-g DST stream. rand is
 		// the source for the math/rand and math/rand/v2 globals (linkname'd to
 		// runtime.rand), for map seeds/iteration (maps.rand), and for
@@ -206,6 +206,11 @@ func rand() uint64 {
 		// goroutine's stack — mrandinit, when a new m is spawned — is exempted
 		// there (it seeds from bootstrapRand under DST). randomizeScheduler's
 		// randn (proc.go) is -race-only and outside DST scope.
+		//
+		// An UNSEEDED goroutine (dstrand == 0 — outside the run-seeded tree)
+		// keeps the per-m path below, as in production: drawing here would
+		// advance the zero-rooted stream and destroy the sentinel dstReadRandom's
+		// entropy gate relies on (INV-CRYPTO unseeded leg; see dstrandUint64).
 		return dstrandUint64(gp)
 	}
 	// Note: We avoid acquirem here so that in the fast path
@@ -247,6 +252,16 @@ func maps_rand() uint64 {
 // root from the DST seed (dstActivate, or a synctest bubble re-root via
 // dstBubbleRoot) and each child from its parent at newproc1.
 //
+// Callers must never draw from an UNSEEDED g (gp.dstrand == 0): zero is the
+// sentinel dstReadRandom reads as "outside the run-seeded tree — use real OS
+// entropy", and a draw would flip it to the fixed, seed-independent constant
+// below, admitting the goroutine (and, via newproc1, its descendants) into the
+// deterministic crypto stream — the INV-CRYPTO violation the sentinel exists
+// to prevent. Every draw site (rand, select pollorder, fake-timer tie-break)
+// gates on dstrand != 0, newproc1 extends the tree only through seeded
+// parents, and dstDeactivate clears the run caller's surviving root — so
+// dstrand != 0 holds only within the run that seeded it.
+//
 //go:nosplit
 func dstrandUint64(gp *g) uint64 {
 	gp.dstrand += 0x9e3779b97f4a7c15
@@ -282,11 +297,14 @@ func dstReadRandom(b []byte) bool {
 	gp := getg()
 	if gp.dstrand == 0 {
 		// This goroutine's per-g stream was never seeded — it was created before
-		// activation (a seeded goroutine roots at dstActivate/newproc1 to a nonzero
-		// value and only advances). Filling from its zero-rooted stream would hand
-		// every such goroutine the SAME fixed, seed-independent bytes: the exact
-		// "predictable outside a run" hole INV-CRYPTO forbids. Fall through to real
-		// OS entropy instead (docs/dst/design.md, INV-CRYPTO unseeded-goroutine leg).
+		// activation, or descends from such a goroutine. The sentinel is stable:
+		// no draw site advances an unseeded stream and newproc1 seeds children
+		// only from seeded parents (see dstrandUint64), so dstrand stays 0 for
+		// the goroutine's lifetime outside the run-seeded tree. Filling from the
+		// zero-rooted stream would hand every such goroutine the SAME fixed,
+		// seed-independent bytes: the exact "predictable outside a run" hole
+		// INV-CRYPTO forbids. Fall through to real OS entropy instead
+		// (docs/dst/design.md, INV-CRYPTO unseeded-goroutine leg).
 		return false
 	}
 	for len(b) >= 8 {

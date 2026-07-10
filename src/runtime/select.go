@@ -191,9 +191,12 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		// Under deterministic scheduling (DST active), draw the poll
 		// order from this goroutine's per-g DST stream instead of the per-m
 		// cheaprand stream, so the chosen ready case depends only on the
-		// goroutine's logical history. See dstrandUint64.
+		// goroutine's logical history. An unseeded goroutine (dstrand == 0 —
+		// outside the run-seeded tree) keeps the per-m stream: its zero-rooted
+		// stream must not advance, or the sentinel dstReadRandom's entropy gate
+		// relies on is destroyed. See dstrandUint64.
 		var j uint32
-		if dstActive() {
+		if dstActive() && gp.dstrand != 0 {
 			j = dstrandn(gp, uint32(norder+1))
 		} else {
 			j = cheaprandn(uint32(norder + 1))

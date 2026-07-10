@@ -15,7 +15,6 @@ chunk(s) there.
 | Issue | Severity | Lands |
 |---|---|---|
 | [socketcall arches bypass the syscall fence](./dst-audit-socketcall-fence.md) | H | chunk 5 |
-| [crypto/rand taints unseeded goroutine subtrees](./dst-audit-crypto-rand-taint.md) | H | chunk 1 |
 | [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
 | [pre-seeded /tmp born unsynced, erased by crash](./dst-audit-fs-tmp-durability.md) | H | chunk 7 |
 | [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |

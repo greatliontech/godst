@@ -1970,6 +1970,18 @@ func dstDiskFaultOp(op, host uint32, arg int64, path string) {
 //go:linkname dstDeactivate
 func dstDeactivate() {
 	dstSeed.Store(0)
+	// Clear the activating goroutine's per-g root. It is the one seeded
+	// goroutine that survives the run AND can still execute: bubble goroutines
+	// exit with the run (gdestroy zeroes dstrand), and the seeded-but-parked
+	// goroutines a recovered deadlock abandons are permanently unwakeable
+	// (dstDiscardAbandonedDrainChains), so they can never reach a draw site.
+	// A stale nonzero root here would pass dstReadRandom's
+	// membership gate during a LATER run started by another goroutine, handing
+	// this goroutine — and, via newproc1, its new children — deterministic
+	// bytes derived from the PREVIOUS run's seed (INV-CRYPTO: the seeded tree
+	// is the active run's own). dstDeactivate runs on the activating goroutine
+	// (runLocked's defer), so this is a self-write.
+	getg().dstrand = 0
 	dstSimRootG = nil
 	dstSimBubble = nil
 	// Hand any goroutines still in the DST ring-overflow queue (foreign

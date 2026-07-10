@@ -58,6 +58,8 @@ func init() {
 	register("DSTZeroCopyFence", DSTZeroCopyFence)
 	register("DSTPCTNonBubbleCreation", DSTPCTNonBubbleCreation)
 	register("DSTCryptoUnseededGoroutine", DSTCryptoUnseededGoroutine)
+	register("DSTCryptoUnseededVectors", DSTCryptoUnseededVectors)
+	register("DSTCryptoPriorRunCaller", DSTCryptoPriorRunCaller)
 	register("DSTPCTMainDrawsPriority", DSTPCTMainDrawsPriority)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
@@ -2740,6 +2742,133 @@ func DSTCryptoUnseededGoroutine() {
 		}
 	})
 	buf := <-result
+	os.Stdout.WriteString(hex.EncodeToString(buf[:]) + "\n")
+}
+
+// DSTCryptoUnseededVectors exercises every operation that could mistakenly
+// admit an unseeded (pre-run, dstrand==0) goroutine into the deterministic
+// crypto stream — spawning a child, a math/rand draw, a select, a fake-timer
+// add in a foreign synctest bubble — then reads crypto/rand DURING the run on
+// the goroutine that performed the operation and, for the spawn vector, on
+// its child. Per INV-CRYPTO's unseeded leg all of them must still get REAL OS
+// entropy: the sentinel is stable, so no draw or spawn moves a goroutine (or
+// its descendants) into the run-seeded tree. The parent test runs this twice
+// and every labeled line must differ across processes; the bug (a draw
+// flipping dstrand to the fixed splitmix constant) makes the corresponding
+// line's bytes seed-independent and identical across processes.
+func DSTCryptoUnseededVectors() {
+	ping := make(chan struct{}) // unbubbled: made before the run, closed inside it
+	type res struct{ label, hex string }
+	results := make(chan res, 8) // unbubbled, never blocks
+	var completed atomic.Int32
+	read := func(label string) {
+		var buf [16]byte
+		crand.Read(buf[:])
+		results <- res{label, hex.EncodeToString(buf[:])}
+		completed.Add(1)
+	}
+	// Every goroutine below is created BEFORE the run, so its per-g stream is
+	// unseeded; each performs its vector (the operation that must not seed it)
+	// only after the run's body closes ping, i.e. while the run is active.
+	go func() {
+		<-ping
+		var inner sync.WaitGroup
+		inner.Add(1)
+		go func() { // created DURING the run from an unseeded parent
+			defer inner.Done()
+			read("spawnchild")
+		}()
+		inner.Wait()
+		read("spawnparent") // the spawn itself must not have seeded the parent
+	}()
+	go func() {
+		<-ping
+		_ = rand.Uint64() // math/rand/v2 global: runtime.rand draw
+		read("mathrand")
+	}()
+	go func() {
+		<-ping
+		a, b := make(chan int, 1), make(chan int, 1)
+		a <- 1
+		b <- 1
+		select { // 2-case ready select: pollorder shuffle draw
+		case <-a:
+		case <-b:
+		}
+		read("select")
+	}()
+	go func() {
+		<-ping
+		synctest.Run(func() { // foreign bubble: its goroutines are unseeded
+			time.Sleep(time.Microsecond) // fake-timer add: the tie-break draw
+			read("timer")
+		})
+	}()
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	// inWindow is observed INSIDE the run body: a laggard reader that completes
+	// between the body's return and a post-Run check would otherwise pass with
+	// trivially-real post-deactivation entropy, never exercising the sentinel.
+	var inWindow bool
+	simulation.Run(n, func() {
+		close(ping)
+		// Hold the run active until every unseeded reader has read (bounded so
+		// a wedged reader ends the run instead of hanging it); the parent test
+		// treats "incomplete" as a failure, so a read that would land after
+		// deactivation cannot silently pass as real entropy.
+		for i := 0; i < 400 && completed.Load() < 5; i++ {
+			time.Sleep(time.Millisecond)
+		}
+		inWindow = completed.Load() >= 5
+	})
+	if !inWindow {
+		os.Stdout.WriteString("incomplete: unseeded readers did not run during the active window\n")
+		return
+	}
+	got := make(map[string]string, 5)
+	for i := 0; i < 5; i++ {
+		r := <-results
+		got[r.label] = r.hex
+	}
+	for _, label := range []string{"mathrand", "select", "spawnchild", "spawnparent", "timer"} {
+		os.Stdout.WriteString(label + "=" + got[label] + "\n")
+	}
+}
+
+// DSTCryptoPriorRunCaller: the goroutine that called a COMPLETED run keeps
+// running with the per-g root dstActivate seeded it with; a later run started
+// by a different goroutine must not readmit it. Deactivation clears the
+// caller's root, so during the second run it is an ordinary unseeded outsider
+// and its crypto/rand reads real OS entropy. Under the bug (root surviving
+// deactivation) its bytes are a pure function of the FIRST run's seed and its
+// deterministic draw count — identical across processes. The parent test runs
+// this twice and the line must differ; "incomplete" (the read missed the
+// second run's active window) is a loud failure, not a pass.
+func DSTCryptoPriorRunCaller() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(n, func() {}) // seeds this goroutine's root at activation
+	ping := make(chan struct{})  // unbubbled
+	var done atomic.Bool
+	inWindow := make(chan bool, 1)
+	go func() { // the second run, on a goroutine that has never called Run
+		simulation.Run(n+1, func() {
+			close(ping)
+			// Hold the run active until the first run's caller has read
+			// (bounded); observe completion INSIDE the body so a read that
+			// landed after deactivation reports incomplete, not a pass.
+			for i := 0; i < 400 && !done.Load(); i++ {
+				time.Sleep(time.Millisecond)
+			}
+			inWindow <- done.Load()
+		})
+	}()
+	<-ping
+	var buf [16]byte
+	crand.Read(buf[:]) // during the second run, on the first run's caller
+	done.Store(true)
+	if !<-inWindow {
+		os.Stdout.WriteString("incomplete: the prior run's caller did not read during the active window\n")
+		return
+	}
 	os.Stdout.WriteString(hex.EncodeToString(buf[:]) + "\n")
 }
 

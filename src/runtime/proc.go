@@ -5449,16 +5449,26 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		}
 	}
 	if dstActive() {
-		// Seed the child's deterministic DST RNG from the parent's stream,
-		// extending the deterministic goroutine tree. Draw before the
-		// trackingSeq cheaprand below so the child's seed depends only on
-		// logical ancestry, not on runtime-internal per-m draws.
-		newg.dstrand = dstrandUint64(callergp)
-		if newg.dstrand == 0 {
-			// Keep a SEEDED per-g root nonzero: dstReadRandom reads dstrand == 0 as
-			// "unseeded, use real entropy", so a seeded child that happened to draw 0
-			// must not be misread. Measure-zero, but the sentinel must be unambiguous.
-			newg.dstrand = 1
+		if callergp.dstrand != 0 {
+			// Seed the child's deterministic DST RNG from the parent's stream,
+			// extending the deterministic goroutine tree. Draw before the
+			// trackingSeq cheaprand below so the child's seed depends only on
+			// logical ancestry, not on runtime-internal per-m draws.
+			//
+			// Only a SEEDED parent extends the tree. An unseeded parent's child
+			// stays unseeded (newg.dstrand == 0, from gdestroy/alloc): drawing
+			// from the parent's zero-rooted stream would flip the parent's own
+			// dstrand nonzero and hand the child a seed-independent value —
+			// admitting both into the deterministic crypto stream dstReadRandom's
+			// sentinel exists to keep them out of (INV-CRYPTO unseeded leg; see
+			// dstrandUint64).
+			newg.dstrand = dstrandUint64(callergp)
+			if newg.dstrand == 0 {
+				// Keep a SEEDED per-g root nonzero: dstReadRandom reads dstrand == 0 as
+				// "unseeded, use real entropy", so a seeded child that happened to draw 0
+				// must not be misread. Measure-zero, but the sentinel must be unambiguous.
+				newg.dstrand = 1
+			}
 		}
 		// Inherit the host/process identity and the per-host clock offset from the
 		// parent — the labeled-subtree tree, extended exactly as dstrand extends the
