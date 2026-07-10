@@ -90,10 +90,14 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		// but the bytes' home does not move).
 		image := node.synced
 		if dstCrashTear {
-			image = dstTearFileLocked(node.synced, node.data)
+			image = dstTearFileLocked(node.synced, node.data, node.wbDropped)
 		}
 		dstNodeSetSizeLocked(node, int64(len(image)))
 		copy(node.data, image)
+		// A crash clears the fsyncgate mark: the page cache is rebuilt from
+		// the platter, so nothing is clean-but-stale afterwards — and the
+		// commit below must be the full one.
+		node.wbDropped = nil
 		// The restored image IS what the platter now holds: commit it as the
 		// new durable image. Left uncommitted, a torn restore leaves synced
 		// at the PRE-crash durable image while disk and cache agree on the

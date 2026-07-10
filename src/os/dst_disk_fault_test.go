@@ -1074,3 +1074,169 @@ func TestDSTDiskLatencyDeterminism(t *testing.T) {
 		t.Fatalf("two reads + a seek took %v, want %v", a, 2*lat)
 	}
 }
+
+// TestDSTDiskEIOFsyncgate: a failed data sync drops the dirty pages from the
+// writeback set, as Linux >= 4.13 does — so a RETRIED sync after healing
+// SUCCEEDS without the data ever reaching the durable image (the fsyncgate
+// trap: a database whose recovery is "retry fsync after EIO" passes the
+// retry and still loses the data on power loss), and only pages REWRITTEN
+// after the failure reach the platter on the next sync; an unrewritten page
+// stays durably stale forever.
+func TestDSTDiskEIOFsyncgate(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			const page = 4096
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			a := make([]byte, 2*page)
+			for i := range a {
+				a[i] = 'A'
+			}
+			_, err = f.Write(a)
+			mustOK(t, "write A", err)
+			mustOK(t, "sync A", f.Sync()) // durable: AA
+
+			b := make([]byte, 2*page)
+			for i := range b {
+				b[i] = 'B'
+			}
+			_, err = f.WriteAt(b, 0)
+			mustOK(t, "write B", err) // dirty: BB
+
+			simulation.FailDisk("h")
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("faulted sync: %v, want EIO", err)
+			}
+			simulation.HealDisk("h")
+
+			// The trap: the retried sync SUCCEEDS...
+			mustOK(t, "retried sync", f.Sync())
+			// ...and the data never reached the durable image.
+			_, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState not ok")
+			}
+			if synced[0] != 'A' || synced[page] != 'A' {
+				t.Fatalf("durable image after retried sync = %c%c, want AA (dropped pages must never reach the platter)", synced[0], synced[page])
+			}
+
+			// Only a REWRITTEN page reaches the platter on the next sync.
+			c := make([]byte, page)
+			for i := range c {
+				c[i] = 'C'
+			}
+			_, err = f.WriteAt(c, 0) // redirty page 0 only
+			mustOK(t, "write C", err)
+			mustOK(t, "sync C", f.Sync())
+			_, synced, _, _, _, _, ok = os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState not ok")
+			}
+			if synced[0] != 'C' {
+				t.Fatalf("redirtied page after sync = %c, want C", synced[0])
+			}
+			if synced[page] != 'A' {
+				t.Fatalf("unrewritten dropped page after sync = %c, want A (durably stale, never written back)", synced[page])
+			}
+		})
+	})
+}
+
+// TestDSTDiskEIOFsyncgateTornCrash: a dropped page cannot LAND in a torn
+// crash — it is writeback-clean, never in flight, so power loss preserves
+// exactly its durable bytes (letting it land would fabricate a write the
+// disk cannot perform and probabilistically mask the fsyncgate trap). Swept
+// over seeds so a draw-based leak cannot hide.
+func TestDSTDiskEIOFsyncgateTornCrash(t *testing.T) {
+	const page = 4096
+	for seed := uint64(1); seed <= 6; seed++ {
+		var got string
+		simulation.RunWith(seed, simulation.Options{CrashTear: true}, func() {
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				simulation.Process("db", func() {
+					f, err := os.Create("/f")
+					mustOK(t, "Create", err)
+					a := make([]byte, 2*page)
+					for i := range a {
+						a[i] = 'A'
+					}
+					_, err = f.Write(a)
+					mustOK(t, "write A", err)
+					mustOK(t, "sync A", f.Sync())
+					dir, err := os.Open("/")
+					mustOK(t, "open /", err)
+					mustOK(t, "sync /", dir.Sync()) // the NAME must be durable too
+					dir.Close()
+					b := make([]byte, 2*page)
+					for i := range b {
+						b[i] = 'B'
+					}
+					_, err = f.WriteAt(b, 0)
+					mustOK(t, "write B", err)
+					simulation.FailDisk("h")
+					if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+						t.Fatalf("faulted sync: %v, want EIO", err)
+					}
+					simulation.HealDisk("h") // the drop is already marked; heal so the reboot can read
+					f.Close()
+				})
+			})
+			simulation.CrashHost("h")
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				simulation.Process("db", func() {
+					data, err := os.ReadFile("/f")
+					mustOK(t, "read after crash", err)
+					got = string(data)
+				})
+			})
+		})
+		for i := 0; i < len(got); i++ {
+			if got[i] != 'A' {
+				t.Fatalf("seed %d: dropped page landed in a torn crash: byte %d = %c, want A", seed, i, got[i])
+			}
+		}
+	}
+}
+
+// TestDSTDiskEIOFsyncgateShrinkRegrow: pages a shrink destroys leave the
+// dropped set — a regrow gives holes (zeros) back, never the dead platter
+// bytes a stale dropped mark would restore at the next sync.
+func TestDSTDiskEIOFsyncgateShrinkRegrow(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			const page = 4096
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			a := make([]byte, 2*page)
+			for i := range a {
+				a[i] = 'A'
+			}
+			_, err = f.Write(a)
+			mustOK(t, "write A", err)
+			mustOK(t, "sync A", f.Sync())
+			b := make([]byte, 2*page)
+			for i := range b {
+				b[i] = 'B'
+			}
+			_, err = f.WriteAt(b, 0)
+			mustOK(t, "write B", err)
+			simulation.FailDisk("h")
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("faulted sync: %v, want EIO", err)
+			}
+			simulation.HealDisk("h")
+			mustOK(t, "shrink", f.Truncate(0))
+			mustOK(t, "regrow", f.Truncate(2*page))
+			mustOK(t, "sync", f.Sync())
+			_, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState not ok")
+			}
+			if synced[page] != 0 {
+				t.Fatalf("regrown page after sync = %c, want a hole (zeros), not resurrected platter bytes", synced[page])
+			}
+		})
+	})
+}

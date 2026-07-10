@@ -63,7 +63,7 @@ Audit reproducers (ephemeral, from the audit session):
   the run epoch like `dstFile`: a Root leaked across a run boundary is refused
   deterministically — never a nil deref, never a read of a prior run's tree.
   (dst-audit-leaked-root-epoch)
-- [ ] 11. fsync-EIO models post-fsyncgate Linux: a faulted fsync drops the
+- [x] 11. fsync-EIO models post-fsyncgate Linux: a faulted fsync drops the
   affected pages from the writeback set, so a retried fsync succeeds without
   the data reaching the durable image. Spec amended accordingly (user decision
   2026-07-10, supersedes the kinder model faults.md chose).

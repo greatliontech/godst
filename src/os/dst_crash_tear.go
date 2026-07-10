@@ -76,7 +76,7 @@ const (
 
 // dstTearFileLocked returns the content a power loss leaves for a file whose
 // durable image is synced and whose page cache holds data. Caller holds dstFS.mu.
-func dstTearFileLocked(synced, data []byte) []byte {
+func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}) []byte {
 	// The file's length is itself unsynced state when the file grew or was
 	// truncated: one draw decides whether the size change reached the inode.
 	// (A grown file whose tail pages are all lost still reads as zeros there —
@@ -103,6 +103,16 @@ func dstTearFileLocked(synced, data []byte) []byte {
 		dur := dstPageSlice(synced, start, curEnd)
 		if slices.Equal(cur, dur) {
 			continue // nothing unsynced in this page
+		}
+		if _, dropped := wbDropped[int64(start)/dstPageSize]; dropped {
+			// A page a failed writeback DROPPED is clean in the kernel's
+			// eyes: it was never in flight and will never be resubmitted, so
+			// power loss cannot land any of it — the durable bytes stand,
+			// with no outcome draw (its fate is not a degree of freedom).
+			// Letting it land would fabricate a write the disk cannot
+			// perform, and would probabilistically mask the fsyncgate trap
+			// this mark exists to model.
+			continue
 		}
 		switch dstTearPageOutcome(dstFaultRandN(3)) {
 		case dstPageDurable:

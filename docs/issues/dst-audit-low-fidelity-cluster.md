@@ -15,13 +15,6 @@ verified, none blocking:
   is not dead-code-eliminated untagged. No behavior change; the spec's "zero
   footprint" note is inaccurate.
 
-- **fsync-EIO model kinder than post-fsyncgate Linux.** A faulted fsync does
-  not advance the durable image and a heal resumes I/O (disk_fault.go:53-56,
-  per faults.md:546/879); on Linux ≥4.13 an fsync EIO marks pages clean and a
-  retried fsync succeeds without the data reaching disk. A DB whose recovery is
-  "retry fsync after EIO" passes here but loses data in production. Spec
-  explicitly chose the kinder model — spec-amend candidate for the user's call.
-
 - **`Listen(":0")` port allocator never wraps or reclaims**
   (`dstAllocateListenPort`, dst.go:429-445): ~55k listens in one run exhaust
   "no free ports" even with every listener closed; real kernels wrap and reuse.

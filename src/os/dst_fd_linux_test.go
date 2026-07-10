@@ -1095,11 +1095,25 @@ func TestDSTFSVirtualFDSyncFrontDoorsFailWithoutCommitting(t *testing.T) {
 				t.Fatalf("synced image after failed syncs = %q, ok=%v; want empty", synced, ok)
 			}
 			simulation.HealDisk("h")
+			// fsyncgate: the failed syncs dropped the dirty pages from the
+			// writeback set, so the retried sync SUCCEEDS without the data
+			// reaching the platter — the durable image holds the committed
+			// size with never-written (zero) pages, not "dirty".
 			if err := syscall.Fdatasync(fd); err != nil {
 				t.Fatalf("Fdatasync after HealDisk: %v", err)
 			}
+			if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-eio"); !ok || synced != "\x00\x00\x00\x00\x00" {
+				t.Fatalf("synced image after heal = %q, ok=%v; want five never-written zero bytes (the dropped pages must not reach the platter)", synced, ok)
+			}
+			// Rewriting the page redirties it; the next sync commits it.
+			if _, err := f.WriteAt([]byte("dirty"), 0); err != nil {
+				t.Fatalf("rewrite: %v", err)
+			}
+			if err := syscall.Fdatasync(fd); err != nil {
+				t.Fatalf("Fdatasync after rewrite: %v", err)
+			}
 			if _, synced, _, _, _, _, ok := os.DSTFSNodeState("/sync-eio"); !ok || synced != "dirty" {
-				t.Fatalf("synced image after heal = %q, ok=%v; want dirty", synced, ok)
+				t.Fatalf("synced image after rewrite+sync = %q, ok=%v; want dirty", synced, ok)
 			}
 		})
 	})

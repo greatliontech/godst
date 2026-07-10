@@ -352,6 +352,28 @@ type dstFSNode struct {
 	synced []byte
 	pc     *dstNodeCache
 
+	// wbDropped is the fsyncgate mark: the set of page indices the kernel
+	// marked CLEAN without writing back when a data sync failed with EIO
+	// (Linux >= 4.13 drops the dirty pages from the writeback set on
+	// writeback error). A failed sync drops EVERY page (dropping an
+	// already-clean page is unobservable — staying at its synced content);
+	// a write REDIRTIES exactly the pages it touches, removing them from
+	// the set. A later successful sync commits everything EXCEPT the still-
+	// dropped pages, which keep their platter bytes — so "retry fsync after
+	// EIO" SUCCEEDS while the unrewritten data never reaches the disk (the
+	// fsyncgate trap), while the correct recovery (rewrite, then fsync)
+	// works even when the rewrite carries byte-identical content: dirtiness
+	// is a write EVENT, not a content diff. Recorded bound: a store through
+	// a SUT MAPPING is an event the model cannot observe, so it does not
+	// redirty a dropped page (write()-path stores do); and the model never
+	// EVICTS a clean-stale page, so reads keep returning the never-persisted
+	// content — one legal Linux schedule (real kernels may evict, after
+	// which reads return the old platter bytes). Nil = no failed writeback
+	// pending. Reset by a host crash (the cache is rebuilt from the platter;
+	// nothing is clean-but-stale afterwards). Crash TEAR consults the set:
+	// a dropped page cannot land (dstTearFileLocked).
+	wbDropped map[int64]struct{}
+
 	// Directory state.
 	entries       map[string]*dstFSNode
 	syncedEntries map[string]*dstFSNode
@@ -806,6 +828,20 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 // process dies, as under production SIGBUS) and the partial page's tail
 // zeroes — ftruncate semantics, which the page cache provides directly.
 func (node *dstFSNode) truncateLocked(size int64) error {
+	if size < int64(len(node.data)) {
+		// A shrink zeroes the kept partial page's tail — a content change
+		// the kernel dirties, so it must leave the fsyncgate dropped set
+		// like any write event.
+		node.dstMarkRedirtiedLocked(size, 1)
+		// Pages wholly beyond the new size are destroyed outright: they
+		// leave the dropped set too, or a later regrow would restore dead
+		// platter bytes over what Linux gives back as holes (zeros).
+		for pg := range node.wbDropped {
+			if pg*dstPageSize >= size {
+				delete(node.wbDropped, pg)
+			}
+		}
+	}
 	dstNodeSetSizeLocked(node, size)
 	node.modTime = time.Now()
 	return nil
@@ -1362,6 +1398,7 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 	// A backed node's data IS the page cache, so the copy is the whole of the
 	// write: every mapping of this file already sees it.
 	n := copy(node.data[off:], b)
+	node.dstMarkRedirtiedLocked(off, int64(n))
 	node.modTime = time.Now()
 	return n, nil
 }
@@ -1502,6 +1539,13 @@ func (d *dstFile) sync() error {
 	}
 	defer d.leave()
 	if err := d.diskEIO(); err != nil {
+		if !d.node.isDir {
+			// fsyncgate: the failed writeback marks the file's dirty pages
+			// clean without persisting them (see dstFSNode.wbDropped).
+			// Directory entry writeback keeps the full-commit model — a
+			// recorded bound: the drop is modeled for file DATA pages.
+			d.node.markWritebackDroppedLocked()
+		}
 		return err
 	}
 	d.node.commitLocked()
@@ -1518,6 +1562,8 @@ func (d *dstFile) datasync() error {
 		return syscall.EINVAL
 	}
 	if err := d.diskEIO(); err != nil {
+		// fsyncgate, as in sync.
+		d.node.markWritebackDroppedLocked()
 		return err
 	}
 	d.node.commitDataLocked()
@@ -1540,7 +1586,57 @@ func (node *dstFSNode) commitLocked() {
 }
 
 func (node *dstFSNode) commitDataLocked() {
-	node.synced = append([]byte(nil), node.data...)
+	if node.wbDropped == nil {
+		node.synced = append([]byte(nil), node.data...)
+		return
+	}
+	// fsyncgate commit: everything reaches the platter except the pages the
+	// failed writeback dropped and nothing has rewritten since — those keep
+	// their old platter bytes (zero where the platter held nothing). See
+	// dstFSNode.wbDropped.
+	old := node.synced
+	synced := append([]byte(nil), node.data...)
+	for pg := range node.wbDropped {
+		off := pg * dstPageSize
+		if off >= int64(len(synced)) {
+			continue
+		}
+		end := min(off+dstPageSize, int64(len(synced)))
+		for i := off; i < end; i++ {
+			if i < int64(len(old)) {
+				synced[i] = old[i]
+			} else {
+				synced[i] = 0
+			}
+		}
+	}
+	node.synced = synced
+	if len(node.wbDropped) == 0 {
+		node.wbDropped = nil // fully redirtied: back to the plain full-commit path
+	}
+}
+
+// markWritebackDroppedLocked records the fsyncgate mark: the failed writeback
+// dropped every page from the writeback set. A page leaves the set only when
+// a write event touches it (dstMarkRedirtiedLocked). Caller holds dstFS.mu.
+func (node *dstFSNode) markWritebackDroppedLocked() {
+	pages := (int64(len(node.data)) + dstPageSize - 1) / dstPageSize
+	node.wbDropped = make(map[int64]struct{}, pages)
+	for pg := int64(0); pg < pages; pg++ {
+		node.wbDropped[pg] = struct{}{}
+	}
+}
+
+// dstMarkRedirtiedLocked removes the pages [off, off+n) touch from the
+// dropped set: a write event redirties them, so the next successful sync
+// writes them back. Caller holds dstFS.mu.
+func (node *dstFSNode) dstMarkRedirtiedLocked(off, n int64) {
+	if node.wbDropped == nil || n <= 0 {
+		return
+	}
+	for pg := off / dstPageSize; pg <= (off+n-1)/dstPageSize; pg++ {
+		delete(node.wbDropped, pg)
+	}
 }
 
 func (d *dstFile) stat() (FileInfo, error) {

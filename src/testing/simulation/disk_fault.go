@@ -49,9 +49,13 @@ const (
 // FailDisk makes every read, write, and fsync on the named host's disk fail with
 // EIO, modeling a failing disk or controller, until HealDisk(host) restores it. It
 // targets exactly the host's disk: another host's I/O, and metadata-only operations
-// that do not touch the media, are unaffected. In-memory file content is not lost —
-// a heal resumes normal I/O — so a SUT can test how it tolerates and recovers from a
-// disk that returns errors.
+// that do not touch the media, are unaffected. In-memory file content is not lost
+// and a heal resumes normal I/O — but a data sync that failed under the fault has
+// DROPPED the file's dirty pages from the writeback set, as Linux >= 4.13 does: a
+// retried sync after the heal succeeds without those pages reaching the durable
+// image, and only pages rewritten after the failure are written back. A recovery
+// that merely retries fsync after EIO therefore passes the retry and still loses
+// the data on power loss; rewriting the data first is the recovery that works.
 func FailDisk(host string) {
 	dstDiskFaultOp(diskOpFailDisk, lookupHost(host), 0, "")
 }

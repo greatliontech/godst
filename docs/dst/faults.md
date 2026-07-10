@@ -545,7 +545,19 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   return EIO. Sound only where the real call can fail: it is injected *before* any mutation, so a faulted
   write writes no bytes and a faulted `fsync` does **not** advance the durable image (it cannot tear
   "durable" state — the durability-monotonicity invariant holds under fault); and never at an infallible
-  call (seek, in-memory stat) — the Soundness boundary. The per-file fault keys on the *node*, not the
+  call (seek, in-memory stat) — the Soundness boundary. A failed DATA sync additionally models
+  **fsyncgate** (Linux >= 4.13): the failed writeback drops the file's dirty pages from the writeback
+  set, so a RETRIED sync succeeds without the data ever reaching the durable image — the "retry fsync
+  after EIO" recovery passes while power loss still loses the data — and only pages REWRITTEN after
+  the failure (a write event, not a content diff: rewriting byte-identical content redirties, so the
+  correct rewrite-then-fsync recovery works) reach the platter on the next sync; unrewritten pages
+  stay durably stale. Recorded bounds: the drop is modeled for file data pages (directory entry
+  writeback keeps the full-commit model); a store through a SUT mapping is an event the model
+  cannot observe, so it does not redirty a dropped page; and the model never EVICTS a clean-stale
+  page — reads keep returning the never-persisted content, one legal Linux schedule (real kernels
+  may evict, after which reads return the old platter bytes). A host crash clears the mark (the cache is
+  rebuilt from the platter). Enforced by `TestDSTDiskEIOFsyncgate` and the retried-sync leg of
+  `TestDSTFSVirtualFDSyncFrontDoorsFailWithoutCommitting`, mutation-tested. The per-file fault keys on the *node*, not the
   path, so a bad sector follows the file across a rename and a removed-but-open handle keeps failing;
   `FailFile` is scoped to a regular file (a directory is a no-op — its own `fsync` stays clean — while a
   whole-disk `FailDisk` does fail a directory `fsync`, a dead disk persisting nothing). Faults are explicit
