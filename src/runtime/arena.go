@@ -811,8 +811,12 @@ func newUserArenaChunk() (unsafe.Pointer, *mspan) {
 	releasem(mp)
 
 	// Again, because this chunk counts toward heapLive, potentially trigger a GC.
-	if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-		gcStart(t)
+	// Under DST the mallocgc dispatcher owns the heap trigger (evaluated and
+	// started only inside the bubble-allocation gate; gc.md M4).
+	if !dstActive() {
+		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+			gcStart(t)
+		}
 	}
 
 	if debug.malloc {

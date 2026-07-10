@@ -63,6 +63,8 @@ func init() {
 	register("DSTCryptoPriorRunCaller", DSTCryptoPriorRunCaller)
 	register("DSTPCTMainDrawsPriority", DSTPCTMainDrawsPriority)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
+	register("DSTGCForeignStart", DSTGCForeignStart)
+	register("DSTGCSysstackAlloc", DSTGCSysstackAlloc)
 	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
 	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
 	register("DSTOvfFlushAtDeactivate", DSTOvfFlushAtDeactivate)
@@ -1003,6 +1005,14 @@ var dstAllocSink []byte
 // one sink between them is a data race, and -race reports it as such.
 var dstOutsideAllocSink []byte
 
+// Per-path sinks for DSTGCForeignStart's pump: each foreign allocation path
+// (tiny, small-noscan, small-with-pointers, large) has its own runtime
+// trigger site to exercise.
+var (
+	dstOutsideTiny *int32
+	dstOutsidePtrs []*int32
+)
+
 // dstOutsideAllocPump allocates a megabyte on a non-bubble goroutine for every
 // ping received on an UNBUBBLED channel. A simulation goroutine sends the
 // pings, so the outside allocations deterministically interleave with the run
@@ -1053,6 +1063,150 @@ func DSTNonBubbleAllocTrigger() {
 	if d1 != alone || d2 != alone {
 		os.Stdout.WriteString("numgc perturbed: with=" + strconv.FormatUint(uint64(d1), 10) +
 			"," + strconv.FormatUint(uint64(d2), 10) +
+			" alone=" + strconv.FormatUint(uint64(alone), 10) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTGCSysstackAlloc: runtime bookkeeping allocated ON SYSTEMSTACK on a
+// bubble goroutine's behalf — allgs append-growth at goroutine creation, whose
+// backing array is not an excluded pooled type and whose capacity carries
+// across runs — must not advance the DST heap trigger: it is process-history,
+// not SUT heap growth. Runs the same goroutine-heavy near-threshold program
+// twice in one process: run 1 creates thousands of CONCURRENT goroutines
+// (distinct g structs, so allgs grows on systemstack; sequential spawn-exit
+// would reuse one g and never grow it), run 2 reuses them all from gFree (no
+// growth). The mid-run per-cycle discovery fingerprints must match; counting
+// the run-1-only growth shifts every later crossing. Prints "done".
+func DSTGCSysstackAlloc() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	run := func() (uint64, uint64) {
+		var partial, total uint64
+		simulation.Run(n, func() {
+			// 1500 concurrently-live goroutines force distinct g structs
+			// (allgs append-growth); released and drained in small batches so
+			// the runnable set stays bounded (the P=1 candidate walks are
+			// quadratic in it).
+			const gs, batch = 1500, 100
+			releases := make([]chan struct{}, gs/batch)
+			var batchWg [gs / batch]sync.WaitGroup
+			for b := range releases {
+				releases[b] = make(chan struct{})
+			}
+			for r := 0; r < gs; r++ {
+				b := r / batch
+				batchWg[b].Add(1)
+				release := releases[b]
+				go func(b int) {
+					defer batchWg[b].Done()
+					<-release
+				}(b)
+			}
+			for b, release := range releases {
+				close(release)
+				batchWg[b].Wait()
+			}
+			const N, K = 60000, 512
+			ring := make([]*dstFinObj, K)
+			for i := 0; i < N; i++ {
+				o := &dstFinObj{}
+				o.b[0] = byte(i)
+				runtime.SetFinalizer(o, func(p *dstFinObj) { _ = p.b[0] })
+				ring[i%K] = o
+				if i == N/2 {
+					partial = dstBubbleFinqFP() // per-cycle: discovered by the mid-run cycles
+				}
+			}
+			total = dstBubbleFinqFP()
+			runtime.KeepAlive(ring)
+		})
+		return partial, total
+	}
+	p1, t1 := run()
+	p2, t2 := run()
+	// Only the MID-RUN partial is asserted. The run-end totals diverge between
+	// a cold and a warmed process at equal NumGC and equal partials — a
+	// distinct, pre-existing effect (the late GOGC-scaled boundary shifts with
+	// what the mark retains across the goroutine phase's reused stacks) that
+	// this prog's goroutine phase exposes but this pin does not own.
+	if p1 != p2 {
+		os.Stdout.WriteString("systemstack bookkeeping moved the trigger: run1=" +
+			strconv.FormatUint(p1, 10) + "/" + strconv.FormatUint(t1, 10) + " run2=" +
+			strconv.FormatUint(p2, 10) + "/" + strconv.FormatUint(t2, 10) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTGCForeignStart: DST cycle STARTS are confined to the bubble-allocation
+// gate. With the bubble's live set held above Options.MemoryLimit the trigger
+// condition is persistently true, so every bubble allocation starts a
+// (deterministic) cycle — and a foreign allocator churning meanwhile must not
+// start any of its own: NumGC deltas with and without the churn are
+// identical. Under the bug, a foreign span grab evaluates the
+// persistently-true condition and starts extra cycles at
+// wall-clock-dependent points. Prints "done".
+func DSTGCForeignStart() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	gcs := func(ping chan struct{}) uint32 {
+		var delta uint32
+		simulation.RunWith(n, simulation.Options{MemoryLimit: 8 << 20}, func() {
+			live := make([][]byte, 0, 40)
+			for i := 0; i < 40; i++ { // retain ~10 MiB, above the 8 MiB limit
+				live = append(live, make([]byte, 256<<10))
+			}
+			var m0, m1 runtime.MemStats
+			runtime.ReadMemStats(&m0)
+			for i := 0; i < 100; i++ {
+				dstAllocSink = make([]byte, 32<<10)
+				if ping != nil {
+					// Rendezvous on the UNBUFFERED unbubbled channel (a
+					// non-durable block): the pump provably allocates before
+					// this send completes, i.e. inside the measured window.
+					ping <- struct{}{}
+				}
+				if i%10 == 0 {
+					time.Sleep(time.Millisecond) // keep fake time moving alongside the churn
+				}
+			}
+			runtime.ReadMemStats(&m1)
+			delta = m1.NumGC - m0.NumGC
+			runtime.KeepAlive(live)
+		})
+		return delta
+	}
+	// UNBUFFERED ping: each send is a rendezvous, so the pump provably
+	// allocates INSIDE the measured window (a buffered ping lets it slip past
+	// the window entirely, making the comparison vacuous). A bubbled
+	// goroutine blocking on an unbubbled channel is a non-durable block; the
+	// bounded infrastructure-first scheduling guarantees the foreign pump the
+	// slots to complete the rendezvous.
+	ping := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // like dstOutsideAllocPump, but exercising every foreign
+		// allocation-path trigger site: tiny (<=16B noscan), small noscan,
+		// small WITH pointers (the scan paths), and large. The user-arena
+		// site is not exercised (arenas need their own GOEXPERIMENT) — a
+		// stated coverage bound, gated identically in code.
+		defer wg.Done()
+		for range ping {
+			dstOutsideTiny = new(int32)
+			dstOutsideAllocSink = make([]byte, 8<<10)
+			dstOutsidePtrs = make([]*int32, 32) // <=512B pointerful: the no-header scan path
+			dstOutsidePtrs = make([]*int32, 512) // >512B pointerful: the header scan path
+			dstOutsideAllocSink = make([]byte, 1<<20)
+		}
+	}()
+	d1 := gcs(ping)
+	d2 := gcs(ping)
+	close(ping)
+	wg.Wait()
+	alone := gcs(nil)
+	if d1 != alone || d2 != alone {
+		os.Stdout.WriteString("foreign allocation started DST cycles: with=" +
+			strconv.FormatUint(uint64(d1), 10) + "," + strconv.FormatUint(uint64(d2), 10) +
 			" alone=" + strconv.FormatUint(uint64(alone), 10) + "\n")
 		return
 	}

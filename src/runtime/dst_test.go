@@ -735,6 +735,34 @@ func TestDSTNonBubbleAllocTrigger(t *testing.T) {
 	}
 }
 
+// TestDSTGCSysstackAlloc: allocations the runtime performs on systemstack on
+// a bubble goroutine's behalf (allgs growth) are excluded from the DST heap
+// trigger — their size and timing are process history, not SUT heap growth.
+// Two in-process runs at one seed, run 1 growing allgs and run 2 reusing
+// gFree, must produce identical per-cycle discovery fingerprints. Mutation:
+// dropping the getg() == cur leg of the dispatcher gate counts run 1's
+// growth arrays and shifts its crossings.
+func TestDSTGCSysstackAlloc(t *testing.T) {
+	out := runTestProgDST(t, "DSTGCSysstackAlloc", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("systemstack bookkeeping moved the DST trigger (got %q, want \"done\")", out)
+	}
+}
+
+// TestDSTGCForeignStart: a DST-armed cycle is STARTED only inside the
+// bubble-allocation gate. The prog holds the bubble's live set above
+// Options.MemoryLimit (trigger condition persistently true) and churns a
+// foreign allocator; NumGC deltas with and without the churn must be equal.
+// Mutation: re-enabling the span-grab trigger sites under dstActive lets
+// every foreign span grab start an extra cycle at a wall-clock-dependent
+// point, diverging the deltas.
+func TestDSTGCForeignStart(t *testing.T) {
+	out := runTestProgDST(t, "DSTGCForeignStart", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("foreign allocation started DST-armed GC cycles (got %q, want \"done\")", out)
+	}
+}
+
 // TestDSTGOMAXPROCSAutoModeRestored verifies that in an auto-GOMAXPROCS
 // process the pin sets the custom flag for the run (blocking the sysmon
 // auto-updater) and restores auto mode afterward.

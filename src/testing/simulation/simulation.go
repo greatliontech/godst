@@ -68,6 +68,7 @@ package simulation
 
 import (
 	"internal/godebug"
+	"internal/goexperiment"
 	"internal/synctest"
 	"runtime"
 	"sync/atomic"
@@ -415,6 +416,15 @@ func enterSimulation(api, buildPanic string) {
 		// crypto/rand would be silently nondeterministic inside the run. Fail
 		// loud instead — one GODEBUG is all it takes to be in this mode.
 		panic("testing/simulation: " + api + " is unsupported in FIPS 140 mode (GODEBUG fips140=on)")
+	}
+	if goexperiment.SizeSpecializedMalloc {
+		// The experiment makes the compiler emit direct size-specialized
+		// malloc calls in USER packages, bypassing the mallocgc dispatcher
+		// that is the DST heap trigger's single evaluation point: SUT
+		// allocations would neither count toward the per-bubble counter nor
+		// gate the trigger, silently breaking GC determinism. Fail loud, as
+		// with FIPS mode.
+		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=sizespecializedmalloc (allocations would bypass the deterministic GC trigger)")
 	}
 	if synctest.IsInBubble() {
 		panic("testing/simulation: " + api + " called from within a synctest bubble")

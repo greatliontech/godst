@@ -24,7 +24,7 @@ Audit reproducers (ephemeral, from the audit session):
 - [x] 2. an always-runnable foreign goroutine cannot starve the bubble, or the
   starvation produces a loud deterministic diagnostic. Test: pre-run Gosched
   spinner, run completes or fails loudly. (dst-audit-sched-foreign-livelock)
-- [ ] 3. the DST heap-trigger crossing starts a GC only from within the
+- [x] 3. the DST heap-trigger crossing starts a GC only from within the
   bubble-allocation gate; an inner `checkGCTrigger` reached by a foreign
   allocation cannot start the DST-armed cycle. Test: foreign allocation
   interleaved against a near-threshold bubble heap, cycle boundaries

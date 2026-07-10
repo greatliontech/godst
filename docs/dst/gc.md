@@ -718,7 +718,23 @@ the channel-light workloads that first validated it (both **landed** with the GC
 - **The crossing fires on the bubble's own allocation.** The trigger test is evaluated **and the GC it
   arms is started inside the bubble-allocation gate** — a crossing latched by a bubble allocation that
   cannot start GC at that point (e.g. `m.locks > 1`) must not leak the *start* to whichever process-wide
-  allocation happens next (a foreign/infra goroutine at an unseeded point). The set-level test (`numGC` + total finalizers,
+  allocation happens next (a foreign/infra goroutine at an unseeded point). Under DST the `mallocgc`
+  dispatcher is the only HEAP-trigger evaluation site: the span-grab and large/arena-allocation
+  trigger checks are disabled while a run is active, so a foreign allocation can never start a
+  DST-armed cycle (`TestDSTGCForeignStart`: with the trigger condition held persistently true, NumGC
+  is identical with and without a foreign allocator churning tiny, small, pointerful, and large
+  objects; the user-arena site is gated identically but not exercised — arenas need their own
+  GOEXPERIMENT). Two consequences: a user-forced `runtime.GC()` (`gcTriggerCycle`) is a separate
+  starter this contract does not cover, and during an active run foreign/process heap growth never
+  TRIGGERS a collection (the physical `heapLive` trigger is unreachable under `dstActive` and forcegc
+  is neutralized) — foreign garbage is reclaimed only by bubble-armed (or user-forced) cycles, so a
+  run whose bubble never crosses leaves foreign growth unbounded, a modeled consequence of
+  bubble-keyed pacing. `GOEXPERIMENT=sizespecializedmalloc` would bypass the dispatcher with
+  compiler-emitted direct calls, so `enterSimulation` refuses it, like FIPS mode. The gate also requires the allocation to be on the bubble
+  goroutine's own stack: runtime bookkeeping allocated on systemstack on its behalf (e.g. `allgs`
+  append-growth, whose size and timing are process history) neither counts toward `dstHeapAlloc` nor
+  evaluates the trigger (`TestDSTGCSysstackAlloc`: a run that grows `allgs` and a warmed rerun that
+  reuses `gFree` produce identical mid-run per-cycle discovery). The set-level test (`numGC` + total finalizers,
 `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial discovery for the
 floored, GOGC-scaled, and `MemoryLimit` regimes, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in
 all builds.

@@ -1222,11 +1222,22 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		// every heap allocation passes through here exactly once with elemsize set. x
 		// is already published (publicationBarrier/gcmarknewobject ran and mp.mallocing
 		// is reset), so a GC started here will not collect it.
-		if cur := getg().m.curg; cur != nil && cur.bubble != nil && cur.bubble == dstSimBubble {
+		if cur := getg().m.curg; cur != nil && getg() == cur && cur.bubble != nil && cur.bubble == dstSimBubble {
 			// Count only the simulation bubble's own allocations: a non-bubble
 			// goroutine (or a foreign synctest bubble) allocating mid-run would
 			// otherwise move the cycle boundary and make NumGC and which cycle
 			// discovers a finalizer depend on unrelated process activity.
+			//
+			// getg() == cur excludes allocations the runtime performs ON
+			// SYSTEMSTACK on the bubble goroutine's behalf (m.curg is still the
+			// bubble goroutine there): those are runtime bookkeeping whose size
+			// and timing depend on process-wide history — e.g. newproc1's
+			// allgs-append growth, whose backing array is not an excluded pooled
+			// type and whose capacity carries across runs — not SUT heap growth.
+			// Counting one would shift the crossing run-to-run, and a crossing
+			// latched on g0 cannot start the GC anyway (gcStart bails on g0),
+			// which would leak the start to a later, possibly foreign,
+			// allocation (gc.md M4).
 			//
 			// And count only the SUT's own heap OBJECTS: runtime-internal pooled
 			// structs (g, sudog, _defer) are EXCLUDED because whether one is allocated
@@ -1393,7 +1404,11 @@ func mallocgcTiny(size uintptr, typ *_type) (unsafe.Pointer, uintptr) {
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger {
+	if checkGCTrigger && !dstActive() {
+		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
+		// and starts the DST-armed cycle only inside the bubble-allocation gate,
+		// so a span-grab reached by a foreign/infra allocation must not start a
+		// cycle a bubble allocation latched but could not start (gc.md M4).
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1505,7 +1520,11 @@ func mallocgcSmallNoscan(size uintptr, typ *_type, needzero bool) (unsafe.Pointe
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger {
+	if checkGCTrigger && !dstActive() {
+		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
+		// and starts the DST-armed cycle only inside the bubble-allocation gate,
+		// so a span-grab reached by a foreign/infra allocation must not start a
+		// cycle a bubble allocation latched but could not start (gc.md M4).
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1645,7 +1664,11 @@ func mallocgcSmallScanNoHeader(size uintptr, typ *_type) (unsafe.Pointer, uintpt
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger {
+	if checkGCTrigger && !dstActive() {
+		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
+		// and starts the DST-armed cycle only inside the bubble-allocation gate,
+		// so a span-grab reached by a foreign/infra allocation must not start a
+		// cycle a bubble allocation latched but could not start (gc.md M4).
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1738,7 +1761,11 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger {
+	if checkGCTrigger && !dstActive() {
+		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
+		// and starts the DST-armed cycle only inside the bubble-allocation gate,
+		// so a span-grab reached by a foreign/infra allocation must not start a
+		// cycle a bubble allocation latched but could not start (gc.md M4).
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1812,9 +1839,13 @@ func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uin
 	mp.mallocing = 0
 	releasem(mp)
 
-	// Check to see if we need to trigger the GC.
-	if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-		gcStart(t)
+	// Check to see if we need to trigger the GC. Under DST the mallocgc
+	// dispatcher owns the heap trigger (evaluated and started only inside the
+	// bubble-allocation gate; gc.md M4).
+	if !dstActive() {
+		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+			gcStart(t)
+		}
 	}
 
 	// Objects can be zeroed late in a context where preemption can occur.

@@ -20,7 +20,6 @@ chunk(s) there.
 | [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
-| [latched GC trigger started by foreign allocation](./dst-audit-gc-foreign-trigger.md) | M | chunk 3 |
 | [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |
 | [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
 | [page-cache memfds killable by SUT close](./dst-audit-memfd-fd-space.md) | M | chunk 6 |
@@ -35,3 +34,6 @@ Found during plan execution:
 |---|---|---|
 | [explore recording admits foreign-bubble goroutines](./dst-explore-foreign-bubble-seq-pollution.md) | M | sim-bubble membership enforced at the recording chokepoints |
 | [-race explore yield placement is foreign-sensitive](./dst-explore-race-foreign-yield-sensitivity.md) | M | sensitivity diagnosed; removed or recorded as a bounded, reported limit |
+| [warm-process runs shift late GC discovery](./dst-gc-warm-process-discovery-tail.md) | M | tail discovery repeatable in-process, or the warm-process bound recorded |
+| [sizespecializedmalloc experiment bypasses the GC trigger](./dst-gc-sizespecialized-experiment.md) | M | combo supported or refused at a testable level |
+| [foreign runtime.GC() shifts the trigger stream](./dst-gc-foreign-runtime-gc.md) | M | foreign GC cannot perturb the bubble's accounting, or fails loudly |
