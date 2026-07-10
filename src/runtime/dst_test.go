@@ -1387,6 +1387,21 @@ func TestDSTCryptoUnseededVectors(t *testing.T) {
 	}
 }
 
+// TestDSTSchedForeignSpinner: bounded infrastructure-first scheduling — a
+// pre-run foreign goroutine that never blocks cannot starve the simulation
+// (the runs complete), and the fairness hand-off leaves the seeded
+// interleaving untouched (fingerprints with the spinner churning equal the
+// spinner-free fingerprints, random and PCT). Mutation: an unconditional
+// system-first pick livelocks the run and the prog's foreign watchdog prints
+// "starved"; selecting over the full mixed set instead of the sim-only subset
+// diverges the fingerprints.
+func TestDSTSchedForeignSpinner(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTSchedForeignSpinner", "DSTSEED=12345"))
+	if out != "done" {
+		t.Fatalf("simulation under a persistently-runnable foreign goroutine: %q", out)
+	}
+}
+
 // TestDSTCryptoPriorRunCaller is the INV-CRYPTO cross-run leg: the goroutine
 // that called a completed run survives with a seeded per-g root; deactivation
 // must clear it, so that during a LATER run (started by another goroutine) it

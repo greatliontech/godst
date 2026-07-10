@@ -106,6 +106,9 @@ func dstSetAccessForce(seq, count []uint64, pc []uintptr)
 //go:linkname dstTraceLenFP runtime.dstTraceLenFP
 func dstTraceLenFP() int
 
+//go:linkname dstSchedForeignSeenFP runtime.dstSchedForeignSeenFP
+func dstSchedForeignSeenFP() bool
+
 //go:linkname dstTraceChosenFP runtime.dstTraceChosenFP
 func dstTraceChosenFP(i int) uint64
 
@@ -476,7 +479,9 @@ func leaveSimulation() {
 //
 // A goroutine in f that never blocks and never makes a function call (e.g. a
 // bare for{}) will not be preempted and will stall the simulation; real code
-// rarely does this.
+// rarely does this. A goroutine OUTSIDE the simulation that never blocks (a
+// Gosched loop started before Run) does not stall it: outside goroutines are
+// scheduled around the simulation and cannot starve it.
 func Run(seed uint64, f func()) {
 	RunWith(seed, Options{}, f)
 }

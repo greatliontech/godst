@@ -172,6 +172,7 @@ func dstActivate(seed uint64) {
 	getg().dstProc = 0
 	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
+	dstSchedPrevSys = false
 	dstFaultRand.Store(dstFaultRoot(seed))
 	// Queue process-level finalizers/cleanups before DST is active and detach them
 	// from the queues the bubble drain observes. They are not part of this run's
@@ -978,6 +979,20 @@ func dstSchedRandUint64() uint64 {
 // rngDraws is lower; the isolation — no system selection draws — is what matters
 // and holds for both.) Reset per bubble. Read by the regression test via linkname.
 var dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws uint64
+
+// dstSchedPrevSys records whether the previous scheduling decision picked an
+// infrastructure candidate. dstFindRunnable's starvation fairness reads it: an
+// infrastructure pick with a simulation candidate runnable hands the NEXT
+// decision to the simulation, so a persistently-runnable foreign goroutine
+// cannot starve the bubble. Pure pacing state — it decides when a simulation
+// decision happens, never which goroutine it picks — so it does not need to
+// replay: the simulation's decision sequence is identical however
+// infrastructure picks interleave. That holds only because the sim bubble's
+// drain is exempt from the alternation (dstFindRunnable's sysDrain): the
+// drain is the one infra-classified goroutine with sim-visible effects, so
+// pacing it would change which enabled sets the simulation's decisions see.
+// Reset at activation.
+var dstSchedPrevSys bool
 
 // dstSchedOvfPuts counts puts routed to the DST order-preserving ring overflow
 // (p.dstRunqOvf) this bubble. Observability for the overflow-order regression:

@@ -4588,6 +4588,17 @@ func gdestroy(gp *g) {
 	gp.dstProc = 0
 	gp.dstPid = 0
 	gp.dstPrio = 0
+	// Scheduled-strategy identity (dstSeq) and pending-access state are the
+	// same leak class: newproc1's dstClearSchedState re-stamps them only for
+	// creations while a run is active, so a g recycled BETWEEN runs would
+	// otherwise carry a dead episode's stable index into its next life — a
+	// foreign goroutine with a stale nonzero dstSeq silently no-ops the
+	// stable-index assignment paths that key on dstSeq == 0. dstBuild-gated
+	// so untagged builds keep a store-free exit path here (the constant
+	// folds the call away).
+	if dstBuild {
+		dstClearSchedState(gp)
+	}
 
 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
 		// Flush assist credit to the global pool. This gives
@@ -7906,16 +7917,67 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	// runnable goroutine first, by a fixed RNG-free policy; dstSchedRand advances only
 	// for selections among bubble goroutines, so the interleaving is a pure function
 	// of the seed regardless of system-goroutine timing (0 divergences over 600+
-	// cross-process runs; mutation-tested by TestDSTSchedSystemIsolation). (Sound because under DST no g.bubble==nil goroutine is persistently
-	// runnable while bubble goroutines are: GC marks stop-the-world in-bubble and
-	// sysmon is neutralized, so these run once and block — they cannot starve the
-	// bubble. In practice they are only ever the sole runnable candidate.)
+	// cross-process runs; mutation-tested by TestDSTSchedSystemIsolation).
+	//
+	// Infrastructure-first is BOUNDED: runtime infrastructure runs once and
+	// blocks, but a USER foreign goroutine (started before the run, or in a
+	// foreign bubble) can be persistently runnable — a bare Gosched loop — and
+	// an unconditional infrastructure-first policy would re-select it on every
+	// decision and starve the bubble forever (an undiagnosable livelock: the
+	// bubble is runnable, so the durably-blocked deadlock detection never
+	// fires). After an infrastructure pick, if a simulation candidate is
+	// runnable, the next decision is handed to the simulation, selecting over
+	// the sim-only subset (dstSchedSelect with mixed=true). Order-preserving
+	// candidate removal keeps that subset identical to the set a foreign-free
+	// execution enumerates, so the hand-off changes only WHEN the simulation's
+	// decisions happen, never WHICH goroutine a decision picks — the seeded
+	// interleaving stays a pure function of the seed, and a persistently
+	// runnable foreign goroutine gets at most every other slot (matching the
+	// round-robin progress upstream GOMAXPROCS=1 scheduling gives the same
+	// shape). Pinned by TestDSTSchedForeignSpinner.
+	// The simulation bubble's own drain goroutine (gcDrain, infra-classified
+	// under the scheduled strategy only) is exempt from the alternation in
+	// both directions: it outranks every other infrastructure candidate in
+	// firstSystemG's scan, and its pick neither sets dstSchedPrevSys nor can
+	// be skipped by the hand-off. The drain runs user callbacks with
+	// sim-visible effects, so it must run at the same logical points as in a
+	// foreign-free execution — a foreign entry sitting ahead of it in the
+	// global-runq FIFO (a re-queued drain continuation after a callback's
+	// Gosched lands at the tail) must not displace it, and the hand-off must
+	// not delay it behind a simulation pick it would otherwise precede.
 	var sel uint32
-	if k, ok := c.firstSystemG(total); ok {
-		sel = k
+	sysK, sysOK := c.firstSystemG(total)
+	sysDrain := false
+	if sysOK {
+		// Only the SIM bubble's drain is exempt: a foreign bubble's drain is
+		// unrelated process activity like any other foreign goroutine.
+		gp := c.at(sysK)
+		sysDrain = gp.bubble == dstSimBubble && gp.bubble != nil && gp.bubble.gcDrain == gp
+	}
+	if sysOK && (sysDrain || !dstSchedPrevSys || !c.hasSimG(total)) {
+		sel = sysK
 		dstSchedSysScheds++
+		if !sysDrain {
+			dstSchedPrevSys = true
+			if dstSchedKind == dstSchedScheduled {
+				// A USER foreign goroutine (not runtime infrastructure, not
+				// the run caller parked in runLocked) EXECUTING during a
+				// recording episode is reported even if it never coexists
+				// with a simulation candidate at a recorded decision: its
+				// execution alone can perturb instrumented yield placement
+				// under -race, and exploration must downgrade its coverage
+				// claim loudly, never silently (ExploreResult.ForeignSched).
+				if gp := c.at(sysK); gp != nil && gp != dstSimRootG && !isSystemGoroutine(gp, false) {
+					dstSchedForeignSeen = true
+				}
+			}
+		}
 	} else {
-		sel = dstSchedSelect(&c, total)
+		// Either a pure simulation set (the common case), or fairness: the
+		// previous decision ran infrastructure and a simulation candidate is
+		// runnable, so this one is the simulation's (sysOK == mixed set).
+		sel = dstSchedSelect(&c, total, sysOK)
+		dstSchedPrevSys = false
 	}
 	gp, inheritTime = c.removeAt(sel)
 	unlock(&sched.lock)
@@ -7925,14 +7987,23 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 // dstSchedSelect returns the index in [0,total) of the candidate to run next
 // under the active scheduling strategy. Random draws uniformly; PCT runs the
 // highest-priority candidate and fires any due priority-change point.
-func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
+//
+// mixed reports that infrastructure candidates are present in [0,total) (the
+// starvation-fairness hand-off in dstFindRunnable): every strategy then
+// selects over the sim-only subset in candidate order, which order-preserving
+// removal keeps identical to the foreign-free enumeration — the same seed
+// picks the same goroutine with or without foreign candidates present.
+func dstSchedSelect(c *dstCandidates, total uint32, mixed bool) uint32 {
 	switch dstSchedKind {
 	case dstSchedPCT:
 		return dstPCTSelect(c, total)
 	case dstSchedScheduled:
 		return dstScheduledSelect(c, total)
 	}
-	return dstSchedRandn(total)
+	if !mixed {
+		return dstSchedRandn(total)
+	}
+	return c.simIdx(total, dstSchedRandn(c.simCount(total)))
 }
 
 // dstPCTSelect implements the PCT choice: advance the step counter, pick the
@@ -7942,14 +8013,31 @@ func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
 // the priority inversion that exposes a depth-d bug.
 func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
 	dstPCT.step++
-	best := uint32(0)
-	bg := c.at(0)
-	bestPrio, bestGoid := bg.dstPrio, bg.goid
-	for k := uint32(1); k < total; k++ {
+	// Consider only simulation candidates: the starvation-fairness hand-off
+	// (dstFindRunnable) can pass a set that still contains infrastructure
+	// candidates, which are not the simulated program and carry no PCT
+	// priority. With a pure set this scan is unchanged. The skip is redundant
+	// enforcement: every simulation priority is >= 1 (dstPCTAssignPrio bases
+	// at dstPCTBase; change-lows are 1..d-1) while infrastructure carries 0,
+	// so an unfiltered max could not pick infrastructure either — the filter
+	// encodes the sim-only contract explicitly rather than leaning on that
+	// value-domain fact.
+	best := ^uint32(0)
+	var bestPrio int64
+	var bestGoid uint64
+	for k := uint32(0); k < total; k++ {
 		g := c.at(k)
-		if g.dstPrio > bestPrio || (g.dstPrio == bestPrio && g.goid < bestGoid) {
+		if g == nil || dstIsInfraCandidate(g) {
+			continue
+		}
+		if best == ^uint32(0) || g.dstPrio > bestPrio || (g.dstPrio == bestPrio && g.goid < bestGoid) {
 			best, bestPrio, bestGoid = k, g.dstPrio, g.goid
 		}
+	}
+	if best == ^uint32(0) {
+		// Same call contract as dstLowestSeqIdx: the caller guarantees at
+		// least one simulation candidate.
+		throw("dst: no simulation candidate in PCT selection")
 	}
 	for i := int32(0); i < dstPCT.nchange; i++ {
 		if !dstPCT.applied[i] && dstPCT.step == dstPCT.changeAt[i] {
@@ -7988,25 +8076,83 @@ type dstCandidates struct {
 // its scheduling is already deterministic there, so isolating it would change
 // their interleavings without removing any nondeterminism.
 func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
+	// The simulation's own drain outranks every other infrastructure
+	// candidate: it has sim-visible effects (user finalizers/cleanups), so a
+	// foreign entry ahead of it in candidate order must not displace it (see
+	// dstFindRunnable). Only the scheduled strategy classifies it as
+	// infrastructure at all (dstIsInfraCandidate).
+	if dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain != nil {
+		for k := uint32(0); k < total; k++ {
+			if c.at(k) == dstSimBubble.gcDrain {
+				return k, true
+			}
+		}
+	}
 	for k := uint32(0); k < total; k++ {
 		gp := c.at(k)
 		if gp == nil {
 			continue
 		}
-		if gp.bubble == nil || gp.bubble != dstSimBubble {
-			// Outside any bubble, or in a FOREIGN bubble (a plain synctest
-			// bubble live concurrently with the simulation): infrastructure
-			// from the simulation's point of view. A foreign bubble's
-			// goroutines must not consume seed draws - the schedule would then
-			// depend on unrelated process activity and the run would not
-			// reproduce in isolation.
-			return k, true
-		}
-		if dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp {
+		if dstIsInfraCandidate(gp) {
 			return k, true
 		}
 	}
 	return 0, false
+}
+
+// dstIsInfraCandidate reports whether gp is scheduled RNG-free as
+// infrastructure at the unified seam: outside any bubble, or in a FOREIGN
+// bubble (a plain synctest bubble live concurrently with the simulation) —
+// such goroutines must not consume seed draws, or the schedule would depend
+// on unrelated process activity and the run would not reproduce in isolation
+// — and, under the scheduled (exploration) strategy only, the bubble's
+// finalizer-drain goroutine (see firstSystemG). The complement is the
+// simulation's own candidate set, which the seeded/PCT/scheduled selections
+// range over; the two classifications must stay in lockstep (fairness in
+// dstFindRunnable selects over the complement of exactly this predicate).
+func dstIsInfraCandidate(gp *g) bool {
+	if gp.bubble == nil || gp.bubble != dstSimBubble {
+		return true
+	}
+	return dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp
+}
+
+// hasSimG reports whether any candidate is a simulation goroutine (the
+// complement of dstIsInfraCandidate). Used by the starvation-fairness
+// hand-off; caller holds sched.lock.
+func (c *dstCandidates) hasSimG(total uint32) bool {
+	for k := uint32(0); k < total; k++ {
+		if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) {
+			return true
+		}
+	}
+	return false
+}
+
+// simCount returns the number of simulation candidates in [0,total).
+func (c *dstCandidates) simCount(total uint32) uint32 {
+	n := uint32(0)
+	for k := uint32(0); k < total; k++ {
+		if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) {
+			n++
+		}
+	}
+	return n
+}
+
+// simIdx returns the absolute candidate index of the j-th (0-based)
+// simulation candidate in candidate order. j must be < simCount(total).
+func (c *dstCandidates) simIdx(total, j uint32) uint32 {
+	for k := uint32(0); k < total; k++ {
+		if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) {
+			if j == 0 {
+				return k
+			}
+			j--
+		}
+	}
+	throw("dst: simIdx out of range")
+	return 0
 }
 
 func (c *dstCandidates) firstCrashedG(total uint32) (uint32, bool) {

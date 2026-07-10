@@ -20,7 +20,6 @@ chunk(s) there.
 | [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
-| [foreign goroutine livelocks the run](./dst-audit-sched-foreign-livelock.md) | M | chunk 2 |
 | [latched GC trigger started by foreign allocation](./dst-audit-gc-foreign-trigger.md) | M | chunk 3 |
 | [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |
 | [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
@@ -29,3 +28,10 @@ chunk(s) there.
 | [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | chunk 12 |
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
 | [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunks 4, 9, 11–17, 24, 25, 28, 29 |
+
+Found during plan execution:
+
+| Issue | Severity | Lands |
+|---|---|---|
+| [explore recording admits foreign-bubble goroutines](./dst-explore-foreign-bubble-seq-pollution.md) | M | sim-bubble membership enforced at the recording chokepoints |
+| [-race explore yield placement is foreign-sensitive](./dst-explore-race-foreign-yield-sensitivity.md) | M | sensitivity diagnosed; removed or recorded as a bounded, reported limit |

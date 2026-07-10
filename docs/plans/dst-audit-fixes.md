@@ -21,7 +21,7 @@ Audit reproducers (ephemeral, from the audit session):
   its subtree into the deterministic stream. Test: spawn from a
   pre-activation goroutine during a run, assert crypto/rand output varies
   across seeds. (dst-audit-crypto-rand-taint)
-- [ ] 2. an always-runnable foreign goroutine cannot starve the bubble, or the
+- [x] 2. an always-runnable foreign goroutine cannot starve the bubble, or the
   starvation produces a loud deterministic diagnostic. Test: pre-run Gosched
   spinner, run completes or fails loudly. (dst-audit-sched-foreign-livelock)
 - [ ] 3. the DST heap-trigger crossing starts a GC only from within the

@@ -1120,6 +1120,7 @@ func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int) {
 func dstScheduleReset() {
 	dstScheduleStep = 0
 	dstScheduleAborted = false
+	dstSchedForeignSeen = false
 	dstExplorePanicValue = nil
 	dstExplorePanicSet = false
 	dstExploreDeadlock = ""
@@ -1156,23 +1157,49 @@ func dstScheduleReset() {
 	dstFilterConservative = false
 }
 
-// dstScheduledSelect implements the scheduled strategy at the unified seam. Every
-// candidate is a bubble goroutine here (dstFindRunnable schedules system Gs first,
-// so dstSchedSelect is reached only when no candidate is a system G), so the
-// enabled set is the whole candidate set. It records the enabled set + choice and
-// returns the chosen candidate index. Allocation-free (runs under sched.lock).
+// dstSchedForeignSeen reports that a foreign candidate (a goroutine outside
+// the simulation — not the sim bubble's own drain) was present at one of the
+// scheduled strategy's recorded decisions this run. Read per episode by the
+// explore harness (dstSchedForeignSeenFP), reset by dstScheduleReset.
+var dstSchedForeignSeen bool
+
+//go:linkname dstSchedForeignSeenFP
+func dstSchedForeignSeenFP() bool { return dstSchedForeignSeen }
+
+// dstScheduledSelect implements the scheduled strategy at the unified seam. The
+// enabled set it assigns, matches against, and records is the SIMULATION's
+// candidates only: dstFindRunnable schedules infrastructure first, and when its
+// starvation-fairness hand-off passes a set that still contains infrastructure
+// candidates (a persistently-runnable foreign goroutine), those are skipped —
+// they are not part of the simulated program, must never enter the recorded
+// schedule or the DPOR enabled sets, and their presence must not shift which
+// simulation candidate a prefix entry resolves to. With a pure set the loops
+// are unchanged. It records the enabled set + choice and returns the chosen
+// candidate index. Allocation-free (runs under sched.lock).
 func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
-	// Assign stable per-bubble indices to any not-yet-seen candidate, in candidate
-	// order (deterministic per execution). dstSeq stores index+1; 0 = unassigned.
+	// Assign stable per-bubble indices to any not-yet-seen simulation
+	// candidate, in candidate order (deterministic per execution). dstSeq
+	// stores index+1; 0 = unassigned. A FOREIGN candidate (infra other than
+	// the sim bubble's own drain) is recorded in dstSchedForeignSeen:
+	// exploration downgrades its exhaustion claim when foreign work was
+	// runnable at its decisions, because foreign activity can perturb where
+	// the instrumented yield points fall (observed under -race) — a coverage
+	// effect that must be reported, never silent.
 	for k := uint32(0); k < total; k++ {
-		dstEnsureSeq(c.at(k))
+		if gp := c.at(k); gp != nil {
+			if !dstIsInfraCandidate(gp) {
+				dstEnsureSeq(gp)
+			} else if !(gp.bubble == dstSimBubble && gp.bubble != nil && gp.bubble.gcDrain == gp) {
+				dstSchedForeignSeen = true
+			}
+		}
 	}
 	var sel uint32
 	if dstScheduleStep < len(dstSchedulePrefix) {
 		want := dstSchedulePrefix[dstScheduleStep]
 		sel = ^uint32(0)
 		for k := uint32(0); k < total; k++ {
-			if c.at(k).dstSeq == want {
+			if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) && gp.dstSeq == want {
 				sel = k
 				break
 			}
@@ -1188,7 +1215,10 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		sel = dstLowestSeqIdx(c, total)
 	}
 	// Record the decision (enabled set in candidate order + chosen id), bounded.
-	if dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(total) <= len(dstTraceEnabFlat) {
+	// The enabled set is the simulation's candidates only (see the doc above);
+	// with a pure set simTotal == total.
+	simTotal := c.simCount(total)
+	if dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(simTotal) <= len(dstTraceEnabFlat) {
 		chosen := c.at(sel)
 		dstTraceChosen[dstTraceN] = chosen.dstSeq
 		dstTraceAddr[dstTraceN] = chosen.dstAccAddr
@@ -1229,10 +1259,12 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		chosen.dstAccPend = false
 		chosen.dstAccAuto = false
 		dstTraceEnabOff[dstTraceN] = int32(dstTraceFlatN)
-		dstTraceEnabLen[dstTraceN] = int32(total)
+		dstTraceEnabLen[dstTraceN] = int32(simTotal)
 		for k := uint32(0); k < total; k++ {
-			dstTraceEnabFlat[dstTraceFlatN] = c.at(k).dstSeq
-			dstTraceFlatN++
+			if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) {
+				dstTraceEnabFlat[dstTraceFlatN] = gp.dstSeq
+				dstTraceFlatN++
+			}
 		}
 		dstTraceN++
 	} else {
@@ -1244,15 +1276,25 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 
 // dstLowestSeqIdx returns the candidate index with the smallest stable index
 // (dstSeq) — the deterministic default choice beyond the prefix (and the canonical
-// first child in the exhaustive DFS). All candidates are assigned by the caller
-// before this runs. Allocation-free.
+// first child in the exhaustive DFS). Infrastructure candidates are skipped:
+// the fairness hand-off (dstFindRunnable) can pass a mixed set, and only
+// simulation candidates carry assigned seqs. All simulation candidates are
+// assigned by the caller before this runs, and the caller guarantees at least
+// one is present. Allocation-free.
 func dstLowestSeqIdx(c *dstCandidates, total uint32) uint32 {
-	best := uint32(0)
-	bestSeq := c.at(0).dstSeq
-	for k := uint32(1); k < total; k++ {
-		if s := c.at(k).dstSeq; s < bestSeq {
-			best, bestSeq = k, s
+	best := ^uint32(0)
+	var bestSeq uint64
+	for k := uint32(0); k < total; k++ {
+		gp := c.at(k)
+		if gp == nil || dstIsInfraCandidate(gp) {
+			continue
 		}
+		if best == ^uint32(0) || gp.dstSeq < bestSeq {
+			best, bestSeq = k, gp.dstSeq
+		}
+	}
+	if best == ^uint32(0) {
+		throw("dst: no simulation candidate in scheduled selection")
 	}
 	return best
 }

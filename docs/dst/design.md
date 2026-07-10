@@ -1076,7 +1076,32 @@ later steps add, never rewrite.
   (`dstSchedRand`) advances only for selections among the *simulation bubble's* goroutines;
   runtime-infrastructure goroutines (`g.bubble == nil`) AND goroutines of any FOREIGN synctest bubble
   (a plain bubble live concurrently with the simulation — `g.bubble != dstSimBubble`) are scheduled by
-  a fixed RNG-free policy (`dstFindRunnable` prefers them in candidate order). The simulation claims
+  a fixed RNG-free policy (`dstFindRunnable` prefers them in candidate order). Infrastructure-first is
+  **bounded**: after an infrastructure pick, a runnable simulation candidate gets the next decision,
+  selected over the sim-only subset — which order-preserving removal keeps identical to the
+  foreign-free enumeration, so the hand-off changes only when the simulation's decisions happen,
+  never which goroutine one picks. **Exception: the simulation's own drain.** Under the scheduled
+  strategy the bubble's finalizer/cleanup drain is infra-classified but has sim-visible effects
+  (user callbacks), so it is exempt from the alternation in both directions: it outranks every other
+  infrastructure candidate, and its pick neither owes the simulation the next slot nor can be
+  displaced by the hand-off — the drain runs at the same logical points, uninterrupted between its
+  yields, as in a foreign-free execution (its scheduling is not an interleaving degree of freedom
+  the explorer models). A persistently-runnable foreign goroutine (a user Gosched loop, a
+  spinning foreign bubble) gets at most every other non-drain slot and cannot starve the bubble —
+  the livelock an unconditional infrastructure-first policy would produce, undiagnosable because the
+  bubble stays runnable and the durably-blocked deadlock detection never fires. Under the scheduled
+  (exploration) strategy the same subset rule keeps foreign candidates out of recorded schedules and
+  DPOR enabled sets, and foreign presence at a simulation decision is REPORTED
+  (`ExploreResult.ForeignSched`, downgrading `Exhausted`): without `-race` the recorded traces are
+  byte-identical with and without churn, but the dst-race auto-instrumentation's yield placement is
+  foreign-sensitive, so coverage under churn is best-effort and says so — never a silent cap.
+  Enforced by `TestDSTSchedForeignSpinner` (run completes under a spinner;
+  fingerprints with/without the spinner identical, random and PCT), `TestExploreForeignSpinner`
+  (exploration completes with identical coverage and byte-identical recorded traces under spinners,
+  churn reported), `TestExploreForeignSpinnerDrainCallback` (a mid-callback drain yield is neither
+  displaced by foreign entries nor interrupted by the hand-off) and
+  `TestExploreForeignSchedReported` (churn reported and exhaustion downgraded, including under
+  `-race`). The simulation claims
   its bubble by activating-goroutine identity (`dstSimRootG`), so a foreign `synctest.Run` — even one
   started between activation and the simulation's own bubble — can neither steal the re-root/drain
   nor consume seed draws; candidate removal is order-preserving so foreign entries cannot permute the

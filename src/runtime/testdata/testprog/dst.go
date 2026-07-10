@@ -54,6 +54,7 @@ func init() {
 	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
 	register("DSTBubbleStreamIsolation", DSTBubbleStreamIsolation)
 	register("DSTForeignBubbleIsolation", DSTForeignBubbleIsolation)
+	register("DSTSchedForeignSpinner", DSTSchedForeignSpinner)
 	register("DSTProcessFencePidfd", DSTProcessFencePidfd)
 	register("DSTZeroCopyFence", DSTZeroCopyFence)
 	register("DSTPCTNonBubbleCreation", DSTPCTNonBubbleCreation)
@@ -935,6 +936,61 @@ func DSTForeignBubbleIsolation() {
 	if withForeign != alone || withForeign2 != alone {
 		os.Stdout.WriteString("schedule perturbed by foreign bubble\nwith1= " + withForeign +
 			"\nwith2= " + withForeign2 + "\nalone= " + alone + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTSchedForeignSpinner: a pre-run foreign goroutine that never blocks (a
+// Gosched loop, persistently runnable on the global runq) must not starve the
+// simulation — infrastructure-first scheduling is bounded: after an
+// infrastructure pick, a runnable simulation candidate gets the next decision.
+// The runs must complete, AND the fairness hand-off must not perturb the
+// seeded schedule: the fingerprint with the spinner churning equals the
+// fingerprint without, under both the random and PCT strategies (the hand-off
+// selects over the sim-only subset, which order-preserving removal keeps
+// identical to the foreign-free set). A foreign watchdog — always-runnable
+// itself, so it makes progress even while the bubble is starved — converts a
+// livelock into a loud "starved" line instead of an undiagnosed hang.
+// Prints "done".
+func DSTSchedForeignSpinner() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	// Foreign-free baselines FIRST: the spinner and the watchdog are both
+	// foreign goroutines, so neither may exist yet or the baseline would
+	// itself be a mixed-set run and the comparison could not detect a
+	// perturbation uniform in foreign presence.
+	alone := dstSchedFingerprint(n)
+	alonePCT := dstSchedFingerprintStrategy(n, true)
+	stop := make(chan struct{})
+	var finished atomic.Bool
+	go func() { // the spinner: foreign, never blocks
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
+	go func() { // watchdog: foreign and always-runnable, so it runs even under starvation
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if finished.Load() {
+				return
+			}
+			runtime.Gosched()
+		}
+		os.Stdout.WriteString("starved\n")
+		os.Exit(2)
+	}()
+	withSpin := dstSchedFingerprint(n)
+	withSpinPCT := dstSchedFingerprintStrategy(n, true)
+	close(stop)
+	finished.Store(true)
+	if withSpin != alone || withSpinPCT != alonePCT {
+		os.Stdout.WriteString("schedule perturbed by foreign spinner\nwith=     " + withSpin +
+			"\nalone=    " + alone + "\nwithPCT=  " + withSpinPCT + "\nalonePCT= " + alonePCT + "\n")
 		return
 	}
 	os.Stdout.WriteString("done\n")

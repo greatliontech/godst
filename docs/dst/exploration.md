@@ -598,8 +598,10 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    Foreclosure: a strategy at the seam.
 4. **`Explore` outer loop + API** (D4; **VALIDATED [V]**). `simulation.Explore(seed, mode, sut)` drives
    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
-   DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`
-   (exhausted vs budget-hit distinct — no silent cap), top-level and child-goroutine SUT panics as
+   DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
+   `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
+   simulation decisions downgrade `Exhausted`, since foreign activity can perturb instrumented
+   yield placement under -race — reported, never silent), top-level and child-goroutine SUT panics as
    `Failure.Panic`, synctest deadlocks as `Failure.Deadlock`, and one `Failure.Race` per new `RaceErrors`
    increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
    child-before-parent-continuation failures are not silently skipped. Child-goroutine and drain-callback

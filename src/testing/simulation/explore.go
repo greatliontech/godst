@@ -64,6 +64,13 @@ type Failure struct {
 	// Deadlock is non-empty iff the schedule ended with a synctest deadlock. Replay
 	// panics with the same deadlock marker for deadlock failures.
 	Deadlock string
+	// ForeignSched is true iff foreign (non-simulation) goroutines were
+	// scheduled during the run that exhibited this failure —
+	// ExploreResult.ForeignSched's per-failure form. Under -race, foreign
+	// activity can perturb instrumented yield placement, so a replay of such
+	// a failure is best-effort: a prefix divergence aborts loudly, but a
+	// shifted auto-yield can also silently change the interleaving.
+	ForeignSched bool
 	// CrashTear records whether the exploration that found this failure was
 	// tearing host crashes (ExploreOptions.CrashTear). Replay restores the same
 	// policy: the fault RNG draws that shaped the wreckage are part of the
@@ -82,11 +89,20 @@ type ExploreResult struct {
 	// (Failure.Race; see D5), each with its replay metadata.
 	Failures []Failure
 	// Exhausted is true iff the (pruned) interleaving space was fully covered. It
-	// is false when Overflow truncated coverage.
+	// is false when Overflow truncated coverage or ForeignSched downgraded it.
 	Exhausted bool
 	// Overflow is true iff some run exceeded the per-bubble trace, edge, or access-log
 	// budget; coverage is then INCOMPLETE (reported, never silently capped).
 	Overflow bool
+	// ForeignSched is true iff foreign (non-simulation, non-runtime)
+	// goroutines were scheduled during some explored run — executed at an
+	// infrastructure slot, or runnable at one of the simulation's own
+	// decisions (e.g. a background spinner or ticker started before the
+	// exploration). Foreign candidates never enter recorded schedules or
+	// enabled sets, but their execution can perturb where the instrumented
+	// yield points fall (observed under -race), so coverage is then
+	// best-effort: Exhausted is false — reported, never silently capped.
+	ForeignSched bool
 	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
 	BudgetHit bool
@@ -278,9 +294,10 @@ type exploreTrace struct {
 	syncStep  []int
 	syncAcc   []int
 	syncOrd   []int
-	aborted   bool // prefix named a non-enabled goroutine (a replay-determinism bug)
-	overflow  bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
-	budgetHit bool // run exceeded a caller-supplied per-run step budget
+	aborted      bool // prefix named a non-enabled goroutine (a replay-determinism bug)
+	overflow     bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
+	budgetHit    bool // run exceeded a caller-supplied per-run step budget
+	foreignSched bool // foreign goroutines scheduled this run: executed at an infra slot, or present at a recorded decision (coverage best-effort)
 }
 
 type accessForce struct {
@@ -464,6 +481,7 @@ func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
 		// copying the trace.
 	}
 	tr.overflow = tr.overflow || dstAccLogOverflowFP()
+	tr.foreignSched = dstSchedForeignSeenFP()
 	n := dstTraceLenFP()
 	tr.procs = make([]uint64, n)
 	tr.enabled = make([][]uint64, n)
@@ -513,14 +531,24 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
 	totalSchedules := 0
+	foreignSeen := false
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true}
+			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true, ForeignSched: foreignSeen}
 		}
 		res, grew := exhaustiveExplorePass(seed, sut, forces, passCfg)
 		totalSchedules += res.Schedules
 		res.Schedules = totalSchedules
+		// Churn is cross-pass state: coverage in the FINAL pass is built on
+		// forces promoted (and race failures carried) from earlier passes, so
+		// churn during any pass taints the whole result even if the foreign
+		// goroutine exited before the last pass.
+		foreignSeen = foreignSeen || res.ForeignSched
+		res.ForeignSched = foreignSeen
+		if foreignSeen {
+			res.Exhausted = false
+		}
 		if !grew {
 			if len(carriedRace) != 0 {
 				res.Failures = append(carriedRace, res.Failures...)
@@ -640,6 +668,9 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 		if tr.overflow {
 			res.Overflow = true
 		}
+		if tr.foreignSched {
+			res.ForeignSched = true
+		}
 		appendRunFailures(&res, prefix, forces, r)
 		if tr.budgetHit {
 			continue
@@ -659,11 +690,21 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 			}
 		}
 	}
-	res.Exhausted = !res.Overflow && !res.BudgetHit
+	res.Exhausted = !res.Overflow && !res.BudgetHit && !res.ForeignSched
 	return res, false
 }
 
 func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult) {
+	start := len(res.Failures)
+	defer func() {
+		// Stamp churn at capture: a failure found while foreign work was
+		// scheduled carries the caveat into its replay token (Failure.ForeignSched).
+		if r.tr.foreignSched {
+			for i := start; i < len(res.Failures); i++ {
+				res.Failures[i].ForeignSched = true
+			}
+		}
+	}()
 	if r.failed {
 		res.Failures = append(res.Failures, newFailure(prefix, false, "", "", forces))
 	}
@@ -853,14 +894,21 @@ func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult 
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
 	totalSchedules := 0
+	foreignSeen := false
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true}
+			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true, ForeignSched: foreignSeen}
 		}
 		res, grew := dporExplorePass(seed, sut, forces, passCfg)
 		totalSchedules += res.Schedules
 		res.Schedules = totalSchedules
+		// See exhaustiveExplore: churn in any pass taints the whole result.
+		foreignSeen = foreignSeen || res.ForeignSched
+		res.ForeignSched = foreignSeen
+		if foreignSeen {
+			res.Exhausted = false
+		}
 		if !grew {
 			if len(carriedRace) != 0 {
 				res.Failures = append(carriedRace, res.Failures...)
@@ -908,6 +956,9 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		}
 		if tr.overflow {
 			res.Overflow = true
+		}
+		if tr.foreignSched {
+			res.ForeignSched = true
 		}
 		appendRunFailures(&res, prefix, forces, r)
 		if tr.budgetHit {
@@ -1037,7 +1088,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 			break
 		}
 	}
-	res.Exhausted = !res.Overflow && !res.BudgetHit
+	res.Exhausted = !res.Overflow && !res.BudgetHit && !res.ForeignSched
 	return res, false
 }
 

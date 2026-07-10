@@ -7,6 +7,7 @@ package simulation
 import (
 	"internal/testenv"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -112,6 +113,286 @@ func TestReplayInstallsAccessForces(t *testing.T) {
 	}
 	if got := dstAccessYieldFP(); got <= unforced {
 		t.Fatalf("Replay did not install the forced access yield: unforced=%d forced=%d", unforced, got)
+	}
+}
+
+// TestExploreForeignSpinner: exploration under a persistently-runnable
+// foreign goroutine. The scheduled strategy's fairness hand-off skips
+// infrastructure candidates, so the spinner neither starves episodes (the
+// exploration completes and exhausts) nor enters the recorded schedules and
+// DPOR enabled sets (the exploration covers exactly the interleavings and
+// failures a spinner-free exploration covers).
+func TestExploreForeignSpinner(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		// The sut's intentional data race fails tRunner under -race, and the
+		// dst-race yield placement is foreign-sensitive (ForeignSched reports
+		// it; TestExploreForeignSchedReported covers the -race behavior).
+		t.Skip("intentionally racy sut; non-race trace regression")
+	}
+	sut := func() bool {
+		x := 0
+		read := -1
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			read = x
+		}()
+		x = 1
+		// Route this simulation goroutine through the GLOBAL runq: a Gosched'd
+		// bubble goroutine re-enqueues at the global tail — BEHIND a foreign
+		// spinner already parked there — so the recorded enabled sets are
+		// pinned against a foreign entry enumerated AHEAD of a simulation
+		// candidate (the ordering where an unfiltered recording loop would
+		// leak the spinner into the enabled-set window).
+		runtime.Gosched()
+		wg.Wait()
+		// A LATE goroutine, first enabled only after mixed sets have already
+		// occurred: its stable index is assigned at first appearance, so a
+		// spinner wrongly consuming the seq counter shifts this goroutine's
+		// index and diverges the recorded trace from the spinner-free one.
+		var wg2 sync.WaitGroup
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			runtime.Gosched()
+		}()
+		wg2.Wait()
+		return read == 0
+	}
+	alone := Explore(1, Exhaustive, sut)
+	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
+	// TWO spinners: at a fairness decision the just-picked spinner has always
+	// re-enqueued at the global tail (behind every simulation candidate), so a
+	// single spinner can never occupy the leading position an enabled-set
+	// recording leak needs — the second spinner is the one already queued
+	// AHEAD of the Gosched'd simulation goroutine when the decision records.
+	stop := make(chan struct{})
+	var done sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+	// The traced episode runs FIRST, while the spinners are fresh (dstSeq 0 —
+	// gdestroy clears scheduled identity, so a recycled g cannot smuggle a
+	// stale index in): a stable-index assignment wrongly reaching a spinner
+	// happens at the first mixed decision, deterministically before the late
+	// goroutine's first appearance, and shifts its index. Tracing after the
+	// spun Explore would mask that — its first episode would stamp the
+	// spinners, and a stamped spinner consumes nothing on later episodes.
+	_, _, trSpun := runOnce(1, nil, map[accessForce]bool{}, sut)
+	spun := Explore(1, Exhaustive, sut)
+	close(stop)
+	done.Wait()
+	if alone.ForeignSched || !alone.Exhausted {
+		t.Fatalf("foreign-free exploration misreported: foreignSched=%v exhausted=%v", alone.ForeignSched, alone.Exhausted)
+	}
+	// Under churn the exploration must complete and cover the same
+	// interleavings, but its exhaustion claim is downgraded and the foreign
+	// presence reported — coverage under churn is best-effort, never a silent
+	// claim (the dst-race yield placement is demonstrably foreign-sensitive).
+	if !spun.ForeignSched || spun.Exhausted || spun.Overflow {
+		t.Fatalf("exploration under a foreign spinner misreported: foreignSched=%v exhausted=%v overflow=%v", spun.ForeignSched, spun.Exhausted, spun.Overflow)
+	}
+	if spun.Schedules != alone.Schedules || len(spun.Failures) != len(alone.Failures) {
+		t.Fatalf("foreign spinner changed exploration coverage: schedules %d vs %d, failures %d vs %d",
+			spun.Schedules, alone.Schedules, len(spun.Failures), len(alone.Failures))
+	}
+	// Direct trace pin: the spinner must be invisible in the recorded
+	// schedule — same decisions chosen, same enabled sets, no unassigned or
+	// duplicate seq (a spinner leaking into the recording would carry seq 0,
+	// and one consuming the seq counter would shift every later seq).
+	assertUniqueEnabledSeqs(t, trSpun)
+	if !reflect.DeepEqual(trAlone.procs, trSpun.procs) || !reflect.DeepEqual(trAlone.enabled, trSpun.enabled) {
+		t.Fatalf("foreign spinner visible in the recorded schedule:\nalone procs=%v enabled=%v\nspun  procs=%v enabled=%v",
+			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
+	}
+}
+
+// TestExploreForeignSpinnerDrainCallback pins the drain-displacement leg of
+// the starvation fairness: the bubble's finalizer drain is infrastructure
+// under the scheduled strategy but has sim-visible effects, so it must run at
+// the same logical points with foreign churn as without. A finalizer that
+// sends and then calls Gosched re-queues the drain's continuation at the
+// global-runq tail — BEHIND a parked foreign spinner — where an
+// unprioritized infra pick would run the spinner first and shift every later
+// enabled set. The drain outranks foreign infrastructure and is transparent
+// to the alternation, so the recorded traces must be identical.
+func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		// The dst-race auto-instrumentation's yield placement is
+		// foreign-sensitive (ForeignSched reports it), so exact trace
+		// equality holds only without it; the -race behavior is covered by
+		// TestExploreForeignSchedReported.
+		t.Skip("non-race trace regression")
+	}
+	sut := func() bool {
+		ch1 := make(chan struct{}, 1)
+		ch2 := make(chan struct{}, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ch2
+		}()
+		func() {
+			x := new(int)
+			runtime.SetFinalizer(x, func(*int) {
+				// Wake ONE simulation goroutine, yield (re-queuing the drain
+				// at the global tail, behind any foreign spinner), then wake
+				// the second: if foreign work displaces the drain's
+				// continuation, the first sim decision sees enabled {main}
+				// instead of {main, helper} and the traces diverge.
+				ch1 <- struct{}{}
+				runtime.Gosched()
+				ch2 <- struct{}{}
+			})
+		}()
+		runtime.GC()
+		<-ch1
+		wg.Wait()
+		return false
+	}
+	Explore(1, Exhaustive, sut) // also initializes the trace buffers
+	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
+	_, _, trSpun := runOnce(1, nil, map[accessForce]bool{}, sut)
+	close(stop)
+	<-done
+	assertUniqueEnabledSeqs(t, trSpun)
+	if !reflect.DeepEqual(trAlone.procs, trSpun.procs) || !reflect.DeepEqual(trAlone.enabled, trSpun.enabled) {
+		t.Fatalf("foreign spinner displaced the drain in the recorded schedule:\nalone procs=%v enabled=%v\nspun  procs=%v enabled=%v",
+			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
+	}
+	// Drain atomicity between its yields: the drain must not be interrupted
+	// by the fairness hand-off (its scheduling is not an interleaving degree
+	// of freedom the explorer models), so the callback's two wakes land
+	// before either woken goroutine runs. Semantic pin: after the helper
+	// disappears from the enabled sets (blocked on ch2), its REAPPEARANCE set
+	// must also contain main — both were woken by the same uninterrupted
+	// callback. A drain interruptible after its yield wakes main first (main
+	// runs and blocks again before ch2 is sent), so the helper reappears in a
+	// singleton set.
+	contains := func(e []uint64, s uint64) bool {
+		for _, v := range e {
+			if v == s {
+				return true
+			}
+		}
+		return false
+	}
+	mainSeq := trAlone.procs[0]
+	var helperSeq uint64
+	for _, e := range trAlone.enabled {
+		if len(e) >= 2 {
+			for _, s := range e {
+				if s != mainSeq {
+					helperSeq = s
+				}
+			}
+			break
+		}
+	}
+	if helperSeq == 0 {
+		t.Fatalf("no multi-candidate startup decision found: enabled=%v", trAlone.enabled)
+	}
+	seen, absent, reappeared := false, false, false
+	for _, e := range trAlone.enabled {
+		has := contains(e, helperSeq)
+		if has && seen && absent {
+			reappeared = true
+			if !contains(e, mainSeq) {
+				t.Fatalf("drain tail did not complete before the woken goroutines ran (helper reappeared without main co-enabled): enabled=%v", trAlone.enabled)
+			}
+			break
+		}
+		if has {
+			seen = true
+		}
+		if seen && !has {
+			absent = true
+		}
+	}
+	if !reappeared {
+		t.Fatalf("helper never reappeared after blocking — test shape no longer exercises the drain callback: enabled=%v", trAlone.enabled)
+	}
+}
+
+// TestExploreForeignSchedReported: exploration under foreign churn reports
+// the churn and downgrades its exhaustion claim — coverage under foreign
+// activity is best-effort, never a silent claim (the dst-race yield
+// placement is demonstrably foreign-sensitive: fewer schedules explored with
+// a spinner than without under -race). Race-free sut, so this runs under
+// -race too — the one configuration where the sensitivity is live.
+func TestExploreForeignSchedReported(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		ch := make(chan struct{}, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ch
+		}()
+		ch <- struct{}{}
+		wg.Wait()
+		return false
+	}
+	alone := Explore(1, Exhaustive, sut)
+	if alone.ForeignSched || !alone.Exhausted {
+		t.Fatalf("foreign-free exploration misreported: foreignSched=%v exhausted=%v", alone.ForeignSched, alone.Exhausted)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
+	spun := Explore(1, Exhaustive, sut)
+	close(stop)
+	<-done
+	if !spun.ForeignSched {
+		t.Fatalf("foreign goroutine runnable at simulation decisions was not reported: %+v", spun)
+	}
+	if spun.Exhausted {
+		t.Fatalf("exhaustion claimed under foreign churn (coverage is best-effort there): %+v", spun)
 	}
 }
 
