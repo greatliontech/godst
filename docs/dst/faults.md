@@ -389,6 +389,14 @@ lookup choke point in `testing/simulation` (`lookupHost`/`lookupProc`) that ever
 clock, HostIP/HostFS, partition, reset, disk — shares; outside a run the calls stay documented no-ops.
 `TestDSTFaultVictimUnknownPanics` / `TestDSTFaultVictimOutsideRunNoop`.
 
+**Fault callers fail loud too.** A fault-injection or clock-fault API invoked during an active run
+from a goroutine OUTSIDE the run's bubble panics, naming the API and the fix — it never executes at
+an OS wall-clock instant the seed does not control (crash, partition, disk) and never silently
+no-ops (clock faults, whose caller has no bubble clock to step): both are the same
+silently-tests-nothing class the victim rule kills. Faults are injected from goroutines the
+simulation schedules — the run body or goroutines started inside it. Outside a run the calls stay
+documented no-ops. `TestDSTFaultFromNonBubbleGoroutinePanics` / `TestDSTFaultOutsideRunIsNoop`.
+
 ### The fault model: policies at existing seams
 
 A fault is a record `{kind, victim, activation}` consulted at the seam its kind owns. It adds **no new
@@ -615,7 +623,8 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   `Options.CrashTear` the policy instead explores the outcomes the contract permits, drawn from the fault
   RNG (the policy is per-run, published only after the run is ADMITTED: a rejected nested/concurrent
   attempt panics with no side effect on the active run's policy —
-  `TestDSTRejectedNestedRunKeepsCrashTearPolicy`): each dirty **page** of a file independently reached the platter, did not, or was caught in flight
+  `TestDSTRejectedNestedRunKeepsCrashTearPolicy`): each dirty **page** of a file independently
+  reached the platter, did not, or was caught in flight
   and **tore at a byte boundary** (the physical torn-write shape: the bytes that went out before the cut
   landed, the rest did not — a strict subset of the arbitrary byte mixes the contract permits, which is
   the sound direction to be incomplete in); each unsynced directory-entry change (a create, a remove, a

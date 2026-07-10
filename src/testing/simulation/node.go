@@ -447,6 +447,21 @@ func Host(name string, config HostConfig, f func()) {
 	f()
 }
 
+// requireBubbleFaultCaller is the fault APIs' caller-position guard, run as
+// each one's first act (before victim lookup). A fault invoked during an
+// active run from a goroutine outside the RUN'S bubble — no bubble at all, or
+// a foreign synctest bubble, itself a distinct scheduling domain — would
+// execute at a wall-clock instant the seed does not control (crash,
+// partition, disk) or silently no-op (clock faults: the caller has no run
+// clock to step) — both the "fault that silently tests nothing" class the
+// victim-naming rule already panics on. Outside a run the APIs stay
+// documented no-ops.
+func requireBubbleFaultCaller(api string) {
+	if runActive.Load() && !dstInSimBubble() {
+		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+	}
+}
+
 // lookupHost resolves an already-declared host name for a fault or inspection API,
 // panicking during a run on a name no Host (or implicit-host Process) declaration has
 // established — a typo'd victim must fail loud, never intern a fresh host id whose
@@ -529,6 +544,7 @@ func crashProcess(name string) {
 // leave the simulation with no driver, so the crash is refused before anything
 // is torn down. Crash is a no-op outside a run.
 func Crash(name string) {
+	requireBubbleFaultCaller("Crash")
 	crashProcess(name)
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
@@ -633,6 +649,7 @@ func crashHost(name string) {
 // run on an undeclared host name, and on a host owning the run's main goroutine
 // (see Crash); it is a no-op outside a run.
 func CrashHost(name string) {
+	requireBubbleFaultCaller("CrashHost")
 	crashHost(name)
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()

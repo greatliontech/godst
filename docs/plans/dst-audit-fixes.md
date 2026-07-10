@@ -122,7 +122,7 @@ Audit reproducers (ephemeral, from the audit session):
   rejected Run/RunWith/Test/TestWith leaves every process-global policy
   untouched, matching Explore/Replay. Test: nested run attempt inside a
   CrashTear run, torn outcomes still occur. (dst-audit-sim-crash-tear-guard)
-- [ ] 27. fault-injection and clock-fault APIs invoked from outside the run's
+- [x] 27. fault-injection and clock-fault APIs invoked from outside the run's
   bubble during an active run fail loudly and deterministically, as the
   victim-naming rule already does. Test: each API from a pre-run goroutine.
   (dst-audit-sim-fault-from-nonbubble)

@@ -44,6 +44,7 @@ func dstDriftHostClock(host uint32, ppb int64)
 // rejects a pre-epoch wall clock, so no real machine can hold one (the
 // wall-representability boundary, docs/dst/faults.md "Clock faults").
 func StepClock(host string, delta time.Duration) {
+	requireBubbleFaultCaller("StepClock")
 	if !dstStepHostClock(lookupHost(host), int64(delta)) {
 		panic("testing/simulation: StepClock takes the host's wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 	}
@@ -61,6 +62,7 @@ func StepClock(host string, delta time.Duration) {
 // Affects exactly the named host, panicking during a run on an undeclared host name.
 // Calls outside a run are no-ops. Call from within a Run.
 func DriftClock(host string, ppb int64) {
+	requireBubbleFaultCaller("DriftClock")
 	if ppb <= -driftPPBBase || ppb > maxDriftPPB {
 		panic("testing/simulation: DriftClock ppb out of range (-1e9, 1e9]; rate must be in (0, 2]")
 	}

@@ -2162,6 +2162,19 @@ func dstFenceActive() bool {
 	return gp.bubble != nil && gp.bubble == dstSimBubble
 }
 
+// dstInSimBubble reports whether the calling goroutine belongs to the ACTIVE
+// simulation's bubble — not merely any synctest bubble: a FOREIGN bubble
+// running concurrently with a simulation is a distinct scheduling domain, and
+// a fault injected from it lands at foreign-bubble timing the seed does not
+// control. Reached via //go:linkname from testing/simulation's fault-caller
+// guard.
+//
+//go:linkname dstInSimBubble
+func dstInSimBubble() bool {
+	gp := getg()
+	return gp.bubble != nil && gp.bubble == dstSimBubble
+}
+
 // dstCgoRefuse panics with the interception-boundary unsupported shape for a
 // bubble goroutine calling into cgo (a real C call is wall-clock, host-visible
 // work no seed controls; see design.md). It is deliberately NOT nosplit and NOT
