@@ -87,13 +87,22 @@ func dstFD(file *file) int {
 	if !dstFSActive() {
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
-	df, ok := file.dstf.(*dstFile)
-	if !ok {
+	// Tree files and proc-overlay files both mint virtual fds — the
+	// proc-overlay contract (zero (st_dev, st_ino) through fstat) is only
+	// reachable through here. Other backends (the pipe) keep the fence.
+	var closed bool
+	switch b := file.dstf.(type) {
+	case *dstFile:
+		b.mu.Lock()
+		closed = b.closed
+		b.mu.Unlock()
+	case *dstProcFile:
+		b.mu.Lock()
+		closed = b.closed
+		b.mu.Unlock()
+	default:
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
-	df.mu.Lock()
-	defer df.mu.Unlock()
-	closed := df.closed
 	if closed {
 		return -1
 	}

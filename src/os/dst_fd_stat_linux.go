@@ -39,9 +39,19 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	// owning host's id (+1 so no simulated device is 0), ino is the node's
 	// synthetic inode. Proc-overlay fds carry no tree node and keep (dev, ino)
 	// zero — no SUT keys identity on synthetic procfs stats.
-	stat.Dev = dstStatDev(stat.Dev, entry.host)
 	if file, ok := entry.backend.(*dstFile); ok {
+		stat.Dev = dstStatDev(stat.Dev, entry.host)
 		stat.Ino = file.node.ino
+	} else {
+		// Proc-overlay fds carry no tree node: (st_dev, st_ino) stays zero —
+		// synthetic procfs identity, per the spec's proc-fd contract — and so
+		// do the timestamps (the overlay's zero mtime would otherwise turn
+		// into UnixNano's garbage negative, a shape no kernel reports).
+		stat.Dev = 0
+		stat.Ino = 0
+		stat.Atim = syscall.Timespec{}
+		stat.Mtim = syscall.Timespec{}
+		stat.Ctim = syscall.Timespec{}
 	}
 	stat.Mode = syscallMode(info.Mode())
 	if info.IsDir() {

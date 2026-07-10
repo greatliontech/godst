@@ -24,11 +24,6 @@ verified, none blocking:
   deadlock in production but succeed in sim (masks a real deadlock, unbounded
   sim memory). Recorded in a code comment, not the spec — spec-amend candidate.
 
-- **Proc-overlay `Fd()` panics** (dst_fd.go:90-92), making the spec's proc-fd
-  identity contract ("zero (st_dev, st_ino)") unreachable; the dead
-  `dstFDFstat` branch would report `Dev = host+1`, not zero
-  (dst_fd_stat_linux.go:42-44). Spec-vs-code contradiction.
-
 - **16K-page / VA-39 hosts refused at first file creation, not first mapping.**
   `dstPageCacheCheckHost` runs in `dstPageCacheNew` at every regular-file
   creation (dst_pagecache_linux.go:162-169; os/dst_pagecache_linux.go:93), so

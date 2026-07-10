@@ -2363,3 +2363,30 @@ func TestDSTFSVirtualFDPwriteAppendHandle(t *testing.T) {
 		}
 	})
 }
+
+// TestDSTProcOverlayFDIdentity: the spec's proc-fd identity contract is
+// reachable and holds — Fd() on a proc-overlay file mints a virtual fd (it
+// must not panic), fstat over it reports zero (st_dev, st_ino) (synthetic
+// procfs identity: no SUT keys file identity on procfs stats), and reads
+// through the fd work.
+func TestDSTProcOverlayFDIdentity(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.Open("/proc/self/stat")
+		if err != nil {
+			t.Fatalf("open /proc/self/stat: %v", err)
+		}
+		defer f.Close()
+		fd := int(f.Fd()) // must mint, not panic
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err != nil {
+			t.Fatalf("Fstat(proc fd): %v", err)
+		}
+		if st.Dev != 0 || st.Ino != 0 {
+			t.Fatalf("proc-overlay identity = (dev %d, ino %d), want (0, 0)", st.Dev, st.Ino)
+		}
+		buf := make([]byte, 8)
+		if n, err := syscall.Read(fd, buf); n <= 0 || err != nil {
+			t.Fatalf("read through the proc fd = %d, %v; want >0, nil", n, err)
+		}
+	})
+}

@@ -80,7 +80,7 @@ Audit reproducers (ephemeral, from the audit session):
   grant Linux gives, not EBADF. (dst-audit-low-fidelity-cluster)
 - [x] 15. raw `syscall.Pwrite` on an O_APPEND file appends, as Linux does.
   (dst-audit-low-fidelity-cluster)
-- [ ] 16. the proc-overlay fd identity contract is reachable and holds:
+- [x] 16. the proc-overlay fd identity contract is reachable and holds:
   `Fd()`/fstat over a proc-overlay file agree with the spec's zero
   `(st_dev, st_ino)` contract. (dst-audit-low-fidelity-cluster)
 - [ ] 17. the 16K-page / VA-39 host refusal is stated at its true scope —
