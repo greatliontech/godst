@@ -110,7 +110,7 @@ Audit reproducers (ephemeral, from the audit session):
   means WITHOUT draining, and governs both arms — app `Close()` and the
   process-exit RST arm, whose current single-end teardown lets the peer drain
   first. (dst-audit-net-kernel-shape, item 5)
-- [ ] 24. the `Listen(":0")` ephemeral port allocator wraps and reclaims
+- [x] 24. the `Listen(":0")` ephemeral port allocator wraps and reclaims
   closed ports, as real kernels do. (dst-audit-low-fidelity-cluster)
 - [ ] 25. same-host connections get the same bounded send buffer as
   cross-host, so the co-located write-write deadlock reproduces in sim (user

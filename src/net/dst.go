@@ -431,26 +431,38 @@ func dstListenerConflict(scope, network string, ip IP, key string, port int, wil
 	return dup
 }
 
+// dstAllocateListenPort picks the next free listener port, advancing the
+// per-run counter and WRAPPING within [dstListenEphemeralStart, 65535] — a
+// closed listener's port is reclaimed on the next pass, as real kernels reuse
+// freed ephemeral ports, so a long-lived run can listen-close indefinitely
+// (the unwrapped counter exhausted after ~55k listens with every port free).
+// Conflict-occupied candidates (a live listener, or a dialer-end conn's local
+// 2-tuple) are skipped. A whole live range fails EADDRINUSE, bind(2)'s
+// exhaustion identity. Caller holds dstNet.mu.
 func dstAllocateListenPort(scope, network string, ip IP, host uint32, wildcard, dual bool) (port int, keys []string, err error) {
-	for p := dstNet.nextListenPort; p <= 65535; p++ {
+	const span = 65535 - dstListenEphemeralStart + 1
+	for tried := 0; tried < span; tried++ {
+		p := dstNet.nextListenPort
+		dstNet.nextListenPort++
+		if dstNet.nextListenPort > 65535 {
+			dstNet.nextListenPort = dstListenEphemeralStart
+		}
 		if dstListenConnConflict(host, network, ip, p, wildcard, dual) {
 			continue // a dialer-end conn occupies the port (no SO_REUSEADDR)
 		}
 		if dual {
 			ks := dstDualKeys(p)
 			if !dstAnyListenerConflict(scope, network, ip, ks, p, wildcard, true) {
-				dstNet.nextListenPort = p + 1
 				return p, ks, nil
 			}
 			continue
 		}
 		k := dstListenerKey(network, ip, p, wildcard)
 		if !dstListenerConflict(scope, network, ip, k, p, wildcard) {
-			dstNet.nextListenPort = p + 1
 			return p, []string{k}, nil
 		}
 	}
-	return 0, nil, errors.New("no free ports")
+	return 0, nil, syscall.EADDRINUSE
 }
 
 // dstListenConnConflict reports whether a live DIALER-end conn on host blocks a
@@ -777,7 +789,9 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	if portnum == 0 {
 		portnum, keys, err = dstAllocateListenPort(scope, network, ip, listeningHost, wildcard, dual)
 		if err != nil {
-			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
+			// Production wraps a bind failure with the REQUESTED address
+			// (port 0), not a nil Addr.
+			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: reportIP, Port: 0}, Err: err}
 		}
 	} else if dual {
 		keys = dstDualKeys(portnum)

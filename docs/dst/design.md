@@ -412,10 +412,13 @@ its port (`TestDSTNetRelistenWithAcceptedConns`) — among CONN ends, only socke
 `SO_REUSEADDR` (dialer ends) block a listener, exactly the kernel's rule (live listeners block each
 other regardless, as two LISTEN sockets always conflict). One divergence: **TIME_WAIT is
 unmodeled** — a conn deregisters at close, so a just-closed 2-tuple is immediately re-bindable where
-production's `bind(2)` without `SO_REUSEADDR` refuses it for 2·MSL (the false-negative direction). `:0` listeners receive deterministic nonzero ports
-(dialer ephemeral ports allocate deterministically
+production's `bind(2)` without `SO_REUSEADDR` refuses it for 2·MSL (the false-negative direction). `:0` listeners receive deterministic nonzero ports, wrapping within
+[10000, 65535] and reclaiming closed ports on the next pass — a long-lived run listens and closes
+indefinitely (`TestDSTNetListenPortAllocatorWrapsAndReclaims`), and a fully live range fails
+`EADDRINUSE`, bind(2)'s exhaustion identity, carrying the requested address
+(`TestDSTNetListenPortExhaustionEADDRINUSE`); dialer ephemeral ports allocate deterministically
 and stay within the valid port range [40000, 65535], wrapping and skipping live local bindings rather
-than minting impossible port numbers), listener lookup uses canonical simulated IPs
+than minting impossible port numbers, listener lookup uses canonical simulated IPs
 (`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6
 wildcard address and accepts dials of both families, conflicting with either family's listeners on the
 port; `"0.0.0.0"` and `tcp4`/`tcp6` stay single-family, and a single-family wildcard listen reports

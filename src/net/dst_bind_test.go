@@ -9,6 +9,7 @@ package net
 import (
 	"errors"
 	"io"
+	"strconv"
 	"syscall"
 	"testing"
 	"testing/simulation"
@@ -393,5 +394,86 @@ func TestDSTNetCloseBeforeDeliveryStillResets(t *testing.T) {
 	})
 	if !errors.Is(readErr, syscall.ECONNRESET) {
 		t.Errorf("read after the peer closed with our bytes in flight = %v, want ECONNRESET: in-flight bytes count as queued (the recorded collapse)", readErr)
+	}
+}
+
+// TestDSTNetListenPortAllocatorWrapsAndReclaims: the :0 listener allocator
+// wraps within [10000, 65535] and reclaims closed ports on the next pass, as
+// real kernels reuse freed ephemeral ports — a long-lived run can listen and
+// close indefinitely (the unwrapped counter exhausted after ~55k listens with
+// every port free).
+func TestDSTNetListenPortAllocatorWrapsAndReclaims(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var ports []string
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			first, err := Listen("tcp", ":0") // closed below, reclaimed on wrap
+			if err != nil {
+				panic(err)
+			}
+			if _, p, _ := SplitHostPort(first.Addr().String()); p != "10000" {
+				panic("first :0 allocation = " + p + ", want 10000 (the reclaim leg's premise)")
+			}
+			first.Close()
+
+			dstNet.mu.Lock()
+			dstNetRoll()
+			dstNet.nextListenPort = 65535 // one candidate before the wrap
+			dstNet.mu.Unlock()
+
+			for i := 0; i < 2; i++ { // 65535, then wrap -> the reclaimed 10000
+				ln, err := Listen("tcp", ":0")
+				if err != nil {
+					panic(err)
+				}
+				defer ln.Close()
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				ports = append(ports, p)
+			}
+		})
+	})
+	want := []string{"65535", "10000"}
+	for i, w := range want {
+		if ports[i] != w {
+			t.Fatalf("allocation %d = %s, want %s (wrap at 65535, reclaim the closed 10000)", i, ports[i], w)
+		}
+	}
+}
+
+// TestDSTNetListenPortExhaustionEADDRINUSE: a fully live listener range fails
+// the next :0 allocation with EADDRINUSE — bind(2)'s exhaustion identity —
+// carrying the requested address, never an unbounded scan or a bare string.
+// Specific-IP listens keep every conflict probe O(1) (a wildcard listen's
+// probe scans all keys, and 55k of those is quadratic).
+func TestDSTNetListenPortExhaustionEADDRINUSE(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var exhaustErr error
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			me := simulation.HostIP("h")
+			lns := make([]Listener, 0, 65535-10000+1)
+			for port := 10000; port <= 65535; port++ {
+				ln, err := Listen("tcp4", me+":"+strconv.Itoa(port))
+				if err != nil {
+					panic(err)
+				}
+				lns = append(lns, ln)
+			}
+			_, exhaustErr = Listen("tcp4", me+":0")
+			for _, ln := range lns {
+				ln.Close()
+			}
+		})
+	})
+	if !errors.Is(exhaustErr, syscall.EADDRINUSE) {
+		t.Fatalf("listen with the whole ephemeral range live = %v, want EADDRINUSE (bind exhaustion)", exhaustErr)
+	}
+	var op *OpError
+	if !errors.As(exhaustErr, &op) || op.Addr == nil {
+		t.Fatalf("exhaustion error = %#v, want an OpError carrying the requested address", exhaustErr)
 	}
 }

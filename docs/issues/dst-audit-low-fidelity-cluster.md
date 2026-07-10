@@ -15,10 +15,6 @@ verified, none blocking:
   is not dead-code-eliminated untagged. No behavior change; the spec's "zero
   footprint" note is inaccurate.
 
-- **`Listen(":0")` port allocator never wraps or reclaims**
-  (`dstAllocateListenPort`, dst.go:429-445): ~55k listens in one run exhaust
-  "no free ports" even with every listener closed; real kernels wrap and reuse.
-
 - **Same-host connections get an unbounded send buffer and no horizon**
   (dst.go:986): two co-located peers each writing ≫1 MiB before reading
   deadlock in production but succeed in sim (masks a real deadlock, unbounded
