@@ -99,7 +99,7 @@ Audit reproducers (ephemeral, from the audit session):
 - [x] 20. the retransmission horizon arms on any write against an unhealable
   path, not only on a full send buffer — undeliverable bytes never
   succeed-and-forget. (dst-audit-net-kernel-shape, item 1)
-- [ ] 21. dial-side local binds and ephemeral allocation check listener
+- [x] 21. dial-side local binds and ephemeral allocation check listener
   bindings: binding to a live listener's 2-tuple fails EADDRINUSE.
   (dst-audit-net-kernel-shape, item 3)
 - [ ] 22. a full accept backlog fails a deadline-less dial with ETIMEDOUT

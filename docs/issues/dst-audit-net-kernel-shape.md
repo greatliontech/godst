@@ -1,18 +1,12 @@
-# DST audit: net divergences from kernel shape (bind, backlog, close-RST)
+# DST audit: net divergences from kernel shape (backlog, close-RST)
 
-Lands: chunks 21–23 of docs/plans/dst-audit-fixes.md (item 3 → 21, 4 → 22, 5 → 23; items 1–2 landed in chunks 20 and 19)
+Lands: chunks 22–23 of docs/plans/dst-audit-fixes.md (item 4 → 22, 5 → 23; items 1–3 landed in chunks 20, 19, 21)
 
 ## Gap
 
 Severity M (full-surface audit, 2026-07-10; each reproduced). Kernel-shape
 divergences in the virtual wire, all in the false-negative direction (a SUT
 that keys on the real behavior is misled or a real failure is masked):
-
-3. **`Dialer.LocalAddr` / ephemeral allocation ignores listener bindings**
-   (`dstLocalBindInUse`, `src/net/dst_reset.go:104-121`; `dstAllocateListenPort`,
-   `dst.go:429`). Binding a dial's local end to a live listener's 2-tuple
-   succeeds in-sim; production `bind(2)` fails EADDRINUSE. Same blindness both
-   ways.
 
 4. **A full accept backlog blocks a deadline-less dial forever**
    (`make(chan Conn, 128)`, `dst.go:765`; blocking send `dst.go:1002-1007`, no

@@ -114,6 +114,18 @@ func dstMatchedVictims(match func(*dstConn) bool) []*dstConn {
 // attribution (localHost + local address). Deterministic (a set-membership test, no
 // iteration order observed).
 func dstLocalBindInUse(host uint32, ip IP, port int) bool {
+	return dstConnBindInUse(host, ip, port, "", false)
+}
+
+// dstConnBindInUse is the general conn-side bind probe: does a live conn end on
+// host occupy local port? ip nil means any IP at the port (the wildcard-listen
+// probe); family "" means either family, otherwise "tcp4"/"tcp6" narrows it.
+// dialerEndsOnly counts only dialer-side ends: an ACCEPTED server end inherits
+// the listener's SO_REUSEADDR, so it never blocks a new listener — a server
+// restarted while its old connections drain must be able to re-bind its port —
+// while a dialer's socket carries no SO_REUSEADDR and blocks everything.
+// Deterministic (a set-membership test, no iteration order observed).
+func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnly bool) bool {
 	dstConns.mu.Lock()
 	defer dstConns.mu.Unlock()
 	dstConnsRoll()
@@ -121,13 +133,20 @@ func dstLocalBindInUse(host uint32, ip IP, port int) bool {
 		if c.localHost != host {
 			continue
 		}
+		if dialerEndsOnly && c.acceptState != nil {
+			continue
+		}
 		la, ok := c.local.(*TCPAddr)
 		if !ok || la.Port != port {
 			continue
 		}
-		if la.IP.Equal(ip) {
-			return true
+		if ip != nil && !la.IP.Equal(ip) {
+			continue
 		}
+		if family != "" && dstAddrFamily("", la.IP) != family {
+			continue
+		}
+		return true
 	}
 	return false
 }

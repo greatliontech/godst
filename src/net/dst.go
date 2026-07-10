@@ -67,9 +67,11 @@ const (
 // [dstDialEphemeralStart, dstDialEphemeralEnd] — so it never returns a port above
 // 65535 (the bare counter reached impossible numbers after ~25k dials) and never
 // duplicates a still-live local addr:port (a real ephemeral allocator skips live
-// ports). Returns 0 when the whole range is live (EADDRNOTAVAIL). Caller holds
-// dstNet.mu; the collision probe nests dstConns.mu under it (a fixed lock order).
+// ports — a conn's local end or a LISTENER on the host, exact or wildcard).
+// Returns 0 when the whole range is live (EADDRNOTAVAIL). Caller holds
+// dstNet.mu; the conn probe nests dstConns.mu under it (a fixed lock order).
 func dstAllocEphemeralPort(host uint32, localIP IP) int {
+	scope := dstNetScope(host)
 	const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
 	for tried := 0; tried < span; tried++ {
 		p := dstNet.nextPort
@@ -77,9 +79,13 @@ func dstAllocEphemeralPort(host uint32, localIP IP) int {
 		if dstNet.nextPort > dstDialEphemeralEnd {
 			dstNet.nextPort = dstDialEphemeralStart
 		}
-		if !dstLocalBindInUse(host, localIP, p) {
-			return p
+		if dstLocalBindInUse(host, localIP, p) {
+			continue
 		}
+		if dstListenerConflict(scope, "tcp", localIP, dstListenerKey("tcp", localIP, p, false), p, false) {
+			continue
+		}
+		return p
 	}
 	return 0
 }
@@ -425,8 +431,11 @@ func dstListenerConflict(scope, network string, ip IP, key string, port int, wil
 	return dup
 }
 
-func dstAllocateListenPort(scope, network string, ip IP, wildcard, dual bool) (port int, keys []string, err error) {
+func dstAllocateListenPort(scope, network string, ip IP, host uint32, wildcard, dual bool) (port int, keys []string, err error) {
 	for p := dstNet.nextListenPort; p <= 65535; p++ {
+		if dstListenConnConflict(host, network, ip, p, wildcard, dual) {
+			continue // a dialer-end conn occupies the port (no SO_REUSEADDR)
+		}
 		if dual {
 			ks := dstDualKeys(p)
 			if !dstAnyListenerConflict(scope, network, ip, ks, p, wildcard, true) {
@@ -442,6 +451,23 @@ func dstAllocateListenPort(scope, network string, ip IP, wildcard, dual bool) (p
 		}
 	}
 	return 0, nil, errors.New("no free ports")
+}
+
+// dstListenConnConflict reports whether a live DIALER-end conn on host blocks a
+// new listener at (ip, port): the dialer's socket carries no SO_REUSEADDR, so
+// bind(2) fails on any overlap — exact for a specific listen, any IP of the
+// listen family for a wildcard, either family for dual. Accepted server ends
+// inherit the listener's SO_REUSEADDR and never block (a restarted server
+// re-binds its port while old connections drain). Caller holds dstNet.mu.
+func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcard, dual bool) bool {
+	switch {
+	case dual:
+		return dstConnBindInUse(host, nil, port, "", true)
+	case wildcard:
+		return dstConnBindInUse(host, nil, port, dstAddrFamily(network, ip), true)
+	default:
+		return dstConnBindInUse(host, ip, port, "", true)
+	}
 }
 
 // dstConn is a simulated connection: a net.Pipe endpoint (Read/Write/Close/
@@ -738,7 +764,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	dstNetRoll()
 	var keys []string
 	if portnum == 0 {
-		portnum, keys, err = dstAllocateListenPort(scope, network, ip, wildcard, dual)
+		portnum, keys, err = dstAllocateListenPort(scope, network, ip, listeningHost, wildcard, dual)
 		if err != nil {
 			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
 		}
@@ -748,7 +774,8 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		keys = []string{dstListenerKey(network, ip, portnum, wildcard)}
 	}
 	addr := &TCPAddr{IP: reportIP, Port: portnum}
-	if dstAnyListenerConflict(scope, network, ip, keys, portnum, wildcard, dual) {
+	if dstAnyListenerConflict(scope, network, ip, keys, portnum, wildcard, dual) ||
+		dstListenConnConflict(listeningHost, network, ip, portnum, wildcard, dual) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
 	}
 	// Scope the keys to the listening host: every registry entry is host-scoped, so
@@ -956,8 +983,13 @@ redial:
 	}
 	if localPort != 0 {
 		// An explicit LocalAddr binds without SO_REUSEADDR: bind(2) fails EADDRINUSE
-		// on a live local addr:port collision (a 2-tuple, whatever the destination).
-		if dstLocalBindInUse(dialerHost, localIP, localPort) {
+		// on a live local addr:port collision (a 2-tuple, whatever the destination) —
+		// against another conn's local end OR a listener on the dialer's own host
+		// (exact or wildcard, same family; the listener's own SO_REUSEADDR does not
+		// help a peer socket that lacks it).
+		dialerScope := dstNetScope(dialerHost)
+		if dstLocalBindInUse(dialerHost, localIP, localPort) ||
+			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, false), localPort, false) {
 			dstNet.mu.Unlock()
 			src := &TCPAddr{IP: localIP, Port: localPort}
 			if localTCPAddr != nil {
@@ -967,9 +999,10 @@ redial:
 		}
 	} else {
 		// Ephemeral: advance the per-run counter, wrapping within the valid port
-		// range and skipping any port still live on the dialer's IP — so a port
+		// range and skipping any local 2-tuple still live on the dialer's IP —
+		// a conn's local end or a listener (exact or wildcard) — so a port
 		// never exceeds 65535 (an impossible number the bare counter reached after
-		// ~25k dials) and a live 4-tuple is never duplicated.
+		// ~25k dials) and a live local binding is never duplicated.
 		localPort = dstAllocEphemeralPort(dialerHost, localIP)
 		if localPort == 0 {
 			dstNet.mu.Unlock()

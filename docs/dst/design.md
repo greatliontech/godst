@@ -397,8 +397,19 @@ models a TCP socket pair, not a message queue:
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set —
 checked against live local bindings on a **2-tuple** (local addr:port) basis, as the real path refuses:
 Go binds an explicit `LocalAddr` without `SO_REUSEADDR`, so `bind(2)` fails `EADDRINUSE` on a local
-collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes) —
-`:0` listeners receive deterministic nonzero ports (dialer ephemeral ports allocate deterministically
+collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes).
+Conns and listeners share ONE port space per host, in both directions: a dial's local bind — explicit
+or ephemeral — conflicts with a live listener at the port (exact or wildcard, same family:
+`TestDSTNetDialLocalBindListenerPortEADDRINUSE`, `TestDSTNetEphemeralDialSkipsListenerPort`), and a
+new listener conflicts with a live DIALER-end conn's local 2-tuple (specific and wildcard listens,
+and the `:0` allocator skips such ports: `TestDSTNetListenConnPortEADDRINUSE`). ACCEPTED server ends
+inherit the listener's `SO_REUSEADDR`, so a server restarted while its old connections drain re-binds
+its port (`TestDSTNetRelistenWithAcceptedConns`) — among CONN ends, only sockets lacking
+`SO_REUSEADDR` (dialer ends) block a listener, exactly the kernel's rule (live listeners block each
+other regardless, as two LISTEN sockets always conflict). One divergence: **TIME_WAIT is
+unmodeled** — a conn deregisters at close, so a just-closed 2-tuple is immediately re-bindable where
+production's `bind(2)` without `SO_REUSEADDR` refuses it for 2·MSL (the false-negative direction). `:0` listeners receive deterministic nonzero ports
+(dialer ephemeral ports allocate deterministically
 and stay within the valid port range [40000, 65535], wrapping and skipping live local bindings rather
 than minting impossible port numbers), listener lookup uses canonical simulated IPs
 (`localhost` maps to loopback), a plain-`"tcp"` wildcard listener is dual-stack (it reports the IPv6

@@ -16,7 +16,7 @@ chunk(s) there.
 |---|---|---|
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
-| [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 21–23 |
+| [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 22–23 |
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
 | [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunks 4, 9, 11–17, 24, 25, 28, 29 |
 
@@ -33,3 +33,4 @@ Found during plan execution:
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
 | [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |
 | [zero-length O_SYNC write over-commits](./dst-fs-osync-zero-write-overcommits.md) | L | O_SYNC commit fires only for writes that wrote |
+| [net TIME_WAIT is unmodeled](./dst-net-time-wait-unmodeled.md) | M | close-time hold modeled, or divergence confirmed kept |
