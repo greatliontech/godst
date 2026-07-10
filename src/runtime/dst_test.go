@@ -766,6 +766,23 @@ func TestDSTRunRequiresBuildTag(t *testing.T) {
 	}
 }
 
+// TestDSTFaultAPILinksUntagged pins the tag boundary of the fault API: the
+// simulated filesystem lives behind -tags dst, so an untagged binary that calls
+// CrashHost (or any fault whose implementation reaches os) must still LINK and
+// no-op outside a run. A direct linkname to a dst-only os symbol from this
+// package's untagged files breaks the build of any program that calls the API,
+// with a relocation error naming an internal symbol.
+func TestDSTFaultAPILinksUntagged(t *testing.T) {
+	exe, err := buildTestProg(t, "testprog") // no -tags dst
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := strings.TrimSpace(runBuiltTestProg(t, exe, "DSTFaultAPINoTag"))
+	if out != "fault api no-op" {
+		t.Fatalf("untagged fault API = %q, want a clean no-op", out)
+	}
+}
+
 // TestDSTFinalizerBubbleChannelOp verifies invariant DST-FIN-1: a finalizer that
 // does a bubble channel op runs without fatal inside dst.Run, because the
 // bubble-scoped drain goroutine (g.bubble == the bubble) runs it, not the async

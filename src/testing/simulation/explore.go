@@ -64,6 +64,12 @@ type Failure struct {
 	// Deadlock is non-empty iff the schedule ended with a synctest deadlock. Replay
 	// panics with the same deadlock marker for deadlock failures.
 	Deadlock string
+	// CrashTear records whether the exploration that found this failure was
+	// tearing host crashes (ExploreOptions.CrashTear). Replay restores the same
+	// policy: the fault RNG draws that shaped the wreckage are part of the
+	// execution, so a failure found under a torn crash reproduces only under one
+	// (DST-FAULT-REPLAY).
+	CrashTear bool
 }
 
 // ExploreResult reports an Explore run.
@@ -95,6 +101,11 @@ type ExploreOptions struct {
 	// MaxSchedules, if > 0, stops after exploring this many schedules and reports
 	// BudgetHit unless the interleaving space is exhausted exactly at that boundary.
 	MaxSchedules int
+	// CrashTear makes CrashHost tear at page granularity rather than losing every
+	// unsynced byte, exactly as Options.CrashTear does for Run. Each explored
+	// schedule draws its crash outcomes from the per-bubble fault RNG, so a
+	// schedule that finds a crash-recovery bug replays it exactly.
+	CrashTear bool
 	// MaxSteps, if > 0, bounds the scheduling decisions recorded in any one run.
 	// Hitting it reports BudgetHit rather than silently treating the truncated trace
 	// as exhausted.
@@ -180,6 +191,7 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResult {
 	enterSimulation("Explore", "testing/simulation: Explore requires building with -tags dst")
 	defer leaveSimulation()
+	setCrashTear(opts.CrashTear)
 	cfg := exploreConfigFromOptions(opts)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	if opts.Mode == DPOR {
@@ -202,6 +214,9 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) {
 	enterSimulation("Replay", "testing/simulation: Replay requires building with -tags dst")
 	defer leaveSimulation()
+	// The crash policy is part of the execution the failure recorded: replaying a
+	// torn crash untorn would restore a different disk and not reproduce.
+	setCrashTear(failure.CrashTear)
 	cfg := defaultExploreConfig()
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg)
@@ -310,7 +325,7 @@ func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
 }
 
 func newFailure(prefix []uint64, raced bool, panicMsg, deadlockMsg string, forces map[accessForce]bool) Failure {
-	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg, Deadlock: deadlockMsg}
+	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg, Deadlock: deadlockMsg, CrashTear: crashTearEnabled()}
 }
 
 func installAccessForces(forces map[accessForce]bool) {

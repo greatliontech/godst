@@ -10,5 +10,4 @@ deletes the resolved entry.
 
 | Issue | Lands |
 |---|---|
-| [DST gmdb crash tear fidelity](./dst-gmdb-crash-tear-fidelity.md) | 13 |
 | [DST gmdb end-to-end compatibility coverage](./dst-gmdb-end-to-end-coverage.md) | 14 |

@@ -68,6 +68,7 @@ func init() {
 	register("DSTGOMAXPROCSDelayedSTW", DSTGOMAXPROCSDelayedSTW)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
 	register("DSTRunNoTag", DSTRunNoTag)
+	register("DSTFaultAPINoTag", DSTFaultAPINoTag)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -2754,4 +2755,17 @@ func DSTPCTMainDrawsPriority() {
 	} else {
 		os.Stdout.WriteString("zero\n")
 	}
+}
+
+// DSTFaultAPINoTag exercises the tag boundary of the fault API in an UNTAGGED
+// binary. The simulated filesystem's symbols exist only under -tags dst, so a
+// direct linkname from this package's untagged files would make merely CALLING
+// these fail to link — a relocation error naming an internal symbol, instead of
+// the documented behavior. They must link, and outside a run they must be
+// no-ops (there is no universe to fault).
+func DSTFaultAPINoTag() {
+	simulation.CrashHost("nohost")
+	simulation.Crash("noproc")
+	simulation.Partition("a", "b")
+	os.Stdout.WriteString("fault api no-op\n")
 }

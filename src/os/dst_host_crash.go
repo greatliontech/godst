@@ -6,7 +6,10 @@
 
 package os
 
-import _ "unsafe" // for go:linkname
+import (
+	"slices"
+	_ "unsafe" // for go:linkname
+)
 
 // Host-crash teardown: power loss / kernel panic. Everything the KERNEL owned
 // dies — the page cache (so unsynced writes and unsynced directory entries are
@@ -38,7 +41,17 @@ func dstRestoreHostDiskFor(host uint32) {
 	if disk == nil {
 		return // the host never touched its filesystem: nothing to restore
 	}
-	dstRestoreNodeLocked(disk.root)
+	// One inode can be reachable from two parents after a rename whose parent
+	// directories were never fsynced (each link independently lands), so the walk
+	// tracks what it has restored: the restore mutates nodes in place, and a
+	// second visit would read already-restored bytes as if they were the page
+	// cache's and tear them again — a second draw off the fault RNG for one
+	// inode. The doubly-torn image is still made of durable and written bytes
+	// (both links read the same node, so it stays self-consistent), which is why
+	// no test can distinguish it: the guard buys one draw per inode, not
+	// soundness. TestDSTCrashTearRenameDoubleLinkRestoredOnce pins that the
+	// two links agree and that every byte is durable-or-written.
+	dstRestoreNodeLocked(disk.root, make(map[*dstFSNode]bool))
 	// The working directories of the host's processes are kernel state
 	// (per-process cwd lives in the task struct); a reboot starts every
 	// process at the root of the restored tree.
@@ -59,7 +72,11 @@ func dstRestoreHostDiskFor(host uint32) {
 // on the disk. Its unlinked mark and its emptied entry map must both be undone,
 // or the resurrected node would be a directory that exists but can never gain
 // an entry (the mark makes creation ENOENT) — a state no kernel produces.
-func dstRestoreNodeLocked(node *dstFSNode) {
+func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
+	if restored[node] {
+		return // reachable from two parents: restore its image exactly once
+	}
+	restored[node] = true
 	node.mode = node.syncedMode
 	node.modTime = node.syncedModTime
 	node.unlinked = false
@@ -67,13 +84,30 @@ func dstRestoreNodeLocked(node *dstFSNode) {
 	// virtual descriptor, and dstCloseHostFilesFor released the host's entire
 	// descriptor table before the disk was restored — the locks went with it.
 	if !node.isDir {
-		node.data = append([]byte(nil), node.synced...)
+		if dstCrashTear {
+			node.data = dstTearFileLocked(node.synced, node.data)
+		} else {
+			node.data = append([]byte(nil), node.synced...)
+		}
 		return
 	}
-	node.entries = make(map[string]*dstFSNode, len(node.syncedEntries))
-	for name, child := range node.syncedEntries {
-		node.entries[name] = child
-		dstRestoreNodeLocked(child)
+	if dstCrashTear {
+		node.entries = dstTearEntriesLocked(node)
+	} else {
+		node.entries = make(map[string]*dstFSNode, len(node.syncedEntries))
+		for name, child := range node.syncedEntries {
+			node.entries[name] = child
+		}
+	}
+	// Recurse in sorted name order: the children's own draws must come off the
+	// fault RNG in a fixed order, never the map's (DST-FAULT-REPLAY).
+	names := make([]string, 0, len(node.entries))
+	for name := range node.entries {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		dstRestoreNodeLocked(node.entries[name], restored)
 	}
 }
 

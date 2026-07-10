@@ -10,5 +10,5 @@
 - [x] 10. DST gmdb compatibility: add crash-time resource teardown for fds, flocks, mappings, conns, goroutines, and pid liveness.
 - [x] 11. DST gmdb compatibility: add process crash and restart over the live host filesystem.
 - [x] 12. DST gmdb compatibility: add host crash and restart with durable-image filesystem restore.
-- [ ] 13. DST gmdb compatibility: add unsynced write history for subset, reorder, and intra-page tear crash fidelity.
+- [x] 13. DST gmdb compatibility: add unsynced write history for subset, reorder, and intra-page tear crash fidelity.
 - [ ] 14. DST gmdb compatibility: add gmdb end-to-end compatibility coverage for open, locking, liveness, mmap, and crash recovery.

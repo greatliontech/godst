@@ -302,6 +302,24 @@ type Options struct {
 	// The zero value is the plain instant network — byte-identical to no Network
 	// config — so even plain Run keeps today's behavior.
 	Network NetworkConfig
+
+	// CrashTear makes CrashHost model power loss at page-cache granularity
+	// rather than losing every unsynced byte. With it off (the default) a host
+	// crash restores exactly the durable image — one legal outcome of the
+	// durability contract, and the simplest to reason about. With it on, each
+	// dirty PAGE of a file independently either reached the platter, did not, or
+	// was caught in flight and tore at a byte boundary; each unsynced
+	// directory-entry change independently landed or did not; and a file's
+	// unsynced size change lands or does not. Every choice is drawn from the
+	// run's fault RNG, so a torn crash is a deterministic function of the seed
+	// and replays exactly (DST-FAULT-REPLAY): sweeping seeds sweeps the crash
+	// outcomes a crash-consistent database must survive.
+	//
+	// Writeback flushes pages, and a dirty page carries the CURRENT bytes of
+	// every byte in it — so a torn crash never persists an older write's bytes
+	// for a byte a newer write covered, a state no page cache produces (see
+	// docs/dst/faults.md, the disk Crash axis).
+	CrashTear bool
 }
 
 // NetworkConfig configures the simulated network for a run.
@@ -516,6 +534,12 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 }
 
 func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostname string, pid, numcpu int) {
+	// Publish the crash-tear policy for this run, before the bubble exists. Every
+	// entry point sets it explicitly — RunWith and TestWith here (Run and Test
+	// wrap them), ExploreWith from its own options, Replay from the failure it is
+	// reproducing — so no run can inherit the previous run's policy, and none has
+	// to be cleared on the way out.
+	setCrashTear(opts.CrashTear)
 	kind = kindRandom
 	switch opts.Strategy {
 	case Random:

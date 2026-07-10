@@ -75,12 +75,6 @@ func dstHostOwnsBubbleMain(host uint32) bool
 //go:linkname dstMarkHostGoroutinesCrashed runtime.dstMarkHostGoroutinesCrashed
 func dstMarkHostGoroutinesCrashed(host uint32)
 
-//go:linkname dstRestoreHostDiskFor os.dstRestoreHostDiskFor
-func dstRestoreHostDiskFor(host uint32)
-
-//go:linkname dstCloseHostFilesFor os.dstCloseHostFilesFor
-func dstCloseHostFilesFor(host uint32)
-
 //go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
 func dstProcAllocEnsure(procid uint32)
 
@@ -593,13 +587,13 @@ func crashHost(name string) {
 	// host-scoped: every open file description and descriptor table on the
 	// machine, every advisory lock, every mapping (WITHOUT write-back — dirty
 	// pages were never on the disk), every socket (RST) and listener.
-	dstCloseHostFilesFor(host)
+	closeHostFiles(host)
 	dstNetPartitionOp(partOpResetHost, host, 0)
 	dstNetPartitionOp(partOpCloseHostListeners, host, 0)
 	// Finally the disk: what survives is exactly what was committed to it. The
 	// host's disk FAULTS (a bad sector, a full disk, a slow device) are physical
 	// properties of the hardware, not kernel state: they survive the reboot.
-	dstRestoreHostDiskFor(host)
+	restoreHostDisk(host)
 }
 
 // CrashHost kills the named host — the power-loss / kernel-panic fault

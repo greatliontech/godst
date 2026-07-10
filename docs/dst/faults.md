@@ -593,10 +593,34 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   draw), so the virtual delays replay deterministically. Per-host victim isolation, host independence,
   in-memory/closed-fd exemption, and replay are enforced by `TestDSTDiskLatency*`
   (`os/dst_disk_fault_test.go`), mutation-tested. This completes the disk axis.
-- **Crash (the durability tear)** is the **host (power-loss) crash** — see "Crash / restart faults". It
-  restores a host's disk to **exactly its durable image** (synced survives byte-exact; unsynced data/
-  entries MAY be lost, unsynced content MAY be torn at arbitrary byte granularity, drawn from the fault
-  RNG — no atomicity beyond `Sync`). Verbatim the durability contract already settled and
+- **Crash (the durability tear)** is the **host (power-loss) crash** — see "Crash / restart faults". Its
+  default policy restores a host's disk to **exactly its durable image** (synced survives byte-exact,
+  everything unsynced is lost): one legal outcome, deterministic, and the simplest to reason about. With
+  `Options.CrashTear` the policy instead explores the outcomes the contract permits, drawn from the fault
+  RNG: each dirty **page** of a file independently reached the platter, did not, or was caught in flight
+  and **tore at a byte boundary** (the physical torn-write shape: the bytes that went out before the cut
+  landed, the rest did not — a strict subset of the arbitrary byte mixes the contract permits, which is
+  the sound direction to be incomplete in); each unsynced directory-entry change (a create, a remove, a
+  rename-over) independently landed or did not; a file's unsynced size change landed or did not. Synced
+  bytes and synced entries never move — no atomicity beyond `Sync`. A page past the live file's end (an
+  unsynced truncate whose size change did not land) holds nothing to write back: the platter keeps the
+  durable blocks the truncate never freed.
+
+  *Why pages, not a write log (soundness).* Writeback flushes pages, and a dirty page carries the CURRENT
+  bytes of every byte in it: if two writes touched a byte before the crash, the page holds the later one.
+  So replaying "an arbitrary subset of the unsynced writes, reordered" would persist an older write's
+  bytes for a byte a newer write covered — a state no page cache can produce, the false-positive class
+  DST-FAULT-SOUND forbids. The subset the contract asks for is therefore an arbitrary subset of dirty
+  PAGES (reorder is unobservable *within* a file: its image is a set of pages, not a sequence), while
+  ordering ACROSS files and names — persist a file's data but lose its name, persist one file of a
+  two-file transaction — falls out of drawing each node's pages and each directory's entries
+  independently. Enforced by `TestDSTCrashTearRespectsDurableBytes` (durable bytes stable; every unsynced
+  byte is either its written value or unwritten, never an older one; the seed sweep reaches lost, landed,
+  and byte-torn), `TestDSTCrashTearEntriesSubset`, and `TestDSTCrashTearReplays` (same seed →
+  byte-identical wreckage, different seeds tear differently — DST-FAULT-REPLAY, every draw ordered by
+  page index and sorted entry name, never map order).
+
+  Verbatim the durability contract already settled and
   **monotonicity-enforced** (`TestDSTFSDurabilityMonotonicity`); the representation needs no change, only
   a crash policy reading the durable image. A *process* crash does **not** tear the host FS (the kernel
   survives) — that split is the crash section. The reason the durability split exists.

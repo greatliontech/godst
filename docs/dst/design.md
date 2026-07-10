@@ -482,9 +482,12 @@ deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` 
 like any other entry change. A simulated **host crash** (`CrashHost`, power loss) restores exactly the durable image:
 synced state survives byte-exactly; unsynced data and entries are lost — including an unsynced
 REMOVAL, which the crash undoes, since the removal itself was never on the disk. (A process crash
-tears nothing: the kernel survives it, so its page cache does.) Today the tear is all-or-nothing per
-node; the contract permits less — unsynced data MAY instead be lost in part, reordered, or torn at
-arbitrary byte granularity — which the write-history increment will exploit. No atomicity of
+tears nothing: the kernel survives it, so its page cache does.) The default policy loses everything unsynced; `Options.CrashTear`
+instead explores the outcomes the contract permits — each dirty page of a file lands, does not, or tears
+at a byte boundary, and each unsynced name change lands or does not, all drawn from the fault RNG and
+replay-exact. The tear is page-structured for soundness, not convenience: a page carries the current
+bytes of every byte in it, so no crash can persist an older write's bytes for a byte a newer write
+covered (see faults.md, the disk Crash axis). No atomicity of
 individual `Write` calls is promised beyond what was synced. Metadata durability is an inode property:
 a node reaches the disk with the mode and mtime it was created with, so a file whose parent directory was
 synced recovers with its creation mode even if the file itself was never synced (a later unsynced `Chmod`
@@ -921,6 +924,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture); syscall-retake gated so a blocked host write serializes, never reorders | ⛔ (program discipline) |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
+| faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
 | faults: process crash + restart | pid-keyed goroutine death + proc-keyed resource teardown (see [faults.md](./faults.md)) | ✅ |
 | faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
 | faults: OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
@@ -955,8 +959,8 @@ trees in the *same* bubble, all driven by the one seed. The axes:
 - **Network / Disk / I/O** — in-memory and deterministic (landed), with sound faults: on the
   reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole, connection reset,
   throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a reliable
-  stream); EIO/ENOSPC/disk latency (landed); lost unsynced writes on host crash (landed — the
-  all-or-nothing collapse; per-write subset/reorder/tear fidelity is the next increment).
+  stream); EIO/ENOSPC/disk latency (landed); torn and lost unsynced writes on host crash (landed:
+  page-granular subset + byte-granular tear, `Options.CrashTear`).
 - **Faults** — net, disk, clock skew/step/drift, process crash+restart, and host crash+reboot axes
   landed; OOM kill and *scheduling* faults (straggler) pending — each anchored to a real degree of
   freedom, so sound (see [faults.md](./faults.md)).
