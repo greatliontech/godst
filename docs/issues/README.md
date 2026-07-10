@@ -17,7 +17,6 @@ chunk(s) there.
 | [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
-| [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |
 | [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
 | [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 19–23 |
 | [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | chunk 12 |
@@ -36,3 +35,4 @@ Found during plan execution:
 | [overdue ticker crossing DriftClock has a phase error](./dst-clock-overdue-ticker-phase.md) | M | backwards remap honors the spec formula's negative remainder, sentinel-safe |
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
 | [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |
+| [zero-length O_SYNC write over-commits](./dst-fs-osync-zero-write-overcommits.md) | L | O_SYNC commit fires only for writes that wrote |

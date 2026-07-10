@@ -574,7 +574,11 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   tree (`residentLocked`), **not** tracked incrementally, so a delete or truncate-down frees room for the
   next write with no accounting in the mutation paths — and never the false ENOSPC a budget-that-ignores-
   frees would produce (DoF: a full disk; sound because in-place overwrites consume nothing, frees are
-  honored, and the partial-fill matches real short-write semantics). Per-host victim isolation, frees,
+  honored, and the partial-fill matches real short-write semantics). A write whose effective slice
+  is empty — a zero-length write at any offset, or one FULLY refused by the cap — has no effect at
+  all, as POSIX gives `write(2)`: no growth to the seek offset, no mtime, no resident-byte charge
+  (a refusal that grew the file would break the capacity invariant with no path to recover the
+  budget; `TestDSTDiskENOSPCRefusedWriteDoesNotGrow`, `TestDSTFSZeroLengthWriteNoEffect`). Per-host victim isolation, frees,
   partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` (`os/dst_disk_fault_test.go`),
   mutation-tested.
 - **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set

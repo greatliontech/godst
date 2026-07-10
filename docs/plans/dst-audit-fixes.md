@@ -55,7 +55,7 @@ Audit reproducers (ephemeral, from the audit session):
   image; a second crash with no intervening writes changes nothing. Test:
   double-crash, byte-identical post-crash images, torn and untorn.
   (dst-audit-fs-tear-durable-image)
-- [ ] 9. a write whose effective slice is empty (zero-length, or fully refused
+- [x] 9. a write whose effective slice is empty (zero-length, or fully refused
   by the ENOSPC cap) leaves size, content, resident-byte accounting, and mtime
   unchanged. (dst-audit-fs-refused-write-grows; subsumes the
   failed-writes-bump-mtime nit of dst-audit-low-fidelity-cluster)

@@ -1342,6 +1342,16 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 // skipped the growth and indexed past the slice instead.
 func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 	node := d.node
+	if len(b) == 0 {
+		// A write whose effective slice is empty — a zero-length write, or
+		// one fully refused by the ENOSPC cap — has no effect at all: POSIX
+		// gives a zero-length write(2) no side effects (no growth to the
+		// offset, no mtime), and the refusal path must not grow the file it
+		// just refused to write (zero-filling to the seek offset would also
+		// count against the disk budget with no path to recover it —
+		// the fault model's capacity invariant broken by its own refusal).
+		return 0, nil
+	}
 	const maxInt64 = 1<<63 - 1
 	if off > maxInt64-int64(len(b)) {
 		return 0, syscall.EFBIG

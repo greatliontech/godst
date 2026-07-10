@@ -533,6 +533,86 @@ func TestDSTDiskENOSPCOverwriteInPlace(t *testing.T) {
 	})
 }
 
+// TestDSTDiskENOSPCRefusedWriteDoesNotGrow: a write fully refused by the
+// ENOSPC cap leaves the file untouched — size, content, mtime, AND the
+// resident-byte accounting. Under the bug the refusal path zero-filled the
+// file to the seek offset (a 1 MiB seek grew a refused file to 1 MiB), and
+// the growth counted against the disk budget with no path to recover it —
+// the fault model's capacity invariant broken by its own refusal.
+func TestDSTDiskENOSPCRefusedWriteDoesNotGrow(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			simulation.LimitDisk("h", 8)
+			mustOK(t, "fill", os.WriteFile("/f", []byte("12345678"), 0o644)) // 8/8 full
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "OpenFile", err)
+			defer f.Close()
+			before, err := f.Stat()
+			mustOK(t, "Stat", err)
+			time.Sleep(time.Millisecond) // advance the fake clock: a wrongly-stamped mtime must differ
+			if _, err := f.Seek(1<<20, io.SeekStart); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			if n, err := f.Write([]byte("x")); n != 0 || !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("refused write = %d, %v; want 0, ENOSPC", n, err)
+			}
+			after, err := f.Stat()
+			mustOK(t, "Stat after refusal", err)
+			if after.Size() != 8 {
+				t.Fatalf("size after refused write = %d, want 8 (the refusal must not grow the file)", after.Size())
+			}
+			if !after.ModTime().Equal(before.ModTime()) {
+				t.Fatalf("mtime bumped by a refused write: %v -> %v", before.ModTime(), after.ModTime())
+			}
+			// Free-then-write accounting stays honest after the refusal:
+			// freeing 4 of the 8 resident bytes admits a 4-byte write. (The
+			// refusal discriminator is the size assertion above; resident
+			// bytes are recomputed from the tree, so this leg pins the
+			// accounting shape, not the growth bug.)
+			mustOK(t, "truncate", f.Truncate(4))
+			if n, err := f.WriteAt([]byte("wxyz"), 4); n != 4 || err != nil {
+				t.Fatalf("write into freed budget = %d, %v; want 4, nil", n, err)
+			}
+		})
+	})
+}
+
+// TestDSTFSZeroLengthWriteNoEffect: a zero-length write at any offset has no
+// effect, as POSIX gives write(2): no growth to the offset, no mtime bump.
+// Under the bug f.Seek(100); f.Write(nil) reported Stat size 100 and stamped
+// a fresh mtime. (The WriteAt(nil) leg pins the generic os surface — its
+// len(b) > 0 loop returns before the backend — the Write(nil) leg is the one
+// that reaches the simulated write path.)
+func TestDSTFSZeroLengthWriteNoEffect(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.Create("/z")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			before, err := f.Stat()
+			mustOK(t, "Stat", err)
+			time.Sleep(time.Millisecond) // advance the fake clock: a wrongly-stamped mtime must differ
+			if _, err := f.Seek(100, io.SeekStart); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			if n, err := f.Write(nil); n != 0 || err != nil {
+				t.Fatalf("zero-length write = %d, %v; want 0, nil", n, err)
+			}
+			if n, err := f.WriteAt(nil, 100); n != 0 || err != nil {
+				t.Fatalf("zero-length WriteAt = %d, %v; want 0, nil", n, err)
+			}
+			after, err := f.Stat()
+			mustOK(t, "Stat after", err)
+			if after.Size() != 0 {
+				t.Fatalf("size after zero-length writes = %d, want 0", after.Size())
+			}
+			if !after.ModTime().Equal(before.ModTime()) {
+				t.Fatalf("mtime bumped by a zero-length write: %v -> %v", before.ModTime(), after.ModTime())
+			}
+		})
+	})
+}
+
 // TestDSTDiskENOSPCCreate: creating a new file or directory on a full disk fails
 // ENOSPC; with room, both succeed.
 func TestDSTDiskENOSPCCreate(t *testing.T) {
