@@ -915,6 +915,13 @@ func sigpanic() {
 		throw("unexpected signal during runtime execution")
 	}
 
+	// A fault inside a simulated file mapping is that file's end-of-file, or its
+	// read-only protection, enforced by the MMU. It kills the simulated process
+	// and never returns. Checked ahead of gp.paniconfault: a system under test
+	// cannot recover from the SIGBUS production would deliver, so it must not
+	// recover from this one either.
+	dstMappingSigpanic(gp)
+
 	switch gp.sig {
 	case _SIGBUS:
 		if gp.sigcode0 == _BUS_ADRERR && gp.sigcode1 < 0x1000 {

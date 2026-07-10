@@ -61,3 +61,18 @@ clean-cache-after-compiler-change rule stands unchanged.
 
 The real port gate is step 5, not git: the enforcing legs are what proves the
 determinism contract survived the new base.
+
+## Configurations the matrix does not cover
+
+`GOEXPERIMENT=staticlockranking` is incompatible with `-tags dst`. Starting a
+simulation aborts with `not holding required lock! (rank sched)` from
+`schedEnabled`, reached when the background mark workers start: the simulation
+suspends the garbage collector and drives the scheduler in ways the static rank
+assertions do not expect. The matrix therefore does not run that experiment,
+and code written for the simulation cannot rely on it to audit lock order.
+
+Fork code must still respect the rules lock ranking would enforce — above all,
+never allocate or park while holding a runtime `mutex`, since `mallocgc` may
+take `mheap_.lock` beneath a leaf-ranked lock or assist the collector. Prefer
+the lock-free copy-on-write shape (`runtime.dstSetPidLive`,
+`runtime.dstSpanAdd`): build the successor, then compare-and-swap it in.

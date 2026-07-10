@@ -940,6 +940,11 @@ func DSTForeignBubbleIsolation() {
 
 var dstAllocSink []byte
 
+// dstOutsideAllocSink is the pump's own keep-alive. The two allocators exist to
+// allocate independently — one inside the bubble, one outside it — so sharing
+// one sink between them is a data race, and -race reports it as such.
+var dstOutsideAllocSink []byte
+
 // dstOutsideAllocPump allocates a megabyte on a non-bubble goroutine for every
 // ping received on an UNBUBBLED channel. A simulation goroutine sends the
 // pings, so the outside allocations deterministically interleave with the run
@@ -948,7 +953,7 @@ var dstAllocSink []byte
 func dstOutsideAllocPump(ping chan struct{}, done *sync.WaitGroup) {
 	defer done.Done()
 	for range ping {
-		dstAllocSink = make([]byte, 1<<20)
+		dstOutsideAllocSink = make([]byte, 1<<20)
 	}
 }
 
