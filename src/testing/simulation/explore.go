@@ -287,13 +287,13 @@ type exploreTrace struct {
 	// unlock/lock, buffered channel slot send/receive). They are consumed as object
 	// clocks so an acquire observes the release-time snapshot, not the releasing
 	// goroutine's later accesses.
-	syncKind  []uint8
-	syncID    []uintptr
-	syncAux   []uintptr
-	syncSeq   []uint64
-	syncStep  []int
-	syncAcc   []int
-	syncOrd   []int
+	syncKind     []uint8
+	syncID       []uintptr
+	syncAux      []uintptr
+	syncSeq      []uint64
+	syncStep     []int
+	syncAcc      []int
+	syncOrd      []int
 	aborted      bool // prefix named a non-enabled goroutine (a replay-determinism bug)
 	overflow     bool // run exceeded the trace, edge, or access-log budget (coverage incomplete)
 	budgetHit    bool // run exceeded a caller-supplied per-run step budget
