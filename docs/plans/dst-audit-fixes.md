@@ -104,7 +104,7 @@ Audit reproducers (ephemeral, from the audit session):
   (dst-audit-net-kernel-shape, item 3)
 - [x] 22. a full accept backlog fails a deadline-less dial with ETIMEDOUT
   instead of hanging forever. (dst-audit-net-kernel-shape, item 4)
-- [ ] 23. `Close()` with unread inbound data resets the peer (read fails
+- [x] 23. `Close()` with unread inbound data resets the peer (read fails
   ECONNRESET), reusing the existing `unreadInbound` predicate, consistent with
   process-exit teardown (user decision 2026-07-10). "Read fails ECONNRESET"
   means WITHOUT draining, and governs both arms — app `Close()` and the

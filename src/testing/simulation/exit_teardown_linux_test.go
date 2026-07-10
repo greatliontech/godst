@@ -226,3 +226,62 @@ func TestDSTProcessExitLastInvocationScopesResources(t *testing.T) {
 		t.Fatalf("dial after last invocation exit = %v, want ECONNREFUSED", afterErr)
 	}
 }
+
+// TestDSTProcessExitResetDropsInFlightBytes: the exit-close RST arm resets the
+// conn at BOTH ends — the surviving peer's next read fails ECONNRESET without
+// draining, even for a reply the dying process sent moments before exiting
+// (the RST destroys the receive queue; a single-end teardown would present as
+// a graceful write-close and let the peer drain first).
+func TestDSTProcessExitResetDropsInFlightBytes(t *testing.T) {
+	var n int
+	var readErr error
+	RunWith(1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+		addrCh := make(chan string, 1)
+		readDone := make(chan struct{})
+		Host("srv", HostConfig{}, func() {
+			go Process("server", func() {
+				l, err := net.Listen("tcp", HostIP("srv")+":0")
+				if err != nil {
+					t.Errorf("listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				c, err := l.Accept()
+				if err != nil {
+					t.Errorf("accept: %v", err)
+					return
+				}
+				// The client's data is delivered and sits UNREAD; our reply is
+				// in flight when the exit-close lands.
+				time.Sleep(300 * time.Millisecond)
+				if _, err := c.Write([]byte("resp")); err != nil {
+					t.Errorf("write: %v", err)
+					return
+				}
+				// Exit without reading: the kernel close RSTs.
+			})
+		})
+		addr := <-addrCh
+		Host("cli", HostConfig{}, func() {
+			go Process("client", func() {
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Errorf("dial: %v", err)
+					return
+				}
+				c.Write([]byte("data"))
+				// Blocks until the server's exit-close resets our end (no data
+				// can arrive first: the reply's delivery lies past the reset).
+				n, readErr = c.Read(make([]byte, 8))
+				close(readDone)
+				c.Close()
+			})
+		})
+		// The server Process body returns after its write; its exit teardown
+		// runs then. Wait for the whole sequence via the client's read.
+		<-readDone
+	})
+	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Fatalf("first read after the peer exited with unread data = (%d, %v), want (0, ECONNRESET): the exit RST drops in-flight bytes, not drains them", n, readErr)
+	}
+}

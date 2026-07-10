@@ -579,6 +579,17 @@ func (c *dstConn) Close() error {
 	if c.closed.Swap(true) {
 		return c.opError("close", errClosed)
 	}
+	// The kernel's close(2) conditional: an end whose receive queue holds
+	// unread data answers the peer with RST — the peer's next read fails
+	// ECONNRESET without draining — otherwise the close FINs and the peer
+	// drains buffered bytes to io.EOF. Bytes still in flight count as queued
+	// (the recorded collapse: the sim RSTs immediately, one of the two
+	// orderings the real close-vs-arrival race produces). The type assertion
+	// is the same wire-backed transport contract dstCloseProcConns records.
+	if e, ok := c.Conn.(*dstWireEnd); ok && e.unreadInbound() {
+		dstResetBothEnds(c)
+		return nil
+	}
 	c.Conn.Close()
 	dstConnDeregister(c)
 	return nil

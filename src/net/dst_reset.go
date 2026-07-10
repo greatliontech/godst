@@ -31,11 +31,15 @@ import (
 // identity, it does NOT close the peer's transport, so a peer whose own dstConn
 // is not reset still DRAINS queued bytes before seeing the error. The no-drain
 // RST teardown therefore requires resetting each end's own dstConn — every
-// reset matcher reaches both ends of a live conn (the host matcher spares a
-// survivor's end whose victim end already closed — see dstResetHost; the
-// process-EXIT path deliberately enumerates one end, a per-end graceful
-// close). resetConn is idempotent when both ends match: an atomic flag store,
-// a sync.Once close, a map delete.
+// RST teardown of an ESTABLISHED conn reaches both ends (the fault matchers
+// match both;
+// the close(2) conditional's RST arm goes through dstResetBothEnds; the host
+// matcher spares a survivor's end whose victim end already closed — see
+// dstResetHost). Only the close conditional's FIN arm — and the
+// listener-backlog teardown of a never-accepted server end, toward whose
+// dialer nothing can yet be queued — is per-end. resetConn
+// is idempotent when both ends are reset: an atomic flag store, a sync.Once
+// close, a map delete.
 var dstConns struct {
 	mu    sync.Mutex
 	epoch uint64
@@ -232,10 +236,41 @@ func dstCloseProcConns(p uint32) {
 		// must extend the unread-inbound probe or it silently degrades the RST
 		// arm to a graceful close.
 		if e, ok := c.Conn.(*dstWireEnd); ok && e.unreadInbound() {
-			c.resetConn()
+			dstResetBothEnds(c)
 			continue
 		}
 		c.Close()
+	}
+}
+
+// dstConnPeer finds the OTHER registered end of c's connection — the two ends
+// share one reset flag, the only cross-end link — or nil if the peer already
+// closed (its Close deregistered it). Deterministic: at most one non-c entry
+// can share the pointer.
+func dstConnPeer(c *dstConn) *dstConn {
+	dstConns.mu.Lock()
+	defer dstConns.mu.Unlock()
+	dstConnsRoll()
+	for c2 := range dstConns.set {
+		if c2 != c && c2.reset == c.reset {
+			return c2
+		}
+	}
+	return nil
+}
+
+// dstResetBothEnds is the RST teardown: the emitting end resets, and so does
+// the surviving peer's OWN dstConn — its transport closes, so its next read
+// fails ECONNRESET WITHOUT draining, queued and in-flight bytes alike, as a
+// real RST destroys the receive queue (the same both-ends rule the fault
+// matchers follow; a single-end reset presents at the peer as a graceful
+// write-close and the peer drains first). A peer that already closed needs
+// nothing (dstConnPeer returns nil).
+func dstResetBothEnds(c *dstConn) {
+	peer := dstConnPeer(c)
+	c.resetConn()
+	if peer != nil {
+		peer.resetConn()
 	}
 }
 

@@ -423,7 +423,12 @@ the family wildcard form — `0.0.0.0:p` / `[::]:p`, dialable back to the listen
 maps to internally), and error identity is production-shaped
 throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listens `EADDRINUSE`; every
 operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
-reads from a gracefully closed peer drain buffered data then return `io.EOF`, writes after a peer's
+reads from a gracefully closed peer drain buffered data then return `io.EOF` — but a `Close()` of an
+end whose receive queue holds UNREAD data answers with RST instead of FIN, and the peer's next read
+fails `ECONNRESET` without draining (the kernel's close(2) conditional; bytes still in flight count
+as queued — the recorded collapse: the sim RSTs immediately, one of the two orderings the real
+close-vs-arrival race produces, `TestDSTNetCloseBeforeDeliveryStillResets`;
+`TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — writes after a peer's
 close follow the FIN/RST shape above (first accepted, subsequent `ECONNRESET`), and any operation on
 a reset connection carries `ECONNRESET`; deadline failures are `*net.OpError` wrapping
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by

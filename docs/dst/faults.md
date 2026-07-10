@@ -780,9 +780,14 @@ connections go down. Teardown follows the kernel's order: the goroutines (thread
 resources close. A `Process` body's normal return (or panic unwind) IS the process's exit and routes
 through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn
 ends (the kernel close()s a dying process's sockets) with the kernel's own conditional per end — an end
-whose receive queue holds unread data answers the peer with RST (ECONNRESET), otherwise the close FINs
+whose receive queue holds unread data answers the peer with RST: the peer's next read fails ECONNRESET
+WITHOUT draining, queued and in-flight bytes alike, as every RST teardown destroys the receive queue
+at both ends (`TestDSTProcessExitResetDropsInFlightBytes`); otherwise the close FINs
 and the peer drains buffered bytes then reads EOF — while crash RESETS them unconditionally, and both
-close its listeners. One recorded collapse of the conditional: bytes still in flight count as queued —
+close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process
+(`TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — close(2) is
+close(2), whoever calls it. The in-flight-counts-as-queued collapse is pinned by
+`TestDSTNetCloseBeforeDeliveryStillResets`. One recorded collapse of the conditional: bytes still in flight count as queued —
 the sim RSTs immediately, which is one of the two orderings a real close-vs-arrival race produces (the
 kernel FINs first and RSTs when the data lands; a peer racing its read can observe either); the
 FIN-then-RST arm is not generated. Goroutine teardown is per-invocation (pid-keyed);

@@ -8,6 +8,7 @@ package net
 
 import (
 	"errors"
+	"io"
 	"syscall"
 	"testing"
 	"testing/simulation"
@@ -241,5 +242,156 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 	}
 	if freedErr != nil {
 		t.Errorf("dial with a slot freed mid-retry = %v, want success (the retransmitted SYN lands)", freedErr)
+	}
+}
+
+// TestDSTNetCloseWithUnreadDataResetsPeer: the kernel's close(2) conditional
+// on the USER-CALLED Close path — an end closed with unread received data
+// answers the peer with RST: the peer's next read fails ECONNRESET WITHOUT
+// draining (a reply the closer sent moments earlier is destroyed with the
+// receive queue, the same no-drain rule every RST teardown follows).
+func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	var n int
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		closed := make(chan struct{})
+		readDone := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			close(ready)
+			go func() {
+				c, _ := ln.Accept()
+				time.Sleep(300 * time.Millisecond) // the client's "data" is delivered, UNREAD
+				c.Write([]byte("resp"))            // in flight when the close lands
+				c.Close()                          // unread inbound -> RST, not FIN
+				close(closed)
+			}()
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
+			if err != nil {
+				panic(err)
+			}
+			c.Write([]byte("data"))
+			<-closed
+			n, readErr = c.Read(make([]byte, 8))
+			close(readDone)
+			c.Close()
+		})
+		<-readDone
+	})
+	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Errorf("read after the peer closed with unread data = (%d, %v), want (0, ECONNRESET): the RST destroys the receive queue, nothing drains", n, readErr)
+	}
+}
+
+// TestDSTNetCloseAfterDrainingFINs: the other arm of the conditional — an end
+// that READ everything before closing FINs, and the peer drains buffered
+// bytes to io.EOF. Guards the RST arm against over-firing.
+func TestDSTNetCloseAfterDrainingFINs(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	var n int
+	var firstErr, secondErr error
+	var buf [8]byte
+	simulation.RunWith(1, opts, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		closed := make(chan struct{})
+		readDone := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			close(ready)
+			go func() {
+				c, _ := ln.Accept()
+				b := make([]byte, 8)
+				if _, err := c.Read(b); err != nil { // drain the client's data
+					panic(err)
+				}
+				c.Write([]byte("resp"))
+				c.Close() // nothing unread -> graceful FIN
+				close(closed)
+			}()
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
+			if err != nil {
+				panic(err)
+			}
+			c.Write([]byte("data"))
+			<-closed
+			n, firstErr = c.Read(buf[:])
+			_, secondErr = c.Read(make([]byte, 8))
+			close(readDone)
+			c.Close()
+		})
+		<-readDone
+	})
+	if n != 4 || string(buf[:4]) != "resp" || firstErr != nil {
+		t.Errorf("read after a graceful peer close = (%d, %q, %v), want (4, %q, nil): a FIN lets the peer drain", n, buf[:n], firstErr, "resp")
+	}
+	if secondErr != io.EOF {
+		t.Errorf("second read after the drain = %v, want io.EOF", secondErr)
+	}
+}
+
+// TestDSTNetCloseBeforeDeliveryStillResets: bytes still IN FLIGHT toward the
+// closing end count as queued — the recorded collapse: the sim RSTs
+// immediately, one of the two orderings the real close-vs-arrival race
+// produces. A Close landing before the inbound data's delivery must RST (the
+// peer reads ECONNRESET), never FIN (the peer would read io.EOF).
+func TestDSTNetCloseBeforeDeliveryStillResets(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		closed := make(chan struct{})
+		readDone := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			close(ready)
+			go func() {
+				c, _ := ln.Accept()
+				// Accept returns at t=100ms (the SYN's half-RTT); the client's
+				// Dial returns at t=200ms and writes; delivery lands at
+				// t=300ms. Close at t=250ms: written, in flight, undelivered.
+				time.Sleep(150 * time.Millisecond)
+				c.Close() // in-flight inbound counts as queued -> RST
+				close(closed)
+			}()
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
+			if err != nil {
+				panic(err)
+			}
+			c.Write([]byte("data")) // at t=200ms; arrives t=300ms — after the close
+			<-closed
+			_, readErr = c.Read(make([]byte, 8))
+			close(readDone)
+			c.Close()
+		})
+		<-readDone
+	})
+	if !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Errorf("read after the peer closed with our bytes in flight = %v, want ECONNRESET: in-flight bytes count as queued (the recorded collapse)", readErr)
 	}
 }
