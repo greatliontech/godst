@@ -96,7 +96,7 @@ Audit reproducers (ephemeral, from the audit session):
 - [x] 19. dialing a crashed declared host blackholes (connect ETIMEDOUT), not
   instant ECONNREFUSED — refusal requires a live kernel to answer RST.
   (dst-audit-net-kernel-shape, item 2)
-- [ ] 20. the retransmission horizon arms on any write against an unhealable
+- [x] 20. the retransmission horizon arms on any write against an unhealable
   path, not only on a full send buffer — undeliverable bytes never
   succeed-and-forget. (dst-audit-net-kernel-shape, item 1)
 - [ ] 21. dial-side local binds and ephemeral allocation check listener

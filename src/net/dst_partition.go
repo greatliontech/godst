@@ -8,6 +8,7 @@ package net
 
 import (
 	"sync"
+	"sync/atomic"
 	_ "unsafe" // for go:linkname
 )
 
@@ -90,6 +91,15 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 // (from→to): a symmetric Partition cuts both a→b and b→a; a one-directional
 // PartitionOneWay(from,to) cuts only from→to (from's writes never reach to, while
 // to→from still flows). isolated is symmetric (a host cut from all others, both ways).
+// dstPartAnyCutCount counts active cut sources (directional cuts + isolated
+// hosts) so hot paths (every wire write) can skip the table locks entirely when
+// no partition exists — the overwhelmingly common case. Maintained under
+// dstPart.mu; reset on the per-run roll.
+var dstPartAnyCutCount atomic.Int64
+
+// dstPartAnyCut reports whether any cut source is active, lock-free.
+func dstPartAnyCut() bool { return dstPartAnyCutCount.Load() > 0 }
+
 var dstPart struct {
 	mu       sync.Mutex
 	epoch    uint64
@@ -138,6 +148,7 @@ func dstPartRoll() {
 		dstPart.isolated = make(map[uint32]int64)
 		dstPart.dead = make(map[uint32]struct{})
 		dstPart.wake = make(chan struct{})
+		dstPartAnyCutCount.Store(0)
 	}
 }
 
@@ -173,6 +184,7 @@ func dstApplyPartitionOp(op, a, b uint32) {
 	case dstFaultOpHostUp:
 		delete(dstPart.dead, a)
 	}
+	dstPartAnyCutCount.Store(int64(len(dstPart.dirs) + len(dstPart.isolated)))
 	close(dstPart.wake)
 	dstPart.wake = make(chan struct{})
 	dstPart.mu.Unlock()

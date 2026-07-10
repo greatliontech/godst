@@ -312,3 +312,383 @@ func TestDSTNetDialPartitionHorizonTimesOut(t *testing.T) {
 		t.Errorf("dial blackhole took %v to fail, want the 1s retransmit horizon", dialDur)
 	}
 }
+
+// TestDSTNetSmallWriteHorizonKillsConn: a write that FITS in the send buffer
+// against a partitioned link succeeds immediately (TCP's async send — the
+// bytes buffer), but it never succeeds-and-forgets: the bytes are
+// undeliverable, a real sender's retransmissions exhaust, and the conn is
+// dead at the horizon — the next operation fails ETIMEDOUT. Before the
+// watchdog, ten small writes over ten virtual minutes into a permanent cut
+// produced zero errors.
+func TestDSTNetSmallWriteHorizonKillsConn(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstN int
+	var firstErr, secondErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			firstN, firstErr = c.Write([]byte("hi")) // fits: buffers and returns
+			time.Sleep(2 * time.Second)              // the 1s horizon passes with the cut permanent
+			_, secondErr = c.Write([]byte("again"))
+			close(done)
+			c.Close()
+		})
+	})
+	if firstN != 2 || firstErr != nil {
+		t.Errorf("small write into a fresh cut = (%d, %v), want (2, nil): TCP's send buffers async", firstN, firstErr)
+	}
+	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
+		t.Errorf("write after the horizon killed the conn = %v, want ETIMEDOUT: undeliverable bytes never succeed-and-forget", secondErr)
+	}
+}
+
+// TestDSTNetWriteThenReadHorizonTimesOut: the death surfaces on a BLOCKED
+// operation too — a small write into a permanent cut, then a deadline-less
+// read, fails ETIMEDOUT at the horizon instead of hanging forever.
+func TestDSTNetWriteThenReadHorizonTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var readErr error
+	var readDur time.Duration
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi")) // buffers; undeliverable
+			t0 := time.Now()
+			_, readErr = c.Read(make([]byte, 8)) // blocks; the outbound horizon kills the end
+			readDur = time.Since(t0)
+			close(done)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Errorf("blocked read on a conn with dying outbound bytes = %v, want ETIMEDOUT", readErr)
+	}
+	if readDur != time.Second {
+		t.Errorf("blocked read failed after %v, want the 1s retransmit horizon", readDur)
+	}
+}
+
+// TestDSTNetHorizonHealDisarms: a heal that delivers the held bytes before the
+// horizon disarms the watchdog — the conn lives, the peer receives the bytes,
+// and no spurious ETIMEDOUT fires after the original deadline passes.
+func TestDSTNetHorizonHealDisarms(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var got string
+	var lateN int
+	var lateErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		received := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				buf := make([]byte, 8)
+				n, _ := c.Read(buf)
+				got = string(buf[:n])
+				close(received)
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi")) // held at the cut; watchdog armed
+			time.Sleep(500 * time.Millisecond)
+			simulation.Heal("srv", "cli") // before the 1s horizon: bytes flush
+			<-received
+			time.Sleep(2 * time.Second) // well past the original deadline
+			lateN, lateErr = c.Write([]byte("ok"))
+			close(done)
+			c.Close()
+		})
+	})
+	if got != "hi" {
+		t.Errorf("peer received %q after the heal, want %q (held bytes flush)", got, "hi")
+	}
+	if lateN != 2 || lateErr != nil {
+		t.Errorf("write after a disarming heal = (%d, %v), want (2, nil): no spurious horizon death", lateN, lateErr)
+	}
+}
+
+// TestDSTNetHorizonDeathDrainsDeliveredData: a horizon-killed end still
+// returns data the network already delivered before failing — tcp_recvmsg
+// reports pending data first, then the socket error.
+func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstN int
+	var firstErr, secondErr error
+	var buf [8]byte
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		sent := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				c.Write([]byte("pre")) // delivered before any cut
+				close(sent)
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			<-sent
+			time.Sleep(10 * time.Millisecond) // let "pre" arrive (instant link, but order the schedule)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi"))       // undeliverable: arms the watchdog
+			time.Sleep(2 * time.Second) // horizon kills the end
+			firstN, firstErr = c.Read(buf[:])
+			_, secondErr = c.Read(make([]byte, 8))
+			close(done)
+			c.Close()
+		})
+	})
+	if firstN != 3 || string(buf[:3]) != "pre" || firstErr != nil {
+		t.Errorf("first read on the killed end = (%d, %q, %v), want (3, %q, nil): delivered data drains before the error", firstN, buf[:firstN], firstErr, "pre")
+	}
+	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
+		t.Errorf("second read on the killed end = %v, want ETIMEDOUT", secondErr)
+	}
+}
+
+// TestDSTNetInFlightBytesCutThenReadTimesOut: bytes already IN FLIGHT when the
+// cut begins (written on a live 100ms link, partitioned before delivery) are
+// undeliverable too — a blocked read observing them arms the horizon and fails
+// ETIMEDOUT; before the read-side arm, this hung forever (the write predated
+// the cut, so nothing armed the watchdog).
+func TestDSTNetInFlightBytesCutThenReadTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{
+		CrossHostLatency:  100 * time.Millisecond,
+		RetransmitTimeout: time.Second,
+	}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			c.Write([]byte("hi"))              // live link: in flight for 100ms
+			simulation.Partition("srv", "cli") // cut before delivery: the bytes are held
+			_, readErr = c.Read(make([]byte, 8))
+			close(done)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Errorf("blocked read with in-flight bytes caught by the cut = %v, want ETIMEDOUT at the horizon", readErr)
+	}
+}
+
+// TestDSTNetHorizonHealRecutAnchorsAtObservation: a heal-then-recut while the
+// stale watchdog is still pending starts a NEW undeliverable episode — the
+// window re-anchors at the check's own observation, never at the new cut's
+// start (which can predate the episode's bytes by arbitrarily long and would
+// kill them before their own horizon: a premature, sim-only ETIMEDOUT). Here
+// the second episode's bytes are healed well inside their true window, so the
+// conn must live.
+func TestDSTNetHorizonHealRecutAnchorsAtObservation(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var lateN int
+	var lateErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				buf := make([]byte, 16)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						break
+					}
+				}
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli") // cut 1 at t=0
+			c.Write([]byte("w1"))              // arms; anchor t=0
+			time.Sleep(100 * time.Millisecond)
+			simulation.Heal("srv", "cli") // t=0.1: w1 flushes; watchdog still pending until t=1.0
+			time.Sleep(100 * time.Millisecond)
+			simulation.Partition("srv", "cli") // cut 2 at t=0.2
+			time.Sleep(700 * time.Millisecond)
+			c.Write([]byte("w2")) // t=0.9: armHorizon no-ops (still armed from episode 1)
+			// Stale check fires at t=1.0: new episode → re-anchor at NOW (1.0),
+			// never at cut 2's start (0.2), which would kill at t=1.2.
+			time.Sleep(400 * time.Millisecond)
+			simulation.Heal("srv", "cli") // t=1.3: w2 (undeliverable for only 0.4s) flushes
+			time.Sleep(100 * time.Millisecond)
+			lateN, lateErr = c.Write([]byte("ok")) // t=1.4: the conn must be alive
+			close(done)
+			c.Close()
+		})
+	})
+	if lateN != 2 || lateErr != nil {
+		t.Errorf("write after a heal-recut episode healed inside its own window = (%d, %v), want (2, nil): the re-anchor must be the observation time, not the cut start", lateN, lateErr)
+	}
+}
+
+// TestDSTNetOneWayCutInFlightReadTimesOut: a ONE-WAY outbound cut catches
+// in-flight bytes while the inbound direction stays live — a blocked read
+// (which is not itself cut) must still fail at the horizon: the sender's ACKs
+// never return through the cut, so its retransmissions exhaust. Before the
+// hoisted arm, this read hung forever.
+func TestDSTNetOneWayCutInFlightReadTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{
+		CrossHostLatency:  100 * time.Millisecond,
+		RetransmitTimeout: time.Second,
+	}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			c.Write([]byte("hi"))                    // live link: in flight for 100ms
+			simulation.PartitionOneWay("cli", "srv") // outbound-only cut catches them; inbound stays live
+			_, readErr = c.Read(make([]byte, 8))     // not cut itself — must still die at the horizon
+			close(done)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Errorf("blocked read under a one-way outbound cut with dying in-flight bytes = %v, want ETIMEDOUT", readErr)
+	}
+}
+
+// TestDSTNetCutAfterReadBlockedTimesOut: the third geometry — the read parks
+// on a LIVE link first, then the cut lands and catches the in-flight bytes.
+// The partition change must wake the parked reader so it re-evaluates and
+// arms the outbound watchdog; before the wake case, the reader stranded past
+// the horizon (a permanent hang the spec forbids).
+func TestDSTNetCutAfterReadBlockedTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{
+		CrossHostLatency:  100 * time.Millisecond,
+		RetransmitTimeout: time.Second,
+	}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		readDone := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			go func() {
+				c.Write([]byte("hi")) // live link: in flight for 100ms
+				_, readErr = c.Read(make([]byte, 8))
+				close(readDone)
+			}()
+			time.Sleep(10 * time.Millisecond)  // the read is parked on the live link
+			simulation.Partition("srv", "cli") // the cut catches the in-flight bytes
+			<-readDone
+			close(done)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Errorf("read parked before the cut landed = %v, want ETIMEDOUT at the horizon (the partition change must wake it to arm)", readErr)
+	}
+}

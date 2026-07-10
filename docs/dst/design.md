@@ -326,7 +326,17 @@ models a TCP socket pair, not a message queue:
 - **Retransmission horizon.** Bytes that stay undeliverable because the link is **partitioned**
   error the connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
   default 2 minutes of bubble time — kernel-shaped: ~15 retries), on the blocked or subsequent
-  operation (`TestDSTNetWriteHorizonTimesOut`, `TestDSTNetDialPartitionHorizonTimesOut`). A
+  operation (`TestDSTNetWriteHorizonTimesOut`, `TestDSTNetDialPartitionHorizonTimesOut`). This holds
+  for ANY undeliverable bytes, not only a blocked buffer-full write: a small write into a cut link
+  returns immediately (TCP's async send — the bytes buffer), but the conn is dead at the horizon and
+  the next operation fails (`TestDSTNetSmallWriteHorizonKillsConn`); a blocked read holding dying
+  outbound bytes fails at the horizon instead of hanging (`TestDSTNetWriteThenReadHorizonTimesOut`,
+  and for bytes already in flight when the cut lands,
+  `TestDSTNetInFlightBytesCutThenReadTimesOut`). The window anchors when the undeliverable bytes are
+  first observed (never earlier than the real first retransmission — errs toward later timeouts, the
+  sound direction); a heal that delivers the bytes disarms it (`TestDSTNetHorizonHealDisarms`). A
+  killed end still drains data the network already delivered before surfacing the error, as
+  tcp_recvmsg reports pending data first (`TestDSTNetHorizonDeathDrainsDeliveredData`). A
   deadline-less write or dial into a permanent partition therefore fails in bounded virtual time, as
   it does on a real kernel — it never succeeds-and-forgets. The horizon is **partition-gated**: a
   full send buffer behind a **live** peer that has merely stopped reading is TCP *zero-window

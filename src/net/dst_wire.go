@@ -275,7 +275,23 @@ type dstWireEnd struct {
 	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
 
 	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none)
-	timedOut  atomic.Bool // a write hit the retransmit horizon: the conn is dead (ETIMEDOUT)
+	timedOut  atomic.Bool // the retransmit horizon fired: this end is dead (ETIMEDOUT)
+
+	// The retransmit-exhaustion watchdog for this end's OUTGOING direction: armed
+	// whenever undeliverable bytes are observed under a cut (any write into the
+	// cut, or a blocked read holding dying outbound bytes), so a small write into
+	// a permanent partition kills the conn at the horizon even though the write
+	// itself returned instantly (buffered, as TCP's async send does) — the error
+	// then surfaces on the blocked or any subsequent operation, never
+	// succeeds-and-forgets. Disarmed by a heal that delivers the bytes; a
+	// heal-then-recut restarts the window (the heal-resets precedent, erring
+	// toward fewer/later ETIMEDOUTs). horizonKill closes when the watchdog kills
+	// the end, waking blocked reads/writes to observe timedOut.
+	horizonMu     sync.Mutex
+	horizonArmed  bool
+	horizonAnchor int64 // base-time the current undeliverable episode was first observed
+	horizonOnce   sync.Once
+	horizonKill   chan struct{}
 
 	once       sync.Once
 	localDone  chan struct{}
@@ -294,13 +310,13 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 	a := &dstWireEnd{
 		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: dialerHost, peerHost: listenHost,
-		localDone: doneA, remoteDone: doneB,
+		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
 		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
-		localDone: doneB, remoteDone: doneA,
+		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	return a, b
@@ -308,6 +324,88 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 
 func (*dstWireEnd) LocalAddr() Addr  { return pipeAddr{} }
 func (*dstWireEnd) RemoteAddr() Addr { return pipeAddr{} }
+
+// heldBeyond reports whether the stream still queues anything a cut beginning at
+// cutStart holds: a segment (or the FIN) whose delivery lies at or after the cut
+// (the same arrived-strictly-before-the-cut boundary pop uses). These are the
+// bytes a real sender would be retransmitting into the void.
+func (s *dstStream) heldBeyond(cutStart int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.segs {
+		if s.segs[i].deliverAt > cutStart-1 {
+			return true
+		}
+	}
+	return s.closed && s.closeAt > cutStart-1
+}
+
+// armHorizon starts the outgoing retransmit-exhaustion watchdog if it is not
+// already running. Callers observe undeliverable outbound bytes under a cut; the
+// anchor is always an OBSERVATION time — set here at arming, and re-set by
+// horizonCheck when a heal-then-recut starts a new episode — never earlier than
+// the real first retransmission, so the sim errs toward later timeouts (the
+// sound direction).
+func (e *dstWireEnd) armHorizon() {
+	if e.retransNs <= 0 || e.timedOut.Load() {
+		return
+	}
+	e.horizonMu.Lock()
+	if e.horizonArmed {
+		e.horizonMu.Unlock()
+		return
+	}
+	e.horizonArmed = true
+	e.horizonAnchor = dstBaseNanos()
+	e.horizonMu.Unlock()
+	time.AfterFunc(time.Duration(e.retransNs), e.horizonCheck)
+}
+
+// horizonCheck runs at the watchdog's deadline: disarm if the episode ended (heal
+// delivered the bytes, or the end closed), extend if a heal-then-recut restarted
+// the window, otherwise kill this end — timedOut, wake every blocked operation.
+func (e *dstWireEnd) horizonCheck() {
+	if e.timedOut.Load() || isClosedChan(e.localDone) {
+		e.horizonMu.Lock()
+		e.horizonArmed = false
+		e.horizonMu.Unlock()
+		return
+	}
+	cutStart, cut, _ := dstPartCutStartDir(e.localHost, e.peerHost)
+	if !cut || !e.out.heldBeyond(cutStart) {
+		e.horizonMu.Lock()
+		e.horizonArmed = false
+		e.horizonMu.Unlock()
+		return
+	}
+	e.horizonMu.Lock()
+	anchor := e.horizonAnchor
+	if cutStart > anchor {
+		// Healed and re-cut since arming: this is a NEW undeliverable episode,
+		// and this check is its first observation — re-anchor at NOW, never at
+		// the cut's start. The cut may predate the episode's bytes by
+		// arbitrarily long (written at cut+Δ while the stale watchdog was
+		// still pending), and a cut-start anchor would kill them before their
+		// own horizon elapsed — a premature, sim-only ETIMEDOUT. Now is always
+		// ≥ any held byte's write time, so the window errs later (the
+		// heal-resets precedent's sound direction).
+		anchor = dstBaseNanos()
+		e.horizonAnchor = anchor
+	}
+	e.horizonMu.Unlock()
+	if remaining := e.retransNs - (dstBaseNanos() - anchor); remaining > 0 {
+		time.AfterFunc(time.Duration(remaining), e.horizonCheck)
+		return
+	}
+	e.horizonMu.Lock()
+	e.horizonArmed = false // no AfterFunc pending past the kill
+	e.horizonMu.Unlock()
+	e.timedOut.Store(true)
+	e.horizonOnce.Do(func() { close(e.horizonKill) })
+	e.out.wake()
+	e.out.wakeWriter()
+	e.in.wake()
+}
 
 // unreadInbound reports whether this end's receive direction still holds bytes
 // the end never consumed — the close(2)-sends-RST predicate: a socket closed
@@ -336,8 +434,6 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 	}
 	for {
 		switch {
-		case e.timedOut.Load():
-			return 0, syscall.ETIMEDOUT
 		case isClosedChan(e.localDone):
 			return 0, io.ErrClosedPipe
 		case isClosedChan(e.rdDead.wait()):
@@ -379,12 +475,32 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		if eof {
 			return 0, io.EOF
 		}
+		// A retransmit-horizon death surfaces only after deliverable data and a
+		// delivered FIN (tcp_recvmsg reports pending data, then the socket
+		// error) — so a killed end still drains what the network carried.
+		if e.timedOut.Load() {
+			return 0, syscall.ETIMEDOUT
+		}
+		// A blocked read observing dying OUTBOUND bytes arms the watchdog — the
+		// spec's "blocked operation" surfacing: write-then-read into a permanent
+		// cut must fail at the horizon, not hang forever. Checked before EITHER
+		// block below: under a ONE-WAY outbound cut the inbound direction is
+		// live (cut=false), yet this end's held bytes still die — a real
+		// sender's ACKs never return through the cut. The any-cut gate keeps
+		// the common no-partition block lock-free.
+		if dstPartAnyCut() {
+			if outCutStart, outCut, _ := dstPartCutStartDir(e.localHost, e.peerHost); outCut && e.out.heldBeyond(outCutStart) {
+				e.armHorizon()
+			}
+		}
 		if cut {
 			// Arrived-before-cut bytes exhausted; anything else (in flight, written
 			// after the cut, or a not-yet-arrived FIN) is held. Block until heal, a
-			// deadline, or a local close.
+			// deadline, a local close, or the outbound retransmit horizon killing
+			// this end.
 			select {
 			case <-wake:
+			case <-e.horizonKill:
 			case <-e.localDone:
 			case <-e.rdDead.wait():
 			}
@@ -407,6 +523,13 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		select {
 		case <-e.in.ready:
 		case <-timerC:
+		case <-wake:
+			// A partition change while parked on a live link: re-evaluate, so a
+			// cut landing AFTER this read blocked still arms the outbound
+			// watchdog (the hoisted check above) instead of stranding the
+			// reader past the horizon. The wake channel is remade per change —
+			// one wakeup per fault op, no spin.
+		case <-e.horizonKill:
 		case <-e.localDone:
 		case <-e.rdDead.wait():
 		}
@@ -484,6 +607,8 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			select {
 			case <-e.out.space:
 			case <-wake: // partition began or healed: re-evaluate the horizon
+			case <-e.horizonKill:
+				return total, syscall.ETIMEDOUT
 			case <-horizonC:
 				e.timedOut.Store(true)
 				return total, syscall.ETIMEDOUT
@@ -528,6 +653,15 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 		total += int(room)
 		b = b[room:]
 		cutStart = -1 // progress: reset the cut window
+		if dstPartAnyCut() && dstPartitionedDir(e.localHost, e.peerHost) {
+			// The bytes just buffered are undeliverable: a real sender's
+			// retransmissions into the void exhaust at the horizon even though
+			// this write returned (TCP's async send). Arm the watchdog so the
+			// death surfaces on the blocked or a subsequent operation — a small
+			// write into a permanent cut never succeeds-and-forgets. The cheap
+			// any-cut gate keeps the un-partitioned fast path map-lookup-free.
+			e.armHorizon()
+		}
 	}
 	return total, nil
 }

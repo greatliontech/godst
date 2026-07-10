@@ -1,20 +1,12 @@
-# DST audit: net divergences from kernel shape (retransmit horizon, bind, backlog, close-RST)
+# DST audit: net divergences from kernel shape (bind, backlog, close-RST)
 
-Lands: chunks 20–23 of docs/plans/dst-audit-fixes.md (item 1 → 20, 3 → 21, 4 → 22, 5 → 23; item 2 landed in 19)
+Lands: chunks 21–23 of docs/plans/dst-audit-fixes.md (item 3 → 21, 4 → 22, 5 → 23; items 1–2 landed in chunks 20 and 19)
 
 ## Gap
 
 Severity M (full-surface audit, 2026-07-10; each reproduced). Kernel-shape
 divergences in the virtual wire, all in the false-negative direction (a SUT
 that keys on the real behavior is misled or a real failure is masked):
-
-1. **Retransmit horizon only arms on a full send buffer**
-   (`src/net/dst_wire.go:459-509`). A `Write` that fits in the 1 MiB buffer
-   never consults the partition; ten 2-byte writes over 10 virtual minutes into
-   a permanent `Partition(A,B)` produce zero errors. design.md (Retransmission
-   horizon): undeliverable bytes "error the connection with ETIMEDOUT … on the
-   blocked or subsequent operation … it never succeeds-and-forgets."
-   `TestDSTNetWriteHorizonTimesOut` pins only the buffer-full path.
 
 3. **`Dialer.LocalAddr` / ephemeral allocation ignores listener bindings**
    (`dstLocalBindInUse`, `src/net/dst_reset.go:104-121`; `dstAllocateListenPort`,
