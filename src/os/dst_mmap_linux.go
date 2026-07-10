@@ -137,9 +137,14 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	// enter() above holds dstFS.mu until leave(): node reads here are under the
 	// tree lock, and the registry lock nests inside it — the same order
 	// dstMunmap and the release paths use.
-	if offset > int64(len(file.node.data)) || int64(length) > int64(len(file.node.data))-offset {
-		return nil, syscall.EINVAL, true
-	}
+	//
+	// The window may extend past the file's end — a RESERVATION, the shape a
+	// database maps its data file with: pages wholly past EOF trap on access
+	// (the process dies, as under production SIGBUS) and become readable when
+	// the file grows over them, with no remapping. No bound is checked here:
+	// offset and length are each int64-bounded, so their uintptr sum cannot
+	// wrap on the 64-bit hosts mappings require, and a window the region
+	// cannot hold is the carve's deterministic ENOMEM below.
 
 	dstMMapRegistry.mu.Lock()
 	mprot := syscall.PROT_READ
@@ -147,10 +152,9 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		mprot |= syscall.PROT_WRITE
 	}
 	// The mapping starts at file offset 0 and runs to the end of the window the
-	// caller asked for; the caller's window is the tail of it. (Today the
-	// EINVAL gate above bounds the window to the file; when past-EOF mapping
-	// lands, the pages past the end are mapped but not backed and trap on
-	// access, as a reservation over a short file does in production.)
+	// caller asked for; the caller's window is the tail of it. Pages past the
+	// file's end are mapped but not backed: they trap on access, exactly as a
+	// reservation over a short file does in production.
 	mapLen := uintptr(offset) + uintptr(length)
 	mapBase := dstPageCacheMap(file.node.pc.fd, mapLen, int32(mprot))
 	if mapBase == 0 {
@@ -396,26 +400,4 @@ func dstMadvise(data []byte, advice int) (syscall.Errno, bool) {
 		return 0, true
 	}
 	return syscall.EINVAL, true
-}
-
-// dstMMapShrinkFencedLocked reports whether truncating node to size would cut
-// bytes out from under a live mapping. Real Linux keeps the pages mapped and
-// delivers SIGBUS on access wholly past the new EOF — an outcome the model
-// cannot produce (no VM) — and silently zero-filling instead would hand a DB
-// page reader zeros where production dies, masking exactly the torn-file bug
-// class DST hunts. So the shrink is fenced loudly (the unsupported shape);
-// growth and shrinks clear of every live mapping stay allowed. Caller holds
-// dstFS.mu.
-func dstMMapShrinkFencedLocked(node *dstFSNode, size int64) bool {
-	dstMMapRegistry.mu.Lock()
-	defer dstMMapRegistry.mu.Unlock()
-	dstMMapRollLocked()
-	for _, bucket := range dstMMapRegistry.maps {
-		for _, entry := range bucket {
-			if entry.node == node && entry.off+int64(len(entry.data)) > size {
-				return true
-			}
-		}
-	}
-	return false
 }

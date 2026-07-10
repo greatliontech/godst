@@ -6,10 +6,4 @@
 
 package os
 
-func dstMMapWriteLocked(node *dstFSNode, off int64, p []byte) {}
-
-func dstMMapSyncLocked(node *dstFSNode) {}
-
-func dstMMapShrinkFencedLocked(node *dstFSNode, size int64) bool { return false }
-
 func dstMMapReleaseHost(host uint32) {}

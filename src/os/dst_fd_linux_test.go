@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -935,8 +937,16 @@ func TestDSTFSVirtualFDMmapUnsupportedShapes(t *testing.T) {
 		if _, err := syscall.Mmap(fd, 1, 1, syscall.PROT_READ, syscall.MAP_SHARED); !errors.Is(err, syscall.EINVAL) {
 			t.Fatalf("unaligned Mmap = %v, want EINVAL", err)
 		}
-		if _, err := syscall.Mmap(fd, 0, 6, syscall.PROT_READ, syscall.MAP_SHARED); !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("past-EOF Mmap = %v, want EINVAL", err)
+		if b, err := syscall.Mmap(fd, 0, 6, syscall.PROT_READ, syscall.MAP_SHARED); err != nil {
+			t.Fatalf("past-EOF Mmap = %v, want a reservation (real mmap allows it)", err)
+		} else if err := syscall.Munmap(b); err != nil {
+			t.Fatalf("Munmap reservation: %v", err)
+		}
+		// A window whose end overflows int64 can never fit an address space:
+		// deterministic ENOMEM, never a small wrapped mapping that would hand
+		// back the wrong bytes.
+		if _, err := syscall.Mmap(fd, math.MaxInt64&^4095, 8192, syscall.PROT_READ, syscall.MAP_SHARED); !errors.Is(err, syscall.ENOMEM) {
+			t.Fatalf("overflowing Mmap = %v, want ENOMEM", err)
 		}
 		if _, err := syscall.Mmap(fd, 0, 5, syscall.PROT_WRITE, syscall.MAP_SHARED); !errors.Is(err, syscall.EACCES) {
 			t.Fatalf("writable Mmap = %v, want EACCES", err)
@@ -1973,3 +1983,134 @@ func TestDSTFSMprotectDowngradeIsEnforcedByHardware(t *testing.T) {
 		t.Errorf("Kill(victim, 0) = %v, want ESRCH", killErr)
 	}
 }
+
+// faultShapeInProcess runs touch inside a simulated process (with a recover
+// and SetPanicOnFault armed — the strongest survival attempt the language
+// affords) and reports whether the process died unswallowably while a peer
+// outlived it.
+func faultShapeInProcess(t *testing.T, setup func(t *testing.T) func(), check func(died, recovered, peerRan bool, killErr error)) {
+	t.Helper()
+	var recovered, past, peer bool
+	var victimPID int
+	var killErr error
+	simulation.Test(t, 1, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			touch := setup(t)
+			ready := make(chan int, 1)
+			go simulation.Process("victim", func() {
+				defer func() {
+					if r := recover(); r != nil {
+						recovered = true
+					}
+				}()
+				debug.SetPanicOnFault(true)
+				ready <- os.Getpid()
+				touch()
+				past = true
+			})
+			victimPID = <-ready
+			simulation.Process("peer", func() {
+				killErr = syscall.Kill(victimPID, 0)
+				peer = true
+			})
+		})
+	})
+	check(!past && killErr == syscall.ESRCH, recovered, peer, killErr)
+}
+
+// TestDSTFSMappingFaultShapes: the two shapes gmdb's pager performs on its hot
+// path, now behaving as the kernel behaves. A RESERVATION maps more than the
+// file holds — reads inside the file and inside its last partial page are
+// ordinary, a read from a page wholly past EOF is the process's death, and
+// growing the file makes the page readable with no remap. A SHRINK under the
+// live mapping cuts pages out from under it — the truncate succeeds, and it
+// is the later ACCESS that dies.
+func TestDSTFSMappingFaultShapes(t *testing.T) {
+	const page = 4096 // the SIMULATED page size; a coarser host is refused before any boundary matters
+	t.Run("reservation past EOF", func(t *testing.T) {
+		faultShapeInProcess(t,
+			func(t *testing.T) func() {
+				if err := os.WriteFile("/db", []byte("hdr"), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				f, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("OpenFile: %v", err)
+				}
+				b, err := syscall.Mmap(int(f.Fd()), 0, 4*page, syscall.PROT_READ, syscall.MAP_SHARED)
+				f.Close()
+				if err != nil {
+					t.Fatalf("reservation Mmap: %v", err)
+				}
+				if b[0] != 'h' || b[3] != 0 || b[page-1] != 0 {
+					t.Fatalf("file bytes and partial-page tail = %q %d %d, want 'h' 0 0", b[0], b[3], b[page-1])
+				}
+				// Grow the file over page 1: the page becomes readable through
+				// the SAME mapping — the reservation extends, no remap.
+				g, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				if _, err := g.WriteAt([]byte{7}, int64(page)); err != nil {
+					t.Fatalf("growth WriteAt: %v", err)
+				}
+				g.Close()
+				if b[page] != 7 {
+					t.Fatalf("grown page reads %d through the reservation, want 7", b[page])
+				}
+				return func() {
+					pcSinkOS.Store(uint32(b[2*page])) // wholly past EOF: SIGBUS
+				}
+			},
+			func(died, recovered, peerRan bool, killErr error) {
+				if !died {
+					t.Errorf("the process survived a read from a reservation page past EOF")
+				}
+				if recovered {
+					t.Errorf("the process recovered from a fault production delivers as SIGBUS")
+				}
+				if !peerRan {
+					t.Errorf("the peer did not run")
+				}
+			})
+	})
+	t.Run("shrink under live mapping", func(t *testing.T) {
+		faultShapeInProcess(t,
+			func(t *testing.T) func() {
+				if err := os.WriteFile("/db", make([]byte, 2*page), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				f, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("OpenFile: %v", err)
+				}
+				b, err := syscall.Mmap(int(f.Fd()), 0, 2*page, syscall.PROT_READ, syscall.MAP_SHARED)
+				f.Close()
+				if err != nil {
+					t.Fatalf("Mmap: %v", err)
+				}
+				if err := os.Truncate("/db", int64(page)); err != nil {
+					t.Fatalf("shrink under live mapping: %v", err)
+				}
+				pcSinkOS.Store(uint32(b[0])) // within the file: fine
+				return func() {
+					pcSinkOS.Store(uint32(b[page])) // cut away: SIGBUS
+				}
+			},
+			func(died, recovered, peerRan bool, killErr error) {
+				if !died {
+					t.Errorf("the process survived a read from a page the truncate cut away")
+				}
+				if recovered {
+					t.Errorf("the process recovered from a fault production delivers as SIGBUS")
+				}
+				if !peerRan {
+					t.Errorf("the peer did not run")
+				}
+			})
+	})
+}
+
+// pcSinkOS keeps a load from being optimized away: an elided load is an
+// elided fault, and the test would pass for the wrong reason.
+var pcSinkOS atomic.Uint32

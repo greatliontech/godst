@@ -792,13 +792,11 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 }
 
 // truncateLocked clamps or zero-extends current content. Caller holds
-// dstFS.mu. Shared by handle and named truncate. Fails with the unsupported
-// shape when the shrink would cut bytes under a live mapping (see
-// dstMMapShrinkFencedLocked); callers must not have mutated anything first.
+// dstFS.mu. Shared by handle and named truncate. A shrink under a live
+// mapping is ordinary: the cut pages trap on access from then on (the
+// process dies, as under production SIGBUS) and the partial page's tail
+// zeroes — ftruncate semantics, which the page cache provides directly.
 func (node *dstFSNode) truncateLocked(size int64) error {
-	if dstMMapShrinkFencedLocked(node, size) {
-		return dstErrUnsupportedFS
-	}
 	dstNodeSetSizeLocked(node, size)
 	node.modTime = time.Now()
 	return nil

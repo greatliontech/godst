@@ -10,7 +10,6 @@ import (
 	"errors"
 	"math"
 	"os"
-	"strings"
 	"syscall"
 	"testing"
 	"testing/simulation"
@@ -92,14 +91,23 @@ func TestDSTFSVirtualFDFstatIdentity(t *testing.T) {
 	})
 }
 
-// TestDSTFSTruncateShrinkUnderLiveMappingFenced: shrinking a file under a live
-// overlapping mapping is fenced loudly (real Linux SIGBUSes access past the
-// new EOF — an outcome the model cannot produce; zero-filling would mask the
-// torn-file bug class). Growth stays allowed, a disjoint shrink stays allowed,
-// and once the mapping is gone the shrink succeeds.
-func TestDSTFSTruncateShrinkUnderLiveMappingFenced(t *testing.T) {
+// TestDSTFSTruncateShrinkUnderLiveMapping: shrinking a file under a live
+// mapping is ordinary ftruncate semantics — every entry point (Truncate by
+// name, by handle, and O_TRUNC) succeeds, bytes within the new end stay
+// readable through the mapping, the partial page's tail zeroes, a whole cut
+// page reads zero after a re-growth (never the dropped bytes), and the
+// access-side death is pinned by TestDSTFSMappingFaultShapes. The last
+// partial page behaves as the kernel page cache: a tail write through a
+// writable mapping is visible, and growth exposes it as file content (tmpfs
+// semantics — recorded in the spec as non-portable and undurable).
+func TestDSTFSTruncateShrinkUnderLiveMapping(t *testing.T) {
+	const page = 4096 // the simulated page size
 	simulation.Run(1, func() {
-		if err := os.WriteFile("/m", make([]byte, 8), 0o644); err != nil {
+		content := make([]byte, 2*page)
+		for i := range content {
+			content[i] = 'x'
+		}
+		if err := os.WriteFile("/m", content, 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
 		f, err := os.OpenFile("/m", os.O_RDWR, 0)
@@ -107,34 +115,63 @@ func TestDSTFSTruncateShrinkUnderLiveMappingFenced(t *testing.T) {
 			t.Fatalf("OpenFile: %v", err)
 		}
 		defer f.Close()
-		b, err := syscall.Mmap(int(f.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		b, err := syscall.Mmap(int(f.Fd()), 0, 2*page, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 		if err != nil {
 			t.Fatalf("Mmap: %v", err)
 		}
-		fenced := func(err error) {
-			t.Helper()
-			if err == nil || !strings.Contains(err.Error(), "unsupported under deterministic simulation") {
-				t.Fatalf("shrink under live mapping = %v, want unsupported-under-simulation", err)
-			}
+		defer syscall.Munmap(b)
+
+		// Shrink by name, mid-page: succeeds under the live mapping.
+		if err := os.Truncate("/m", page/2); err != nil {
+			t.Fatalf("shrink under live mapping = %v, want success", err)
 		}
-		fenced(os.Truncate("/m", 4))
-		fenced(f.Truncate(4))
-		_, openErr := os.OpenFile("/m", os.O_RDWR|os.O_TRUNC, 0)
-		fenced(openErr)
-		if err := f.Truncate(16); err != nil {
-			t.Fatalf("grow under mapping: %v", err)
+		if b[0] != 'x' || b[page/2-1] != 'x' {
+			t.Fatalf("bytes within the new end changed: %q %q", b[0], b[page/2-1])
 		}
-		if err := f.Truncate(8); err != nil {
-			t.Fatalf("shrink back to mapping end: %v", err)
+		if b[page/2] != 0 || b[page-1] != 0 {
+			t.Fatalf("partial-page tail = %d %d, want zeros (truncate zeroes it)", b[page/2], b[page-1])
 		}
-		if got, _, _, _, _, _, ok := os.DSTFSNodeState("/m"); !ok || len(got) != 8 {
-			t.Fatalf("post-shrink length = %d ok=%v, want 8 true", len(got), ok)
+
+		// A tail write through the mapping is visible, and growth exposes it
+		// as file content — the kernel page cache's (tmpfs) semantics.
+		b[page/2] = 'T'
+		if err := f.Truncate(page); err != nil {
+			t.Fatalf("grow by handle: %v", err)
 		}
-		if err := syscall.Munmap(b); err != nil {
-			t.Fatalf("Munmap: %v", err)
+		got, err := os.ReadFile("/m")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
 		}
-		if err := os.Truncate("/m", 4); err != nil {
-			t.Fatalf("shrink after Munmap: %v", err)
+		if got[page/2] != 'T' {
+			t.Fatalf("grown file byte = %q, want the tail write 'T' (page-cache semantics)", got[page/2])
+		}
+
+		// Re-grow over the WHOLE cut page: it reads zero, not the dropped 'x's.
+		if err := f.Truncate(2 * page); err != nil {
+			t.Fatalf("regrow: %v", err)
+		}
+		if b[page] != 0 || b[2*page-1] != 0 {
+			t.Fatalf("re-grown page = %d %d, want zeros: the shrink dropped these bytes", b[page], b[2*page-1])
+		}
+
+		// Mprotect over a window that spans past EOF (reservation pages) is
+		// legal: protection applies to the mapping, not the file's length.
+		if err := os.Truncate("/m", page); err != nil {
+			t.Fatalf("shrink for mprotect: %v", err)
+		}
+		if err := syscall.Mprotect(b, syscall.PROT_READ); err != nil {
+			t.Fatalf("Mprotect spanning past EOF = %v, want success", err)
+		}
+
+		// O_TRUNC is the third entry point: truncates to zero under the live
+		// mapping — the whole mapping is past EOF afterward.
+		g, err := os.OpenFile("/m", os.O_RDWR|os.O_TRUNC, 0)
+		if err != nil {
+			t.Fatalf("O_TRUNC under live mapping = %v, want success", err)
+		}
+		g.Close()
+		if got, _, _, _, _, _, ok := os.DSTFSNodeState("/m"); !ok || len(got) != 0 {
+			t.Fatalf("post-O_TRUNC length = %d ok=%v, want 0 true", len(got), ok)
 		}
 	})
 }

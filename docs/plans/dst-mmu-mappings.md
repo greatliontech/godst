@@ -64,7 +64,7 @@ is attributed to a process, and the simulated page size stays 4096.
       `!canpanic()` never reaches `sigpanic` and would abort the harness.
       Capability limits (region exhaustion outside `mmap`) are unswallowable
       fatals; handles from a dead run are refused by an epoch gate.
-- [ ] 3. The two divergences die. Mapping past EOF is allowed (a reservation);
+- [x] 3. The two divergences die. Mapping past EOF is allowed (a reservation);
       access past EOF faults. Truncate-shrink under a live mapping is allowed;
       access to the cut pages faults. Remove the `EINVAL` and
       `dstMMapShrinkFencedLocked`. Re-anchor the tests that pinned the old

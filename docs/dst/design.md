@@ -584,12 +584,20 @@ taking back the region in one stroke. Attempts to create writable private mappin
 required fd access mode, or unmap only a subrange fail deterministically. Offsets validate against a
 **fixed simulated page size of 4096** — never the host's page geometry, which is machine state (every
 16K-aligned offset is also 4K-aligned, so host-derived offsets stay valid; the host MMU enforces at its
-own page size, which the 4096 floor guarantees is never coarser) — and mapping past EOF is `EINVAL` (a
-recorded divergence: real mmap allows it, delivering SIGBUS on access to pages wholly past EOF; the model
-can now produce that outcome, and the divergence is scheduled to be removed). Likewise **truncating a
-file to a smaller size under a live overlapping mapping is fenced** (recorded divergence, same removal
-path): real Linux keeps the pages mapped and SIGBUSes access past the new EOF. Growth and shrinks clear
-of every live mapping stay allowed. `Mprotect` and `Madvise` on a subrange whose file offset is not
+own page size, which the 4096 floor guarantees is never coarser). **A mapping may be a reservation**:
+mapping past EOF is ordinary, an access to a page wholly past EOF is the simulated process's death, and
+growing the file makes the grown pages readable through every existing reservation with no remapping —
+the shape a database maps its data file with. The file's last partial page behaves as the kernel's page
+cache does: its untouched tail reads zeros, a write to the tail through a writable mapping is visible to
+every mapping, and if the file grows over it the tail bytes become file content — tmpfs semantics, one
+real Linux behavior, but one POSIX leaves unspecified (a disk filesystem may zero the tail on writeback),
+so portable code must not rely on tail-write survival; the bytes are in any case as undurable as every
+unsynced write. **Truncating a file under a live mapping is ordinary ftruncate semantics**: the call
+succeeds whatever mappings exist; the cut pages trap on later access (the process dies, as under
+production SIGBUS), the partial page's tail zeroes, and bytes a shrink dropped never resurface through a
+re-growth. The mapping region is also the model's capability ceiling: a file size or mapping set the
+region cannot hold (2^40 bytes on the wide architectures, per-run, views and reservations together) is a
+loud deterministic refusal — a harness limit stated here so it is never mistaken for a modeled errno. `Mprotect` and `Madvise` on a subrange whose file offset is not
 4096-aligned are `EINVAL` (the deterministic analog of the kernel's page-aligned-address requirement).
 Process teardown unmaps the victim process's mappings — no write-back exists or is needed, since the
 bytes were the page cache's all along, visible to survivors and to a restart; a HOST crash instead
