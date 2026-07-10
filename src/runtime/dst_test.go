@@ -749,6 +749,23 @@ func TestDSTGCSysstackAlloc(t *testing.T) {
 	}
 }
 
+// TestDSTMemfdFDIsolation: the harness's page-cache memfds are invisible in
+// the simulated fd namespace — a bubble goroutine gets exactly EBADF for
+// them on every fenced surface (named wrappers via Syscall, Pread via
+// Syscall6, RawSyscall — all bottoming out in the trampolines' single
+// chokepoint), a daemonize-style close sweep is the harmless loop it is in
+// production, and resizes and reads of the open simulated file keep working.
+// Mutation: dropping the trampoline check fails at the white-box probe
+// ("got nil, want EBADF" — the probe's own close then host-closes the
+// memfd); dropping the registration prints "no page-cache fd found";
+// answering success instead of EBADF fails the probes on the exact value.
+func TestDSTMemfdFDIsolation(t *testing.T) {
+	out := runTestProgDST(t, "DSTMemfdFDIsolation", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("page-cache fds reachable from the simulated process (got %q, want \"done\")", out)
+	}
+}
+
 // TestDSTGCForeignStart: a DST-armed cycle is STARTED only inside the
 // bubble-allocation gate. The prog holds the bubble's live set above
 // Options.MemoryLimit (trigger condition persistently true) and churns a

@@ -57,6 +57,28 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
 	return dstSyscallVirtualFDArchTrap(trap)
 }
 
+// dstSyscallPageCacheFDTrap reports whether an allowlisted fd-carrying trap
+// names a live harness page-cache descriptor. Those fds are INVISIBLE in the
+// simulated fd namespace: the caller answers EBADF — exactly what a fd the
+// SUT never opened would get — never a panic, because sweeping unknown fd
+// numbers with close is legal production shape (daemonize), and never host
+// I/O, because a passed-through close would kill a live file's cache (fatal
+// at the next resize or mmap) and a freed number reused by a later
+// memfd_create would silently alias another file's bytes.
+//
+//go:nosplit
+func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool {
+	if !dstPageCacheFDReserved(fd) {
+		return false
+	}
+	switch trap {
+	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
+		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
+		return true
+	}
+	return dstSyscallVirtualFDArchTrap(trap)
+}
+
 // dstSyscallMintingFcntl reports whether an allowlisted raw fcntl carries a
 // descriptor-MINTING command: F_DUPFD/F_DUPFD_CLOEXEC duplicate a host fd — a
 // minted host resource, the class the interception boundary refuses — while

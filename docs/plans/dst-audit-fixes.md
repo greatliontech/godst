@@ -40,7 +40,7 @@ Audit reproducers (ephemeral, from the audit session):
   standard refusal, non-bubble callers fall through. The 386 fence test
   exercises the `syscall.Socket` wrapper path, not only the raw trampoline.
   (dst-audit-socketcall-fence)
-- [ ] 6. harness page-cache memfds are unreachable from the SUT-visible fd
+- [x] 6. harness page-cache memfds are unreachable from the SUT-visible fd
   number space: reserved range refused at the syscall boundary, or bubble
   `close` of a page-cache fd is EBADF/no-op. Test: close-loop over low fd
   numbers, then a resize and an mmap. (dst-audit-memfd-fd-space)

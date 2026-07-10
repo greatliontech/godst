@@ -21,7 +21,6 @@ chunk(s) there.
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
 | [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |
 | [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
-| [page-cache memfds killable by SUT close](./dst-audit-memfd-fd-space.md) | M | chunk 6 |
 | [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 19–23 |
 | [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | chunk 12 |
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
@@ -37,3 +36,4 @@ Found during plan execution:
 | [sizespecializedmalloc experiment bypasses the GC trigger](./dst-gc-sizespecialized-experiment.md) | M | combo supported or refused at a testable level |
 | [foreign runtime.GC() shifts the trigger stream](./dst-gc-foreign-runtime-gc.md) | M | foreign GC cannot perturb the bubble's accounting, or fails loudly |
 | [overdue ticker crossing DriftClock has a phase error](./dst-clock-overdue-ticker-phase.md) | M | backwards remap honors the spec formula's negative remainder, sentinel-safe |
+| [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |

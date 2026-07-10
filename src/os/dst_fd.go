@@ -206,6 +206,11 @@ func dstDropClosedNode(backend dstFileBackend) {
 
 func dstFDLookup(fd int) (entry dstFDEntry, handled bool, errno syscall.Errno) {
 	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
+		// Harness page-cache fds need no gate here: a non-virtual fd falls
+		// through to the host wrappers, which bottom out in the fenced
+		// Syscall/RawSyscall trampolines — the single chokepoint that answers
+		// EBADF for a bubble goroutine naming a page-cache fd
+		// (dstSyscallPageCacheFDTrap).
 		return dstFDEntry{}, false, 0
 	}
 	if !dstFSActive() {

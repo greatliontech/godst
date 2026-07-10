@@ -25,6 +25,13 @@ const dstSimFenced = true
 //go:linkname dstFenceActive runtime.dstFenceActive
 func dstFenceActive() bool
 
+// dstPageCacheFDReserved reports whether fd is a live harness page-cache
+// descriptor (see runtime.dstPageCacheFDReserved). Nosplit, alloc-free and
+// lock-free, callable from the raw trampolines like dstFenceActive.
+//
+//go:linkname dstPageCacheFDReserved runtime.dstPageCacheFDReserved
+func dstPageCacheFDReserved(fd uintptr) bool
+
 // dstErrUnsupported is the refusal for fenced entry points whose signature
 // carries an error channel (process spawn, exec) — the standard "unsupported
 // under deterministic simulation" shape, mirroring os's simulated-filesystem

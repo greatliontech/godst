@@ -240,17 +240,87 @@ func dstPageCacheResetRegion() {
 	dstSpans.Store(nil)
 }
 
+// dstPageCacheFDs is an atomically-published bitmap of live page-cache fd
+// numbers, indexed by fd. The simulated process must not be able to reach
+// these descriptors: the syscall boundary consults dstPageCacheFDReserved and
+// answers EBADF for a bubble goroutine, exactly as for a fd the SUT never
+// opened — a passed-through close would kill a live file's cache (fatal at
+// the next resize or mmap), and a freed number reused by a later memfd_create
+// would silently alias another file's bytes. Readers are lock-free (atomic
+// pointer load + atomic word load) and nosplit-safe: the raw syscall boundary
+// runs without a P. Writers serialize on dstPageCacheFDLock, and the
+// memfd_create/closefd syscalls happen INSIDE that lock together with the bit
+// flip: holding a runtime mutex (m.locks > 0) suppresses cooperative
+// preemption, so no other goroutine can run — and sweep-close an
+// unregistered newborn memfd, or catch the gap between unregister and the
+// host close — while a descriptor exists in one state but is recorded in the
+// other.
+var dstPageCacheFDs atomic.Pointer[dstPageCacheFDSet]
+var dstPageCacheFDLock mutex
+
+type dstPageCacheFDSet struct {
+	words []uint32
+}
+
+// dstPageCacheFDRegisterLocked flips fd's reserved bit. Caller holds
+// dstPageCacheFDLock. The in-lock make is sound: gcStart and gcAssistAlloc
+// both bail while m.locks > 0.
+func dstPageCacheFDRegisterLocked(fd int32, on bool) {
+	set := dstPageCacheFDs.Load()
+	w := uint(fd) >> 5
+	if set == nil || w >= uint(len(set.words)) {
+		if !on {
+			return
+		}
+		grown := &dstPageCacheFDSet{words: make([]uint32, (w+1)*2)}
+		if set != nil {
+			copy(grown.words, set.words)
+		}
+		dstPageCacheFDs.Store(grown)
+		set = grown
+	}
+	if on {
+		atomic.Or32(&set.words[w], 1<<(uint(fd)&31))
+	} else {
+		atomic.And32(&set.words[w], ^uint32(1<<(uint(fd)&31)))
+	}
+}
+
+// dstPageCacheFDReserved reports whether fd is a live harness page-cache
+// descriptor. Called from the syscall package's fence boundary via linkname;
+// nosplit and allocation-free (the raw boundary runs without a P).
+//
+//go:linkname dstPageCacheFDReserved
+//go:nosplit
+func dstPageCacheFDReserved(fd uintptr) bool {
+	set := dstPageCacheFDs.Load()
+	if set == nil {
+		return false
+	}
+	w := fd >> 5
+	if w >= uintptr(len(set.words)) {
+		return false
+	}
+	return atomic.Load(&set.words[w])&(1<<(fd&31)) != 0
+}
+
 // dstPageCacheNew creates an empty page cache. The descriptor is the harness's,
-// never the simulated process's: no simulated file descriptor ever names it.
+// never the simulated process's: no simulated file descriptor ever names it,
+// and it is registered as reserved so the simulated process cannot reach it
+// through the raw or named syscall surfaces.
 //
 //go:linkname dstPageCacheNew
 func dstPageCacheNew() int32 {
 	dstPageCacheCheckHost()
+	lock(&dstPageCacheFDLock)
 	fd, _, errno := linux.Syscall6(dstSysMemfdCreate,
 		uintptr(unsafe.Pointer(&dstMemfdName[0])), _MFD_CLOEXEC, 0, 0, 0, 0)
 	if errno != 0 {
+		unlock(&dstPageCacheFDLock)
 		throw("dst: page cache creation failed")
 	}
+	dstPageCacheFDRegisterLocked(int32(fd), true)
+	unlock(&dstPageCacheFDLock)
 	return int32(fd)
 }
 
@@ -327,7 +397,14 @@ func dstPageCacheUnmap(base, n uintptr, state uint8) {
 
 //go:linkname dstPageCacheClose
 func dstPageCacheClose(fd int32) {
+	// Unregister and close under one lock hold (no preemption window between
+	// them), unregister first: after closefd the number is free for reuse by
+	// any host allocation, and a stale reserved bit would make an unrelated
+	// new fd invisible to the simulated process.
+	lock(&dstPageCacheFDLock)
+	dstPageCacheFDRegisterLocked(fd, false)
 	closefd(fd)
+	unlock(&dstPageCacheFDLock)
 }
 
 // dstPageCacheProtect changes a live mapping's protection in place: the

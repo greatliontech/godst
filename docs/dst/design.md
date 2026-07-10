@@ -770,7 +770,15 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   virtual-fd paragraph in the filesystem section); selected split-safe named
   Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
-  dispatch them to the simulated backend. Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
+  dispatch them to the simulated backend. The harness's own page-cache descriptors (the memfds
+  backing simulated files) are **invisible in the simulated fd namespace**: a bubble goroutine's
+  allowlisted fd operation naming one answers `EBADF` at the trampolines — exactly what a fd the
+  process never opened would get, so the daemonize-style close sweep stays the harmless loop it is
+  in production — never host I/O, which would kill a live file's cache (fatal at the next resize or
+  mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
+  page cache admits (32-bit hosts are refused before any memfd exists), every named fd wrapper
+  bottoms out in the same trampolines, so one chokepoint covers both surfaces; non-bubble callers
+  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
   `CLOCK_BOOTTIME` is also selected and split-safe — at the 32-bit-time trap on every arch AND the
   time64 trap (`clock_gettime64`, `__kernel_timespec`) on the 32-bit arches that have one: it
   returns the DST virtual base clock, and

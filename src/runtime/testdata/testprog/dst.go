@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing/simulation"
 	"time"
 	_ "unsafe" // for go:linkname
@@ -65,6 +66,7 @@ func init() {
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTGCForeignStart", DSTGCForeignStart)
 	register("DSTGCSysstackAlloc", DSTGCSysstackAlloc)
+	register("DSTMemfdFDIsolation", DSTMemfdFDIsolation)
 	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
 	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
 	register("DSTOvfFlushAtDeactivate", DSTOvfFlushAtDeactivate)
@@ -1139,6 +1141,98 @@ func DSTGCSysstackAlloc() {
 	os.Stdout.WriteString("done\n")
 }
 
+func errStr(err error) string {
+	if err == nil {
+		return "nil"
+	}
+	return err.Error()
+}
+
+// DSTMemfdFDIsolation: the classic daemonize idiom — sweeping low fd numbers
+// with close, a harmless EBADF loop in production — from a bubble goroutine
+// must not reach the harness's page-cache memfds: they are invisible in the
+// simulated fd namespace (EBADF, like any fd the process never opened), on
+// the named-wrapper path AND the raw-trampoline path. Under the bug the sweep
+// closed the memfd backing an open simulated file and the next Truncate died
+// "fatal error: dst: page cache resize failed" (or a reused number silently
+// aliased another file's bytes). The file created BEFORE the sweeps pins the
+// memfd inside the swept range. Prints "done".
+func DSTMemfdFDIsolation() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	simulation.Run(n, func() {
+		f, err := os.Create("/tmp/swept")
+		if err != nil {
+			os.Stdout.WriteString("create: " + err.Error() + "\n")
+			return
+		}
+		defer f.Close()
+		payload := make([]byte, 8<<10)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+		if _, err := f.Write(payload); err != nil {
+			os.Stdout.WriteString("write: " + err.Error() + "\n")
+			return
+		}
+		// White-box: find the open file's memfd and pin the exact refusal
+		// shape on all three fenced surfaces — EBADF, indistinguishable from
+		// a fd the process never opened, never silent success.
+		memfd := -1
+		for fd := 3; fd < 64; fd++ {
+			if dstPageCacheFDReservedFP(uintptr(fd)) {
+				memfd = fd
+				break
+			}
+		}
+		if memfd < 0 {
+			os.Stdout.WriteString("no page-cache fd found in the swept range\n")
+			return
+		}
+		if err := syscall.Close(memfd); err != syscall.EBADF { // named path (Syscall)
+			os.Stdout.WriteString("named close of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
+			return
+		}
+		var one [1]byte
+		if _, err := syscall.Pread(memfd, one[:], 0); err != syscall.EBADF { // Syscall6 path
+			os.Stdout.WriteString("pread of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
+			return
+		}
+		if _, _, errno := syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(memfd), 0, 0); errno != syscall.EBADF { // raw path
+			os.Stdout.WriteString("raw close of the page-cache fd: got " + errStr(errno) + ", want EBADF\n")
+			return
+		}
+		for fd := 3; fd < 64; fd++ { // named-wrapper sweep
+			syscall.Close(fd)
+		}
+		if err := f.Truncate(64 << 10); err != nil { // memfd resize: fatal if swept
+			os.Stdout.WriteString("truncate after named sweep: " + err.Error() + "\n")
+			return
+		}
+		for fd := 3; fd < 64; fd++ { // raw-trampoline sweep
+			syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(fd), 0, 0)
+		}
+		// 128 KiB exceeds the page cache's minimum view reservation, so this
+		// resize also forces a fresh mmap of the memfd (the issue's mmap
+		// leg) — fatal, not just an error, if the fd was swept.
+		if err := f.Truncate(128 << 10); err != nil {
+			os.Stdout.WriteString("truncate after raw sweep: " + err.Error() + "\n")
+			return
+		}
+		check := make([]byte, len(payload))
+		if _, err := f.ReadAt(check, 0); err != nil {
+			os.Stdout.WriteString("readback: " + err.Error() + "\n")
+			return
+		}
+		for i := range check {
+			if check[i] != payload[i] {
+				os.Stdout.WriteString("payload corrupted after sweeps\n")
+				return
+			}
+		}
+		os.Stdout.WriteString("done\n")
+	})
+}
+
 // DSTGCForeignStart: DST cycle STARTS are confined to the bubble-allocation
 // gate. With the bubble's live set held above Options.MemoryLimit the trigger
 // condition is persistently true, so every bubble allocation starts a
@@ -1194,7 +1288,7 @@ func DSTGCForeignStart() {
 		for range ping {
 			dstOutsideTiny = new(int32)
 			dstOutsideAllocSink = make([]byte, 8<<10)
-			dstOutsidePtrs = make([]*int32, 32) // <=512B pointerful: the no-header scan path
+			dstOutsidePtrs = make([]*int32, 32)  // <=512B pointerful: the no-header scan path
 			dstOutsidePtrs = make([]*int32, 512) // >512B pointerful: the header scan path
 			dstOutsideAllocSink = make([]byte, 1<<20)
 		}
