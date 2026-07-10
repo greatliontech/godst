@@ -10,7 +10,6 @@ import (
 	"cmp"
 	"internal/poll"
 	"io"
-	"math"
 	"path"
 	"runtime"
 	"slices"
@@ -1333,7 +1332,8 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 // skipped the growth and indexed past the slice instead.
 func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 	node := d.node
-	if off > int64(math.MaxInt64)-int64(len(b)) {
+	const maxInt64 = 1<<63 - 1
+	if off > maxInt64-int64(len(b)) {
 		return 0, syscall.EFBIG
 	}
 	if need := off + int64(len(b)); need > int64(len(node.data)) {
