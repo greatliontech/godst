@@ -74,7 +74,7 @@ Audit reproducers (ephemeral, from the audit session):
   2026-07-10). Also removes the dead `dstMMapEntry.seq` and its stale
   tie-breaking comment. (dst-audit-mprotect-fidelity;
   dst-audit-low-fidelity-cluster, seq nit)
-- [ ] 13. lseek on a directory fd at a nonzero offset is permitted, as Linux
+- [x] 13. lseek on a directory fd at a nonzero offset is permitted, as Linux
   permits. (dst-audit-low-fidelity-cluster)
 - [ ] 14. a blocked flock waiter whose fd is closed elsewhere wakes to the
   grant Linux gives, not EBADF. (dst-audit-low-fidelity-cluster)

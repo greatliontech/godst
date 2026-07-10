@@ -29,9 +29,6 @@ verified, none blocking:
   `dstFDFstat` branch would report `Dev = host+1`, not zero
   (dst_fd_stat_linux.go:42-44). Spec-vs-code contradiction.
 
-- **Directory `Seek` at nonzero returns EISDIR** (dst_fs.go:1369-1372); Linux
-  permits lseek on a directory fd.
-
 - **16K-page / VA-39 hosts refused at first file creation, not first mapping.**
   `dstPageCacheCheckHost` runs in `dstPageCacheNew` at every regular-file
   creation (dst_pagecache_linux.go:162-169; os/dst_pagecache_linux.go:93), so

@@ -1413,9 +1413,17 @@ func (d *dstFile) seek(offset int64, whence int) (int64, error) {
 	case io.SeekStart:
 		base = 0
 	case io.SeekCurrent:
-		base = d.off
+		if d.node.isDir {
+			base = int64(d.dirpos) // the telldir idiom: lseek(fd, 0, SEEK_CUR) reads the cookie
+		} else {
+			base = d.off
+		}
 	case io.SeekEnd:
-		base = int64(len(d.node.data))
+		if d.node.isDir {
+			base = int64(len(d.node.entries)) // the cookie space's end: the entry count
+		} else {
+			base = int64(len(d.node.data))
+		}
 	default:
 		return 0, syscall.EINVAL
 	}
@@ -1424,11 +1432,20 @@ func (d *dstFile) seek(offset int64, whence int) (int64, error) {
 		return 0, syscall.EINVAL
 	}
 	if d.node.isDir {
-		if pos != 0 {
-			return 0, syscall.EISDIR
+		// lseek on a directory fd is permitted at any offset, as Linux
+		// permits: the offset is an opaque readdir cookie — here the
+		// sorted-name index, the deterministic listing order the spec
+		// promises — and getdents resumes there (readDirLocked clamps a
+		// past-end position). Rewinding to 0 restarts the listing, the
+		// rewinddir shape. The stored cursor clamps to the int range so a
+		// 32-bit host cannot wrap it negative; the clamp is invisible (any
+		// cookie past the entry count lists nothing).
+		cookie := pos
+		if maxInt := int64(^uint(0) >> 1); cookie > maxInt {
+			cookie = maxInt
 		}
-		d.dirpos = 0
-		return 0, nil
+		d.dirpos = int(cookie)
+		return pos, nil
 	}
 	d.off = pos
 	return pos, nil

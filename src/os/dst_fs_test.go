@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1729,6 +1730,61 @@ func TestDSTRootLeakedAcrossRuns(t *testing.T) {
 		}
 		if _, err := leakedFile.Read(make([]byte, 4)); err == nil {
 			t.Error("leaked root-minted File read from a dead run")
+		}
+	})
+}
+
+// TestDSTFSDirectorySeek: lseek on a directory fd is permitted at any
+// offset, as Linux permits — the offset is an opaque readdir cookie (the
+// deterministic sorted-name index here): seeking resumes the listing there,
+// and seeking to 0 restarts it (the rewinddir shape).
+func TestDSTFSDirectorySeek(t *testing.T) {
+	simulation.Run(1, func() {
+		for _, name := range []string{"a", "b", "c", "d"} {
+			if err := os.WriteFile("/"+name, nil, 0o644); err != nil {
+				t.Fatalf("WriteFile %s: %v", name, err)
+			}
+		}
+		dir, err := os.Open("/")
+		if err != nil {
+			t.Fatalf("Open /: %v", err)
+		}
+		defer dir.Close()
+		all, err := dir.Readdirnames(-1) // the full sorted listing, no hardcoded tree
+		if err != nil {
+			t.Fatalf("Readdirnames: %v", err)
+		}
+		if pos, err := dir.Seek(2, io.SeekStart); pos != 2 || err != nil {
+			t.Fatalf("Seek(2) on a directory = %d, %v; want 2, nil (Linux permits lseek on a directory fd)", pos, err)
+		}
+		// telldir: SEEK_CUR reads the cookie without moving it.
+		if pos, err := dir.Seek(0, io.SeekCurrent); pos != 2 || err != nil {
+			t.Fatalf("telldir Seek(0, CUR) = %d, %v; want 2, nil", pos, err)
+		}
+		names, err := dir.Readdirnames(-1)
+		if err != nil {
+			t.Fatalf("Readdirnames after seek: %v", err)
+		}
+		if !slices.Equal(names, all[2:]) {
+			t.Fatalf("listing after Seek(2) = %v, want %v", names, all[2:])
+		}
+		// SEEK_END: the cookie space ends at the entry count — the listing
+		// from there is empty.
+		if pos, err := dir.Seek(0, io.SeekEnd); pos != int64(len(all)) || err != nil {
+			t.Fatalf("Seek(0, END) = %d, %v; want %d, nil", pos, err, len(all))
+		}
+		if names, err := dir.Readdirnames(-1); (err != nil && err != io.EOF) || len(names) != 0 {
+			t.Fatalf("listing at END = %v, %v; want empty", names, err)
+		}
+		if pos, err := dir.Seek(0, io.SeekStart); pos != 0 || err != nil {
+			t.Fatalf("rewind Seek(0) = %d, %v; want 0, nil", pos, err)
+		}
+		names, err = dir.Readdirnames(-1)
+		if err != nil {
+			t.Fatalf("Readdirnames after rewind: %v", err)
+		}
+		if !slices.Equal(names, all) {
+			t.Fatalf("listing after rewind = %v, want %v", names, all)
 		}
 	})
 }
