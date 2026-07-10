@@ -998,9 +998,10 @@ The runtime substrate and the **I/O surface** are **landed**: the per-g RNG + sc
 Seq 5), the `testing/simulation` API, and — beyond the original sequence — deterministic process
 identity, crypto/rand, GC, memory bounding, a hardening pass, the in-memory filesystem and network,
 and the **interception boundary** (raw syscalls, processes, signals, `os.Executable`, cgo, and the
-per-process environment) — each documented in its own section. The remaining work is the
-**fault-orchestration** layer (crash/restart, OOM kill, scheduling stragglers, seeded drift — the
-one ⏳ row of the source table, see [faults.md](./faults.md)). Each step respects the fixed seams, so
+per-process environment), and the fault axes over them (net, disk, clock, process crash + restart, host
+crash + reboot, crash tear) — each documented in its own section. The remaining work is the
+**fault-orchestration** layer's remaining axes and its declarative surface (OOM kill, scheduling
+stragglers — the one ⏳ row of the source table, see [faults.md](./faults.md)). Each step respects the fixed seams, so
 later steps add, never rewrite.
 
 > Note: Seq 1a/1b originally enabled DST via `GODEBUG=dstseed`; that was pivoted to the public
@@ -1112,7 +1113,8 @@ later steps add, never rewrite.
 ### Pending features
 
 With the three I/O axes landed (network, disk, pipes), one feature remains: layering fault
-injection on top of the virtualized substrate.
+injection on top of the virtualized substrate. Most of its axes are landed (see the source table); the
+open work is the OOM and scheduling faults and the declarative orchestration layer.
 
 - **Fault orchestration** — compose scheduling, network, disk, clock, OOM, and crash/restart faults under
   one seed, with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound);
@@ -1120,7 +1122,10 @@ injection on top of the virtualized substrate.
   host, memory isolated at the process). **Contract settled** in [faults.md](./faults.md) (every axis +
   the shared contract designed up front, so no axis forecloses
   another); implementation is **bottoms-up** — the Host/Process substrate first, faults last (see "Build
-  order").
+  order"). The net, disk, clock, **process-crash/restart**, **host-crash/reboot**, and **crash-tear**
+  axes are landed and replay-exact; what remains is the OOM (allocation-triggered) and scheduling
+  (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a seeded
+  `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
 Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →
 disk ✅ → pipes ✅) each brought a class of real I/O into the bubble; fault orchestration layers
 exploration power on top now that there is something to fault. Level 2 extends the scheduling axis
