@@ -89,7 +89,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Network (src/net)
 
-- [ ] 18. a host crash resets each of its connections at the surviving peer
+- [x] 18. a host crash resets each of its connections at the surviving peer
   with RST semantics: queued and in-flight bytes discarded, the peer's next
   read returns ECONNRESET without draining. Test: crash the writer host with
   bytes in flight, peer's first read fails. (dst-audit-net-crash-drain)
@@ -106,8 +106,10 @@ Audit reproducers (ephemeral, from the audit session):
   instead of hanging forever. (dst-audit-net-kernel-shape, item 4)
 - [ ] 23. `Close()` with unread inbound data resets the peer (read fails
   ECONNRESET), reusing the existing `unreadInbound` predicate, consistent with
-  process-exit teardown (user decision 2026-07-10).
-  (dst-audit-net-kernel-shape, item 5)
+  process-exit teardown (user decision 2026-07-10). "Read fails ECONNRESET"
+  means WITHOUT draining, and governs both arms — app `Close()` and the
+  process-exit RST arm, whose current single-end teardown lets the peer drain
+  first. (dst-audit-net-kernel-shape, item 5)
 - [ ] 24. the `Listen(":0")` ephemeral port allocator wraps and reclaims
   closed ports, as real kernels do. (dst-audit-low-fidelity-cluster)
 - [ ] 25. same-host connections get the same bounded send buffer as

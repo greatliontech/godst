@@ -25,9 +25,17 @@ import (
 
 // dstConns is the per-run set of active simulated connections, registered at Dial
 // and deregistered on Close/reset. Keyed off the run epoch (dstNetEpoch) so it
-// resets each run. Both ends of a connection are registered, so a reset finds the
-// conn through whichever end is still live; resetConn shares one reset flag, so
-// resetting either end tears down both (idempotent if both match).
+// resets each run. Both ends of a connection are registered, each as its own
+// dstConn. resetConn tears down the END it is called on — that end's transport
+// closes; the shared reset flag only maps the peer's eventual EOF to ECONNRESET
+// identity, it does NOT close the peer's transport, so a peer whose own dstConn
+// is not reset still DRAINS queued bytes before seeing the error. The no-drain
+// RST teardown therefore requires resetting each end's own dstConn — every
+// reset matcher reaches both ends of a live conn (the host matcher spares a
+// survivor's end whose victim end already closed — see dstResetHost; the
+// process-EXIT path deliberately enumerates one end, a per-end graceful
+// close). resetConn is idempotent when both ends match: an atomic flag store,
+// a sync.Once close, a map delete.
 var dstConns struct {
 	mu    sync.Mutex
 	epoch uint64
@@ -79,7 +87,11 @@ func dstResetMatching(match func(*dstConn) bool) {
 // dstMatchedVictims collects the registered conns satisfying match and returns them
 // in registration-SEQUENCE order (never the registry map's pointer-address iteration
 // order — see dstResetMatching's note). Factored out so the ordering is directly
-// testable without resetConn's side effects.
+// testable without resetConn's side effects. Collect-before-teardown is
+// load-bearing beyond ordering: a matcher's predicate may read state a sibling
+// victim's resetConn mutates (dstResetHost's app-closed skip reads the peer
+// end's done channel), so every match must run against the pre-fault snapshot,
+// before the first teardown.
 func dstMatchedVictims(match func(*dstConn) bool) []*dstConn {
 	dstConns.mu.Lock()
 	var victims []*dstConn
@@ -121,12 +133,46 @@ func dstLocalBindInUse(host uint32, ip IP, port int) bool {
 }
 
 // dstResetHost resets every conn an end of which lives on host h — the machine
-// lost power, so each of its sockets emits an RST (resetConn tears down both
-// ends, so a surviving peer on another host sees ECONNRESET). Matching the
-// LOCAL end keys the fault to exactly the victim's connections
-// (DST-FAULT-VICTIM); a conn between two other hosts is untouched.
+// lost power, so each of its sockets emits an RST. Matching EITHER end (as the
+// pair and process matchers do) resets both registered dstConns of an affected
+// connection, so the surviving peer's own transport end closes too and its
+// next read fails ECONNRESET WITHOUT draining — queued and in-flight bytes are
+// dropped, as a real RST destroys the receive queue (DST-FAULT-SOUND).
+// Matching only the victim's local end would tear down just that end, which
+// presents at the peer as a graceful write-close: the peer would drain every
+// queued segment — bytes the powered-off machine's teardown destroyed — before
+// seeing the reset. A conn between two other hosts has neither end on h and is
+// untouched (DST-FAULT-VICTIM).
 func dstResetHost(h uint32) {
-	dstResetMatching(func(c *dstConn) bool { return c.localHost == h })
+	dstResetMatching(func(c *dstConn) bool {
+		if c.localHost == h {
+			return true
+		}
+		if c.remoteHost != h {
+			return false
+		}
+		// The surviving peer's end of a victim conn. Skip it when the victim's
+		// own end was already closed before the power loss (its Close
+		// deregistered it): the data and FIN are on the wire, and a powered-off
+		// machine emits no packet that could destroy bytes its peer already
+		// holds — the peer drains and reads EOF (or the ECONNRESET an earlier
+		// exit-reset recorded), exactly as the pre-crash teardown left it. No
+		// real RST exists for an app-closed end at power loss
+		// (DST-FAULT-SOUND). Every simulated connection is wire-backed (the
+		// transport contract); a future non-wire Conn wrapper falls to the
+		// reset arm — the uniform crash collapse — never to a silent skip.
+		// The predicate is evaluated against the PRE-CRASH snapshot:
+		// dstMatchedVictims runs every match before any resetConn, so a
+		// victim-side reset in the same crash (which closes exactly the
+		// channel tested here) cannot flip a survivor entry to a spurious
+		// skip. An interleaved match-and-reset loop would reintroduce the
+		// drain whenever the victim end carries the lower regSeq (victim
+		// dialed) — see TestDSTCrashHostDropsInFlightBytesVictimDialer.
+		if e, ok := c.Conn.(*dstWireEnd); ok && isClosedChan(e.remoteDone) {
+			return false
+		}
+		return true
+	})
 }
 
 // dstCloseHostListeners closes every listener on host h — the whole port space

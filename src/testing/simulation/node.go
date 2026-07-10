@@ -599,7 +599,10 @@ func crashHost(name string) {
 // CrashHost kills the named host — the power-loss / kernel-panic fault
 // (docs/dst/faults.md "Crash / restart faults"). Every process on the host dies
 // as under Crash (goroutines descheduled permanently, no defers, pids dead),
-// every connection an end of which lives on the host is RESET at its peer, and
+// every connection an end of which lives on the host is RESET at its peer —
+// the peer's next read fails ECONNRESET without draining, except a conn the
+// victim's application had already closed, whose peer still drains and reads
+// io.EOF (power loss emits no packet; bytes on the wire survive) — and
 // every listener closes. Then the machine's kernel state is gone: its
 // filesystem TEARS BACK TO ITS DURABLE IMAGE — data a file's Fsync committed
 // survives byte-exactly, a name its parent directory's Fsync committed survives,

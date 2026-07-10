@@ -757,6 +757,17 @@ ops are abandoned — a crash does not, cannot in Go, force-unwind a goroutine m
 model is *they never run again*, what a killed process's threads do), conns RST, fds drop, memory is gone.
 The host crash additionally tears the host disk; the process crash leaves it intact.
 
+The crash-RST collapse has one boundary: a connection whose victim-side end the application had
+**already closed** before the crash is NOT reset at the surviving peer. Its data and FIN are on the
+wire, and a powered-off machine emits no packet — nothing can destroy bytes the network already
+carries, so the peer drains and reads `io.EOF` (or whatever error the pre-crash teardown recorded),
+exactly as if the crash never happened to that conn (DST-FAULT-SOUND: no real RST exists for an
+app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns`. The RST applies to
+the connections the victim still holds open, at the surviving peer's own end — its next read fails
+`ECONNRESET` **without draining**, queued and in-flight bytes alike, as a real RST destroys the
+receive queue. *Enforced:* `TestDSTCrashHostDropsInFlightBytes`, `TestDSTCrashHostFreesVictimPorts`
+(the victim's port space clears with the machine).
+
 Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit: the
 active process invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines
 are removed from the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close,

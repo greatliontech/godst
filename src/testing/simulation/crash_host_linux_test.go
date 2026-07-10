@@ -8,6 +8,7 @@ package simulation
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -868,5 +869,287 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 	}
 	if cwdAfter != "/" {
 		t.Fatalf("cwd after reboot = %q, want %q (the cwd lived in the dead kernel)", cwdAfter, "/")
+	}
+}
+
+// TestDSTCrashHostDropsInFlightBytes: a host crash RSTs each of its
+// connections AT THE SURVIVING PEER — queued and in-flight bytes are discarded
+// and the peer's next read fails ECONNRESET without draining. A real RST
+// destroys the receive queue; the simulation must not deliver bytes the
+// powered-off machine's teardown destroyed (DST-FAULT-SOUND).
+func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
+	var n int
+	var readErr error
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		written := make(chan struct{})
+		dialed := make(chan struct{})
+		crashed := make(chan struct{})
+		readDone := make(chan struct{})
+		exited := make(chan struct{})
+
+		Host("victim", HostConfig{}, func() {
+			go Process("writer", func() {
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				c, err := l.Accept()
+				if err != nil {
+					t.Errorf("victim accept: %v", err)
+					return
+				}
+				if _, err := c.Write([]byte("abc")); err != nil {
+					t.Errorf("victim write: %v", err)
+					return
+				}
+				close(written)
+				select {} // dies with the machine
+			})
+		})
+		addr := <-addrCh
+
+		Host("survivor", HostConfig{}, func() {
+			go func() {
+				defer close(exited)
+				Process("reader", func() {
+					c, err := net.Dial("tcp", addr)
+					if err != nil {
+						t.Errorf("survivor dial: %v", err)
+						return
+					}
+					// Dial returned, so both conn ends are registered — the
+					// crash below cannot benignly miss an unregistered conn on
+					// any seed's schedule.
+					close(dialed)
+					<-crashed
+					// The writer's 3 bytes are still in flight (100ms link;
+					// no virtual time passed between the write and the crash).
+					// The first read must fail — never deliver them.
+					n, readErr = c.Read(make([]byte, 8))
+					close(readDone)
+				})
+			}()
+		})
+
+		<-written
+		<-dialed
+		CrashHost("victim")
+		close(crashed)
+		<-readDone
+		<-exited
+	})
+	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Fatalf("first read after the writer host crashed = (%d, %v), want (0, ECONNRESET): in-flight bytes must be dropped, not drained", n, readErr)
+	}
+}
+
+// TestDSTCrashHostSparesAppClosedConns: a conn whose victim-host end the
+// application already close()d before the power loss is NOT reset at the
+// surviving peer — the data and FIN are on the wire, and a powered-off machine
+// emits no packet that could destroy bytes its peer already holds
+// (DST-FAULT-SOUND). The peer drains and reads EOF, exactly as the pre-crash
+// teardown left it.
+func TestDSTCrashHostSparesAppClosedConns(t *testing.T) {
+	var n int
+	var firstErr, secondErr error
+	var got [8]byte
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		closed := make(chan struct{})
+		dialed := make(chan struct{})
+		crashed := make(chan struct{})
+		readDone := make(chan struct{})
+		exited := make(chan struct{})
+
+		Host("victim", HostConfig{}, func() {
+			go Process("writer", func() {
+				l, err := net.Listen("tcp", HostIP("victim")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				c, err := l.Accept()
+				if err != nil {
+					t.Errorf("victim accept: %v", err)
+					return
+				}
+				if _, err := c.Write([]byte("abc")); err != nil {
+					t.Errorf("victim write: %v", err)
+					return
+				}
+				c.Close() // graceful FIN before the power loss
+				close(closed)
+				select {} // dies with the machine
+			})
+		})
+		addr := <-addrCh
+
+		Host("survivor", HostConfig{}, func() {
+			go func() {
+				defer close(exited)
+				Process("reader", func() {
+					c, err := net.Dial("tcp", addr)
+					if err != nil {
+						t.Errorf("survivor dial: %v", err)
+						return
+					}
+					close(dialed)
+					<-crashed
+					n, firstErr = c.Read(got[:])
+					_, secondErr = c.Read(make([]byte, 8))
+					close(readDone)
+				})
+			}()
+		})
+
+		<-closed
+		<-dialed
+		CrashHost("victim")
+		close(crashed)
+		<-readDone
+		<-exited
+	})
+	if n != 3 || string(got[:3]) != "abc" || firstErr != nil {
+		t.Fatalf("read of gracefully-closed conn after the peer host crashed = (%d, %q, %v), want (3, %q, nil): the crash cannot destroy bytes the network already carries", n, got[:n], firstErr, "abc")
+	}
+	if secondErr != io.EOF {
+		t.Fatalf("second read = %v, want io.EOF: the app-closed end FINned before the crash; no RST exists", secondErr)
+	}
+}
+
+// TestDSTCrashHostFreesVictimPorts: a host crash deregisters the victim's OWN
+// conn ends too, so after the machine restarts (a fresh Host declaration over
+// the recovered disk) an explicit bind to a 2-tuple a pre-crash conn held
+// succeeds — a real reboot clears the port space; a leaked registry entry would
+// phantom-EADDRINUSE it.
+func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
+	var redialErr error
+	Test(t, 1, func(t *testing.T) {
+		lnCh := make(chan net.Listener, 1)
+		dialed := make(chan struct{})
+		serverExited := make(chan struct{})
+
+		Host("survivor", HostConfig{}, func() {
+			go Process("server", func() {
+				defer close(serverExited)
+				l, err := net.Listen("tcp", HostIP("survivor")+":0")
+				if err != nil {
+					t.Errorf("survivor listen: %v", err)
+					return
+				}
+				lnCh <- l
+				for {
+					if _, err := l.Accept(); err != nil {
+						return
+					}
+				}
+			})
+		})
+		ln := <-lnCh
+		addr := ln.Addr().String()
+
+		var src *net.TCPAddr
+		Host("victim", HostConfig{}, func() {
+			src = &net.TCPAddr{IP: net.ParseIP(HostIP("victim")), Port: 34567}
+			go Process("dialer", func() {
+				d := net.Dialer{LocalAddr: src}
+				if _, err := d.Dial("tcp", addr); err != nil {
+					t.Errorf("victim dial: %v", err)
+					return
+				}
+				close(dialed)
+				select {} // dies with the machine
+			})
+		})
+		<-dialed
+
+		CrashHost("victim")
+
+		rebooted := make(chan struct{})
+		Host("victim", HostConfig{}, func() { // the restart: same machine, fresh kernel
+			go Process("dialer2", func() {
+				d := net.Dialer{LocalAddr: src}
+				_, redialErr = d.Dial("tcp", addr)
+				close(rebooted)
+			})
+		})
+		<-rebooted
+		ln.Close()
+		<-serverExited
+	})
+	if redialErr != nil {
+		t.Fatalf("post-reboot dial from the pre-crash source port = %v, want success: the crash cleared the victim's port space", redialErr)
+	}
+}
+
+// TestDSTCrashHostDropsInFlightBytesVictimDialer: the no-drain RST holds with
+// the roles swapped — the victim host DIALED, so its conn end carries the
+// LOWER registration sequence and is torn down first within the crash. The
+// survivor's entry must still be matched against the pre-crash snapshot
+// (dstMatchedVictims collects before any teardown): an interleaved
+// match-and-reset loop would see the victim end's just-closed done channel,
+// mistake it for an app-close, skip the survivor's end, and reintroduce the
+// drain.
+func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
+	var n int
+	var readErr error
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		written := make(chan struct{})
+		crashed := make(chan struct{})
+		readDone := make(chan struct{})
+		exited := make(chan struct{})
+
+		Host("survivor", HostConfig{}, func() {
+			go func() {
+				defer close(exited)
+				Process("reader", func() {
+					l, err := net.Listen("tcp", HostIP("survivor")+":0")
+					if err != nil {
+						t.Errorf("survivor listen: %v", err)
+						return
+					}
+					addrCh <- l.Addr().String()
+					c, err := l.Accept()
+					if err != nil {
+						t.Errorf("survivor accept: %v", err)
+						return
+					}
+					<-crashed
+					n, readErr = c.Read(make([]byte, 8))
+					close(readDone)
+				})
+			}()
+		})
+		addr := <-addrCh
+
+		Host("victim", HostConfig{}, func() {
+			go Process("writer", func() {
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Errorf("victim dial: %v", err)
+					return
+				}
+				if _, err := c.Write([]byte("abc")); err != nil {
+					t.Errorf("victim write: %v", err)
+					return
+				}
+				close(written)
+				select {} // dies with the machine
+			})
+		})
+
+		<-written
+		CrashHost("victim")
+		close(crashed)
+		<-readDone
+		<-exited
+	})
+	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Fatalf("first read after the dialing writer's host crashed = (%d, %v), want (0, ECONNRESET): in-flight bytes must be dropped, not drained", n, readErr)
 	}
 }

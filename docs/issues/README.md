@@ -14,7 +14,6 @@ chunk(s) there.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
 | [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 19–23 |
