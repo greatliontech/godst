@@ -29,7 +29,7 @@ Audit reproducers (ephemeral, from the audit session):
   allocation cannot start the DST-armed cycle. Test: foreign allocation
   interleaved against a near-threshold bubble heap, cycle boundaries
   seed-stable. (dst-audit-gc-foreign-trigger)
-- [ ] 4. a periodic fake timer whose `when == bubble.now` exactly at the
+- [x] 4. a periodic fake timer whose `when == bubble.now` exactly at the
   `DriftClock` instant adopts the new rate. (dst-audit-low-fidelity-cluster,
   timer nit)
 

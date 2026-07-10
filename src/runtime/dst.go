@@ -606,10 +606,11 @@ func dstDriftHostClock(host uint32, ppb int64) {
 // ppbNew at change instant now: each timer's base when was computed under the old rate,
 // so the remaining host-perceived time occupies a different base span under the new —
 // when' = now + (when−now)·r_old/r_new, period' = period·r_old/r_new. Every armed fake
-// timer (heaped or not) is in dstFakeTimers; for those this host owns and that are still
-// pending (when > now), when/period are re-mapped IN PLACE under the timer's lock,
-// marking a heaped timer modified so the heap re-adjusts (but never clearing a zombie
-// bit — an unblocked channel timer must stay un-runnable until its receiver returns).
+// timer (heaped or not) is in dstFakeTimers; for those this host owns, the period is
+// re-mapped IN PLACE under the timer's lock, and the when additionally for those still
+// pending (when > now), marking a heaped timer modified so the heap re-adjusts (but
+// never clearing a zombie bit — an unblocked channel timer must stay un-runnable until
+// its receiver returns).
 // An unheaped timer simply carries its re-mapped when until it is next added to the heap.
 func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 	if ppbOld == ppbNew {
@@ -623,22 +624,36 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 	// calls DriftClock.) Each timer is re-mapped under its own lock.
 	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
 		t.lock()
-		if t.dstReg == epoch && t.dstHost == host && t.when > now {
-			rem := dstDriftRemap(t.when-now, ppbOld, ppbNew)
-			when := int64(maxWhen)
-			if rem <= maxWhen-now { // avoid now+rem overflowing int64
-				when = now + rem
-			}
+		if t.dstReg == epoch && t.dstHost == host {
+			// The period is re-mapped for EVERY owned timer, not only pending
+			// ones: a periodic timer due exactly at the change instant
+			// (when == now, unfired — channel timers fire lazily on access)
+			// or overdue has its period reused by the next re-arm, so an
+			// unconverted period would keep it firing at the old rate for the
+			// rest of the run. An exactly-due when needs no move — firing
+			// "now" is correct under any rate. (An overdue when — reachable
+			// for a never-heaped channel timer — is left unconverted here
+			// even though the re-arm catch-up divides the mixed-regime delay
+			// by the new-rate period, leaving a bounded one-shot phase
+			// divergence: converting it backwards risks the when <= 0
+			// "not running" sentinel.)
 			t.period = dstDriftRemap(t.period, ppbOld, ppbNew)
-			t.when = when
-			if t.state&timerHeaped != 0 {
-				// Mark the heap entry stale so timers.adjust re-positions it at the next
-				// check; preserve timerZombie (do not resurrect an unblocked channel
-				// timer). Mirrors (*timer).modify's heap-marking minus the zombie clear.
-				t.state |= timerModified
-				if min := t.ts.minWhenModified.Load(); min == 0 || when < min {
-					t.astate.Store(t.state)
-					t.ts.updateMinWhenModified(when)
+			if t.when > now {
+				rem := dstDriftRemap(t.when-now, ppbOld, ppbNew)
+				when := int64(maxWhen)
+				if rem <= maxWhen-now { // avoid now+rem overflowing int64
+					when = now + rem
+				}
+				t.when = when
+				if t.state&timerHeaped != 0 {
+					// Mark the heap entry stale so timers.adjust re-positions it at the next
+					// check; preserve timerZombie (do not resurrect an unblocked channel
+					// timer). Mirrors (*timer).modify's heap-marking minus the zombie clear.
+					t.state |= timerModified
+					if min := t.ts.minWhenModified.Load(); min == 0 || when < min {
+						t.astate.Store(t.state)
+						t.ts.updateMinWhenModified(when)
+					}
 				}
 			}
 		}

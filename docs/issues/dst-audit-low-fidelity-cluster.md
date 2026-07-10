@@ -48,9 +48,7 @@ verified, none blocking:
   the effective scope is every dst file op — surface it so the capability claim
   matches reality.
 
-- **nits:** a periodic fake timer whose `when == bubble.now` exactly at the
-  `DriftClock` instant keeps its old rate (dst.go dstRemapHostTimers);
-  `dstMMapEntry.seq` is written, never read, with a comment describing
+- **nits:** `dstMMapEntry.seq` is written, never read, with a comment describing
   nonexistent tie-breaking (dst_mmap_linux.go:57,176,183); Explore misattributes
   fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455); a blocked
   flock waiter whose fd is closed elsewhere wakes EBADF where Linux grants

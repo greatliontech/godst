@@ -664,7 +664,10 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   wall reading itself (bubble durations are wall-based), and the "rate-aware deadline conversion at the
   synctest wake" as arm-time conversion. A **mid-run change** re-anchors the wall so it stays continuous
   (folds drift-so-far into `offset`, resets the anchor) and re-maps every *armed* timer of the host
-  (`when' = T + (when−T)·r_old/r_new`). Because a channel timer is heaped only while a goroutine is blocked on
+  (`when' = T + (when−T)·r_old/r_new`); a periodic timer's **period is converted for every armed
+  timer**, including one due exactly at the change instant (its `when` needs no move — firing "now"
+  is correct under any rate — but the next re-arm reuses the period, which must already be at the
+  new rate; `TestDSTClockDriftClockDueTicker`). Because a channel timer is heaped only while a goroutine is blocked on
   it, the re-map enumerates a per-run list of armed fake timers (`runtime.dstFakeTimers`), not just the heap,
   so a held `NewTimer`/`NewTicker` or a ticker between ticks is re-mapped too; the re-map is in place under the
   timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). **Host

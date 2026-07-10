@@ -151,6 +151,43 @@ func TestDSTClockDriftClockWallContinuity(t *testing.T) {
 
 // TestDSTClockDriftClockResync: DriftClock(h, 0) restores rate 1 — a sleep armed after the
 // re-sync takes its full base duration again.
+// TestDSTClockDriftClockDueTicker: a periodic ticker whose tick is DUE
+// exactly at the DriftClock instant (when == now, still unfired — channel
+// timers fire lazily on channel access) adopts the new rate for subsequent
+// ticks: the re-map converts its period even though its due when needs no
+// move (firing "now" is correct under any rate). The next re-arm reuses the
+// period, so an unconverted period would keep the ticker at the old rate for
+// the rest of the run. Measured on the root (rate 1): a 100ms-host-period
+// ticker on a host switched to rate 2 must tick again 50ms base later.
+func TestDSTClockDriftClockDueTicker(t *testing.T) {
+	var gap time.Duration
+	Run(1, func() {
+		tick1 := make(chan struct{})
+		tick2 := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				tk := time.NewTicker(100 * time.Millisecond)
+				defer tk.Stop()
+				// Wake at exactly the tick's due instant: the tick timer sits
+				// at when == now, unfired, while this goroutine runs.
+				time.Sleep(100 * time.Millisecond)
+				DriftClock("h", 1_000_000_000) // host rate -> 2x
+				<-tk.C                         // consume the due tick (fires lazily, re-arms)
+				close(tick1)
+				<-tk.C // first tick re-armed after the rate change
+				close(tick2)
+			}()
+		})
+		<-tick1
+		start := time.Now() // root base clock
+		<-tick2
+		gap = time.Since(start)
+	})
+	if want := 50 * time.Millisecond; gap != want {
+		t.Fatalf("ticker due at the DriftClock instant kept its old rate: next tick after %v base, want %v", gap, want)
+	}
+}
+
 func TestDSTClockDriftClockResync(t *testing.T) {
 	var afterResync time.Duration
 	Run(1, func() {
