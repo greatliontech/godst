@@ -85,51 +85,75 @@ const (
 
 var dstMemfdName = [...]byte{'d', 's', 't', '-', 'p', 'a', 'g', 'e', 'c', 'a', 'c', 'h', 'e', 0}
 
-// dstSpan is one live mapping's address range.
+// A mapping's registry entry outlives the mapping as a TOMBSTONE: the address
+// space is PROT_NONE-covered and never reused within the run, so the entry
+// keeps enough truth to attribute a later fault to what the range USED to be —
+// the difference between a process touching memory it unmapped (its own
+// SIGSEGV death, as in production), code reaching a dead machine's or dead
+// process's memory (no production analog: the memory does not exist — a named
+// model-boundary abort), and a genuine harness bug (everything else).
+const (
+	dstSpanLive     = iota
+	dstSpanUnmapped // the owner unmapped it: a later touch is the toucher's SIGSEGV
+	dstSpanCrashed  // its process or machine died: a later touch is a named abort
+	dstSpanRetired  // a model-internal view, replaced: a later touch is a harness bug, named
+)
+
+// dstSpan is one mapping's address range and its state.
 type dstSpan struct {
-	base uintptr
-	size uintptr
+	base  uintptr
+	size  uintptr
+	state uint8
 }
 
-// dstSpanSet is immutable once published; mutators build the successor, then
-// CAS it in. Readers (dstMappingFaultAddr, reached from sigpanic) take no lock:
-// a fault can arrive at any instruction, including one inside a mutator, and a
-// reader that blocked on a mutator's lock would deadlock. Allocating outside
-// any lock also keeps mallocgc — which may take mheap_.lock or assist the GC —
-// off a held runtime mutex.
+// dstSpanSet is an append-only vector published by pointer. It must be safe
+// against its OWN mutator faulting mid-mutation (sigpanic re-enters the reader
+// on the same thread, so a lock here would self-deadlock) and against readers
+// racing a mutation from another M (a P migration is a full barrier; the
+// length is published atomically after the entry is written, so a reader
+// either sees the entry whole or not at all). Tombstones made the set
+// monotonic per run, so the shape is amortized in-place append plus in-place
+// state stores — never a copy per operation, which over m map/unmap cycles
+// was O(m²) bytes.
 type dstSpanSet struct {
-	spans []dstSpan
+	spans []dstSpan // entries [0, n) are published; capacity is pre-allocated
+	n     atomic.Uintptr
 }
 
 var dstSpans atomic.Pointer[dstSpanSet]
 
 func dstSpanAdd(base, size uintptr) {
-	for {
-		old := dstSpans.Load()
-		next := &dstSpanSet{}
-		if old != nil {
-			next.spans = append(next.spans, old.spans...)
-		}
-		next.spans = append(next.spans, dstSpan{base: base, size: size})
-		if dstSpans.CompareAndSwap(old, next) {
-			return
-		}
+	set := dstSpans.Load()
+	n := uintptr(0)
+	if set != nil {
+		n = set.n.Load()
 	}
+	if set == nil || n == uintptr(cap(set.spans)) {
+		grown := &dstSpanSet{spans: make([]dstSpan, max(16, 2*int(n)))}
+		if set != nil {
+			copy(grown.spans, set.spans[:n])
+		}
+		grown.n.Store(n)
+		dstSpans.Store(grown)
+		set = grown
+	}
+	set.spans[n] = dstSpan{base: base, size: size}
+	set.n.Store(n + 1) // publish after the entry is whole
 }
 
-func dstSpanRemove(base uintptr) {
-	for {
-		old := dstSpans.Load()
-		if old == nil {
-			return
-		}
-		next := &dstSpanSet{}
-		for _, s := range old.spans {
-			if s.base != base {
-				next.spans = append(next.spans, s)
-			}
-		}
-		if dstSpans.CompareAndSwap(old, next) {
+func dstSpanKill(base uintptr, state uint8) {
+	set := dstSpans.Load()
+	if set == nil {
+		return
+	}
+	n := set.n.Load()
+	for i := uintptr(0); i < n; i++ {
+		if set.spans[i].base == base {
+			// An in-place store: every state transition a fault could race
+			// (live→unmapped, live→crashed) leaves both attributions sound at
+			// the racing instant, and under a single P the race cannot occur
+			// anyway — the store is atomic for form.
+			atomic.Store8(&set.spans[i].state, state)
 			return
 		}
 	}
@@ -213,7 +237,7 @@ func dstPageCacheResetRegion() {
 		throw("dst: mapping region reset failed")
 	}
 	dstMapRegion.next.Store(0)
-	dstSpans.Store(&dstSpanSet{})
+	dstSpans.Store(nil)
 }
 
 // dstPageCacheNew creates an empty page cache. The descriptor is the harness's,
@@ -280,21 +304,17 @@ func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr {
 	return base
 }
 
-// dstPageCacheUnmap unregisters the mapping, then unmaps it. In that order: a
-// fault in the range after the address space is gone but while it is still
-// registered would be attributed to a simulated process that no longer has the
-// mapping. Unregistering first means such a fault is reported as the harness
-// bug it is.
-//
-// The address space is re-covered inaccessible rather than unmapped: a hole in
+// dstPageCacheUnmap tombstones the mapping's registry entry with state — a
+// later fault into the range is attributed to what the range WAS — and
+// re-covers the address space inaccessible rather than unmapping it: a hole in
 // the region is space the kernel may hand to an unrelated mmap, and a foreign
-// mapping inside the region would turn its faults into simulated process
-// deaths. Covered space stays ours; adjacent PROT_NONE anonymous mappings
-// merge, so the cover does not accumulate VMAs.
+// mapping inside the region would confuse that attribution. Covered space
+// stays ours; adjacent PROT_NONE anonymous mappings merge, so the cover does
+// not accumulate VMAs.
 //
 //go:linkname dstPageCacheUnmap
-func dstPageCacheUnmap(base, n uintptr) {
-	dstSpanRemove(base)
+func dstPageCacheUnmap(base, n uintptr, state uint8) {
+	dstSpanKill(base, state)
 	if rem := n % dstPageCachePageSize; rem != 0 {
 		n += dstPageCachePageSize - rem
 	}
@@ -331,20 +351,21 @@ func dstPageCacheFatal(reason string) {
 	throw(reason)
 }
 
-// dstMappingFaultAddr reports whether addr lies inside a live mapping, i.e.
-// whether the fault is a simulated process touching a page its file does not
-// have, or writing through a read-only mapping.
-func dstMappingFaultAddr(addr uintptr) bool {
+// dstMappingFaultAddr classifies addr: not a simulated mapping's (found=false),
+// or found with the span's state — live (the file does not have the page, or
+// the view is read-only), unmapped, crashed, or retired.
+func dstMappingFaultAddr(addr uintptr) (state uint8, found bool) {
 	set := dstSpans.Load()
 	if set == nil {
-		return false
+		return 0, false
 	}
-	for _, s := range set.spans {
+	for i, n := uintptr(0), set.n.Load(); i < n; i++ {
+		s := &set.spans[i]
 		if addr >= s.base && addr < s.base+s.size {
-			return true
+			return atomic.Load8(&s.state), true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // dstMappingFault converts a hardware fault inside a mapping into the death of
@@ -359,7 +380,7 @@ func dstMappingFault(addr uintptr) {
 	gp := getg()
 	pid := gp.dstPid
 	if pid <= 0 {
-		print("dst: fault at ", hex(addr), " inside a simulated mapping, outside any simulated process\n")
+		print("dst: fault at ", hex(addr), " inside a simulated mapping (live or unmapped), outside any simulated process\n")
 		throw("dst: mapping fault outside a simulated process")
 	}
 	// A pid outlives its simulation only if a mapping did too, which is a
@@ -395,8 +416,27 @@ func dstMappingSigpanic(gp *g) {
 	if gp.sig != _SIGSEGV && gp.sig != _SIGBUS {
 		return
 	}
-	if !dstMappingFaultAddr(gp.sigcode1) {
+	state, found := dstMappingFaultAddr(gp.sigcode1)
+	if !found {
 		return
 	}
-	dstMappingFault(gp.sigcode1)
+	switch state {
+	case dstSpanLive, dstSpanUnmapped:
+		// A page the file does not have, a protection violation, or memory the
+		// process unmapped and touched anyway: the toucher's own death, exactly
+		// as production delivers it.
+		dstMappingFault(gp.sigcode1)
+	case dstSpanCrashed:
+		// Production would deliver the toucher its own SIGSEGV here too; the
+		// named abort is the deliberate choice — a mapping reached after its
+		// owner exited or crashed means a slice crossed a process boundary,
+		// and exposing that beats laundering it as one more process death.
+		print("dst: fault at ", hex(gp.sigcode1), " inside a dead owner's mapping\n")
+		throw("dst: access to a dead owner's mapping (its process exited or crashed, or its machine died; passing a mapping between simulated processes is outside the model)")
+	case dstSpanRetired:
+		print("dst: fault at ", hex(gp.sigcode1), " inside a retired internal file view\n")
+		throw("dst: access to a retired file view (harness bug: node.data must be re-read under the lock)")
+	default:
+		throw("dst: mapping tombstone carries an unknown state")
+	}
 }

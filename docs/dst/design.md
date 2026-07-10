@@ -579,8 +579,14 @@ address within a process and across invocations — the address is observable (t
 replay-exactness owns it; region exhaustion is therefore also deterministic and reports `ENOMEM`
 (64-bit hosts only; a coarser-than-4096-page or 32-bit host is refused loudly at first use). The mapping
 lifetime is independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap` unregisters
-exactly the mapping passed to it, and the run epoch resets any residue, closing every page cache and
-taking back the region in one stroke. Attempts to create writable private mappings, map without the
+exactly the mapping passed to it — and a later touch of the unmapped range is the toucher's own death,
+as production SIGSEGV delivers it. The run epoch resets any residue, closing every page cache and
+taking back the region in one stroke. A mapping whose owning process exited or crashed, or whose machine died, is gone
+with its owner: touching it is a loud, NAMED harness abort — a deliberate divergence, since production
+would deliver the toucher its own SIGSEGV; a mapping reached after its owner's death means a slice
+crossed a process boundary (outside the model — see below), and naming that beats laundering it as one
+more process death. Never a silent read, and never an "unexpected fault address" that reads as a
+harness bug. Attempts to create writable private mappings, map without the
 required fd access mode, or unmap only a subrange fail deterministically. Offsets validate against a
 **fixed simulated page size of 4096** — never the host's page geometry, which is machine state (every
 16K-aligned offset is also 4K-aligned, so host-derived offsets stay valid; the host MMU enforces at its

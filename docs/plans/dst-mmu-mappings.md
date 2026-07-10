@@ -70,7 +70,7 @@ is attributed to a process, and the simulated page size stays 4096.
       `dstMMapShrinkFencedLocked`. Re-anchor the tests that pinned the old
       stance, and re-anchor the spec's two recorded divergences out of
       § Memory mappings.
-- [ ] 4. Fault semantics under crash. A process crash keeps the arena (the page
+- [x] 4. Fault semantics under crash. A process crash keeps the arena (the page
       cache outlives the process); a host crash drops it; a tear rebuilds it
       from the durable image. `Explore`/`Replay` reproduce a fault exactly.
 - [ ] 5. Compatibility coverage. Extend the harness with the reservation mapping,

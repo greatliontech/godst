@@ -2074,6 +2074,41 @@ func TestDSTFSMappingFaultShapes(t *testing.T) {
 				}
 			})
 	})
+	t.Run("munmap then touch", func(t *testing.T) {
+		faultShapeInProcess(t,
+			func(t *testing.T) func() {
+				if err := os.WriteFile("/db", make([]byte, page), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				f, err := os.OpenFile("/db", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("OpenFile: %v", err)
+				}
+				b, err := syscall.Mmap(int(f.Fd()), 0, page, syscall.PROT_READ, syscall.MAP_SHARED)
+				f.Close()
+				if err != nil {
+					t.Fatalf("Mmap: %v", err)
+				}
+				pcSinkOS.Store(uint32(b[0])) // mapped: fine
+				if err := syscall.Munmap(b); err != nil {
+					t.Fatalf("Munmap: %v", err)
+				}
+				return func() {
+					pcSinkOS.Store(uint32(b[0])) // unmapped: the toucher's SIGSEGV
+				}
+			},
+			func(died, recovered, peerRan bool, killErr error) {
+				if !died {
+					t.Errorf("the process survived touching memory it unmapped")
+				}
+				if recovered {
+					t.Errorf("the process recovered from a fault production delivers as SIGSEGV")
+				}
+				if !peerRan {
+					t.Errorf("the peer did not run")
+				}
+			})
+	})
 	t.Run("shrink under live mapping", func(t *testing.T) {
 		faultShapeInProcess(t,
 			func(t *testing.T) func() {

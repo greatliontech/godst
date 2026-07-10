@@ -24,4 +24,8 @@ const DSTMapRegionSize = dstMapRegionSize
 const (
 	DSTProtRead  = _PROT_READ
 	DSTProtWrite = _PROT_WRITE
+
+	DSTSpanUnmapped = dstSpanUnmapped
+	DSTSpanCrashed  = dstSpanCrashed
+	DSTSpanRetired  = dstSpanRetired
 )

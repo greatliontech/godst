@@ -47,7 +47,17 @@ func dstPageCacheResize(fd int32, size int64)
 func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr
 
 //go:linkname dstPageCacheUnmap runtime.dstPageCacheUnmap
-func dstPageCacheUnmap(base, n uintptr)
+func dstPageCacheUnmap(base, n uintptr, state uint8)
+
+// The tombstone states a released mapping's registry entry keeps — mirrors of
+// runtime's dstSpan* constants, which decide how a later fault into the range
+// is reported (the toucher's death for unmapped; a named abort for crashed and
+// retired).
+const (
+	dstSpanUnmapped uint8 = 1
+	dstSpanCrashed  uint8 = 2
+	dstSpanRetired  uint8 = 3
+)
 
 //go:linkname dstPageCacheClose runtime.dstPageCacheClose
 func dstPageCacheClose(fd int32)
@@ -124,7 +134,7 @@ func dstNodeGrowReserveLocked(node *dstFSNode, need uintptr) {
 	if base == 0 {
 		dstPageCacheFatal("dst: the mapping region cannot hold the grown file view")
 	}
-	dstPageCacheUnmap(node.pc.base, node.pc.reserve)
+	dstPageCacheUnmap(node.pc.base, node.pc.reserve, dstSpanRetired)
 	node.pc.base = base
 	node.pc.reserve = reserve
 }

@@ -169,7 +169,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	dstMMapRollLocked()
 	key, errno := dstMMapKey(data)
 	if errno != 0 {
-		dstPageCacheUnmap(mapBase, mapLen)
+		dstPageCacheUnmap(mapBase, mapLen, dstSpanRetired)
 		dstMMapRegistry.mu.Unlock()
 		return nil, errno, true
 	}
@@ -243,7 +243,7 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 	for i := len(bucket) - 1; i >= 0; i-- {
 		entry := bucket[i]
 		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
-			dstPageCacheUnmap(entry.mapBase, entry.mapLen)
+			dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanUnmapped)
 			bucket = append(bucket[:i], bucket[i+1:]...)
 			if len(bucket) == 0 {
 				delete(dstMMapRegistry.maps, key)
@@ -288,7 +288,7 @@ func dstMMapReleaseHost(host uint32) {
 		out := bucket[:0]
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && entry.host == host {
-				dstPageCacheUnmap(entry.mapBase, entry.mapLen)
+				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
 				continue
 			}
 			out = append(out, entry)
@@ -311,7 +311,7 @@ func dstMMapReleaseProc(proc uint32) {
 		out := bucket[:0]
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && entry.proc == proc {
-				dstPageCacheUnmap(entry.mapBase, entry.mapLen)
+				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
 				continue
 			}
 			out = append(out, entry)

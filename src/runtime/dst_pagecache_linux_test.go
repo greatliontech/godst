@@ -38,7 +38,7 @@ func newPageCache(t *testing.T, length int64, reserveN uintptr) (fd int32, base 
 	runtime.DSTPageCacheResize(fd, length)
 	base = runtime.DSTPageCacheMap(fd, reserveN, runtime.DSTProtRead|runtime.DSTProtWrite)
 	t.Cleanup(func() {
-		runtime.DSTPageCacheUnmap(base, reserveN)
+		runtime.DSTPageCacheUnmap(base, reserveN, runtime.DSTSpanUnmapped)
 		runtime.DSTPageCacheClose(fd)
 	})
 	return fd, base
@@ -86,7 +86,7 @@ func TestDSTPageCacheResizeSemantics(t *testing.T) {
 func TestDSTPageCacheSharesBytesNotProtections(t *testing.T) {
 	fd, rw := newPageCache(t, pcPage, pcPage)
 	ro := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
-	defer runtime.DSTPageCacheUnmap(ro, pcPage)
+	defer runtime.DSTPageCacheUnmap(ro, pcPage, runtime.DSTSpanUnmapped)
 
 	mappingBytes(rw, pcPage)[0] = 'X'
 	if got := mappingBytes(ro, pcPage)[0]; got != 'X' {
@@ -102,34 +102,53 @@ func TestDSTPageCacheSharesBytesNotProtections(t *testing.T) {
 // died, and a false positive launders a genuine harness nil-dereference into a
 // simulated process death.
 func TestDSTMappingFaultAddr(t *testing.T) {
+	// Tombstones persist until the run boundary, so a neighbor test's released
+	// mapping would otherwise claim adjacent addresses here.
+	runtime.DSTPageCacheReset()
 	fd := runtime.DSTPageCacheNew()
 	runtime.DSTPageCacheResize(fd, pcPage)
 	base := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
 
-	if !runtime.DSTMappingFaultAddr(base) {
-		t.Errorf("first byte of a mapping not attributed to it")
+	if st, ok := runtime.DSTMappingFaultAddr(base); !ok || st != 0 {
+		t.Errorf("first byte of a mapping = (%d,%v), want live", st, ok)
 	}
-	if !runtime.DSTMappingFaultAddr(base + pcPage - 1) {
-		t.Errorf("last byte of a mapping not attributed to it")
+	if st, ok := runtime.DSTMappingFaultAddr(base + pcPage - 1); !ok || st != 0 {
+		t.Errorf("last byte of a mapping = (%d,%v), want live", st, ok)
 	}
-	if runtime.DSTMappingFaultAddr(base + pcPage) {
+	if _, ok := runtime.DSTMappingFaultAddr(base + pcPage); ok {
 		t.Errorf("byte just past a mapping attributed to it")
 	}
-	if runtime.DSTMappingFaultAddr(base - 1) {
+	if _, ok := runtime.DSTMappingFaultAddr(base - 1); ok {
 		t.Errorf("byte just before a mapping attributed to it")
 	}
 	var local int
-	if runtime.DSTMappingFaultAddr(uintptr(unsafe.Pointer(&local))) {
+	if _, ok := runtime.DSTMappingFaultAddr(uintptr(unsafe.Pointer(&local))); ok {
 		t.Errorf("a stack address attributed to a mapping")
 	}
-	if runtime.DSTMappingFaultAddr(0) {
+	if _, ok := runtime.DSTMappingFaultAddr(0); ok {
 		t.Errorf("a nil dereference attributed to a mapping")
 	}
 
-	runtime.DSTPageCacheUnmap(base, pcPage)
+	// A released range is a TOMBSTONE, not unclaimed: the registry keeps what
+	// the range used to be, so a later fault is attributed to that — the
+	// toucher's own death for unmapped memory, a named abort for a crashed
+	// owner's — instead of reading as a harness bug.
+	runtime.DSTPageCacheUnmap(base, pcPage, runtime.DSTSpanUnmapped)
 	runtime.DSTPageCacheClose(fd)
-	if runtime.DSTMappingFaultAddr(base) {
-		t.Errorf("an unmapped range still claims its addresses")
+	if st, ok := runtime.DSTMappingFaultAddr(base); !ok || st != runtime.DSTSpanUnmapped {
+		t.Errorf("an unmapped range = (%d,%v), want the unmapped tombstone", st, ok)
+	}
+	fd2 := runtime.DSTPageCacheNew()
+	runtime.DSTPageCacheResize(fd2, pcPage)
+	dead := runtime.DSTPageCacheMap(fd2, pcPage, runtime.DSTProtRead)
+	runtime.DSTPageCacheUnmap(dead, pcPage, runtime.DSTSpanCrashed)
+	runtime.DSTPageCacheClose(fd2)
+	if st, ok := runtime.DSTMappingFaultAddr(dead); !ok || st != runtime.DSTSpanCrashed {
+		t.Errorf("a crashed owner's range = (%d,%v), want the crashed tombstone", st, ok)
+	}
+	runtime.DSTPageCacheReset()
+	if _, ok := runtime.DSTMappingFaultAddr(base); ok {
+		t.Errorf("the run-boundary reset left a tombstone claiming addresses")
 	}
 }
 
@@ -220,7 +239,7 @@ func TestDSTMappingFaultShrinkUnderLiveMapping(t *testing.T) {
 func TestDSTMappingFaultReadOnlyWrite(t *testing.T) {
 	fd, _ := newPageCache(t, pcPage, pcPage)
 	ro := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
-	defer runtime.DSTPageCacheUnmap(ro, pcPage)
+	defer runtime.DSTPageCacheUnmap(ro, pcPage, runtime.DSTSpanUnmapped)
 	mem := mappingBytes(ro, pcPage)
 
 	died, recovered, peerRan := faultInProcess(t, func() {
@@ -265,8 +284,8 @@ func TestDSTPageCacheCarveResetDeterminism(t *testing.T) {
 		runtime.DSTPageCacheResize(fd, pcPage)
 		a := runtime.DSTPageCacheMap(fd, 64<<10, runtime.DSTProtRead|runtime.DSTProtWrite)
 		b := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
-		runtime.DSTPageCacheUnmap(b, pcPage)
-		runtime.DSTPageCacheUnmap(a, 64<<10)
+		runtime.DSTPageCacheUnmap(b, pcPage, runtime.DSTSpanUnmapped)
+		runtime.DSTPageCacheUnmap(a, 64<<10, runtime.DSTSpanUnmapped)
 		runtime.DSTPageCacheClose(fd)
 		return [2]uintptr{a, b}
 	}
@@ -298,13 +317,27 @@ func TestDSTPageCacheRegionExhaustionIsDeterministicENOMEM(t *testing.T) {
 	if a == 0 {
 		t.Fatalf("a %d-byte reservation did not fit an empty region", almost)
 	}
-	defer runtime.DSTPageCacheUnmap(a, almost)
+	defer runtime.DSTPageCacheUnmap(a, almost, runtime.DSTSpanUnmapped)
 	if b := runtime.DSTPageCacheMap(fd, 128<<10, runtime.DSTProtRead); b != 0 {
 		t.Fatalf("a carve past the region's end returned %#x, want the 0 sentinel", b)
 	}
 	if c := runtime.DSTPageCacheMap(fd, 64<<10, runtime.DSTProtRead); c == 0 {
 		t.Fatalf("a carve that fits the remainder was refused")
 	} else {
-		runtime.DSTPageCacheUnmap(c, 64<<10)
+		runtime.DSTPageCacheUnmap(c, 64<<10, runtime.DSTSpanUnmapped)
+	}
+}
+
+// TestDSTCrashedMappingTouchIsNamed: reaching a dead owner's mapping is a
+// model-boundary violation with no production analog (the memory does not
+// exist), and it must abort with the NAMED reason — not "unexpected fault
+// address" (which reads as a harness bug), and not a laundered process death.
+func TestDSTCrashedMappingTouchIsNamed(t *testing.T) {
+	got := runTestProgDST(t, "DSTCrashedMappingTouch")
+	if !strings.Contains(got, "dst: access to a dead owner's mapping") {
+		t.Fatalf("touching a crashed owner's mapping reported:\n%s\nwant the named abort", got)
+	}
+	if strings.Contains(got, "UNREACHED") {
+		t.Fatalf("the touch of a dead mapping did not abort:\n%s", got)
 	}
 }
