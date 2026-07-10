@@ -1898,7 +1898,7 @@ func dstNetCrossHostBandwidthBps() int64 { return dstNetCrossHostBandwidth }
 
 // dstNetSendBuffer is the per-run per-direction send-buffer capacity in bytes: a Write
 // blocks once this many written-but-undelivered bytes are outstanding (backpressure).
-// 0 means unbounded (writes never block; same-host always). dstNetRetransmitNs is the
+// 0 means unbounded (writes never block; SendBuffer<0). dstNetRetransmitNs is the
 // virtual-time horizon after which an undeliverable write/dial fails ETIMEDOUT; 0 means
 // no horizon. Both resolved (defaults applied) by testing/simulation before the bubble
 // and reset after, like the latency/jitter/bandwidth globals.

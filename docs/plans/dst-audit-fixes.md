@@ -112,7 +112,7 @@ Audit reproducers (ephemeral, from the audit session):
   first. (dst-audit-net-kernel-shape, item 5)
 - [x] 24. the `Listen(":0")` ephemeral port allocator wraps and reclaims
   closed ports, as real kernels do. (dst-audit-low-fidelity-cluster)
-- [ ] 25. same-host connections get the same bounded send buffer as
+- [x] 25. same-host connections get the same bounded send buffer as
   cross-host, so the co-located write-write deadlock reproduces in sim (user
   decision 2026-07-10). (dst-audit-low-fidelity-cluster)
 

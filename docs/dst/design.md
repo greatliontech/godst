@@ -323,6 +323,10 @@ models a TCP socket pair, not a message queue:
 - **Bounded send buffer / backpressure.** Each connection direction has a fixed send-buffer
   capacity (`Options.Network.SendBuffer`, default 1 MiB): a write fills it and **blocks durably**
   when full, resuming as the link drains it. Writes never succeed unboundedly into a partition.
+  Same-host and loopback connections carry the SAME bound — loopback TCP has finite socket buffers
+  too, so two co-located peers that each write past them before reading deadlock in production, and
+  the simulation reproduces that as a loud bubble deadlock instead of masking it in an unbounded
+  sim-only buffer (`TestDSTNetSameHostWriteWriteDeadlocks`, `TestDSTNetSameHostBackpressure`).
 - **Retransmission horizon.** Bytes that stay undeliverable because the link is **partitioned**
   error the connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
   default 2 minutes of bubble time — kernel-shaped: ~15 retries), on the blocked or subsequent

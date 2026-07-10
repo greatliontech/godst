@@ -301,7 +301,7 @@ type dstWireEnd struct {
 	wrDead pipeDeadline
 }
 
-// dstWirePair builds the two ends of a cross-host connection between dialerHost
+// dstWirePair builds the two ends of a connection between dialerHost
 // (the a/dialer end) and listenHost (the b/server end). Each direction gets a send
 // buffer of capacity bytes (0 = unbounded) and the retransmit horizon retransNs.
 func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32) (Conn, Conn) {
@@ -564,8 +564,8 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	// (transmission + latency + jitter) into a send buffer of capacity e.out.capacity
 	// bytes. A write that would overrun the buffer BLOCKS until the reader drains
 	// enough (the peer consuming bytes frees space, wakeWriter), so a program cannot
-	// outrun a slow peer with unbounded buffering. capacity 0 = unbounded (same-host,
-	// or SendBuffer<0): the fast path, a write never blocks.
+	// outrun a slow peer with unbounded buffering. capacity 0 = unbounded
+	// (SendBuffer<0, user-chosen): the fast path, a write never blocks.
 	//
 	// The retransmit horizon fires ONLY while the link is PARTITIONED — bytes held at
 	// a cut are genuinely undeliverable, so a permanent cut kills the conn ETIMEDOUT

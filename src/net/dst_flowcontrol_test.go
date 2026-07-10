@@ -8,8 +8,10 @@ package net
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -691,4 +693,107 @@ func TestDSTNetCutAfterReadBlockedTimesOut(t *testing.T) {
 	if !errors.Is(readErr, syscall.ETIMEDOUT) {
 		t.Errorf("read parked before the cut landed = %v, want ETIMEDOUT at the horizon (the partition change must wake it to arm)", readErr)
 	}
+}
+
+// TestDSTNetSameHostBackpressure: same-host connections carry the same
+// bounded send buffer as cross-host ones — loopback TCP has finite socket
+// buffers too. A co-located writer far exceeding the buffer blocks until the
+// reader drains, and the bytes flow end-to-end intact.
+func TestDSTNetSameHostBackpressure(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const total = 100 << 10
+	opts := simulation.Options{Network: simulation.NetworkConfig{SendBuffer: 4 << 10}}
+	var gotN int
+	var gotSum, wantSum uint64
+	simulation.RunWith(1, opts, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			ln, err := Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				panic(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 8<<10)
+				for {
+					n, err := c.Read(buf)
+					for i := 0; i < n; i++ {
+						gotSum += uint64(buf[i])
+					}
+					gotN += n
+					if err != nil {
+						return
+					}
+				}
+			}()
+			c, err := Dial("tcp", ln.Addr().String()) // same host: loopback
+			if err != nil {
+				panic(err)
+			}
+			data := make([]byte, total)
+			for i := range data {
+				data[i] = byte(i % 251)
+				wantSum += uint64(data[i])
+			}
+			if n, err := c.Write(data); n != total || err != nil {
+				panic(err)
+			}
+			c.Close()
+			<-done
+			ln.Close()
+		})
+	})
+	if gotN != total || gotSum != wantSum {
+		t.Errorf("same-host bounded transfer = %d bytes (sum %d), want %d (sum %d)", gotN, gotSum, total, wantSum)
+	}
+}
+
+// TestDSTNetSameHostWriteWriteDeadlocks: the fidelity the bound buys — two
+// co-located peers that each write past the send buffer BEFORE reading
+// deadlock in production (both loopback socket buffers fill; neither read
+// runs). The simulation reproduces it as a loud bubble deadlock instead of
+// completing both writes into an unbounded sim-only buffer that masks the bug.
+func TestDSTNetSameHostWriteWriteDeadlocks(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{SendBuffer: 4 << 10}}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("co-located write-write past both send buffers completed; want the production deadlock, reproduced loudly")
+		}
+		if !strings.Contains(fmt.Sprint(r), "deadlock") {
+			panic(r) // not the bubble-deadlock diagnostic: repanic
+		}
+	}()
+	simulation.RunWith(1, opts, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", "127.0.0.1:0")
+			defer ln.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Write(make([]byte, 64<<10)) // fills its 4 KiB buffer, blocks
+				c.Close()
+			}()
+			c, err := Dial("tcp", ln.Addr().String())
+			if err != nil {
+				panic(err)
+			}
+			c.Write(make([]byte, 64<<10)) // both sides writing, nobody reading
+			c.Close()
+			<-done
+		})
+	})
 }

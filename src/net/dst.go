@@ -1060,11 +1060,17 @@ redial:
 	// simulation where real TCP — whose send buffer is never zero — completes both
 	// instantly, a false positive the Soundness invariant forbids. The wire's
 	// buffered write is the faithful TCP shape (a send buffer the link drains).
+	// The send buffer is BOUNDED everywhere, same-host included: loopback TCP
+	// has finite socket buffers too, so two co-located peers that each write
+	// past them before reading deadlock in production — and must deadlock
+	// (loudly, as a bubble deadlock) in simulation rather than succeed into an
+	// unbounded sim-only buffer that masks the bug. The retransmit horizon
+	// value is irrelevant on a same-host wire (never partitioned, so it can
+	// never arm) and is passed uniformly.
 	latency, jitter, bandwidth := int64(0), int64(0), int64(0)
-	capacity, retrans := int64(0), int64(0) // same-host: unbounded buffer (instant drain), no horizon
+	capacity, retrans := dstNetSendBufferBytes(), dstNetRetransmitTimeoutNs()
 	if l.host != dialerHost {
 		latency, jitter, bandwidth = dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps()
-		capacity, retrans = dstNetSendBufferBytes(), dstNetRetransmitTimeoutNs()
 	}
 	// SYN: the first half of the connect round trip travels to the server. A connect
 	// deadline shorter than this traversal fails now, before anything is established —
@@ -1082,9 +1088,8 @@ redial:
 	// send below lands) or its retries exhaust — connect fails ETIMEDOUT at
 	// the retransmit horizon. Without the horizon a deadline-less dial into a
 	// saturated listener hung forever, a sim-only permanent hang. This arms
-	// for same-host dials too — unlike the wire's same-host no-horizon rule —
-	// because a loopback connect into a full queue times out in production
-	// just the same (the queue, not the link, is what's exhausted).
+	// for same-host dials too: a loopback connect into a full queue times out
+	// in production just the same (the queue, not the link, is exhausted).
 	var backlogHorizonC <-chan time.Time
 	var backlogHorizonT *time.Timer
 	if retransNs > 0 {
