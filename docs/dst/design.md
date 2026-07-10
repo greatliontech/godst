@@ -746,7 +746,15 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, host-backed `Mmap`, `ForkExec`/`Exec`) fail with the standard
   "unsupported under deterministic simulation" shape — loud and deterministic, exactly like `Fd()`.
   A minted host resource is a simulation escape; refusing it is the fence, absorbing it silently is
-  the defect.
+  the defect. On the socketcall architectures (386, s390x) the socket-family wrappers dispatch
+  through the dedicated `socketcall`/`rawsocketcall` entries rather than the fenced trampolines, so
+  those entries carry the same fence (same predicate and refusal shape as the raw `SYS_SOCKETCALL`
+  trap; one chokepoint covers every socket-family wrapper). The socket family of
+  `golang.org/x/sys/unix` enters through the same fenced entries on 386 — its assembly jumps to
+  `syscall.socketcall` by linkname, a path the trampoline choke point never sees there. Pinned by
+  `TestDSTSyscallFence`'s `syscall.Socket` and `syscall.Bind` wrapper probes and by
+  `TestDSTSocketcallEntryFenced` (the linkname entry x/sys resolves to refuses in-bubble; the pull
+  linkname also turns dropping the export into a build failure).
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,

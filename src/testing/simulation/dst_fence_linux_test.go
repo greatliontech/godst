@@ -23,6 +23,8 @@ import (
 func TestDSTSyscallFence(t *testing.T) {
 	var (
 		socketPanicked  bool
+		wrapperPanicked bool
+		bindPanicked    bool
 		allowedPanicked bool
 		forkPanicked    bool
 		execPanicked    bool
@@ -34,6 +36,26 @@ func TestDSTSyscallFence(t *testing.T) {
 		// Minting a socket is a simulation escape: fenced (panic).
 		socketPanicked = dstDidPanic(func() {
 			rawSocketSyscall(syscall.SOCK_STREAM)
+		})
+
+		// The same escape through the NAMED wrapper. On most architectures
+		// this reaches the same fenced trampoline as the raw probe; on
+		// socketcall architectures (386, s390x) it dispatches through the
+		// dedicated socketcall assembly entries instead — the path a real SUT
+		// takes — which carry their own fence. A raw-only probe passes there
+		// while the wrapper path stays open.
+		wrapperPanicked = dstDidPanic(func() {
+			if fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0); err == nil {
+				syscall.Close(fd)
+			}
+		})
+
+		// Bind exercises the second wrapper entry on socketcall architectures
+		// (socket dispatches raw, bind through the syscall-slow variant); the
+		// fence must fire before the kernel could even say EBADF for the
+		// bogus fd.
+		bindPanicked = dstDidPanic(func() {
+			syscall.Bind(0x7fffffff, &syscall.SockaddrInet4{Port: 1})
 		})
 
 		// close() is on the allowlist for inherited host handles. Active virtual
@@ -62,6 +84,12 @@ func TestDSTSyscallFence(t *testing.T) {
 
 	if !socketPanicked {
 		t.Errorf("raw SYS_SOCKET in bubble did not panic: the resource-minting fence is inactive")
+	}
+	if !wrapperPanicked {
+		t.Errorf("syscall.Socket in bubble did not panic: the socket-wrapper path bypasses the fence")
+	}
+	if !bindPanicked {
+		t.Errorf("syscall.Bind in bubble did not panic: the socket-wrapper path bypasses the fence")
 	}
 	if allowedPanicked {
 		t.Errorf("raw SYS_CLOSE in bubble panicked: the inherited-handle allowlist is broken")
@@ -105,6 +133,11 @@ func TestDSTFenceIsBubbleScoped(t *testing.T) {
 		fd, errno := rawSocketSyscall(syscall.SOCK_DGRAM)
 		if errno == 0 {
 			syscall.RawSyscall(syscall.SYS_CLOSE, fd, 0, 0)
+		}
+		// Same through the named wrapper — on socketcall architectures this is
+		// the dedicated assembly path, whose fence must be bubble-scoped too.
+		if wfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0); err == nil {
+			syscall.Close(wfd)
 		}
 	}()
 

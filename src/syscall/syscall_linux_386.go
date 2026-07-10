@@ -121,8 +121,41 @@ const (
 	_SENDMMSG    = 20
 )
 
-func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
-func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
+func socketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
+func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
+
+// socketcall and rawsocketcall dispatch the multiplexed socket-family
+// syscalls through the dedicated SYS_SOCKETCALL assembly entries — a path
+// that never passes the fenced Syscall/RawSyscall trampolines, so the DST
+// fence is consulted HERE: without it, a bubble goroutine's syscall.Socket
+// (or Bind/Connect/...) would mint a live host socket, a silent simulation
+// escape (design.md, interception boundary, DST-NODE-ISOLATION). Same
+// predicate and refusal shape as the trampolines give the raw
+// SYS_SOCKETCALL trap; non-bubble callers fall through to the host
+// unchanged. Folds away in stock builds (dstSimFenced const).
+
+// The push linknames keep golang.org/x/sys/unix linking: its 386 assembly
+// enters these by name (JMP syscall·socketcall(SB)), a pull reference the
+// linker permits only against assembly-defined or linkname-exported symbols —
+// and deliberately so: routed through the FENCED wrappers, unix.Socket and
+// friends are refused in-bubble exactly like syscall.Socket, which the
+// trampolines never see on this architecture.
+//
+//go:linkname socketcall
+func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
+	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+		dstSyscallRefuse(SYS_SOCKETCALL)
+	}
+	return socketcall1(call, a0, a1, a2, a3, a4, a5)
+}
+
+//go:linkname rawsocketcall
+func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
+	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+		dstSyscallRefuse(SYS_SOCKETCALL)
+	}
+	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)
+}
 
 func accept4(s int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (fd int, err error) {
 	fd, e := socketcall(_ACCEPT4, uintptr(s), uintptr(unsafe.Pointer(rsa)), uintptr(unsafe.Pointer(addrlen)), uintptr(flags), 0, 0)

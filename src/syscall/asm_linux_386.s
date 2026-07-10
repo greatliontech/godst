@@ -48,9 +48,10 @@ TEXT ·rawSyscallNoError(SB),NOSPLIT,$0-24
 
 #define SYS_SOCKETCALL 102	/* from zsysnum_linux_386.go */
 
-// func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err int)
+// func socketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err int)
 // Kernel interface gets call sub-number and pointer to a0.
-TEXT ·socketcall(SB),NOSPLIT,$0-36
+// Reached only through the socketcall Go wrapper, which consults the DST fence.
+TEXT ·socketcall1(SB),NOSPLIT,$0-36
 	CALL	runtime·entersyscall(SB)
 	MOVL	$SYS_SOCKETCALL, AX	// syscall entry
 	MOVL	call+0(FP), BX	// socket call number
@@ -72,9 +73,10 @@ oksock:
 	CALL	runtime·exitsyscall(SB)
 	RET
 
-// func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err int)
+// func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err int)
 // Kernel interface gets call sub-number and pointer to a0.
-TEXT ·rawsocketcall(SB),NOSPLIT,$0-36
+// Reached only through the rawsocketcall Go wrapper, which consults the DST fence.
+TEXT ·rawsocketcall1(SB),NOSPLIT,$0-36
 	MOVL	$SYS_SOCKETCALL, AX	// syscall entry
 	MOVL	call+0(FP), BX	// socket call number
 	LEAL		a0+4(FP), CX	// pointer to call arguments

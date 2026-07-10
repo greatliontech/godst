@@ -35,7 +35,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Syscall boundary (src/syscall)
 
-- [ ] 5. on socketcall architectures (386, s390x) the socket-family wrappers
+- [x] 5. on socketcall architectures (386, s390x) the socket-family wrappers
   consult the fence exactly as the trampolines do: bubble caller gets the
   standard refusal, non-bubble callers fall through. The 386 fence test
   exercises the `syscall.Socket` wrapper path, not only the raw trampoline.
