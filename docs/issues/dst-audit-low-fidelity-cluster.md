@@ -1,6 +1,6 @@
 # DST audit: low-severity fidelity and hygiene divergences
 
-Lands: when each divergence is corrected or recorded as a modeled limit
+Lands: chunks 4, 9, 11–17, 24, 25, 28, 29 of docs/plans/dst-audit-fixes.md (per item; chunk 29 is the last)
 
 ## Gap
 

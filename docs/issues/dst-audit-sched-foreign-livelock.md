@@ -1,6 +1,6 @@
 # DST audit: an always-runnable outside goroutine livelocks the run with no diagnostic
 
-Lands: when foreign-goroutine scheduling cannot starve the bubble, or the starvation is diagnosed
+Lands: chunk 2 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

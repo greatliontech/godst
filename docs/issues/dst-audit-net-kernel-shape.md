@@ -1,6 +1,6 @@
 # DST audit: net divergences from kernel shape (retransmit horizon, refuse-vs-blackhole, bind, backlog, close-RST)
 
-Lands: when the wire model matches these production behaviors, or the spec records each as a modeled limit
+Lands: chunks 19–23 of docs/plans/dst-audit-fixes.md (item 1 → 20, 2 → 19, 3 → 21, 4 → 22, 5 → 23)
 
 ## Gap
 

@@ -1,6 +1,6 @@
 # DST audit: fault APIs from a non-bubble goroutine execute nondeterministically or silently no-op
 
-Lands: when fault-injection APIs require a bubble-goroutine caller during an active run
+Lands: chunk 27 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

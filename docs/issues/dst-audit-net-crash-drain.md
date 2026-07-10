@@ -1,6 +1,6 @@
 # DST audit: host crash lets the surviving peer drain in-flight bytes before ECONNRESET
 
-Lands: when a crashed host's connections reset at the peer without delivering queued bytes
+Lands: chunk 18 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

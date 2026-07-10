@@ -1,6 +1,6 @@
 # DST audit: crypto/rand hands seed-independent constant bytes to unseeded goroutine subtrees
 
-Lands: when the deterministic-entropy gate keys on membership in the seeded goroutine tree
+Lands: chunk 1 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

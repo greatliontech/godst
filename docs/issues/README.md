@@ -8,24 +8,25 @@ deletes the resolved entry.
 
 ## Open
 
-Full-surface DST audit (2026-07-10), severity-ordered. Each entry's `Lands:` is
-the self-contained condition that resolves it.
+Full-surface DST audit (2026-07-10), severity-ordered. Every entry is folded
+into the active plan, `docs/plans/dst-audit-fixes.md`; `Lands:` names its
+chunk(s) there.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [socketcall arches bypass the syscall fence](./dst-audit-socketcall-fence.md) | H | fence refuses socket-family syscalls on socketcall arches |
-| [crypto/rand taints unseeded goroutine subtrees](./dst-audit-crypto-rand-taint.md) | H | entropy gate keys on seeded-tree membership |
-| [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | crashed host's conns reset at peer without delivering queued bytes |
-| [pre-seeded /tmp born unsynced, erased by crash](./dst-audit-fs-tmp-durability.md) | H | mkfs image is part of the durable image |
-| [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | restore commits the restored image as durable |
-| [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | options apply only after enterSimulation admits the run |
-| [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | fault APIs require a bubble-goroutine caller |
-| [foreign goroutine livelocks the run](./dst-audit-sched-foreign-livelock.md) | M | foreign scheduling cannot starve the bubble, or is diagnosed |
-| [latched GC trigger started by foreign allocation](./dst-audit-gc-foreign-trigger.md) | M | DST trigger started only inside the bubble-allocation gate |
-| [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | empty-effective-slice write leaves size/mtime unchanged |
-| [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | dstRoot handles carry and check the run epoch |
-| [page-cache memfds killable by SUT close](./dst-audit-memfd-fd-space.md) | M | page-cache fds isolated from the SUT-visible fd space |
-| [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | wire model matches, or spec records each as a modeled limit |
-| [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | mprotect tracks fd writability, or spec records the restriction |
-| [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | spec docs reconciled with the landed surface |
-| [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | each divergence corrected or recorded as a modeled limit |
+| [socketcall arches bypass the syscall fence](./dst-audit-socketcall-fence.md) | H | chunk 5 |
+| [crypto/rand taints unseeded goroutine subtrees](./dst-audit-crypto-rand-taint.md) | H | chunk 1 |
+| [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
+| [pre-seeded /tmp born unsynced, erased by crash](./dst-audit-fs-tmp-durability.md) | H | chunk 7 |
+| [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |
+| [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
+| [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
+| [foreign goroutine livelocks the run](./dst-audit-sched-foreign-livelock.md) | M | chunk 2 |
+| [latched GC trigger started by foreign allocation](./dst-audit-gc-foreign-trigger.md) | M | chunk 3 |
+| [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |
+| [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
+| [page-cache memfds killable by SUT close](./dst-audit-memfd-fd-space.md) | M | chunk 6 |
+| [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 19–23 |
+| [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | chunk 12 |
+| [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
+| [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunks 4, 9, 11–17, 24, 25, 28, 29 |

@@ -1,6 +1,6 @@
 # DST audit: spec-hygiene defects (stale status, undefined invariant IDs, planning codenames)
 
-Lands: when the spec docs are reconciled with the landed surface and the artifact-homes contract
+Lands: chunk 30 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

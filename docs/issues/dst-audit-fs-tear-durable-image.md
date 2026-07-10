@@ -1,6 +1,6 @@
 # DST audit: crash restore never advances the durable image; a second crash redraws the disk
 
-Lands: when a host-crash restore commits the restored image as the new durable image
+Lands: chunk 8 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

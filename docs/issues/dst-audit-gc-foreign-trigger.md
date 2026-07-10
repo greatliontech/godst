@@ -1,6 +1,6 @@
 # DST audit: a latched GC trigger can be started by a foreign allocation, shifting cycle boundaries
 
-Lands: when the DST GC trigger is started only inside the bubble-allocation gate
+Lands: chunk 3 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

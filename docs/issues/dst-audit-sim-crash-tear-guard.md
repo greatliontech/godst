@@ -1,6 +1,6 @@
 # DST audit: a rejected Run mutates the active run's crash-tear policy before its guard panics
 
-Lands: when runOptions applies policy only after enterSimulation admits the run
+Lands: chunk 26 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

@@ -1,6 +1,6 @@
 # DST audit: the pre-seeded /tmp baseline is born unsynced and erased by every host crash
 
-Lands: when the mkfs image is part of the durable image
+Lands: chunk 7 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

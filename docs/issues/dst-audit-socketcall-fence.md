@@ -1,6 +1,6 @@
 # DST audit: socketcall arches bypass the syscall fence
 
-Lands: when the interception boundary refuses socket-family syscalls on socketcall architectures
+Lands: chunk 5 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

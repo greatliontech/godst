@@ -1,6 +1,6 @@
 # DST audit: page-cache memfds live in ordinary fd numbers and are killable by SUT close
 
-Lands: when harness page-cache fds are isolated from the SUT-visible fd number space
+Lands: chunk 6 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

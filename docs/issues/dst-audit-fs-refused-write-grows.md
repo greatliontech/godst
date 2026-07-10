@@ -1,6 +1,6 @@
 # DST audit: zero-effective-length and fully-refused writes still grow the file
 
-Lands: when a write with an empty effective slice neither grows the file nor bumps mtime
+Lands: chunk 9 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

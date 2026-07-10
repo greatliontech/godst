@@ -1,6 +1,6 @@
 # DST audit: a leaked *Root across runs defeats the epoch gate and nil-derefs
 
-Lands: when dstRoot handles carry and check the run epoch like dstFile
+Lands: chunk 10 of docs/plans/dst-audit-fixes.md
 
 ## Gap
 

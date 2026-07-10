@@ -1,6 +1,6 @@
 # DST audit: dstMprotect refuses protection changes Linux allows
 
-Lands: when mprotect tracks fd writability, or the spec records the modeled restriction
+Lands: chunk 12 of docs/plans/dst-audit-fixes.md (user decision 2026-07-10: track fd writability)
 
 ## Gap
 
