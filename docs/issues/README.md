@@ -17,7 +17,6 @@ chunk(s) there.
 | [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
-| [leaked *Root across runs defeats the epoch gate](./dst-audit-leaked-root-epoch.md) | M | chunk 10 |
 | [net divergences from kernel shape](./dst-audit-net-kernel-shape.md) | M | chunks 19–23 |
 | [mprotect refuses changes Linux allows](./dst-audit-mprotect-fidelity.md) | M | chunk 12 |
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |

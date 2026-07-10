@@ -656,8 +656,11 @@ implemented in-sim or fails with the unsupported shape while a run is active
 (`os.Pipe` is simulated — see "Deterministic pipes and the stdio stance"). A `File` or `Root` opened
 BEFORE the run is a host-backed handle and stays outside the base model, exactly as inherited fds are
 for the network — program discipline, recorded here as the inherited-handle stance — and
-symmetrically, a simulated `File` leaked OUT of its run keeps operating on its run's orphaned tree in
-later runs: deterministic, host-isolated, and meaningless, the same discipline applied in reverse. An
+symmetrically, a simulated `File` or `Root` leaked OUT of its run is refused like a closed handle
+(both carry the run epoch; the run's nodes are released with the run — lazily, at the next run's
+first filesystem op) — deterministic and
+host-isolated, the same discipline applied in reverse, and never a read of a prior run's tree nor a
+dereference of its released page caches (`TestDSTRootLeakedAcrossRuns`). An
 operation pairing a simulated handle with a pre-run host handle behaves as its two halves: the
 simulated side goes through the gated funnels and the host side does real I/O (`io.Copy` from a
 simulated file to an inherited stdout takes the generic loop — the zero-copy fast paths bail whenever

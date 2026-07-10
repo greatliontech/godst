@@ -59,7 +59,7 @@ Audit reproducers (ephemeral, from the audit session):
   by the ENOSPC cap) leaves size, content, resident-byte accounting, and mtime
   unchanged. (dst-audit-fs-refused-write-grows; subsumes the
   failed-writes-bump-mtime nit of dst-audit-low-fidelity-cluster)
-- [ ] 10. `dstRoot` handles (and files opened through them) carry and check
+- [x] 10. `dstRoot` handles (and files opened through them) carry and check
   the run epoch like `dstFile`: a Root leaked across a run boundary is refused
   deterministically — never a nil deref, never a read of a prior run's tree.
   (dst-audit-leaked-root-epoch)

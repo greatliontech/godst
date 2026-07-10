@@ -1664,3 +1664,71 @@ func TestDSTFSReplay(t *testing.T) {
 		t.Fatalf("transcript length %d, want %d (lost or duplicated writes)", len(a), 4*4*len("[g0:0]"))
 	}
 }
+
+// TestDSTRootLeakedAcrossRuns: a *Root leaked across a run boundary — and any
+// file minted through it — is refused deterministically, like a leaked *File:
+// never a nil deref, never a read of the prior run's tree, on BOTH sides of
+// the next run's first filesystem op (which is when the prior run's nodes are
+// released). Under the bug, an op ordered before that release silently read
+// run 1's un-released tree, and one ordered after it SIGSEGV'd on the
+// released page cache — run-2 observable state depending on op ordering.
+func TestDSTRootLeakedAcrossRuns(t *testing.T) {
+	var leakedRoot *os.Root
+	var leakedFile *os.File
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/d", 0o755); err != nil {
+			t.Errorf("mkdir: %v", err)
+			return
+		}
+		if err := os.WriteFile("/d/f", []byte("run1"), 0o644); err != nil {
+			t.Errorf("write: %v", err)
+			return
+		}
+		r, err := os.OpenRoot("/d")
+		if err != nil {
+			t.Errorf("OpenRoot: %v", err)
+			return
+		}
+		leakedRoot = r
+		f, err := r.OpenFile("f", os.O_RDWR, 0)
+		if err != nil {
+			t.Errorf("root OpenFile: %v", err)
+			return
+		}
+		leakedFile = f
+	})
+	if t.Failed() {
+		return
+	}
+	// BETWEEN runs (no run active, epoch reads 0): already refused — the tree
+	// is not yet physically released, so a pass-through here would silently
+	// read run 1's tree with no run active.
+	if _, err := leakedRoot.Stat("f"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("leaked Root between runs = %v, want ErrClosed", err)
+	}
+	simulation.Run(2, func() {
+		// Before the roll (no run-2 fs op yet): refused, not a stale read —
+		// with the closed-handle identity, like a leaked *File.
+		if _, err := leakedRoot.Stat("f"); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("leaked Root before the roll = %v, want ErrClosed", err)
+		}
+		if _, err := leakedRoot.OpenFile("f", os.O_RDWR, 0); err == nil {
+			t.Error("leaked Root minted a file over the prior run's tree")
+		}
+		// Roll: the first run-2 fs op releases run 1's nodes.
+		if _, err := os.Stat("/tmp"); err != nil {
+			t.Errorf("stat /tmp: %v", err)
+		}
+		// After the roll: still refused, and the leaked root-minted file is
+		// refused too (a write here SIGSEGV'd on the released page cache).
+		if _, err := leakedRoot.Stat("f"); err == nil {
+			t.Error("leaked Root usable after the roll")
+		}
+		if _, err := leakedFile.Write([]byte("x")); err == nil {
+			t.Error("leaked root-minted File wrote into a dead run")
+		}
+		if _, err := leakedFile.Read(make([]byte, 4)); err == nil {
+			t.Error("leaked root-minted File read from a dead run")
+		}
+	})
+}

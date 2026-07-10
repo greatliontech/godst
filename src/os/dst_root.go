@@ -17,6 +17,16 @@ import (
 type dstRoot struct {
 	node *dstFSNode
 	disk *dstFSDisk
+	// epoch is the run this Root belongs to, stamped at creation.
+	// dstRootEnter refuses a Root from a dead run exactly as dstFile.enter
+	// refuses a dead handle: the run's nodes were released with the run
+	// (their page caches are gone — node.pc is nil), and before this gate a
+	// leaked *Root either nil-dereferenced them (op ordered after the next
+	// run's first fs op) or silently read the prior run's un-released tree
+	// (ordered before it) — run-2 observable state depending on op ordering,
+	// a determinism leak. Files opened through a Root are epoch-gated by the
+	// same check before dstNewFile can stamp them with the current epoch.
+	epoch uint64
 }
 
 func dstRootActive(r *Root) bool {
@@ -24,7 +34,7 @@ func dstRootActive(r *Root) bool {
 }
 
 func dstNewRoot(name string, node *dstFSNode, disk *dstFSDisk) *Root {
-	r := &Root{&root{fd: -1, name: name, dst: &dstRoot{node: node, disk: disk}}}
+	r := &Root{&root{fd: -1, name: name, dst: &dstRoot{node: node, disk: disk, epoch: dstFSEpoch()}}}
 	runtime.SetFinalizer(r.root, (*root).Close)
 	return r
 }
@@ -69,6 +79,14 @@ func dstRootDelay(r *dstRoot) {
 func dstRootEnter(r *Root) (*dstRoot, error) {
 	if err := r.root.incref(); err != nil {
 		return nil, err
+	}
+	if r.root.dst.epoch != dstFSEpoch() {
+		// A Root from a dead run: refused like a closed handle, the identity
+		// a closed Root and a leaked *File both surface (the File's
+		// ErrFileClosing is converted by wrapErr; the Root path has no such
+		// converter, so ErrClosed is returned directly). See dstRoot.epoch.
+		r.root.decref()
+		return nil, ErrClosed
 	}
 	return r.root.dst, nil
 }
