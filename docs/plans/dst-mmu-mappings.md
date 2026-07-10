@@ -73,7 +73,7 @@ is attributed to a process, and the simulated page size stays 4096.
 - [x] 4. Fault semantics under crash. A process crash keeps the arena (the page
       cache outlives the process); a host crash drops it; a tear rebuilds it
       from the durable image. `Explore`/`Replay` reproduce a fault exactly.
-- [ ] 5. Compatibility coverage. Extend the harness with the reservation mapping,
+- [x] 5. Compatibility coverage. Extend the harness with the reservation mapping,
       per-commit shrink, and a reader that respects the high-water mark — plus
       the negative: a read past it kills that process and only that process.
 - [ ] 6. Spec, release, close-out. Verify § Memory mappings matches the landed

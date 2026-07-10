@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -335,3 +336,299 @@ func TestDSTGMDBCompat(t *testing.T) {
 		t.Fatalf("after a HOST crash the file reads %q, want only the durable header", rebootReadsDurableOnly)
 	}
 }
+
+// TestDSTGMDBPagerLifecycle is the pager's mmap strategy end to end, the
+// shape gmdb's internal/pager performs: a read-only reservation of MaxSize
+// over a short file, growth in GrowStep extents under the live reservation
+// (readable with no remap), per-commit fdatasync then maybeShrink's truncate
+// toward the high-water mark, a reader that respects the HWM published
+// through the coordination slot — and the negative, a reader that does not,
+// whose process dies alone. Then a TORN host crash with the reservation live:
+// the durable prefix survives byte-for-byte, the unsynced tail is at the
+// tear's mercy, and the rebooted process's fresh mapping reads the restored
+// page cache (the same pages read(2) sees, which is what rules out a restore
+// that moved the bytes out of the page cache).
+func TestDSTGMDBPagerLifecycle(t *testing.T) {
+	const (
+		page        = 4096
+		maxSize     = 64 * page // the reservation: MaxSize
+		growStep    = 4 * page
+		commits     = 6
+		durablePage = 0 // the header page: fdatasync'd, so the torn crash must preserve it
+	)
+	var (
+		rogueDied            bool
+		writerAlive          error
+		grownVisible         bool
+		shrunkTo             int64
+		rebootMappedDurable  []byte
+		rebootMappedUnsynced byte
+	)
+	TestWith(t, 1, Options{CrashTear: true}, func(t *testing.T) {
+		Host("db", HostConfig{}, func() {
+			f, err := os.OpenFile("/data", os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatalf("create data file: %v", err)
+			}
+			// MinSize: two pages, header durable.
+			f.Write(make([]byte, 2*page))
+			f.WriteAt([]byte("HDRv1"), 0)
+			rawFdatasync(f.Fd())
+			// The data barrier covers the BYTES; the directory fsync makes the
+			// NAMES durable — omit it and the torn reboot rightly finds no file.
+			syncDir(t, "/")
+
+			// The coordination slot (gmdb's lock-file header): HWM in pages.
+			lf, err := os.OpenFile("/lock", os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatalf("create lock file: %v", err)
+			}
+			lf.Write(make([]byte, 8))
+			slot, err := syscall.Mmap(int(lf.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("lock mmap: %v", err)
+			}
+			hwm := (*uint32)(unsafe.Pointer(&slot[0]))
+			atomic.StoreUint32(hwm, 2)
+
+			// mmapRO: the MaxSize reservation over the two-page file.
+			ro, err := syscall.Mmap(int(f.Fd()), 0, maxSize, syscall.PROT_READ, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("reservation mmap: %v", err)
+			}
+			if err := rawMadvise(ro, madvPopulateRead); err != nil {
+				t.Fatalf("madvise reservation: %v", err)
+			}
+
+			writerPID := make(chan int, 1)
+			commitsDone := make(chan struct{})
+			freesGo := make(chan struct{})
+			freesDone := make(chan struct{})
+			go Process("writer", func() {
+				writerPID <- os.Getpid()
+				g, err := os.OpenFile("/data", os.O_RDWR, 0)
+				if err != nil {
+					t.Errorf("writer open: %v", err)
+					return
+				}
+				defer g.Close()
+				// The single-writer flock, as the database's writer holds it.
+				if err := syscall.Flock(int(g.Fd()), syscall.LOCK_EX); err != nil {
+					t.Errorf("writer flock: %v", err)
+					return
+				}
+				// Mapping slices are process-owned capabilities: the writer maps
+				// the coordination slot ITSELF, as the database's processes each
+				// map their own views — never through another process's slice.
+				wl, err := os.OpenFile("/lock", os.O_RDWR, 0)
+				if err != nil {
+					t.Errorf("writer lock open: %v", err)
+					return
+				}
+				wslot, err := syscall.Mmap(int(wl.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				wl.Close()
+				if err != nil {
+					t.Errorf("writer slot mmap: %v", err)
+					return
+				}
+				whwm := (*uint32)(unsafe.Pointer(&wslot[0]))
+				extent := int64(2 * page) // file-backed pages, ahead of the HWM
+				for c := 0; c < commits; c++ {
+					pageNo := int64(2 + c)
+					// AllocPage: grow only when the claimed page is PAST the
+					// extent, GrowStep-aligned — one truncate per GrowStep.
+					if need := (pageNo + 1) * page; need > extent {
+						target := (need + growStep - 1) / growStep * growStep
+						if err := g.Truncate(target); err != nil {
+							t.Errorf("grow to %d: %v", target, err)
+							return
+						}
+						extent = target
+					}
+					content := byte('A' + c)
+					buf := make([]byte, page)
+					for i := range buf {
+						buf[i] = content
+					}
+					if _, err := g.WriteAt(buf, pageNo*page); err != nil {
+						t.Errorf("commit %d write: %v", c, err)
+						return
+					}
+					if c < commits-1 { // the LAST commit stays unsynced: the tear's prey
+						rawFdatasync(g.Fd())
+						atomic.StoreUint32(whwm, uint32(pageNo+1))
+					}
+					// maybeShrink: truncate toward HWM under the live reservation.
+					hw := int64(atomic.LoadUint32(whwm)) * page
+					target := (hw + growStep - 1) / growStep * growStep
+					if target < extent {
+						if err := g.Truncate(target); err != nil {
+							t.Errorf("maybeShrink to %d: %v", target, err)
+							return
+						}
+						extent = target
+					}
+				}
+				close(commitsDone)
+				// Frees: after the harness has read the grown pages, the
+				// workload drops to 3 live pages and maybeShrink reclaims the
+				// slack — the shape that makes the shrink observable (tight
+				// growth alone also ends GrowStep-aligned, at a larger size).
+				<-freesGo
+				atomic.StoreUint32(whwm, 3)
+				target := (int64(3)*page + growStep - 1) / growStep * growStep
+				if target < extent {
+					if err := g.Truncate(target); err != nil {
+						t.Errorf("maybeShrink after frees: %v", err)
+						return
+					}
+					extent = target
+				}
+				close(freesDone)
+				select {} // hold the file and the flock until the machine dies
+			})
+			wpid := <-writerPID
+			<-commitsDone
+
+			// A reader that respects the HWM sees the committed pages through
+			// the reservation — including pages that did not exist at map time.
+			grownVisible = true
+			for p := 2; p < int(atomic.LoadUint32(hwm)); p++ {
+				want := byte('A' + p - 2)
+				if ro[p*page] != want || ro[(p+1)*page-1] != want {
+					grownVisible = false
+					t.Errorf("page %d via reservation = %q %q, want %q", p, ro[p*page], ro[(p+1)*page-1], want)
+				}
+			}
+
+			// Only now may the writer free and shrink: the loop above read the
+			// grown pages through the reservation, and the shrink cuts them.
+			close(freesGo)
+			<-freesDone
+
+			// The rogue reader ignores the HWM and reads wholly past EOF: its
+			// process dies; the writer and the harness do not.
+			rogueDone := make(chan int, 1)
+			go Process("rogue", func() {
+				rogueDone <- os.Getpid()
+				rf, err := os.Open("/data")
+				if err != nil {
+					t.Errorf("rogue open: %v", err)
+					return
+				}
+				rro, err := syscall.Mmap(int(rf.Fd()), 0, maxSize, syscall.PROT_READ, syscall.MAP_SHARED)
+				rf.Close()
+				if err != nil {
+					t.Errorf("rogue reservation: %v", err)
+					return
+				}
+				pagerSink.Store(uint32(rro[maxSize-page])) // SIGBUS: page far past EOF
+				t.Errorf("rogue read past the reservation's backing did not fault")
+			})
+			rpid := <-rogueDone
+			for range 100 {
+				runtime.Gosched()
+			}
+			rogueDied = syscall.Kill(rpid, 0) == syscall.ESRCH
+			writerAlive = syscall.Kill(wpid, 0)
+
+			if fi, err := os.Stat("/data"); err == nil {
+				shrunkTo = fi.Size()
+			}
+		})
+
+		CrashHost("db") // power loss, TORN: page-granular wreckage of the unsynced tail
+
+		Host("db", HostConfig{}, func() {
+			Process("recovery", func() {
+				g, err := os.OpenFile("/data", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("reboot open: %v", err)
+				}
+				defer g.Close()
+				m, err := syscall.Mmap(int(g.Fd()), 0, maxSize, syscall.PROT_READ, syscall.MAP_SHARED)
+				if err != nil {
+					t.Fatalf("reboot reservation: %v", err)
+				}
+				// Read the DURABLE page through the fresh mapping: the restore
+				// must have landed in the page cache itself, or read(2) and
+				// the mapping would disagree.
+				rebootMappedDurable = append([]byte(nil), m[durablePage*page:durablePage*page+8]...)
+				rd, err := os.ReadFile("/data")
+				if err != nil {
+					t.Fatalf("reboot read: %v", err)
+				}
+				// The durable prefix survives byte-for-byte: every SYNCED commit
+				// ('A'..'E' on pages 2..6) reads back through the fresh
+				// reservation, and the restored length is one of the two sizes
+				// the torn size-draw allows.
+				// The size draw decides whether the unsynced shrink's length
+				// change landed: the durable image was 8 pages (the last
+				// fdatasync), the current file 4. Synced pages beyond a landed
+				// truncate are genuinely lost — an unsynced ftruncate frees
+				// their blocks — so the byte-for-byte claim is bounded by the
+				// restored length.
+				if int64(len(rd)) != 4*page && int64(len(rd)) != 8*page {
+					t.Errorf("restored length = %d, want 4 or 8 pages", len(rd))
+				}
+				for p := int64(2); p <= 6 && (p+1)*page <= int64(len(rd)); p++ {
+					want := byte('A' + p - 2)
+					if m[p*page] != want || m[(p+1)*page-1] != want {
+						t.Errorf("durable page %d after torn reboot = %q %q, want %q", p, m[p*page], m[(p+1)*page-1], want)
+					}
+				}
+				// One set of bytes: read(2) and the fresh mapping must agree on
+				// EVERY byte of the restored file — a restore that moved the
+				// bytes out of the page cache would leave the memfd holding the
+				// pre-crash image while read(2) serves the restored one.
+				for i := range rd {
+					if rd[i] != m[i] {
+						t.Errorf("read(2) and the mapping disagree at byte %d: %d vs %d", i, rd[i], m[i])
+						break
+					}
+				}
+				// And write-through must hold POST-restore, whatever the tear
+				// drew: a write(2) after reboot is visible through the mapping.
+				if _, err := g.WriteAt([]byte{0xEE}, int64(durablePage*page+9)); err != nil {
+					t.Fatalf("post-reboot write: %v", err)
+				}
+				if m[durablePage*page+9] != 0xEE {
+					t.Errorf("post-reboot write invisible through the mapping: the restore detached the page cache")
+				}
+				// The last commit was never synced: its page holds either the
+				// durable image's bytes (zeros — it did not exist durably) or,
+				// page-granularly, the torn survivors. Never a mix within one
+				// byte's identity, and never a fault below the restored size.
+				lastPage := 2 + commits - 1
+				if int64(len(rd)) > int64(lastPage)*page {
+					rebootMappedUnsynced = m[lastPage*page]
+					if got := rebootMappedUnsynced; got != 0 && got != byte('A'+commits-1) {
+						t.Errorf("torn unsynced page reads %q, want zeros or its own content", got)
+					}
+				}
+				syscall.Munmap(m)
+			})
+		})
+	})
+	if !rogueDied {
+		t.Errorf("the rogue reader survived reading past the reservation's backing")
+	}
+	if writerAlive != nil {
+		t.Errorf("the writer did not survive the rogue's death: Kill = %v", writerAlive)
+	}
+	if !grownVisible {
+		t.Errorf("committed pages were not visible through the pre-growth reservation")
+	}
+	// Exact, not merely GrowStep-aligned: without maybeShrink the file ends at
+	// 6 GrowSteps of growth; with it, alignUp(final HWM of 7 pages) = 8 pages.
+	if shrunkTo != 4*page {
+		t.Errorf("maybeShrink left size %d, want %d (alignUp of the post-frees HWM)", shrunkTo, 4*page)
+	}
+	if string(rebootMappedDurable) != "HDRv1\x00\x00\x00" {
+		t.Errorf("durable page after torn reboot = %q, want the fdatasync'd header", rebootMappedDurable)
+	}
+}
+
+// pagerSink keeps the rogue's load from being optimized away: an elided load
+// is an elided fault.
+var pagerSink atomic.Uint32
