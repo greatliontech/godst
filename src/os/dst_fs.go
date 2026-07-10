@@ -1351,6 +1351,14 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
+	if d.app {
+		// Linux pwrite(2), BUGS section: on a file opened O_APPEND, pwrite
+		// APPENDS to the end of the file regardless of the offset.
+		// os.File.WriteAt refuses append handles at the os layer
+		// (ErrWriteAtInAppendMode), so only the raw syscall.Pwrite surface
+		// reaches here with one — and it must get the kernel's shape.
+		off = int64(len(d.node.data))
+	}
 	// pwrite models a SINGLE pwrite(2): os.File.WriteAt loops over it and adds the
 	// count only after the error check, so a partial fill must return (n, nil) here
 	// and let the loop surface ENOSPC on the next zero-byte call — returning a

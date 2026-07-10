@@ -2336,3 +2336,30 @@ func TestDSTFSVirtualFDFlockCloseWhileBlocked(t *testing.T) {
 		})
 	})
 }
+
+// TestDSTFSVirtualFDPwriteAppendHandle: Linux pwrite(2) (BUGS section)
+// appends to a file opened O_APPEND regardless of the offset — the raw
+// syscall surface must reproduce that shape (os.File.WriteAt never reaches
+// it: the os layer refuses append handles).
+func TestDSTFSVirtualFDPwriteAppendHandle(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/log", []byte("base"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f, err := os.OpenFile("/log", os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		defer f.Close()
+		if n, err := syscall.Pwrite(int(f.Fd()), []byte("XY"), 0); n != 2 || err != nil {
+			t.Fatalf("Pwrite on O_APPEND = %d, %v; want 2, nil", n, err)
+		}
+		got, err := os.ReadFile("/log")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(got) != "baseXY" {
+			t.Fatalf("file after Pwrite(off=0) on O_APPEND = %q, want %q (Linux appends, ignoring the offset)", got, "baseXY")
+		}
+	})
+}

@@ -78,7 +78,7 @@ Audit reproducers (ephemeral, from the audit session):
   permits. (dst-audit-low-fidelity-cluster)
 - [x] 14. a blocked flock waiter whose fd is closed elsewhere wakes to the
   grant Linux gives, not EBADF. (dst-audit-low-fidelity-cluster)
-- [ ] 15. raw `syscall.Pwrite` on an O_APPEND file appends, as Linux does.
+- [x] 15. raw `syscall.Pwrite` on an O_APPEND file appends, as Linux does.
   (dst-audit-low-fidelity-cluster)
 - [ ] 16. the proc-overlay fd identity contract is reachable and holds:
   `Fd()`/fstat over a proc-overlay file agree with the spec's zero

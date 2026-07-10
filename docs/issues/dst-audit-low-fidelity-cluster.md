@@ -39,8 +39,7 @@ verified, none blocking:
   matches reality.
 
 - **nits:** Explore misattributes
-  fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455); raw `syscall.Pwrite` on an O_APPEND file honors the
-  offset (Linux appends).
+  fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455).
 
 ## Required outcome
 
