@@ -10,6 +10,7 @@ import (
 	"cmp"
 	"internal/poll"
 	"io"
+	"math"
 	"path"
 	"runtime"
 	"slices"
@@ -61,6 +62,10 @@ var dstFS struct {
 	disks   map[uint32]*dstFSDisk // host id -> the host's in-memory tree
 	cwds    map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
 	nextIno uint64                // last synthetic inode number handed out (dstFSAllocIno)
+	// backed lists every regular node of the run — each is born with a page
+	// cache — so the run's end can close their descriptors and take back the
+	// mapping region in one stroke (dstNodeReleaseRunLocked).
+	backed []*dstFSNode
 }
 
 var dstOpenFiles struct {
@@ -197,6 +202,10 @@ func dstFSCurrentNode() (host, proc uint32)
 // clears the maps.
 func dstFSRoll() {
 	if e := dstFSEpoch(); e != dstFS.epoch || dstFS.disks == nil {
+		// The run that is ending owns page caches and their mappings. Drop them
+		// before the nodes go: a mapping outliving its run would leave the
+		// runtime's fault registry claiming addresses no simulated file owns.
+		dstNodeReleaseRunLocked()
 		dstFS.epoch = e
 		dstFS.disks = make(map[uint32]*dstFSDisk)
 		dstFS.cwds = make(map[[2]uint32]string)
@@ -230,6 +239,10 @@ func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
 	}
 	if isDir {
 		node.entries = make(map[string]*dstFSNode)
+	} else {
+		// A regular file's bytes live in its page cache from birth (see
+		// dst_pagecache_linux.go); both create paths hold dstFS.mu.
+		dstNodeBackLocked(node)
 	}
 	return node
 }
@@ -320,9 +333,15 @@ type dstFSNode struct {
 	// before the removal); lookups need no flag — an unlinked dir is empty.
 	unlinked bool
 
-	// Regular file state.
+	// Regular file state. Once the file is mapped, data aliases the node's page
+	// cache (dstNodeCache) and MUST NOT be appended to: an append that
+	// reallocated would move the bytes out of the page cache, and the system
+	// under test's mappings would stop seeing them. dstNodeSetSizeLocked is the
+	// only way to change its length. synced, the durable image, is always an
+	// ordinary slice — nothing maps it.
 	data   []byte
 	synced []byte
+	pc     *dstNodeCache
 
 	// Directory state.
 	entries       map[string]*dstFSNode
@@ -780,15 +799,7 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 	if dstMMapShrinkFencedLocked(node, size) {
 		return dstErrUnsupportedFS
 	}
-	dstMMapSyncLocked(node)
-	switch {
-	case size <= int64(len(node.data)):
-		node.data = node.data[:size]
-	default:
-		grown := make([]byte, size)
-		copy(grown, node.data)
-		node.data = grown
-	}
+	dstNodeSetSizeLocked(node, size)
 	node.modTime = time.Now()
 	return nil
 }
@@ -926,6 +937,13 @@ type dstFile struct {
 	app    bool
 	osync  bool // O_SYNC: every write commits the durable image
 	closed bool
+	// epoch is the run this handle belongs to, stamped at creation
+	// (dstNewFile). enter() refuses a handle from a dead run as it refuses a
+	// closed one: the run's nodes were released with the run (their page
+	// caches are gone — node.pc is nil), and before this gate a leaked *File
+	// dereferenced them. The virtual-fd front door has the same gate
+	// (dstFDLookup's epoch check answers EBADF).
+	epoch uint64
 }
 
 // dstOpenFile implements OpenFile against the simulated tree while a run is
@@ -1048,6 +1066,9 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 // with an invalid Sysfd so any not-yet-gated path fails with EBADF
 // deterministically instead of touching a real descriptor.
 func dstNewFile(d dstFileBackend, name string) *File {
+	if df, ok := d.(*dstFile); ok {
+		df.epoch = dstFSEpoch()
+	}
 	f := &File{&file{name: name, dstf: d}}
 	f.pfd.Sysfd = -1
 	host, proc := dstFSCurrentNode()
@@ -1061,7 +1082,7 @@ func dstNewFile(d dstFileBackend, name string) *File {
 // order). Callers must call leave (via defer) when it returns nil.
 func (d *dstFile) enter() error {
 	d.mu.Lock()
-	if d.closed {
+	if d.closed || d.epoch != dstFSEpoch() {
 		d.mu.Unlock()
 		return poll.ErrFileClosing
 	}
@@ -1208,7 +1229,6 @@ func (d *dstFile) read(b []byte) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
-	dstMMapSyncLocked(d.node)
 	if d.off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -1234,7 +1254,6 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
-	dstMMapSyncLocked(d.node)
 	if off >= int64(len(d.node.data)) {
 		return 0, io.EOF
 	}
@@ -1257,7 +1276,10 @@ func (d *dstFile) write(b []byte) (int, error) {
 		d.off = int64(len(d.node.data))
 	}
 	allowed := d.enospcAllowed(d.off, int64(len(b)))
-	n := d.writeAtLocked(b[:allowed], d.off)
+	n, werr := d.writeAtLocked(b[:allowed], d.off)
+	if werr != nil {
+		return n, werr
+	}
 	d.off += int64(n)
 	if d.osync {
 		d.node.commitLocked()
@@ -1295,7 +1317,10 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if allowed == 0 && len(b) > 0 {
 		return 0, syscall.ENOSPC
 	}
-	n := d.writeAtLocked(b[:allowed], off)
+	n, werr := d.writeAtLocked(b[:allowed], off)
+	if werr != nil {
+		return n, werr
+	}
 	if d.osync {
 		d.node.commitLocked()
 	}
@@ -1304,26 +1329,23 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 
 // writeAtLocked extends-with-zeros as needed and copies b at off. Caller
 // holds both locks. Mutates current content only (never the durable image).
-func (d *dstFile) writeAtLocked(b []byte, off int64) int {
+// writeAtLocked's caller checked the offset is non-negative; the far bound is
+// checked here: an offset so large the write's end overflows int64 is EFBIG on
+// real Linux (the file size limit), where the overflowed arithmetic would have
+// skipped the growth and indexed past the slice instead.
+func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 	node := d.node
-	dstMMapSyncLocked(node)
-	if need := off + int64(len(b)); need > int64(len(node.data)) {
-		if need <= int64(cap(node.data)) {
-			// Re-extending within capacity: zero the gap, or bytes from a
-			// previous longer state resurrect (truncate-down then extend).
-			oldLen := len(node.data)
-			node.data = node.data[:need]
-			clear(node.data[oldLen:])
-		} else {
-			// append for amortized growth (an exact-size make would copy
-			// O(n^2) over append-heavy workloads).
-			node.data = append(node.data, make([]byte, need-int64(len(node.data)))...)
-		}
+	if off > int64(math.MaxInt64)-int64(len(b)) {
+		return 0, syscall.EFBIG
 	}
+	if need := off + int64(len(b)); need > int64(len(node.data)) {
+		dstNodeSetSizeLocked(node, need)
+	}
+	// A backed node's data IS the page cache, so the copy is the whole of the
+	// write: every mapping of this file already sees it.
 	n := copy(node.data[off:], b)
-	dstMMapWriteLocked(node, off, b[:n])
 	node.modTime = time.Now()
-	return n
+	return n, nil
 }
 
 func (d *dstFile) seek(offset int64, whence int) (int64, error) {
@@ -1498,7 +1520,6 @@ func (node *dstFSNode) commitLocked() {
 }
 
 func (node *dstFSNode) commitDataLocked() {
-	dstMMapSyncLocked(node)
 	node.synced = append([]byte(nil), node.data...)
 }
 

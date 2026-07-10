@@ -84,11 +84,16 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 	// virtual descriptor, and dstCloseHostFilesFor released the host's entire
 	// descriptor table before the disk was restored — the locks went with it.
 	if !node.isDir {
+		// In place, never by reassignment: node.data aliases the node's page
+		// cache, and the rewind must land where any still-registered mapping
+		// of a dead process's would have looked (they are unmapped by then,
+		// but the bytes' home does not move).
+		image := node.synced
 		if dstCrashTear {
-			node.data = dstTearFileLocked(node.synced, node.data)
-		} else {
-			node.data = append([]byte(nil), node.synced...)
+			image = dstTearFileLocked(node.synced, node.data)
 		}
+		dstNodeSetSizeLocked(node, int64(len(image)))
+		copy(node.data, image)
 		return
 	}
 	if dstCrashTear {

@@ -191,7 +191,7 @@ func TestDSTCrashHostResurrectsUnsyncedRemoval(t *testing.T) {
 func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 	var afterProcCrash, afterHostCrash byte
 	var deadMachineMapping []byte
-	var deadMappingByte byte
+	var rebootMapping []byte
 	Test(t, 1, func(t *testing.T) {
 		Host("h", HostConfig{}, func() {
 			// Seed a durable baseline: content 'A', data + entry synced.
@@ -232,8 +232,10 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 			afterProcCrash = pb[0]
 
 			// A LIVE mapping at the moment the machine dies. Its slice is the
-			// dead machine's memory; the registry entry must go with it, or a
-			// rebooted process's fresh mapping of the same bytes would alias it.
+			// dead machine's memory: the crash takes the mapping with the
+			// machine (touching it faults — the pages are gone), and a rebooted
+			// process's fresh mapping of the same bytes must be its own, never
+			// a reuse of the dead machine's address space.
 			go Process("livemapper", func() {
 				g, err := os.OpenFile("/m", os.O_RDWR, 0)
 				if err != nil {
@@ -275,7 +277,7 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 					t.Fatalf("reboot mmap: %v", err)
 				}
 				m[0] = 'Q'
-				deadMappingByte = deadMachineMapping[0]
+				rebootMapping = m
 				syscall.Munmap(m)
 			})
 		})
@@ -286,8 +288,12 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 	if afterHostCrash != 'A' {
 		t.Fatalf("after host crash file byte = %q, want 'A' (power loss loses the page cache)", afterHostCrash)
 	}
-	if deadMappingByte != 'Z' {
-		t.Fatalf("the dead machine's mapping observed the rebooted machine's write (%q): its registry entry outlived the crash", deadMappingByte)
+	// The dead machine's memory is unreachable (reading deadMachineMapping
+	// would fault: its pages went with the machine), so non-aliasing is pinned
+	// structurally: the rebooted machine's mapping is fresh address space, not
+	// a reuse of the dead machine's.
+	if &rebootMapping[0] == &deadMachineMapping[0] {
+		t.Fatalf("the rebooted machine's mapping reuses the dead machine's address %p", &deadMachineMapping[0])
 	}
 }
 

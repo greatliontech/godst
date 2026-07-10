@@ -354,8 +354,11 @@ func TestDSTFSVirtualFDMmapWritableShared(t *testing.T) {
 				if err != nil {
 					t.Fatalf("p2 Mmap: %v", err)
 				}
-				if p2Addr := uintptr(unsafe.Pointer(&b[0])); p2Addr != p1Addr {
-					t.Fatalf("p2 mapping address = %#x, want p1 address %#x", p2Addr, p1Addr)
+				// Each process's mmap is its own view of the shared pages, as on
+				// real Linux: distinct addresses, one set of bytes. The CAS below
+				// observing p1's store through p2's view pins the sharing.
+				if p2Addr := uintptr(unsafe.Pointer(&b[0])); p2Addr == p1Addr {
+					t.Fatalf("p2 mapping reuses p1's address %#x; real mmap returns distinct views", p1Addr)
 				}
 				if !atomic.CompareAndSwapUint32((*uint32)(unsafe.Pointer(&b[0])), 1, 2) {
 					t.Fatalf("p2 CAS did not observe p1 store; value=%d", atomic.LoadUint32((*uint32)(unsafe.Pointer(&b[0]))))
@@ -404,8 +407,8 @@ func TestDSTFSVirtualFDMmapWritableSurvivesFileGrowth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("wider Mmap after growth: %v", err)
 		}
-		if got := uintptr(unsafe.Pointer(&b2[0])); got != addr {
-			t.Fatalf("wider mapping address after growth = %#x, want %#x", got, addr)
+		if got := uintptr(unsafe.Pointer(&b2[0])); got == addr {
+			t.Fatalf("wider mapping reuses the first mapping's address %#x; real mmap returns distinct views", addr)
 		}
 		if atomic.LoadUint32((*uint32)(unsafe.Pointer(&b2[0]))) != 7 {
 			t.Fatalf("wider mapping after growth did not observe mapped store")
@@ -459,8 +462,8 @@ func TestDSTFSVirtualFDMmapOverlappingRangesShareBytes(t *testing.T) {
 			t.Fatalf("slot Mmap: %v", err)
 		}
 		defer syscall.Munmap(slot)
-		if got, want := uintptr(unsafe.Pointer(&slot[0])), uintptr(unsafe.Pointer(&whole[page])); got != want {
-			t.Fatalf("slot address = %#x, want whole page address %#x", got, want)
+		if got, aliased := uintptr(unsafe.Pointer(&slot[0])), uintptr(unsafe.Pointer(&whole[page])); got == aliased {
+			t.Fatalf("overlapping mappings alias one address %#x; real mmap returns distinct views", got)
 		}
 		atomic.StoreUint32((*uint32)(unsafe.Pointer(&slot[0])), 21)
 		if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&whole[page]))); got != 21 {
@@ -473,7 +476,7 @@ func TestDSTFSVirtualFDMmapOverlappingRangesShareBytes(t *testing.T) {
 	})
 }
 
-func TestDSTFSVirtualFDMmapWiderOverlapBeyondBackingRejected(t *testing.T) {
+func TestDSTFSVirtualFDMmapWiderOverlapAfterGrowthCoheres(t *testing.T) {
 	simulation.Run(1, func() {
 		if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
@@ -491,10 +494,17 @@ func TestDSTFSVirtualFDMmapWiderOverlapBeyondBackingRejected(t *testing.T) {
 		if _, err := f.WriteAt([]byte{1}, int64(page)); err != nil {
 			t.Fatalf("WriteAt growth beyond backing: %v", err)
 		}
-		if _, err := syscall.Mmap(int(f.Fd()), 0, page+1, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED); !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("wider overlap beyond backing Mmap = %v, want EINVAL", err)
+		// A second, wider mapping over a grown file is ordinary on real Linux
+		// (the copy-model refused it: it could not widen a shared buffer).
+		wider, err := syscall.Mmap(int(f.Fd()), 0, page+1, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("wider Mmap after growth: %v", err)
 		}
+		defer syscall.Munmap(wider)
 		atomic.StoreUint32((*uint32)(unsafe.Pointer(&b[0])), 23)
+		if got := atomic.LoadUint32((*uint32)(unsafe.Pointer(&wider[0]))); got != 23 {
+			t.Fatalf("wider view reads %d, want the first view's store 23", got)
+		}
 		if err := syscall.Munmap(b); err != nil {
 			t.Fatalf("Munmap: %v", err)
 		}
@@ -508,7 +518,7 @@ func TestDSTFSVirtualFDMmapWiderOverlapBeyondBackingRejected(t *testing.T) {
 	})
 }
 
-func TestDSTFSVirtualFDMmapBridgeAcrossBackingsRejected(t *testing.T) {
+func TestDSTFSVirtualFDMmapBridgeAcrossRangesCoheres(t *testing.T) {
 	simulation.Run(1, func() {
 		if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
@@ -536,77 +546,73 @@ func TestDSTFSVirtualFDMmapBridgeAcrossBackingsRejected(t *testing.T) {
 		if uintptr(unsafe.Pointer(&first[0])) == uintptr(unsafe.Pointer(&second[0])) {
 			t.Fatalf("disjoint mappings unexpectedly have identical start address")
 		}
-		if _, err := syscall.Mmap(int(f.Fd()), 0, secondOff+4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED); !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("bridging overlap Mmap = %v, want EINVAL", err)
+		bridge, err := syscall.Mmap(int(f.Fd()), 0, secondOff+4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("bridging Mmap: %v", err)
+		}
+		defer syscall.Munmap(bridge)
+		first[0] = 31
+		second[3] = 32
+		if bridge[0] != 31 {
+			t.Fatalf("bridge reads %d at 0, want the first window's 31", bridge[0])
+		}
+		if bridge[secondOff+3] != 32 {
+			t.Fatalf("bridge reads %d at the second window, want 32", bridge[secondOff+3])
 		}
 	})
 }
 
-func TestDSTFSVirtualFDMmapOverlappingCandidateIgnoresDisjointBacking(t *testing.T) {
+// TestDSTFSVirtualFDMmapWindowsAtOffsetsCohere: a window at a nonzero offset
+// and a wider window overlapping it are independent views of the file's pages;
+// a store through either is a store in the other, and a disjoint window at
+// offset zero is untouched.
+func TestDSTFSVirtualFDMmapWindowsAtOffsetsCohere(t *testing.T) {
 	simulation.Run(1, func() {
 		page := syscall.Getpagesize()
-		for attempt := 0; attempt < 64; attempt++ {
-			name := fmt.Sprintf("/lock-%d", attempt)
-			if err := os.WriteFile(name, make([]byte, page*2), 0o644); err != nil {
-				t.Fatalf("WriteFile %s: %v", name, err)
-			}
-			f, err := os.OpenFile(name, os.O_RDWR, 0)
-			if err != nil {
-				t.Fatalf("OpenFile %s: %v", name, err)
-			}
-			first, err := syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-			if err != nil {
-				f.Close()
-				t.Fatalf("first Mmap: %v", err)
-			}
-			if _, err := f.WriteAt([]byte{1}, int64(page*2)); err != nil {
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("WriteAt growth: %v", err)
-			}
-			wide, err := syscall.Mmap(int(f.Fd()), int64(page), page+1, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-			if err != nil {
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("wide Mmap: %v", err)
-			}
-			sub, err := syscall.Mmap(int(f.Fd()), int64(page), 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
-			if err != nil {
-				syscall.Munmap(wide)
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("sub Mmap attempt %d: %v", attempt, err)
-			}
-			if got, want := uintptr(unsafe.Pointer(&sub[0])), uintptr(unsafe.Pointer(&wide[0])); got != want {
-				syscall.Munmap(sub)
-				syscall.Munmap(wide)
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("sub address attempt %d = %#x, want wide address %#x", attempt, got, want)
-			}
-			if err := syscall.Munmap(sub); err != nil {
-				syscall.Munmap(wide)
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("sub Munmap: %v", err)
-			}
-			if err := syscall.Munmap(wide); err != nil {
-				syscall.Munmap(first)
-				f.Close()
-				t.Fatalf("wide Munmap: %v", err)
-			}
-			if err := syscall.Munmap(first); err != nil {
-				f.Close()
-				t.Fatalf("first Munmap: %v", err)
-			}
-			if err := f.Close(); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
+		if err := os.WriteFile("/lock", make([]byte, page*2), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		defer f.Close()
+		first, err := syscall.Mmap(int(f.Fd()), 0, 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("first Mmap: %v", err)
+		}
+		defer syscall.Munmap(first)
+		if _, err := f.WriteAt([]byte{1}, int64(page*2)); err != nil {
+			t.Fatalf("WriteAt growth: %v", err)
+		}
+		wide, err := syscall.Mmap(int(f.Fd()), int64(page), page+1, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("wide Mmap: %v", err)
+		}
+		defer syscall.Munmap(wide)
+		sub, err := syscall.Mmap(int(f.Fd()), int64(page), 4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("sub Mmap: %v", err)
+		}
+		defer syscall.Munmap(sub)
+		sub[0] = 41
+		if wide[0] != 41 {
+			t.Fatalf("wide view reads %d at its start, want the sub view's 41", wide[0])
+		}
+		wide[1] = 42
+		if sub[1] != 42 {
+			t.Fatalf("sub view reads %d, want the wide view's 42", sub[1])
+		}
+		if first[0] != 0 {
+			t.Fatalf("disjoint window at offset 0 reads %d, want 0", first[0])
 		}
 	})
 }
 
-func TestDSTFSVirtualFDMmapSpareCandidateUsesLargestBacking(t *testing.T) {
+// TestDSTFSVirtualFDMmapWindowsCohereAfterGrowth: windows mapped at different
+// offsets, before and after the file grew, all read and write the same pages —
+// including one that bridges two earlier windows.
+func TestDSTFSVirtualFDMmapWindowsCohereAfterGrowth(t *testing.T) {
 	simulation.Run(1, func() {
 		page := syscall.Getpagesize()
 		if err := os.WriteFile("/lock", make([]byte, page*2), 0o644); err != nil {
@@ -635,20 +641,22 @@ func TestDSTFSVirtualFDMmapSpareCandidateUsesLargestBacking(t *testing.T) {
 			t.Fatalf("middle Mmap: %v", err)
 		}
 		defer syscall.Munmap(middle)
-		if got, want := uintptr(unsafe.Pointer(&middle[0]))+uintptr(page*2), uintptr(unsafe.Pointer(&second[0])); got != want {
-			t.Fatalf("middle mapping did not use largest spare backing: middle+2page=%#x second=%#x", got, want)
-		}
-		bridgeLen := page*2 + 4
-		bridge, err := syscall.Mmap(int(f.Fd()), int64(page), bridgeLen, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		bridge, err := syscall.Mmap(int(f.Fd()), int64(page), page*2+4, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 		if err != nil {
 			t.Fatalf("bridge Mmap: %v", err)
 		}
 		defer syscall.Munmap(bridge)
-		if got, want := uintptr(unsafe.Pointer(&bridge[0])), uintptr(unsafe.Pointer(&middle[0])); got != want {
-			t.Fatalf("bridge start address = %#x, want middle address %#x", got, want)
+		middle[0] = 51
+		if bridge[0] != 51 {
+			t.Fatalf("bridge reads %d at its start, want the middle window's 51", bridge[0])
 		}
-		if got, want := uintptr(unsafe.Pointer(&bridge[page*2])), uintptr(unsafe.Pointer(&second[0])); got != want {
-			t.Fatalf("bridge second-range address = %#x, want second address %#x", got, want)
+		second[0] = 52
+		if bridge[page*2] != 52 {
+			t.Fatalf("bridge reads %d at the second window, want 52", bridge[page*2])
+		}
+		bridge[1] = 53
+		if middle[1] != 53 {
+			t.Fatalf("middle window reads %d, want the bridge's 53", middle[1])
 		}
 	})
 }
@@ -742,8 +750,11 @@ func TestDSTFSVirtualFDMmapReadOnlyAndWritableShareRange(t *testing.T) {
 				if err != nil {
 					t.Fatalf("writable Mmap: %v", err)
 				}
-				if rwAddr := uintptr(unsafe.Pointer(&rw[0])); rwAddr != roAddr {
-					t.Fatalf("writable mapping address = %#x, want read-only address %#x", rwAddr, roAddr)
+				// Two mmaps of one file are distinct views of shared pages, as on
+				// real Linux: distinct addresses, one set of bytes. The store below,
+				// observed through the reader's mapping, pins the sharing.
+				if rwAddr := uintptr(unsafe.Pointer(&rw[0])); rwAddr == roAddr {
+					t.Fatalf("writable mapping reuses the read-only mapping's address %#x; real mmap returns distinct views", roAddr)
 				}
 				atomic.StoreUint32((*uint32)(unsafe.Pointer(&rw[0])), 11)
 				if err := syscall.Munmap(rw); err != nil {
@@ -845,8 +856,12 @@ func TestDSTFSVirtualFDMmapWritablePermissionsAndRegistrations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("second writable Mmap: %v", err)
 		}
-		if uintptr(unsafe.Pointer(&b1[0])) != uintptr(unsafe.Pointer(&b2[0])) {
-			t.Fatalf("same-range writable mappings use different backing addresses")
+		if uintptr(unsafe.Pointer(&b1[0])) == uintptr(unsafe.Pointer(&b2[0])) {
+			t.Fatalf("duplicate mappings share an address; real mmap returns distinct views")
+		}
+		b1[0] = 7
+		if b2[0] != 7 {
+			t.Fatalf("second mapping reads %d, want the first mapping's 7: the views do not share pages", b2[0])
 		}
 		if err := syscall.Mprotect(b1, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
 			t.Fatalf("Mprotect writable mapping read/write: %v", err)
@@ -881,8 +896,12 @@ func TestDSTFSVirtualFDMmapMixedProtectionDuplicateRegistrations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("writable Mmap: %v", err)
 		}
-		if uintptr(unsafe.Pointer(&ro[0])) != uintptr(unsafe.Pointer(&rw[0])) {
-			t.Fatalf("mixed protection mappings use different backing addresses")
+		if uintptr(unsafe.Pointer(&ro[0])) == uintptr(unsafe.Pointer(&rw[0])) {
+			t.Fatalf("mixed-protection mappings share an address, so they cannot differ in protection")
+		}
+		rw[0] = 9
+		if ro[0] != 9 {
+			t.Fatalf("read-only view reads %d, want the writable view's 9: the views do not share pages", ro[0])
 		}
 		if err := syscall.Mprotect(rw, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
 			t.Fatalf("Mprotect writable duplicate: %v", err)
@@ -1852,4 +1871,105 @@ func TestDSTFSVirtualFDFlockErrors(t *testing.T) {
 			t.Fatalf("Flock after close = %v, want EBADF", err)
 		}
 	})
+}
+
+// TestDSTFSMmapAddressDeterministicAcrossRuns pins the run boundary's half of
+// address determinism at the os level: the filesystem roll must reset the
+// mapping region (dstNodeReleaseRunLocked), or the second run's identical
+// schedule would carve at a bump offset the first run advanced — same seed,
+// different address, and a pointer-keyed map in the system under test iterates
+// differently on replay.
+func TestDSTFSMmapAddressDeterministicAcrossRuns(t *testing.T) {
+	one := func() uintptr {
+		var addr uintptr
+		simulation.Run(1, func() {
+			if err := os.WriteFile("/lock", make([]byte, 8), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			defer f.Close()
+			b, err := syscall.Mmap(int(f.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("Mmap: %v", err)
+			}
+			defer syscall.Munmap(b)
+			addr = uintptr(unsafe.Pointer(&b[0]))
+		})
+		return addr
+	}
+	a1 := one()
+	a2 := one()
+	if a1 != a2 {
+		t.Fatalf("one seed, two runs, two mapping addresses: %#x vs %#x", a1, a2)
+	}
+}
+
+// TestDSTFSMprotectDowngradeIsEnforcedByHardware pins the half of Mprotect a
+// return code cannot: after Mprotect(PROT_READ) on a writable mapping, a store
+// through it is a protection fault, and the fault is the simulated process's
+// death — unswallowable, leaving its peer and the harness running. Before the
+// page cache, Mprotect was bookkeeping and this store silently succeeded.
+func TestDSTFSMprotectDowngradeIsEnforcedByHardware(t *testing.T) {
+	var recovered, pastStore, peerRan bool
+	var victimPID int
+	var killErr error
+	simulation.Test(t, 1, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			downgraded := make(chan []byte, 1)
+			pid := make(chan int, 1)
+			go simulation.Process("victim", func() {
+				defer func() {
+					if r := recover(); r != nil {
+						recovered = true
+					}
+				}()
+				f, err := os.OpenFile("/m", os.O_CREATE|os.O_RDWR, 0o644)
+				if err != nil {
+					t.Errorf("OpenFile: %v", err)
+					return
+				}
+				if _, err := f.Write(make([]byte, 8)); err != nil {
+					t.Errorf("Write: %v", err)
+					return
+				}
+				b, err := syscall.Mmap(int(f.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				f.Close()
+				if err != nil {
+					t.Errorf("Mmap: %v", err)
+					return
+				}
+				b[0] = 1 // writable: fine
+				if err := syscall.Mprotect(b, syscall.PROT_READ); err != nil {
+					t.Errorf("Mprotect: %v", err)
+					return
+				}
+				pid <- os.Getpid()
+				downgraded <- b
+				b[1] = 2 // downgraded: production SIGSEGVs, so must we
+				pastStore = true
+			})
+			b := <-downgraded
+			victimPID = <-pid
+			_ = b
+			simulation.Process("peer", func() {
+				killErr = syscall.Kill(victimPID, 0)
+				peerRan = true
+			})
+		})
+	})
+	if pastStore {
+		t.Errorf("the victim ran past a store through a read-only-downgraded mapping")
+	}
+	if recovered {
+		t.Errorf("the victim recovered from a protection fault production delivers as SIGSEGV")
+	}
+	if !peerRan {
+		t.Errorf("the peer did not run: the fault took down more than its process")
+	}
+	if killErr != syscall.ESRCH {
+		t.Errorf("Kill(victim, 0) = %v, want ESRCH", killErr)
+	}
 }

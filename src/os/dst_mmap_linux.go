@@ -45,8 +45,13 @@ func init() {
 }
 
 type dstMMapEntry struct {
+	// data is the window the system under test holds: a slice of the real
+	// mapping, starting at file offset off. mapBase/mapLen are the mapping
+	// itself, which always starts at file offset 0 (see dstPageCacheMap), so
+	// data's first byte is mapBase+off.
 	data     []byte
-	base     []byte
+	mapBase  uintptr
+	mapLen   uintptr
 	node     *dstFSNode
 	epoch    uint64
 	seq      uint64 // per-run registration sequence (see dstMMapRegistry.seq)
@@ -128,28 +133,47 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	if err := file.diskEIO(); err != nil {
 		return nil, dstFDErr(err), true
 	}
+	host, proc := dstFSCurrentNode()
+	// enter() above holds dstFS.mu until leave(): node reads here are under the
+	// tree lock, and the registry lock nests inside it — the same order
+	// dstMunmap and the release paths use.
 	if offset > int64(len(file.node.data)) || int64(length) > int64(len(file.node.data))-offset {
 		return nil, syscall.EINVAL, true
 	}
 
-	dstMMapSyncLocked(file.node)
-	host, proc := dstFSCurrentNode()
 	dstMMapRegistry.mu.Lock()
-	dstMMapRollLocked()
-	data, base, errno := dstMMapDataLocked(file.node, offset, length)
-	if errno != 0 {
-		dstMMapRegistry.mu.Unlock()
-		return nil, errno, true
+	mprot := syscall.PROT_READ
+	if writable {
+		mprot |= syscall.PROT_WRITE
 	}
+	// The mapping starts at file offset 0 and runs to the end of the window the
+	// caller asked for; the caller's window is the tail of it. (Today the
+	// EINVAL gate above bounds the window to the file; when past-EOF mapping
+	// lands, the pages past the end are mapped but not backed and trap on
+	// access, as a reservation over a short file does in production.)
+	mapLen := uintptr(offset) + uintptr(length)
+	mapBase := dstPageCacheMap(file.node.pc.fd, mapLen, int32(mprot))
+	if mapBase == 0 {
+		// The region is exhausted — deterministically: the bump pointer is a
+		// pure function of the run's mapping sequence. Production's mmap says
+		// ENOMEM when the address space cannot hold the mapping.
+		dstMMapRegistry.mu.Unlock()
+		return nil, syscall.ENOMEM, true
+	}
+	data := unsafe.Slice((*byte)(unsafe.Pointer(mapBase+uintptr(offset))), length)
+
+	dstMMapRollLocked()
 	key, errno := dstMMapKey(data)
 	if errno != 0 {
+		dstPageCacheUnmap(mapBase, mapLen)
 		dstMMapRegistry.mu.Unlock()
 		return nil, errno, true
 	}
 	dstMMapRegistry.seq++
 	dstMMapRegistry.maps[key] = append(dstMMapRegistry.maps[key], &dstMMapEntry{
 		data:     data,
-		base:     base,
+		mapBase:  mapBase,
+		mapLen:   mapLen,
 		node:     file.node,
 		epoch:    dstFSEpoch(),
 		seq:      dstMMapRegistry.seq,
@@ -160,68 +184,6 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	})
 	dstMMapRegistry.mu.Unlock()
 	return data, 0, true
-}
-
-func dstMMapDataLocked(node *dstFSNode, offset int64, length int) ([]byte, []byte, syscall.Errno) {
-	end := offset + int64(length)
-	start := int(offset)
-	stop := int(end)
-	var overlapCandidate, spareCandidate []byte
-	var spareSeq uint64
-	for _, bucket := range dstMMapRegistry.maps {
-		for _, entry := range bucket {
-			if entry.node != node || entry.epoch != dstFSEpoch() {
-				continue
-			}
-			mapStart := entry.off
-			mapEnd := entry.off + int64(len(entry.data))
-			overlaps := offset < mapEnd && end > mapStart
-			if overlaps {
-				if int64(cap(entry.base)) < end {
-					return nil, nil, syscall.EINVAL
-				}
-				if overlapCandidate == nil {
-					overlapCandidate = entry.base
-				} else if &overlapCandidate[0] != &entry.base[0] {
-					return nil, nil, syscall.EINVAL
-				}
-			} else if int64(cap(entry.base)) >= end {
-				// Spare-base choice: largest capacity, ties by earliest
-				// registration (seq) — order-independent over the registry map's
-				// nondeterministic iteration, and never by heap address.
-				if spareCandidate == nil || cap(entry.base) > cap(spareCandidate) ||
-					(cap(entry.base) == cap(spareCandidate) && entry.seq < spareSeq) {
-					spareCandidate = entry.base
-					spareSeq = entry.seq
-				}
-			}
-		}
-	}
-	candidate := overlapCandidate
-	if candidate == nil {
-		candidate = spareCandidate
-	}
-	if candidate != nil {
-		copy(candidate, node.data)
-		return candidate[start:stop:stop], candidate, 0
-	}
-	base := dstMMapNewBase(node, end)
-	return base[start:stop:stop], base, 0
-}
-
-func dstMMapNewBase(node *dstFSNode, size int64) []byte {
-	reserve := int(size)
-	if reserve < len(node.data) {
-		reserve = len(node.data)
-	}
-	if reserve < dstMMapPageSize {
-		reserve = dstMMapPageSize
-	} else if rem := reserve % dstMMapPageSize; rem != 0 {
-		reserve += dstMMapPageSize - rem
-	}
-	base := make([]byte, reserve)
-	copy(base, node.data)
-	return base
 }
 
 func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
@@ -277,7 +239,7 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 	for i := len(bucket) - 1; i >= 0; i-- {
 		entry := bucket[i]
 		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
-			dstMMapSyncEntryLocked(entry)
+			dstPageCacheUnmap(entry.mapBase, entry.mapLen)
 			bucket = append(bucket[:i], bucket[i+1:]...)
 			if len(bucket) == 0 {
 				delete(dstMMapRegistry.maps, key)
@@ -306,14 +268,12 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 	return 0, false
 }
 
-// dstMMapReleaseHost unregisters every mapping made on host WITHOUT copying
-// writable bytes back into the file state. That asymmetry with
-// dstMMapReleaseProc is the host/process crash split itself: a dying process
-// leaves its dirty MAP_SHARED pages in the kernel's page cache (so they are
-// visible to survivors and to a restart), while a dying KERNEL loses them —
-// they were never on the disk. Copying back here would hand a rebooted host
-// data that power loss destroyed, the exact false-negative the durability
-// contract exists to prevent.
+// dstMMapReleaseHost unmaps every mapping made on host. The host/process crash
+// split no longer lives here: a mapping's bytes ARE the page cache's, so a
+// dying process leaves its dirty MAP_SHARED pages exactly where the kernel
+// leaves them, visible to survivors and to a restart. A dying HOST loses them
+// instead, and dstRestoreHostDiskFor is what rewinds the page cache to the
+// durable image — this function only gives back the address space.
 func dstMMapReleaseHost(host uint32) {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
@@ -324,7 +284,8 @@ func dstMMapReleaseHost(host uint32) {
 		out := bucket[:0]
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && entry.host == host {
-				continue // dropped: no write-back
+				dstPageCacheUnmap(entry.mapBase, entry.mapLen)
+				continue
 			}
 			out = append(out, entry)
 		}
@@ -346,7 +307,7 @@ func dstMMapReleaseProc(proc uint32) {
 		out := bucket[:0]
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && entry.proc == proc {
-				dstMMapSyncEntryLocked(entry)
+				dstPageCacheUnmap(entry.mapBase, entry.mapLen)
 				continue
 			}
 			out = append(out, entry)
@@ -396,13 +357,15 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		return syscall.EINVAL, true
 	}
 	if foundCurrent {
-		if prot == syscall.PROT_READ {
-			return 0, true
+		// A mapping may not gain a permission its file descriptor never had:
+		// the page cache is opened read-write, so only the model knows this.
+		if prot != syscall.PROT_READ && !(prot == syscall.PROT_READ|syscall.PROT_WRITE && foundWritable) {
+			return syscall.EACCES, true
 		}
-		if prot == syscall.PROT_READ|syscall.PROT_WRITE && foundWritable {
-			return 0, true
+		if !dstPageCacheProtect(start, end-start, int32(prot)) {
+			return syscall.EINVAL, true
 		}
-		return syscall.EACCES, true
+		return 0, true
 	}
 	if foundOther {
 		return syscall.EINVAL, true
@@ -433,69 +396,6 @@ func dstMadvise(data []byte, advice int) (syscall.Errno, bool) {
 		return 0, true
 	}
 	return syscall.EINVAL, true
-}
-
-func dstMMapWriteLocked(node *dstFSNode, off int64, p []byte) {
-	if len(p) == 0 {
-		return
-	}
-	dstMMapRegistry.mu.Lock()
-	dstMMapRollLocked()
-	for _, bucket := range dstMMapRegistry.maps {
-		for _, entry := range bucket {
-			if entry.node != node {
-				continue
-			}
-			start := off
-			end := off + int64(len(p))
-			mapStart := entry.off
-			mapEnd := entry.off + int64(len(entry.data))
-			if end <= mapStart || start >= mapEnd {
-				continue
-			}
-			if start < mapStart {
-				start = mapStart
-			}
-			if end > mapEnd {
-				end = mapEnd
-			}
-			copy(entry.data[start-mapStart:end-mapStart], p[start-off:end-off])
-		}
-	}
-	dstMMapRegistry.mu.Unlock()
-}
-
-func dstMMapSyncLocked(node *dstFSNode) {
-	dstMMapRegistry.mu.Lock()
-	dstMMapRollLocked()
-	for _, bucket := range dstMMapRegistry.maps {
-		for _, entry := range bucket {
-			if entry.node != node {
-				continue
-			}
-			dstMMapSyncEntryLocked(entry)
-		}
-	}
-	dstMMapRegistry.mu.Unlock()
-}
-
-func dstMMapSyncEntryLocked(entry *dstMMapEntry) {
-	if !entry.writable {
-		return
-	}
-	node := entry.node
-	start := entry.off
-	end := entry.off + int64(len(entry.data))
-	if end <= 0 || start >= int64(len(node.data)) {
-		return
-	}
-	if start < 0 {
-		start = 0
-	}
-	if end > int64(len(node.data)) {
-		end = int64(len(node.data))
-	}
-	copy(node.data[start:end], entry.data[start-entry.off:end-entry.off])
 }
 
 // dstMMapShrinkFencedLocked reports whether truncating node to size would cut

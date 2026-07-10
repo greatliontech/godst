@@ -8,6 +8,7 @@ package os_test
 
 import (
 	"errors"
+	"math"
 	"os"
 	"strings"
 	"syscall"
@@ -605,5 +606,76 @@ func TestDSTFSOpenRootSubtreeHasNoProc(t *testing.T) {
 			t.Fatalf("root proc/self/stat: %v", err)
 		}
 		f.Close()
+	})
+}
+
+// TestDSTFSTruncateRegrowReadsZeros: bytes a truncate dropped must not
+// resurrect when the file grows back over them. The page cache makes this a
+// real hazard: the memfd holds pages, and a shrink that failed to ftruncate
+// would leave the old bytes waiting under the re-grown range.
+func TestDSTFSTruncateRegrowReadsZeros(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/f", []byte("abcd"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := os.Truncate("/f", 0); err != nil {
+			t.Fatalf("Truncate down: %v", err)
+		}
+		if err := os.Truncate("/f", 4); err != nil {
+			t.Fatalf("Truncate up: %v", err)
+		}
+		got, err := os.ReadFile("/f")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(got) != "\x00\x00\x00\x00" {
+			t.Fatalf("re-grown file reads %q, want four zero bytes: truncation dropped these", got)
+		}
+	})
+}
+
+// TestDSTFSStaleHandleFromDeadRunRefused: a *File leaked out of one run and
+// used in the next answers "file already closed" — its run's nodes were
+// released with the run (their page caches are gone), and before the epoch
+// gate this dereferenced them. The virtual-fd front door has the same gate
+// (EBADF); this pins the File-method door.
+func TestDSTFSStaleHandleFromDeadRunRefused(t *testing.T) {
+	var leaked *os.File
+	simulation.Run(1, func() {
+		f, err := os.Create("/f")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if _, err := f.WriteString("live"); err != nil {
+			t.Fatalf("Write in owning run: %v", err)
+		}
+		leaked = f
+	})
+	simulation.Run(2, func() {
+		if _, err := leaked.WriteString("stale"); err == nil {
+			t.Fatalf("a dead run's handle accepted a write")
+		} else if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("a dead run's handle failed with %v, want ErrClosed", err)
+		}
+		if _, err := leaked.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("a dead run's handle Stat = %v, want ErrClosed", err)
+		}
+	})
+}
+
+// TestDSTFSWriteAtHugeOffsetIsEFBIG: an offset so large the write's end
+// overflows int64 is the file-size limit, not an index computation — real
+// Linux answers EFBIG, and the overflowed arithmetic used to skip the growth
+// and panic on the slice index instead.
+func TestDSTFSWriteAtHugeOffsetIsEFBIG(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.Create("/f")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		defer f.Close()
+		if _, err := f.WriteAt([]byte("xx"), math.MaxInt64-1); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("WriteAt near MaxInt64 = %v, want EFBIG", err)
+		}
 	})
 }

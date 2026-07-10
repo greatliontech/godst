@@ -490,7 +490,7 @@ func crashProcess(name string) {
 	}
 	activeProcClearAll(proc)
 	// Kernel teardown order: the threads die first, then exit_files closes fds
-	// (releasing flocks, unmapping with page-cache write-back) and the sockets
+	// (releasing flocks, unmapping (the bytes are the page cache's; nothing to write back)) and the sockets
 	// reset. Killing the goroutines first also closes the window in which a
 	// victim could observe its own resources half-torn-down.
 	for _, pid := range pids {

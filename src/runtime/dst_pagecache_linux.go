@@ -320,6 +320,17 @@ func dstPageCacheProtect(base, n uintptr, prot int32) bool {
 	return ret == 0
 }
 
+// dstPageCacheFatal aborts the harness with reason: the os layer's capability
+// limits (the mapping region cannot hold another view) must be as
+// unswallowable as the runtime's own, and a Go panic is not — a system under
+// test's recover() would turn "the harness is out of address space" into an
+// execution no kernel produces.
+//
+//go:linkname dstPageCacheFatal
+func dstPageCacheFatal(reason string) {
+	throw(reason)
+}
+
 // dstMappingFaultAddr reports whether addr lies inside a live mapping, i.e.
 // whether the fault is a simulated process touching a page its file does not
 // have, or writing through a read-only mapping.

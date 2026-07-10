@@ -48,25 +48,34 @@ is attributed to a process, and the simulated page size stays 4096.
       a canonical region at bump-allocated offsets, the bump resetting per run —
       the SUT holds the slice, so its address is observable, and replay demands
       it be reproducible across invocations (64-bit hosts only).
-- [ ] 2. A node's bytes live in its page cache. `data` aliases a writable mapping
-      of the `memfd` on first `Mmap`; growth and shrink become `ftruncate` plus a
-      reslice rather than a reallocation. Mappings hand out real subslices.
-      Delete `dstMMapDataLocked`'s candidate hunt, `dstMMapNewBase`,
-      `dstMMapWriteLocked`, `dstMMapSyncLocked`, `dstMMapSyncEntryLocked`.
-      Constraint (from review): the os layer must touch mapped bytes only from
-      ordinary goroutine context — a fault taken while `!canpanic()` (runtime
-      lock held, mallocing, on the system stack, mid-syscall) never reaches
-      `sigpanic` and would abort the harness instead of killing the process.
+- [x] 2. A node's bytes live in its page cache — from BIRTH (uniform backing,
+      one representation per binary; the lazy split was rejected as a
+      convention-guarded runtime mode). `data` aliases a writable view of the
+      `memfd`; `dstNodeSetSizeLocked` (ftruncate + reslice) is the only length
+      mutation. SUT mappings are real `MAP_SHARED` mmaps of the same memfd.
+      Deleted: the candidate hunt, `dstMMapNewBase`, the write-back ledger
+      (`dstMMapWriteLocked`/`dstMMapSyncLocked`/`dstMMapSyncEntryLocked`),
+      process-teardown write-back. `Mprotect` became hardware here (it fell out
+      of deleting the bookkeeping), and § Memory mappings was amended for what
+      this chunk changed — deferring the amendment would have meant
+      reimplementing the deleted rejections to keep dead divergences alive.
+      Constraint (from review), honored: the os layer touches mapped bytes only
+      from ordinary goroutine context under `sync.Mutex` — a fault taken while
+      `!canpanic()` never reaches `sigpanic` and would abort the harness.
+      Capability limits (region exhaustion outside `mmap`) are unswallowable
+      fatals; handles from a dead run are refused by an epoch gate.
 - [ ] 3. The two divergences die. Mapping past EOF is allowed (a reservation);
       access past EOF faults. Truncate-shrink under a live mapping is allowed;
       access to the cut pages faults. Remove the `EINVAL` and
-      `dstMMapShrinkFencedLocked`. `Mprotect` and `Madvise` act on the hardware.
-      Re-anchor the tests that pinned the old stance.
+      `dstMMapShrinkFencedLocked`. Re-anchor the tests that pinned the old
+      stance, and re-anchor the spec's two recorded divergences out of
+      § Memory mappings.
 - [ ] 4. Fault semantics under crash. A process crash keeps the arena (the page
       cache outlives the process); a host crash drops it; a tear rebuilds it
       from the durable image. `Explore`/`Replay` reproduce a fault exactly.
 - [ ] 5. Compatibility coverage. Extend the harness with the reservation mapping,
       per-commit shrink, and a reader that respects the high-water mark — plus
       the negative: a read past it kills that process and only that process.
-- [ ] 6. Spec, release, close-out. Amend § Memory mappings; retarget every cite;
-      run the full enforcing matrix; delete this plan.
+- [ ] 6. Spec, release, close-out. Verify § Memory mappings matches the landed
+      whole; retarget every cite; run the full enforcing matrix; delete this
+      plan.

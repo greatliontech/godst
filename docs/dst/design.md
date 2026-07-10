@@ -559,40 +559,45 @@ nothing (retaining it would keep executions no real kernel produces). Exit- and 
 part of process resource teardown in the fault contract. Other file-lock
 front doors remain fenced until they have a split-safe virtual-fd dispatch.
 
-Linux virtual fds support shared file mappings for database page readers and lock-file coordination:
-`syscall.Mmap(fd, offset, length, PROT_READ, MAP_SHARED)` on a readable regular tree file returns a
-process-owned mapping over that file's current bytes without allocating or naming a host mapping.
-`syscall.Mmap(fd, offset, length, PROT_READ|PROT_WRITE, MAP_SHARED)` on a read/write regular tree file
-returns a writable mapping backed by the simulated host's shared file state. Co-located processes mapping
-the same file range, or overlapping bytes of supported shared ranges, observe each other's writes through
-that mapped file state; `sync/atomic` operations on shared mapped bytes announce the same file-byte identity
-to DST's access scheduler. The mapping lifetime is
-independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap` unregisters exactly the
-mapping passed to it, and the run epoch resets any residue. Reads through read-only mappings observe the
-bytes at map time and later normal writes to the same simulated file node update overlapping mapped bytes,
-matching the shared page-cache view. `Mprotect(PROT_READ)` succeeds on such mappings; `Mprotect` preserving
-read/write protection succeeds for writable mappings. Attempts to create writable private mappings, map
-without the required fd access mode, overlap a live mapping in a way that would require moving that mapping,
-or unmap only a subrange fail deterministically. Offsets validate against a **fixed simulated page size of
-4096** — never the host's page geometry, which is machine state (every 16K-aligned offset is also
-4K-aligned, so host-derived offsets stay valid) — and mapping past EOF is `EINVAL` (a recorded divergence:
-real mmap allows it within the last page, delivering SIGBUS on access — an outcome the model cannot
-produce). For the same reason, **truncating a file to a smaller size under a live overlapping mapping is
-fenced** (the unsupported shape): real Linux keeps the pages mapped and SIGBUSes access past the new EOF,
-and silently zero-filling instead would hand a DB page reader zeros where production dies. Growth and
-shrinks clear of every live mapping stay allowed. `Mprotect` is bookkeeping, not hardware protection — it
-validates and records the request but cannot make a write through a protected slice fault; `Mprotect` and
-`Madvise` on a subrange whose file offset is not 4096-aligned are `EINVAL` (the deterministic analog of
-the kernel's page-aligned-address requirement — heap addresses vary run to run and cannot carry it).
-Process teardown unregisters the victim process's mappings;
-writable shared mappings first copy their bytes back to the host file state, because the mapped file contents
-are page-cache state, not process memory — and that write-back never advances the durable image (exit and
-crash move no durability boundary). `Madvise` on such
-mappings accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
-`MADV_COLD`) without touching the host; unsupported advice values fail deterministically. Mapping slices
-are process-owned capabilities, not an IPC channel: passing one to another simulated process is outside the
-model, while file writes by any process on the same simulated host update mappings through the shared file
-node.
+Linux virtual fds support shared file mappings for database page readers and lock-file coordination.
+**A regular file's bytes are its page cache**: a memfd the harness owns (no simulated descriptor ever
+names it), whose length is the file's length, written and read by every modeled operation through one
+private view. `syscall.Mmap(fd, offset, length, prot, MAP_SHARED)` on a regular tree file returns a real
+`MAP_SHARED` mapping of that memfd: distinct calls return **distinct views of the same pages** — as on
+real Linux — so co-located processes mapping the same file range observe each other's writes, a `write(2)`
+is visible through every mapping, and a store through a writable mapping is visible to `read(2)`, because
+they are the same pages, not because a ledger copies them. Overlapping and bridging windows, and windows
+mapped before a file grew, all cohere the same way; `sync/atomic` operations on shared mapped bytes are
+genuine shared-memory atomics. `PROT_READ` requires a readable fd and `PROT_READ|PROT_WRITE` a read/write
+fd; protection is **hardware**, per view: a store through a read-only mapping faults. A fault inside a
+mapping — a store through a read-only view, or an access to a page the file does not have — is the
+simulated process's death: unswallowable (checked ahead of `recover`'s reach, `debug.SetPanicOnFault`
+included), killing exactly the touching process while peers and the harness run on, as production SIGBUS
+does. **Mapping addresses are a pure function of the schedule**: every mapping is carved `MAP_FIXED` from
+a canonical reserved region at bump-allocated offsets, reset at the run boundary, so one seed yields one
+address within a process and across invocations — the address is observable (the SUT holds the slice), so
+replay-exactness owns it; region exhaustion is therefore also deterministic and reports `ENOMEM`
+(64-bit hosts only; a coarser-than-4096-page or 32-bit host is refused loudly at first use). The mapping
+lifetime is independent of the descriptor lifetime: closing the fd does not unmap it; `Munmap` unregisters
+exactly the mapping passed to it, and the run epoch resets any residue, closing every page cache and
+taking back the region in one stroke. Attempts to create writable private mappings, map without the
+required fd access mode, or unmap only a subrange fail deterministically. Offsets validate against a
+**fixed simulated page size of 4096** — never the host's page geometry, which is machine state (every
+16K-aligned offset is also 4K-aligned, so host-derived offsets stay valid; the host MMU enforces at its
+own page size, which the 4096 floor guarantees is never coarser) — and mapping past EOF is `EINVAL` (a
+recorded divergence: real mmap allows it, delivering SIGBUS on access to pages wholly past EOF; the model
+can now produce that outcome, and the divergence is scheduled to be removed). Likewise **truncating a
+file to a smaller size under a live overlapping mapping is fenced** (recorded divergence, same removal
+path): real Linux keeps the pages mapped and SIGBUSes access past the new EOF. Growth and shrinks clear
+of every live mapping stay allowed. `Mprotect` and `Madvise` on a subrange whose file offset is not
+4096-aligned are `EINVAL` (the deterministic analog of the kernel's page-aligned-address requirement).
+Process teardown unmaps the victim process's mappings — no write-back exists or is needed, since the
+bytes were the page cache's all along, visible to survivors and to a restart; a HOST crash instead
+rewinds the page cache to the durable image (exit and crash move no durability boundary). `Madvise`
+accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
+`MADV_COLD`); unsupported advice values fail deterministically. Mapping slices are process-owned
+capabilities, not an IPC channel: passing one to another simulated process is outside the model, while
+file writes by any process on the same simulated host update mappings through the shared page cache.
 
 `os.OpenRoot` and rooted `Root` operations are modeled over the same tree. Opening a root captures
 the directory node identity, so a `Root` keeps addressing that node across namespace renames rather
