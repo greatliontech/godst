@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -172,6 +173,87 @@ func testCrashHostPreservesMkfsImage(t *testing.T, tear bool) {
 	}
 	if readErr != nil || readData != "checkpoint" {
 		t.Fatalf("fsync-disciplined /tmp/state after reboot = %q, %v; want %q, nil", readData, readErr, "checkpoint")
+	}
+}
+
+// TestDSTCrashHostSecondCrashIsNoop: a host-crash restore commits the
+// restored image as the new durable image (it is, by definition, what the
+// platter holds), so a second crash with ZERO intervening writes changes
+// nothing — torn and untorn. Left uncommitted, a torn restore leaves synced
+// at the pre-crash durable image, and the second crash re-tears live-vs-stale
+// and redraws pages: bytes on the platter revert with nothing having written,
+// a state no real crash ordering can produce.
+func TestDSTCrashHostSecondCrashIsNoop(t *testing.T) {
+	for _, tear := range []bool{false, true} {
+		t.Run(map[bool]string{false: "untorn", true: "torn"}[tear], func(t *testing.T) {
+			testCrashHostSecondCrashIsNoop(t, tear)
+		})
+	}
+}
+
+func testCrashHostSecondCrashIsNoop(t *testing.T, tear bool) {
+	var first, second string
+	var names1, names2 []string
+	boot := func(out *string, outNames *[]string) {
+		Host("h", HostConfig{}, func() {
+			Process("db", func() {
+				b, err := os.ReadFile("/tmp/state")
+				if err != nil {
+					b = []byte("read error: " + err.Error())
+				}
+				*out = string(b)
+				ents, err := os.ReadDir("/tmp")
+				if err != nil {
+					*outNames = append(*outNames, "readdir error: "+err.Error())
+					return
+				}
+				for _, e := range ents {
+					*outNames = append(*outNames, e.Name())
+				}
+			})
+		})
+	}
+	TestWith(t, 2, Options{CrashTear: tear}, func(t *testing.T) {
+		Host("h", HostConfig{}, func() {
+			go Process("db", func() {
+				f, err := os.Create("/tmp/state")
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				durable := make([]byte, 8<<10)
+				for i := range durable {
+					durable[i] = 'd'
+				}
+				f.Write(durable)
+				f.Sync()
+				syncDir(t, "/tmp")
+				// Overwrite unsynced, and land an unsynced entry, so a torn
+				// first crash has live-vs-durable divergence to tear along.
+				unsynced := make([]byte, 8<<10)
+				for i := range unsynced {
+					unsynced[i] = 'u'
+				}
+				f.WriteAt(unsynced, 0)
+				f.Close()
+				os.WriteFile("/tmp/landed", []byte("x"), 0o644)
+				select {} // stay alive until the machine dies
+			})
+			for range 30 {
+				runtime.Gosched()
+			}
+		})
+
+		CrashHost("h")
+		boot(&first, &names1) // read-only: no writes between the crashes
+		CrashHost("h")
+		boot(&second, &names2)
+	})
+	if first != second {
+		t.Fatalf("second crash with zero intervening writes changed the file image:\nfirst=%.32q...\nsecond=%.32q...", first, second)
+	}
+	if !slices.Equal(names1, names2) {
+		t.Fatalf("second crash with zero intervening writes changed the directory image:\nfirst=%v\nsecond=%v", names1, names2)
 	}
 }
 

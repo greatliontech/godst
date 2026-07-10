@@ -15,7 +15,6 @@ chunk(s) there.
 | Issue | Severity | Lands |
 |---|---|---|
 | [host crash lets peer drain in-flight bytes](./dst-audit-net-crash-drain.md) | H | chunk 18 |
-| [crash restore never advances the durable image](./dst-audit-fs-tear-durable-image.md) | H | chunk 8 |
 | [rejected Run mutates active crash-tear policy](./dst-audit-sim-crash-tear-guard.md) | M | chunk 26 |
 | [fault APIs from a non-bubble goroutine misbehave](./dst-audit-sim-fault-from-nonbubble.md) | M | chunk 27 |
 | [refused/zero-length writes still grow the file](./dst-audit-fs-refused-write-grows.md) | M | chunk 9 |

@@ -500,7 +500,12 @@ deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` 
 (observers see old or new, never neither/both); its durability rides the parent directories' sync state
 like any other entry change. A simulated **host crash** (`CrashHost`, power loss) restores exactly the durable image:
 synced state survives byte-exactly; unsynced data and entries are lost — including an unsynced
-REMOVAL, which the crash undoes, since the removal itself was never on the disk. (A process crash
+REMOVAL, which the crash undoes, since the removal itself was never on the disk. The restore
+**commits the restored image as the new durable image** — it is, by definition, what the platter
+holds after the reboot — so a second crash with zero intervening writes changes nothing, torn or
+untorn (`TestDSTCrashHostSecondCrashIsNoop`); a restore that left the durable image at its
+pre-crash state would let the next crash revert platter bytes with nothing having written, a state
+no real crash ordering can produce. (A process crash
 tears nothing: the kernel survives it, so its page cache does.) The default policy loses everything unsynced; `Options.CrashTear`
 instead explores the outcomes the contract permits — each dirty page of a file lands, does not, or tears
 at a byte boundary, and each unsynced name change lands or does not, all drawn from the fault RNG and
@@ -520,7 +525,8 @@ ENFORCED now (promoted from spec tier at the durability chunk): `TestDSTFSDurabi
 asserts over a test-only node inspector (current vs durable content, sorted entry-name sets,
 metadata image) that content writes, truncate, O_TRUNC, and entry create/remove/rename leave the
 durable image untouched — including that the image is a copy, never an alias of live state — and
-that sync alone advances it. `O_SYNC` commits per WRITE through the same single commit point;
+that on the MUTATION paths sync alone advances it (the one other writer is the host-crash restore,
+which re-bases the durable image to the platter's post-crash state — see the crash contract above). `O_SYNC` commits per WRITE through the same single commit point;
 ftruncate is deliberately not covered (POSIX synchronized I/O is for writes — committing on
 truncate would grant durability real disks do not, hiding exactly the bug class DST exists to
 catch). The metadata-CHANGE operations (Chmod/Chtimes, named Truncate) are implemented with the same

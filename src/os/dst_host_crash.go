@@ -94,6 +94,15 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		}
 		dstNodeSetSizeLocked(node, int64(len(image)))
 		copy(node.data, image)
+		// The restored image IS what the platter now holds: commit it as the
+		// new durable image. Left uncommitted, a torn restore leaves synced
+		// at the PRE-crash durable image while disk and cache agree on the
+		// torn bytes — so a second crash with no intervening writes re-tears
+		// against stale durable content and redraws pages, persisting an
+		// earlier durable state no real crash ordering can produce (bytes on
+		// the platter reverting with nothing having written — the
+		// DST-FAULT-SOUND false-positive class).
+		node.commitDataLocked()
 		return
 	}
 	if dstCrashTear {
@@ -103,6 +112,13 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		for name, child := range node.syncedEntries {
 			node.entries[name] = child
 		}
+	}
+	// Directory side of the same commit: the restored entry set is the
+	// platter's — landed-but-unsynced entries a tear kept must not re-flip at
+	// the next crash.
+	node.syncedEntries = make(map[string]*dstFSNode, len(node.entries))
+	for name, child := range node.entries {
+		node.syncedEntries[name] = child
 	}
 	// Recurse in sorted name order: the children's own draws must come off the
 	// fault RNG in a fixed order, never the map's (DST-FAULT-REPLAY).

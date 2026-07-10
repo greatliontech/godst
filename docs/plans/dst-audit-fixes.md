@@ -51,7 +51,7 @@ Audit reproducers (ephemeral, from the audit session):
   birth — the mkfs image is part of the durable image. Test: crash test with
   files under `/tmp` and directory fsync on `/tmp`, not `/`.
   (dst-audit-fs-tmp-durability)
-- [ ] 8. a host-crash restore commits the restored image as the new durable
+- [x] 8. a host-crash restore commits the restored image as the new durable
   image; a second crash with no intervening writes changes nothing. Test:
   double-crash, byte-identical post-crash images, torn and untorn.
   (dst-audit-fs-tear-durable-image)

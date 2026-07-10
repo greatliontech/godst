@@ -1481,8 +1481,10 @@ func (d *dstFile) truncate(size int64) error {
 // for a file, the current content and metadata; for a directory, the current
 // entry set (entry durability is the parent directory's property — POSIX's
 // fsync-the-file-then-fsync-the-directory model). Mutations never touch the
-// durable image; this is its only writer (plus O_SYNC's per-write commit,
-// which routes through the same helper).
+// durable image; on the mutation paths this is its only writer (plus
+// O_SYNC's per-write commit, which routes through the same helper). The one
+// other writer is the host-crash restore, which re-bases the durable image
+// to the platter's post-crash state (dstRestoreNodeLocked).
 func (d *dstFile) sync() error {
 	d.diskDelay()
 	if err := d.enter(); err != nil {
