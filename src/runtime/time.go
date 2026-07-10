@@ -87,10 +87,10 @@ type timer struct {
 	isChan bool         // timer has a channel; immutable; can be read without lock
 	isFake bool         // timer is using fake time; immutable; can be read without lock
 
-	blocked uint32 // number of goroutines blocked on timer's channel
-	rand    uint32 // randomizes order of timers at same instant; only set when isFake
-	dstHost uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
-	dstReg  uint32 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
+	blocked     uint32 // number of goroutines blocked on timer's channel
+	rand        uint32 // randomizes order of timers at same instant; only set when isFake
+	dstHost     uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
+	dstReg      uint32 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
 	dstFakeNext *timer // DST: intrusive link in the per-run fake-timer list (dst.go dstFakeTimers), a lock-free prepend stack; set once per run at registration. Unused when DST off / not a fake timer
 
 	// Timer wakes up at when, and then at when+period, ... (period > 0 only)

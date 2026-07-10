@@ -625,6 +625,7 @@ func dstAccPageBucket(page uintptr) int {
 // (exploration.md, hardening clause 2 — filter capacity is a function of counts the
 // schedule determines, never of addresses). Exact, not merely an upper bound, so the
 // filter degrades to conservative no sooner than a real alignment forces it to.
+//
 //go:linkname dstAccPageCharge
 func dstAccPageCharge(size uintptr) uintptr {
 	if size == 0 {
