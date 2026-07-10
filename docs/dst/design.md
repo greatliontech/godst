@@ -343,7 +343,11 @@ models a TCP socket pair, not a message queue:
   persist*, not retransmit exhaustion — the write blocks (backpressure) with **no** horizon and
   resumes when the peer drains (`TestDSTNetWritePersistsWithoutPartition`). Firing `ETIMEDOUT` on
   live-peer backpressure would be a sim-only failure a live peer cannot produce — the false-positive
-  class Soundness forbids. A **heal resets** the horizon window (the timer restarts on the next cut),
+  class Soundness forbids. The horizon has one further trigger, on the CONNECT path: a dial whose
+  SYN a full accept backlog drops (`tcp_abort_on_overflow=0`) retransmits and fails `ETIMEDOUT` at
+  the horizon unless a slot frees first (`TestDSTNetBacklogFullDialTimesOut`) — kernel-real exhaustion against a
+  live listener, so the partition gate above scopes the ESTABLISHED-connection write path, not
+  connect. A **heal resets** the horizon window (the timer restarts on the next cut),
   approximating "the retransmit timer resets on ACK progress" — exact only when the heal is long
   enough to deliver a byte; a sub-latency partition *flap* resets it with no real progress, so the
   sim keeps a conn alive a real stack's RTO would eventually kill. That errs toward *fewer* ETIMEDOUTs
@@ -423,10 +427,16 @@ reads from a gracefully closed peer drain buffered data then return `io.EOF`, wr
 close follow the FIN/RST shape above (first accepted, subsequent `ECONNRESET`), and any operation on
 a reset connection carries `ECONNRESET`; deadline failures are `*net.OpError` wrapping
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
-the bubble's virtual clock. Closing a listener resets the connections still in its accept backlog
-(production's RST), so a dialer that already succeeded observes `ECONNRESET` instead of blocking
-durably forever, and `Accept` after `Close` always fails with `net.ErrClosed` — including an `Accept`
-already blocked in its select when `Close` runs: the overlap linearizes to close-first (the pending
+the bubble's virtual clock. A FULL accept backlog (128 pending connections) drops the dial's SYN, as
+`tcp_abort_on_overflow=0` does: the dial blocks (the retransmitted SYNs), connects if a slot frees
+within the retransmit horizon, and otherwise fails `ETIMEDOUT` — a deadline-less dial into a
+saturated listener fails in bounded virtual time, never a permanent sim-only hang
+(`TestDSTNetBacklogFullDialTimesOut`; the horizon arms after the SYN traversal, so the bound is
+½RTT + horizon — never earlier than a kernel's connect()-anchored timer). Closing a listener
+resets the connections still in its accept backlog (production's RST), so a dialer that already
+succeeded observes `ECONNRESET` instead of blocking durably forever, and `Accept` after `Close`
+always fails with `net.ErrClosed` — including an `Accept` already blocked in its select when
+`Close` runs: the overlap linearizes to close-first (the pending
 accept unblocks with `net.ErrClosed` and its would-be connection is reset with the backlog, as
 production unblocks pending accepts on close). The nettrace
 `ConnectStart`/`ConnectDone` callbacks fire around a simulated dial, so `httptrace`-instrumented

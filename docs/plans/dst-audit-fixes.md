@@ -102,7 +102,7 @@ Audit reproducers (ephemeral, from the audit session):
 - [x] 21. dial-side local binds and ephemeral allocation check listener
   bindings: binding to a live listener's 2-tuple fails EADDRINUSE.
   (dst-audit-net-kernel-shape, item 3)
-- [ ] 22. a full accept backlog fails a deadline-less dial with ETIMEDOUT
+- [x] 22. a full accept backlog fails a deadline-less dial with ETIMEDOUT
   instead of hanging forever. (dst-audit-net-kernel-shape, item 4)
 - [ ] 23. `Close()` with unread inbound data resets the peer (read fails
   ECONNRESET), reusing the existing `unreadInbound` predicate, consistent with

@@ -1052,12 +1052,37 @@ redial:
 	reset := new(atomic.Bool)
 	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc}
 	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc}
+	// A FULL accept backlog drops the SYN (tcp_abort_on_overflow=0, the
+	// default): the dialer retransmits and either a slot frees in time (the
+	// send below lands) or its retries exhaust — connect fails ETIMEDOUT at
+	// the retransmit horizon. Without the horizon a deadline-less dial into a
+	// saturated listener hung forever, a sim-only permanent hang. This arms
+	// for same-host dials too — unlike the wire's same-host no-horizon rule —
+	// because a loopback connect into a full queue times out in production
+	// just the same (the queue, not the link, is what's exhausted).
+	var backlogHorizonC <-chan time.Time
+	var backlogHorizonT *time.Timer
+	if retransNs > 0 {
+		backlogHorizonT = time.NewTimer(time.Duration(retransNs))
+		backlogHorizonC = backlogHorizonT.C
+	}
+	stopBacklogHorizon := func() {
+		if backlogHorizonT != nil {
+			backlogHorizonT.Stop()
+		}
+	}
 	select {
 	case <-ctx.Done():
+		stopBacklogHorizon()
 		p1.Close()
 		p2.Close()
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
+	case <-backlogHorizonC:
+		p1.Close()
+		p2.Close()
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 	case l.accept <- server:
+		stopBacklogHorizon()
 		select {
 		case <-l.done:
 			// The listener closed while this connection sat in (or entered)
@@ -1087,6 +1112,7 @@ redial:
 		dstConnectSYNACK(latency, jitter)
 		return dialer, nil
 	case <-l.done:
+		stopBacklogHorizon()
 		p1.Close()
 		p2.Close()
 		goto refused

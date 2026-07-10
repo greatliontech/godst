@@ -374,11 +374,13 @@ type NetworkConfig struct {
 	SendBuffer int
 
 	// RetransmitTimeout is the virtual-time horizon after which a connection whose
-	// data cannot be delivered — a Write blocked on a full send buffer that never
-	// drains (a permanent partition), or a deadline-less Dial across a cut — fails
-	// with ETIMEDOUT, modeling a real kernel's ~15 retransmissions. The zero value
-	// uses a 2-minute default; a negative value disables the horizon (blocked writes
-	// and dials wait forever, subject only to their own deadlines).
+	// data cannot be delivered — any bytes held at a partition (written, in
+	// flight, or blocking a full send buffer), a deadline-less Dial across a
+	// cut or to a crashed host, or a Dial whose SYN a full accept backlog
+	// drops — fails with ETIMEDOUT, modeling a real kernel's ~15
+	// retransmissions. The zero value uses a 2-minute default; a negative
+	// value disables the horizon (blocked writes and dials wait forever,
+	// subject only to their own deadlines).
 	RetransmitTimeout time.Duration
 }
 

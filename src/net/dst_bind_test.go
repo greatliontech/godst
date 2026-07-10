@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/simulation"
+	"time"
 )
 
 // dstBindTestTarget declares host "srv" with a listener at an EXPLICIT port
@@ -182,5 +183,63 @@ func TestDSTNetRelistenWithAcceptedConns(t *testing.T) {
 	})
 	if relistenErr != nil {
 		t.Errorf("re-listen on the restarted server's port with accepted conns draining = %v, want success (accepted ends inherit SO_REUSEADDR)", relistenErr)
+	}
+}
+
+// TestDSTNetBacklogFullDialTimesOut: a full accept backlog drops the SYN
+// (tcp_abort_on_overflow=0); a deadline-less dial retransmits into the
+// saturated listener and fails ETIMEDOUT at the horizon instead of hanging
+// forever. A dial whose retries are still running when a slot frees connects.
+func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var fullErr error
+	var fullDur time.Duration
+	var freedErr error
+	simulation.RunWith(1, opts, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			close(ready)
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			target := simulation.HostIP("srv") + ":20000"
+			backlog := cap(ln.(*dstListener).accept)
+			for i := 0; i < backlog; i++ { // saturate the backlog
+				if _, err := Dial("tcp", target); err != nil {
+					panic(err)
+				}
+			}
+			t0 := time.Now()
+			_, fullErr = Dial("tcp", target) // one past the backlog: the queue never drains
+			fullDur = time.Since(t0)
+
+			// Free one slot mid-retry: the next dial's "retransmitted SYN"
+			// lands and the connect completes.
+			dialDone := make(chan struct{})
+			go func() {
+				_, freedErr = Dial("tcp", target)
+				close(dialDone)
+			}()
+			time.Sleep(200 * time.Millisecond) // the dial is parked on the full backlog
+			if _, err := ln.Accept(); err != nil {
+				panic(err)
+			}
+			<-dialDone
+		})
+	})
+	if !errors.Is(fullErr, syscall.ETIMEDOUT) {
+		t.Errorf("dial into a permanently full backlog = %v, want ETIMEDOUT (the SYN is dropped, retries exhaust)", fullErr)
+	}
+	if fullDur != time.Second {
+		t.Errorf("full-backlog dial failed after %v, want the 1s retransmit horizon", fullDur)
+	}
+	if freedErr != nil {
+		t.Errorf("dial with a slot freed mid-retry = %v, want success (the retransmitted SYN lands)", freedErr)
 	}
 }

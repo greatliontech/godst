@@ -1,17 +1,12 @@
-# DST audit: net divergences from kernel shape (backlog, close-RST)
+# DST audit: net divergences from kernel shape (close-RST)
 
-Lands: chunks 22–23 of docs/plans/dst-audit-fixes.md (item 4 → 22, 5 → 23; items 1–3 landed in chunks 20, 19, 21)
+Lands: chunk 23 of docs/plans/dst-audit-fixes.md (item 5 → 23; items 1–4 landed in chunks 20, 19, 21, 22)
 
 ## Gap
 
 Severity M (full-surface audit, 2026-07-10; each reproduced). Kernel-shape
 divergences in the virtual wire, all in the false-negative direction (a SUT
 that keys on the real behavior is misled or a real failure is masked):
-
-4. **A full accept backlog blocks a deadline-less dial forever**
-   (`make(chan Conn, 128)`, `dst.go:765`; blocking send `dst.go:1002-1007`, no
-   retransmit horizon on that loop). Production drops the SYN → connect
-   ETIMEDOUT (~130s). Sim-only permanent hang, the class Soundness forbids.
 
 5. **`Close()` with unread inbound data FINs; real kernels RST**
    (`dstConn.Close`, `dst.go:552-559`). The kernel predicate `unreadInbound`
