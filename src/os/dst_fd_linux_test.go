@@ -2244,3 +2244,95 @@ func TestDSTFSMprotectNoneIsEnforcedByHardware(t *testing.T) {
 			}
 		})
 }
+
+// TestDSTFSVirtualFDFlockCloseWhileBlocked: a blocked flock waiter whose fd
+// is closed elsewhere is NOT woken with EBADF — Linux's in-flight flock holds
+// a reference to the open file description, so the wait survives the close
+// and the call GRANTS once the lock becomes available; the description's last
+// reference (the in-flight call itself) drops at return, so the grant records
+// nothing and a fresh lock succeeds immediately.
+func TestDSTFSVirtualFDFlockCloseWhileBlocked(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			f1, err := os.OpenFile("/lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatalf("open f1: %v", err)
+			}
+			defer f1.Close()
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX); err != nil {
+				t.Fatalf("f1 lock: %v", err)
+			}
+			f2, err := os.OpenFile("/lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatalf("open f2: %v", err)
+			}
+			fd2 := int(f2.Fd())
+			res := make(chan error, 1)
+			go func() {
+				res <- syscall.Flock(fd2, syscall.LOCK_EX) // blocks: f1 holds
+			}()
+			time.Sleep(time.Millisecond) // let the waiter block
+			if err := f2.Close(); err != nil {
+				t.Fatalf("close f2 while its flock blocks: %v", err)
+			}
+			time.Sleep(time.Millisecond)
+			select {
+			case err := <-res:
+				t.Fatalf("blocked flock returned early after the close: %v", err)
+			default:
+			}
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+				t.Fatalf("f1 unlock: %v", err)
+			}
+			if err := <-res; err != nil {
+				t.Fatalf("flock woken after close-while-blocked = %v, want nil (Linux grants on the pinned description)", err)
+			}
+			// The phantom grant recorded nothing: a fresh nonblocking lock
+			// succeeds at once.
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				t.Fatalf("fresh lock after the phantom grant = %v, want nil (the grant must record nothing)", err)
+			}
+
+			// Second cycle: the woken phantom waiter finds the lock ALREADY
+			// retaken and must keep waiting (the wait-again path), granting
+			// only at the next unlock. The retake happens in straight-line
+			// code after the unlock — no yield point between the two calls
+			// at P=1 — so the waiter deterministically loses the race.
+			f3, err := os.OpenFile("/lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatalf("open f3: %v", err)
+			}
+			fd3 := int(f3.Fd())
+			res2 := make(chan error, 1)
+			go func() {
+				res2 <- syscall.Flock(fd3, syscall.LOCK_EX)
+			}()
+			time.Sleep(time.Millisecond)
+			if err := f3.Close(); err != nil {
+				t.Fatalf("close f3 while its flock blocks: %v", err)
+			}
+			time.Sleep(time.Millisecond)
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+				t.Fatalf("unlock before retake: %v", err)
+			}
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				t.Fatalf("straight-line retake = %v, want nil", err)
+			}
+			time.Sleep(time.Millisecond) // the woken waiter re-checks, finds f1 holding, waits again
+			select {
+			case err := <-res2:
+				t.Fatalf("phantom waiter granted %v while the lock was held (must wait again)", err)
+			default:
+			}
+			if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+				t.Fatalf("final unlock: %v", err)
+			}
+			if err := <-res2; err != nil {
+				t.Fatalf("phantom waiter after wait-again = %v, want nil", err)
+			}
+		})
+	})
+}

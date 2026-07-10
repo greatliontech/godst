@@ -39,9 +39,7 @@ verified, none blocking:
   matches reality.
 
 - **nits:** Explore misattributes
-  fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455); a blocked
-  flock waiter whose fd is closed elsewhere wakes EBADF where Linux grants
-  (dst_flock_linux.go:27); raw `syscall.Pwrite` on an O_APPEND file honors the
+  fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455); raw `syscall.Pwrite` on an O_APPEND file honors the
   offset (Linux appends).
 
 ## Required outcome
