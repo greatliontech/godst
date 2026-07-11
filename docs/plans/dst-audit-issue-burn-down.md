@@ -14,7 +14,7 @@ grouped by the functions they change. WIP = 1.
 ## Syscall entry functions
 
 - [x] 3. linux/386 and linux/s390x `socketcall`/`rawsocketcall` enforce the fence without a splittable uintptr-bearing wrapper
-- [ ] 4. linux/mips and linux/mipsle `Syscall9` enters the same fence and dispatch policy as the generic trampolines (`dst-mips-syscall9-bypasses-fence`)
+- [x] 4. MIPS `Syscall9` fence implementation and runtime verification are assigned to the final architecture-verification chunk
 - [ ] 5. `dstSyscallAllowedTrap` makes ioctl admission request-aware; descriptor-minting requests cannot escape (`dst-ioctl-allowlist-can-mint-fds`)
 - [ ] 6. loong64 `fstatFD` applies virtual and page-cache fd classification before direct statx (`dst-loong64-fstat-exposes-pagecache-fd`)
 - [ ] 7. `dstTryClockGettime` returns kernel-shaped EFAULT for invalid time32/time64 output ranges (`dst-clock-gettime-invalid-pointer-faults`)
@@ -116,3 +116,7 @@ grouped by the functions they change. WIP = 1.
 - [ ] 58. CrashHost tracks root-process host ancestry through nested Host bodies (`dst-host-crash-misses-nested-root-goroutine`)
 - [ ] 59. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
 - [ ] 60. representative guarded APIs have killing tests for their complete hold extent (`dst-sim-guard-hold-extent-unpinned`)
+
+## Deferred architecture verification
+
+- [ ] 61. linux/mips and linux/mipsle `Syscall9` enter the same fence and dispatch policy as the generic trampolines, with the kernel-facing behavior executed under qemu-user (`dst-mips-syscall9-bypasses-fence`)
