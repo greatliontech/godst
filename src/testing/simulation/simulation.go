@@ -122,6 +122,9 @@ func dstTraceEnabledFP(i int) []uint64
 //go:linkname dstTraceOverflowFP runtime.dstTraceOverflowFP
 func dstTraceOverflowFP() bool
 
+//go:linkname dstTraceEnabOverflowFP runtime.dstTraceEnabOverflowFP
+func dstTraceEnabOverflowFP() bool
+
 //go:linkname dstExplorePanicFP runtime.dstExplorePanicFP
 func dstExplorePanicFP() (any, bool)
 

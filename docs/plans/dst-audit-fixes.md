@@ -126,7 +126,7 @@ Audit reproducers (ephemeral, from the audit session):
   bubble during an active run fail loudly and deterministically, as the
   victim-naming rule already does. Test: each API from a pre-run goroutine.
   (dst-audit-sim-fault-from-nonbubble)
-- [ ] 28. Explore attributes fan-out overflow distinctly, not as BudgetHit
+- [x] 28. Explore attributes fan-out overflow distinctly, not as BudgetHit
   under `MaxSteps`. (dst-audit-low-fidelity-cluster)
 
 ## Spec & docs (docs/dst, untagged-build surface)

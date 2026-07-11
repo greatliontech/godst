@@ -15,7 +15,7 @@ chunk(s) there.
 | Issue | Severity | Lands |
 |---|---|---|
 | [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
-| [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunks 4, 9, 11–17, 24, 25, 28, 29 |
+| [low-severity fidelity/hygiene cluster](./dst-audit-low-fidelity-cluster.md) | L | chunk 29 |
 
 Found during plan execution:
 
@@ -33,3 +33,4 @@ Found during plan execution:
 | [net TIME_WAIT is unmodeled](./dst-net-time-wait-unmodeled.md) | M | close-time hold modeled, or divergence confirmed kept |
 | [Host/Process from non-bubble goroutines mid-run](./dst-sim-topology-apis-from-nonbubble.md) | M | declaration APIs guarded, or caller contract recorded |
 | [fault-caller guard run-start TOCTOU](./dst-sim-fault-guard-runstart-toctou.md) | L | activation edge closed, or window confirmed accepted |
+| [DPOR truncation-continuation pin missing](./dst-explore-dpor-truncation-continuation-pin.md) | L | deterministic discriminating SUT, or brittleness demonstrated |

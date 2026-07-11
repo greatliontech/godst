@@ -2440,3 +2440,99 @@ func TestExploreAccPageChargeAddressIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestExploreFanOutOverflowIsNotBudgetHit: a run whose enabled-set FAN-OUT
+// exceeds the internal capacity — while its decision count still fits the
+// caller's MaxSteps — reports Overflow (internal truncation), never BudgetHit:
+// the attribution names the capacity that actually hit (the fan-out headroom
+// derives from MaxSteps, so raising it can still help).
+// 300 concurrently-live goroutines give the spawn ramp a quadratic
+// enabled-set footprint (~N²/2 entries) that crosses MaxSteps*64 near step
+// 256, well under the 512-decision budget.
+func TestExploreFanOutOverflowIsNotBudgetHit(t *testing.T) {
+	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, func() bool {
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for i := 0; i < 300; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-release
+			}()
+		}
+		close(release)
+		wg.Wait()
+		return false
+	})
+	if !res.Overflow {
+		t.Errorf("Overflow = false, want true: the enabled-set fan-out exceeded the internal capacity")
+	}
+	if res.BudgetHit {
+		t.Errorf("BudgetHit = true, want false: the truncation is the internal fan-out capacity, not a caller budget (with the misattribution, MaxSteps took the blame)")
+	}
+	if res.Exhausted {
+		t.Errorf("Exhausted = true, want false under overflow")
+	}
+}
+
+// TestExploreTruncatedFailureReplays: a failure found in a run whose decision
+// trace TRUNCATED (fan-out overflow) still carries a replayable Schedule.
+// Failure.Schedule is the SPAWNING prefix (derived from untruncated parents —
+// here the root, so empty), which is what makes it structurally gap-free; the
+// runtime separately CHECKS that recording never resumes past a truncation
+// (the trace-gap throw), so any future consumer of the recorded trace is
+// protected too.
+func TestExploreTruncatedFailureReplays(t *testing.T) {
+	sut := func() bool {
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for i := 0; i < 300; i++ { // overflow the fan-out capacity mid-ramp
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-release
+			}()
+		}
+		close(release)
+		wg.Wait() // the fan-out shrinks back to 1: resumed recording would gap here
+		return true
+	}
+	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, sut)
+	if len(res.Failures) == 0 {
+		t.Fatal("the failing SUT produced no failure")
+	}
+	failed, _ := Replay(1, res.Failures[0], sut)
+	if !failed {
+		t.Error("replay of the truncated-trace failure did not reproduce the assertion failure")
+	}
+}
+
+// TestExploreDPORFanOutOverflowContinues: the DPOR walk under a fan-out
+// truncation reports Overflow (not BudgetHit), does not extend frames from
+// the truncated region, and TERMINATES — pending backtracks seeded by earlier
+// untruncated runs still run rather than the walk aborting or exploding.
+func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 512}, func() bool {
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for i := 0; i < 300; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-release
+			}()
+		}
+		close(release)
+		wg.Wait()
+		return false
+	})
+	if !res.Overflow {
+		t.Errorf("Overflow = false, want true under a fan-out truncation")
+	}
+	if res.BudgetHit {
+		t.Errorf("BudgetHit = true, want false: no caller budget was exceeded")
+	}
+	if res.Exhausted {
+		t.Errorf("Exhausted = true, want false under overflow")
+	}
+}

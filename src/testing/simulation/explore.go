@@ -161,9 +161,9 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 	cfg.maxSteps = opts.MaxSteps
 	if opts.MaxSteps > 0 {
 		cfg.maxDecisions = opts.MaxSteps
-		// Keep enough enabled-set room for ordinary tests while still letting a
-		// pathological fan-out hit the same explicit step budget instead of an
-		// unreported internal cap.
+		// Keep enough enabled-set room for ordinary tests; a pathological
+		// fan-out that exceeds even this headroom reports Overflow (internal
+		// truncation), attributed distinctly from the caller's step budget.
 		cfg.maxEnabledTotal = opts.MaxSteps * 64
 		if cfg.maxEnabledTotal < opts.MaxSteps {
 			cfg.maxEnabledTotal = opts.MaxSteps
@@ -259,6 +259,11 @@ type exploreTrace struct {
 	// precision is compromised for this trace, so source-backtracking degrades to
 	// the all-enabled over-approximation (sound: over-explore, never prune).
 	syncEventOverflow bool
+	// traceTruncated: the DECISION trace itself stopped recording (step budget
+	// or fan-out capacity), so decisions beyond the truncation point are
+	// unrecorded and no child prefix may be derived past it. Edge/access-log
+	// overflows do not set this — they degrade coverage, not the trace.
+	traceTruncated bool
 	// Access log: EVERY instrumented access in execution order, decoupled from the
 	// decision trace (a single-owner access records here without yielding, so it is
 	// not a decision). DPOR's dependency/HB relation is sourced from this log, not from
@@ -471,7 +476,14 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 
 func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
 	traceOverflow := dstTraceOverflowFP()
-	tr.budgetHit = stepBudget && traceOverflow
+	enabOverflow := dstTraceEnabOverflowFP()
+	// A caller-supplied MaxSteps owns only the DECISION-count leg of the trace
+	// budget: a fan-out (enabled-set capacity) overflow is internal truncation
+	// and reports Overflow, never BudgetHit — the caller's step budget is not
+	// what truncated (the fan-out headroom derives from MaxSteps, so raising
+	// it can help, but the attribution names the capacity that actually hit).
+	tr.budgetHit = stepBudget && traceOverflow && !enabOverflow
+	tr.traceTruncated = traceOverflow
 	tr.syncEventOverflow = dstSyncEventOverflowFP()
 	tr.overflow = (traceOverflow && !tr.budgetHit) || dstEdgeOverflowFP() || tr.syncEventOverflow
 	tr.aborted = dstScheduleAbortedFP()
@@ -676,7 +688,12 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 			res.ForeignSched = true
 		}
 		appendRunFailures(&res, prefix, forces, r)
-		if tr.budgetHit {
+		if tr.traceTruncated {
+			// The decision trace stopped recording (caller step budget or
+			// fan-out capacity): decisions beyond the truncation are
+			// unrecorded, children of a truncated trace typically re-truncate
+			// (the fan-out is structural), and coverage is already reported
+			// incomplete — do not expand.
 			continue
 		}
 		if promoteAccessForces(tr, forces) {
@@ -965,9 +982,6 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 			res.ForeignSched = true
 		}
 		appendRunFailures(&res, prefix, forces, r)
-		if tr.budgetHit {
-			break
-		}
 		if promoteAccessForces(tr, forces) {
 			return res, true
 		}
@@ -995,6 +1009,15 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		// goroutines, FILTERED by independence with the parent's chosen interval set. A
 		// sleeping goroutine has not executed since it was put to sleep, so the access
 		// set stored with it stays valid down the frames it sleeps through.
+		// A TRUNCATED trace extends nothing: its recorded region is a
+		// contiguous prefix (sticky truncation), but frames derived from its
+		// deepest reaches would spawn children that re-truncate, and the
+		// space beyond the budget is already reported incomplete (Overflow).
+		// The walk CONTINUES: pending backtracks seeded on earlier frames by
+		// earlier untruncated runs are sound and still explored.
+		if tr.traceTruncated {
+			n = len(stack)
+		}
 		for d := len(stack); d < n; d++ {
 			sleep := map[uint64][]dporTrans{}
 			if useSleep && d > 0 {
@@ -1036,7 +1059,10 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 			for i := j - 1; i >= 0; i-- {
 				if accessConflict(tr, i, j) {
 					if dporConcurrent(clk, pidx, tr, i, j) {
-						if d := tr.accStep[i] - 1; d >= 0 && d < n {
+						// d < len(stack): with a truncated trace the stack was
+						// not extended, and a backtrack can only seed a frame
+						// that exists.
+						if d := tr.accStep[i] - 1; d >= 0 && d < n && d < len(stack) {
 							if raceEnabled || tr.syncEventOverflow {
 								// All-enabled over-approximation. For a sync-event overflow
 								// trace the weak-initial computation is under-ordered (a

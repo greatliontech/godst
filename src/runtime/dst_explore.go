@@ -301,6 +301,11 @@ var (
 	dstTraceN        int
 	dstTraceFlatN    int
 	dstTraceOverflow bool
+	// dstTraceEnabOverflow: the overflow was (at least) the enabled-set FAN-OUT
+	// capacity (dstTraceEnabFlat), not the decision count — the brain reports
+	// it as internal-capacity truncation (Overflow), never as the caller's
+	// step budget (BudgetHit), which the decision-count leg alone signals.
+	dstTraceEnabOverflow bool
 )
 
 // Happens-before edge buffers (increment 2). Each goready under the scheduled
@@ -1128,6 +1133,7 @@ func dstScheduleReset() {
 	dstTraceN = 0
 	dstTraceFlatN = 0
 	dstTraceOverflow = false
+	dstTraceEnabOverflow = false
 	dstSeqCtr = 0
 	dstEdgeN = 0
 	dstEdgeOverflow = false
@@ -1219,7 +1225,25 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 	// The enabled set is the simulation's candidates only (see the doc above);
 	// with a pure set simTotal == total.
 	simTotal := c.simCount(total)
-	if dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(simTotal) <= len(dstTraceEnabFlat) {
+	if !dstTraceOverflow && dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(simTotal) > len(dstTraceEnabFlat) {
+		// The decision would fit, but its enabled set would not: fan-out
+		// overflow, distinct from running out of decisions.
+		dstTraceEnabOverflow = true
+	}
+	// Truncation is STICKY: once any step fails to record, no later step may —
+	// a later, smaller enabled set could otherwise fit again and resume
+	// recording with a GAP, and the trace would no longer be a contiguous
+	// prefix of the run's decisions. The explorer builds child prefixes from
+	// consecutive trace indices; a gapped trace replays as a diverged schedule
+	// (the DST-L2-2 abort).
+	if !dstTraceOverflow && dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(simTotal) <= len(dstTraceEnabFlat) {
+		if dstTraceN != dstScheduleStep {
+			// Contiguity is checked, not assumed: recording index == step
+			// number at every record ⇔ no step was ever skipped. A gapped
+			// trace would replay as a diverged schedule (DST-L2-2) at any
+			// future consumer.
+			throw("dst: explore trace gap — recording resumed after truncation")
+		}
 		chosen := c.at(sel)
 		dstTraceChosen[dstTraceN] = chosen.dstSeq
 		dstTraceAddr[dstTraceN] = chosen.dstAccAddr
@@ -1374,6 +1398,13 @@ func dstTraceEnabledFP(i int) []uint64 {
 //
 //go:linkname dstTraceOverflowFP
 func dstTraceOverflowFP() bool { return dstTraceOverflow }
+
+// dstTraceEnabOverflowFP reports whether the last run's trace overflow was (at
+// least partly) the enabled-set fan-out capacity rather than the decision
+// count.
+//
+//go:linkname dstTraceEnabOverflowFP
+func dstTraceEnabOverflowFP() bool { return dstTraceEnabOverflow }
 
 //go:linkname dstExplorePanicFP
 func dstExplorePanicFP() (any, bool) { return dstExplorePanicValue, dstExplorePanicSet }

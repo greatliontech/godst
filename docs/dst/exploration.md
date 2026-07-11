@@ -797,5 +797,17 @@ relation.
   reports.
 - **Budget policy when the space exceeds the budget (IMPLEMENTED).** `ExploreWith` reports partial
   coverage with `Schedules` plus `BudgetHit=true`; `Exhausted` is false — never a silent cap (DST-L2-3 /
-  No silent downscoping).
+  No silent downscoping). Attribution is precise: `BudgetHit` names only the CALLER's budgets
+  (`MaxSchedules`, `MaxSteps` — the decision-count leg); an enabled-set FAN-OUT overflow is internal
+  truncation and reports `Overflow`, never `BudgetHit` — the attribution names the capacity that
+  actually hit (the fan-out headroom derives from `MaxSteps`, so raising it can still help)
+  (`TestExploreFanOutOverflowIsNotBudgetHit`). Trace truncation
+  is STICKY and CHECKED (recording never resumes past a truncation — the runtime throws on a would-be
+  gap — so the recorded trace is always a contiguous prefix); a `Failure.Schedule` is gap-free by
+  construction (spawning prefixes derive only from untruncated parents) and replays
+  (`TestExploreTruncatedFailureReplays`). A truncated trace is never EXTENDED into new child
+  schedules or DPOR frames — its children typically re-truncate, and coverage is already reported
+  incomplete — but the walk continues: work seeded by earlier untruncated runs (queued prefixes in
+  the exhaustive walk, pending backtracks in DPOR) is still explored, and force promotion is gated
+  on untruncated traces in both modes.
 

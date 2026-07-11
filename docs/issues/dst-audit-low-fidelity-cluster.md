@@ -1,6 +1,6 @@
 # DST audit: low-severity fidelity and hygiene divergences
 
-Lands: chunks 28–29 of docs/plans/dst-audit-fixes.md (per item; chunks 4, 9, 11–17, 24, 25 landed)
+Lands: chunk 29 of docs/plans/dst-audit-fixes.md (the zero-footprint item; all others landed)
 
 ## Gap
 
@@ -14,9 +14,6 @@ verified, none blocking:
   `NumCPU` (debug.go:267) branches on a runtime var, not a build const, so it
   is not dead-code-eliminated untagged. No behavior change; the spec's "zero
   footprint" note is inaccurate.
-
-- **nits:** Explore misattributes
-  fan-out overflow as BudgetHit under `MaxSteps` (explore.go:452-455).
 
 ## Required outcome
 
