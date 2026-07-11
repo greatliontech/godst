@@ -15,5 +15,4 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [in-flight allowlisted read/write can straddle host-fd creation](./dst-fd-inflight-io-straddles-creation.md) | M | non-close dispatch atomic w.r.t. host-fd creation, or window proven empty |
 | [lazy-fire timestamp mixes regimes on drifted hosts](./dst-clock-lazy-fire-timestamp-drift.md) | L | delivered-value contract for rate≠1 lazily-fired timers stated in faults.md |
 | [IP-less explicit LocalAddr collapses to a concrete-IP bind](./dst-net-wildcard-localaddr-bind-collapse.md) | L | wildcard bind conflict modeled, or the collapse recorded in design.md |
-| [Host/Process from non-bubble goroutines mid-run](./dst-sim-topology-apis-from-nonbubble.md) | M | declaration APIs guarded, or caller contract recorded |
-| [fault-caller guard run-start TOCTOU](./dst-sim-fault-guard-runstart-toctou.md) | L | activation edge closed, or window confirmed accepted |
+| [caller-position guards run-start TOCTOU](./dst-sim-fault-guard-runstart-toctou.md) | L | activation edge closed for both guards, or window confirmed accepted |

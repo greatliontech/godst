@@ -173,6 +173,125 @@ func TestDSTForeignRuntimeGCPanics(t *testing.T) {
 	}
 }
 
+// TestDSTTopologyFromNonBubbleGoroutinePanics: the DECLARATION APIs (Host,
+// Process) carry the fault APIs' caller-position guard — they mutate run
+// state too (a mid-run Host re-declaration is a reboot: host-up relay plus
+// clock re-establishment; Process starts SUT goroutines), so a foreign
+// caller during an active run fails loudly instead of rebooting a machine or
+// scheduling goroutines at a wall-clock instant the seed does not control.
+// Both bare foreign goroutines and foreign synctest bubbles are outside the
+// run's bubble. In-run declarations from bubble goroutines stay sanctioned;
+// the guard fires before the intern tables are touched, so a refused
+// declaration leaves no trace.
+func TestDSTTopologyFromNonBubbleGoroutinePanics(t *testing.T) {
+	decls := []struct {
+		name string
+		call func()
+	}{
+		{"Host", func() { Host("foreign-h", HostConfig{}, func() {}) }},
+		{"Process", func() { Process("foreign-p", func() {}) }},
+	}
+
+	inject := make(chan func())
+	result := make(chan string)
+	go func() {
+		for call := range inject {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						result <- fmt.Sprint(r)
+					} else {
+						result <- ""
+					}
+				}()
+				call()
+			}()
+		}
+	}()
+	defer close(inject)
+
+	var got map[string]string
+	inBubble := false
+	Test(t, 1, func(t *testing.T) {
+		got = make(map[string]string, 2*len(decls))
+		for _, d := range decls {
+			inject <- d.call
+			got[d.name] = <-result
+			call := d.call
+			inject <- func() { // a foreign bubble is still outside the run's
+				var msg string
+				synctest.Run(func() {
+					defer func() {
+						if r := recover(); r != nil {
+							msg = fmt.Sprint(r)
+						}
+					}()
+					call()
+				})
+				if msg != "" {
+					panic(msg) // re-raise on the injector for uniform reporting
+				}
+			}
+			got[d.name+"/foreign-bubble"] = <-result
+		}
+		// The refused declarations left no trace: the names were never
+		// interned, so the victim rule still fails loud on them.
+		func() {
+			defer func() {
+				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "unknown host") {
+					t.Errorf("CrashHost(\"foreign-h\") after a refused declaration = %v, want the unknown-host panic (the guard must fire before the intern tables)", r)
+				}
+			}()
+			CrashHost("foreign-h")
+		}()
+		func() {
+			defer func() {
+				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "unknown process") {
+					t.Errorf("Crash(\"foreign-p\") after a refused declaration = %v, want the unknown-process panic (the guard must fire before the intern tables)", r)
+				}
+			}()
+			Crash("foreign-p")
+		}()
+		// The run's own goroutines: sanctioned declarations still work.
+		Host("h", HostConfig{}, func() {})
+		done := make(chan struct{})
+		go Process("p", func() { <-done })
+		close(done)
+		inBubble = true
+	})
+	for _, d := range decls {
+		for _, pos := range []string{d.name, d.name + "/foreign-bubble"} {
+			msg := got[pos]
+			if msg == "" {
+				t.Errorf("%s during an active run did not panic", pos)
+				continue
+			}
+			if !strings.Contains(msg, d.name) || !strings.Contains(msg, "outside the run's bubble") {
+				t.Errorf("%s panic = %q, want the caller-position diagnostic naming the API", pos, msg)
+			}
+		}
+	}
+	if !inBubble {
+		t.Error("in-bubble declarations did not complete")
+	}
+}
+
+// TestDSTTopologyOutsideRunKeepsBehavior: outside a run the declaration APIs
+// keep their documented behavior — Host runs f, Process runs f; no panic.
+func TestDSTTopologyOutsideRunKeepsBehavior(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("declaration API outside a run panicked: %v", r)
+		}
+	}()
+	ranHost, ranProc := false, false
+	Host("outside-h", HostConfig{}, func() { ranHost = true })
+	Process("outside-p", func() { ranProc = true })
+	if !ranHost || !ranProc {
+		t.Errorf("outside a run Host/Process must still run f (host=%v proc=%v)", ranHost, ranProc)
+	}
+}
+
 // TestDSTFaultOutsideRunIsNoop: the guard changes nothing outside a run —
 // every fault API remains the documented no-op.
 func TestDSTFaultOutsideRunIsNoop(t *testing.T) {

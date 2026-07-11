@@ -48,7 +48,9 @@ process 0 is the default — the test driver — so the N=1 program is host 0, p
 zero-config). Both are callable **at any time**, not only at setup: since there is no `os/exec` under
 DST, calling `Host`/`Process` mid-run **is** how a SUT models a node joining (membership change). The id
 is stamped+inherited, so a process started mid-run, or added to an existing host, just works; the body
-scopes *declaration*, the goroutines it starts outlive it.
+scopes *declaration*, the goroutines it starts outlive it. Mid-run declarations come from goroutines
+the simulation schedules — a foreign caller panics, like the fault APIs (see "Fault callers fail
+loud too").
 
 ```go
 simulation.Host("h1", simulation.HostConfig{IP: "10.0.0.1", NumCPU: 4, Clock: simulation.Skew(50*ms)}, func() {
@@ -396,6 +398,11 @@ no-ops (clock faults, whose caller has no bubble clock to step): both are the sa
 silently-tests-nothing class the victim rule kills. Faults are injected from goroutines the
 simulation schedules — the run body or goroutines started inside it. Outside a run the calls stay
 documented no-ops. `TestDSTFaultFromNonBubbleGoroutinePanics` / `TestDSTFaultOutsideRunIsNoop`.
+The DECLARATION APIs (`Host`, `Process`) carry the same guard: they mutate run state too — a
+mid-run `Host` re-declaration is a reboot (host-up relay plus clock re-establishment) and
+`Process` starts SUT goroutines — so a foreign caller during an active run panics identically,
+while pre-run and outside-run calls keep their documented behavior.
+`TestDSTTopologyFromNonBubbleGoroutinePanics`.
 
 ### The fault model: policies at existing seams
 

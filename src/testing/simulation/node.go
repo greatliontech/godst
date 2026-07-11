@@ -408,8 +408,13 @@ func internProc(name string) uint32 {
 // name) and NumCPU (runtime.NumCPU) come from config and are recorded for the host
 // for the rest of the run. The zero HostConfig is the plain, in-sync host whose
 // os.Hostname is its name. Calling Host outside a simulation has no effect beyond
-// running f (the recorded identity is read only inside an active run).
+// running f (the recorded identity is read only inside an active run). During an
+// active run Host must be called from a goroutine the simulation schedules (the
+// run body or a goroutine started inside it); a foreign caller panics, like the
+// fault APIs — a mid-run declaration is a reboot, and a reboot at a wall-clock
+// instant the seed does not control would silently diverge replay.
 func Host(name string, config HostConfig, f func()) {
+	requireBubbleDeclCaller("Host")
 	hid := internHost(name)
 	hostname := config.Hostname
 	if hostname == "" {
@@ -459,6 +464,20 @@ func Host(name string, config HostConfig, f func()) {
 func requireBubbleFaultCaller(api string) {
 	if runActive.Load() && !dstInSimBubble() {
 		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+	}
+}
+
+// requireBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
+// requireBubbleFaultCaller, run as each one's first act — before the intern
+// tables are touched. A mid-run Host re-declaration relays the host-up op (a
+// reboot: HealHost plus clock re-establishment) and Process starts SUT
+// goroutines; from a goroutine outside the run's bubble both would mutate run
+// state at a wall-clock instant the seed does not control — the same
+// silent-nondeterminism class the fault guard kills, through a declaration
+// API. Outside a run the APIs keep their documented no-run behavior.
+func requireBubbleDeclCaller(api string) {
+	if runActive.Load() && !dstInSimBubble() {
+		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 	}
 }
 
@@ -674,8 +693,12 @@ func CrashHost(name string) {
 // real main must. A process is restarted by calling Process again with the same
 // name — it keeps the logical name but gets a new pid, as a real restart does, and
 // the restart inherits nothing from the exited invocation but the shared host state
-// (filesystem, page cache).
+// (filesystem, page cache). During an active run Process must be called from a
+// goroutine the simulation schedules; a foreign caller panics, like the fault
+// APIs — it would start SUT goroutines outside the bubble, unscheduled by the
+// seed (see Host).
 func Process(name string, f func()) {
+	requireBubbleDeclCaller("Process")
 	host, _ := dstCurrentNode()
 	if host == 0 {
 		host = internHost(name)
