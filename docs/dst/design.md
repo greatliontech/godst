@@ -871,7 +871,10 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   `syscall.socketcall` by linkname, a path the trampoline choke point never sees there. Pinned by
   `TestDSTSyscallFence`'s `syscall.Socket` and `syscall.Bind` wrapper probes and by
   `TestDSTSocketcallEntryFenced` (the linkname entry x/sys resolves to refuses in-bubble; the pull
-  linkname also turns dropping the export into a build failure).
+  linkname also turns dropping the export into a build failure). On non-bubble fallthrough, these
+  entries preserve the raw-syscall pointer-lifetime contract: pointer-derived `uintptr` arguments
+  remain live and the caller stack cannot move before kernel dispatch, including through the entry
+  symbols used by external assembly callers.
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,

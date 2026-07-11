@@ -124,6 +124,11 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 // SYS_SOCKETCALL trap; non-bubble callers fall through to the host
 // unchanged. Folds away in stock builds (dstSimFenced const).
 
+// uintptrkeepalive keeps pointer-derived arguments live, and nosplit prevents
+// stack copying from leaving their integer addresses stale before dispatch.
+//
+//go:uintptrkeepalive
+//go:nosplit
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
 		dstSyscallRefuse(SYS_SOCKETCALL)
@@ -131,6 +136,8 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)
 }
 
+//go:uintptrkeepalive
+//go:nosplit
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
 		dstSyscallRefuse(SYS_SOCKETCALL)

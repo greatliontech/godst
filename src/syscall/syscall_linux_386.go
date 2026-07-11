@@ -141,6 +141,11 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 // friends are refused in-bubble exactly like syscall.Socket, which the
 // trampolines never see on this architecture.
 //
+// uintptrkeepalive keeps pointer-derived arguments live, and nosplit prevents
+// stack copying from leaving their integer addresses stale before dispatch.
+//
+//go:uintptrkeepalive
+//go:nosplit
 //go:linkname socketcall
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
@@ -149,6 +154,8 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)
 }
 
+//go:uintptrkeepalive
+//go:nosplit
 //go:linkname rawsocketcall
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {

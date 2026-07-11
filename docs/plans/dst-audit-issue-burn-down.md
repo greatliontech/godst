@@ -13,7 +13,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Syscall entry functions
 
-- [ ] 3. linux/386 and linux/s390x `socketcall`/`rawsocketcall` enforce the fence without a splittable uintptr-bearing wrapper (`dst-socketcall-wrappers-can-stale-uintptrs`)
+- [x] 3. linux/386 and linux/s390x `socketcall`/`rawsocketcall` enforce the fence without a splittable uintptr-bearing wrapper
 - [ ] 4. linux/mips and linux/mipsle `Syscall9` enters the same fence and dispatch policy as the generic trampolines (`dst-mips-syscall9-bypasses-fence`)
 - [ ] 5. `dstSyscallAllowedTrap` makes ioctl admission request-aware; descriptor-minting requests cannot escape (`dst-ioctl-allowlist-can-mint-fds`)
 - [ ] 6. loong64 `fstatFD` applies virtual and page-cache fd classification before direct statx (`dst-loong64-fstat-exposes-pagecache-fd`)
@@ -47,7 +47,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Runtime scheduling functions
 
-- [ ] 22. random-strategy broadcast scheduling replays identically under focused and full-suite repetition, with its load-dependent input eliminated (`dst-schedule-broadcast-replay-flake`)
+- [ ] 22. same-seed scheduler probes replay identically under focused and contended full-suite repetition, with their load-dependent inputs eliminated (`dst-schedule-broadcast-replay-flake`, `dst-scheduler-load-replay-flakes`)
 
 ## Exploration recorder functions
 
