@@ -52,6 +52,51 @@ budget (its two-advance causality harness proves mid-episode foreign
 execution and is reusable). This work owes those door-reaching arms, or an
 explanation of why the doors stay shut.
 
+Diagnosis progress (2026-07-11, partial — evidence-backed, mechanism not yet
+closed):
+
+- Reproduced 12-vs-6 schedules on the finalizer workload (Exhaustive, -race).
+  The first divergence is in the ENABLED SETS, not yield placement per se: at
+  decision 3 the main goroutine is enabled alone but still blocked under
+  churn — it sits in runtime.GC(), whose completion needs GC mark-worker
+  infra slots, and foreign churn competes for the infra alternation. SUT
+  blocking points released by INFRASTRUCTURE progress are the sensitive
+  class; pure chan/mutex workloads are byte-identical (the spinner pins).
+- The alone run ALSO reports ForeignSched=true (and so Exhausted=false) on
+  this workload: candidacy probes attribute it to two long-lived goroutines
+  (stable goids across episodes) with startpc = the runOnce bubble-body
+  closure (runOnceResultLocked.func2), status _Grunnable, waitreason 0,
+  bubble nil, seq 0 — candidates at EVERY decision of later episodes. They
+  look like prior-episode bubble mains created but never run (or never
+  reaped), leaking as permanent foreign-classified runnable zombies — i.e.
+  the harness supplies its own churn, which both poisons ForeignSched
+  (always true for this workload class under -race) and may itself displace
+  infra slots (the leaked zombies are spinner-equivalent). Where they leak
+  from is the open question (suspects: aborted/truncated episodes leaving a
+  newborn main unscheduled; the -race access-yield path interacting with
+  episode teardown).
+- Access logs alone-vs-churned are same-length with identical PC streams but
+  different heap ADDRESSES from entry 3 on (layout shift) — the
+  address-keyed filter surfaces are designed address-insensitive, so this is
+  noise, not mechanism.
+- Probe recipes (all rerunnable): candidacy prints at proc.go's foreign-PICK
+  branch and dst_explore.go's foreign-CAND branch (print goid +
+  funcname(findfunc(gp.startpc))); go test needs -v or output is swallowed
+  on pass. A scratch white-box test reproducing 12-vs-6 lived at
+  testing/simulation/zz_diag_test.go in the working tree during diagnosis
+  (git log of this doc's commit has the recipe inline below).
+
+  Reproducer sut: finalizer sends ch1, Gosched, sends ch2; body registers
+  finalizer, runtime.GC(), <-ch1, wg.Wait on a goroutine reading ch2; two
+  bare Gosched spinners as churn; compare Explore(1, Exhaustive) schedule
+  counts and runOnce traces.
+
+Next steps: (1) find the zombie mains' origin (probe episode teardown for
+unreaped runnable bubble goroutines; check the abort path); (2) re-measure
+the 12-vs-6 with the zombies eliminated — the GC-slot mechanism may shrink
+or vanish; (3) then decide fix-vs-record per the Required outcome, and build
+the chunk-5 door-reaching arms with the same scaffolding.
+
 ## Required outcome
 
 Under `-race`, either exploration coverage is foreign-insensitive (the
