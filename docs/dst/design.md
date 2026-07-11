@@ -233,11 +233,13 @@ not runtime-seedable.
 It is: in the standard configuration every `crypto/rand` read funnels through the single chokepoint
 `crypto/internal/sysrand.Read` (the non-FIPS `drbg.Read` is just `sysrand.Read(b)`), so one hook there
 makes *all* of `crypto/rand` a reproducible function of the seed for free — exactly as the runtime RNG
-seed already covers `math/rand[/v2]`. `crypto/internal/sysrand/dst.go` bridges to
-`runtime.dstReadRandom`, which fills the buffer from the calling goroutine's per-g DST stream when a
-run is active and returns false otherwise (so production crypto/rand and process-startup entropy are
-untouched: `dstActive()` is false outside a run — `dstSeed` is only set by `simulation.Run`, which
-requires `-tags dst` — the same cheap atomic load `rand()` already does on its hot path). This holds under `-race`
+seed already covers `math/rand[/v2]`. `crypto/internal/sysrand/dst.go` bridges to the runtime's
+active-and-seeded per-g stream. Admitted run goroutines receive deterministic bytes; every other
+caller receives OS entropy, including during an active run and on legacy `/dev/urandom` fallback
+platforms. After one-time entropy-source initialization, both paths preserve the allocation-free
+`crypto/rand.Read` behavior. Production crypto/rand and process-startup entropy are untouched:
+`dstActive()` is false outside a run, and `dstSeed` is only set by `simulation.Run`, which requires
+`-tags dst`. This holds under `-race`
 (the per-g RNG drives it). Boundary: only the **standard** configuration is deterministic — FIPS mode
 keeps a process-global SP 800-90A DRBG whose counter the seam does not control (it consumes the
 seam's deterministic bytes only as additional input), and BoringCrypto uses its own generator.
@@ -259,11 +261,12 @@ latched, rather than letting `crypto/rand` go silently nondeterministic inside a
   goroutine the same fixed, seed-independent bytes (the exact "predictable outside a run" violation
   this invariant forbids), and a stale prior-run root would hand its goroutine bytes derived from
   the previous run's seed. Enforced by `TestDSTCryptoRandDeterministic` (deterministic + seed-varying
-  inside a run; two reads *outside* a run differ) and structurally by the `dstActive()` +
+  inside a run, exact full-word/tail encoding, empty-read stream neutrality, and two reads *outside*
+  a run differing) and structurally by the `dstActive()` +
   seeded-per-g gate (`dstSeed` is never set on any production path: its only setters are
   `simulation.Run`, which panics without `-tags dst`, and the unexported `dstActivate` linkname used
   solely by the runtime's own white-box tests). The unseeded-goroutine leg is enforced by
-  the `gp.dstrand == 0` gate in `dstReadRandom` together with the **stability of that sentinel**:
+  the active-and-seeded gate together with the **stability of the `gp.dstrand == 0` sentinel**:
   no draw site (`runtime.rand`, select poll order, the fake-timer tie-break) advances an unseeded
   goroutine's stream, and `newproc1` extends the seeded tree only through seeded parents — so a
   pre-run goroutine that spawns, draws math/rand, selects, or adds a fake timer during a run stays
@@ -275,8 +278,9 @@ latched, rather than letting `crypto/rand` go silently nondeterministic inside a
   `TestDSTCryptoUnseededGoroutine` (a goroutine created before activation reads real,
   cross-process-varying entropy while a run is live), `TestDSTCryptoUnseededVectors` (each seeding
   vector — spawn, math/rand draw, select, fake-timer add — plus the spawned child, all still real
-  entropy), and `TestDSTCryptoPriorRunCaller` (a completed run's caller reads real entropy during a
-  later run started by another goroutine).
+  entropy), `TestDSTCryptoPriorRunCaller` (a completed run's caller reads real entropy during a
+  later run started by another goroutine), and `TestDSTCryptoSeededChildAfterDeactivate` (a
+  white-box seeded child surviving deactivation returns to OS entropy despite its nonzero stream root).
 - **INV-IDENTITY**: within a run, every identity read (`pid`/`ppid`/`hostname`/`uid`/`gid`/`euid`/`egid`/
   `NumCPU`/`os/user.Current`) is a fixed function of the run config, and is restored to the real value
   outside the run. Enforced by `TestDSTProcessIdentity` and `TestDSTIdentityExtra` (the latter also
@@ -986,7 +990,7 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   enforces that `runtime/testdata/testprog` stays cgo-free — a cgo-pulling import there (net,
   os/user — DST fixtures needing those live in `testprognet`) disables the runtime's deadlock
   detection and hangs the crash tests loudly.
-- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation net os syscall os/exec os/signal`,
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation crypto/rand net os syscall os/exec os/signal`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
   `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
@@ -994,6 +998,7 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   testprog. `syscall`/`os/exec`/`os/signal` are in the list because the interception-boundary
   fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
   fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
+  `crypto/rand` enforces that the tagged outside-run entropy path remains allocation-free.
 - **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation`): the dst-race
   sync-hook encodings. The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
   intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via

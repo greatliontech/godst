@@ -9,7 +9,7 @@ grouped by the functions they change. WIP = 1.
 ## Build and public symbol selection
 
 - [x] 1. `os.File` DST field access is selected only on layouts that carry it; ordinary Windows and Plan 9 `os` builds join the enforcing cross-build matrix
-- [ ] 2. `crypto/internal/sysrand.Read` preserves the allocation-free host path while retaining seeded in-run entropy (`dst-crypto-rand-tagged-fastpath-allocates`)
+- [x] 2. `crypto/internal/sysrand.Read` preserves the allocation-free host path while retaining seeded in-run entropy
 
 ## Syscall entry functions
 

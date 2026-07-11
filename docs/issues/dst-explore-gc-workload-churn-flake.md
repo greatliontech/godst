@@ -1,7 +1,7 @@
 # DST explore: the foreign-GC-workload invariance test flakes ~20% on HEAD
 
-Lands: when TestExploreForeignGCWorkloadInsensitive AND TestDSTExploreTimerHB
-are stable across repeated invocations in both build modes, with the
+Lands: when TestExploreForeignGCWorkloadInsensitive, TestDSTExploreTimerHB,
+AND TestExploreForeignSpinnerDrainCallback are stable across repeated invocations in both build modes, with the
 divergence mechanism diagnosed, or the churn-invariance contract is narrowed
 with the bound recorded
 
@@ -27,9 +27,14 @@ unconditional byte-identical-in-both-build-modes contract in exploration.md
 and design.md; the foreign-free-leg failures are outside the scope of the
 recorded sim-idle-window divergence.
 
+The same panic also occurred once in `TestExploreForeignSpinnerDrainCallback`
+during the chunk-2 full tagged gate; the test drives a forced GC and finalizer
+drain, and ten immediate focused repetitions passed. This is a third victim of
+the intermittent GC-workload replay signature, not a stable assertion mismatch.
+
 ## Required outcome
 
-The divergence is diagnosed at its mechanism and the test made stable, or the
+The divergence is diagnosed at its mechanism and all three tests made stable, or the
 churn-invariance contract in exploration.md/design.md is narrowed to what
 holds, with the flake's bound recorded and the test's assertion matched to
 the narrowed contract.

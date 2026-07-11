@@ -1396,6 +1396,10 @@ func TestDSTCryptoRandDeterministic(t *testing.T) {
 	if !strings.Contains(out1, " eq=true seedvaries=true realdiffers=true active=false") {
 		t.Fatalf("crypto/rand not deterministic/seed-varying/real-and-inactive-outside under DST: %q", out1)
 	}
+	const vectors = " vectors=1:2b,7:2b298af2e35a36,8:2b298af2e35a36e0,9:2b298af2e35a36e08e,15:2b298af2e35a36e08ea48997c92d76 emptyneutral=true"
+	if !strings.Contains(out1, vectors) {
+		t.Fatalf("crypto/rand seeded byte encoding or empty-read draw count changed: %q", out1)
+	}
 	// The deterministic in-run stream (h=...) replays across processes; the
 	// outside-run bytes (out=...) are real entropy and must NOT. Comparing the
 	// split fields catches a mutation that leaves the deterministic source
@@ -1411,6 +1415,18 @@ func TestDSTCryptoRandDeterministic(t *testing.T) {
 	}
 	if outside1 == outside2 {
 		t.Fatalf("outside-run crypto/rand identical across processes (still deterministic?):\nrun1=%q\nrun2=%q", out1, out2)
+	}
+}
+
+// TestDSTCryptoSeededChildAfterDeactivate pins the active half of the entropy
+// gate independently of the seeded sentinel: a white-box child keeps its
+// nonzero stream root after deactivation but must read OS entropy. Across two
+// processes the bytes therefore differ.
+func TestDSTCryptoSeededChildAfterDeactivate(t *testing.T) {
+	a := strings.TrimSpace(runTestProgDST(t, "DSTCryptoSeededChildAfterDeactivate"))
+	b := strings.TrimSpace(runTestProgDST(t, "DSTCryptoSeededChildAfterDeactivate"))
+	if a == "" || a == b {
+		t.Fatalf("a seeded child reads deterministic crypto/rand after deactivation:\na=%q\nb=%q", a, b)
 	}
 }
 

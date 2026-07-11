@@ -16,9 +16,7 @@ const dstReadRandomEnabled = true
 // a reproducible function of the seed; outside a run it returns false and Read
 // falls through to the operating system. See runtime.dstReadRandom.
 //
-// go:noescape is sound: the runtime writes into b but never retains it, so the
-// added call must not push b to the heap and regress crypto/rand's alloc-free
-// Read fast path.
+// go:noescape is sound: the runtime writes into b but never retains it.
 //
 //go:noescape
 //go:linkname dstReadRandom runtime.dstReadRandom

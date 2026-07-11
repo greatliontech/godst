@@ -62,6 +62,7 @@ func init() {
 	register("DSTCryptoUnseededGoroutine", DSTCryptoUnseededGoroutine)
 	register("DSTCryptoUnseededVectors", DSTCryptoUnseededVectors)
 	register("DSTCryptoPriorRunCaller", DSTCryptoPriorRunCaller)
+	register("DSTCryptoSeededChildAfterDeactivate", DSTCryptoSeededChildAfterDeactivate)
 	register("DSTPCTMainDrawsPriority", DSTPCTMainDrawsPriority)
 	register("DSTNonBubbleAllocTrigger", DSTNonBubbleAllocTrigger)
 	register("DSTGCForeignStart", DSTGCForeignStart)
@@ -250,6 +251,19 @@ func DSTCryptoRand() {
 	a := readSeed(n)
 	b := readSeed(n)     // same seed: must equal a
 	c := readSeed(n + 1) // different seed: must differ
+	var vectors []string
+	for _, size := range []int{1, 7, 8, 9, 15} {
+		buf := make([]byte, size)
+		simulation.Run(n, func() { crand.Read(buf) })
+		vectors = append(vectors, strconv.Itoa(size)+":"+hex.EncodeToString(buf))
+	}
+	var direct, afterEmpty [16]byte
+	simulation.Run(n, func() { crand.Read(direct[:]) })
+	simulation.Run(n, func() {
+		crand.Read(nil)
+		crand.Read([]byte{})
+		crand.Read(afterEmpty[:])
+	})
 	// Outside any run, crypto/rand is real entropy: two reads differ within
 	// the process, DST must be fully deactivated, and the bytes must differ
 	// ACROSS processes (the parent compares the out= field of two runs) — an
@@ -259,11 +273,35 @@ func DSTCryptoRand() {
 	crand.Read(x[:])
 	crand.Read(y[:])
 	os.Stdout.WriteString("h=" + hex.EncodeToString(a[:]) +
+		" vectors=" + strings.Join(vectors, ",") +
+		" emptyneutral=" + strconv.FormatBool(direct == afterEmpty) +
 		" eq=" + strconv.FormatBool(a == b) +
 		" seedvaries=" + strconv.FormatBool(a != c) +
 		" realdiffers=" + strconv.FormatBool(x != y) +
 		" active=" + strconv.FormatBool(dstRuntimeActive()) +
 		" out=" + hex.EncodeToString(x[:]) + "\n")
+}
+
+// DSTCryptoSeededChildAfterDeactivate verifies that a seeded goroutine which
+// survives white-box deactivation returns to OS entropy. Checking only its
+// nonzero stream root after deactivation would produce repeatable bytes.
+func DSTCryptoSeededChildAfterDeactivate() {
+	ready := make(chan struct{})
+	read := make(chan struct{})
+	out := make(chan [16]byte)
+	dstActivate(7)
+	go func() {
+		close(ready)
+		<-read
+		var b [16]byte
+		crand.Read(b[:])
+		out <- b
+	}()
+	<-ready
+	dstDeactivate()
+	close(read)
+	b := <-out
+	os.Stdout.WriteString(hex.EncodeToString(b[:]) + "\n")
 }
 
 // dstBubbleFinqFP returns the bubble-local total finalizers discovered (the

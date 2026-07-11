@@ -7,11 +7,13 @@
 package sysrand
 
 import (
+	"internal/abi"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
-	_ "unsafe"
+	"unsafe"
 )
 
 var firstUse atomic.Bool
@@ -66,13 +68,18 @@ var urandomErr error
 
 func urandomRead(b []byte) error {
 	urandomOnce.Do(func() {
-		urandomFile, urandomErr = os.Open("/dev/urandom")
+		urandomFile, urandomErr = openUrandom()
 	})
 	if urandomErr != nil {
 		return urandomErr
 	}
 	for len(b) > 0 {
-		n, err := urandomFile.Read(b)
+		// Tagged os.File.Read has a simulated-backend interface arm, so escape
+		// analysis cannot prove its buffer stays synchronous. This file is
+		// structurally host-backed and Read never retains the slice.
+		p := unsafe.Slice((*byte)(abi.NoEscape(unsafe.Pointer(unsafe.SliceData(b)))), len(b))
+		n, err := urandomFile.Read(p)
+		runtime.KeepAlive(b)
 		// Note that we don't ignore EAGAIN because it should not be possible to
 		// hit for a blocking read from urandom, although there were
 		// unreproducible reports of it at https://go.dev/issue/9205.
