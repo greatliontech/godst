@@ -59,7 +59,7 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
 | [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |
 | [environment dispatch straddles run edges](./dst-env-dispatch-straddles-run-edge.md) | M | environment world selection is atomic with run edges |
-| [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | named Fstat applies page-cache invisibility |
+| [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | chunk 62, with qemu-user available for the runtime witness |
 | [virtual clock_gettime faults on invalid pointers](./dst-clock-gettime-invalid-pointer-faults.md) | M | invalid output addresses return EFAULT |
 | [buffered direct handoff omits HB events](./dst-explore-buffered-direct-handoff-misses-hb.md) | L | every buffered slot reuse records the same HB relation |
 | [Host NumCPU wraps through int32](./dst-host-numcpu-wraps-int32.md) | L | accepted NumCPU values are exact or fail loudly |
