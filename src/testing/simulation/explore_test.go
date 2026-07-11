@@ -5,6 +5,7 @@
 package simulation
 
 import (
+	"internal/synctest"
 	"internal/testenv"
 	"os"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -221,6 +223,290 @@ func TestExploreForeignSpinner(t *testing.T) {
 			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
 	}
 }
+
+// TestDSTForeignSeqRefused pins the membership chokepoint (dstEnsureSeq)
+// directly: during an active run, only a goroutine of the simulation's own
+// bubble receives a stable index — a bare pre-run goroutine and a FOREIGN
+// synctest bubble's goroutine (which passes any mere bubble-ness check) both
+// get 0, so they can neither consume the per-episode seq counter nor carry a
+// stale index into later episodes.
+func TestDSTForeignSeqRefused(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	probe := make(chan func())
+	result := make(chan uint64)
+	go func() {
+		for f := range probe {
+			f()
+		}
+	}()
+	defer close(probe)
+
+	var member uint64
+	Run(1, func() {
+		probe <- func() { result <- dstEnsureSeqSelfFP() } // bare foreign goroutine
+		bare := <-result
+		probe <- func() {
+			var got uint64
+			synctest.Run(func() { got = dstEnsureSeqSelfFP() }) // foreign bubble
+			result <- got
+		}
+		foreignBubble := <-result
+		if bare != 0 || foreignBubble != 0 {
+			panic("foreign goroutine received a stable index: bare=" +
+				strconv.FormatUint(bare, 10) + " foreignBubble=" + strconv.FormatUint(foreignBubble, 10))
+		}
+		member = dstEnsureSeqSelfFP() // the run body: a sim-bubble member
+	})
+	if member == 0 {
+		t.Fatal("a simulation-bubble goroutine was refused a stable index")
+	}
+}
+
+// TestExploreForeignBubbleSyncChurn pins the membership chokepoint
+// (dstEnsureSeq): a FOREIGN synctest bubble live concurrently with an
+// exploration — whose goroutines pass any mere bubble-ness check — must not
+// perturb recorded schedules, stable-index assignment, or the offline HB
+// state. The foreign bubble churns mutex lock/unlock (sync release/acquire
+// events that reach the recording surfaces) and Gosched (candidacy at
+// simulation decisions); before the chokepoint, its goroutines drew stable
+// indices from the per-episode seq counter at foreign-timing-dependent
+// points — shifting the late simulation goroutine's index — and carried
+// stale indices into later episodes while the counter reset, colliding with
+// fresh simulation indices in the HB clocks. The SUT and assertions mirror
+// TestExploreForeignSpinner: identical coverage and byte-identical traces
+// alone vs churned, with the foreign presence reported, never silent.
+func TestExploreForeignBubbleSyncChurn(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		t.Skip("intentionally racy sut; non-race trace regression (ForeignSched covers -race)")
+	}
+	sut := func() bool {
+		x := 0
+		read := -1
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			read = x
+		}()
+		x = 1
+		runtime.Gosched()
+		wg.Wait()
+		var wg2 sync.WaitGroup
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			runtime.Gosched()
+		}()
+		wg2.Wait()
+		return read == 0
+	}
+	alone := Explore(1, Exhaustive, sut)
+	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
+
+	// The foreign bubble: never durably blocked (Gosched loop on an external
+	// flag), so its synctest.Run does not return until stopped; each
+	// iteration's mutex ops hit the sync-event recording surface from a
+	// goroutine whose bubble is non-nil but NOT the simulation's.
+	var stop, started atomic.Bool
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		synctest.Run(func() {
+			// UNBUFFERED rendezvous between two foreign-bubble goroutines:
+			// each wake is a foreign-internal goready, which reaches
+			// dstRecordReadyEdge in EVERY build — the non-race door to the
+			// membership chokepoint (the sync-event and access-log doors are
+			// race-instrumentation-gated; TestExploreForeignBubbleSyncChurnRace
+			// covers those). The starvation-fairness alternation gives these
+			// persistently-runnable goroutines slots throughout the episode,
+			// so the churn's wakes record BEFORE the late simulation
+			// goroutine draws its index.
+			ch := make(chan int)
+			go func() {
+				for range ch {
+				}
+			}()
+			for !stop.Load() {
+				started.Store(true)
+				ch <- 1
+				runtime.Gosched()
+			}
+			close(ch)
+		})
+	}()
+	for !started.Load() { // the churn must be live before the traced episode
+		runtime.Gosched()
+	}
+
+	_, _, trChurned := runOnce(1, nil, map[accessForce]bool{}, sut)
+	churned := Explore(1, Exhaustive, sut)
+	stop.Store(true)
+	done.Wait()
+
+	if alone.ForeignSched || !alone.Exhausted {
+		t.Fatalf("foreign-free exploration misreported: foreignSched=%v exhausted=%v", alone.ForeignSched, alone.Exhausted)
+	}
+	if !churned.ForeignSched || churned.Exhausted || churned.Overflow {
+		t.Fatalf("exploration under a foreign bubble misreported: foreignSched=%v exhausted=%v overflow=%v",
+			churned.ForeignSched, churned.Exhausted, churned.Overflow)
+	}
+	if churned.Schedules != alone.Schedules || len(churned.Failures) != len(alone.Failures) {
+		t.Fatalf("foreign bubble changed exploration coverage: schedules %d vs %d, failures %d vs %d",
+			churned.Schedules, alone.Schedules, len(churned.Failures), len(alone.Failures))
+	}
+	assertUniqueEnabledSeqs(t, trChurned)
+	// The churn's rendezvous wakes are FOREIGN-INTERNAL goready calls, which
+	// reach dstRecordReadyEdge in every build (the goready hook is gated on
+	// the scheduled kind only): the membership chokepoint refuses both ends
+	// and the degrade must buffer nothing — a buffered (0,0) edge would mint
+	// a phantom proc in the offline clocks.
+	for i := range trChurned.edgeFrom {
+		if trChurned.edgeFrom[i] == 0 || trChurned.edgeTo[i] == 0 {
+			t.Fatalf("edge %d has a zero endpoint (%d -> %d): a foreign wake was buffered",
+				i, trChurned.edgeFrom[i], trChurned.edgeTo[i])
+		}
+	}
+	// Defensive net (vacuous in non-race builds: no foreign path reaches the
+	// access log here even ungated; the race-build door is pinned by
+	// TestExploreForeignBubbleSyncChurnRace).
+	for i, q := range trChurned.accSeq {
+		if q == 0 {
+			t.Fatalf("access log entry %d has seq 0: a foreign access was recorded", i)
+		}
+	}
+	if !reflect.DeepEqual(trAlone.procs, trChurned.procs) || !reflect.DeepEqual(trAlone.enabled, trChurned.enabled) {
+		t.Fatalf("foreign bubble visible in the recorded schedule:\nalone   procs=%v enabled=%v\nchurned procs=%v enabled=%v",
+			trAlone.procs, trAlone.enabled, trChurned.procs, trChurned.enabled)
+	}
+}
+
+// TestExploreForeignBubbleSyncChurnRace is the RACE-BUILD arm of the
+// membership pins: under -race the auto-instrumented access path and the
+// sync-event recording sites (chan.go's raceenabled-gated
+// dstRecordSyncEventForGID calls) are live, and a foreign-bubble goroutine's
+// instrumented access can reach the inline filtered commit — dstCommitAccess
+// with seq 0 — through dstAccessShouldYield's early false, burning log space
+// and forcing the filter conservative for the whole episode. The yield
+// gate's membership term and the sync-event degrade must keep every foreign
+// entry out of the logs. Trace-byte equality is NOT asserted (the -race
+// yield placement is foreign-sensitive; ForeignSched reports it) — the pins
+// are the logs' cleanliness. The SUT is race-free so tRunner survives.
+//
+// KNOWN COVERAGE CAP: the log-cleanliness assertions cannot fire under a
+// membership-gate regression in THIS shape, because the shape shields its
+// own doors — the foreign rendezvous wakes set the conservative filter flag
+// (the edge degrade) before any foreign access reaches
+// dstAccessShouldYield, whose first line then routes every auto access to
+// the pending path, which never commits for an infra-picked goroutine. An
+// edge-free foreign shape (pure instrumented-write churn, no rendezvous)
+// would leave the flag clear and open the inline-commit door; building the
+// door-reaching arms belongs to the -race foreign-sensitivity scaffolding
+// (dst-explore-race-foreign-yield-sensitivity). The assertions stay as
+// nets.
+func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the instrumented access and sync-event doors)")
+	}
+	// foreignProgress advances only AFTER the foreign bubble has executed an
+	// instrumented write and completed a rendezvous. The SUT waits for TWO
+	// advances from its episode-start reading: a blocking rendezvous can
+	// straddle the episode start (write before activation, wake and store
+	// after), but the second advance's whole iteration — instrumented write
+	// included — provably lies between two mid-episode stores. Mid-episode
+	// foreign arrival at the recording surfaces is proven by causality, not
+	// assumed from scheduling analysis.
+	var foreignProgress atomic.Int64
+	sut := func() bool {
+		c0 := foreignProgress.Load()
+		for foreignProgress.Load() < c0+2 {
+			runtime.Gosched()
+		}
+		ch := make(chan int, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch <- 1
+		}()
+		runtime.Gosched()
+		wg.Wait()
+		var wg2 sync.WaitGroup
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			runtime.Gosched()
+		}()
+		wg2.Wait()
+		return <-ch == 1
+	}
+	var stop, started atomic.Bool
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		synctest.Run(func() {
+			ch := make(chan int)
+			go func() {
+				for range ch {
+				}
+			}()
+			// foreignChurnSink is a package-level variable written only by
+			// this goroutine: the write is race-instrumented (locals whose
+			// address never escapes are not) yet UNSHARED, so under a
+			// membership regression it takes dstAccessShouldYield's early
+			// false into the inline filtered commit — the exact door that
+			// would put a seq-0 entry in the access log.
+			for !stop.Load() {
+				started.Store(true)
+				foreignChurnSink++
+				ch <- 1
+				foreignProgress.Add(1) // after the write AND a rendezvous
+				runtime.Gosched()
+			}
+			close(ch)
+		})
+	}()
+	for !started.Load() {
+		runtime.Gosched()
+	}
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+	res := Explore(1, Exhaustive, sut)
+	stop.Store(true)
+	done.Wait()
+
+	if !res.ForeignSched {
+		t.Error("foreign bubble runnable at decisions was not reported")
+	}
+	for i, q := range tr.accSeq {
+		if q == 0 {
+			t.Errorf("access log entry %d has seq 0: a foreign instrumented access was recorded", i)
+			break
+		}
+	}
+	for i := range tr.edgeFrom {
+		if tr.edgeFrom[i] == 0 || tr.edgeTo[i] == 0 {
+			t.Errorf("edge %d has a zero endpoint: a foreign wake was buffered", i)
+			break
+		}
+	}
+	for i, q := range tr.syncSeq {
+		if q == 0 {
+			t.Errorf("sync event %d has seq 0: a foreign sync event was buffered", i)
+			break
+		}
+	}
+}
+
+var foreignChurnSink int // keeps the race-variant churn's counter accesses live
 
 // TestExploreForeignSpinnerDrainCallback pins the drain-displacement leg of
 // the starvation fairness: the bubble's finalizer drain is infrastructure

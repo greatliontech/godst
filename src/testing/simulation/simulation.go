@@ -137,6 +137,9 @@ func dstExploreDeadlockFP() string
 //go:linkname dstEdgeLenFP runtime.dstEdgeLenFP
 func dstEdgeLenFP() int
 
+//go:linkname dstEnsureSeqSelfFP runtime.dstEnsureSeqSelfFP
+func dstEnsureSeqSelfFP() uint64
+
 //go:linkname dstEdgeAtFP runtime.dstEdgeAtFP
 func dstEdgeAtFP(i int) (from, to uint64, step, acc int)
 

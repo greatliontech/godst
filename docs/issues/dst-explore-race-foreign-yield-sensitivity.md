@@ -36,6 +36,22 @@ interleaving, returning `failed=false` with no diagnostic.
 work must either make replay divergence detectable in this regime or record
 the limit.
 
+Additional scope (foreign-bubble membership handoff, 2026-07-11): the
+membership gates on the -race recording surfaces are currently unpinnable —
+TestExploreForeignBubbleSyncChurnRace's log-cleanliness assertions are nets
+that cannot fire under a gate regression because the shape shields its own
+doors: foreign rendezvous wakes set the conservative filter flag (the edge
+degrade) before any foreign access reaches dstAccessShouldYield, routing
+every auto access to the pending path, which never commits for an
+infra-picked goroutine. An EDGE-FREE foreign shape (instrumented-write churn
+with no rendezvous, so the flag stays clear) should open the inline-commit
+door (dstAccessMaybeShared false → early false → dstCommitAccess with
+seq 0), and a rendezvous shape with the sync-event degrade reverted should
+buffer seq-0 events — neither was reproduced within the membership chunk's
+budget (its two-advance causality harness proves mid-episode foreign
+execution and is reusable). This work owes those door-reaching arms, or an
+explanation of why the doors stay shut.
+
 ## Required outcome
 
 Under `-race`, either exploration coverage is foreign-insensitive (the

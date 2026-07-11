@@ -612,7 +612,20 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 
 **As built — the substrate + brain are proven on the manual hook:** the stable
 per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
-across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
+across re-executions, so it cannot key a replayable schedule; assignment is MEMBERSHIP-gated at its
+single chokepoint, `dstEnsureSeq`: only goroutines of the active simulation's bubble receive an
+index, so a foreign synctest bubble live concurrently with an exploration can neither consume the
+per-episode counter at foreign-timing-dependent points nor carry a stale index into a later
+episode's schedules or happens-before clocks. The recording surfaces enforce membership jointly:
+the access surface skips a foreign goroutine outright (its accesses are not simulation
+transitions), and the ready-edge and sync-event surfaces degrade a refused end to the conservative
+filter fallback and buffer nothing (a zero endpoint would mint a phantom proc in the offline
+clocks). The chokepoint stops silent regressions of index ASSIGNMENT anywhere; the access-surface
+gate is itself load-bearing under `-race`, where an instrumented foreign access could otherwise
+reach the inline filtered commit with seq 0. Pinned by `TestDSTForeignSeqRefused` (the chokepoint) and
+`TestExploreForeignBubbleSyncChurn` (non-race: ready-edge door, trace invisibility); the race-build
+doors are netted by `TestExploreForeignBubbleSyncChurnRace`, pending the -race foreign-sensitivity
+diagnosis (its rendezvous shape shields its own doors through the conservative flag)), the allocation-free recorder
 (`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for
 memory accesses, `dstSyncAcquire` for synchronization object decisions — D1), and the Exhaustive + DPOR
 engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). The remaining

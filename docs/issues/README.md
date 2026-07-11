@@ -10,8 +10,8 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [explore recording admits foreign-bubble goroutines](./dst-explore-foreign-bubble-seq-pollution.md) | M | sim-bubble membership enforced at the recording chokepoints |
 | [-race explore yield placement is foreign-sensitive](./dst-explore-race-foreign-yield-sensitivity.md) | M | sensitivity diagnosed; removed or recorded as a bounded, reported limit |
+| [foreign work in a sim-idle window diverges replay](./dst-explore-foreign-idle-window-divergence.md) | M | idle-window composition replays deterministically, or diagnosed and recorded |
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
 | [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |
 | [zero-length O_SYNC write over-commits](./dst-fs-osync-zero-write-overcommits.md) | L | O_SYNC commit fires only for writes that wrote |

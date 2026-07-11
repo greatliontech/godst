@@ -58,7 +58,13 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	// access under -race (so any -tags dst -race run, not just Explore, reaches here).
 	// Gating to dstSchedScheduled confines access yields to Explore; non-scheduled
 	// strategies are byte-for-byte unaffected.
-	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil || gp.bubble != dstSimBubble {
+		// Membership, not mere bubble-ness: a FOREIGN synctest bubble's
+		// accesses are not simulation transitions — foreign goroutines never
+		// enter schedules, so their conflicts prune nothing, and recording
+		// them pollutes the access log and consumes seq state
+		// (dstEnsureSeq's chokepoint would refuse them anyway; refusing here
+		// also skips the yield).
 		return
 	}
 	if gp != gp.m.curg || gp.m.locks != 0 {
@@ -455,7 +461,22 @@ const (
 	dstAccLargeMax     = 64
 )
 
+// dstEnsureSeq lazily assigns gp's stable per-bubble index. THE membership
+// chokepoint: only goroutines of the ACTIVE simulation's bubble receive one —
+// a foreign goroutine (no bubble, or a foreign synctest bubble live
+// concurrently with the simulation) gets 0, so it can neither consume the
+// per-episode seq counter at foreign-timing-dependent points (shifting a
+// simulation goroutine's index across episodes) nor carry a stale index into
+// a later episode's schedule/HB state (dstSeqCtr resets per episode while
+// dstClearSchedState runs only for bubble goroutines). Every recording
+// surface funnels through here, so a call-site filter cannot silently
+// regress; callers degrade a 0 to their conservative fallback. The sim
+// bubble's own drain and root ARE members (bubble == dstSimBubble) and keep
+// their access/edge-path seqs.
 func dstEnsureSeq(gp *g) uint64 {
+	if gp.bubble == nil || gp.bubble != dstSimBubble {
+		return 0
+	}
 	if gp.dstSeq == 0 {
 		dstSeqCtr++
 		gp.dstSeq = dstSeqCtr
@@ -467,6 +488,18 @@ func dstEnsureSeq(gp *g) uint64 {
 // access state from gp. Goroutine structs are reused across bubbles, and the
 // synctest root goroutine is reused directly by repeated Explore/Replay calls, so
 // this state must not survive past one scheduled bubble.
+// dstEnsureSeqSelfFP runs the membership chokepoint for the calling
+// goroutine; white-box probe pinning that only goroutines of the ACTIVE
+// simulation's bubble receive a stable index (a bare or foreign-bubble
+// caller gets 0). Kind-independent: a probe call outside the scheduled
+// strategy consumes at most one counter value, and the counter resets per
+// exploration episode.
+//
+//go:linkname dstEnsureSeqSelfFP
+func dstEnsureSeqSelfFP() uint64 {
+	return dstEnsureSeq(getg())
+}
+
 func dstClearSchedState(gp *g) {
 	if gp == nil {
 		return
@@ -911,6 +944,15 @@ func dstRecordReadyEdge(readier, readied *g) {
 	}
 	from := dstEnsureSeq(readier)
 	to := dstEnsureSeq(readied)
+	if from == 0 || to == 0 {
+		// An end outside the simulation's bubble (a FOREIGN synctest bubble —
+		// nil-bubble system/driver wakes returned above): the edge carries
+		// real ordering the recorded HB cannot express, so the promotion
+		// filter degrades to conservative; the edge is not buffered (a 0
+		// endpoint would mint a phantom proc in the offline clocks).
+		dstFilterConservative = true
+		return
+	}
 	if fromIdx, toIdx := dstClockIdx(from), dstClockIdx(to); fromIdx >= 0 && toIdx >= 0 {
 		dstClockMerge(toIdx, fromIdx)
 	} else {
@@ -966,6 +1008,15 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 		return
 	}
 	seq := dstEnsureSeq(gp)
+	if seq == 0 {
+		// A goroutine outside the simulation's bubble (a FOREIGN synctest
+		// bubble; nil-bubble returned above): its release/acquire orders
+		// simulation events in ways the recorded HB cannot express — degrade
+		// the filter to conservative and buffer nothing (a 0 seq would mint
+		// a phantom proc in the offline clocks).
+		dstFilterConservative = true
+		return
+	}
 	dstApplyLiveSyncEvent(kind, id, aux, seq)
 	// Buffer overflow below is REPORTED (dstSyncEventOverflow), never silent. The
 	// "a missing offline edge only enlarges the computed concurrent set" argument
