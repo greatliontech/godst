@@ -13,7 +13,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [explore recording admits foreign-bubble goroutines](./dst-explore-foreign-bubble-seq-pollution.md) | M | sim-bubble membership enforced at the recording chokepoints |
 | [-race explore yield placement is foreign-sensitive](./dst-explore-race-foreign-yield-sensitivity.md) | M | sensitivity diagnosed; removed or recorded as a bounded, reported limit |
 | [warm-process runs shift late GC discovery](./dst-gc-warm-process-discovery-tail.md) | M | tail discovery repeatable in-process, or the warm-process bound recorded |
-| [sizespecializedmalloc experiment bypasses the GC trigger](./dst-gc-sizespecialized-experiment.md) | M | combo supported or refused at a testable level |
 | [overdue ticker crossing DriftClock has a phase error](./dst-clock-overdue-ticker-phase.md) | M | backwards remap honors the spec formula's negative remainder, sentinel-safe |
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
 | [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |

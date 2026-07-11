@@ -67,8 +67,11 @@
 package simulation
 
 import (
+	"internal/asan"
 	"internal/godebug"
 	"internal/goexperiment"
+	"internal/msan"
+	"internal/race"
 	"internal/synctest"
 	"runtime"
 	"sync/atomic"
@@ -422,13 +425,24 @@ func enterSimulation(api, buildPanic string) {
 		// loud instead — one GODEBUG is all it takes to be in this mode.
 		panic("testing/simulation: " + api + " is unsupported in FIPS 140 mode (GODEBUG fips140=on)")
 	}
-	if goexperiment.SizeSpecializedMalloc {
+	if goexperiment.SizeSpecializedMalloc && !race.Enabled && !msan.Enabled && !asan.Enabled {
 		// The experiment makes the compiler emit direct size-specialized
 		// malloc calls in USER packages, bypassing the mallocgc dispatcher
 		// that is the DST heap trigger's single evaluation point: SUT
 		// allocations would neither count toward the per-bubble counter nor
 		// gate the trigger, silently breaking GC determinism. Fail loud, as
-		// with FIPS mode.
+		// with FIPS mode. Instrumented builds are exempt: the compiler
+		// suppresses specialized emission whenever it instruments a package
+		// (ssagen's sizeSpecializedMallocEnabled; runtime-group packages
+		// never get it at all, and the NoInstrument non-runtime packages —
+		// runtime/race, runtime/msan, runtime/asan — do get emission but
+		// contain no allocating Go code), so under -race/-msan/-asan every
+		// heap allocation still funnels through the dispatcher and there is
+		// no bypass to refuse. This exemption assumes build-uniform
+		// instrumentation; configurations it cannot see (a per-package
+		// -gcflags instrumentation opt-out) are caught by the runtime's
+		// generated-site backstop, which throws on the first specialized
+		// allocation during an active run (see runtime's mallocStub).
 		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=sizespecializedmalloc (allocations would bypass the deterministic GC trigger)")
 	}
 	if synctest.IsInBubble() {

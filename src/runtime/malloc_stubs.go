@@ -57,6 +57,21 @@ func mallocPanic(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 // WARNING: mallocStub does not do any work for sanitizers so callers need
 // to steer out of this codepath early if sanitizers are enabled.
 func mallocStub(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+		// Under -tags dst the runtime never dispatches to the specialized
+		// functions (sizeSpecializedMallocEnabled is false): the only way in
+		// is a compiler-emitted direct call from a user package built with
+		// GOEXPERIMENT=sizespecializedmalloc and instrumentation off — an
+		// allocation that bypasses the mallocgc dispatcher, the DST heap
+		// trigger's single evaluation point. testing/simulation refuses such
+		// builds up front; this backstop catches the configurations the
+		// build-level refusal cannot see (a per-package instrumentation
+		// opt-out like -gcflags='pkg=-race=false', or a NoInstrument
+		// non-runtime package growing allocating code) the moment one
+		// allocates during an active run. Outside a run these paths work
+		// normally.
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if isTiny_ {
 		// secret code, need to avoid the tiny allocator since it might keep

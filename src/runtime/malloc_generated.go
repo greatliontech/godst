@@ -11,6 +11,10 @@ import (
 )
 
 func mallocgcSmallScanNoHeaderSC1(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -176,6 +180,10 @@ func mallocgcSmallScanNoHeaderSC1(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -341,6 +349,10 @@ func mallocgcSmallScanNoHeaderSC2(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC3(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -506,6 +518,10 @@ func mallocgcSmallScanNoHeaderSC3(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -671,6 +687,10 @@ func mallocgcSmallScanNoHeaderSC4(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC5(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -836,6 +856,10 @@ func mallocgcSmallScanNoHeaderSC5(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC6(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1001,6 +1025,10 @@ func mallocgcSmallScanNoHeaderSC6(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC7(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1166,6 +1194,10 @@ func mallocgcSmallScanNoHeaderSC7(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC8(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1331,6 +1363,10 @@ func mallocgcSmallScanNoHeaderSC8(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC9(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1496,6 +1532,10 @@ func mallocgcSmallScanNoHeaderSC9(size uintptr, typ *_type, needzero bool) unsaf
 }
 
 func mallocgcSmallScanNoHeaderSC10(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1661,6 +1701,10 @@ func mallocgcSmallScanNoHeaderSC10(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC11(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1826,6 +1870,10 @@ func mallocgcSmallScanNoHeaderSC11(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC12(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -1991,6 +2039,10 @@ func mallocgcSmallScanNoHeaderSC12(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC13(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2156,6 +2208,10 @@ func mallocgcSmallScanNoHeaderSC13(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC14(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2321,6 +2377,10 @@ func mallocgcSmallScanNoHeaderSC14(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC15(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2486,6 +2546,10 @@ func mallocgcSmallScanNoHeaderSC15(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC16(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2651,6 +2715,10 @@ func mallocgcSmallScanNoHeaderSC16(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC17(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2816,6 +2884,10 @@ func mallocgcSmallScanNoHeaderSC17(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC18(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -2981,6 +3053,10 @@ func mallocgcSmallScanNoHeaderSC18(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC19(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3146,6 +3222,10 @@ func mallocgcSmallScanNoHeaderSC19(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC20(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3311,6 +3391,10 @@ func mallocgcSmallScanNoHeaderSC20(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC21(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3476,6 +3560,10 @@ func mallocgcSmallScanNoHeaderSC21(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC22(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3641,6 +3729,10 @@ func mallocgcSmallScanNoHeaderSC22(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC23(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3806,6 +3898,10 @@ func mallocgcSmallScanNoHeaderSC23(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC24(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -3971,6 +4067,10 @@ func mallocgcSmallScanNoHeaderSC24(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC25(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -4136,6 +4236,10 @@ func mallocgcSmallScanNoHeaderSC25(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcSmallScanNoHeaderSC26(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -4301,6 +4405,10 @@ func mallocgcSmallScanNoHeaderSC26(size uintptr, typ *_type, needzero bool) unsa
 }
 
 func mallocgcTinySize1(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -4457,6 +4565,10 @@ func mallocgcTinySize1(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -4613,6 +4725,10 @@ func mallocgcTinySize2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize3(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -4769,6 +4885,10 @@ func mallocgcTinySize3(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -4925,6 +5045,10 @@ func mallocgcTinySize4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize5(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5081,6 +5205,10 @@ func mallocgcTinySize5(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize6(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5237,6 +5365,10 @@ func mallocgcTinySize6(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize7(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5393,6 +5525,10 @@ func mallocgcTinySize7(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize8(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5549,6 +5685,10 @@ func mallocgcTinySize8(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize9(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5705,6 +5845,10 @@ func mallocgcTinySize9(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 
 func mallocgcTinySize10(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -5861,6 +6005,10 @@ func mallocgcTinySize10(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcTinySize11(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -6017,6 +6165,10 @@ func mallocgcTinySize11(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcTinySize12(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -6173,6 +6325,10 @@ func mallocgcTinySize12(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcTinySize13(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -6329,6 +6485,10 @@ func mallocgcTinySize13(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcTinySize14(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -6485,6 +6645,10 @@ func mallocgcTinySize14(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcTinySize15(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	gp := getg()
 	if goexperiment.RuntimeSecret && gp.secret > 0 {
@@ -6641,6 +6805,10 @@ func mallocgcTinySize15(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 }
 
 func mallocgcSmallNoScanSC2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -6777,6 +6945,10 @@ func mallocgcSmallNoScanSC2(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC3(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -6913,6 +7085,10 @@ func mallocgcSmallNoScanSC3(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7049,6 +7225,10 @@ func mallocgcSmallNoScanSC4(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC5(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7185,6 +7365,10 @@ func mallocgcSmallNoScanSC5(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC6(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7321,6 +7505,10 @@ func mallocgcSmallNoScanSC6(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC7(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7457,6 +7645,10 @@ func mallocgcSmallNoScanSC7(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC8(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7593,6 +7785,10 @@ func mallocgcSmallNoScanSC8(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC9(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7729,6 +7925,10 @@ func mallocgcSmallNoScanSC9(size uintptr, typ *_type, needzero bool) unsafe.Poin
 }
 
 func mallocgcSmallNoScanSC10(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -7865,6 +8065,10 @@ func mallocgcSmallNoScanSC10(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC11(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8001,6 +8205,10 @@ func mallocgcSmallNoScanSC11(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC12(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8137,6 +8345,10 @@ func mallocgcSmallNoScanSC12(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC13(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8273,6 +8485,10 @@ func mallocgcSmallNoScanSC13(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC14(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8409,6 +8625,10 @@ func mallocgcSmallNoScanSC14(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC15(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8545,6 +8765,10 @@ func mallocgcSmallNoScanSC15(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC16(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8681,6 +8905,10 @@ func mallocgcSmallNoScanSC16(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC17(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8817,6 +9045,10 @@ func mallocgcSmallNoScanSC17(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC18(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -8953,6 +9185,10 @@ func mallocgcSmallNoScanSC18(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC19(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9089,6 +9325,10 @@ func mallocgcSmallNoScanSC19(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC20(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9225,6 +9465,10 @@ func mallocgcSmallNoScanSC20(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC21(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9361,6 +9605,10 @@ func mallocgcSmallNoScanSC21(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC22(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9497,6 +9745,10 @@ func mallocgcSmallNoScanSC22(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC23(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9633,6 +9885,10 @@ func mallocgcSmallNoScanSC23(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC24(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9769,6 +10025,10 @@ func mallocgcSmallNoScanSC24(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC25(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {
@@ -9905,6 +10165,10 @@ func mallocgcSmallNoScanSC25(size uintptr, typ *_type, needzero bool) unsafe.Poi
 }
 
 func mallocgcSmallNoScanSC26(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if dstBuild && dstActive() {
+
+		throw("dst: size-specialized malloc during a simulation bypasses the deterministic GC trigger")
+	}
 
 	if doubleCheckMalloc {
 		if gcphase == _GCmarktermination {

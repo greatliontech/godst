@@ -763,7 +763,22 @@ the channel-light workloads that first validated it (both **landed**):
   is neutralized) — foreign garbage is reclaimed only by bubble-armed (or user-forced) cycles, so a
   run whose bubble never crosses leaves foreign growth unbounded, a modeled consequence of
   bubble-keyed pacing. `GOEXPERIMENT=sizespecializedmalloc` would bypass the dispatcher with
-  compiler-emitted direct calls, so `enterSimulation` refuses it, like FIPS mode. The gate also requires the allocation to be on the bubble
+  compiler-emitted direct calls in user packages, so `enterSimulation` refuses it, like FIPS mode —
+  except in instrumented builds (`-race`/`-msan`/`-asan`), where the compiler suppresses specialized
+  emission for every package it instruments, runtime-group packages never receive it, and the
+  NoInstrument non-runtime packages (`runtime/race`, `runtime/msan`, `runtime/asan`) receive it but
+  contain no allocating Go code — so every heap allocation still funnels through the dispatcher and
+  the run is admitted. The build-level exemption assumes build-uniform instrumentation; what it
+  cannot see (a per-package `-gcflags` instrumentation opt-out, or one of those stub packages
+  growing allocating code) a generated-site backstop catches: every size-specialized malloc
+  function throws on entry during an active run (under `-tags dst` the runtime never dispatches to
+  them, so any arrival is a compiler-emitted bypass call). Pinned by real builds under the
+  experiment: `TestDSTSizeSpecializedMallocRefused` (plain build refuses; with the refusal dropped
+  the same probe observes the bypass — zero same-seed GC deltas),
+  `TestDSTSizeSpecializedMallocRaceExempt` (race build admits and keeps same-seed NumGC deltas
+  equal and nonzero), and `TestDSTSizeSpecializedMallocPerPackageOptOutFailsLoud` (the opt-out
+  configuration dies on the backstop's throw; with the backstop neutered it runs to completion with
+  zero deltas). The gate also requires the allocation to be on the bubble
   goroutine's own stack: runtime bookkeeping allocated on systemstack on its behalf (e.g. `allgs`
   append-growth, whose size and timing are process history) neither counts toward `dstHeapAlloc` nor
   evaluates the trigger (`TestDSTGCSysstackAlloc`: a run that grows `allgs` and a warmed rerun that
