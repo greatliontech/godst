@@ -673,6 +673,53 @@ func TestDSTDiskENOSPCSyncPartialDurable(t *testing.T) {
 	})
 }
 
+// TestDSTDiskOSyncZeroWriteDoesNotCommit: a zero-length write on an O_SYNC
+// handle commits NOTHING (Linux generic_write_sync fires only for ret > 0),
+// so data an earlier unsynced write left pending stays out of the durable
+// image — the simulated image must not be "too durable". Prior-unsynced
+// bytes are written through a plain handle; Write(nil) on an O_SYNC handle
+// to the same file must not flush them. Asserted directly on the durable
+// image (DSTFSNodeState) rather than through a crash: the loss a crash
+// would then expose is unconditional here (the durable image simply never
+// held the bytes), whereas a CrashTear restore only MAY drop unsynced
+// pages, which would make a post-crash content assertion seed-dependent.
+func TestDSTDiskOSyncZeroWriteDoesNotCommit(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			// Establish an empty file, then unsynced data through a PLAIN
+			// handle (not yet in the durable image).
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			_, err = f.Write([]byte("unsynced"))
+			mustOK(t, "write unsynced", err)
+			f.Close()
+			// A zero-length write on an O_SYNC handle to the same file:
+			// generic_write_sync does not fire (ret == 0), so it must NOT
+			// commit the pending "unsynced" bytes.
+			sf, err := os.OpenFile("/f", os.O_RDWR|os.O_SYNC, 0)
+			mustOK(t, "OpenFile O_SYNC", err)
+			n, err := sf.Write(nil)
+			if n != 0 || err != nil {
+				t.Fatalf("Write(nil) on O_SYNC = %d, %v; want 0, nil", n, err)
+			}
+			sf.Close()
+			// The durable image must not hold the unsynced bytes (an empty
+			// file was created but never synced, so the durable content is
+			// "" — the zero-length O_SYNC write committed nothing).
+			cur, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState(/f): not found")
+			}
+			if cur != "unsynced" {
+				t.Fatalf("current content = %q, want \"unsynced\" (the write itself must land in live state)", cur)
+			}
+			if synced != "" {
+				t.Fatalf("durable image = %q, want \"\" (the O_SYNC zero-length write must not have committed the unsynced bytes)", synced)
+			}
+		})
+	})
+}
+
 // TestDSTDiskENOSPCCapBelowUsage: a cap set below current usage puts the disk over
 // quota — growth and creates fail, but in-place overwrites still work, and freeing
 // below the cap re-enables writes.

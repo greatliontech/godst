@@ -578,7 +578,13 @@ asserts over a test-only node inspector (current vs durable content, sorted entr
 metadata image) that content writes, truncate, O_TRUNC, and entry create/remove/rename leave the
 durable image untouched — including that the image is a copy, never an alias of live state — and
 that on the MUTATION paths sync alone advances it (the one other writer is the host-crash restore,
-which re-bases the durable image to the platter's post-crash state — see the crash contract above). `O_SYNC` commits per WRITE through the same single commit point;
+which re-bases the durable image to the platter's post-crash state — see the crash contract above). `O_SYNC` commits per WRITE through the same single commit point,
+but only for a write that WROTE (`n > 0`, matching Linux's `generic_write_sync`): a zero-length
+write, or one the ENOSPC cap fully refused, commits nothing (a partial write still commits its `n`
+bytes) — so the pending unsynced data stays out of the durable image and a crash can lose it as hardware
+would, keeping the crash-tear surface honest (`TestDSTDiskOSyncZeroWriteDoesNotCommit` asserts the
+durable image directly — the loss a crash then exposes is unconditional, where a tear restore only
+MAY drop the pages).
 ftruncate is deliberately not covered (POSIX synchronized I/O is for writes — committing on
 truncate would grant durability real disks do not, hiding exactly the bug class DST exists to
 catch). The metadata-CHANGE operations (Chmod/Chtimes, named Truncate) are implemented with the same

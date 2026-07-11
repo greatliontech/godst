@@ -1324,7 +1324,13 @@ func (d *dstFile) write(b []byte) (int, error) {
 		return n, werr
 	}
 	d.off += int64(n)
-	if d.osync {
+	if d.osync && n > 0 {
+		// generic_write_sync fires only for ret > 0: a zero-length write, or
+		// one the ENOSPC cap fully refused, syncs nothing on real Linux. A
+		// PARTIAL write (0 < n < len(b), the disk filling mid-write) still
+		// commits its n bytes, matching the kernel. Without the guard a crash
+		// after Write(nil) on an O_SYNC handle would durably preserve prior
+		// unsynced writes hardware could lose, narrowing the crash-tear surface.
 		d.node.commitLocked()
 	}
 	if n < len(b) {
@@ -1372,7 +1378,12 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if werr != nil {
 		return n, werr
 	}
-	if d.osync {
+	if d.osync && n > 0 {
+		// generic_write_sync fires only for ret > 0 (see write). On this
+		// path n == 0 is unreachable — a zero-length WriteAt is diverted
+		// before the backend (dstFDPwrite's len==0 short-circuit) and a
+		// fully-refused write already returned ENOSPC above — so the n > 0
+		// term is defensive parity with write, not a live branch.
 		d.node.commitLocked()
 	}
 	return n, nil

@@ -1370,9 +1370,11 @@ func TestDSTFSDurabilityMonotonicity(t *testing.T) {
 			t.Fatalf("syncedMode = %v, mode = %v (sync did not commit metadata)", syncedMode, mode)
 		}
 
-		// O_SYNC: every WRITE commits through the single commit point;
-		// ftruncate is NOT covered (POSIX synchronized-I/O is for writes —
-		// O_SYNC-truncate durability would be finer than real disks grant).
+		// O_SYNC: a WRITE THAT WROTE (n > 0) commits through the single
+		// commit point (a zero-length or fully-refused write commits
+		// nothing — TestDSTDiskOSyncZeroWriteDoesNotCommit); ftruncate is NOT
+		// covered (POSIX synchronized-I/O is for writes — O_SYNC-truncate
+		// durability would be finer than real disks grant).
 		sf, err := os.OpenFile("/s", os.O_CREATE|os.O_WRONLY|os.O_SYNC, 0o644)
 		must("O_SYNC open", err)
 		_, err = sf.WriteString("123")
