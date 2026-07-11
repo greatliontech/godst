@@ -6,9 +6,8 @@ membership terms under -race
 
 ## Gap
 
-Test-surface extension, carried out of the foreign-bubble membership work
-(2026-07-11). The membership gates on the -race recording surfaces are
-unpinnable in the shipped shapes: TestExploreForeignBubbleSyncChurnRace's
+Severity L. The membership gates on the -race recording surfaces are
+unpinnable in the existing shapes: TestExploreForeignBubbleSyncChurnRace's
 log-cleanliness assertions cannot fire under a gate regression because the
 rendezvous shape shields its own doors — foreign wakes set the conservative
 filter flag (the edge degrade) before any foreign access reaches

@@ -6,12 +6,11 @@ recorded as the modeled behavior)
 
 ## Gap
 
-Adjacent finding, chunk-4 review (2026-07-11); pre-existing — reproduces on
-HEAD with no mid-run rate change. `sendTime` computes the delivered value as
-`Now().Add(-delta)` where `delta = now − when` is a BASE-time span but
-`Now()` is the host's (rate-scaled) wall: for a timer that fires lazily long
-after its due time on a host at rate r ≠ 1, the subtraction removes a
-base-ns delay from a host-ns reading, so the value lands r·delta − delta
+Severity L. `sendTime` computes the delivered value as `Now().Add(-delta)`
+where `delta = now - when` is a base-time span but `Now()` is the host's
+rate-scaled wall. For a timer that fires lazily long after its due time on a
+host at rate r != 1, the subtraction removes a base-ns delay from a host-ns
+reading, so the value lands r*delta - delta
 away from the host-perceived due instant. On rate-1 hosts (and for the
 DriftClock overdue-conversion cases, whose shift discount restores the
 unchanged-rate value) the delivered timestamp is exact; the divergence needs

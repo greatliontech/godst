@@ -6,13 +6,12 @@ loudly-reported limit
 
 ## Gap
 
-Adjacent finding, chunk-5 test construction (2026-07-11); pre-existing
-(reproduces with the pre-chunk recorder). Composition: an Explore whose SUT
-sleeps (a window where NO simulation goroutine is runnable) while a foreign
-synctest bubble churns runnable goroutines. The recorded schedule prefix then
-diverges on replay — "a goroutine in the prefix was not enabled at its
-decision" — and the run dies with the loud DST-L2-2 internal-error panic (not
-a silent miss). Without the sleep window the same churn is trace-invisible
+Severity M. An Explore SUT sleeps through a window where no simulation
+goroutine is runnable while a foreign synctest bubble churns runnable
+goroutines. The recorded schedule prefix then diverges on replay: a goroutine
+in the prefix is not enabled at its decision, and the run dies with the loud
+DST-L2-2 internal-error panic rather than a silent miss. Without the sleep
+window the same churn is trace-invisible
 (TestExploreForeignBubbleSyncChurn); without the churn the sleep is fine, so
 the divergence needs foreign work occupying a sim-idle window. Mechanism
 undiagnosed: candidates include the bubble-time advance racing the foreign
@@ -22,13 +21,11 @@ family. Reproducer: TestExploreForeignBubbleSyncChurn's SUT with
 `time.Sleep(time.Millisecond)` inserted between the two phases, run with the
 rendezvous churn live.
 
-Ruled out (2026-07-11): the sticky simulation-membership classification
-(g.dstSimG — which resolved the -race foreign-yield sensitivity, including
-making the run root a uniform simulation candidate) does NOT cure this
-composition; the divergence reproduces unchanged with it landed. The
-remaining suspects are the time-advance machinery itself (the advance step's
-position racing foreign churn) and the timer-path transient
-(time.go's bubble disassociation window).
+The sticky simulation-membership classification (`g.dstSimG`) does not cure
+this composition. It resolves the -race foreign-yield sensitivity, including
+making the run root a uniform simulation candidate, but the remaining suspects
+are the time-advance machinery itself and the timer-path bubble-disassociation
+window.
 
 ## Required outcome
 

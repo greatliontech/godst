@@ -26,3 +26,48 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |
 | [pooled cancellation's _defer leg has no killing test](./dst-gc-pooled-defer-leg-unpinned.md) | L | heap-defer shape pins the arm, or untested status recorded |
 | [GC counter gates key on the live bubble field](./dst-gc-counter-gates-live-bubble-field.md) | L | gates keyed on the sticky bit, or per-window unreachability recorded |
+| [crash scans skip temporarily disassociated simulation goroutines](./dst-runtime-crash-skips-disassociated-members.md) | H | crash victim scans key on sticky simulation membership |
+| [user-arena allocations bypass DST accounting](./dst-gc-user-arena-bypasses-accounting.md) | H | arena bytes feed deterministic heap and process accounting, or arena builds are refused |
+| [crashed stacks retain process memory as GC roots](./dst-crash-retains-stacks-and-process-memory.md) | H | crashed invocation stacks no longer retain process memory |
+| [callbacks can run after their process exits](./dst-process-callbacks-run-after-exit.md) | H | dead-process callbacks cannot execute after exit |
+| [mapping-fault process death skips resource teardown](./dst-mapping-fault-skips-resource-teardown.md) | H | mapping faults route through complete process teardown |
+| [graceful EOF can strand a concurrent reader](./dst-net-concurrent-eof-strands-reader.md) | H | persistent EOF wakes every eligible reader |
+| [SYN-ACK traversal ignores cancellation and teardown](./dst-net-synack-ignores-cancel-and-teardown.md) | H | full handshake observes context and endpoint death |
+| [accept handoff precedes connection ownership](./dst-net-accept-handoff-precedes-ownership.md) | H | endpoints are lifecycle-owned before handoff is observable |
+| [concurrent same-name Process starts can acquire two hosts](./dst-process-cross-host-admission-race.md) | H | different-host validation and registration are atomic |
+| [Crash refusal mutates run-main process state](./dst-crash-main-refusal-mutates-state.md) | H | crash preflight is state-neutral for every victim |
+| [host crash misses a nested root-process goroutine](./dst-host-crash-misses-nested-root-goroutine.md) | H | host ancestry makes every machine thread killable |
+| [socketcall fence wrappers can stale uintptr arguments](./dst-socketcall-wrappers-can-stale-uintptrs.md) | H | 386/s390x socketcall fence entries preserve stack pointer lifetime |
+| [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | every MIPS raw entry applies the boundary fence |
+| [unrestricted ioctl can mint host descriptors](./dst-ioctl-allowlist-can-mint-fds.md) | H | ioctl admission excludes resource-minting requests |
+| [common os hooks break Windows and Plan 9 builds](./dst-os-common-code-breaks-windows-plan9.md) | H | ordinary Windows and Plan 9 os builds compile |
+| [fake-timer rollover can erase a registration](./dst-clock-fake-timer-roll-loses-registration.md) | M | epoch rollover preserves every new-epoch timer |
+| [discarded callbacks count as executed](./dst-gc-discarded-callbacks-count-as-executed.md) | M | discard and execution metrics are distinct |
+| [foreign races can be attributed to the SUT](./dst-explore-foreign-races-misattributed.md) | M | reported races are simulation-attributed or explicitly foreign |
+| [PCT silently clamps depths above sixteen](./dst-pct-depth-silently-clamped.md) | M | public PCT validation matches runtime capacity |
+| [network base delays scale with host drift](./dst-net-base-delay-scaled-by-host-drift.md) | M | all network waits consume universe base time |
+| [FIN bypasses link delay](./dst-net-fin-bypasses-link-delay.md) | M | graceful close pays link latency and jitter |
+| [LocalAddr lacks a complete bind lifecycle](./dst-net-local-bind-lifecycle-incomplete.md) | M | explicit binds validate, reserve, and release atomically |
+| [ephemeral port allocation couples independent hosts](./dst-net-port-allocator-cross-host-coupling.md) | M | allocator state is host-scoped |
+| [blackhole cannot override an existing refuse cut](./dst-net-blackhole-cannot-override-refuse.md) | M | overlapping cuts preserve blackhole dominance |
+| [network handles cross run epochs](./dst-net-handles-cross-run-epochs.md) | M | connections and listeners reject stale epochs |
+| [process restart inherits cwd](./dst-process-restart-inherits-cwd.md) | M | process teardown resets cwd |
+| [process restart inherits environment](./dst-process-restart-inherits-environment.md) | M | process teardown resets environment state |
+| [crash aliases double-count disk capacity](./dst-fs-crash-alias-double-counts-capacity.md) | M | resident bytes count unique nodes |
+| [crash directory aliases permit a cycle](./dst-fs-crash-directory-alias-allows-cycle.md) | M | rename containment is node-based and acyclic |
+| [Root handles are not owned by teardown](./dst-root-not-owned-by-process-or-host.md) | M | Root participates in process and host teardown |
+| [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |
+| [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
+| [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |
+| [environment dispatch straddles run edges](./dst-env-dispatch-straddles-run-edge.md) | M | environment world selection is atomic with run edges |
+| [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | named Fstat applies page-cache invisibility |
+| [tagged crypto/rand allocates outside runs](./dst-crypto-rand-tagged-fastpath-allocates.md) | M | tagged host entropy remains allocation-free |
+| [virtual clock_gettime faults on invalid pointers](./dst-clock-gettime-invalid-pointer-faults.md) | M | invalid output addresses return EFAULT |
+| [buffered direct handoff omits HB events](./dst-explore-buffered-direct-handoff-misses-hb.md) | L | every buffered slot reuse records the same HB relation |
+| [Host NumCPU wraps through int32](./dst-host-numcpu-wraps-int32.md) | L | accepted NumCPU values are exact or fail loudly |
+| [network delay arithmetic can overflow](./dst-net-delay-arithmetic-overflows.md) | L | accepted network delay arithmetic cannot wrap |
+| [terminal dot checks bypass physical walking](./dst-fs-terminal-dot-bypasses-walk.md) | L | physical path errors precede terminal dot restrictions |
+| [creation drops special mode bits](./dst-fs-create-drops-special-mode-bits.md) | L | create and Chmod preserve the same modeled bits |
+| [SlowDisk skips Chdir](./dst-disk-latency-skips-chdir.md) | L | Chdir pays one path traversal delay |
+| [unknown Explore modes fall back to Exhaustive](./dst-explore-unknown-mode-falls-back.md) | L | unknown modes fail before SUT execution |
+| [zero-length raw mappings bypass ownership](./dst-raw-zero-mapping-bypasses-ownership.md) | L | named and raw empty-range operations agree |
