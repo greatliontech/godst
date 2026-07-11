@@ -376,21 +376,21 @@ func TestDSTPooledCleanupRunEndInBubble(t *testing.T) {
 	}
 }
 
-// TestDSTGCAllocBoundDeterministic verifies the two Chunk A guarantees for an
+// TestDSTGCAllocBoundDeterministic verifies the two STW-forcing-increment guarantees for an
 // alloc-heavy, non-blocking SUT (design dimension 11): GC is enabled in-run and
 // bounds memory, and its observable effect is deterministic. The testprog churns
 // ~60MB across four non-blocking goroutines inside dst.Run with GOGC=100, so only
 // the heap trigger (not synctest quiescence) can fire GC.
 //
 // Two assertions, with distinct teeth:
-//   - numGC>0 — the reliable teeth for the core Chunk A change (GC enabled in-run).
+//   - numGC>0 — the reliable teeth for the core change (GC enabled in-run).
 //     Disabling GC (GOGC=off, or reverting dst.Run to force GC off) makes numGC=0
 //     and fails here: memory would be unbounded.
 //   - "<sum> <numGC>" identical across runs — observable determinism. With STW
 //     (Tier 2, D2) the GC count is stable; concurrent GC lets wall-clock-timed
 //     floating garbage flip numGC ±1 (GOGC=100 churn: 20 vs 21), which several
 //     samples here catch. This is a secondary guard: STW's primary, reliable teeth
-//     is deterministic finalizer/weak discovery, tested in Chunk B. Note the exact
+//     is deterministic finalizer/weak discovery, tested with the quiescence drain. Note the exact
 //     trigger byte is NOT asserted — it carries sub-observable accounting noise
 //     (design D1); only the observable count is.
 func TestDSTGCAllocBoundDeterministic(t *testing.T) {
@@ -1245,10 +1245,10 @@ func TestDSTScheduleDeterministic(t *testing.T) {
 	}
 }
 
-// TestDSTScheduleDiversity verifies the Seq-5 feature, for every strategy: the
-// interleaving is seed-*varied*, so different seeds explore different sound
-// interleavings (the completeness gain — before Seq 5 every seed produced the
-// identical schedule). Freely-concurrent scenarios must produce many distinct
+// TestDSTScheduleDiversity verifies seed-varied scheduling, for every strategy:
+// the interleaving is seed-*varied*, so different seeds explore different sound
+// interleavings (the completeness gain — before the seeded scheduling draw,
+// every seed produced the identical schedule). Freely-concurrent scenarios must produce many distinct
 // interleavings; the channel-ring, whose token path is fixed by happens-before,
 // must still vary (>1) but is not required to vary freely — diversity scales with
 // real scheduling freedom. Mutation check: a constant scheduling draw (FIFO)

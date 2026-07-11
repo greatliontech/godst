@@ -387,7 +387,7 @@ func TestDSTClockDriftClockUnheapedTicker(t *testing.T) {
 // constructible (a select-abandon unheaps the timer; a Stop zeroes its when). Preserve vs
 // clear is also observably equivalent for a cap-1 timer channel (any observation re-blocks
 // and resurrects). So that branch is verified by inspection (it mirrors modify minus the
-// zombie-clear) and the round-2 review, not by a distinguishing test.
+// zombie-clear), not by a distinguishing test.
 func TestDSTClockDriftClockAbandonedTimer(t *testing.T) {
 	var total time.Duration
 	Run(1, func() {

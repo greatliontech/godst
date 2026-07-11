@@ -141,7 +141,7 @@ The heap trigger fires when `gcController.heapLive.Load() >= trigger` (`mgc.go:7
 `runway` (the only wall-clock-derived trigger input: `consMark` carries `idleMarkTime`, and under
 `gcForceBlockMode` idle mark workers still run because DST forces the *mode* but not
 `debug.gcstoptheworld`, so the pacer never zeroes them — `idleMarkTime` is nonzero and varies
-run-to-run). **Both the override and the no-override path were instrumented (Chunk A).** Findings:
+run-to-run). **Both the override and the no-override path were instrumented (the STW-forcing increment).** Findings:
 
 > - **The runway override does not make the trigger deterministic.** With `runway:=0`, the trigger value
 >   (`gcController.trigger()`, recorded at each `gcStart`) *still* varied run-to-run, because the trigger
@@ -157,7 +157,7 @@ run-to-run). **Both the override and the no-override path were instrumented (Chu
 >   accounting noise doesn't already deny, and removes none the system needs.
 
 **Decision: no runway code.** Byte-exact trigger determinism is neither achievable (heapLive accounting
-noise) nor the contract. What DST guarantees and what Chunk A tests is **observable** determinism:
+noise) nor the contract. What DST guarantees and what the STW-forcing increment's tests pin is **observable** determinism:
 allocation results, scheduling, and `numGC` (bounded + stable). The earlier "[V] STW makes consMark
 deterministic (assistTime=idleMarkTime=0)" claim was **wrong** — `idleMarkTime` is nonzero; that line
 is corrected here. (Revised invariant **DST-GC-1**: *under `dstActive`, GC introduces no nondeterminism
@@ -183,12 +183,12 @@ sweep with the world stopped (`mgc.go:673`; the synchronous-sweep special case i
 this single mode-forcing delivers, in one move: **`numGC` determinism** (no concurrent mark → no
 "allocate-black" floating garbage whose volume varies with wall-clock mark timing → the GC count is
 stable, where concurrent GC flips it ±1 — D2 below), D3 (synchronous sweep → deterministic finalizer/
-weak *discovery*, the load-bearing reason, tested in Chunk B), and dimension 10 (assists):
+weak *discovery*, the load-bearing reason, tested with the quiescence drain), and dimension 10 (assists):
 `gcAssistAlloc1` is gated on `gcBlackenEnabled` (`mgcmark.go:716`), set only during concurrent mark, so
 no mutator reaches the assist path under STW. **[R]** (It does **not** make the trigger *byte*-exact —
 see D1; that is not the contract.)
 
-**What STW is and is not load-bearing for — empirical (Chunk A mutation testing).** The earlier claim
+**What STW is and is not load-bearing for — empirical (mutation-tested at the STW-forcing increment).** The earlier claim
 that STW is needed to stop *concurrent mark from reordering mutators* did **not** survive testing: at
 `GOMAXPROCS=1` + `asyncpreemptoff` + the per-g RNG, GC is **transparent to mutator scheduling** for
 deterministically-scheduled workloads — CPU-bound and channel-based probes are bit-identical across
@@ -197,14 +197,14 @@ nondeterminism reproducible at single-P is **`runtime.Gosched`-contention** (sev
 runnable goroutines racing for the run queue), and it is **GC-independent**: it diverges with GC fully
 *off* too. That is a **Seq 5** concern (ordering simultaneously-runnable goroutines), out of scope for
 the GC work; GC *amplifies* it but STW does not fix it. So STW's load-bearing roles here are the
-**demonstrable** ones: deterministic finalizer/weak **discovery** (D3/D4 — tested in Chunk B), assist
+**demonstrable** ones: deterministic finalizer/weak **discovery** (D3/D4 — tested with the quiescence drain), assist
 elimination (above), and a **safe in-bubble GC** (no concurrent GC system goroutine competing for the
-bubble's single P). Its mutator-scheduling effect is not relied upon. This is why Chunk A's test
-(`TestDSTGCAllocBoundDeterministic`) asserts the **demonstrable** Chunk A invariant — `NumGC>0`, i.e.
-the heap trigger fires and bounds memory (dimension 11) — and STW's own teeth-test lives in Chunk B.
+bubble's single P). Its mutator-scheduling effect is not relied upon. This is why the STW-forcing increment's test
+(`TestDSTGCAllocBoundDeterministic`) asserts the **demonstrable** invariant — `NumGC>0`, i.e.
+the heap trigger fires and bounds memory (dimension 11) — and STW's own teeth-test lives with the quiescence drain.
 
 **Is the heap-trigger crossing point deterministic?** **No — and this is fundamental** (corrected by
-Chunk A round-2 instrumentation). The schedule up to the crossing is deterministic, but `heapLive`
+the trigger instrumentation pass). The schedule up to the crossing is deterministic, but `heapLive`
 accounting is **not** byte-deterministic at `GOMAXPROCS=1`: it advances in span-granular jumps, and span
 boundaries relative to the allocation stream depend on the **heap layout** (span addresses from the
 process's `mmap` history), which varies run-to-run. So `heapLive` crosses `trigger` at a slightly
@@ -235,8 +235,8 @@ The unifying invariant — the load-bearing piece of Tier 2:
 
 > **Invariant (DST finalizer drain).** Finalizer and cleanup callbacks run on a goroutine whose
 > `g.bubble == ` the Run's bubble, scheduled by the deterministic scheduler, woken at the deterministic
-> **quiescence** point (not at GC-completion — see "Where it runs / when it drains" below, corrected by
-> Chunk A round-2). Never on the async system `fing` (`runFinalizers`) or the async cleanup pool
+> **quiescence** point (not at GC-completion — see "Where it runs / when it drains" below, an
+> as-built correction). Never on the async system `fing` (`runFinalizers`) or the async cleanup pool
 > (`runCleanups`). Scope — **ownership by registration**: the drain executes exactly the callbacks
 > registered by THIS run's bubble goroutines among those a simulation GC discovers in-run (a
 > run-owned object discovered only after the run finalizes on the ordinary async workers, as always;
@@ -284,7 +284,7 @@ Why this is the faithful collapse, dimension by dimension:
   (`dstDiscardQueuedFinq`/`dstDiscardQueuedCleanups`, accounted so the queue ledger stays exact — as
   *discarded*, never as *executed*: `finexecuted` and the cleanup executed counter feed
   `runtime/metrics`, and counting never-run callbacks there falsifies a public observable post-run;
-  the ledger-exactness check gets its own discard leg instead — lands with the GC-determinism chunk) —
+  the ledger-exactness check gets its own discard leg instead — `TestDSTFinalizerGoexitLedger`) —
   never leaked to the bubble-less async workers (DST-FIN-1/DST-CLEANUP-1). A finalizer that **spawns** a
   goroutine: the child inherits `g.bubble` via `newproc1` (normal goroutines inherit; only system
   goroutines skip it at `proc.go:5390`), so it is bubble-accounted and deterministically scheduled.
@@ -292,7 +292,26 @@ Why this is the faithful collapse, dimension by dimension:
 - **Cleanups (6).** Identical treatment: drain the cleanup queue (`gcCleanups`, enqueued from
   `freeSpecial` at `mheap.go:2810` during sweep) on the same bubble goroutine, in block order. **[R]**
 
-**Where it runs / when it drains — at quiescence, not at every GC (corrected by Chunk A round-2).** A
+The invariant's named legs, cited across the runtime and this doc:
+
+- **DST-FIN-1 / DST-CLEANUP-1 (bubble-only execution).** A run's finalizers/cleanups execute only on
+  the run's drain goroutine — never leaked to the bubble-less async workers (`fing`, the cleanup
+  pool), including at discard: a dead drain's queued callbacks are deterministically discarded, never
+  executed elsewhere. *Enforced:* `TestDSTPooledFinalizerRunEndInBubble`,
+  `TestDSTPooledCleanupRunEndInBubble`, `TestDSTFinalizerGoexitDrain`.
+- **DST-FIN-2 / DST-CLEANUP-2 (quiescence dead set).** The callback set run at each quiescence point
+  is the deterministic dead set discovered by then (the drain runs before virtual time advances; a
+  callback landing mid-drain defers at most one quiescence). *Enforced:*
+  `TestDSTGCFinalizerDiscoveryDeterministic`, `TestDSTCleanupRunSetDeterministic`,
+  `TestDSTFinalizerBlockedDrainQuiescence`.
+- **DST-FIN-3 (drain lifecycle).** A drain not stuck in a user callback exits before the run's
+  end-of-bubble deadlock accounting (the `dstStopGCDrain` handshake) — it never outlives the bubble
+  nor inflates its goroutine total; a drain STUCK in a blocking user finalizer at Run end surfaces
+  as the deterministic bubble-deadlock diagnostic, never silently goreadied out of its wait.
+  *Enforced:* `TestDSTFinalizerStuckDrainRunEnd` (the stuck arm; the clean-exit arm holds in every
+  other drain test's teardown).
+
+**Where it runs / when it drains — at quiescence, not at every GC (an as-built correction).** A
 single **persistent per-`Run` drain goroutine** (`synctestGCDrain` — finalizers+cleanups), started inside the bubble by
 `synctestRun` (like `bubble.main`, via `newproc1`, so `g.bubble` is the Run's bubble and it dies with the
 bubble — no cross-Run leak), parked when idle. It is woken to drain **at synctest quiescence points** —
@@ -317,8 +336,7 @@ goroutine, or `newproc1` would withhold `g.bubble` from it. **[C]**
 > finalizer that blocks would stall the driver and wedge time advancement. Hence a **separate** drain
 > goroutine, never the root. **[R]**
 
-**Discovery-cycle scoping — what "deterministic finalizer discovery" can and cannot mean (Chunk A
-round-2 finding).** D2 established that the heap-trigger **crossing point wobbles** run-to-run (heap
+**Discovery-cycle scoping — what "deterministic finalizer discovery" can and cannot mean (a trigger-instrumentation finding).** D2 established that the heap-trigger **crossing point wobbles** run-to-run (heap
 layout noise), so the live set captured at a *mid-burst* GC's mark instant (`heapMarked`) varies — a
 finalizable temporary that is live at one run's mark instant but already dead at another's is
 **discovered in a different GC cycle**. Measured: mid-run finalizer-run count 54661 / 54787 / 55417
@@ -367,7 +385,7 @@ run. **[V]** Weak-pointer clearing (dimension 7) inherits the same scoping: clea
 quiescence-deterministic; the exact clearing cycle for a boundary object is not. This is the honest
 contract; it is **faithful to production**, which specifies neither finalizer timing nor order.
 
-**As built — exactly one GC per quiescence, not a fixpoint (Chunk B).** `dstDrainAtQuiescence` runs a
+**As built — exactly one GC per quiescence, not a fixpoint.** `dstDrainAtQuiescence` runs a
 *single* fresh STW GC, then drains what it queued — it does **not** loop GC+drain to a fixpoint. This is
 the faithful realization of the invariant above: an object reachable only through another finalizable
 object's *still-pending* finalizer is marked alive by that GC (kept for the pending finalizer), so it is
@@ -390,7 +408,7 @@ before teardown. The loop has no finite round cap: every finite chain completes 
 that continually re-registers itself is a non-terminating callback workload (like a user goroutine that
 never durably blocks) and the run does not complete rather than leaking the residual to a bubble-less
 async goroutine. It is sound because the SUT has exited (everything is dead, so running the full chain is
-correct) and changes no in-run quiescence behavior; the cleanup drain (Chunk C) is covered identically
+correct) and changes no in-run quiescence behavior; the cleanup drain is covered identically
 (the loop checks both `finPending` and `cleanupPending`). Regressions: `DSTFinChain` (a 3-level chain with
 a channel-touching tail) fatals after teardown without the fixpoint; the long-chain tests
 (`DSTFinLongChain`, `DSTCleanupLongChain`) require a >256-level tail to run while `dstActive` is still true.
@@ -407,7 +425,7 @@ a SUT that reads RSS — see D6. **[C]**
 
 #### D6 — Memory-pressure faithfulness & `GOMEMLIMIT` (dimension 12); upstreamability
 
-Because the per-bubble relative trigger (A.5) reuses production's GOGC ratio, a memory-pressure-adaptive
+Because the per-bubble relative trigger reuses production's GOGC ratio, a memory-pressure-adaptive
 SUT sees a **production-plausible** GOGC heap trajectory *between quiescence points*: the heap grows to
 the GOGC ratio of the bubble's live set, then STW GC. The plausibility claim is bounded honestly: the
 drain machinery also runs **one full GC at every quiescence point** (D4), so a timer-driven SUT that
@@ -418,10 +436,10 @@ horizons. `NumGC` under GOGC is deterministic (the GC-set-level guarantee), and
 `ReadMemStats` is deterministic at observable granularity for `NumGC`; `HeapAlloc`/`NextGC` carry the
 sub-observable byte-noise of the heap trigger (D2), so a SUT that branches coarsely on `MemStats`
 replays, one that compares them byte-exactly may see noise. Weak-pointer clearing (dimension 7) is
-deterministic at the set level — confirmed in Chunk D (`TestDSTWeakClearingDeterministic`).
+deterministic at the set level — confirmed by `TestDSTWeakClearingDeterministic`.
 
-**`GOMEMLIMIT` and RSS stats under DST — resolved by Chunk G.** The *env* `GOMEMLIMIT` still cannot be
-honored deterministically: A.5 replaced the production heap goal (`min(gcPercentHeapGoal,
+**`GOMEMLIMIT` and RSS stats under DST — resolved by the per-run memory-limit knob.** The *env* `GOMEMLIMIT` still cannot be
+honored deterministically: the per-bubble relative trigger replaced the production heap goal (`min(gcPercentHeapGoal,
 memoryLimitHeapGoal)`) with a *GOGC-only* bubble-relative trigger, and `memoryLimitHeapGoal` derives
 from `mappedReady` (total mapped memory), which is **not bubble-local** and **nondeterministic** under
 DST (~115 KB run-to-run: mmap-arena history + ASLR + scavenger-off accumulation); honoring it makes
@@ -497,20 +515,20 @@ The ordering key: **the drain hooks to "the bubble reached quiescence," never to
 mid-burst heap trigger can be added independently of the drain, and the drain's determinism rests on the
 deterministic quiescent live set, not on a deterministic trigger byte (which does not exist — D2).
 
-1. **STW forcing + GC enabled in-run** (D2; **Chunk A — landed**). Force `gcForceBlockMode` under
+1. **STW forcing + GC enabled in-run** (D2; **landed** — the STW-forcing increment). Force `gcForceBlockMode` under
    `dstActive`; stop disabling GC in `simulation.Run`; park the scavenger (D5). No runway code (D1: the override
    was tried and dropped as ineffective). Delivers memory bounding (dimension 11) and observable
    determinism (`numGC`, alloc, sched). Tests: `TestDSTGCAllocBoundDeterministic` (numGC>0 + cross-run
    identity). Foreclosure check: none — STW is the safe in-bubble default and the precondition for 2/4.
    (Synchronous sweep, D3, comes free with `gcForceBlockMode`, `mgc.go:2092`.)
-2. **Quiescence GC hook** (D1 quiescence source; **Chunk B — landed**). At the `synctestRun` driver
+2. **Quiescence GC hook** (D1 quiescence source; **landed** — the quiescence-drain increment). At the `synctestRun` driver
    quiescence point (`synctest.go`, after the `gopark(synctestidle_c)` at the loop top), run **one** fresh
    STW GC so the live set drained next is the deterministic quiescent set. Depends on 1. Foreclosure
    check: none — an added trigger site into the same STW path. **As built:** the GC is run by
    `(*synctestBubble).dstDrainAtQuiescence`, called from the driver right after the quiescence `gopark`
    returns, before virtual time advances; merged with step 3 (the GC and the drain wake are one call).
-3. **Bubble-scoped drain — finalizers** (D4 for `fing`; **Chunk B — landed**). Persistent per-`Run`
-   bubble goroutine (`synctestGCDrain` — named for finalizers+cleanups after Chunk C; created once in
+3. **Bubble-scoped drain — finalizers** (D4 for `fing`; **landed** with the quiescence drain). Persistent per-`Run`
+   bubble goroutine (`synctestGCDrain` — named for finalizers+cleanups once the cleanup drain joined; created once in
    `synctestRun` so it does not perturb the root's DST RNG stream); new idle-classified wait reason
    (`waitReasonSynctestGCDrain` in `isIdleInSynctest`); identified as a user goroutine by start-PC in
    `isSystemGoroutine` so `newproc1`
@@ -525,7 +543,7 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
    - *Drain exit handshake.* The drain is a bubble goroutine and counts toward `bubble.total`, so it must
      exit before the `total != 1` deadlock check; `dstStopGCDrain` runs a final drain, sets `gcDrainExit`,
      and waits for the drain to die (invariant DST-FIN-3).
-4. **Bubble-scoped drain — cleanups** (D4 for `mcleanup`; **Chunk C — landed**). The *same* drain
+4. **Bubble-scoped drain — cleanups** (D4 for `mcleanup`; **landed** — the cleanup-drain increment). The *same* drain
    goroutine (`synctestGCDrain`), same quiescence wake, drains `gcCleanups` after `finq` via a factored
    `runCleanupBlock`/`dstDrainCleanups`; `cleanupPending` joins `finPending` in the wake decision; the
    quiescence GC's sweep already flushes per-P cleanup blocks (`mgcsweep.go`). Depends on 3. Foreclosure
@@ -551,16 +569,16 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
    quiescence drain.
    (`createfing` is the one gate not independently testable in the harness — fing pre-exists from a stdlib
    import; same mechanism as the tested `createGs`.)
-5. **Mid-burst heap trigger semantics** (dimension 11 finalizer interaction; **Chunk B — landed**).
+5. **Mid-burst heap trigger semantics** (dimension 11 finalizer interaction; **landed** with the quiescence drain).
    Heap-triggered GCs already fire (step 1); they **queue** finalizers without waking the drain — which
    falls out of the step-3 design directly: nothing wakes the drain except the quiescence hook, so a
    mid-burst GC's queued finalizers simply wait in `finq` for the next quiescence drain. Depends on 3.
    Foreclosure check: none — it only gates *who wakes the drain*.
 6. **Scavenger off** (D5). Folded into step 1 (one-liner). Listed for dimension completeness.
-7. **Memory-pressure validation** (D6; **Chunk D — landed, with a correction**). Validated: `NumGC`
+7. **Memory-pressure validation** (D6; **landed, with a correction** — the memory-pressure increment). Validated: `NumGC`
    under GOGC and weak-pointer clearing are deterministic (`TestDSTGCAllocBoundDeterministic`,
    `TestDSTWeakClearingDeterministic`). The verification **disproved** D6's original `GOMEMLIMIT` claim:
-   A.5's relative trigger dropped the `memoryLimitHeapGoal` term, and that goal (and `HeapReleased`)
+   the relative trigger dropped the `memoryLimitHeapGoal` term, and that goal (and `HeapReleased`)
    derive from non-bubble-local `mappedReady`, which is nondeterministic under DST — so `GOMEMLIMIT` is
    ignored and RSS stats are nondeterministic (open question, filed). Added: a `defaultHeapMinimum`
    floor so a `GOGC=off` bubble is still deterministically memory-bounded (`TestDSTGCOffMemoryBounded`).
@@ -569,7 +587,7 @@ deterministic quiescent live set, not on a deterministic trigger byte (which doe
 Tier 1 ≈ steps 1–2 + 6 (memory-bounded, observably deterministic, finalizers still async — the
 documented Tier-1 limitation). Tier 2 = all. Because the drain (3–4) hooks to quiescence and the
 mid-burst trigger (5) only changes who wakes it, the two compose without a throwaway retrofit — the
-non-foreclosure property the design is organized around. **Chunk A landed step 1; Chunks B/C/D build
+non-foreclosure property the design is organized around. **Step 1 landed first; the drain, cleanup, and memory-pressure increments build
 2–7.**
 
 #### Investigation RESULT — per-bubble relative trigger makes finalizer discovery deterministic ✅
@@ -581,17 +599,17 @@ is achievable.** A throwaway prototype (instrumented overlay; reverted) establis
 below is not adopted; with it adopted, the drain may run **per-GC** and discovery is per-cycle
 deterministic.
 
-**As built (Chunk B), discovery is per-cycle but the drain still runs at quiescence — these are
-separate axes.** A.5's relative trigger (adopted) makes *discovery* per-cycle deterministic: which GC
+**As built, discovery is per-cycle but the drain still runs at quiescence — these are
+separate axes.** The per-bubble relative trigger (adopted) makes *discovery* per-cycle deterministic: which GC
 cycle queues a given object is a function of the seed, **in the contract** since Phase 2a (the
 per-object trigger made it robust to -race and binary composition) and enforced by
 `TestDSTGCPerCycleDiscoveryDeterministic` — see the layered-contract section below. That is independent
-of *when the queued finalizers run*. Chunk B runs them on the drain
+of *when the queued finalizers run*. The landed drain runs them
 **at quiescence**, not per-GC, deliberately: a per-GC (mid-burst) drain would execute user finalizers
 while SUT goroutines are mid-execution (between cooperative yields), interleaving finalizer side effects
 with the SUT; at quiescence every SUT goroutine is durably blocked, so finalizers run in isolation and
-the run *set* is the deterministic quiescent dead set. So per-cycle discovery determinism (A.5) and the
-quiescence drain (D4, "corrected by Chunk A round-2") compose: the cycles that queue are deterministic,
+the run *set* is the deterministic quiescent dead set. So per-cycle discovery determinism (the relative trigger) and the
+quiescence drain (D4, the as-built correction) compose: the cycles that queue are deterministic,
 and the drain runs the accumulated set deterministically at the next quiescence.
 
 **Root of the crossing wobble (measured).** The trigger is roughly *absolute* (≈`heapMinimum`), and
@@ -637,11 +655,11 @@ GOGC collapse (fixed = a floor; scaled = the real ratio); neither is *finer* tha
 
 **Decision for the build (supersedes the prior plan):** adopt the per-bubble relative trigger as the DST
 heap trigger, so finalizer/weak **discovery is per-cycle deterministic**. Discovery and callback
-*execution* are separate axes (see "As built (Chunk B)" above): discovery tightens to per-cycle, while
+*execution* are separate axes (see "As built" above): discovery tightens to per-cycle, while
 the drain continues to run at quiescence, where callbacks execute in isolation against a quiescent
 bubble. DST-GC-1 and D4 tighten from set-at-quiescence to **per-cycle discovery determinism**.
 
-**A.5 — IMPLEMENTED (GOGC-scaled, full-faithful).** Landed as the GOGC-scaled-with-entry-GC version
+**The per-bubble relative trigger — IMPLEMENTED (GOGC-scaled, full-faithful).** Landed as the GOGC-scaled-with-entry-GC version
 (the production-faithful option, user-chosen):
 - `dstActivate` forces a full GC at bubble entry (STW under DST) and snapshots `dstHeapBase =
   gcController.heapMarked` — the process *live* set, with pre-bubble garbage collected so the baseline
@@ -676,7 +694,7 @@ deterministic. That residual is now **closed** by the system-goroutine-isolation
 remaining nondeterminism was infrastructure goroutines consuming the bubble's scheduling RNG a
 timing-varying number of times; isolating them makes the runnable order — and thus *which* objects sit
 in each per-goroutine structure at the (deterministic) GC instant — a pure function of the seed even
-under contention. **Scope of the A.5 tighten:** per-cycle discovery is deterministic *given* a deterministic
+under contention. **Scope of the relative-trigger tighten:** per-cycle discovery is deterministic *given* a deterministic
 runnable order; under contention it is an interleaving-sensitive observable, dependent on that order
 (the scheduling-order axis, Seq 5) exactly as every such observable is — which is why the
 discovery test is single-goroutine, to isolate the GC trigger from that axis. (`finqueued` is
@@ -693,7 +711,7 @@ made deterministic" subsection below the table):
 | layer | guarantee | basis | under `-race` |
 |---|---|---|---|
 | **Logical** | scheduling, select, map, `math/rand`, values, **replay** | per-g RNG + single-P | **holds** (verified: 8/8 DST logical tests pass under `-race`, incl. GOMAXPROCS=4 churn; no race reports) |
-| **Finalizer set @ quiescence** | the finalizer/cleanup *set* run by a quiescence point = objects logically unreachable there | reachability (logical) | **holds** (lands with Chunk B's drain) |
+| **Finalizer set @ quiescence** | the finalizer/cleanup *set* run by a quiescence point = objects logically unreachable there | reachability (logical) | **holds** (the quiescence drain enforces it) |
 | **GC set-level** (`numGC`, total finalizer/weak set) | the GC count and the *set* of objects discovered | heap bytes, but target floors at `heapMinimum` | **holds** (the 2 GC tests pass under `-race`) |
 | **GC per-cycle** — *which cycle* discovers an object | **per-object allocated bytes** (`dstHeapAlloc`) | **holds** (Phase 2a; `TestDSTGCPerCycleDiscoveryDeterministic`) |
 
@@ -701,7 +719,7 @@ All four layers are unconditional. Every DST heap-trigger crossing fires on `dst
 allocated bytes): the floored case (`target == heapMinimum`), the GOGC-scaled case
 (`target == (heapMarked − base)·GOGC/100`), and the `Options.MemoryLimit` case (the bubble's net heap
 `bubbleMarked + dstHeapAlloc` vs the limit). Two closure conditions make the per-cycle row hold beyond
-the channel-light workloads that first validated it (both **landed** with the GC-determinism chunk):
+the channel-light workloads that first validated it (both **landed**):
 
 - **Internal-pooled allocations are excluded from the trigger (M4).** `clearpools` leaves per-P sudog/
   defer caches alone and per-P `gFree` lists survive across runs — so whether a bubble channel op or
@@ -799,7 +817,7 @@ heap-layout noise as irreducible. **The next investigation tests whether it is a
 the per-bubble heap trajectory can be made byte-exact, the contract tightens to **per-cycle / byte-exact
 discovery determinism** and the drain need not be quiescence-only.
 
-Investigation plan (do this *before* committing to Chunk B's quiescence-only drain — the outcome
+Investigation plan (run *before* committing to the quiescence-only drain — the outcome
 decides the drain's shape):
 
 1. **Find the root of the crossing wobble.** `heapLive` is a byte counter advanced in span-granular
@@ -818,13 +836,13 @@ decides the drain's shape):
    `stopTheWorld`+flush) so allocations start from a deterministic span-fill state; **(iii)** a forced
    GC at bubble entry to pin `heapMarked`. Combine as the root demands. A full per-bubble arena/allocator
    reset is the heavy end — only if (i)/(ii) are insufficient.
-3. **Measure.** Re-run the trigger-value instrumentation (the `dstMixTrigger` overlay from Chunk A) and
+3. **Measure.** Re-run the trigger-value instrumentation (the `dstMixTrigger` overlay from the STW-forcing increment) and
    a finalizer-discovery-count probe across many runs/seeds. Success = trigger value AND per-cycle
    finalizer count byte-identical across runs.
 4. **Decide the contract.** If byte-exact is achieved cheaply and soundly (no production-faithfulness
    violation — the heap trajectory must stay GOGC-plausible), tighten DST-GC-1 and the D4 discovery
-   invariant to per-cycle determinism, and Chunk B's drain may run per-GC (simpler, more faithful to
+   invariant to per-cycle determinism, and the drain may run per-GC (simpler, more faithful to
    production timing). If not achievable cost-proportionately, the set-at-quiescence design stands and
    the drain is quiescence-only. *(Outcome: per-cycle discovery adopted; the quiescence drain was
-   retained — see "Decision for the build" and "As built (Chunk B)" above.)* **This is a Spec-first / collapse-check decision: the chosen trigger
+   retained — see "Decision for the build" and "As built" above.)* **This is a Spec-first / collapse-check decision: the chosen trigger
    must remain a faithful GOGC collapse, neither finer nor coarser.**

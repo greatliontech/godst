@@ -74,16 +74,15 @@ func TestDSTMemChildAttributed(t *testing.T) {
 	}
 }
 
-// TestDSTMemDeterminism enforces DST-MEMALLOC-DET (refined): the per-process counter
-// is deterministic to the granularity the OOM fault needs — the budget-CROSSING
-// decision is a deterministic function of the seed — while the exact byte count
-// carries sub-observable runtime-pool-refill noise (the per-process analogue of the
-// GC's DST-MEM-1: a sudog cache refill from a channel op is charged to whichever
-// process empties the process-global, cross-run pool, so the raw count is not
-// byte-exact across runs in concurrent programs). This concurrent program with
-// channel synchronization exercises that pool churn; two same-seed runs must agree
-// on the budget crossing and stay within the noise band — and must NOT diverge at
-// the MB scale (a real attribution bug).
+// TestDSTMemDeterminism enforces DST-MEMALLOC-DET: the per-process counter is
+// deterministic to the granularity the OOM fault needs — the budget-CROSSING
+// decision is a deterministic function of the seed — while the exact byte
+// count may carry sub-observable noise. Pool refills never reach the counter
+// (the accounting hook excludes the runtime-internal pooled structs,
+// dstIsInternalPooledType); what this concurrent, channel-heavy program
+// exercises is the residual non-pooled band. Two same-seed runs must agree on
+// the budget crossing and stay within the noise band — and must NOT diverge
+// at the MB scale (a real attribution bug).
 func TestDSTMemDeterminism(t *testing.T) {
 	const budget = 4 << 20 // a meaningful OOM-style budget, far above the pool-noise floor
 	const noise = 64 << 10 // sub-observable tolerance: real divergence is MB-scale, the noise ~hundreds of bytes

@@ -1,14 +1,15 @@
 # DST distributed model & fault orchestration
 
-> **Pending feature** (the last ⏳ row of the source table), governed by the top-tier contract in
-> [design.md](./design.md) (Soundness / Non-foreclosure invariants, control surface, scope, roadmap).
-> Settles the Universe / Host / Process substrate and the fault axes built on it; implementation is
-> bottoms-up (see "Build order"). Code will conform to this contract.
+> Governs the distributed model (Universe / Host / Process) and the fault axes built on it, under the
+> top-tier contract in [design.md](./design.md) (Soundness / Non-foreclosure invariants, control
+> surface, scope, roadmap). The substrate and every fault axis below are **landed** except OOM kill
+> and scheduling (straggler) — the remaining ⏳ row of the source table. Code conforms to this
+> contract.
 
 ## The distributed model: Universe / Host / Process
 
-Status: **design settled, implementation pending** (it is the substrate the fault feature is built on —
-see "Build order"). The fault feature targets *distributed* programs, and to fault one soundly the
+Status: **landed** (the substrate the fault axes are built on; the "Build order" section records the
+bottom-up method it was built by). The fault feature targets *distributed* programs, and to fault one soundly the
 substrate must first model what a distributed program **is**: not one process but **N processes on M
 hosts**, with the right things shared and the right things isolated. The current substrate is the **N=1
 collapse** of this model — one universe, one host, one process — so a program that never declares
@@ -59,10 +60,10 @@ simulation.Process("n3", n3main)       // implicit dedicated host
 
 ### Per-host filesystem (process isolation by construction)
 
-Today the FS is one process-global tree + one cwd (`os/dst_fs.go` `dstFS{root, cwd}`), shared by every
-goroutine. The model: the **tree** is per-**host**; the **cwd** and the **fd table** are per-**process**.
+The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process**
+(`os/dst_fs.go` — landed; the bullets state the model the code implements).
 
-- **Per-host tree.** `dstFS` becomes `nodes map[hostId]*dstFSDisk` (each `{root, …}`), created lazily
+- **Per-host tree.** `dstFS` holds per-host disks (`nodes map[hostId]*dstFSDisk`), created lazily
   with the `/tmp` pre-seed on a host's first FS op; a goroutine's FS ops resolve against *its host's* tree
   (via `g.dstHost`). This makes "process A reads/corrupts process B's file" **unrepresentable** across
   hosts (A's resolver never reaches B's host tree) — the Structural-enforcement win: collapse to one
@@ -82,8 +83,7 @@ goroutine. The model: the **tree** is per-**host**; the **cwd** and the **fd tab
 
 ### Per-host network address space
 
-Today the registry is one flat keyed-by-string map (`net/dst.go` `dstNet`). The model makes addressing
-per-host:
+Addressing is per-host (`net/dst.go` — the registry keys are host-scoped; landed):
 
 - **Loopback is host-private** — `127.0.0.1`/`localhost` resolve within the *dialing process's host*, so
   `p1` on `h1` dialing `localhost:80` reaches a listener on `h1`, never `h2`.
@@ -190,8 +190,8 @@ tolerate*, so it cannot be a single global clock.
   processes**: a process observes another's state only over the simulated network or a shared *host*
   filesystem. The environment surface is inside this invariant — env is per-**process** state on a real
   machine, so `os.Setenv` in one simulated process must never be observable from another
-  (design.md, "Environment surface"; the env leg's enforcement lands with the interception-boundary
-  chunk). *violation:* process A on host hA reads a path process
+  (design.md, "Environment surface"; the env leg is enforced by the per-process COW env view —
+  design.md's environment row, ✅). *violation:* process A on host hA reads a path process
   B wrote on host hB and sees B's bytes — a back-channel two separate machines never had, so a SUT passes
   only because the nodes secretly shared a disk (a false negative) — or B `Setenv`s a "leader" flag A
   `Getenv`s (the same back-channel through the process env) — or a crash on B corrupts A's file.
@@ -272,15 +272,13 @@ tolerate*, so it cannot be a single global clock.
   independent counters; and the per-process counter is deterministic *to the granularity the OOM fault
   needs* — the budget-**crossing** decision (does process P exceed budget B?) is a deterministic function
   of the seed. The *exact* byte count is **not** byte-deterministic across runs: it carries sub-observable
-  runtime-pool-refill noise — a `sudog` cache refill from a channel op is charged to whichever process
-  empties the pool — the per-process analogue of the GC's `DST-MEM-1` byte-noise,
-  sound for the same reason (it cannot flip a budget-scale crossing; an OOM budget sits far above the noise
-  floor of a few KB). The *cross-run-varying* component of that noise is closed at activation:
-  `dstActivate` **normalizes the per-P runtime pools** (sudog and defer caches, the gFree list) to a
-  fixed empty state, so refill points during the run are a function of the schedule, not of pre-run
-  process history (gc.md, layered contract; lands with the GC-determinism chunk). What remains in the
-  band is mid-run cross-consumer noise (e.g. a concurrent foreign bubble draining the global pool),
-  which stays sub-observable. *violation:* an allocation attributed to the wrong process (or the root), or counts
+  noise the same way the GC's `DST-MEM-1` byte-noise does, sound for the same reason (it cannot flip
+  a budget-scale crossing; an OOM budget sits far above the noise floor of a few KB). The pooling
+  component of that noise is closed by EXCLUSION, not normalization: the accounting hook skips the
+  runtime-internal pooled structs (`g`/`sudog`/`_defer`, `dstIsInternalPooledType` — the Memory
+  accounting entry above), so whether a channel op allocates or reuses a pooled cache entry never
+  reaches the counter at all. What remains in the band is non-pooled allocator noise (mid-run
+  cross-consumer effects on shared runtime state), which stays sub-observable. *violation:* an allocation attributed to the wrong process (or the root), or counts
   that diverge at the *budget* scale (not within the sub-observable band), so the OOM fault fires
   nondeterministically or on the wrong process. *Enforced:* `elemsize` (size-class size, `-race`-invariant)
   summed per-object at the one mallocgc hook under the bubble gate, counters keyed by `g.dstProc`;
@@ -323,9 +321,8 @@ tolerate*, so it cannot be a single global clock.
 
 ## Fault orchestration design
 
-Status: **design settled, implementation pending.** Fault orchestration is the last ⏳ row of the source
-table: faults over the now-distributed substrate (the Universe/Host/Process model above), composed under
-one seed, replay-exact, with failure shrinking. **Methodology: every axis and seam is designed upfront
+Status: **landed** for the net, disk, clock, crash/restart, host-crash, and crash-tear axes —
+composed under one seed, replay-exact; OOM kill and the straggler remain the ⏳ row. **Methodology: every axis and seam is designed upfront
 (this section + the distributed model above) and implemented bottoms-up — the substrate layers first,
 faults last — not as vertical per-axis slices** (see "Build order").
 
@@ -377,7 +374,8 @@ Attribution is what makes targeting sound and leak-free: a conn records both end
 file its host, a goroutine its host+process — so a host-pair partition touches exactly that pair's
 cross-host conns, and a process crash exactly that process's resources (DST-FAULT-VICTIM). The host-pair
 targeting (`Partition`/`Heal`/`Isolate`/`HealHost`) is **landed** as the imperative network-partition API;
-the per-process/zone forms and the `Link`/`Crash`/`OOM`/… sugar extend it as the later axes land.
+the per-process and per-host forms (`Crash`, `ResetProcess`; `CrashHost`) and the crash/restart axes are landed;
+the group/zone forms and the `Link`/`OOM`/`Straggle` sugar extend it as those axes land.
 
 **Victim names fail loud.** A fault or configuration API that takes a host name (`StepClock`,
 `DriftClock`, `HostIP`, `HostFS`, the partition/reset targets) **panics on a name no `Host`
@@ -846,8 +844,9 @@ root process's resources on the victim or reach its resources on a sibling host 
 
 **OOM** is a **process crash** whose *trigger* is the per-process allocation counter crossing a budget
 (cgroup-style per-process budget by default; a host-total kernel-OOM with victim selection is a recordable
-variant). The budget must sit above the counter's **noise floor** (a few KB — the counter carries
-sub-observable runtime-pool-refill noise, DST-MEMALLOC-DET); a realistic OOM budget (KB–MB+) does, so the
+variant). The budget must sit above the counter's **noise floor** (a few KB of sub-observable non-pooled
+allocator noise — pool refills never reach the counter at all, DST-MEMALLOC-DET); a realistic OOM
+budget (KB–MB+) does, so the
 crossing is replay-exact. Same effect, *organic* trigger — the node dies where its own workload takes it, so it tests "how
 the cluster handles a node hitting its memory limit" at a workload-determined point. **Hard-kill only**:
 soft `GOMEMLIMIT`-style per-node degradation (GC thrash/backpressure *approaching* the limit) is **out** —

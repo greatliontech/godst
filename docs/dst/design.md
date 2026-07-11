@@ -34,8 +34,8 @@ streams (pre-run host handles under the inherited-handle stance; see "Determinis
 stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
 network below, the filesystem by the in-memory deterministic filesystem, and `os.Pipe` by the
 in-memory deterministic pipe (all per-bubble, all reset by the run epoch); what remains is modeled
-in-memory by the program under test or avoided. The remaining pending features are the crash/restart
-and scheduling fault axes — see the Roadmap.
+in-memory by the program under test or avoided. The remaining pending fault axes are OOM kill and
+scheduling (straggler) — see the Roadmap.
 
 ## The core idea (why the minimum is small)
 
@@ -573,7 +573,7 @@ fires: everything survives, and `Sync` is *not* a no-op — it moves the synced/
 which the representation carries from day one (per-node durable image + pending state). The fault
 feature later adds crash/EIO/ENOSPC/latency as **policies over this representation**, never new
 representation — same layering as network faults over the registry. The monotonicity half is
-ENFORCED now (promoted from spec tier at the durability chunk): `TestDSTFSDurabilityMonotonicity`
+ENFORCED (promoted from spec tier when the durable-image mechanism landed): `TestDSTFSDurabilityMonotonicity`
 asserts over a test-only node inspector (current vs durable content, sorted entry-name sets,
 metadata image) that content writes, truncate, O_TRUNC, and entry create/remove/rename leave the
 durable image untouched — including that the image is a copy, never an alias of live state — and
@@ -1082,7 +1082,8 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
 | faults: process crash + restart | pid-keyed goroutine death + proc-keyed resource teardown (see [faults.md](./faults.md)) | ✅ |
 | faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
-| faults: OOM kill, scheduling (straggler), seeded drift | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
+| faults: seeded clock drift (`Drift`/`BoundedDrift` declared, `DriftClock` mid-run) | per-host rate over the base clock (see [faults.md](./faults.md)) | ✅ |
+| faults: OOM kill, scheduling (straggler) | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
 | raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
 | signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
@@ -1124,7 +1125,7 @@ trees in the *same* bubble, all driven by the one seed. The axes:
 
 ## Companion design documents
 
-The mechanism designs and the pending fault feature live in companion docs under `docs/dst/`, each
+The mechanism designs live in companion docs under `docs/dst/`, each
 governed by the top-tier contract in this file (read this contract first — Spec-first). This file is
 the canonical spec; the companions are lower-tier designs that collapse from it.
 
@@ -1132,7 +1133,9 @@ the canonical spec; the companions are lower-tier designs that collapse from it.
   diversity + strategies, and Level 2 access-granularity DPOR.
 - **[gc.md](./gc.md)** — deterministic GC for DST (full scope; the landed state is Tier 2).
 - **[faults.md](./faults.md)** — the distributed model (Universe / Host / Process) and fault
-  orchestration (the pending feature; designed upfront, built bottoms-up).
+  orchestration (the fault AXES are landed except OOM kill and the straggler; the declarative
+  Options.Faults / seeded FaultPolicy layer and failure shrinking remain pending — see Pending
+  features; designed upfront, built bottoms-up).
 
 ## Roadmap
 
@@ -1252,7 +1255,8 @@ later steps add, never rewrite.
   synced/unsynced split crash faults will tear along). Everything not modeled is fenced — host
   isolation is an enforced invariant, not a convention. See the "In-memory deterministic filesystem"
   section above; tested by the `TestDSTFS*` family, the durability white-box, and the cross-process
-  `TestDSTDiskReplay`. Caveats: no symlinks/locking yet (fenced follow-ons), no ownership
+  `TestDSTDiskReplay`. Caveats: no symlinks yet (a fenced follow-on; BSD-style `syscall.Flock`
+  advisory locking IS landed — see "flock" above), no ownership
   model (`Chown` fenced; permission bits stored, not enforced), tree-file `Fd()` is virtual on Linux and only
   selected syscall wrappers consume it, `Sys()` is nil.
 

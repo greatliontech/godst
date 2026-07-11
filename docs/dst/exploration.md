@@ -610,7 +610,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 
-**As built so far (this session) — the substrate + brain are proven on the manual hook:** the stable
+**As built — the substrate + brain are proven on the manual hook:** the stable
 per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
 across re-executions, so it cannot key a replayable schedule), the allocation-free recorder
 (`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for

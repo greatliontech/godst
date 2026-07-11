@@ -14,7 +14,6 @@ chunk(s) there.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [spec-hygiene defects](./dst-audit-spec-hygiene.md) | M/L | chunk 30 |
 
 Found during plan execution:
 

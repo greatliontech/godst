@@ -79,8 +79,9 @@ func TestDSTScheduleDeterminism(t *testing.T) {
 	}
 }
 
-// dstIdentityProgram exercises ONLY L1 — concurrent Host/Process declarations and
-// their identity readings (hostname, pid), with no L2 clock/memory/filesystem. It
+// dstIdentityProgram exercises ONLY the identity surface — concurrent Host/Process
+// declarations and their identity readings (hostname, pid), with no
+// clock/memory/filesystem use. It
 // re-stresses the concurrent identity-table path (the dstSetHostIdent serialization)
 // across the seed sweep under -race.
 func dstIdentityProgram(seed uint64) string {
@@ -116,7 +117,7 @@ func TestDSTIdentityDeterminismSweep(t *testing.T) {
 	for seed := uint64(0); seed < dstDeterminismSeeds; seed++ {
 		a, b := dstIdentityProgram(seed), dstIdentityProgram(seed)
 		if a != b {
-			t.Fatalf("L1 identity non-deterministic at seed %d:\n a=%s\n b=%s", seed, a, b)
+			t.Fatalf("identity surface non-deterministic at seed %d:\n a=%s\n b=%s", seed, a, b)
 		}
 		distinct[a] = true
 	}

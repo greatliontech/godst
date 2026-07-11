@@ -136,7 +136,7 @@ Audit reproducers (ephemeral, from the audit session):
   dead-code-eliminated; if a leg is disproportionate to restore, surface it as
   a spec-amend instead — no silent divergence.
   (dst-audit-low-fidelity-cluster)
-- [ ] 30. spec docs reconciled with the landed surface: DST-MEMALLOC-DET's
+- [x] 30. spec docs reconciled with the landed surface: DST-MEMALLOC-DET's
   contradictory normalization claim corrected, stale "pending" markers
   removed, DST-FIN-1/2/3 and DST-CLEANUP-1 defined or removed, planning
   codenames replaced with self-contained conditions, stale `Lands:` and
