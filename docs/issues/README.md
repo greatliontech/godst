@@ -18,6 +18,7 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [foreign Process exit teardown can span a run activation](./dst-sim-process-exit-teardown-spans-activation.md) | M | teardown cannot execute into an undeclared-in run, or acceptance recorded |
 | [foreign-GC-workload invariance test flakes ~20%](./dst-explore-gc-workload-churn-flake.md) | H | test stable in both modes with mechanism diagnosed, or contract narrowed with bound recorded |
 | [explore recording gates key on bubble-ness, not membership](./dst-explore-recorder-gates-not-membership-keyed.md) | H | recorders keyed on sim membership, or per-gate unreachability recorded |
+| [same-seed broadcast scheduling can diverge across runs](./dst-schedule-broadcast-replay-flake.md) | H | random broadcast scheduling replays identically under focused and full-suite repetition |
 | [foreign SetGCPercent mid-run silently perturbs the trigger](./dst-gc-foreign-setgcpercent-perturbs-trigger.md) | M | mutation refused or latched out of the trigger, with a test arm |
 | [AllThreadsSyscall bypasses the interception boundary](./dst-syscall-allthreads-bypasses-fence.md) | M | fenced at entry, or recorded as an accepted bypass at the boundary spec |
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
@@ -40,7 +41,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [socketcall fence wrappers can stale uintptr arguments](./dst-socketcall-wrappers-can-stale-uintptrs.md) | H | 386/s390x socketcall fence entries preserve stack pointer lifetime |
 | [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | every MIPS raw entry applies the boundary fence |
 | [unrestricted ioctl can mint host descriptors](./dst-ioctl-allowlist-can-mint-fds.md) | H | ioctl admission excludes resource-minting requests |
-| [common os hooks break Windows and Plan 9 builds](./dst-os-common-code-breaks-windows-plan9.md) | H | ordinary Windows and Plan 9 os builds compile |
 | [fake-timer rollover can erase a registration](./dst-clock-fake-timer-roll-loses-registration.md) | M | epoch rollover preserves every new-epoch timer |
 | [discarded callbacks count as executed](./dst-gc-discarded-callbacks-count-as-executed.md) | M | discard and execution metrics are distinct |
 | [foreign races can be attributed to the SUT](./dst-explore-foreign-races-misattributed.md) | M | reported races are simulation-attributed or explicitly foreign |

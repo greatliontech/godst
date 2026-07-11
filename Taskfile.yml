@@ -67,6 +67,14 @@ tasks:
     cmds:
       - '{{.RUN}} test -count=1 -short std'
 
+  test:cross:
+    desc: Untagged standard-library cross-builds for Windows and Plan 9 file layouts
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - 'GOOS=windows GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
+      - 'GOOS=plan9 GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
+
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
     dir: src

@@ -8,7 +8,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Build and public symbol selection
 
-- [ ] 1. `os.File` DST field access is selected only on layouts that carry it; ordinary Windows and Plan 9 `os` builds join the enforcing cross-build matrix (`dst-os-common-code-breaks-windows-plan9`)
+- [x] 1. `os.File` DST field access is selected only on layouts that carry it; ordinary Windows and Plan 9 `os` builds join the enforcing cross-build matrix
 - [ ] 2. `crypto/internal/sysrand.Read` preserves the allocation-free host path while retaining seeded in-run entropy (`dst-crypto-rand-tagged-fastpath-allocates`)
 
 ## Syscall entry functions
@@ -45,70 +45,74 @@ grouped by the functions they change. WIP = 1.
 - [ ] 20. `dstFakeTimersRoll` and `dstRegisterFakeTimer` preserve new-epoch registrations under multi-P activation (`dst-clock-fake-timer-roll-loses-registration`)
 - [ ] 21. lazy-fire timestamp semantics on drifted hosts are implemented or recorded with their bound (`dst-clock-lazy-fire-timestamp-drift`)
 
+## Runtime scheduling functions
+
+- [ ] 22. random-strategy broadcast scheduling replays identically under focused and full-suite repetition, with its load-dependent input eliminated (`dst-schedule-broadcast-replay-flake`)
+
 ## Exploration recorder functions
 
-- [ ] 22. panic, deadlock, access, ready-edge, and sync-event recorders all key on active simulation membership (`dst-explore-recorder-gates-not-membership-keyed`)
-- [ ] 23. race-build tests independently reach and kill each foreign access and sync-event membership mutant (`dst-explore-race-door-reaching-arms`)
-- [ ] 24. race failures are attributed to the active simulation rather than process-global foreign races (`dst-explore-foreign-races-misattributed`)
-- [ ] 25. buffered direct handoff records the slot reuse HB relation used by the race detector (`dst-explore-buffered-direct-handoff-misses-hb`)
+- [ ] 23. panic, deadlock, access, ready-edge, and sync-event recorders all key on active simulation membership (`dst-explore-recorder-gates-not-membership-keyed`)
+- [ ] 24. race-build tests independently reach and kill each foreign access and sync-event membership mutant (`dst-explore-race-door-reaching-arms`)
+- [ ] 25. race failures are attributed to the active simulation rather than process-global foreign races (`dst-explore-foreign-races-misattributed`)
+- [ ] 26. buffered direct handoff records the slot reuse HB relation used by the race detector (`dst-explore-buffered-direct-handoff-misses-hb`)
 
 ## Exploration scheduling functions
 
-- [ ] 26. idle-window foreign work cannot diverge replay, or produces the precise reported incomplete condition (`dst-explore-foreign-idle-window-divergence`)
-- [ ] 27. `dstSchedRootPCT` and public option validation support one depth range without silent clamping (`dst-pct-depth-silently-clamped`)
-- [ ] 28. `ExploreWith` rejects unknown modes before publishing exploration state (`dst-explore-unknown-mode-falls-back`)
+- [ ] 27. idle-window foreign work cannot diverge replay, or produces the precise reported incomplete condition (`dst-explore-foreign-idle-window-divergence`)
+- [ ] 28. `dstSchedRootPCT` and public option validation support one depth range without silent clamping (`dst-pct-depth-silently-clamped`)
+- [ ] 29. `ExploreWith` rejects unknown modes before publishing exploration state (`dst-explore-unknown-mode-falls-back`)
 
 ## Filesystem path and metadata functions
 
-- [ ] 29. `dstRemove`, `dstRemoveAll`, and `dstRename` resolve physical intermediates before terminal dot restrictions (`dst-fs-terminal-dot-bypasses-walk`)
-- [ ] 30. named and rooted create functions preserve the special mode bits Chmod can represent (`dst-fs-create-drops-special-mode-bits`)
-- [ ] 31. `dstChdir` pays one SlowDisk path traversal delay (`dst-disk-latency-skips-chdir`)
-- [ ] 32. the O_DSYNC data-only contract is modeled or its O_SYNC conflation is recorded (`dst-fs-odsync-conflates-osync`)
+- [ ] 30. `dstRemove`, `dstRemoveAll`, and `dstRename` resolve physical intermediates before terminal dot restrictions (`dst-fs-terminal-dot-bypasses-walk`)
+- [ ] 31. named and rooted create functions preserve the special mode bits Chmod can represent (`dst-fs-create-drops-special-mode-bits`)
+- [ ] 32. `dstChdir` pays one SlowDisk path traversal delay (`dst-disk-latency-skips-chdir`)
+- [ ] 33. the O_DSYNC data-only contract is modeled or its O_SYNC conflation is recorded (`dst-fs-odsync-conflates-osync`)
 
 ## Filesystem crash-image functions
 
-- [ ] 33. `residentLocked` counts unique nodes in every crash-tear alias image (`dst-fs-crash-alias-double-counts-capacity`)
-- [ ] 34. `dstRename` uses node containment so crash-recovered directory aliases cannot form cycles (`dst-fs-crash-directory-alias-allows-cycle`)
+- [ ] 34. `residentLocked` counts unique nodes in every crash-tear alias image (`dst-fs-crash-alias-double-counts-capacity`)
+- [ ] 35. `dstRename` uses node containment so crash-recovered directory aliases cannot form cycles (`dst-fs-crash-directory-alias-allows-cycle`)
 
 ## File, Root, and process-state functions
 
-- [ ] 35. `dstRoot` records host/process ownership and closes on process and host teardown (`dst-root-not-owned-by-process-or-host`)
-- [ ] 36. process teardown removes cwd and environment views before a same-name restart (`dst-process-restart-inherits-cwd`, `dst-process-restart-inherits-environment`)
-- [ ] 37. environment host/COW dispatch is atomic with activation and deactivation (`dst-env-dispatch-straddles-run-edge`)
-- [ ] 38. mapping-fault death invokes the complete process resource lifecycle exactly once (`dst-mapping-fault-skips-resource-teardown`)
+- [ ] 36. `dstRoot` records host/process ownership and closes on process and host teardown (`dst-root-not-owned-by-process-or-host`)
+- [ ] 37. process teardown removes cwd and environment views before a same-name restart (`dst-process-restart-inherits-cwd`, `dst-process-restart-inherits-environment`)
+- [ ] 38. environment host/COW dispatch is atomic with activation and deactivation (`dst-env-dispatch-straddles-run-edge`)
+- [ ] 39. mapping-fault death invokes the complete process resource lifecycle exactly once (`dst-mapping-fault-skips-resource-teardown`)
 
 ## Network stream functions
 
-- [ ] 39. `dstStream` persistent EOF signaling wakes all legal concurrent readers (`dst-net-concurrent-eof-strands-reader`)
-- [ ] 40. FIN is a delayed control event and pays the configured one-way link latency/jitter (`dst-net-fin-bypasses-link-delay`)
-- [ ] 41. link delivery and handshake timers consume universe base time under host drift while the sender-clock retransmission rule remains intact (`dst-net-base-delay-scaled-by-host-drift`)
-- [ ] 42. throttle and delivery timestamp arithmetic clamps or rejects every signed overflow (`dst-net-delay-arithmetic-overflows`)
+- [ ] 40. `dstStream` persistent EOF signaling wakes all legal concurrent readers (`dst-net-concurrent-eof-strands-reader`)
+- [ ] 41. FIN is a delayed control event and pays the configured one-way link latency/jitter (`dst-net-fin-bypasses-link-delay`)
+- [ ] 42. link delivery and handshake timers consume universe base time under host drift while the sender-clock retransmission rule remains intact (`dst-net-base-delay-scaled-by-host-drift`)
+- [ ] 43. throttle and delivery timestamp arithmetic clamps or rejects every signed overflow (`dst-net-delay-arithmetic-overflows`)
 
 ## Network partition and bind functions
 
-- [ ] 43. directional cut state composes refuse and blackhole sources with blackhole dominance (`dst-net-blackhole-cannot-override-refuse`)
-- [ ] 44. dialer and listener ephemeral counters are host-scoped (`dst-net-port-allocator-cross-host-coupling`)
-- [ ] 45. explicit LocalAddr validates source ownership, reserves before parking, and releases on every failure (`dst-net-local-bind-lifecycle-incomplete`)
-- [ ] 46. IP-less wildcard LocalAddr behavior is modeled or recorded (`dst-net-wildcard-localaddr-bind-collapse`)
+- [ ] 44. directional cut state composes refuse and blackhole sources with blackhole dominance (`dst-net-blackhole-cannot-override-refuse`)
+- [ ] 45. dialer and listener ephemeral counters are host-scoped (`dst-net-port-allocator-cross-host-coupling`)
+- [ ] 46. explicit LocalAddr validates source ownership, reserves before parking, and releases on every failure (`dst-net-local-bind-lifecycle-incomplete`)
+- [ ] 47. IP-less wildcard LocalAddr behavior is modeled or recorded (`dst-net-wildcard-localaddr-bind-collapse`)
 
 ## Network establishment and handle functions
 
-- [ ] 47. the SYN-ACK traversal observes cancellation, reset, process exit, and host crash before success (`dst-net-synack-ignores-cancel-and-teardown`)
-- [ ] 48. connection ownership publishes atomically with listener handoff and teardown visibility (`dst-net-accept-handoff-precedes-ownership`)
-- [ ] 49. stateful connection/listener operations reject stale epochs; address accessors stay immutable and Close remains local cleanup (`dst-net-handles-cross-run-epochs`)
+- [ ] 48. the SYN-ACK traversal observes cancellation, reset, process exit, and host crash before success (`dst-net-synack-ignores-cancel-and-teardown`)
+- [ ] 49. connection ownership publishes atomically with listener handoff and teardown visibility (`dst-net-accept-handoff-precedes-ownership`)
+- [ ] 50. stateful connection/listener operations reject stale epochs; address accessors stay immutable and Close remains local cleanup (`dst-net-handles-cross-run-epochs`)
 
 ## Simulation process lifecycle functions
 
-- [ ] 50. different-host liveness validation and active-process registration are atomic (`dst-process-cross-host-admission-race`)
-- [ ] 51. process-crash preflight rejects run-main victims before any registration or pid mutation (`dst-crash-main-refusal-mutates-state`)
-- [ ] 52. normal exit orders invocation-thread death and pid/procfs liveness coherently, and closes logical-process resources only on the last invocation (`dst-process-exit-publishes-dead-too-early`)
-- [ ] 53. a pre-run Process exit cannot tear into a newly active run (`dst-sim-process-exit-teardown-spans-activation`)
-- [ ] 54. PID exhaustion rolls back node identity and victim registration completely (`dst-process-pid-exhaustion-leaks-stamp`)
+- [ ] 51. different-host liveness validation and active-process registration are atomic (`dst-process-cross-host-admission-race`)
+- [ ] 52. process-crash preflight rejects run-main victims before any registration or pid mutation (`dst-crash-main-refusal-mutates-state`)
+- [ ] 53. normal exit orders invocation-thread death and pid/procfs liveness coherently, and closes logical-process resources only on the last invocation (`dst-process-exit-publishes-dead-too-early`)
+- [ ] 54. a pre-run Process exit cannot tear into a newly active run (`dst-sim-process-exit-teardown-spans-activation`)
+- [ ] 55. PID exhaustion rolls back node identity and victim registration completely (`dst-process-pid-exhaustion-leaks-stamp`)
 
 ## Simulation Host and caller-gate functions
 
-- [ ] 55. Host declaration validation and publication are all-or-nothing on invalid clocks and table exhaustion (`dst-host-declaration-failure-not-atomic`)
-- [ ] 56. Host NumCPU is exact over its accepted public range or rejected before publication (`dst-host-numcpu-wraps-int32`)
-- [ ] 57. CrashHost tracks root-process host ancestry through nested Host bodies (`dst-host-crash-misses-nested-root-goroutine`)
-- [ ] 58. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
-- [ ] 59. representative guarded APIs have killing tests for their complete hold extent (`dst-sim-guard-hold-extent-unpinned`)
+- [ ] 56. Host declaration validation and publication are all-or-nothing on invalid clocks and table exhaustion (`dst-host-declaration-failure-not-atomic`)
+- [ ] 57. Host NumCPU is exact over its accepted public range or rejected before publication (`dst-host-numcpu-wraps-int32`)
+- [ ] 58. CrashHost tracks root-process host ancestry through nested Host bodies (`dst-host-crash-misses-nested-root-goroutine`)
+- [ ] 59. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
+- [ ] 60. representative guarded APIs have killing tests for their complete hold extent (`dst-sim-guard-hold-extent-unpinned`)

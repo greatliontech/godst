@@ -34,6 +34,10 @@ type file struct {
 	appendMode bool                    // whether file is opened for appending
 }
 
+func (*file) dstBackend() dstFileBackend {
+	return nil
+}
+
 // fd is the Plan 9 implementation of Fd.
 func (f *File) fd() uintptr {
 	if f == nil {

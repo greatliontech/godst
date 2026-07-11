@@ -1002,6 +1002,11 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the other three legs
   sequentially and fail-fast.
+- **`test:cross`** (`GOOS=windows GOARCH=amd64` and `GOOS=plan9 GOARCH=amd64`, each
+  `CGO_ENABLED=0 go build std`, untagged): ordinary standard-library builds remain valid for the
+  two file layouts that do not carry DST backend storage. This leg makes no tagged DST support
+  claim for Windows or Plan 9; the tagged filesystem requires a supported Unix, js/wasm, or wasip1
+  file layout. It runs separately from the `test` aggregate.
 
 Two operational rules for running these configurations honestly: never let a pipeline eat the exit
 code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures
@@ -1014,7 +1019,7 @@ version, not the binary hash, and a reinstalled compiler does NOT invalidate cac
 still reporting the bare release — distinct checkouts cannot cross-poison the shared
 `~/.cache/go-build`. The suffix does NOT fix the within-checkout trap (a suffixed release is still
 a release to the tool-ID logic: the whole `-V=full` line, constant across rebuilds), so the
-clean-cache rule stands unchanged. All four legs gate green; a red leg is a regression against
+clean-cache rule stands unchanged. All five legs gate green; a red leg is a regression against
 this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"

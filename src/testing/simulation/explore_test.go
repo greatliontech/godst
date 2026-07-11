@@ -2876,6 +2876,9 @@ func TestExploreAccPageChargeAddressIndependent(t *testing.T) {
 // enabled-set footprint (~N²/2 entries) that crosses MaxSteps*64 near step
 // 256, well under the 512-decision budget.
 func TestExploreFanOutOverflowIsNotBudgetHit(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
 	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, func() bool {
 		var wg sync.WaitGroup
 		release := make(chan struct{})
@@ -2909,6 +2912,9 @@ func TestExploreFanOutOverflowIsNotBudgetHit(t *testing.T) {
 // (the trace-gap throw), so any future consumer of the recorded trace is
 // protected too.
 func TestExploreTruncatedFailureReplays(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
 	sut := func() bool {
 		var wg sync.WaitGroup
 		release := make(chan struct{})
@@ -3068,6 +3074,9 @@ func TestExploreDPORTruncatedChildNoExtensionExplosion(t *testing.T) {
 // TestExploreDPORTruncatedChildContinuesWalk for that) nor the
 // extension-skip (see TestExploreDPORTruncatedChildNoExtensionExplosion).
 func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 512}, func() bool {
 		var wg sync.WaitGroup
 		release := make(chan struct{})

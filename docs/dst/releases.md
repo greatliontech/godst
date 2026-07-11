@@ -20,7 +20,7 @@ task is the executable form of the procedure below.
 ## Tags
 
 `goX.Y.Z-dst.N` — upstream base version plus a dst release counter, cut ONLY
-after the full enforcing matrix passes (the four Taskfile legs, the
+after the full enforcing matrix passes (the five Taskfile legs, including the
 cross-compile targets, and the 802-program sweep the `test:dst` leg contains).
 Consumers (gmdb CI and any other toolchain pin) reference **tags, never
 branches**: tags survive rebases, so force-pushes on `dst` cannot break a

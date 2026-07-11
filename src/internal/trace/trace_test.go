@@ -424,6 +424,7 @@ func TestTraceStacks(t *testing.T) {
 			// we won't have an EventRangeBegin event that matches the stace trace we're
 			// looking for, since runtime.GC will not have triggered the GC.
 			gcEv := evDesc{trace.EventRangeBegin, "GC concurrent mark phase", []frame{
+				{"runtime.gcForce", 0},
 				{"runtime.GC", 0},
 				{"main.main", 0},
 			}}

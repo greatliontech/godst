@@ -73,6 +73,10 @@ type file struct {
 	dstfds      map[dstFDKey]int        // simulated descriptors registered with the DST syscall boundary
 }
 
+func (f *file) dstBackend() dstFileBackend {
+	return f.dstf
+}
+
 // fd is the Unix implementation of Fd.
 func (f *File) fd() uintptr {
 	if f == nil {

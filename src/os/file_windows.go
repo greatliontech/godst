@@ -31,6 +31,10 @@ type file struct {
 	appendMode bool                    // whether file is opened for appending
 }
 
+func (*file) dstBackend() dstFileBackend {
+	return nil
+}
+
 // fd is the Windows implementation of Fd.
 func (file *File) fd() uintptr {
 	if file == nil {
