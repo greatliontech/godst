@@ -19,7 +19,7 @@ bound where the issue's own outcome clause allows it.
 
 - [x] 5. Explore recording keys on sim-bubble membership at the seq/access chokepoints (`dst-explore-foreign-bubble-seq-pollution`)
 - [x] 6. `-race` yield-placement foreign sensitivity diagnosed; removed or recorded as a bounded, reported limit (`dst-explore-race-foreign-yield-sensitivity`)
-- [ ] 7. DPOR truncated-child continuation pinned by a discriminating SUT, or brittleness demonstrated (`dst-explore-dpor-truncation-continuation-pin`)
+- [x] 7. DPOR truncated-child continuation pinned by a discriminating SUT, or brittleness demonstrated (`dst-explore-dpor-truncation-continuation-pin`)
 
 ## Filesystem & page cache
 

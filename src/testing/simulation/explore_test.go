@@ -2930,10 +2930,140 @@ func TestExploreTruncatedFailureReplays(t *testing.T) {
 	}
 }
 
+// dporConflict runs one shared-variable read/write race through the manual
+// access hooks: a reader and a writer of v, so DPOR sees a reversible
+// conflict and seeds a backtrack at the reader's decision. Returns the value
+// the reader observed (1 iff the write was ordered first).
+func dporConflict(v *int) int {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		dstAccessYield(unsafe.Pointer(v), true)
+		*v = 1
+	}()
+	dstAccessYield(unsafe.Pointer(v), false)
+	seen := *v
+	wg.Wait()
+	return seen
+}
+
+// TestExploreDPORTruncatedChildContinuesWalk is the discriminating pin for the
+// truncated-child continuation contract: a truncated DPOR child must not END
+// the walk — backtracks seeded on earlier frames by earlier untruncated runs
+// are still explored. Two independent conflicts, the shallow one (b) before
+// the deeper one (a); the fan-out that truncates is gated on a's REVERSAL, so
+// deepest-first backtracking reaches the truncating run while b's backtrack is
+// still pending. The observable failure lives ONLY in b's reversal. Continuing
+// past the truncation (the contract) explores it; ending the walk at the
+// truncation (the regression this pins) loses it. Empirically: 9 schedules /
+// 3 failures continuing, 3 / 0 with the walk broken at truncation.
+func TestExploreDPORTruncatedChildContinuesWalk(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		// The conflicts are intentional data races (the point of the manual
+		// access hooks); -race fails tRunner on them. DPOR's walk structure —
+		// the contract under test — is identical in both build modes.
+		t.Skip("intentionally racy sut; the continuation contract is build-mode-independent")
+	}
+	sut := func() bool {
+		var b, a int
+		bWas := dporConflict(&b) // shallow conflict: seeds a backtrack first
+		aWas := dporConflict(&a) // deeper conflict
+		if aWas == 1 {
+			// Gated on the DEEPER conflict's reversal so deepest-first
+			// backtracking explores this truncating arm BEFORE the shallow
+			// conflict's reversal is drained.
+			var wg sync.WaitGroup
+			release := make(chan struct{})
+			for i := 0; i < 300; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-release
+				}()
+			}
+			close(release)
+			wg.Wait()
+		}
+		return bWas == 1 // the failure is reachable only via b's reversal
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 256}, sut)
+	if !res.Overflow {
+		t.Errorf("Overflow = false, want true: the gated fan-out truncates a child")
+	}
+	if res.Exhausted {
+		t.Errorf("Exhausted = true, want false under truncation")
+	}
+	// The load-bearing assertion: the shallow conflict's failure survives the
+	// truncation of the deeper arm. A walk that stopped at the truncating run
+	// would report zero failures.
+	if len(res.Failures) == 0 {
+		t.Fatalf("no failures found: the walk did not continue past the truncated child (its pending backtracks were abandoned)")
+	}
+}
+
+// TestExploreDPORTruncatedChildNoExtensionExplosion pins the EXTENSION-SKIP
+// leg of the truncation guard (explore.go: `if tr.traceTruncated { n =
+// len(stack) }`), distinct from the continuation leg above: a truncated
+// trace must not be EXTENDED into new DPOR frames, or each conflict in the
+// truncating run's recorded prefix multiplies the walk (its children
+// re-truncate without bound). The SUT records k independent conflicts and
+// then an UNCONDITIONAL fan-out that truncates every run: with the guard the
+// stack is never extended past the recorded conflicts, so the walk stays
+// bounded (backtracks over the k conflicts alone); without it the truncated
+// frames spawn children that re-truncate, and schedules grow ~3^k. k=6 is
+// well under a second guarded and blows past any test budget unguarded, so
+// a bounded time cap discriminates without a fragile timeout assertion.
+func TestExploreDPORTruncatedChildNoExtensionExplosion(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		t.Skip("intentionally racy sut; the extension-skip is build-mode-independent")
+	}
+	const k = 6
+	sut := func() bool {
+		vars := make([]int, k)
+		for i := range vars {
+			_ = dporConflict(&vars[i]) // k independent recorded conflicts
+		}
+		// Unconditional fan-out: every run truncates here, AFTER the k
+		// conflicts are recorded.
+		var wg sync.WaitGroup
+		release := make(chan struct{})
+		for i := 0; i < 300; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-release
+			}()
+		}
+		close(release)
+		wg.Wait()
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 256}, sut)
+	if !res.Overflow {
+		t.Errorf("Overflow = false, want true under the fan-out truncation")
+	}
+	// The load-bearing assertion: extension-skip keeps the walk bounded. With
+	// the guard, the k conflicts truncate immediately, so the walk explores a
+	// handful of schedules; without it, ~3^k. A generous ceiling well below
+	// 3^6 = 729 kills the mutant without over-pinning the exact count.
+	if res.Schedules > 64 {
+		t.Fatalf("walk explored %d schedules for %d conflicts: truncated frames were extended (no extension-skip)", res.Schedules, k)
+	}
+}
+
 // TestExploreDPORFanOutOverflowContinues: the DPOR walk under a fan-out
-// truncation reports Overflow (not BudgetHit), does not extend frames from
-// the truncated region, and TERMINATES — pending backtracks seeded by earlier
-// untruncated runs still run rather than the walk aborting or exploding.
+// truncation reports Overflow (not BudgetHit) and does not claim exhaustion —
+// the truncating run here is the last thing to explore, so it pins the
+// Overflow/BudgetHit attribution, not the continuation (see
+// TestExploreDPORTruncatedChildContinuesWalk for that) nor the
+// extension-skip (see TestExploreDPORTruncatedChildNoExtensionExplosion).
 func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 512}, func() bool {
 		var wg sync.WaitGroup

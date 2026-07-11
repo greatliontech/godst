@@ -827,5 +827,12 @@ relation.
   schedules or DPOR frames — its children typically re-truncate, and coverage is already reported
   incomplete — but the walk continues: work seeded by earlier untruncated runs (queued prefixes in
   the exhaustive walk, pending backtracks in DPOR) is still explored, and force promotion is gated
-  on untruncated traces in both modes.
+  on untruncated traces in both modes. The DPOR continuation is pinned discriminatingly by
+  `TestExploreDPORTruncatedChildContinuesWalk`: two independent conflicts with the fan-out gated on
+  the deeper one's reversal, so deepest-first backtracking reaches the truncating run while the
+  shallow conflict's backtrack is still pending and its failure lives only there — ending the walk
+  at the truncation loses that failure (9 schedules/3 failures continuing, 3/0 broken). The
+  EXTENSION-SKIP leg — a truncated trace spawns no new frames — is pinned separately by
+  `TestExploreDPORTruncatedChildNoExtensionExplosion`: k recorded conflicts before an unconditional
+  truncating fan-out stay bounded with the skip and grow ~3^k without it (k=6 → 729).
 

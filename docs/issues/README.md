@@ -19,4 +19,3 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [net TIME_WAIT is unmodeled](./dst-net-time-wait-unmodeled.md) | M | close-time hold modeled, or divergence confirmed kept |
 | [Host/Process from non-bubble goroutines mid-run](./dst-sim-topology-apis-from-nonbubble.md) | M | declaration APIs guarded, or caller contract recorded |
 | [fault-caller guard run-start TOCTOU](./dst-sim-fault-guard-runstart-toctou.md) | L | activation edge closed, or window confirmed accepted |
-| [DPOR truncation-continuation pin missing](./dst-explore-dpor-truncation-continuation-pin.md) | L | deterministic discriminating SUT, or brittleness demonstrated |
