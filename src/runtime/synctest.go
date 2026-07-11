@@ -493,7 +493,7 @@ func (bubble *synctestBubble) dstDrainAtQuiescence() bool {
 		}
 		return false
 	}
-	GC()
+	gcForce()
 	if !finPending() && !cleanupPending() {
 		return false
 	}
@@ -616,7 +616,7 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 			// bubble channel op, DST-FIN-1/DST-CLEANUP-1).
 			quiet := 0
 			for quiet < poolReapGenerations {
-				GC()
+				gcForce()
 				if finPending() || cleanupPending() {
 					dstDiscardQueuedCallbacks()
 					quiet = 0

@@ -98,6 +98,7 @@ func init() {
 	register("DSTFinInFlightReleaseDuringRun", DSTFinInFlightReleaseDuringRun)
 	register("DSTCleanupInFlightReleaseDuringRun", DSTCleanupInFlightReleaseDuringRun)
 	register("DSTMemLimit", DSTMemLimit)
+	register("DSTForeignGCActivationStretch", DSTForeignGCActivationStretch)
 }
 
 //go:linkname dstRuntimeActive runtime.dstActive
@@ -2748,6 +2749,68 @@ func DSTRunqOverflowOrder() {
 
 //go:linkname dstDeactivate runtime.dstDeactivate
 func dstDeactivate()
+
+//go:linkname dstSetSimEnv runtime.dstSetSimEnv
+func dstSetSimEnv(hostname string, pid, numcpu int)
+
+//go:linkname dstClearSimEnv runtime.dstClearSimEnv
+func dstClearSimEnv()
+
+//go:linkname goroutineLeakGC runtime.dstGoroutineLeakGCFP
+func goroutineLeakGC()
+
+//go:linkname dstGoroutineLeakPendingFP runtime.dstGoroutineLeakPendingFP
+func dstGoroutineLeakPendingFP() bool
+
+// DSTForeignGCActivationStretch: the foreign forced-GC refusal covers the
+// run-entry stretch between the activation seed store and the bubble's
+// creation — the window where a foreign cycle would move heapMarked after the
+// dstHeapBase baseline snapshot and silently shift every later trigger
+// crossing. White-box reconstruction of that stretch (simulated process env
+// published, then activation, no bubble yet): runtime.GC() from the bare
+// goroutine must panic with the caller-position diagnostic. Prints "refused".
+func DSTForeignGCActivationStretch() {
+	dstSetSimEnv("h", 1, 1)
+	dstActivate(7)
+	msg := ""
+	func() {
+		defer func() {
+			if r, ok := recover().(string); ok {
+				msg = r
+			}
+		}()
+		runtime.GC()
+	}()
+	// The goroutine-leak entry must refuse BEFORE arming its process-global
+	// mode flag: a recovered refusal that left the flag armed would put the
+	// next cycle anywhere — possibly the simulation's own — into
+	// leak-detection mode.
+	leakMsg := ""
+	func() {
+		defer func() {
+			if r, ok := recover().(string); ok {
+				leakMsg = r
+			}
+		}()
+		goroutineLeakGC()
+	}()
+	armed := dstGoroutineLeakPendingFP()
+	dstDeactivate()
+	dstClearSimEnv()
+	if !strings.Contains(msg, "outside the run's bubble") {
+		os.Stdout.WriteString("not refused: " + msg + "\n")
+		return
+	}
+	if !strings.Contains(leakMsg, "outside the run's bubble") {
+		os.Stdout.WriteString("leak entry not refused: " + leakMsg + "\n")
+		return
+	}
+	if armed {
+		os.Stdout.WriteString("leak flag armed\n")
+		return
+	}
+	os.Stdout.WriteString("refused\n")
+}
 
 // DSTOvfFlushAtDeactivate: goroutines still sitting in the DST ring-overflow
 // queue when DST deactivates must be handed back to the normal scheduler

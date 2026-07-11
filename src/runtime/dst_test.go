@@ -2320,6 +2320,20 @@ func TestDSTFaultRandStreamIsolation(t *testing.T) {
 	}
 }
 
+// TestDSTForeignGCActivationStretch: the foreign forced-GC refusal is keyed
+// on the published simulated-process env, so it already holds in the
+// run-entry stretch between the activation seed store and the bubble's
+// creation — where a foreign cycle would silently stale the dstHeapBase
+// baseline. Mutation: keying the refusal on an existing simulation bubble
+// instead (dstSimBubble != nil) passes the mid-run guard tests but lets this
+// stretch through ("not refused").
+func TestDSTForeignGCActivationStretch(t *testing.T) {
+	out := runTestProgDST(t, "DSTForeignGCActivationStretch")
+	if strings.TrimSpace(out) != "refused" {
+		t.Fatalf("forced GC in the activation stretch (got %q, want \"refused\")", out)
+	}
+}
+
 // TestDSTUntaggedCodeFootprint pins the zero-code-footprint contract
 // (design.md, "Untagged footprint"): in a non-`-tags dst` build, the
 // dstBuild-guarded legs on the panic, finalizer, and NumCPU paths fold out —
@@ -2366,6 +2380,8 @@ func main() {
 		{"runtime.runFinqBlocks$", true},
 		{"runtime.NumCPU$", false},   // may be fully inlined away — trivially clean
 		{"runtime.AddCleanup", true}, // the user-package generic instantiation (prefix match)
+		{"runtime.GC$", false},       // the foreign-caller refusal folds; GC may inline into callers
+		{"runtime.gcForce$", true},   // the forced-cycle protocol behind GC
 	} {
 		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
 		out, err := cmd.CombinedOutput()

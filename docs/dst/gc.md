@@ -742,8 +742,23 @@ the channel-light workloads that first validated it (both **landed**):
   DST-armed cycle (`TestDSTGCForeignStart`: with the trigger condition held persistently true, NumGC
   is identical with and without a foreign allocator churning tiny, small, pointerful, and large
   objects; the user-arena site is gated identically but not exercised — arenas need their own
-  GOEXPERIMENT). Two consequences: a user-forced `runtime.GC()` (`gcTriggerCycle`) is a separate
-  starter this contract does not cover, and during an active run foreign/process heap growth never
+  GOEXPERIMENT). Two consequences: a user-forced `runtime.GC()` (`gcTriggerCycle`) is bubble-controlled too —
+  from a bubble goroutine it is sanctioned (the cycle runs at that call's deterministic point in the
+  schedule); from any other goroutine it panics, the fault APIs' caller-position rule (a foreign
+  forced cycle would mark the bubble's heap, discovering its finalizers/weaks, and zero
+  `dstHeapAlloc` at a wall-clock instant). The refusal is keyed on the published simulated-process
+  env (white-box `dstActivate`, which never publishes one, stays exempt), so it covers the whole run
+  INCLUDING the entry stretch between the activation seed store and the bubble's creation, where a
+  foreign cycle would move `heapMarked` after the `dstHeapBase` baseline snapshot and silently stale
+  the relative trigger for the entire run; a call already in flight across activation is caught by a
+  second refusal after the cycle-number capture (the interleaving that could hurt — a post-baseline
+  cycle number — is exactly the one whose capture synchronizes with the baseline cycle and so sees
+  the seed store); the runtime's own
+  activation/quiescence cycles use an internal entry, `debug.FreeOSMemory` and pprof's goroutine-leak
+  GC funnel through the guarded one (the leak entry refuses before arming its process-global mode
+  flag, which a recovered panic would otherwise leak into the run's own next cycle). Pinned by
+  `TestDSTForeignRuntimeGCPanics` (mid-run, both foreign positions) and
+  `TestDSTForeignGCActivationStretch` (the entry stretch). And during an active run foreign/process heap growth never
   TRIGGERS a collection (the physical `heapLive` trigger is unreachable under `dstActive` and forcegc
   is neutralized) — foreign garbage is reclaimed only by bubble-armed (or user-forced) cycles, so a
   run whose bubble never crosses leaves foreign growth unbounded, a modeled consequence of

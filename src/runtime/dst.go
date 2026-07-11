@@ -195,7 +195,7 @@ func dstActivate(seed uint64) {
 	// dstDeactivate.
 	dstPreparing.Store(true)
 	for range 2 {
-		GC()
+		gcForce()
 		dstDeferPreBubbleFinq()
 		dstDeferPreBubbleCleanups()
 	}
@@ -222,7 +222,7 @@ func dstActivate(seed uint64) {
 	// garbage that the first in-bubble GC then frees, driving heapMarked below the
 	// baseline and breaking the relative computation. See docs/dst/gc.md
 	// (Tier 2, per-bubble relative trigger).
-	GC()
+	gcForce()
 	dstHeapBase.Store(gcController.heapMarked)
 	dstFinqBase.Store(finqueued)
 }
@@ -2186,6 +2186,32 @@ func dstFenceActive() bool {
 func dstInSimBubble() bool {
 	gp := getg()
 	return gp.bubble != nil && gp.bubble == dstSimBubble
+}
+
+// dstRefuseForeignForcedGC panics when a user-forced GC cycle is requested
+// during an active simulation run from a goroutine outside the run's bubble.
+// A foreign forced cycle would mark the bubble's heap — discovering its
+// finalizers and weak pointers — and zero its allocation-trigger counter at a
+// wall-clock instant the seed does not control; refuse loudly, like foreign
+// fault injection (testing/simulation's caller-position guard). A bubble
+// goroutine's runtime.GC() is sanctioned: it runs at that call's
+// deterministic point in the schedule.
+//
+// The guard keys on dstSimEnvSet, which testing/simulation publishes before
+// the activation seed store and clears after deactivation. That covers the
+// whole run INCLUDING the activation stretch between the seed store and the
+// bubble's creation — a foreign cycle landing there would move
+// gcController.heapMarked after the dstHeapBase baseline snapshot, silently
+// shifting every later trigger crossing — and exempts the white-box
+// dstActivate mode (runtime tests; no simulated process env, no bubble),
+// which drives its deferral protocol through runtime.GC. Callers: GC and
+// goroutineLeakGC (before it arms the process-global leak-detection flag);
+// debug.FreeOSMemory funnels through GC, and sysmon's forcegc is neutralized
+// separately.
+func dstRefuseForeignForcedGC() {
+	if dstBuild && dstActive() && dstSimEnvSet && !dstInSimBubble() {
+		panic("runtime: GC forced during an active simulation from outside the run's bubble")
+	}
 }
 
 // dstCgoRefuse panics with the interception-boundary unsupported shape for a

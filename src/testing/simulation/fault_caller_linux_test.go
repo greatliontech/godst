@@ -9,6 +9,7 @@ package simulation
 import (
 	"fmt"
 	"internal/synctest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +108,68 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 				t.Errorf("%s panic = %q, want the caller-position diagnostic naming the API", pos, msg)
 			}
 		}
+	}
+}
+
+// TestDSTForeignRuntimeGCPanics: runtime.GC() invoked during an active run
+// from a goroutine outside the run's bubble fails loudly. A foreign
+// user-forced cycle would mark the bubble's heap (discovering finalizers and
+// weak pointers) and zero the allocation-trigger counter at a wall-clock
+// instant the seed does not control — the same silent-nondeterminism class
+// the fault-API caller guard kills. A bubble goroutine's runtime.GC() stays
+// sanctioned: it runs at that call's deterministic point in the schedule.
+func TestDSTForeignRuntimeGCPanics(t *testing.T) {
+	inject := make(chan func())
+	result := make(chan string)
+	go func() {
+		for call := range inject {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						result <- fmt.Sprint(r)
+					} else {
+						result <- ""
+					}
+				}()
+				call()
+			}()
+		}
+	}()
+	defer close(inject)
+
+	var bare, foreignBubble string
+	inBubble := false
+	Test(t, 1, func(t *testing.T) {
+		Host("h", HostConfig{}, func() {})
+		inject <- func() { runtime.GC() }
+		bare = <-result
+		inject <- func() { // being in SOME bubble must not pass the guard
+			var msg string
+			synctest.Run(func() {
+				defer func() {
+					if r := recover(); r != nil {
+						msg = fmt.Sprint(r)
+					}
+				}()
+				runtime.GC()
+			})
+			if msg != "" {
+				panic(msg) // re-raise on the injector for uniform reporting
+			}
+		}
+		foreignBubble = <-result
+		runtime.GC() // the run's own goroutine: a sanctioned, deterministic starter
+		inBubble = true
+	})
+	for pos, msg := range map[string]string{"bare": bare, "foreign-bubble": foreignBubble} {
+		if msg == "" {
+			t.Errorf("foreign runtime.GC() (%s) during an active run did not panic", pos)
+		} else if !strings.Contains(msg, "outside the run's bubble") {
+			t.Errorf("foreign runtime.GC() (%s) panic = %q, want the caller-position diagnostic", pos, msg)
+		}
+	}
+	if !inBubble {
+		t.Error("in-bubble runtime.GC() did not complete")
 	}
 }
 

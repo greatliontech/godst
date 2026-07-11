@@ -529,6 +529,20 @@ type workType struct {
 // garbage collection is complete. It may also block the entire
 // program.
 func GC() {
+	dstRefuseForeignForcedGC()
+	gcForce()
+}
+
+// gcForce runs the full forced-cycle protocol behind GC, bypassing the
+// foreign-caller refusal. It exists for the activation baseline GC
+// (dstActivate): that cycle runs after the seed store on the activating
+// goroutine, which carries no bubble yet — exactly the position the refusal
+// rejects. The DST runtime's other deterministic cycles (the pre-activation
+// preparation GCs in dstActivate, and the quiescence/stop-drain GCs in
+// synctest, which run on the root goroutine while it carries the bubble)
+// would pass the refusal anyway; they use this entry so the internal
+// protocol is bypass-by-construction, not bypass-by-analysis.
+func gcForce() {
 	// We consider a cycle to be: sweep termination, mark, mark
 	// termination, and sweep. This function shouldn't return
 	// until a full cycle has been completed, from beginning to
@@ -556,6 +570,22 @@ func GC() {
 	// Wait until the current sweep termination, mark, and mark
 	// termination complete.
 	n := work.cycles.Load()
+	if dstBuild && getg() != dstSimRootG {
+		// Re-run the foreign-caller refusal after the cycle-number capture: a
+		// foreign GC() suspended across simulation activation (entry refusal
+		// read the seed as 0, cooperative preemption landed at this
+		// function's prologue) resumes here, and only the resumption whose n
+		// is post-baseline can hurt — a stale n self-heals (gcStart no-ops on
+		// an already-run cycle number, and a foreign cycle serialized ahead
+		// of the baseline is re-absorbed by it). A post-baseline n means the
+		// load above read the baseline cycle's increment, which makes the
+		// seed store visible to this check — it cannot miss. The activating
+		// goroutine (dstSimRootG, the baseline GC itself) is the one
+		// sanctioned non-bubble caller through here. No deterministic test
+		// can pin this re-check (the window is a wall-clock preemption
+		// race); its guarantee is the synchronizes-with edge just described.
+		dstRefuseForeignForcedGC()
+	}
 	gcWaitOnMark(n)
 
 	// We're now in sweep N or later. Trigger GC cycle N+1, which
@@ -600,10 +630,36 @@ func GC() {
 	releasem(mp)
 }
 
+// dstGoroutineLeakPendingFP reports whether the goroutine-leak-detection
+// pending flag is armed. White-box probe (testprog): a refused foreign
+// goroutineLeakGC must not have armed it — an armed flag surviving a
+// recovered refusal would put the next cycle anywhere, possibly the
+// simulation's own, into leak-detection mode.
+//
+//go:linkname dstGoroutineLeakPendingFP
+func dstGoroutineLeakPendingFP() bool {
+	return work.goroutineLeak.pending.Load()
+}
+
+// dstGoroutineLeakGCFP invokes the goroutine-leak GC entry; white-box probe
+// (testprog) companion to dstGoroutineLeakPendingFP — the pprof linkname the
+// entry carries is not pullable from a test program.
+//
+//go:linkname dstGoroutineLeakGCFP
+func dstGoroutineLeakGCFP() {
+	goroutineLeakGC()
+}
+
 // goroutineLeakGC runs a GC cycle that performs goroutine leak detection.
 //
 //go:linkname goroutineLeakGC runtime/pprof.runtime_goroutineLeakGC
 func goroutineLeakGC() {
+	// Refuse a foreign caller BEFORE arming the process-global pending flag:
+	// GC() below would refuse too, but by then the flag is set, a recovered
+	// panic (e.g. net/http's handler recoverer) leaks it armed, and the next
+	// cycle anywhere — possibly the simulation's own — silently runs in
+	// leak-detection mode.
+	dstRefuseForeignForcedGC()
 	// Set the pending flag to true, instructing the next GC cycle to
 	// perform goroutine leak detection.
 	work.goroutineLeak.pending.Store(true)
