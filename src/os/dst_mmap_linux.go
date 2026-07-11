@@ -49,9 +49,9 @@ type dstMMapEntry struct {
 	// mapping, starting at file offset off. mapBase/mapLen are the mapping
 	// itself, which always starts at file offset 0 (see dstPageCacheMap), so
 	// data's first byte is mapBase+off.
-	data     []byte
-	mapBase  uintptr
-	mapLen   uintptr
+	data    []byte
+	mapBase uintptr
+	mapLen  uintptr
 	node    *dstFSNode
 	epoch   uint64
 	host    uint32
