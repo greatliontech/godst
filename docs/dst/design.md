@@ -904,6 +904,22 @@ needs process identity or umask under a run uses the `os` API, which is modeled 
 
 ### Enforcing test configurations
 
+**Untagged footprint (contract).** A non-`-tags dst` build carries zero CODE footprint: `dstBuild`
+is a build constant, so every `if dstActive()`/`if dstBuild` guard — hot paths included: `NumCPU`'s
+simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's drain legs, and
+`synctest`'s drain/teardown calls — is dead-code-eliminated. `TestDSTUntaggedCodeFootprint` pins the fold by objdump at the panic,
+finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
+pattern and were objdump-verified at the change. The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
+thirteen per-goroutine DST words (the six identity/RNG stamps and the seven race-access staging
+fields), `p` carries the run-queue overflow flag, `synctestBubble` carries the GC-drain
+bookkeeping, `specialfinalizer` carries epoch+seq, `specialCleanup` carries epoch, and
+`finalizer`/`cleanupFn` each carry one registration-sequence word (so untagged builds fit slightly
+fewer entries per block). Restoring the untagged layouts would fork per-tag variants of the runtime's central `g`
+struct and of hand-maintained GC bitmap constants (`finalizer1`'s word pattern;
+`cleanupBlockPtrMask`, whose two-per-byte packing is load-bearing on the 4-word `cleanupFn`) — an
+unsafe-critical duplication for a few words per object; recorded here as the deliberate limit, with
+the rationale at the claim in `runtime/dst.go`.
+
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the
 authoritative statement of its leg, and the `go test` command in the Taskfile is its definition:

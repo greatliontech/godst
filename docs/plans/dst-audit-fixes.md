@@ -131,7 +131,7 @@ Audit reproducers (ephemeral, from the audit session):
 
 ## Spec & docs (docs/dst, untagged-build surface)
 
-- [ ] 29. the untagged zero-footprint claim is made true: `finalizer`/
+- [x] 29. the untagged zero-footprint claim is made true: `finalizer`/
   `cleanupFn` carry no dead dst word untagged, `NumCPU`'s branch is
   dead-code-eliminated; if a leg is disproportionate to restore, surface it as
   a spec-amend instead — no silent divergence.

@@ -859,7 +859,7 @@ func gopanic(e any) {
 		}
 		fn()
 	}
-	if dstExploreRecordUncaughtPanic(e) {
+	if dstBuild && dstExploreRecordUncaughtPanic(e) {
 		dstExploreDropPanicDefers(gp)
 		goexit1()
 	}

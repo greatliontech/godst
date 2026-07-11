@@ -2319,3 +2319,67 @@ func TestDSTFaultRandStreamIsolation(t *testing.T) {
 		}
 	}
 }
+
+// TestDSTUntaggedCodeFootprint pins the zero-code-footprint contract
+// (design.md, "Untagged footprint"): in a non-`-tags dst` build, the
+// dstBuild-guarded legs on the panic, finalizer, and NumCPU paths fold out —
+// the compiled symbols reference no runtime.dst* symbol. (The synctest legs
+// are covered by the same constant-guard pattern but are not reachable from a
+// plain main; they were verified by objdump at the change.)
+func TestDSTUntaggedCodeFootprint(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips build-mode objdump checks")
+	}
+	testenv.MustHaveGoBuild(t)
+	dir := t.TempDir()
+	src := []byte(`package main
+
+import "runtime"
+
+type big struct{ buf [64]byte }
+
+func main() {
+	println(runtime.NumCPU())
+	b := &big{}
+	runtime.SetFinalizer(b, func(*big) { println("f") })
+	runtime.AddCleanup(new(int), func(int) {}, 0)
+	b = nil
+	runtime.GC()
+	defer func() { recover() }()
+	panic("x")
+}
+`)
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), src, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "app")
+	cmd := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "build", "-o", exe, "main.go"))
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	for _, probe := range []struct {
+		pattern       string
+		mustBePresent bool // guards vacuity: a rename/inlining drift must fail loudly, not pass silently
+	}{
+		{"runtime.gopanic$", true},
+		{"runtime.runFinqBlocks$", true},
+		{"runtime.NumCPU$", false},   // may be fully inlined away — trivially clean
+		{"runtime.AddCleanup", true}, // the user-package generic instantiation (prefix match)
+	} {
+		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump %s: %v\n%s", probe.pattern, err, out)
+		}
+		if !strings.Contains(string(out), "TEXT ") {
+			if probe.mustBePresent {
+				t.Errorf("untagged binary has no symbol matching %s — the anchor drifted; re-anchor the fold test", probe.pattern)
+			}
+			continue
+		}
+		if strings.Contains(string(out), "runtime.dst") {
+			t.Errorf("untagged %s references runtime.dst symbols:\n%s", probe.pattern, out)
+		}
+	}
+}

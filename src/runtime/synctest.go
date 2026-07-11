@@ -213,7 +213,7 @@ func synctestRun(f func()) {
 		if dstActive() && dstSchedKind == dstSchedScheduled {
 			dstClearSchedState(gp)
 		}
-		if dstSimBubble == bubble {
+		if dstBuild && dstSimBubble == bubble {
 			dstSimBubble = nil
 		}
 		gp.bubble = nil
@@ -326,7 +326,9 @@ func synctestRun(f func()) {
 		// advancing virtual time, so the set of finalizers run by the next
 		// quiescence point is the deterministic dead set (invariant DST-FIN-2).
 		// No-op (no GC) when this bubble has no DST drain.
-		bubble.dstDrainAtQuiescence()
+		if dstBuild {
+			bubble.dstDrainAtQuiescence()
+		}
 		lock(&bubble.mu)
 		if bubble.active < 0 {
 			throw("active < 0")
@@ -350,7 +352,9 @@ func synctestRun(f func()) {
 	// drain goroutine so it does not outlive the bubble and inflate total past the
 	// root, which would spuriously trip the total != 1 deadlock check below
 	// (invariant DST-FIN-3). No-op when this bubble has no DST drain.
-	bubble.dstStopGCDrain()
+	if dstBuild {
+		bubble.dstStopGCDrain()
+	}
 
 	lock(&bubble.mu)
 	total := bubble.total

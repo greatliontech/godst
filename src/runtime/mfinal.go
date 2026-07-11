@@ -314,7 +314,7 @@ func runFinqBlocks(fb *finBlock) {
 	// straight-line code (no park, no recoverable panic), so the discard, which
 	// runs only after the drain has died, can never observe it. Do not add a
 	// park or preemption point between the free below and the next publish.
-	onDrain := gp.bubble != nil && gp == gp.bubble.gcDrain
+	onDrain := dstBuild && gp.bubble != nil && gp == gp.bubble.gcDrain
 	var (
 		frame    unsafe.Pointer
 		framecap uintptr
@@ -324,12 +324,12 @@ func runFinqBlocks(fb *finBlock) {
 		racefingo()
 	}
 	for fb != nil {
-		if onDrain {
+		if onDrain { // onDrain embeds dstBuild: folds untagged
 			dstDrainingFinq = fb
 		}
 		n := fb.cnt
 		for i := n; i > 0; i-- {
-			for onFing && dstParkFingIfBlocked() {
+			for dstBuild && onFing && dstParkFingIfBlocked() {
 			}
 			f := &fb.fin[i-1]
 

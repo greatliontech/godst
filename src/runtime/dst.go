@@ -103,12 +103,25 @@ func dstNetEpoch() uint64 {
 //
 // The dstBuild guard is load-bearing for cost, not just correctness: dstBuild is
 // a constant (dst_on.go/dst_off.go), so in a non-`-tags dst` build dstActive()
-// folds to a constant false and every `if dstActive()` branch — on the rand() and
-// scheduler hot paths included — is dead-code-eliminated. The DST machinery then
-// has zero footprint unless the build opted in. In a `-tags dst` build the guard
-// is true and this is the runtime seed load as before. (dstSeed is never set
-// without dstBuild anyway: simulation.Run requires the tag, and dstActivate is an
-// unexported test-only linkname.)
+// folds to a constant false and every `if dstActive()`/`if dstBuild` guard — on
+// the rand(), scheduler, panic, finalizer, and synctest paths included — is
+// dead-code-eliminated: zero CODE footprint unless the build opted in
+// (TestDSTUntaggedCodeFootprint pins the fold; a generic like AddCleanup
+// instantiates in user packages where dstActive does not inline, so such
+// guards lead with the exported constant). The DATA layout is not
+// zero-footprint, deliberately, in every build: g carries thirteen
+// per-goroutine DST words (identity/RNG stamps and race-access staging), p a
+// run-queue overflow flag, synctestBubble the drain bookkeeping,
+// specialfinalizer/specialCleanup epoch/seq words, and finalizer/cleanupFn one
+// registration-sequence word each. Splitting
+// those by build tag would fork the runtime's central g struct and the
+// hand-maintained GC bitmap constants (finalizer1's word pattern;
+// cleanupBlockPtrMask, whose two-per-byte packing is load-bearing on the
+// 4-word cleanupFn) into per-tag variants — an unsafe-critical duplication for
+// a few words per object (design.md, "Untagged footprint"). In a `-tags dst`
+// build the guard is true and this is the runtime seed load as before.
+// (dstSeed is never set without dstBuild anyway: simulation.Run requires the
+// tag, and dstActivate is an unexported test-only linkname.)
 //
 // The push linkname lets net pull it to gate the simulated network at Dial/Listen.
 //

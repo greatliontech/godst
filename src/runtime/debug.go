@@ -209,7 +209,12 @@ func dstGOMAXPROCSAutoFP() bool {
 // at process startup. Changes to operating system CPU allocation after
 // process startup are not reflected.
 func NumCPU() int {
-	if dstSimEnvSet {
+	// dstBuild is a build constant: untagged, the whole branch folds out and
+	// NumCPU compiles to the numCPUStartup load alone (the zero-code-footprint
+	// contract in dst.go). dstSimEnvSet cannot be true untagged anyway
+	// (simulation.Run panics before activating), so this is cost, not
+	// correctness.
+	if dstBuild && dstSimEnvSet {
 		// Deterministic simulation: report the simulated CPU count so a SUT that
 		// sizes pools/shards by NumCPU is reproducible across hosts. Per-host (this
 		// host's HostConfig.NumCPU if it set one) falling back to the run default

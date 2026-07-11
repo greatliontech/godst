@@ -179,7 +179,11 @@ func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup {
 	// instead, so no async cleanup G is needed. Pre-bubble cleanups are excluded
 	// before dstActive and released back to the ordinary async pool after
 	// dstDeactivate.
-	if !dstActive() && gcCleanups.needG() {
+	// (!dstBuild || ...) first: AddCleanup is generic and instantiates in USER
+	// packages, where dstActive does not inline — the exported constant
+	// short-circuits the call away untagged (the zero-code-footprint contract
+	// in dst.go); tagged semantics identical.
+	if (!dstBuild || !dstActive()) && gcCleanups.needG() {
 		gcCleanups.createGs()
 	}
 
