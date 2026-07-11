@@ -45,6 +45,85 @@ var dstConns struct {
 	epoch uint64
 	set   map[*dstConn]struct{}
 	seq   uint64 // per-run monotonic registration counter (see dstConn.regSeq)
+
+	// timeWait holds the local 2-tuples of actively-FIN-closed conn ends
+	// until their base-time expiry — production's TIME_WAIT, visible only to
+	// the explicit-LocalAddr bind probe (dstTimeWaitHeld), never to listener
+	// probes or the ephemeral allocator (SO_REUSEADDR binds over TIME_WAIT;
+	// connect-time selection reuses held ports). Appended in Close order
+	// (schedule-determined) and pruned in place, so iteration order is
+	// deterministic. prunedLen is the slice length after the last prune; adds
+	// prune again once the length doubles (amortized O(1), length-driven so
+	// replay-exact). See design.md's bind paragraph for the modeled scope.
+	timeWait  []dstTimeWait
+	prunedLen int
+}
+
+// dstTimeWait is one held local 2-tuple: an actively-closed dialer end's
+// local binding, refused to non-SO_REUSEADDR binds until expireAt.
+type dstTimeWait struct {
+	host     uint32
+	ip       IP
+	port     int
+	expireAt int64 // universe base-time ns (dstBaseNanos)
+}
+
+// dstTimeWaitNs is production's TIME_WAIT hold: Linux's TCP_TIMEWAIT_LEN, a
+// fixed 60s — the kernel's 2·MSL. Counted in universe base time, the same
+// basis wire delivery is gated on (a kernel TCP timer, not the host's
+// possibly-drifted wall clock — DST-NET-LATENCY-DET's precedent).
+const dstTimeWaitNs = 60_000_000_000
+
+// dstTimeWaitAdd records an actively-closed conn end's local 2-tuple. Prunes
+// expired entries once the slice has doubled since the last prune, so a run
+// that never consults the probe still holds only a bounded window of churn.
+func dstTimeWaitAdd(host uint32, ip IP, port int) {
+	dstConns.mu.Lock()
+	now := dstBaseNanos()
+	dstConnsRoll()
+	if len(dstConns.timeWait) >= 64 && len(dstConns.timeWait) >= 2*dstConns.prunedLen {
+		dstTimeWaitPrune(now)
+	}
+	dstConns.timeWait = append(dstConns.timeWait, dstTimeWait{
+		host: host, ip: ip, port: port, expireAt: now + dstTimeWaitNs,
+	})
+	dstConns.mu.Unlock()
+}
+
+// dstTimeWaitPrune drops expired holds in place, order-preserving so the
+// slice stays deterministic. Caller holds dstConns.mu.
+func dstTimeWaitPrune(now int64) {
+	live := dstConns.timeWait[:0]
+	for _, w := range dstConns.timeWait {
+		if w.expireAt > now {
+			live = append(live, w)
+		}
+	}
+	dstConns.timeWait = live
+	dstConns.prunedLen = len(live)
+}
+
+// dstTimeWaitHeld reports whether ip:port on host is inside a TIME_WAIT hold —
+// the bind(2)-without-SO_REUSEADDR probe of the explicit-LocalAddr dial path —
+// pruning expired entries as it scans. ip nil means any IP at the port,
+// matching the live-conn probe's convention.
+func dstTimeWaitHeld(host uint32, ip IP, port int) bool {
+	dstConns.mu.Lock()
+	defer dstConns.mu.Unlock()
+	dstConnsRoll()
+	dstTimeWaitPrune(dstBaseNanos())
+	held := false
+	for _, w := range dstConns.timeWait {
+		if w.host != host || w.port != port {
+			continue
+		}
+		if ip != nil && !w.ip.Equal(ip) {
+			continue
+		}
+		held = true
+		break
+	}
+	return held
 }
 
 func dstConnsRoll() { // caller holds mu
@@ -52,6 +131,8 @@ func dstConnsRoll() { // caller holds mu
 		dstConns.epoch = e
 		dstConns.set = make(map[*dstConn]struct{})
 		dstConns.seq = 0
+		dstConns.timeWait = nil
+		dstConns.prunedLen = 0
 	}
 }
 
@@ -115,8 +196,12 @@ func dstMatchedVictims(match func(*dstConn) bool) []*dstConn {
 // explicit LocalAddr without SO_REUSEADDR, so bind(2) fails EADDRINUSE on a local
 // addr:port collision even when the destinations differ, and an ephemeral allocator
 // must skip a still-live port. Scans the per-run conn registry by the dialer end's
-// attribution (localHost + local address). Deterministic (a set-membership test, no
-// iteration order observed).
+// attribution (localHost + local address). LIVE conns only: the explicit-LocalAddr
+// dial path consults the TIME_WAIT holds separately (dstTimeWaitHeld — the bind(2)
+// surface), while the ephemeral allocator deliberately does not (production's
+// connect-time selection is 4-tuple-aware with tcp_tw_reuse, so churn never
+// exhausts the range there — see design.md's bind paragraph). Deterministic (a
+// set-membership test, no iteration order observed).
 func dstLocalBindInUse(host uint32, ip IP, port int) bool {
 	return dstConnBindInUse(host, ip, port, "", false)
 }

@@ -602,9 +602,39 @@ func (c *dstConn) Close() error {
 		dstResetBothEnds(c)
 		return nil
 	}
+	c.timeWaitHold()
 	c.Conn.Close()
 	dstConnDeregister(c)
 	return nil
+}
+
+// timeWaitHold records this end's local 2-tuple as a TIME_WAIT hold when
+// production would: the FIN arm of an ACTIVE close — the ends production
+// sends to CLOSED directly hold nothing (the RST arm above, an already-reset
+// conn, a retransmit-exhaustion death), and neither does the PASSIVE closer
+// (the peer closed first). The peer's close INSTANT, not its FIN's delivery,
+// decides active vs passive — the same collapse the RST arm records for the
+// close-vs-arrival race. The first closer therefore always holds, and two
+// Closes that interleave before either transport closes BOTH hold —
+// production's simultaneous-close shape (each end sent its FIN before
+// receiving the peer's, so both enter TIME_WAIT). Both dialer and accepted
+// ends hold, as in production; the hold is visible only to the explicit-
+// LocalAddr bind probe (dstTimeWaitHeld), so accepts, re-listens, and the
+// ephemeral allocator never see it. Runs BEFORE c.Conn.Close so remoteDone
+// still reflects only the peer's action.
+func (c *dstConn) timeWaitHold() {
+	if c.reset.Load() {
+		return
+	}
+	la, ok := c.local.(*TCPAddr)
+	if !ok {
+		return
+	}
+	e, ok := c.Conn.(*dstWireEnd)
+	if !ok || e.timedOut.Load() || isClosedChan(e.remoteDone) {
+		return
+	}
+	dstTimeWaitAdd(c.localHost, la.IP, la.Port)
 }
 
 // setDeadline applies a deadline with production error identity: after a
@@ -1009,11 +1039,14 @@ redial:
 	if localPort != 0 {
 		// An explicit LocalAddr binds without SO_REUSEADDR: bind(2) fails EADDRINUSE
 		// on a live local addr:port collision (a 2-tuple, whatever the destination) —
-		// against another conn's local end OR a listener on the dialer's own host
+		// against another conn's local end, a TIME_WAIT hold (this bind carries
+		// no SO_REUSEADDR, so a held tuple refuses it — the one surface
+		// TIME_WAIT is visible to), OR a listener on the dialer's own host
 		// (exact or wildcard, same family; the listener's own SO_REUSEADDR does not
 		// help a peer socket that lacks it).
 		dialerScope := dstNetScope(dialerHost)
 		if dstLocalBindInUse(dialerHost, localIP, localPort) ||
+			dstTimeWaitHeld(dialerHost, localIP, localPort) ||
 			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, false), localPort, false) {
 			dstNet.mu.Unlock()
 			src := &TCPAddr{IP: localIP, Port: localPort}

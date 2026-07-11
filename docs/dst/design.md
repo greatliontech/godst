@@ -414,9 +414,31 @@ and the `:0` allocator skips such ports: `TestDSTNetListenConnPortEADDRINUSE`). 
 inherit the listener's `SO_REUSEADDR`, so a server restarted while its old connections drain re-binds
 its port (`TestDSTNetRelistenWithAcceptedConns`) — among CONN ends, only sockets lacking
 `SO_REUSEADDR` (dialer ends) block a listener, exactly the kernel's rule (live listeners block each
-other regardless, as two LISTEN sockets always conflict). One divergence: **TIME_WAIT is
-unmodeled** — a conn deregisters at close, so a just-closed 2-tuple is immediately re-bindable where
-production's `bind(2)` without `SO_REUSEADDR` refuses it for 2·MSL (the false-negative direction). `:0` listeners receive deterministic nonzero ports, wrapping within
+other regardless, as two LISTEN sockets always conflict). **TIME_WAIT is modeled**: an ACTIVE
+FIN-close of a conn end — dialer or accepted alike — holds its local 2-tuple for 60 seconds of
+universe base time (Linux's fixed `TCP_TIMEWAIT_LEN`, the kernel's 2·MSL; base time because a
+TCP timer is kernel machinery gated like wire delivery, not the host's possibly-drifted wall
+clock). The hold is visible ONLY to the `bind(2)`-without-`SO_REUSEADDR` surface — an
+explicit-`LocalAddr` dial of a held tuple fails `EADDRINUSE` until the hold expires
+(`TestDSTNetDialerTimeWaitEADDRINUSE`, accepted-end hold
+`TestDSTNetAcceptedEndTimeWaitEADDRINUSE`). The EPHEMERAL allocator deliberately ignores holds
+(`TestDSTNetEphemeralChurnOutlivesTimeWait` — a dial/close churn loop crossing the whole port
+span in zero simulated time keeps dialing): production's connect-time selection is 4-tuple-aware
+and reuses a TIME_WAIT port toward any other destination (and toward the SAME destination on
+loopback, `tcp_tw_reuse`'s default scope), so a held-port skip would manufacture sim-only
+`EADDRNOTAVAIL` churn failures production's selection does not produce. The recorded collapse runs
+the other way: an ephemeral dial may receive a port whose tuple production could still refuse
+toward the identical destination with `tcp_tw_reuse` unavailable — a corner the SUT cannot
+steer, since which ephemeral port a dial receives is sim-defined anyway. Listeners bind over
+holds, `SO_REUSEADDR` over TIME_WAIT (`TestDSTNetListenerBindsOverTimeWait`), and accepts never
+consult the bind probe, so a live listener keeps accepting on a port whose dead conns are still
+held. No hold for the ends production sends to CLOSED directly: the RST shapes (unread-inbound
+close `TestDSTNetRSTCloseSkipsTimeWait`, resets, retransmit-exhaustion deaths) and the PASSIVE
+closer (`TestDSTNetPassiveCloseSkipsTimeWait`). The peer's close INSTANT, not its FIN's
+delivery, decides active vs passive — the same collapse the close-vs-arrival RST arm records.
+The first closer always holds; two closes that interleave before either transport closes BOTH
+hold — production's simultaneous-close shape, where each end sent its FIN before receiving the
+peer's and both enter TIME_WAIT. `:0` listeners receive deterministic nonzero ports, wrapping within
 [10000, 65535] and reclaiming closed ports on the next pass — a long-lived run listens and closes
 indefinitely (`TestDSTNetListenPortAllocatorWrapsAndReclaims`), and a fully live range fails
 `EADDRINUSE`, bind(2)'s exhaustion identity, carrying the requested address

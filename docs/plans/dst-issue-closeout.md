@@ -29,7 +29,7 @@ bound where the issue's own outcome clause allows it.
 
 ## Network
 
-- [ ] 11. TIME_WAIT close-time hold modeled for active-close dialer 2-tuples, or divergence confirmed kept (`dst-net-time-wait-unmodeled`)
+- [x] 11. TIME_WAIT close-time hold modeled for active-close dialer 2-tuples, or divergence confirmed kept (`dst-net-time-wait-unmodeled`)
 
 ## Simulation API surface
 

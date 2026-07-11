@@ -143,6 +143,305 @@ func TestDSTNetListenConnPortEADDRINUSE(t *testing.T) {
 	}
 }
 
+// TestDSTNetDialerTimeWaitEADDRINUSE: an ACTIVE FIN-close of a dialer end
+// holds its local 2-tuple for 60s of simulated time (Linux's TCP_TIMEWAIT_LEN,
+// the kernel's fixed 2·MSL) — an explicit-LocalAddr re-dial inside the hold
+// fails EADDRINUSE, production's bind(2)-without-SO_REUSEADDR answer for a
+// TIME_WAIT tuple, and succeeds once the hold expires.
+func TestDSTNetDialerTimeWaitEADDRINUSE(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var heldErr, expiredErr error
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			me := ParseIP(simulation.HostIP("cli"))
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			c.Close() // nothing unread, peer has not closed: the active FIN close
+			_, heldErr = d.Dial("tcp", target)
+			time.Sleep(61 * time.Second) // simulated: crosses the 60s hold
+			c2, err := d.Dial("tcp", target)
+			expiredErr = err
+			if err == nil {
+				c2.Close()
+			}
+		})
+	})
+	if !errors.Is(heldErr, syscall.EADDRINUSE) {
+		t.Errorf("re-dial of a TIME_WAIT 2-tuple = %v, want EADDRINUSE", heldErr)
+	}
+	if expiredErr != nil {
+		t.Errorf("re-dial after the 2·MSL hold = %v, want success", expiredErr)
+	}
+}
+
+// TestDSTNetListenerBindsOverTimeWait: a listener binds with SO_REUSEADDR, so
+// a TIME_WAIT hold — unlike a LIVE dialer conn — does not block it.
+func TestDSTNetListenerBindsOverTimeWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var listenErr error
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			me := ParseIP(simulation.HostIP("cli"))
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			c.Close() // active close: cli:33000 enters TIME_WAIT
+			ln, err := Listen("tcp", simulation.HostIP("cli")+":33000")
+			listenErr = err
+			if err == nil {
+				ln.Close()
+			}
+		})
+	})
+	if listenErr != nil {
+		t.Errorf("listen on a TIME_WAIT 2-tuple = %v, want success (SO_REUSEADDR binds over TIME_WAIT)", listenErr)
+	}
+}
+
+// TestDSTNetAcceptedEndTimeWaitEADDRINUSE: an ACTIVE close of an ACCEPTED
+// end holds its local 2-tuple (the listener's port) too, exactly as
+// production does — visible only to a later non-SO_REUSEADDR bind of that
+// port, here an explicit-LocalAddr dial from the server host after the
+// listener is gone. Same-host conns exercise the wire path like any other.
+func TestDSTNetAcceptedEndTimeWaitEADDRINUSE(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var heldErr error
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		done := make(chan struct{})
+		simulation.Host("app", simulation.HostConfig{}, func() {
+			me := ParseIP(simulation.HostIP("app"))
+			self := simulation.HostIP("app")
+			ln, err := Listen("tcp", self+":21000")
+			if err != nil {
+				panic(err)
+			}
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Close() // ACTIVE close of the accepted end: app:21000 enters TIME_WAIT
+				close(done)
+			}()
+			c, err := Dial("tcp", self+":21000") // ephemeral dialer end, same host
+			if err != nil {
+				panic(err)
+			}
+			<-done
+			io.ReadAll(c) // drain the FIN
+			c.Close()     // passive: the dialer end holds nothing
+			ln.Close()    // the port's LISTENER is gone; only the hold remains
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 21000}}
+			_, heldErr = d.Dial("tcp", target)
+		})
+	})
+	if !errors.Is(heldErr, syscall.EADDRINUSE) {
+		t.Errorf("dial bound to an accepted end's TIME_WAIT tuple = %v, want EADDRINUSE", heldErr)
+	}
+}
+
+// TestDSTNetPassiveCloseSkipsTimeWait: the PASSIVE closer (the peer closed
+// first) goes to CLOSED without TIME_WAIT — after draining the peer's FIN to
+// EOF and closing, the same 2-tuple re-dials immediately.
+func TestDSTNetPassiveCloseSkipsTimeWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var redialErr error
+	simulation.Run(1, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Close() // the server closes first: its FIN reaches the dialer
+			}()
+			close(ready)
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			me := ParseIP(simulation.HostIP("cli"))
+			target := simulation.HostIP("srv") + ":20000"
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			io.ReadAll(c) // drain to EOF: the peer's close has happened
+			c.Close()     // passive close: no TIME_WAIT
+			c2, err := d.Dial("tcp", target)
+			redialErr = err
+			if err == nil {
+				c2.Close()
+			}
+		})
+	})
+	if redialErr != nil {
+		t.Errorf("re-dial after a PASSIVE close = %v, want success (no TIME_WAIT for the passive closer)", redialErr)
+	}
+}
+
+// TestDSTNetRSTCloseSkipsTimeWait: an end that answers with RST (closed with
+// unread received data — the close(2) conditional's RST arm) goes to CLOSED
+// without TIME_WAIT; the same 2-tuple re-dials immediately.
+func TestDSTNetRSTCloseSkipsTimeWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var redialErr error
+	simulation.Run(1, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		sent := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Write([]byte{1}) // a byte the dialer never reads
+				close(sent)
+			}()
+			close(ready)
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			me := ParseIP(simulation.HostIP("cli"))
+			target := simulation.HostIP("srv") + ":20000"
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			<-sent
+			c.Close() // unread inbound: the RST arm — no TIME_WAIT
+			c2, err := d.Dial("tcp", target)
+			redialErr = err
+			if err == nil {
+				c2.Close()
+			}
+		})
+	})
+	if redialErr != nil {
+		t.Errorf("re-dial after an RST close = %v, want success (RST skips TIME_WAIT)", redialErr)
+	}
+}
+
+// TestDSTNetEphemeralChurnOutlivesTimeWait: the ephemeral allocator ignores
+// TIME_WAIT holds — production's connect-time selection is 4-tuple-aware with
+// tcp_tw_reuse, so a dial/close churn loop never exhausts the port range even
+// though every active close holds its tuple. More iterations than the whole
+// ephemeral span, in zero simulated time, so a hold-respecting allocator
+// would exhaust and fail EADDRNOTAVAIL partway.
+func TestDSTNetEphemeralChurnOutlivesTimeWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var churnErr error
+	simulation.Run(1, func() {
+		var ln Listener
+		ready := make(chan struct{})
+		simulation.Host("sink", simulation.HostConfig{}, func() {
+			ln, _ = Listen("tcp", simulation.HostIP("sink")+":20000")
+			go func() {
+				// Drain the backlog but KEEP the accepted ends open, so the
+				// dialer is always the ACTIVE closer and every dialer port
+				// genuinely enters TIME_WAIT.
+				for {
+					if _, err := ln.Accept(); err != nil {
+						return
+					}
+				}
+			}()
+			close(ready)
+		})
+		<-ready
+		defer ln.Close()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			target := simulation.HostIP("sink") + ":20000"
+			const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
+			for i := 0; i < span+100; i++ {
+				c, err := Dial("tcp", target)
+				if err != nil {
+					churnErr = err
+					return
+				}
+				c.Close()
+			}
+		})
+	})
+	if churnErr != nil {
+		t.Errorf("ephemeral churn across the port span = %v, want success (the allocator must not respect TIME_WAIT holds)", churnErr)
+	}
+}
+
+// TestDSTNetTimeWaitDeadEndsHoldNothing: the two CLOSED-direct shapes without
+// a deterministic dial-level driver — a retransmit-exhaustion death (the
+// horizon fired) and an already-reset conn — hold nothing at Close. White-box:
+// the states are forced directly and the hold registry is probed directly.
+func TestDSTNetTimeWaitDeadEndsHoldNothing(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var timedOutHeld, resetHeld bool
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			host, _ := dstNetCurrentNode()
+			me := ParseIP(simulation.HostIP("cli"))
+
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			c.(*dstConn).Conn.(*dstWireEnd).timedOut.Store(true) // the retransmit horizon fired
+			c.Close()
+			timedOutHeld = dstTimeWaitHeld(host, me, 33000)
+
+			d = Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33001}}
+			c2, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			c2.(*dstConn).resetConn() // the conn was reset before the user's Close
+			c2.Close()
+			resetHeld = dstTimeWaitHeld(host, me, 33001)
+		})
+	})
+	if timedOutHeld {
+		t.Errorf("a retransmit-exhaustion-dead end held its tuple at Close, want no hold (production goes to CLOSED)")
+	}
+	if resetHeld {
+		t.Errorf("an already-reset end held its tuple at Close, want no hold (RST skips TIME_WAIT)")
+	}
+}
+
 // TestDSTNetRelistenWithAcceptedConns: accepted server-side ends inherit the
 // listener's SO_REUSEADDR, so a server restarted while its old connections
 // drain re-binds its port — the classic restart shape. Only DIALER ends (no
