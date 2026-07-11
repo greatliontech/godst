@@ -1,21 +1,12 @@
 # Issue docs
 
 Tracked follow-ups and **pending features**. Each entry carries a `Lands:` trigger
-(a chunk number, a condition, or "pending feature" for planned roadmap work). The
-chunk-start gate (sub-chunk `N.1`) scans this index for entries resolving to the
-current chunk; the close-out gate promotes any load-bearing rationale inline and
-deletes the resolved entry.
+(a chunk number of the active plan, a self-contained condition, or "pending
+feature" for planned roadmap work). The chunk-start gate (sub-chunk `N.1`) scans
+this index for entries resolving to the current chunk; the close-out gate
+promotes any load-bearing rationale inline and deletes the resolved entry.
 
 ## Open
-
-Full-surface DST audit (2026-07-10), severity-ordered. Every entry is folded
-into the active plan, `docs/plans/dst-audit-fixes.md`; `Lands:` names its
-chunk(s) there.
-
-| Issue | Severity | Lands |
-|---|---|---|
-
-Found during plan execution:
 
 | Issue | Severity | Lands |
 |---|---|---|
