@@ -34,4 +34,4 @@ bound where the issue's own outcome clause allows it.
 ## Simulation API surface
 
 - [x] 12. `Host`/`Process` gain the fault APIs' caller-position guard, or the declaration-caller contract is recorded (`dst-sim-topology-apis-from-nonbubble`)
-- [ ] 13. Fault-guard activation-edge TOCTOU closed, or the acceptance recorded at the guard (`dst-sim-fault-guard-runstart-toctou`)
+- [x] 13. Fault-guard activation-edge TOCTOU closed, or the acceptance recorded at the guard (`dst-sim-fault-guard-runstart-toctou`)

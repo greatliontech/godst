@@ -871,6 +871,9 @@ func TestPublicExploreGuardsBeforeTraceInit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dstExploreInit(0, 0, 0, 0)
 			panicked := false
+			// Direct store, deliberately bypassing callerGate's write side: this
+			// constructs the overlap precondition with no concurrent guarded ops
+			// in flight, so the gate's exclusion invariant is not in play.
 			runActive.Store(true)
 			func() {
 				defer func() {

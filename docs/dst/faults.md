@@ -402,7 +402,17 @@ The DECLARATION APIs (`Host`, `Process`) carry the same guard: they mutate run s
 mid-run `Host` re-declaration is a reboot (host-up relay plus clock re-establishment) and
 `Process` starts SUT goroutines — so a foreign caller during an active run panics identically,
 while pre-run and outside-run calls keep their documented behavior.
-`TestDSTTopologyFromNonBubbleGoroutinePanics`.
+`TestDSTTopologyFromNonBubbleGoroutinePanics`. The guard's decision and the guarded op are
+**atomic against the run activation/deactivation edges**: every guarded API holds a
+reader-side gate from its check through its state mutation, and the `runActive` flips take the
+writer side, so a call that passed the guard just before a run started completes as the
+documented pre-run no-op before activation proceeds — never a torn op executing into the
+newly-activated run (`TestDSTRunActivationExcludesInFlightGuardedOps`,
+`TestDSTRunDeactivationExcludesInFlightGuardedOps`). The declaration APIs hold the gate through
+their declaration mutations, not through `f`: user code inside `Host`/`Process` bodies runs
+ungated, and so does `Process`'s exit teardown at `f`'s return — a foreign pre-run `Process`
+whose `f` spans a run activation can therefore still tear into the new run at exit, a known
+open window tracked outside this contract.
 
 ### The fault model: policies at existing seams
 

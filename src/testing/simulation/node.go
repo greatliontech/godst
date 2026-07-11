@@ -414,40 +414,48 @@ func internProc(name string) uint32 {
 // fault APIs — a mid-run declaration is a reboot, and a reboot at a wall-clock
 // instant the seed does not control would silently diverge replay.
 func Host(name string, config HostConfig, f func()) {
-	requireBubbleDeclCaller("Host")
-	hid := internHost(name)
-	hostname := config.Hostname
-	if hostname == "" {
-		hostname = name
+	release := requireBubbleDeclCaller("Host")
+	var oldH, oldP uint32
+	declare := func() {
+		// Scoped so the gate covers exactly the declaration mutations —
+		// through the host-up relay — and releases on the panic path too; f
+		// below is ordinary goroutine code, run outside the gate.
+		defer release()
+		hid := internHost(name)
+		hostname := config.Hostname
+		if hostname == "" {
+			hostname = name
+		}
+		setHostIdent(hid, hostname, config.NumCPU)
+		_, curProc := dstCurrentNode()
+		oldH, oldP = dstSetNode(hid, curProc)
+		// Establish the host's configured clock (offset, and rate) in the per-host table
+		// (keyed by host id). No save/restore: the clock is read via g.dstHost, which
+		// dstSetNode already saves and restores, so after f returns the caller reads its
+		// own host's clock again; the table entry persists for hid's long-lived goroutines
+		// that outlive this call. A re-declaration (restart) re-establishes the clock
+		// COMPLETELY (docs/dst/faults.md "Clock faults", Host re-declaration): the rate is
+		// applied through the DriftClock path unconditionally — including rate 1 for a
+		// zero config — so a surviving stale rate/anchor is folded and cleared and the
+		// host's armed timers are re-mapped to the declared rate; then the offset is
+		// overwritten to the declared value, discarding prior steps and folded drift.
+		// Setting only the offset (the earlier shape) left a "restarted, in-sync" host
+		// reading ahead of base and sleeping at the old rate — self-consistent to its own
+		// probes, wrong against the base clock.
+		if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPBForHost(hid)) {
+			dstSetNode(oldH, oldP)
+			panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
+		}
+		// The declaration boots (or reboots) the machine: if it was crashed, it is
+		// reachable again — dials find its kernel (ECONNREFUSED until a listener is
+		// up, then connect), and any dial blocked blackholing on the dead machine
+		// wakes to retry. In-run only: outside a run there is no network state and
+		// Host has no effect beyond running f.
+		if runActive.Load() {
+			dstNetPartitionOp(partOpHostUp, hid, 0)
+		}
 	}
-	setHostIdent(hid, hostname, config.NumCPU)
-	_, curProc := dstCurrentNode()
-	oldH, oldP := dstSetNode(hid, curProc)
-	// Establish the host's configured clock (offset, and rate) in the per-host table
-	// (keyed by host id). No save/restore: the clock is read via g.dstHost, which
-	// dstSetNode already saves and restores, so after f returns the caller reads its
-	// own host's clock again; the table entry persists for hid's long-lived goroutines
-	// that outlive this call. A re-declaration (restart) re-establishes the clock
-	// COMPLETELY (docs/dst/faults.md "Clock faults", Host re-declaration): the rate is
-	// applied through the DriftClock path unconditionally — including rate 1 for a
-	// zero config — so a surviving stale rate/anchor is folded and cleared and the
-	// host's armed timers are re-mapped to the declared rate; then the offset is
-	// overwritten to the declared value, discarding prior steps and folded drift.
-	// Setting only the offset (the earlier shape) left a "restarted, in-sync" host
-	// reading ahead of base and sleeping at the old rate — self-consistent to its own
-	// probes, wrong against the base clock.
-	if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPBForHost(hid)) {
-		dstSetNode(oldH, oldP)
-		panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
-	}
-	// The declaration boots (or reboots) the machine: if it was crashed, it is
-	// reachable again — dials find its kernel (ECONNREFUSED until a listener is
-	// up, then connect), and any dial blocked blackholing on the dead machine
-	// wakes to retry. In-run only: outside a run there is no network state and
-	// Host has no effect beyond running f.
-	if runActive.Load() {
-		dstNetPartitionOp(partOpHostUp, hid, 0)
-	}
+	declare()
 	defer dstSetNode(oldH, oldP)
 	f()
 }
@@ -461,10 +469,20 @@ func Host(name string, config HostConfig, f func()) {
 // clock to step) — both the "fault that silently tests nothing" class the
 // victim-naming rule already panics on. Outside a run the APIs stay
 // documented no-ops.
-func requireBubbleFaultCaller(api string) {
+//
+// The guard holds callerGate's read side and returns the release; the caller
+// keeps it held through its state mutation (usually `defer ...()`), so the
+// guard's decision and the op land on one side of any runActive flip — a
+// guard that loaded false cannot have its op execute torn into a
+// newly-activated run (see callerGate). Ops that park forever release
+// explicitly BEFORE parking.
+func requireBubbleFaultCaller(api string) func() {
+	callerGate.RLock()
 	if runActive.Load() && !dstInSimBubble() {
+		callerGate.RUnlock()
 		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 	}
+	return callerGate.RUnlock
 }
 
 // requireBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
@@ -475,10 +493,19 @@ func requireBubbleFaultCaller(api string) {
 // state at a wall-clock instant the seed does not control — the same
 // silent-nondeterminism class the fault guard kills, through a declaration
 // API. Outside a run the APIs keep their documented no-run behavior.
-func requireBubbleDeclCaller(api string) {
+//
+// Like requireBubbleFaultCaller, holds callerGate's read side and returns
+// the release. The declaration APIs release after their declaration
+// mutations and BEFORE running f: holding across user code would deadlock
+// run activation against an f that legally blocks, and f is ordinary
+// goroutine code, not declaration state.
+func requireBubbleDeclCaller(api string) func() {
+	callerGate.RLock()
 	if runActive.Load() && !dstInSimBubble() {
+		callerGate.RUnlock()
 		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 	}
+	return callerGate.RUnlock
 }
 
 // lookupHost resolves an already-declared host name for a fault or inspection API,
@@ -563,8 +590,14 @@ func crashProcess(name string) {
 // leave the simulation with no driver, so the crash is refused before anything
 // is torn down. Crash is a no-op outside a run.
 func Crash(name string) {
-	requireBubbleFaultCaller("Crash")
-	crashProcess(name)
+	release := requireBubbleFaultCaller("Crash")
+	func() {
+		// Scoped so the gate is released (panic paths included) BEFORE a
+		// self-crash parks this goroutine forever — a parked reader would
+		// deadlock the run's deactivation flip.
+		defer release()
+		crashProcess(name)
+	}()
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
 	}
@@ -668,8 +701,12 @@ func crashHost(name string) {
 // run on an undeclared host name, and on a host owning the run's main goroutine
 // (see Crash); it is a no-op outside a run.
 func CrashHost(name string) {
-	requireBubbleFaultCaller("CrashHost")
-	crashHost(name)
+	release := requireBubbleFaultCaller("CrashHost")
+	func() {
+		// Scoped like Crash's: released before the self-crash park.
+		defer release()
+		crashHost(name)
+	}()
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
 	}
@@ -698,7 +735,19 @@ func CrashHost(name string) {
 // APIs — it would start SUT goroutines outside the bubble, unscheduled by the
 // seed (see Host).
 func Process(name string, f func()) {
-	requireBubbleDeclCaller("Process")
+	release := requireBubbleDeclCaller("Process")
+	// The gate covers the declaration mutations below and releases before f
+	// (ordinary goroutine code) runs; the flag keeps the panic paths covered.
+	// Registered FIRST so it runs LAST at unwind — by which point either the
+	// explicit release already ran (released=true; the park-forever defer
+	// below can then never strand a gate reader) or a declaration panic is
+	// unwinding and this releases.
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
 	host, _ := dstCurrentNode()
 	if host == 0 {
 		host = internHost(name)
@@ -787,5 +836,7 @@ func Process(name string, f func()) {
 	}()
 	dstSetPidLive(simPid, true)
 	live = true
+	released = true
+	release()
 	f()
 }

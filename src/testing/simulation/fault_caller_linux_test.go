@@ -173,6 +173,81 @@ func TestDSTForeignRuntimeGCPanics(t *testing.T) {
 	}
 }
 
+// TestDSTRunActivationExcludesInFlightGuardedOps: the run-START activation
+// edge cannot split a guarded op — a guard that loaded runActive=false holds
+// callerGate's read side through its op, and enterSimulation's flip takes the
+// write side, so activation WAITS for the in-flight op to finish and the op
+// completes wholly against pre-run state (the documented no-op). White-box:
+// hold the gate as a guarded op would, start Run concurrently, and pin that
+// activation does not happen until the hold is released. Mutation: dropping
+// the callerGate.Lock around enterSimulation's CAS lets runActive flip while
+// the read side is held, tripping the poll below.
+func TestDSTRunActivationExcludesInFlightGuardedOps(t *testing.T) {
+	for _, g := range []struct {
+		name string
+		hold func() func()
+	}{
+		{"fault-guard", func() func() { return requireBubbleFaultCaller("gate-probe") }},
+		{"decl-guard", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+	} {
+		t.Run(g.name, func(t *testing.T) {
+			release := g.hold() // no run active: passes, holds the gate
+			done := make(chan struct{})
+			go func() {
+				Run(1, func() {})
+				close(done)
+			}()
+			// Real-time poll (no run is active yet): activation must not land
+			// while the guarded op is in flight.
+			for i := 0; i < 50; i++ {
+				if runActive.Load() {
+					release()
+					<-done
+					t.Fatal("Run activated while a guarded op held callerGate")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			release()
+			<-done // and with the gate released, activation and the run complete
+		})
+	}
+}
+
+// TestDSTRunDeactivationExcludesInFlightGuardedOps: the closing edge holds
+// too — leaveSimulation's flip takes callerGate's write side, so a reader
+// held across the run's end delays deactivation until it releases (white-box:
+// the reader is taken directly, since a foreign guard call mid-run panics by
+// design). Mutation: dropping the Lock in leaveSimulation lets runActive flip
+// while the read side is held, tripping the poll.
+func TestDSTRunDeactivationExcludesInFlightGuardedOps(t *testing.T) {
+	bodyEntered := make(chan struct{})
+	gateHeld := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		Run(1, func() {
+			close(bodyEntered) // the run is active from here
+			<-gateHeld         // and its body waits until the reader is in place
+		})
+		close(done)
+	}()
+	<-bodyEntered
+	callerGate.RLock()
+	close(gateHeld)
+	for i := 0; i < 50; i++ {
+		if !runActive.Load() {
+			callerGate.RUnlock()
+			<-done
+			t.Fatal("Run deactivated while a guarded op held callerGate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	callerGate.RUnlock()
+	<-done
+	if runActive.Load() {
+		t.Fatal("run did not deactivate after the gate was released")
+	}
+}
+
 // TestDSTTopologyFromNonBubbleGoroutinePanics: the DECLARATION APIs (Host,
 // Process) carry the fault APIs' caller-position guard — they mutate run
 // state too (a mid-run Host re-declaration is a reboot: host-up relay plus

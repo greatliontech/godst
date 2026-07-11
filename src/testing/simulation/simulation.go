@@ -74,6 +74,7 @@ import (
 	"internal/race"
 	"internal/synctest"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -406,6 +407,28 @@ const (
 // async-preempt, and GOMAXPROCS are all process-wide for the duration of a run.
 var runActive atomic.Bool
 
+// callerGate orders the caller-position guards (requireBubbleFaultCaller,
+// requireBubbleDeclCaller) against the runActive flips. Every guarded API
+// holds the read side from its guard check through its state mutation;
+// enterSimulation and leaveSimulation hold the write side across the flip.
+// Mutual exclusion puts a guarded op's whole extent on one side of any flip:
+// before activation, the guard saw false and the op completed against
+// pre-run state (the documented no-op) before the run could observe it;
+// after, a foreign caller panics at the guard. The activation-edge TOCTOU —
+// guard loads false, the CAS lands, the op executes torn into the
+// newly-activated run — is unrepresentable. During a settled run the write
+// side is never taken (enterSimulation fast-paths the doomed overlap before
+// touching the gate), so bubble callers' RLock never contends and never
+// parks: no schedule perturbation. The one transient exception is a doomed
+// activation-tie loser — two activations that both loaded false — taking the
+// write side for the microseconds of its failing CAS at the flip's edge; it
+// holds no park and panics immediately. Ops that park forever (a self-crash,
+// a dead
+// enclosing invocation) release BEFORE parking, and the declaration APIs
+// release before running f, so no reader outlives its op
+// (TestDSTRunActivationExcludesInFlightGuardedOps).
+var callerGate sync.RWMutex
+
 // fips140Mode is latched at startup, mirroring crypto/internal/fips140's own
 // init-time read of the GODEBUG, so a mid-process Setenv cannot desynchronize
 // the two.
@@ -451,13 +474,27 @@ func enterSimulation(api, buildPanic string) {
 	if synctest.IsInBubble() {
 		panic("testing/simulation: " + api + " called from within a synctest bubble")
 	}
-	if !runActive.CompareAndSwap(false, true) {
+	// Fast-path the doomed mid-run overlap BEFORE touching callerGate: a
+	// pending writer would park mid-run bubble readers (writer preference) on
+	// a non-simulated sema — a schedule perturbation the overlap panic alone
+	// must not cause. Only when activation is plausible does the write side
+	// exclude in-flight guarded ops across the flip (see callerGate); the CAS
+	// under the Lock still arbitrates concurrent activation ties.
+	if runActive.Load() {
+		panic("testing/simulation: " + api + " called while another simulation operation is active")
+	}
+	callerGate.Lock()
+	ok := runActive.CompareAndSwap(false, true)
+	callerGate.Unlock()
+	if !ok {
 		panic("testing/simulation: " + api + " called while another simulation operation is active")
 	}
 }
 
 func leaveSimulation() {
+	callerGate.Lock()
 	runActive.Store(false)
+	callerGate.Unlock()
 }
 
 // Run runs f inside a deterministic simulation seeded by seed: with the same

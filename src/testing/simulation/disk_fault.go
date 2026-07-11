@@ -57,14 +57,14 @@ const (
 // that merely retries fsync after EIO therefore passes the retry and still loses
 // the data on power loss; rewriting the data first is the recovery that works.
 func FailDisk(host string) {
-	requireBubbleFaultCaller("FailDisk")
+	defer requireBubbleFaultCaller("FailDisk")()
 	dstDiskFaultOp(diskOpFailDisk, lookupHost(host), 0, "")
 }
 
 // HealDisk clears the host-wide EIO fault set by FailDisk; the host's reads, writes,
 // and fsyncs succeed again. Per-file faults set by FailFile are unaffected.
 func HealDisk(host string) {
-	requireBubbleFaultCaller("HealDisk")
+	defer requireBubbleFaultCaller("HealDisk")()
 	dstDiskFaultOp(diskOpHealDisk, lookupHost(host), 0, "")
 }
 
@@ -75,13 +75,13 @@ func HealDisk(host string) {
 // removed-but-open handle keeps failing; faulting a path that does not exist, or that
 // names a directory, is a no-op (there is no file's I/O to fail).
 func FailFile(host, path string) {
-	requireBubbleFaultCaller("FailFile")
+	defer requireBubbleFaultCaller("FailFile")()
 	dstDiskFaultOp(diskOpFailFile, lookupHost(host), 0, path)
 }
 
 // HealFile clears the per-file EIO fault set by FailFile on the named host's file.
 func HealFile(host, path string) {
-	requireBubbleFaultCaller("HealFile")
+	defer requireBubbleFaultCaller("HealFile")()
 	dstDiskFaultOp(diskOpHealFile, lookupHost(host), 0, path)
 }
 
@@ -95,7 +95,7 @@ func HealFile(host, path string) {
 // enough is freed). bytes must be >= 0. UnlimitDisk removes the cap. Call from within
 // a Run.
 func LimitDisk(host string, bytes int64) {
-	requireBubbleFaultCaller("LimitDisk")
+	defer requireBubbleFaultCaller("LimitDisk")()
 	if bytes < 0 {
 		panic("testing/simulation: LimitDisk bytes must be >= 0")
 	}
@@ -105,7 +105,7 @@ func LimitDisk(host string, bytes int64) {
 // UnlimitDisk removes the capacity set by LimitDisk on the named host's disk; writes
 // and creates stop failing with ENOSPC.
 func UnlimitDisk(host string) {
-	requireBubbleFaultCaller("UnlimitDisk")
+	defer requireBubbleFaultCaller("UnlimitDisk")()
 	dstDiskFaultOp(diskOpUnlimit, lookupHost(host), 0, "")
 }
 
@@ -122,7 +122,7 @@ func UnlimitDisk(host string) {
 // disk op) — as a real slow disk would charge each syscall. perOp of 0 removes the
 // latency. Negative perOp is invalid. Call from within a Run.
 func SlowDisk(host string, perOp time.Duration) {
-	requireBubbleFaultCaller("SlowDisk")
+	defer requireBubbleFaultCaller("SlowDisk")()
 	if perOp < 0 {
 		panic("testing/simulation: SlowDisk perOp must be >= 0")
 	}
