@@ -379,6 +379,39 @@ func dstMulDivClampCeil(x, num, den int64) int64 {
 	return hi + lo
 }
 
+// dstMulDivClampFloor is dstMulDivClampCeil rounding DOWN: ⌊x·num/den⌋,
+// clamped the same way. The overdue-timer re-anchor uses it so the anchor is
+// never EARLIER than the true boundary (a floored remainder puts the anchor
+// at or after the boundary, keeping every re-armed fire never-early — the
+// same direction the forward remap's ceil protects).
+func dstMulDivClampFloor(x, num, den int64) int64 {
+	if x <= 0 {
+		return 0
+	}
+	q := x / den
+	r := x % den
+	if q > maxWhen/num {
+		return maxWhen // q·num alone would overflow
+	}
+	hi := q * num
+	lo := r * num / den // < num, since r < den
+	if hi > maxWhen-lo {
+		return maxWhen // hi + lo would overflow
+	}
+	return hi + lo
+}
+
+// dstDriftRemapFloor is dstDriftRemap rounding down (see dstMulDivClampFloor
+// for why the overdue re-anchor floors). Linknamed for testing.
+//
+//go:linkname dstDriftRemapFloor
+func dstDriftRemapFloor(x, ppbOld, ppbNew int64) int64 {
+	if x <= 0 || ppbOld == ppbNew {
+		return x
+	}
+	return dstMulDivClampFloor(x, dstDriftPPBBase+ppbOld, dstDriftPPBBase+ppbNew)
+}
+
 // dstDriftToBase converts a host-perceived duration d (ns) to the base-time duration it
 // occupies on a clock with rate departure ppb: ⌈d·1e9/(1e9+ppb)⌉ = ⌈d/rate⌉ (ceil — the
 // rounding contract above). The divisor 1e9 + ppb is > 0 for ppb > -1e9. Linknamed for
@@ -647,12 +680,8 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 			// or overdue has its period reused by the next re-arm, so an
 			// unconverted period would keep it firing at the old rate for the
 			// rest of the run. An exactly-due when needs no move — firing
-			// "now" is correct under any rate. (An overdue when — reachable
-			// for a never-heaped channel timer — is left unconverted here
-			// even though the re-arm catch-up divides the mixed-regime delay
-			// by the new-rate period, leaving a bounded one-shot phase
-			// divergence: converting it backwards risks the when <= 0
-			// "not running" sentinel.)
+			// "now" is correct under any rate.
+			oldPeriod := t.period
 			t.period = dstDriftRemap(t.period, ppbOld, ppbNew)
 			if t.when > now {
 				rem := dstDriftRemap(t.when-now, ppbOld, ppbNew)
@@ -671,6 +700,60 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 						t.ts.updateMinWhenModified(when)
 					}
 				}
+			} else if t.when > 0 && t.when < now {
+				// OVERDUE — reachable for a never-heaped channel timer, which
+				// fires lazily on the next receive: the remap formula's
+				// negative remainder. RE-ANCHOR at the last host-period
+				// boundary before the change: the periodic remainder is
+				// computed in the OLD regime ((now−when) mod the pre-remap
+				// period, where host scaling cancels, so the boundary index
+				// is exact) and floor-remapped into the new (a floored
+				// remainder can only move the anchor LATER than the true
+				// boundary, keeping every re-armed fire never-early; late by
+				// under a nanosecond per rounding step, the forward remap's
+				// contract mirrored). The re-arm catch-up
+				// (next = when + period·(1+delay/period), time.go) then
+				// counts whole new-regime periods from a boundary-aligned
+				// anchor. Anchoring on the raw overdue span instead
+				// double-rounds — ceil'd span vs ceil'd period — and an
+				// exact-multiple overdue span undercounts the catch-up index,
+				// duplicating a boundary's tick almost a full period early in
+				// host time. A one-shot (period 0) keeps the full span: only
+				// "still overdue" matters, it never re-arms.
+				//
+				// The when == 0 "not running" sentinel is skipped (converting
+				// it would resurrect a stopped timer), and the result is
+				// clamped above it: an extreme slowdown can remap the
+				// remainder past the whole base epoch, and a when of exactly
+				// 0 reads as that sentinel on the lazy-fire path, wedging the
+				// receive into a manufactured bubble deadlock. The clamp
+				// costs a one-shot phase error anchored at base 1, in a
+				// regime where the host clock has effectively stopped. An
+				// overdue timer is never heaped under bubble time (the heap
+				// runs due timers as time advances), so no heap re-marking is
+				// needed.
+				if oldPeriod > 0 {
+					rem := (now - t.when) % oldPeriod
+					rem = dstDriftRemapFloor(rem, ppbOld, ppbNew)
+					when := now - rem
+					if when < 1 {
+						when = 1
+					}
+					// The delivered timestamp must keep the ORIGINAL due
+					// time (sendTime derives it from the fire-time delay,
+					// now − when): the re-anchor moves when TOWARD now (the
+					// last pre-change boundary is later than the original
+					// due instant), shrinking that delay, so the move
+					// (new − old, positive) is recorded and added back to
+					// the delay at fire (unlockAndRun); only the re-arm
+					// catch-up sees the converted anchor. Accumulates across
+					// successive rate changes before the fire.
+					t.dstWhenShift += when - t.when
+					t.when = when
+				}
+				// A one-shot (period 0) is left untouched: it never re-arms,
+				// only "still overdue" matters for its lazy fire, and an
+				// unconverted when keeps its delivered timestamp exact.
 			}
 		}
 		t.unlock()

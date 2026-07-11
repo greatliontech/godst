@@ -13,7 +13,7 @@ bound where the issue's own outcome clause allows it.
 
 ## Runtime — simulated clock
 
-- [ ] 4. Overdue-timer backwards remap honors the spec formula's negative remainder, sentinel-safe (`dst-clock-overdue-ticker-phase`)
+- [x] 4. Overdue-timer backwards remap honors the spec formula's negative remainder, sentinel-safe (`dst-clock-overdue-ticker-phase`)
 
 ## Runtime — exploration
 

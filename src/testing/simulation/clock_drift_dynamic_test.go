@@ -188,6 +188,247 @@ func TestDSTClockDriftClockDueTicker(t *testing.T) {
 	}
 }
 
+// TestDSTClockDriftClockOverdueTicker: a ticker OVERDUE at the DriftClock
+// instant (its channel timer is never heaped while no receiver blocks, so it
+// sits due-unfired) re-arms on host-period boundaries: the conversion
+// re-anchors at the last host-period boundary before the change (the
+// old-regime remainder, floor-remapped), so the catch-up counts whole
+// new-regime periods from a boundary-aligned anchor, never early and at most
+// nanoseconds late. NewTicker(100ms) with ticks due at host 100/200/...;
+// rate change mid-overdue; consume the overdue tick; the gap to the next
+// tick is the base span to the next HOST boundary. The mixed-regime catch-up
+// this replaces gave 50ms at the speedup2x arm (want 25ms) and 150ms at
+// slowdownHalf (want 100ms); raw-span anchoring (no remainder) gave 1ns at
+// nondividingExactMultiple (want one full new-regime period).
+func TestDSTClockDriftClockOverdueTicker(t *testing.T) {
+	for _, r := range []struct {
+		name  string
+		ppb   int64
+		sleep time.Duration
+		want  time.Duration
+	}{
+		// 350ms sleep: overdue 2.5 periods, remainder 50ms host.
+		{"speedup2x", 1_000_000_000, 350 * time.Millisecond, 25 * time.Millisecond},
+		{"slowdownHalf", -500_000_000, 350 * time.Millisecond, 100 * time.Millisecond},
+		// Non-dividing rate ~4/3 (ppb 333333333): period' =
+		// ceil(75000000.01875) = 75000001ns.
+		// 300ms sleep: overdue EXACTLY 2 periods (remainder 0) — the shape
+		// where anchoring on the raw ceil'd span undercounts the catch-up
+		// index and duplicates a boundary's tick 1ns after the consumed one.
+		{"nondividingExactMultiple", 333_333_333, 300 * time.Millisecond, 75000001 * time.Nanosecond},
+		// 350ms sleep at rate 4/3: remainder 50ms host, floor(37500000.009375)
+		// anchors 37500000ns before the change; the next boundary lands 1ns
+		// late of the true 37500000.009 — never early.
+		{"nondividingRemainder", 333_333_333, 350 * time.Millisecond, 37500001 * time.Nanosecond},
+	} {
+		t.Run(r.name, func(t *testing.T) {
+			var gap time.Duration
+			Run(1, func() {
+				tick1 := make(chan struct{})
+				tick2 := make(chan struct{})
+				Host("h", HostConfig{}, func() {
+					go func() {
+						tk := time.NewTicker(100 * time.Millisecond)
+						defer tk.Stop()
+						time.Sleep(r.sleep) // overdue, possibly by multiple periods
+						DriftClock("h", r.ppb)
+						<-tk.C // the overdue tick, delivered lazily at the receive
+						close(tick1)
+						<-tk.C // re-armed after the rate change
+						close(tick2)
+					}()
+				})
+				<-tick1
+				start := time.Now() // root base clock
+				<-tick2
+				gap = time.Since(start)
+			})
+			if gap != r.want {
+				t.Fatalf("overdue ticker re-armed off the host-period boundary: next tick after %v base, want %v", gap, r.want)
+			}
+		})
+	}
+}
+
+// TestDSTClockDriftClockOverdueRemapZeroClamp: the backwards conversion is
+// clamped ABOVE the when == 0 "not running" sentinel. The inputs here land
+// the unclamped conversion on zero exactly — bubble epoch E = 946684800e9 is
+// divisible by 1e9; with period P = 2·999999999 − 946684800 ns and sleep 2s
+// the ticker is overdue by S−P = 946684802 ns, LESS than one period, so the
+// old-regime remainder is the whole span, and at rate 1e-9 (ppb −999999999,
+// remap ratio 1e9) the floored remap is exact:
+// when' = (E+2s) − 946684802·1e9 = 0 — which the lazy-fire path reads as a
+// stopped timer: the receive blocks forever and the run dies as a
+// manufactured bubble deadlock. Clamped to 1, the overdue tick is delivered.
+func TestDSTClockDriftClockOverdueRemapZeroClamp(t *testing.T) {
+	const period = 2*999999999 - 946684800 // ns; see comment
+	delivered := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("run died instead of delivering the overdue tick (unclamped when' hit the sentinel): %v", r)
+			}
+		}()
+		Run(1, func() {
+			done := make(chan struct{})
+			Host("h", HostConfig{}, func() {
+				go func() {
+					tk := time.NewTicker(period * time.Nanosecond)
+					defer tk.Stop()
+					time.Sleep(2 * time.Second)
+					DriftClock("h", -999_999_999)
+					<-tk.C
+					close(done)
+				}()
+			})
+			<-done
+			delivered = true
+		})
+	}()
+	if !delivered {
+		t.Fatal("overdue tick was not delivered")
+	}
+}
+
+// TestDSTClockDriftClockOverdueDeliveredTimestamp: the timestamp an overdue
+// timer or tick DELIVERS across a rate change keeps its original due time —
+// sendTime derives the value from the fire-time delay, and the overdue
+// conversion's re-anchoring is discounted there (a one-shot's when is not
+// converted at all; a ticker's accumulated shift is added back to the
+// delivery delay while the re-arm catch-up keeps the converted anchor). On a
+// host at rate 1 before the change, both must read exactly start+100ms, as
+// they do without any rate change.
+func TestDSTClockDriftClockOverdueDeliveredTimestamp(t *testing.T) {
+	for _, r := range []struct {
+		name string
+		make func() <-chan time.Time
+	}{
+		{"one-shot", func() <-chan time.Time { return time.NewTimer(100 * time.Millisecond).C }},
+		{"ticker", func() <-chan time.Time {
+			tk := time.NewTicker(100 * time.Millisecond)
+			return tk.C
+		}},
+	} {
+		t.Run(r.name, func(t *testing.T) {
+			var got, want time.Time
+			Run(1, func() {
+				done := make(chan struct{})
+				Host("h", HostConfig{}, func() {
+					go func() {
+						defer close(done)
+						start := time.Now()
+						want = start.Add(100 * time.Millisecond) // the original due instant
+						c := r.make()
+						time.Sleep(350 * time.Millisecond) // overdue by 250ms
+						DriftClock("h", 1_000_000_000)
+						got = <-c
+					}()
+				})
+				<-done
+			})
+			if !got.Equal(want) {
+				t.Fatalf("overdue %s across DriftClock delivered %v, want the original due time %v (Δ %v)",
+					r.name, got, want, got.Sub(want))
+			}
+		})
+	}
+}
+
+// TestDSTClockDriftClockOverdueTwoChanges: two rate changes while the same
+// tick is overdue compose — the conversion shifts telescope, so the
+// delivered timestamp still reads the original due time, and the re-arm
+// still lands on the next HOST period boundary (armed at host 0 with period
+// 100ms host, the boundary after host 380 is host 400 — 20ms host away,
+// measured on the drifted host itself).
+func TestDSTClockDriftClockOverdueTwoChanges(t *testing.T) {
+	var got, want time.Time
+	var gap time.Duration
+	Run(1, func() {
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				defer close(done)
+				start := time.Now()
+				want = start.Add(100 * time.Millisecond)
+				tk := time.NewTicker(100 * time.Millisecond)
+				defer tk.Stop()
+				time.Sleep(350 * time.Millisecond) // overdue 250ms host
+				DriftClock("h", 1_000_000_000)     // rate 2
+				time.Sleep(30 * time.Millisecond)  // host 380: same tick still overdue
+				DriftClock("h", -500_000_000)      // rate ½
+				got = <-tk.C
+				t0 := time.Now()
+				<-tk.C
+				gap = time.Since(t0)
+			}()
+		})
+		<-done
+	})
+	if !got.Equal(want) {
+		t.Fatalf("overdue tick across two rate changes delivered %v, want %v (Δ %v)", got, want, got.Sub(want))
+	}
+	if wantGap := 20 * time.Millisecond; gap != wantGap {
+		t.Fatalf("re-arm after two rate changes missed the host boundary: next tick %v host later, want %v", gap, wantGap)
+	}
+}
+
+// TestDSTClockDriftClockStoppedTickerStaysStopped: the backwards conversion
+// skips the when == 0 "not running" sentinel — converting it would turn a
+// STOPPED ticker's sentinel into a positive overdue when and resurrect it
+// with a spurious tick on the next receive.
+func TestDSTClockDriftClockStoppedTickerStaysStopped(t *testing.T) {
+	resurrected := false
+	Run(1, func() {
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				defer close(done)
+				tk := time.NewTicker(100 * time.Millisecond)
+				time.Sleep(350 * time.Millisecond) // overdue, then stopped
+				tk.Stop()
+				DriftClock("h", 1_000_000_000)
+				select {
+				case <-tk.C:
+					resurrected = true
+				case <-time.After(500 * time.Millisecond):
+				}
+			}()
+		})
+		<-done
+	})
+	if resurrected {
+		t.Fatal("DriftClock resurrected a stopped ticker (the when == 0 sentinel was converted)")
+	}
+}
+
+// TestDSTClockDriftClockOverdueExtremeSlowdown: an overdue ticker crossing
+// an extreme slowdown (rate 1e-9) still delivers its tick — the conversion
+// stays inside representable time and the lazy-fire path keeps working.
+// (The when == 0 sentinel clamp is pinned by RemapZeroClamp, whose inputs
+// land on zero exactly; a merely NEGATIVE unclamped when would fire lazily
+// anyway, so this arm alone cannot see the clamp.)
+func TestDSTClockDriftClockOverdueExtremeSlowdown(t *testing.T) {
+	completed := false
+	Run(1, func() {
+		done := make(chan struct{})
+		Host("h", HostConfig{}, func() {
+			go func() {
+				tk := time.NewTicker(100 * time.Millisecond)
+				defer tk.Stop()
+				time.Sleep(1100 * time.Millisecond) // overdue span > base epoch at rate 1e-9
+				DriftClock("h", -999_999_999)
+				<-tk.C // must not read the clamped when as "not running"
+				close(done)
+			}()
+		})
+		<-done
+		completed = true
+	})
+	if !completed {
+		t.Fatal("overdue tick was not delivered after an extreme slowdown")
+	}
+}
+
 func TestDSTClockDriftClockResync(t *testing.T) {
 	var afterResync time.Duration
 	Run(1, func() {

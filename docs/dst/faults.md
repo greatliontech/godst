@@ -689,10 +689,29 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   wall reading itself (bubble durations are wall-based), and the "rate-aware deadline conversion at the
   synctest wake" as arm-time conversion. A **mid-run change** re-anchors the wall so it stays continuous
   (folds drift-so-far into `offset`, resets the anchor) and re-maps every *armed* timer of the host
-  (`when' = T + (when−T)·r_old/r_new`); a periodic timer's **period is converted for every armed
-  timer**, including one due exactly at the change instant (its `when` needs no move — firing "now"
-  is correct under any rate — but the next re-arm reuses the period, which must already be at the
-  new rate; `TestDSTClockDriftClockDueTicker`). Because a channel timer is heaped only while a goroutine is blocked on
+  (`when' = T + (when−T)·r_old/r_new` — including the formula's NEGATIVE remainder: an OVERDUE
+  timer, reachable for a never-heaped channel timer that fires lazily, RE-ANCHORS at the last
+  host-period boundary before the change — `when' = T − remapFloor((T−when) mod period_old)`, the
+  remainder taken in the old regime where host scaling cancels so the boundary index is exact, and
+  floor-remapped so the anchor never lands earlier than the true boundary — and the re-arm catch-up
+  then counts whole new-regime periods from a boundary-aligned anchor: never early in
+  host-perceived time, late by at most a nanosecond per rounding step (the forward remap's
+  contract, mirrored; anchoring on the raw ceil'd span instead double-rounds against the ceil'd
+  period, and an exact-multiple overdue span undercounts the catch-up index, duplicating a
+  boundary's tick almost a full period early). The DELIVERED timestamp is unchanged by the conversion: a
+  lazily-fired timer's value is derived from its fire-time delay, so a one-shot's `when` is not
+  converted at all (it never re-arms) and a periodic timer's conversion move is recorded on the
+  timer and added back to the delivery delay — an overdue tick or timer crossing a rate change
+  reports the same due time it would have reported without the change
+  (`TestDSTClockDriftClockOverdueDeliveredTimestamp`). The conversion skips the `when == 0` "not running"
+  sentinel and clamps its result above it — an extreme slowdown can remap the remainder past the
+  whole base epoch, and the sentinel value would wedge the lazy fire;
+  `TestDSTClockDriftClockOverdueTicker` (dividing and non-dividing rates, exact-multiple and
+  fractional overdue spans), `TestDSTClockDriftClockOverdueRemapZeroClamp`,
+  `TestDSTClockDriftClockOverdueExtremeSlowdown`, `TestDSTClockDriftClockStoppedTickerStaysStopped`); a periodic timer's **period is converted for
+  every armed timer**, including one due exactly at the change instant (its `when` needs no move —
+  firing "now" is correct under any rate — but the next re-arm reuses the period, which must
+  already be at the new rate; `TestDSTClockDriftClockDueTicker`). Because a channel timer is heaped only while a goroutine is blocked on
   it, the re-map enumerates a per-run list of armed fake timers (`runtime.dstFakeTimers`), not just the heap,
   so a held `NewTimer`/`NewTicker` or a ticker between ticks is re-mapped too; the re-map is in place under the
   timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). **Host

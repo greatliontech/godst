@@ -911,7 +911,8 @@ simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's
 finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
 pattern and were objdump-verified at the change. The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
 thirteen per-goroutine DST words (the six identity/RNG stamps and the seven race-access staging
-fields), `p` carries the run-queue overflow flag, `synctestBubble` carries the GC-drain
+fields), `p` carries the run-queue overflow flag, `timer` carries four fake-timer words (arming
+host, registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
 bookkeeping, `specialfinalizer` carries epoch+seq, `specialCleanup` carries epoch, and
 `finalizer`/`cleanupFn` each carry one registration-sequence word (so untagged builds fit slightly
 fewer entries per block). Restoring the untagged layouts would fork per-tag variants of the runtime's central `g`

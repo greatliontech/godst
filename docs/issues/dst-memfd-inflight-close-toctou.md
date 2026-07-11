@@ -18,6 +18,17 @@ only; the closing M is already mid-flight. Bound: needs a µs-scale syscall to
 straddle a sysmon tick plus an exact number collision, and the triggering
 retake is wall-clock scheduling the design already tolerates for syscalls.
 
+Observed in the wild (2026-07-11, chunk-4 battery): DSTMemfdFDIsolation — the
+daemonize close-sweep prog — died ~1-in-8 runs with "epollwait on fd 4 failed
+with 9 / fatal error: runtime: netpoll failed" from the teardown quiescence
+drain's GC (startTheWorldWithSema → netpoll): the netpoll epoll fd is
+created lazily, and here it was assigned a number an in-flight swept close
+(dispatched for its authentic EBADF while the number was free) was already
+mid-kernel for — the straddle killed the RUNTIME'S OWN epoll fd. The
+window's victims are not limited to page-cache memfds — any host fd created
+during the straddle is exposed; the fix must close the window for the whole
+host-fd space, not re-home memfds alone.
+
 ## Required outcome
 
 A host close dispatched before a memfd's number was assigned cannot destroy
