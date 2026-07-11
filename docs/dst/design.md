@@ -434,11 +434,19 @@ holds, `SO_REUSEADDR` over TIME_WAIT (`TestDSTNetListenerBindsOverTimeWait`), an
 consult the bind probe, so a live listener keeps accepting on a port whose dead conns are still
 held. No hold for the ends production sends to CLOSED directly: the RST shapes (unread-inbound
 close `TestDSTNetRSTCloseSkipsTimeWait`, resets, retransmit-exhaustion deaths) and the PASSIVE
-closer (`TestDSTNetPassiveCloseSkipsTimeWait`). The peer's close INSTANT, not its FIN's
-delivery, decides active vs passive — the same collapse the close-vs-arrival RST arm records.
-The first closer always holds; two closes that interleave before either transport closes BOTH
-hold — production's simultaneous-close shape, where each end sent its FIN before receiving the
-peer's and both enter TIME_WAIT. `:0` listeners receive deterministic nonzero ports, wrapping within
+closer (`TestDSTNetPassiveCloseSkipsTimeWait`). The reset exemption carries the crash fault's
+recorded RST collapse with it: a crashed PROCESS's conns reset, so their tuples hold nothing,
+where a production `kill -9` has the kernel FIN clean sockets into TIME_WAIT — the same
+already-recorded collapse, observed here through the bind probe. A HOST crash purges the
+host's holds outright — TIME_WAIT is kernel socket-table state and dies with power, so a
+rebooted host re-binds immediately (`TestDSTNetHostCrashClearsTimeWait`); a process crash
+leaves the kernel and its holds alive. The peer's close INSTANT, not its FIN's delivery,
+decides active vs passive — the same collapse the close-vs-arrival RST arm records. The first
+closer always holds; two closes that interleave before either transport closes BOTH hold —
+production's simultaneous-close shape, where each end sent its FIN before receiving the peer's
+and both enter TIME_WAIT (`TestDSTNetSimultaneousCloseBothHold` pins the window's discriminant:
+a peer mid-Close — committed but transport still open — does not demote our close to
+passive). `:0` listeners receive deterministic nonzero ports, wrapping within
 [10000, 65535] and reclaiming closed ports on the next pass — a long-lived run listens and closes
 indefinitely (`TestDSTNetListenPortAllocatorWrapsAndReclaims`), and a fully live range fails
 `EADDRINUSE`, bind(2)'s exhaustion identity, carrying the requested address
@@ -900,7 +908,9 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   so it owns no real fd to legitimately close: every bubble close of a real number is the
   daemonize-sweep shape, and `EBADF` is exactly what production gives that sweep. The
   knowingly-accepted divergence: a bubble close of an *inherited* pre-run handle (real stdio and
-  the like) reports `EBADF` where production reports success, and the handle stays open — a
+  the like) reports `EBADF` where production reports success, and the handle stays open — so a
+  non-bubble peer waiting on that handle's closure (an EOF on a harness pipe whose write end the
+  bubble "closed") waits forever, and a write-then-close integrity idiom sees the `EBADF` — a
   host-table mutation the bubble is not allowed to make, in exchange for closing the
   creation-race window (`TestDSTHostFDCloseRefused`). Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
   `CLOCK_BOOTTIME` is also selected and split-safe — at the 32-bit-time trap on every arch AND the

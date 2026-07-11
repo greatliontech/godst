@@ -753,6 +753,18 @@ func TestDSTGCSysstackAlloc(t *testing.T) {
 	}
 }
 
+// TestDSTPooledGBytesExact: the pooled-g cancellation constant equals what a
+// fresh g's allocation actually charges heapMarked (size-class elemsize,
+// malloc header included past MinSizeForMallocHeader) — the exactness the
+// warm/cold cancellation contract requires, pinned arithmetically because
+// the totals-equality tests move only when a GC crossing happens to land
+// inside the 8-byte-per-g band.
+func TestDSTPooledGBytesExact(t *testing.T) {
+	if got, want := runtime.DstFreshGHeapBytes(), runtime.DstFreshGHeapBytesWant(); got != want {
+		t.Fatalf("dstPooledGBytes arithmetic = %d, want %d (a fresh g charges heapMarked its full elemsize)", got, want)
+	}
+}
+
 // TestDSTMemfdFDIsolation: the harness's page-cache memfds are invisible in
 // the simulated fd namespace — a bubble goroutine gets exactly EBADF for
 // them on every fenced surface (named wrappers via Syscall, Pread via

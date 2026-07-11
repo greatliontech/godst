@@ -407,7 +407,10 @@ while pre-run and outside-run calls keep their documented behavior.
 reader-side gate from its check through its state mutation, and the `runActive` flips take the
 writer side, so a call that passed the guard just before a run started completes as the
 documented pre-run no-op before activation proceeds — never a torn op executing into the
-newly-activated run (`TestDSTRunActivationExcludesInFlightGuardedOps`,
+newly-activated run. (One transient exception to the writer side's mid-run absence: a doomed
+activation-tie loser — a second Run racing the winner, both loading inactive — holds the writer
+for its failing arbitration at the flip's edge; a bubble caller landing in exactly that window
+parks briefly at wall-clock timing, a perturbation confined to the winner's first instants.) (`TestDSTRunActivationExcludesInFlightGuardedOps`,
 `TestDSTRunDeactivationExcludesInFlightGuardedOps`). The declaration APIs hold the gate through
 their declaration mutations, not through `f`: user code inside `Host`/`Process` bodies runs
 ungated, and so does `Process`'s exit teardown at `f`'s return — a foreign pre-run `Process`

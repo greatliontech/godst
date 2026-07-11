@@ -423,10 +423,15 @@ var runActive atomic.Bool
 // activation-tie loser — two activations that both loaded false — taking the
 // write side for the microseconds of its failing CAS at the flip's edge; it
 // holds no park and panics immediately. Ops that park forever (a self-crash,
-// a dead
-// enclosing invocation) release BEFORE parking, and the declaration APIs
-// release before running f, so no reader outlives its op
-// (TestDSTRunActivationExcludesInFlightGuardedOps).
+// a dead enclosing invocation) release BEFORE parking, and the declaration
+// APIs release before running f, so no reader outlives its op
+// (TestDSTRunActivationExcludesInFlightGuardedOps). One property is NOT yet
+// held and is tracked as an open issue: a guarded extent parks at
+// procTeardownMu, and a goroutine killed while parked there (its own
+// process crashed by a sibling fault, or a mapping-fault crash from the
+// signal path) never resumes — its release strands and the deactivation
+// flip hangs. Until that closes, a new park point inside a guarded extent
+// only widens the window.
 var callerGate sync.RWMutex
 
 // fips140Mode is latched at startup, mirroring crypto/internal/fips140's own

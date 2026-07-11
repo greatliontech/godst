@@ -213,7 +213,7 @@ func dstActivate(seed uint64) {
 	// nil cache (a nil would wrongly COUNT a g/sudog/_defer alloc).
 	dstPooledAlloc.Store(0)
 	dstPooledMarked.Store(0)
-	dstPooledGBytes = uint64(roundupsize(abi.TypeFor[g]().Size_, false))
+	dstPooledGBytes = dstFreshGHeapBytes()
 	dstInternalPooledTypes.g = abi.TypeFor[g]()
 	dstInternalPooledTypes.sudog = abi.TypeFor[sudog]()
 	dstInternalPooledTypes.defr = abi.TypeFor[_defer]()
@@ -1000,15 +1000,34 @@ var dstHeapAlloc atomic.Uint64
 // term cancels exactly.
 var dstPooledAlloc atomic.Uint64
 
-// dstPooledGBytes is the size-class-rounded size of the g struct — the exact
-// bytes a fresh g contributes to heapMarked while sizeof(g) stays at or
-// under MinSizeForMallocHeader (512): past it, roundupsize returns the user
-// size (it subtracts the malloc header back out) while heapMarked counts
-// full elemsize, an 8-byte-per-g undercount. Not silent: the mismatch times
-// the goroutine phase's fresh-g count splits TestDSTGCSysstackAlloc's
-// asserted totals. Set at activation; added to dstPooledAlloc per allgadd
-// of a bubble-attributed g.
+// dstPooledGBytes is the exact bytes a fresh g contributes to heapMarked:
+// the full span elemsize of its allocation. sizeof(g) has outgrown
+// MinSizeForMallocHeader (512), so a fresh g is header-allocated and
+// roundupsize alone returns the USER size — it subtracts the malloc header
+// back out — while heapMarked counts the full elemsize: an 8-byte-per-g
+// undercount, and a SILENT one (the asserted totals of
+// TestDSTGCSysstackAlloc move only when a GC crossing lands inside the
+// band, which the pinned shape's does not). dstFreshGHeapBytes restores
+// exactness in both size regimes; TestDSTPooledGBytesExact pins it against
+// the malloc arithmetic directly. Set at activation; added to
+// dstPooledAlloc per allgadd of a bubble-attributed g.
 var dstPooledGBytes uint64
+
+// dstFreshGHeapBytes computes what one fresh g's allocation adds to
+// heapMarked: size-class elemsize, malloc header included when the size is
+// past MinSizeForMallocHeader (g is scannable, so the header regime applies
+// exactly when roundupsize's !noscan branch does). Valid through the
+// small-object bound (maxSmallSize - mallocHeaderSize); a g grown past 32KB
+// would take malloc's large path (no inline header) and fail the
+// TestDSTPooledGBytesExact pin loudly rather than drift silently.
+func dstFreshGHeapBytes() uint64 {
+	gsize := abi.TypeFor[g]().Size_
+	rounded := uint64(roundupsize(gsize, false))
+	if gsize > minSizeForMallocHeader {
+		rounded += mallocHeaderSize
+	}
+	return rounded
+}
 
 // dstPooledMarked is dstPooledAlloc snapshotted at each mark termination
 // (resetLive), i.e. the pooled bytes contained in the current heapMarked.

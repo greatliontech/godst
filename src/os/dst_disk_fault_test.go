@@ -720,6 +720,44 @@ func TestDSTDiskOSyncZeroWriteDoesNotCommit(t *testing.T) {
 	})
 }
 
+// TestDSTDiskOSyncRefusedWriteDoesNotCommit: an O_SYNC write the ENOSPC cap
+// FULLY refused (n == 0, err != nil) commits nothing — the third arm of the
+// n > 0 rule beside the zero-length arm above and the partial arm
+// (TestDSTDiskENOSPCSyncPartialDurable): pending unsynced bytes must not
+// ride a refused write into the durable image. Same direct durable-image
+// assertion as the zero-length arm, for the same seed-independence reason.
+func TestDSTDiskOSyncRefusedWriteDoesNotCommit(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			_, err = f.Write([]byte("unsynced"))
+			mustOK(t, "write unsynced", err)
+			f.Close()
+			// Cap the disk at current usage: any growing write is fully
+			// refused with ENOSPC.
+			simulation.LimitDisk("h", 8)
+			sf, err := os.OpenFile("/f", os.O_RDWR|os.O_APPEND|os.O_SYNC, 0)
+			mustOK(t, "OpenFile O_SYNC", err)
+			n, err := sf.Write([]byte("more"))
+			if n != 0 || err == nil {
+				t.Fatalf("growing O_SYNC write on a full disk = %d, %v; want 0, ENOSPC", n, err)
+			}
+			sf.Close()
+			cur, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState(/f): not found")
+			}
+			if cur != "unsynced" {
+				t.Fatalf("current content = %q, want \"unsynced\" (the refused write must not land)", cur)
+			}
+			if synced != "" {
+				t.Fatalf("durable image = %q, want \"\" (a fully-refused O_SYNC write must not commit the pending bytes)", synced)
+			}
+		})
+	})
+}
+
 // TestDSTDiskENOSPCCapBelowUsage: a cap set below current usage puts the disk over
 // quota — growth and creates fail, but in-place overwrites still work, and freeing
 // below the cap re-enables writes.

@@ -442,6 +442,105 @@ func TestDSTNetTimeWaitDeadEndsHoldNothing(t *testing.T) {
 	}
 }
 
+// TestDSTNetHostCrashClearsTimeWait: TIME_WAIT is kernel socket-table state,
+// lost with power — a host crash purges the host's holds, so a rebooted
+// host re-binds a tuple its pre-crash kernel held, exactly as a real reboot
+// does. (A process crash leaves the kernel and its holds alive — the
+// dead-ends test covers that side's reset shape.)
+func TestDSTNetHostCrashClearsTimeWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var heldErr, rebootErr error
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		held := make(chan struct{})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			go simulation.Process("app", func() {
+				me := ParseIP(simulation.HostIP("cli"))
+				d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+				c, err := d.Dial("tcp", target)
+				if err != nil {
+					panic(err)
+				}
+				c.Close()                          // active close: cli:33000 enters TIME_WAIT
+				_, heldErr = d.Dial("tcp", target) // still held: EADDRINUSE
+				close(held)
+			})
+		})
+		<-held
+		simulation.CrashHost("cli") // power loss: the kernel's TIME_WAIT table dies with it
+		rebootDone := make(chan struct{})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			go simulation.Process("app", func() {
+				me := ParseIP(simulation.HostIP("cli"))
+				d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+				c, err := d.Dial("tcp", target)
+				rebootErr = err
+				if err == nil {
+					c.Close()
+				}
+				close(rebootDone)
+			})
+		})
+		<-rebootDone // before the deferred target cleanup closes the listener
+	})
+	if !errors.Is(heldErr, syscall.EADDRINUSE) {
+		t.Errorf("pre-crash re-dial of the held tuple = %v, want EADDRINUSE", heldErr)
+	}
+	if rebootErr != nil {
+		t.Errorf("post-reboot dial of the tuple = %v, want success (a rebooted kernel holds no TIME_WAIT)", rebootErr)
+	}
+}
+
+// TestDSTNetSimultaneousCloseBothHold: the close INSTANT decides active vs
+// passive, so an end whose peer is MID-Close — closed flag set, transport
+// not yet closed, the simultaneous-close window — still holds: the decision
+// reads the peer's transport (remoteDone), never its bookkeeping flag.
+// White-box: the mid-Close peer state is constructed directly.
+func TestDSTNetSimultaneousCloseBothHold(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var held bool
+	simulation.Run(1, func() {
+		target, cleanup := dstBindTestTarget()
+		defer cleanup()
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			host, _ := dstNetCurrentNode()
+			me := ParseIP(simulation.HostIP("cli"))
+			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
+			c, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			// Put the PEER (the backlog server end) mid-Close: its
+			// user-facing closed flag is set, but its transport has not
+			// closed (our remoteDone stays open). Our close is then the
+			// simultaneous-close window — both ends committed to closing
+			// before either transport closed — and must hold.
+			var peer *dstConn
+			dstConns.mu.Lock()
+			for pc := range dstConns.set {
+				if pc != c.(*dstConn) && pc.remoteHost == host {
+					peer = pc
+				}
+			}
+			dstConns.mu.Unlock()
+			if peer == nil {
+				panic("server end not found in the conn registry")
+			}
+			peer.closed.Store(true)
+			c.Close()
+			held = dstTimeWaitHeld(host, me, 33000)
+		})
+	})
+	if !held {
+		t.Error("an end closing while its peer's transport is still open must hold (the first/simultaneous closer enters TIME_WAIT)")
+	}
+}
+
 // TestDSTNetRelistenWithAcceptedConns: accepted server-side ends inherit the
 // listener's SO_REUSEADDR, so a server restarted while its old connections
 // drain re-binds its port — the classic restart shape. Only DIALER ends (no

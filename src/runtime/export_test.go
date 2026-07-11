@@ -2162,3 +2162,20 @@ func CustomGOMAXPROCS() bool {
 func DstFaultRandDraw() uint64                  { return dstFaultRandUint64() }
 func DstSchedRandPeek() uint64                  { return dstSchedRand }
 func DstFaultSchedRootsDiffer(seed uint64) bool { return dstFaultRoot(seed) != dstSchedRoot(seed) }
+
+// DstFreshGHeapBytes is the pooled-g cancellation constant; DstFreshGHeapBytesWant
+// recomputes the ground truth by the malloc path's own arithmetic (header added for
+// a scannable size past MinSizeForMallocHeader, then the size-class elemsize) so a
+// regression in either regime — dropping the header add, or reverting to bare
+// roundupsize — splits the two.
+func DstFreshGHeapBytes() uint64 { return dstFreshGHeapBytes() }
+func DstFreshGHeapBytesWant() uint64 {
+	s := abi.TypeFor[g]().Size_
+	if s > minSizeForMallocHeader {
+		s += mallocHeaderSize
+	}
+	if s <= gc.SmallSizeMax-8 {
+		return uint64(gc.SizeClassToSize[gc.SizeToSizeClass8[divRoundUp(s, gc.SmallSizeDiv)]])
+	}
+	return uint64(gc.SizeClassToSize[gc.SizeToSizeClass128[divRoundUp(s-gc.SmallSizeMax, gc.LargeSizeDiv)]])
+}

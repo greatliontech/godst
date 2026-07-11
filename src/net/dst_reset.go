@@ -103,6 +103,26 @@ func dstTimeWaitPrune(now int64) {
 	dstConns.prunedLen = len(live)
 }
 
+// dstTimeWaitDropHost drops every hold on host h — the host-crash arm:
+// TIME_WAIT is kernel socket-table state, lost with power. Order-preserving
+// in place; the prune watermark is clamped so the doubling trigger stays
+// monotone against the shrunk slice.
+func dstTimeWaitDropHost(h uint32) {
+	dstConns.mu.Lock()
+	dstConnsRoll()
+	live := dstConns.timeWait[:0]
+	for _, w := range dstConns.timeWait {
+		if w.host != h {
+			live = append(live, w)
+		}
+	}
+	dstConns.timeWait = live
+	if dstConns.prunedLen > len(live) {
+		dstConns.prunedLen = len(live)
+	}
+	dstConns.mu.Unlock()
+}
+
 // dstTimeWaitHeld reports whether ip:port on host is inside a TIME_WAIT hold —
 // the bind(2)-without-SO_REUSEADDR probe of the explicit-LocalAddr dial path —
 // pruning expired entries as it scans. ip nil means any IP at the port,
@@ -252,6 +272,11 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 // seeing the reset. A conn between two other hosts has neither end on h and is
 // untouched (DST-FAULT-VICTIM).
 func dstResetHost(h uint32) {
+	// The machine lost power, so its kernel's TIME_WAIT table is gone too: a
+	// hold surviving the crash would refuse a bind the rebooted kernel
+	// allows. A process crash, by contrast, leaves the kernel (and its
+	// holds) alive — only this host-crash path purges.
+	dstTimeWaitDropHost(h)
 	dstResetMatching(func(c *dstConn) bool {
 		if c.localHost == h {
 			return true

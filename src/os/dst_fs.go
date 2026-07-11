@@ -978,7 +978,7 @@ type dstFile struct {
 	dirpos int // directory read cursor (sorted-name index)
 	rd, wr bool
 	app    bool
-	osync  bool // O_SYNC: every write commits the durable image
+	osync  bool // O_SYNC: a write that wrote (n > 0) commits the durable image
 	closed bool
 	// epoch is the run this handle belongs to, stamped at creation
 	// (dstNewFile). enter() refuses a handle from a dead run as it refuses a

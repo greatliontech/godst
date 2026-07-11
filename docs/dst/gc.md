@@ -745,7 +745,10 @@ the channel-light workloads that first validated it (both **landed**):
   activation (`dstPooledAlloc`, on either stack — `malg` allocates the `g` struct on systemstack),
   snapshots the counter at each mark termination (`dstPooledMarked`, the same STW that sets
   `heapMarked`), and subtracts the snapshot from `bubbleMarked` in both the GOGC target and the
-  `MemoryLimit` crossing: the nondeterministic cold-vs-warm term cancels exactly. What remains of the
+  `MemoryLimit` crossing: the nondeterministic cold-vs-warm term cancels exactly (the g's
+  per-unit charge is its allocation's full span elemsize, malloc header included — `sizeof(g)`
+  is past the header threshold, where bare `roundupsize` under-reports by the header;
+  `TestDSTPooledGBytesExact` pins the arithmetic). What remains of the
   cold→warm live-set delta is non-pooled persistent bookkeeping — chiefly the `allgs` backing array
   (8 bytes per peak new goroutine; old arrays die mid-run so it cannot be tracked as live) plus
   KB-scale one-time cache backing arrays and any mid-run `allocm` g0/gsignal — a bounded, KB-scale residual in the target that could in
