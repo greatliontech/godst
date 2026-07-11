@@ -1822,31 +1822,34 @@ func TestDSTFSVirtualFDRawSyscallSemantics(t *testing.T) {
 	})
 }
 
-// TestDSTRawSyscallHostFdNotDispatched: the virtual-fd range test is what keeps
-// the dispatch off host descriptors. A pre-run host handle (the inherited-handle
-// stance) must still reach the kernel through the allowlist — the dispatch's
-// helpers never fall through, so dispatching a host fd would refuse an operation
-// the boundary permits.
-func TestDSTRawSyscallHostFdNotDispatched(t *testing.T) {
+// TestDSTRawSyscallHostFdSurvivesBubbleClose: a bubble goroutine's close of a
+// pre-run host handle is answered EBADF at the trampolines and NEVER
+// dispatched — the host-close fence (syscall's dstSyscallHostClose): a
+// dispatched close of a then-free number races the harness assigning that
+// number to a newborn host fd, so bubble-originated destruction of host fds
+// is refused for the whole real-fd space. The handle surviving the run is the
+// recorded accepted divergence of the inherited-handle stance (design.md
+// "The interception boundary"); the non-close allowlist family still reaches
+// the host (pinned elsewhere — the post-run fcntl below runs outside the
+// fence and proves only that the fd survived).
+func TestDSTRawSyscallHostFdSurvivesBubbleClose(t *testing.T) {
 	// A real descriptor of our own, opened BEFORE the run (the inherited-handle
-	// stance) and owned by nothing else, since the raw close below really closes
-	// it: dup a descriptor rather than borrowing one the test harness tracks.
+	// stance) and owned by nothing else: dup a descriptor rather than borrowing
+	// one the test harness tracks.
 	dup, err := syscall.Dup(0)
 	if err != nil {
 		t.Skipf("dup(0): %v", err)
 	}
+	defer syscall.Close(dup)
 	fd := uintptr(dup)
 	simulation.Run(1, func() {
-		// close(2) is allowlisted for inherited handles: it must reach the host,
-		// not be dispatched (the dispatch's helpers never fall through, so a
-		// dispatched host fd would be refused) and not be fenced.
-		if _, _, e := syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0); e != 0 {
-			t.Fatalf("raw close of a pre-run host fd = %v, want success (host passthrough)", e)
+		if _, _, e := syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0); e != syscall.EBADF {
+			t.Fatalf("bubble close of a pre-run host fd = %v, want EBADF (the host-close fence must refuse dispatch)", e)
 		}
 	})
-	// The descriptor is gone: the close reached the kernel.
-	if _, _, e := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_GETFD), 0); e != syscall.EBADF {
-		t.Fatalf("fcntl on the closed host fd = %v, want EBADF (the raw close reached the host)", e)
+	// The descriptor survives: the close never reached the kernel.
+	if _, _, e := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_GETFD), 0); e != 0 {
+		t.Fatalf("fcntl on the surviving host fd = %v, want success (the bubble close must never reach the host)", e)
 	}
 }
 
