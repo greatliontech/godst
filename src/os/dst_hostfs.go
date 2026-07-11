@@ -48,8 +48,16 @@ func (h dstHostFS) Open(name string) (fs.File, error) {
 		// A host with no FS activity reports its baseline (empty root + /tmp).
 		// Use a throwaway disk rather than storing one: inspection must not mutate
 		// simulation state (the host materializes its own identical baseline if it
-		// ever touches the filesystem).
+		// ever touches the filesystem). newDstFSDisk draws root+/tmp inodes from
+		// the shared per-run counter (dstFS.nextIno); restore it so the phantom
+		// draw is invisible — every subsequently created file keeps the st_ino it
+		// would have had without the inspection (the counter is the only
+		// simulation state the throwaway construction mutates; its nodes, page
+		// caches, and durable images are discarded with it). The host's real
+		// baseline, materialized later, draws these same inodes fresh.
+		savedIno := dstFS.nextIno
 		d = newDstFSDisk()
+		dstFS.nextIno = savedIno
 	}
 	node := d.root
 	base := "."

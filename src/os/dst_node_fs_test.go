@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/simulation"
 )
@@ -125,6 +126,57 @@ func TestDSTNodeCwdIsolation(t *testing.T) {
 	}
 	if srvCwd != "/" {
 		t.Errorf(`process "srv" on host h3 cwd = %q, want / (shared proc-id cwd leak from h2)`, srvCwd)
+	}
+}
+
+// TestDSTHostFSInspectionAllocatesNoInodes: inspecting an UNTOUCHED host's
+// disk via HostFS must be side-effect-free on simulation state. The
+// throwaway baseline tree it builds draws root+/tmp inodes from the shared
+// per-run counter; without restoring the counter, every file created after
+// the inspection shifts its st_ino by two, observable through Stat_t by the
+// inode-keyed lock-dedup SUTs the inode identity exists for. The st_ino
+// sequence of files created on hA must be identical whether or not an
+// untouched hB is inspected between them.
+func TestDSTHostFSInspectionAllocatesNoInodes(t *testing.T) {
+	inoSeq := func(inspect bool) [3]uint64 {
+		var seq [3]uint64
+		simulation.Run(1, func() {
+			simulation.Host("hA", simulation.HostConfig{}, func() {
+				statIno := func(name string) uint64 {
+					f, err := os.Open(name)
+					if err != nil {
+						t.Fatalf("Open %s: %v", name, err)
+					}
+					defer f.Close()
+					var st syscall.Stat_t
+					if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+						t.Fatalf("Fstat %s: %v", name, err)
+					}
+					return st.Ino
+				}
+				mustOK(t, "write a0", os.WriteFile("/a0", []byte("0"), 0o644))
+				seq[0] = statIno("/a0")
+				if inspect {
+					// An untouched host inspected mid-sequence: declared so the
+					// inspector does not fail loud, never touched so HostFS
+					// builds the throwaway baseline.
+					simulation.Host("hB", simulation.HostConfig{}, func() {})
+					if _, err := fs.ReadDir(simulation.HostFS("hB"), "."); err != nil {
+						t.Fatalf("inspect hB: %v", err)
+					}
+				}
+				mustOK(t, "write a1", os.WriteFile("/a1", []byte("1"), 0o644))
+				seq[1] = statIno("/a1")
+				mustOK(t, "write a2", os.WriteFile("/a2", []byte("2"), 0o644))
+				seq[2] = statIno("/a2")
+			})
+		})
+		return seq
+	}
+	base := inoSeq(false)
+	withInspect := inoSeq(true)
+	if base != withInspect {
+		t.Fatalf("HostFS inspection shifted the inode sequence: without=%v with=%v", base, withInspect)
 	}
 }
 

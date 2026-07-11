@@ -79,7 +79,9 @@ The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process
   body (idiom 1 — what real recovery code does on restart, needs no API). For *harness* assertions across
   hosts (do all replicas agree? did h2 persist the commit?), `simulation.HostFS(name)` returns a
   **read-only** `io/fs.FS` over a host's current tree — read-only by construction so it can never become a
-  cross-host back-channel write.
+  cross-host back-channel write, and side-effect-free on simulation state: inspecting an untouched host
+  builds a throwaway baseline tree but restores the shared inode counter afterward, so the phantom draw
+  never shifts a later file's `st_ino` (`TestDSTHostFSInspectionAllocatesNoInodes`).
 
 ### Per-host network address space
 
