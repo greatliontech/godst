@@ -878,11 +878,14 @@ active** — non-bubble goroutines keep full host access, so the harness around 
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
-  pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
+  pread64/pwrite64, fstat, fcntl) so
   operations **on pre-run host handles** keep working (`close` excepted — it mutates the shared fd
   table rather than doing I/O on a handle; see the host-close paragraph below). The fcntl allowlisting is
   **argument-aware**: its descriptor-MINTING commands (`F_DUPFD`/`F_DUPFD_CLOEXEC`) are refused —
-  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed. The reserved virtual-fd number range never reaches
+  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed.
+  `ioctl` is refused entirely: request numbers are interpreted by the target device, so no numeric
+  request can prove read-only, non-minting behavior for an arbitrary inherited handle. Terminal
+  probing therefore requires a modeled terminal capability rather than host passthrough. The reserved virtual-fd number range never reaches
   the host from this raw boundary: `Syscall`/`Syscall6` DISPATCH the settled subset (`fsync`,
   `fdatasync`, `flock`, `close`, `madvise`, `mprotect`, `munmap` — the surface `golang.org/x/sys/unix`
   reaches, since its asm enters these trampolines rather than the named wrappers), and every other

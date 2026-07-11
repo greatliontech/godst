@@ -40,7 +40,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [Crash refusal mutates run-main process state](./dst-crash-main-refusal-mutates-state.md) | H | crash preflight is state-neutral for every victim |
 | [host crash misses a nested root-process goroutine](./dst-host-crash-misses-nested-root-goroutine.md) | H | host ancestry makes every machine thread killable |
 | [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | chunk 61, with qemu-user available for the runtime witness |
-| [unrestricted ioctl can mint host descriptors](./dst-ioctl-allowlist-can-mint-fds.md) | H | ioctl admission excludes resource-minting requests |
 | [fake-timer rollover can erase a registration](./dst-clock-fake-timer-roll-loses-registration.md) | M | epoch rollover preserves every new-epoch timer |
 | [discarded callbacks count as executed](./dst-gc-discarded-callbacks-count-as-executed.md) | M | discard and execution metrics are distinct |
 | [foreign races can be attributed to the SUT](./dst-explore-foreign-races-misattributed.md) | M | reported races are simulation-attributed or explicitly foreign |

@@ -18,7 +18,8 @@ import _ "unsafe" // for go:linkname
 // is refused. close is in the family so a daemonize-style sweep stays the
 // EBADF loop it is in production, but a real-number close is answered before
 // this allowlist is consulted and never dispatched (dstSyscallHostClose).
-// ioctl is included so isatty probes on real stdio still work.
+// ioctl is excluded entirely: request numbers are device-specific, so no
+// numeric request proves read-only, non-minting behavior for an arbitrary fd.
 //
 // nosplit so the raw-syscall trampolines can call it without growing their
 // uintptrkeepalive stack.
@@ -27,7 +28,7 @@ import _ "unsafe" // for go:linkname
 func dstSyscallAllowedTrap(trap uintptr) bool {
 	switch trap {
 	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
-		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
+		SYS_FCNTL, SYS_PREAD64, SYS_PWRITE64:
 		return true
 	}
 	return dstSyscallAllowedArchTrap(trap)
