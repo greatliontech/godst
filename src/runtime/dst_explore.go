@@ -470,11 +470,17 @@ const (
 // a later episode's schedule/HB state (dstSeqCtr resets per episode while
 // dstClearSchedState runs only for bubble goroutines). Every recording
 // surface funnels through here, so a call-site filter cannot silently
-// regress; callers degrade a 0 to their conservative fallback. The sim
-// bubble's own drain and root ARE members (bubble == dstSimBubble) and keep
-// their access/edge-path seqs.
+// regress; callers degrade a 0 to their conservative fallback. Membership
+// is the STICKY per-g bit (g.dstSimG) — the same predicate the scheduler
+// classification uses — NOT the live gp.bubble field, which the GC assist
+// paths transiently nil: the run root parks inside gcMarkDone (via the
+// quiescence drain's forced cycles) with the field nil and must still draw
+// its stable index at its first candidacy. One predicate for classification
+// and assignment makes a sim-candidate-without-an-index unrepresentable.
+// The sim bubble's own drain and root ARE members and keep their
+// access/edge-path seqs.
 func dstEnsureSeq(gp *g) uint64 {
-	if gp.bubble == nil || gp.bubble != dstSimBubble {
+	if !gp.dstSimG {
 		return 0
 	}
 	if gp.dstSeq == 0 {
@@ -1247,7 +1253,7 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		if gp := c.at(k); gp != nil {
 			if !dstIsInfraCandidate(gp) {
 				dstEnsureSeq(gp)
-			} else if !(gp.bubble == dstSimBubble && gp.bubble != nil && gp.bubble.gcDrain == gp) {
+			} else if !(gp.dstSimG && dstSimBubble != nil && dstSimBubble.gcDrain == gp) {
 				dstSchedForeignSeen = true
 			}
 		}

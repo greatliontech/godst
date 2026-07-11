@@ -405,10 +405,9 @@ func TestExploreForeignBubbleSyncChurn(t *testing.T) {
 // dstAccessShouldYield, whose first line then routes every auto access to
 // the pending path, which never commits for an infra-picked goroutine. An
 // edge-free foreign shape (pure instrumented-write churn, no rendezvous)
-// would leave the flag clear and open the inline-commit door; building the
-// door-reaching arms belongs to the -race foreign-sensitivity scaffolding
-// (dst-explore-race-foreign-yield-sensitivity). The assertions stay as
-// nets.
+// would leave the flag clear and open the inline-commit door
+// (dstAccessMaybeShared false, early false, inline dstCommitAccess with
+// seq 0); until such an arm exists, the assertions stay as nets.
 func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
@@ -507,6 +506,144 @@ func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
 }
 
 var foreignChurnSink int // keeps the race-variant churn's counter accesses live
+
+// TestExploreForeignGCWorkloadInsensitive extends the foreign-invisibility
+// contract to the workload class that used to break it, in BOTH build modes:
+// a race-free finalizer/GC workload whose main blocks in runtime.GC() and on
+// finalizer-driven channels. The GC assist paths temporarily nil gp.bubble
+// ("disassociate"), and while the classification keyed on that live field an
+// assist-parked simulation goroutine transiently became INFRASTRUCTURE —
+// resumed RNG-free, foreign-reported (ForeignSched true with zero foreign
+// work, Exhausted never claimable), and racing real foreign churn for the
+// infra alternation slots, so two spinners shrank -race coverage (12
+// schedules to 6) and diverged single-episode traces. With membership sticky
+// (g.dstSimG), coverage and traces are churn-invariant and the foreign-free
+// run claims exhaustion.
+func TestExploreForeignGCWorkloadInsensitive(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		ch1 := make(chan struct{})
+		ch2 := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ch2
+		}()
+		func() {
+			x := new(int)
+			runtime.SetFinalizer(x, func(*int) {
+				ch1 <- struct{}{}
+				runtime.Gosched()
+				ch2 <- struct{}{}
+			})
+		}()
+		runtime.GC()
+		<-ch1
+		wg.Wait()
+		return false
+	}
+	alone := Explore(1, Exhaustive, sut)
+	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
+	if alone.ForeignSched || !alone.Exhausted {
+		t.Fatalf("foreign-free GC workload misreported: foreignSched=%v exhausted=%v (an assist-parked simulation goroutine was classified foreign)", alone.ForeignSched, alone.Exhausted)
+	}
+	stop := make(chan struct{})
+	var done sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+	_, _, trSpun := runOnce(1, nil, map[accessForce]bool{}, sut)
+	spun := Explore(1, Exhaustive, sut)
+	close(stop)
+	done.Wait()
+	if !spun.ForeignSched || spun.Exhausted {
+		t.Fatalf("exploration under churn misreported: foreignSched=%v exhausted=%v", spun.ForeignSched, spun.Exhausted)
+	}
+	if spun.Schedules != alone.Schedules {
+		t.Fatalf("foreign churn changed GC-workload coverage: %d vs %d schedules", spun.Schedules, alone.Schedules)
+	}
+	if !reflect.DeepEqual(trAlone.procs, trSpun.procs) || !reflect.DeepEqual(trAlone.enabled, trSpun.enabled) {
+		t.Fatalf("foreign churn diverged the GC-workload trace:\nalone procs=%v enabled=%v\nspun  procs=%v enabled=%v",
+			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
+	}
+}
+
+// TestExploreForeignPriorRootSpinner: simulation membership must not leak
+// across runs through the ROOT — the goroutine that called Run carries the
+// sticky membership bit for its run's duration, and the run teardown must
+// clear it: a prior run's root later spinning as an ordinary foreign
+// goroutine during a NEW exploration would otherwise be classified a
+// simulation candidate of a run it is not part of (consuming seed draws,
+// entering enabled sets with no assignable index).
+func TestExploreForeignPriorRootSpinner(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		ch := make(chan struct{}, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ch
+		}()
+		ch <- struct{}{}
+		runtime.Gosched()
+		wg.Wait()
+		return false
+	}
+	alone := Explore(1, Exhaustive, sut)
+	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
+
+	// A goroutine that was a RUN ROOT and now spins as plain foreign work.
+	ranRun := make(chan struct{})
+	stop := make(chan struct{})
+	spun := make(chan struct{})
+	go func() {
+		defer close(spun)
+		Run(7, func() {})
+		close(ranRun)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
+	<-ranRun
+
+	_, _, trSpun := runOnce(1, nil, map[accessForce]bool{}, sut)
+	res := Explore(1, Exhaustive, sut)
+	close(stop)
+	<-spun
+
+	if res.Schedules != alone.Schedules {
+		t.Fatalf("a prior run's root perturbed exploration coverage: %d vs %d schedules", res.Schedules, alone.Schedules)
+	}
+	if !res.ForeignSched {
+		t.Error("the prior root spinning at decisions was not reported as foreign")
+	}
+	assertUniqueEnabledSeqs(t, trSpun)
+	if !reflect.DeepEqual(trAlone.procs, trSpun.procs) || !reflect.DeepEqual(trAlone.enabled, trSpun.enabled) {
+		t.Fatalf("a prior run's root is visible in the recorded schedule")
+	}
+}
 
 // TestExploreForeignSpinnerDrainCallback pins the drain-displacement leg of
 // the starvation fairness: the bubble's finalizer drain is infrastructure

@@ -216,6 +216,7 @@ func synctestRun(f func()) {
 		if dstBuild && dstSimBubble == bubble {
 			dstSimBubble = nil
 		}
+		gp.dstSimG = false // the root outlives the run; a stale bit would make it a sim candidate of a LATER run (TestExploreForeignPriorRootSpinner hangs without this)
 		gp.bubble = nil
 	}()
 
@@ -234,6 +235,13 @@ func synctestRun(f func()) {
 			// are scheduled RNG-free as infrastructure instead (see
 			// firstSystemG).
 			dstSimBubble = bubble
+			// Sticky membership for the two goroutines that predate the claim:
+			// the bubble main (created above, before dstSimBubble was set) and
+			// the root. Children inherit the bit at newproc1. The scheduler
+			// classification keys on the bit, not the live bubble field, which
+			// the GC assist paths temporarily nil (see g.dstSimG).
+			bubble.main.dstSimG = true
+			gp.dstSimG = true
 			// Re-root the per-g DST tree at this bubble so the bubble's
 			// randomness is independent of what ran before it in this process: a
 			// bubble (test) is then reproducible in isolation. Without this,

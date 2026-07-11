@@ -600,8 +600,13 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
    DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
    `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
-   simulation decisions downgrade `Exhausted`, since foreign activity can perturb instrumented
-   yield placement under -race — reported, never silent), top-level and child-goroutine SUT panics as
+   simulation decisions downgrade `Exhausted` — reported, never silent, and conservative: with
+   simulation membership a STICKY per-goroutine property, coverage and single-episode traces are
+   churn-invariant even for GC/finalizer workloads whose goroutines park inside the GC assist
+   paths — the assist "disassociation" transiently nils `gp.bubble`, and classification through
+   the live field used to demote an assist-parked simulation goroutine to infrastructure, shrinking
+   -race coverage under churn and reporting foreign work where none ran;
+   `TestExploreForeignGCWorkloadInsensitive`, `TestExploreForeignPriorRootSpinner`), top-level and child-goroutine SUT panics as
    `Failure.Panic`, synctest deadlocks as `Failure.Deadlock`, and one `Failure.Race` per new `RaceErrors`
    increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
    child-before-parent-continuation failures are not silently skipped. Child-goroutine and drain-callback

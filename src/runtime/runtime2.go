@@ -520,6 +520,7 @@ type g struct {
 	dstAccCount  uint64  // DST per-bubble access ordinal for forced replay yield points; unused otherwise
 	dstAccPend   bool    // DST pending transition came from a hook call; false means a synthetic coarse decision
 	dstAccAuto   bool    // DST pending transition came from dst-race memory auto-instrumentation; stack addresses are private for this path
+	dstSimG      bool    // DST sticky membership in the ACTIVE simulation's bubble: set at creation-inheritance (newproc1) and at the bubble claim (synctestRun), cleared at gdestroy. The scheduler classification (dstIsInfraCandidate) keys on THIS, not the live gp.bubble field, because the GC assist paths temporarily nil the field (mgc.go/mgcmark.go "disassociate") — an assist-parked simulation goroutine must not transiently become infrastructure (RNG-free resumption, foreign-report, churn-displaceable slot). Unused when DST off
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting

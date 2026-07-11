@@ -1,8 +1,8 @@
 # DST explore: foreign work in a sim-idle window diverges replay (loud DST-L2-2 panic)
 
-Lands: when the -race foreign-yield-sensitivity diagnosis
-(dst-explore-race-foreign-yield-sensitivity) lands, or the idle-window
-composition is separately diagnosed and fixed or recorded as a bounded limit
+Lands: when the idle-window composition replays deterministically under
+foreign churn, or its mechanism is diagnosed and recorded as a bounded,
+loudly-reported limit
 
 ## Gap
 
@@ -21,6 +21,14 @@ distinct from the -race yield-placement sensitivity but plausibly the same
 family. Reproducer: TestExploreForeignBubbleSyncChurn's SUT with
 `time.Sleep(time.Millisecond)` inserted between the two phases, run with the
 rendezvous churn live.
+
+Ruled out (2026-07-11): the sticky simulation-membership classification
+(g.dstSimG — which resolved the -race foreign-yield sensitivity, including
+making the run root a uniform simulation candidate) does NOT cure this
+composition; the divergence reproduces unchanged with it landed. The
+remaining suspects are the time-advance machinery itself (the advance step's
+position racing foreign churn) and the timer-path transient
+(time.go's bubble disassociation window).
 
 ## Required outcome
 

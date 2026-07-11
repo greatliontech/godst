@@ -66,10 +66,15 @@ type Failure struct {
 	Deadlock string
 	// ForeignSched is true iff foreign (non-simulation) goroutines were
 	// scheduled during the run that exhibited this failure —
-	// ExploreResult.ForeignSched's per-failure form. Under -race, foreign
-	// activity can perturb instrumented yield placement, so a replay of such
-	// a failure is best-effort: a prefix divergence aborts loudly, but a
-	// shifted auto-yield can also silently change the interleaving.
+	// ExploreResult.ForeignSched's per-failure form. Replay of such a
+	// failure is best-effort: simulation membership is sticky, so recorded
+	// schedules are churn-invariant for the known-sensitive workload
+	// classes, but foreign work can still shift infrastructure-mediated
+	// progress (the time-advance machinery is a recorded open divergence) —
+	// a prefix divergence aborts loudly, while a divergence that keeps
+	// every prefix entry enabled remains undetected (Failure carries no
+	// enabled sets): a silently different interleaving can report
+	// failed=false.
 	ForeignSched bool
 	// CrashTear records whether the exploration that found this failure was
 	// tearing host crashes (ExploreOptions.CrashTear). Replay restores the same
@@ -99,9 +104,12 @@ type ExploreResult struct {
 	// infrastructure slot, or runnable at one of the simulation's own
 	// decisions (e.g. a background spinner or ticker started before the
 	// exploration). Foreign candidates never enter recorded schedules or
-	// enabled sets, but their execution can perturb where the instrumented
-	// yield points fall (observed under -race), so coverage is then
-	// best-effort: Exhausted is false — reported, never silently capped.
+	// enabled sets, and simulation membership is sticky (coverage and
+	// traces are churn-invariant for the known-sensitive workload classes),
+	// but foreign work can still shift infrastructure-mediated progress
+	// (the time-advance machinery is a recorded open divergence), so
+	// coverage is conservatively best-effort: Exhausted is false —
+	// reported, never silently capped.
 	ForeignSched bool
 	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.

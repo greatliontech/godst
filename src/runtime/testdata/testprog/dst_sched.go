@@ -27,7 +27,28 @@ func dstSchedStatsFP() (decisions, sysScheds, rngDraws uint64)
 // bubble RNG, making the interleaving nondeterministic.
 func DSTSchedStats() {
 	seed, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	// A persistently-runnable FOREIGN goroutine: simulation membership is a
+	// sticky per-g property, so the run's own goroutines — including the
+	// root parked in runLocked and any goroutine the GC assist paths
+	// transiently disassociate — are never system picks; a genuine non-sim
+	// pick needs a genuinely foreign goroutine, which the starvation
+	// fairness alternation schedules throughout the run.
+	stop := make(chan struct{})
+	spun := make(chan struct{})
+	go func() {
+		defer close(spun)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
 	simulation.Run(seed, func() { _ = schedMutex() })
+	close(stop)
+	<-spun
 	d, sys, rng := dstSchedStatsFP()
 	os.Stdout.WriteString(strconv.FormatUint(d, 10) + " " +
 		strconv.FormatUint(sys, 10) + " " + strconv.FormatUint(rng, 10) + "\n")

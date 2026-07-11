@@ -10,7 +10,7 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 
 | Issue | Severity | Lands |
 |---|---|---|
-| [-race explore yield placement is foreign-sensitive](./dst-explore-race-foreign-yield-sensitivity.md) | M | sensitivity diagnosed; removed or recorded as a bounded, reported limit |
+| [-race membership-gate doors lack reaching test arms](./dst-explore-race-door-reaching-arms.md) | L | the two -race membership mutants each have a killing test, or unreachability recorded |
 | [foreign work in a sim-idle window diverges replay](./dst-explore-foreign-idle-window-divergence.md) | M | idle-window composition replays deterministically, or diagnosed and recorded |
 | [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
 | [HostFS inspection allocates inodes](./dst-hostfs-inspection-allocates-inodes.md) | L | inspection side-effect-free on simulation state |

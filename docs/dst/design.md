@@ -910,8 +910,8 @@ simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's
 `synctest`'s drain/teardown calls — is dead-code-eliminated. `TestDSTUntaggedCodeFootprint` pins the fold by objdump at the panic,
 finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
 pattern and were objdump-verified at the change. The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
-thirteen per-goroutine DST words (the six identity/RNG stamps and the seven race-access staging
-fields), `p` carries the run-queue overflow flag, `timer` carries four fake-timer words (arming
+fourteen per-goroutine DST words (the six identity/RNG stamps, the seven race-access staging
+fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries four fake-timer words (arming
 host, registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
 bookkeeping, `specialfinalizer` carries epoch+seq, `specialCleanup` carries epoch, and
 `finalizer`/`cleanupFn` each carry one registration-sequence word (so untagged builds fit slightly
@@ -1205,13 +1205,21 @@ later steps add, never rewrite.
   bubble stays runnable and the durably-blocked deadlock detection never fires. Under the scheduled
   (exploration) strategy the same subset rule keeps foreign candidates out of recorded schedules and
   DPOR enabled sets, and foreign presence at a simulation decision is REPORTED
-  (`ExploreResult.ForeignSched`, downgrading `Exhausted`): without `-race` the recorded traces are
-  byte-identical with and without churn, but the dst-race auto-instrumentation's yield placement is
-  foreign-sensitive, so coverage under churn is best-effort and says so — never a silent cap.
-  Enforced by `TestDSTSchedForeignSpinner` (run completes under a spinner;
+  (`ExploreResult.ForeignSched`, downgrading `Exhausted`): for the pinned workload classes —
+  including the GC/finalizer class that used to diverge — recorded traces are byte-identical with
+  and without churn in BOTH build modes — simulation membership is a sticky per-goroutine property
+  (`g.dstSimG`), so a simulation goroutine parked inside the GC assist paths (which transiently nil
+  `gp.bubble`) stays a seed-scheduled simulation candidate instead of becoming churn-displaceable
+  infrastructure, the misclassification that used to shrink `-race` coverage under churn and report
+  foreign work where none ran. The downgrade stays conservative (the time-advance machinery's
+  churn sensitivity is a recorded open divergence) — coverage under churn is best-effort and says
+  so, never a silent cap. Enforced by `TestDSTSchedForeignSpinner` (run completes under a spinner;
   fingerprints with/without the spinner identical, random and PCT), `TestExploreForeignSpinner`
   (exploration completes with identical coverage and byte-identical recorded traces under spinners,
-  churn reported), `TestExploreForeignSpinnerDrainCallback` (a mid-callback drain yield is neither
+  churn reported), `TestExploreForeignGCWorkloadInsensitive` (the GC/finalizer workload class:
+  churn-equal coverage and traces in both modes, exhaustion claimable foreign-free),
+  `TestExploreForeignPriorRootSpinner` (membership does not leak across runs through the root),
+  `TestExploreForeignSpinnerDrainCallback` (a mid-callback drain yield is neither
   displaced by foreign entries nor interrupted by the hand-off) and
   `TestExploreForeignSchedReported` (churn reported and exhaustion downgraded, including under
   `-race`). The simulation claims

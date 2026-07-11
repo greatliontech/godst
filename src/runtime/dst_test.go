@@ -1550,15 +1550,19 @@ func TestDSTNetSemantics(t *testing.T) {
 	}
 }
 
-// TestDSTSchedSystemIsolation verifies the system-goroutine-isolation invariant
-// that keeps the schedule deterministic regardless of timing-/composition-varying
-// runtime-infrastructure scheduling: under DST the scheduling RNG advances exactly
-// once per *bubble* goroutine selection and never for a system (bubble==nil) one.
-// So for a contended workload under the Random strategy, rngDraws == decisions -
-// sysScheds, with sysScheds>0 (system goroutines are interleaved). Without isolation, system selections
-// would draw from the bubble RNG, and how often they occur (timing/binary
-// composition) would shift every subsequent selection — the nondeterminism a bare
-// `import "net"` exposed (~1% of runs). Mutation check: making dstFindRunnable
+// TestDSTSchedSystemIsolation verifies the non-simulation-goroutine isolation
+// invariant that keeps the schedule deterministic regardless of
+// timing-/composition-varying infrastructure scheduling: under DST the
+// scheduling RNG advances exactly once per SIMULATION goroutine selection and
+// never for an infrastructure one (simulation membership is the sticky per-g
+// dstSimG property — the run's own goroutines stay simulation candidates even
+// while the GC assist paths transiently nil their bubble field). The prog
+// runs a foreign Gosched spinner across the run, so rngDraws ==
+// decisions - sysScheds with sysScheds>0 (the spinner's alternation picks).
+// Without isolation, infrastructure selections would draw from the bubble
+// RNG, and how often they occur (timing/binary composition) would shift
+// every subsequent selection — the nondeterminism a bare `import "net"`
+// exposed (~1% of runs). Mutation check: making dstFindRunnable
 // select system goroutines via dstSchedSelect (drawing RNG) makes rngDraws ==
 // decisions != decisions - sysScheds.
 func TestDSTSchedSystemIsolation(t *testing.T) {

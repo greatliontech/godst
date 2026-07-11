@@ -4588,6 +4588,7 @@ func gdestroy(gp *g) {
 		}
 		unlock(&bubble.mu)
 	}
+	gp.dstSimG = false
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0
@@ -5506,6 +5507,12 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.dstHost = callergp.dstHost
 		newg.dstProc = callergp.dstProc
 		newg.dstPid = callergp.dstPid
+		// Sticky simulation membership: inherited from the creator's LIVE
+		// bubble field at creation (a creator mid-GC-assist never runs go
+		// statements, so the transient nil window cannot mis-inherit). The
+		// bubble main is created before the claim and gets its bit at the
+		// claim itself (synctestRun).
+		newg.dstSimG = newg.bubble != nil && newg.bubble == dstSimBubble
 		dstClearSchedState(newg)
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 &&
 			(callergp.bubble == dstSimBubble || (callergp == dstSimRootG && dstSimBubble == nil)) {
@@ -7965,7 +7972,7 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 		// Only the SIM bubble's drain is exempt: a foreign bubble's drain is
 		// unrelated process activity like any other foreign goroutine.
 		gp := c.at(sysK)
-		sysDrain = gp.bubble == dstSimBubble && gp.bubble != nil && gp.bubble.gcDrain == gp
+		sysDrain = gp.dstSimG && dstSimBubble != nil && dstSimBubble.gcDrain == gp
 	}
 	if sysOK && (sysDrain || !dstSchedPrevSys || !c.hasSimG(total)) {
 		sel = sysK
@@ -7973,13 +7980,15 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 		if !sysDrain {
 			dstSchedPrevSys = true
 			if dstSchedKind == dstSchedScheduled {
-				// A USER foreign goroutine (not runtime infrastructure, not
-				// the run caller parked in runLocked) EXECUTING during a
-				// recording episode is reported even if it never coexists
-				// with a simulation candidate at a recorded decision: its
-				// execution alone can perturb instrumented yield placement
-				// under -race, and exploration must downgrade its coverage
+				// A USER foreign goroutine (not runtime infrastructure)
+				// EXECUTING during a recording episode is reported even if
+				// it never coexists with a simulation candidate at a
+				// recorded decision: exploration downgrades its coverage
 				// claim loudly, never silently (ExploreResult.ForeignSched).
+				// The dstSimRootG exemption below is reachable only in the
+				// white-box dstActivate mode — in a bubble run the root
+				// carries the sticky membership bit and never lands on this
+				// infra path.
 				if gp := c.at(sysK); gp != nil && gp != dstSimRootG && !isSystemGoroutine(gp, false) {
 					dstSchedForeignSeen = true
 				}
@@ -8124,10 +8133,18 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 // range over; the two classifications must stay in lockstep (fairness in
 // dstFindRunnable selects over the complement of exactly this predicate).
 func dstIsInfraCandidate(gp *g) bool {
-	if gp.bubble == nil || gp.bubble != dstSimBubble {
+	if !gp.dstSimG {
+		// Sticky membership, not the live gp.bubble field: the GC assist
+		// paths temporarily nil the field while assisting (mgc.go/mgcmark.go
+		// "disassociate"), and an assist-parked SIMULATION goroutine must
+		// stay a simulation candidate — through the field it transiently
+		// became infrastructure: resumed RNG-free, foreign-reported
+		// (ForeignSched true with no foreign work), and racing real foreign
+		// churn for the infra alternation slots (the -race foreign
+		// sensitivity's classification leg).
 		return true
 	}
-	return dstSchedKind == dstSchedScheduled && gp.bubble.gcDrain == gp
+	return dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain == gp
 }
 
 // hasSimG reports whether any candidate is a simulation goroutine (the
