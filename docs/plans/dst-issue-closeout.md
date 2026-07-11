@@ -9,7 +9,7 @@ bound where the issue's own outcome clause allows it.
 
 - [x] 1. Foreign `runtime.GC()` mid-run cannot perturb the bubble trigger stream, or fails loudly (`dst-gc-foreign-runtime-gc`)
 - [x] 2. `GOEXPERIMENT=sizespecializedmalloc` refusal made precise (instrumented builds exempt) and pinned at a testable level (`dst-gc-sizespecialized-experiment`)
-- [ ] 3. Warm-process late-discovery divergence diagnosed; tail repeatable in-process or the bound recorded (`dst-gc-warm-process-discovery-tail`)
+- [x] 3. Warm-process late-discovery divergence diagnosed; tail repeatable in-process or the bound recorded (`dst-gc-warm-process-discovery-tail`)
 
 ## Runtime — simulated clock
 

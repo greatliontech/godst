@@ -806,6 +806,19 @@ func (t gcTrigger) test() bool {
 			if hm > base {
 				bubbleMarked = hm - base
 			}
+			// Subtract the pooled-struct bytes (g/sudog/_defer) the bubble
+			// allocated since activation: they sit inside heapMarked (live in
+			// allgs and the pools) but whether they were allocated or reused
+			// is pre-run process history — leaving them in would give a cold
+			// process a larger GOGC-scaled target than a warmed one at the
+			// same seed, shifting the last cycle's discovery boundary. The
+			// snapshot is taken at the same STW that set heapMarked, so the
+			// nondeterministic term cancels exactly (see dstPooledAlloc).
+			if pm := dstPooledMarked.Load(); bubbleMarked > pm {
+				bubbleMarked -= pm
+			} else {
+				bubbleMarked = 0
+			}
 			// Deterministic bubble-local memory limit (Options.MemoryLimit). The env
 			// GOMEMLIMIT cannot be honored deterministically under DST — its goal
 			// derives from total mapped memory, which is not bubble-local and varies
@@ -2312,6 +2325,25 @@ func clearpools() {
 	// clear boringcrypto caches
 	for _, p := range boringCaches {
 		atomicstorep(p, nil)
+	}
+
+	if dstBuild && dstActive() {
+		// While a simulation run is active, leave the central sudog/defer
+		// caches alone too (per-P caches are always left alone): the DST
+		// trigger's target computation subtracts the pooled-struct bytes the
+		// bubble allocated since activation (dstPooledAlloc), and that
+		// cancellation is exact only if counted structs stay live at every
+		// in-run mark — a central-cache drop would let some die mid-run at a
+		// pool-traffic-dependent point. The caches are cleared by the first
+		// cycle after deactivation; growth meanwhile is bounded by the run's
+		// own overflow traffic. (Mid-run deaths would in fact hit a cold and
+		// a warm run through equal-magnitude terms — counted-but-dead
+		// over-subtraction vs base-resident erosion, with a
+		// schedule-deterministic death pattern — so no cold-vs-warm shape
+		// observes this gate; it is kept because it makes the subtraction's
+		// soundness a LOCAL liveness invariant, counted implies live, rather
+		// than a global symmetry argument.)
+		return
 	}
 
 	// Clear central sudog cache.

@@ -733,6 +733,25 @@ the channel-light workloads that first validated it (both **landed**):
   growth, and stacks are already excluded (`stackalloc`, not `mallocgc`), so this makes the trigger
   consistently reflect the SUT's own objects with no leak. Pinned by `TestDSTGCPoolCarryoverDeterministic`
   (two in-process runs at one seed whose inherited `g`/`sudog` pools would otherwise shift the crossing).
+  The exclusion has a **marked-side counterpart**: the pooled structs a run allocates fresh stay live at
+  every in-run mark (`g`s are counted at their `allgadd` publication, so only `allgs`-pinned —
+  process-immortal — g's enter the tracker; an `allocm`-created g0/gsignal can die via `sched.freem`
+  and is deliberately left in the residual band instead; sudogs/defers sit referenced in their
+  caches, and while a run is active `clearpools` leaves the central caches alone so none dies at a
+  pool-traffic-dependent point), so they sit inside `heapMarked` — and, uncorrected, inside the GOGC-scaled target
+  (`bubbleMarked`), giving a COLD process a larger target than a warmed one at the same seed and
+  shifting the last cycle's discovery boundary while the earlier, floor-clamped targets hide the
+  difference. The trigger therefore counts pooled bytes allocated for bubble goroutines since
+  activation (`dstPooledAlloc`, on either stack — `malg` allocates the `g` struct on systemstack),
+  snapshots the counter at each mark termination (`dstPooledMarked`, the same STW that sets
+  `heapMarked`), and subtracts the snapshot from `bubbleMarked` in both the GOGC target and the
+  `MemoryLimit` crossing: the nondeterministic cold-vs-warm term cancels exactly. What remains of the
+  cold→warm live-set delta is non-pooled persistent bookkeeping — chiefly the `allgs` backing array
+  (8 bytes per peak new goroutine; old arrays die mid-run so it cannot be tracked as live) plus
+  KB-scale one-time cache backing arrays and any mid-run `allocm` g0/gsignal — a bounded, KB-scale residual in the target that could in
+  principle shift a late boundary whose crossing lands within it; at the pinned shapes it shifts
+  none. Warmed runs carry no residual at all (the bookkeeping is in the baseline), so
+  warm-vs-warm repeat runs agree exactly.
 - **The crossing fires on the bubble's own allocation.** The trigger test is evaluated **and the GC it
   arms is started inside the bubble-allocation gate** — a crossing latched by a bubble allocation that
   cannot start GC at that point (e.g. `m.locks > 1`) must not leak the *start* to whichever process-wide
@@ -782,7 +801,9 @@ the channel-light workloads that first validated it (both **landed**):
   goroutine's own stack: runtime bookkeeping allocated on systemstack on its behalf (e.g. `allgs`
   append-growth, whose size and timing are process history) neither counts toward `dstHeapAlloc` nor
   evaluates the trigger (`TestDSTGCSysstackAlloc`: a run that grows `allgs` and a warmed rerun that
-  reuses `gFree` produce identical mid-run per-cycle discovery). The set-level test (`numGC` + total finalizers,
+  reuses `gFree` produce identical per-cycle discovery, mid-run partial AND run-end total — the
+  total holds because the pooled-struct bytes are subtracted from the target, the marked-side
+  counterpart above). The set-level test (`numGC` + total finalizers,
 `TestDSTGCFinalizerDiscoveryDeterministic`) and the per-cycle test (mid-run partial discovery for the
 floored, GOGC-scaled, and `MemoryLimit` regimes, `TestDSTGCPerCycleDiscoveryDeterministic`) both run in
 all builds.

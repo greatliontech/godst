@@ -1128,13 +1128,18 @@ func DSTGCSysstackAlloc() {
 	}
 	p1, t1 := run()
 	p2, t2 := run()
-	// Only the MID-RUN partial is asserted. The run-end totals diverge between
-	// a cold and a warmed process at equal NumGC and equal partials — a
-	// distinct, pre-existing effect (the late GOGC-scaled boundary shifts with
-	// what the mark retains across the goroutine phase's reused stacks) that
-	// this prog's goroutine phase exposes but this pin does not own.
-	if p1 != p2 {
-		os.Stdout.WriteString("systemstack bookkeeping moved the trigger: run1=" +
+	// Both the mid-run partial AND the run-end total are asserted: the
+	// goroutine phase makes run 1 allocate ~1500 fresh g structs (and the
+	// blocking phase ~1500 sudogs) that run 2 reuses from the pools. Those
+	// bytes are excluded from the trigger counter (M4) and stay live at
+	// every in-run mark, so the target computation must subtract them from
+	// heapMarked (dstPooledMarked) — with the subtraction gone, the cold
+	// run's inflated GOGC-scaled target shifts the LAST cycle's boundary
+	// and its discovery tail (equal partials, ~3k-finalizer total gap at
+	// this shape), while the mid-run partial still matches because the
+	// early targets sit on the heapMinimum floor.
+	if p1 != p2 || t1 != t2 {
+		os.Stdout.WriteString("cold/warm discovery diverged: run1=" +
 			strconv.FormatUint(p1, 10) + "/" + strconv.FormatUint(t1, 10) + " run2=" +
 			strconv.FormatUint(p2, 10) + "/" + strconv.FormatUint(t2, 10) + "\n")
 		return

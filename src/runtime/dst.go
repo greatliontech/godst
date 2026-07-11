@@ -211,6 +211,9 @@ func dstActivate(seed uint64) {
 	// Cache the internal pooled-struct type descriptors the heap trigger excludes,
 	// BEFORE dstSeed.Store makes dstActive() true — so mallocgc's DST gate never reads a
 	// nil cache (a nil would wrongly COUNT a g/sudog/_defer alloc).
+	dstPooledAlloc.Store(0)
+	dstPooledMarked.Store(0)
+	dstPooledGBytes = uint64(roundupsize(abi.TypeFor[g]().Size_, false))
 	dstInternalPooledTypes.g = abi.TypeFor[g]()
 	dstInternalPooledTypes.sudog = abi.TypeFor[sudog]()
 	dstInternalPooledTypes.defr = abi.TypeFor[_defer]()
@@ -894,6 +897,43 @@ var dstFinqBase atomic.Uint64
 // heapMarked) and at bubble entry (synctestRun), so it measures the bubble's own
 // net allocation since the last collection.
 var dstHeapAlloc atomic.Uint64
+
+// dstPooledAlloc is the count of bytes of runtime-internal pooled structs
+// allocated since activation on behalf of simulation-bubble goroutines:
+// sudog/_defer by allocation type (user stack, acquireSudog/newdefer), g by
+// the allgadd publication (systemstack, so only allgs-pinned g's enter — an
+// allocm-created g0/gsignal also carries a bubble m.curg but can die via
+// sched.freem, and counting one would break counted-implies-live; it stays
+// in the recorded residual band). These bytes are excluded from the heap
+// trigger counter (dstHeapAlloc, gc.md M4) because whether one is allocated
+// or reused from its cross-run pool is pre-run process history — but the
+// counted ones stay LIVE at every in-run mark (allgs pins its g's; sudog/
+// _defer sit referenced in their caches, and clearpools leaves the central
+// caches alone while a run is active), so they inflate heapMarked and,
+// uncorrected, the GOGC-scaled target: a cold run that allocates 1500 g's
+// carries a ~900KB larger target than a warmed rerun that reuses them,
+// shifting the last cycle's boundary and its discovery tail. The trigger's
+// target computation subtracts the snapshot below, so the nondeterministic
+// term cancels exactly.
+var dstPooledAlloc atomic.Uint64
+
+// dstPooledGBytes is the size-class-rounded size of the g struct — the exact
+// bytes a fresh g contributes to heapMarked while sizeof(g) stays at or
+// under MinSizeForMallocHeader (512): past it, roundupsize returns the user
+// size (it subtracts the malloc header back out) while heapMarked counts
+// full elemsize, an 8-byte-per-g undercount. Not silent: the mismatch times
+// the goroutine phase's fresh-g count splits TestDSTGCSysstackAlloc's
+// asserted totals. Set at activation; added to dstPooledAlloc per allgadd
+// of a bubble-attributed g.
+var dstPooledGBytes uint64
+
+// dstPooledMarked is dstPooledAlloc snapshotted at each mark termination
+// (resetLive), i.e. the pooled bytes contained in the current heapMarked.
+// The GOGC target and memory-limit crossings subtract it from
+// heapMarked - dstHeapBase so both remain functions of the bubble's own SUT
+// live set. Snapshotting at the same STW point that sets heapMarked keeps
+// the two consistent.
+var dstPooledMarked atomic.Uint64
 
 // dstBubbleFinqFP returns the bubble-local count of finalizers queued so far
 // (finqueued minus the bubble-entry baseline). It is the set-level observable

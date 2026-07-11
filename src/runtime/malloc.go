@@ -1222,50 +1222,77 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		// every heap allocation passes through here exactly once with elemsize set. x
 		// is already published (publicationBarrier/gcmarknewobject ran and mp.mallocing
 		// is reset), so a GC started here will not collect it.
-		if cur := getg().m.curg; cur != nil && getg() == cur && cur.bubble != nil && cur.bubble == dstSimBubble {
-			// Count only the simulation bubble's own allocations: a non-bubble
-			// goroutine (or a foreign synctest bubble) allocating mid-run would
-			// otherwise move the cycle boundary and make NumGC and which cycle
-			// discovers a finalizer depend on unrelated process activity.
-			//
-			// getg() == cur excludes allocations the runtime performs ON
-			// SYSTEMSTACK on the bubble goroutine's behalf (m.curg is still the
-			// bubble goroutine there): those are runtime bookkeeping whose size
-			// and timing depend on process-wide history — e.g. newproc1's
-			// allgs-append growth, whose backing array is not an excluded pooled
-			// type and whose capacity carries across runs — not SUT heap growth.
-			// Counting one would shift the crossing run-to-run, and a crossing
-			// latched on g0 cannot start the GC anyway (gcStart bails on g0),
-			// which would leak the start to a later, possibly foreign,
-			// allocation (gc.md M4).
-			//
-			// And count only the SUT's own heap OBJECTS: runtime-internal pooled
-			// structs (g, sudog, _defer) are EXCLUDED because whether one is allocated
-			// vs reused from its cross-run-surviving cache (gFree / sudogcache /
-			// deferpool) is a pooling artifact of pre-run process history, not SUT heap
-			// growth — counting it would move the GC cycle boundary run-to-run for
-			// channel/goroutine-heavy SUTs (gc.md M4). Stacks are already excluded
-			// (stackalloc, not mallocgc), so this makes the trigger consistently reflect
-			// the SUT's real heap; and it needs no cache flush (flushing gFree would
-			// leak: allgs pins g's, so emptying it strands them across a test's runs).
-			if !dstIsInternalPooledType(typ) {
-				// Also attribute this object to the allocating goroutine's process
-				// (per-process allocation accounting, the OOM-fault metric; see
-				// dstProcAllocAdd). Same gate, same elemsize — deterministic allocation
-				// flow per process. No-op for the un-budgeted root (dstProc 0).
+		if cur := getg().m.curg; cur != nil && cur.bubble != nil && cur.bubble == dstSimBubble {
+			// Only the simulation bubble's own allocations reach the counters
+			// and the trigger: a non-bubble goroutine (or a foreign synctest
+			// bubble) allocating mid-run would otherwise move the cycle
+			// boundary and make NumGC and which cycle discovers a finalizer
+			// depend on unrelated process activity.
+			if dstIsInternalPooledType(typ) {
+				if typ != dstInternalPooledTypes.g {
+					// sudog/_defer count here by type. g's count at their
+					// allgadd publication instead: only allgs-pinned g's are
+					// provably immortal (allocm's g0/gsignal reach this
+					// branch with a bubble m.curg too, but can die via
+					// sched.freem — counting one would break
+					// counted-implies-live).
+					dstPooledAlloc.Add(int64(elemsize))
+				}
+				// A pooled struct (g/sudog/_defer) allocated on behalf of a
+				// bubble goroutine — on EITHER stack: malg allocates the g
+				// struct on systemstack with m.curg still the creating bubble
+				// goroutine. EXCLUDED from the trigger counter because whether
+				// one is allocated or reused from its cross-run-surviving
+				// cache (gFree / sudogcache / deferpool) is a pooling artifact
+				// of pre-run process history, not SUT heap growth — counting
+				// it would move the GC cycle boundary run-to-run for
+				// channel/goroutine-heavy SUTs (gc.md M4; no cache flush:
+				// flushing gFree would leak, allgs pins g's forever). But
+				// TRACKED here: the allocated ones stay live at every in-run
+				// mark (allgs; the caches, central ones uncleared while a run
+				// is active), so the target computation subtracts them back
+				// out of heapMarked (dstPooledMarked) — otherwise a cold run's
+				// fresh pool allocations inflate the GOGC-scaled target
+				// relative to a warmed rerun that reuses them, shifting the
+				// last cycle's discovery boundary and its tail.
+			} else if getg() == cur {
+				// getg() == cur excludes allocations the runtime performs ON
+				// SYSTEMSTACK on the bubble goroutine's behalf (m.curg is still
+				// the bubble goroutine there) that are not pooled structs:
+				// runtime bookkeeping whose size and timing depend on
+				// process-wide history — e.g. newproc1's allgs-append growth,
+				// whose old backing arrays also DIE mid-run, so it cannot be
+				// tracked as live like the pooled structs above — not SUT heap
+				// growth. Counting one would shift the crossing run-to-run,
+				// and a crossing latched on g0 cannot start the GC anyway
+				// (gcStart bails on g0), which would leak the start to a
+				// later, possibly foreign, allocation (gc.md M4). Stacks are
+				// already excluded entirely (stackalloc, not mallocgc).
+				//
+				// Also attribute the object to the allocating goroutine's
+				// process (per-process allocation accounting, the OOM-fault
+				// metric; see dstProcAllocAdd). Same gate, same elemsize —
+				// deterministic allocation flow per process. No-op for the
+				// un-budgeted root (dstProc 0).
 				dstHeapAlloc.Add(int64(elemsize))
 				dstProcAllocAdd(cur.dstProc, int64(elemsize))
 			}
-			// The crossing fires on the BUBBLE's OWN allocation: evaluate the trigger
-			// and start the GC only inside this gate, never for a foreign/infra
-			// allocation that happens next — otherwise a crossing latched by a bubble
-			// allocation that could not start GC at that point (e.g. m.locks > 1) would
-			// leak the start to an unseeded process-wide allocation (gc.md M4). An
-			// excluded-type allocation still runs the test (dstHeapAlloc is unchanged,
-			// so it only re-checks a possibly-already-crossed target) — a deterministic
-			// bubble point to start a GC the previous SUT allocation could not.
-			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-				gcStart(t)
+			if getg() == cur {
+				// The crossing fires on the BUBBLE's OWN allocation: evaluate
+				// the trigger and start the GC only inside this gate, never
+				// for a foreign/infra allocation that happens next — otherwise
+				// a crossing latched by a bubble allocation that could not
+				// start GC at that point (e.g. m.locks > 1) would leak the
+				// start to an unseeded process-wide allocation (gc.md M4). An
+				// excluded-type allocation still runs the test (dstHeapAlloc
+				// is unchanged, so it only re-checks a possibly-already-crossed
+				// target) — a deterministic bubble point to start a GC the
+				// previous SUT allocation could not. A systemstack allocation
+				// does not (gcStart bails on g0; the next user-stack bubble
+				// allocation re-checks).
+				if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+					gcStart(t)
+				}
 			}
 		}
 	}

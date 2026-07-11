@@ -923,6 +923,10 @@ func (c *gcControllerState) resetLive(bytesMarked uint64) {
 		// deterministic, per-object analogue of heapLive - heapMarked that drives the
 		// DST heap trigger. See runtime/dst.go dstHeapAlloc.
 		dstHeapAlloc.Store(0)
+		// Snapshot the pooled-struct bytes contained in this heapMarked, at
+		// the same STW point that sets it, so the trigger's target
+		// computation can subtract them consistently (see dstPooledMarked).
+		dstPooledMarked.Store(dstPooledAlloc.Load())
 	}
 	c.heapScan.Store(uint64(c.heapScanWork.Load()))
 	c.lastHeapScan = uint64(c.heapScanWork.Load())

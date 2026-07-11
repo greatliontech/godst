@@ -735,13 +735,17 @@ func TestDSTNonBubbleAllocTrigger(t *testing.T) {
 	}
 }
 
-// TestDSTGCSysstackAlloc: allocations the runtime performs on systemstack on
-// a bubble goroutine's behalf (allgs growth) are excluded from the DST heap
-// trigger — their size and timing are process history, not SUT heap growth.
-// Two in-process runs at one seed, run 1 growing allgs and run 2 reusing
-// gFree, must produce identical per-cycle discovery fingerprints. Mutation:
-// dropping the getg() == cur leg of the dispatcher gate counts run 1's
-// growth arrays and shifts its crossings.
+// TestDSTGCSysstackAlloc: cold-process and warm-process runs at one seed
+// agree on the full per-cycle discovery sequence INCLUDING the run-end tail.
+// Two exclusions make that hold: allocations the runtime performs on
+// systemstack on a bubble goroutine's behalf (allgs growth) never reach the
+// trigger counter — their size and timing are process history, not SUT heap
+// growth (mutation: dropping the getg() == cur leg of the dispatcher gate
+// counts run 1's growth arrays and shifts its crossings) — and the pooled
+// structs run 1 allocates fresh (g/sudog) are subtracted back out of the
+// GOGC-scaled target (dstPooledMarked; mutation: dropping the subtraction
+// re-inflates the cold run's late target and splits the totals — 52104 vs
+// 48626 at this shape and seed on the fixed tree).
 func TestDSTGCSysstackAlloc(t *testing.T) {
 	out := runTestProgDST(t, "DSTGCSysstackAlloc", "DSTSEED=12345")
 	if strings.TrimSpace(out) != "done" {

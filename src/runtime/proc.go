@@ -704,6 +704,19 @@ func allgadd(gp *g) {
 	}
 	atomic.Storeuintptr(&allglen, uintptr(len(allgs)))
 	unlock(&allglock)
+
+	if dstBuild && dstActive() {
+		// A fresh g published for a bubble goroutine: count its size-class
+		// bytes into the pooled-allocation tracker the DST trigger's target
+		// subtracts from heapMarked (see dstPooledAlloc). Counting happens
+		// HERE, not at the g's mallocgc, so only allgs-pinned g's — immortal
+		// for the process lifetime — enter the counter: an allocm-created
+		// g0/gsignal also allocates with a bubble m.curg but can die via
+		// sched.freem, which would break counted-implies-live.
+		if cur := getg().m.curg; cur != nil && cur.bubble != nil && cur.bubble == dstSimBubble {
+			dstPooledAlloc.Add(int64(dstPooledGBytes))
+		}
+	}
 }
 
 // allGsSnapshot returns a snapshot of the slice of all Gs.
