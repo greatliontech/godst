@@ -16,6 +16,8 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool { return false }
 
 func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool { return false }
 
+func dstSyscallHostClose(trap, fd uintptr) bool { return false }
+
 func dstSyscallMintingFcntl(trap, cmd uintptr) bool { return false }
 
 func dstSyscallRefuse(trap uintptr) {}

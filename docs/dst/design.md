@@ -842,7 +842,8 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
   syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
   pread64/pwrite64, fstat, fcntl, ioctl — the last so isatty probes on real stdio keep working) so
-  operations **on pre-run host handles** keep working. The fcntl allowlisting is
+  operations **on pre-run host handles** keep working (`close` excepted — it mutates the shared fd
+  table rather than doing I/O on a handle; see the host-close paragraph below). The fcntl allowlisting is
   **argument-aware**: its descriptor-MINTING commands (`F_DUPFD`/`F_DUPFD_CLOEXEC`) are refused —
   duplication mints a host fd, the class the fence exists for — while probe commands stay allowed. The reserved virtual-fd number range never reaches
   the host from this raw boundary: `Syscall`/`Syscall6` DISPATCH the settled subset (`fsync`,
@@ -861,7 +862,25 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
   page cache admits (32-bit hosts are refused before any memfd exists), every named fd wrapper
   bottoms out in the same trampolines, so one chokepoint covers both surfaces; non-bubble callers
-  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
+  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). `close` goes further
+  than the per-number invisibility check: a bubble goroutine's close of **any** real
+  (non-virtual) fd number is answered `EBADF` at the trampolines and **never dispatched to the
+  kernel**. The invisibility check alone cannot protect a fd that does not exist yet — the fence
+  check and the kernel entry are not atomic across Ms, so a dispatched close of a then-free
+  number races the harness assigning that number to a newborn host fd (a page-cache memfd, or
+  the runtime's lazily-created netpoll epoll fd) and can land after the assignment, killing the
+  newborn. Refusing dispatch outright removes bubble-originated *destruction* of host fds
+  entirely — a close that is never dispatched cannot straddle a creation — for the whole host-fd
+  space rather than one fd class. (An in-flight allowlisted *read/write* naming a then-free real
+  number can still straddle a creation and land on the newborn fd; that residual window is a
+  recorded gap this mechanism does not cover.) `EBADF` is sound
+  because a bubble goroutine can never *mint* a host fd (the fence refuses open/socket/pipe/dup),
+  so it owns no real fd to legitimately close: every bubble close of a real number is the
+  daemonize-sweep shape, and `EBADF` is exactly what production gives that sweep. The
+  knowingly-accepted divergence: a bubble close of an *inherited* pre-run handle (real stdio and
+  the like) reports `EBADF` where production reports success, and the handle stays open — a
+  host-table mutation the bubble is not allowed to make, in exchange for closing the
+  creation-race window (`TestDSTHostFDCloseRefused`). Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and
   `CLOCK_BOOTTIME` is also selected and split-safe — at the 32-bit-time trap on every arch AND the
   time64 trap (`clock_gettime64`, `__kernel_timespec`) on the 32-bit arches that have one: it
   returns the DST virtual base clock, and
@@ -1091,7 +1110,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
 | faults: seeded clock drift (`Drift`/`BoundedDrift` declared, `DriftClock` mid-run) | per-host rate over the base clock (see [faults.md](./faults.md)) | ✅ |
 | faults: OOM kill, scheduling (straggler) | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
-| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write/close on host fds stay (inherited-handle stance) | ✅ |
+| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write on host fds stay (inherited-handle stance); close of a real fd is answered `EBADF`, never dispatched | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
 | signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
 | `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ✅ |

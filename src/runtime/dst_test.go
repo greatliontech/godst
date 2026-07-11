@@ -770,6 +770,24 @@ func TestDSTMemfdFDIsolation(t *testing.T) {
 	}
 }
 
+// TestDSTHostFDCloseRefused: a bubble goroutine's close of a real
+// (non-virtual) fd number never reaches the kernel — answered EBADF at the
+// trampolines on both the named and raw surfaces. This is what makes host-fd
+// creation (page-cache memfds, the runtime's lazily-created netpoll epoll fd)
+// atomic with respect to in-flight bubble dispatch: a close that is never
+// dispatched cannot straddle the harness assigning that number to a newborn
+// fd. The prog proves the kernel never saw the close by pushing a byte
+// through a harness pipe whose read end the bubble "closed". Mutation:
+// letting SYS_CLOSE dispatch for non-virtual numbers really closes the pipe
+// and the post-run write/read fails; answering success instead of EBADF
+// fails the probes on the exact value.
+func TestDSTHostFDCloseRefused(t *testing.T) {
+	out := runTestProgDST(t, "DSTHostFDCloseRefused", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("bubble close of a host fd reached the kernel (got %q, want \"ok\")", out)
+	}
+}
+
 // TestDSTGCForeignStart: a DST-armed cycle is STARTED only inside the
 // bubble-allocation gate. The prog holds the bubble's live set above
 // Options.MemoryLimit (trigger condition persistently true) and churns a

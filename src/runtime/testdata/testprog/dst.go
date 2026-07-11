@@ -67,6 +67,7 @@ func init() {
 	register("DSTGCForeignStart", DSTGCForeignStart)
 	register("DSTGCSysstackAlloc", DSTGCSysstackAlloc)
 	register("DSTMemfdFDIsolation", DSTMemfdFDIsolation)
+	register("DSTHostFDCloseRefused", DSTHostFDCloseRefused)
 	register("DSTForeignCallbackDeferred", DSTForeignCallbackDeferred)
 	register("DSTRunqOverflowOrder", DSTRunqOverflowOrder)
 	register("DSTOvfFlushAtDeactivate", DSTOvfFlushAtDeactivate)
@@ -1237,6 +1238,67 @@ func DSTMemfdFDIsolation() {
 		}
 		os.Stdout.WriteString("done\n")
 	})
+}
+
+// DSTHostFDCloseRefused: a bubble goroutine closing a real (non-virtual) fd
+// number never reaches the kernel — it is EBADF, so a harness fd sharing the
+// real fd table survives the close. Closes the memfd-creation TOCTOU for the
+// whole host-fd space (not just page-cache fds — the netpoll epoll fd was a
+// victim too). The harness opens a pipe BEFORE the run (a bubble goroutine
+// cannot mint one — the fence refuses it); inside the run a bubble goroutine
+// closes the pipe's read fd on both the named and raw surfaces; after the run
+// the pipe must still carry a byte, proving no kernel close landed. Prints
+// "ok".
+func DSTHostFDCloseRefused() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var pfds [2]int
+	if err := syscall.Pipe(pfds[:]); err != nil { // harness (non-bubble): allowed
+		os.Stdout.WriteString("pipe: " + err.Error() + "\n")
+		return
+	}
+	rfd, wfd := pfds[0], pfds[1]
+	if rfd < 3 {
+		os.Stdout.WriteString("pipe read fd unexpectedly low\n")
+		return
+	}
+	var namedErr, rawErr, sixErr syscall.Errno
+	simulation.Run(n, func() {
+		if err := syscall.Close(rfd); err != nil { // named path (Syscall)
+			namedErr = err.(syscall.Errno)
+		}
+		if _, _, e := syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(rfd), 0, 0); e != 0 { // raw path (RawSyscall6)
+			rawErr = e
+		}
+		if _, _, e := syscall.Syscall6(syscall.SYS_CLOSE, uintptr(rfd), 0, 0, 0, 0, 0); e != 0 { // Syscall6 path
+			sixErr = e
+		}
+	})
+	if namedErr != syscall.EBADF {
+		os.Stdout.WriteString("named close of a host fd: got " + errStr(namedErr) + ", want EBADF\n")
+		return
+	}
+	if rawErr != syscall.EBADF {
+		os.Stdout.WriteString("raw close of a host fd: got " + errStr(rawErr) + ", want EBADF\n")
+		return
+	}
+	if sixErr != syscall.EBADF {
+		os.Stdout.WriteString("Syscall6 close of a host fd: got " + errStr(sixErr) + ", want EBADF\n")
+		return
+	}
+	// The pipe must still be open: the bubble closes never reached the
+	// kernel. A byte written to wfd must read back from rfd.
+	if _, err := syscall.Write(wfd, []byte{42}); err != nil {
+		os.Stdout.WriteString("pipe write after run: " + err.Error() + " (the read fd was really closed)\n")
+		return
+	}
+	var b [1]byte
+	if _, err := syscall.Read(rfd, b[:]); err != nil || b[0] != 42 {
+		os.Stdout.WriteString("pipe read after run: " + errStr(err) + " byte=" + strconv.Itoa(int(b[0])) + " (the read fd was really closed by a passed-through bubble close)\n")
+		return
+	}
+	syscall.Close(rfd) // harness cleanup (non-bubble): allowed
+	syscall.Close(wfd)
+	os.Stdout.WriteString("ok\n")
 }
 
 // DSTGCForeignStart: DST cycle STARTS are confined to the bubble-allocation

@@ -13,9 +13,12 @@ import _ "unsafe" // for go:linkname
 // sanctioned inherited-handle stance. Active virtual fd numbers are checked
 // separately and refused at the raw boundary before host dispatch. See
 // design.md "The interception boundary". Everything outside the family is
-// fenced: read/write/close on inherited handles keep working, but a bubble
+// fenced: read/write on inherited handles keep working, but a bubble
 // goroutine minting a new host resource (open, socket, pipe, dup, mmap, execve)
-// is refused. ioctl is included so isatty probes on real stdio still work.
+// is refused. close is in the family so a daemonize-style sweep stays the
+// EBADF loop it is in production, but a real-number close is answered before
+// this allowlist is consulted and never dispatched (dstSyscallHostClose).
+// ioctl is included so isatty probes on real stdio still work.
 //
 // nosplit so the raw-syscall trampolines can call it without growing their
 // uintptrkeepalive stack.
@@ -77,6 +80,30 @@ func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool {
 		return true
 	}
 	return dstSyscallVirtualFDArchTrap(trap)
+}
+
+// dstSyscallHostClose reports whether a bubble goroutine is closing a real
+// (non-virtual) fd number. Such a close must NEVER reach the real kernel: the
+// harness and the simulated process share the one real fd table, so a close
+// of a currently-free number races the harness assigning that number to a new
+// fd (a page-cache memfd, or the runtime's own lazily-created netpoll epoll
+// fd) between the fence check and the kernel dispatch — the closing M is
+// already mid-flight when sysmon's syscall retake hands its P to the
+// allocating goroutine. A bubble goroutine can never MINT a real fd (the
+// interception boundary refuses open/socket/pipe/dup), so it owns no real fd
+// to legitimately close; every real close is a daemonize-style sweep of a
+// number outside its simulated namespace. Answered EBADF — exactly what a fd
+// it never opened returns — closing the TOCTOU window for the whole host-fd
+// space rather than re-homing one fd class. Virtual-range closes are handled
+// by the named registry (dstFDClose); a RAW close of a virtual number is an
+// escape refused separately (dstSyscallVirtualFDTrap).
+//
+//go:nosplit
+func dstSyscallHostClose(trap, fd uintptr) bool {
+	if trap != SYS_CLOSE {
+		return false
+	}
+	return fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount
 }
 
 // dstSyscallMintingFcntl reports whether an allowlisted raw fcntl carries a

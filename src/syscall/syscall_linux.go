@@ -75,6 +75,12 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 			// EBADF as for a fd it never opened (see dstSyscallPageCacheFDTrap).
 			return ^uintptr(0), 0, EBADF
 		}
+		if dstSyscallHostClose(trap, a1) {
+			// A bubble goroutine closing a real (non-virtual) fd: never
+			// dispatched to the kernel, EBADF (see dstSyscallHostClose) — a
+			// passed-through close races the harness reusing the number.
+			return ^uintptr(0), 0, EBADF
+		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
 			dstSyscallRefuse(trap)
 		}
@@ -101,6 +107,12 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 		if dstSyscallPageCacheFDTrap(trap, a1) {
 			// A harness page-cache fd: invisible to the simulated process,
 			// EBADF as for a fd it never opened (see dstSyscallPageCacheFDTrap).
+			return ^uintptr(0), 0, EBADF
+		}
+		if dstSyscallHostClose(trap, a1) {
+			// A bubble goroutine closing a real (non-virtual) fd: never
+			// dispatched to the kernel, EBADF (see dstSyscallHostClose) — a
+			// passed-through close races the harness reusing the number.
 			return ^uintptr(0), 0, EBADF
 		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
@@ -140,6 +152,12 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) 
 		if dstSyscallPageCacheFDTrap(trap, a1) {
 			// A harness page-cache fd: invisible to the simulated process,
 			// EBADF as for a fd it never opened (see dstSyscallPageCacheFDTrap).
+			return ^uintptr(0), 0, EBADF
+		}
+		if dstSyscallHostClose(trap, a1) {
+			// A bubble goroutine closing a real (non-virtual) fd: never
+			// dispatched to the kernel, EBADF (see dstSyscallHostClose) — a
+			// passed-through close races the harness reusing the number.
 			return ^uintptr(0), 0, EBADF
 		}
 		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {

@@ -12,7 +12,7 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 |---|---|---|
 | [-race membership-gate doors lack reaching test arms](./dst-explore-race-door-reaching-arms.md) | L | the two -race membership mutants each have a killing test, or unreachability recorded |
 | [foreign work in a sim-idle window diverges replay](./dst-explore-foreign-idle-window-divergence.md) | M | idle-window composition replays deterministically, or diagnosed and recorded |
-| [in-flight host close can straddle memfd creation](./dst-memfd-inflight-close-toctou.md) | M | creation atomic w.r.t. in-flight dispatch, or the window proven empty |
+| [in-flight allowlisted read/write can straddle host-fd creation](./dst-fd-inflight-io-straddles-creation.md) | M | non-close dispatch atomic w.r.t. host-fd creation, or window proven empty |
 | [lazy-fire timestamp mixes regimes on drifted hosts](./dst-clock-lazy-fire-timestamp-drift.md) | L | delivered-value contract for rate≠1 lazily-fired timers stated in faults.md |
 | [net TIME_WAIT is unmodeled](./dst-net-time-wait-unmodeled.md) | M | close-time hold modeled, or divergence confirmed kept |
 | [Host/Process from non-bubble goroutines mid-run](./dst-sim-topology-apis-from-nonbubble.md) | M | declaration APIs guarded, or caller contract recorded |

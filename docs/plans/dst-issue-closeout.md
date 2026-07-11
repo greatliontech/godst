@@ -25,7 +25,7 @@ bound where the issue's own outcome clause allows it.
 
 - [x] 8. O_SYNC commit fires only for writes that wrote (`dst-fs-osync-zero-write-overcommits`)
 - [x] 9. HostFS inspection is side-effect-free on simulation state (`dst-hostfs-inspection-allocates-inodes`)
-- [ ] 10. Page-cache creation atomic w.r.t. in-flight host close, or the window proven empty (`dst-memfd-inflight-close-toctou`)
+- [x] 10. Page-cache creation atomic w.r.t. in-flight host close, or the window proven empty (`dst-memfd-inflight-close-toctou`)
 
 ## Network
 
