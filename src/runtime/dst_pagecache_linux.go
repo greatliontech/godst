@@ -476,7 +476,9 @@ func dstMappingFault(addr uintptr) {
 		print("dst: fault at ", hex(addr), " inside a simulated mapping\n")
 		throw("dst: a mapping fault crashed the process running the simulation body")
 	}
-	dstCrashProcessPid(pid)
+	if !dstMappingFaultTeardown(gp.dstProc) {
+		dstCrashProcessPid(pid)
+	}
 	dstParkCrashedSelf()
 	throw("dst: a process crashed by a mapping fault resumed")
 }

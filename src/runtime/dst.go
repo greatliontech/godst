@@ -2245,11 +2245,12 @@ func dstNetHostDead(host uint32) bool {
 
 // dstProcessTeardownHook is os's handler for all process-owned state and resources.
 // dstProcessStateTeardownHook is the logical cwd/environment subset used by host
-// power loss, which must not run resource cleanup that writes mappings back. Runtime is
+// power loss, which must not run process-exit resource cleanup. Runtime is
 // the dependency-free relay so testing/simulation can drive process death without
 // importing os.
 var dstProcessTeardownHook func(proc uint32)
 var dstProcessStateTeardownHook func(proc uint32)
+var dstMappingFaultTeardownHook func(proc uint32)
 
 // dstSetProcessTeardownHook registers os's process resource teardown handler.
 // Reached via //go:linkname from os's init.
@@ -2275,6 +2276,17 @@ func dstProcessStateTeardown(proc uint32) {
 	if dstProcessStateTeardownHook != nil {
 		dstProcessStateTeardownHook(proc)
 	}
+}
+
+//go:linkname dstSetMappingFaultTeardownHook
+func dstSetMappingFaultTeardownHook(fn func(proc uint32)) { dstMappingFaultTeardownHook = fn }
+
+func dstMappingFaultTeardown(proc uint32) bool {
+	if dstMappingFaultTeardownHook == nil {
+		return false
+	}
+	dstMappingFaultTeardownHook(proc)
+	return true
 }
 
 // dstDiskFaultHook is os's disk-fault handler, registered from os's init via the

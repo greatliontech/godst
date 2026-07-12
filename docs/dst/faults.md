@@ -842,8 +842,8 @@ out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect c
 Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit: the
 active process invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines
 are removed from the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close,
-fd-owned `flock`s release, process-owned mappings unregister after writable `MAP_SHARED` bytes are copied
-into host file state (never advancing the durable image — page cache is volatile), and the process's
+fd-owned `flock`s release, process-owned mappings unregister (their `MAP_SHARED` bytes already are the
+host page-cache pages; teardown performs no copy-back), and the process's
 connections go down. Teardown follows the kernel's order: the goroutines (threads) die first, then the
 resources close. A `Process` body's normal return (or panic unwind) IS the process's exit and routes
 through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn

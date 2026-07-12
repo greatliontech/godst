@@ -7,7 +7,7 @@ drains stranded readers), with the interleaving pinned
 ## Gap
 
 Severity M (review-found 2026-07-11, adjacent — the park and the kill paths
-predate the gate; the gate adds the hang consequence). Two reachable shapes:
+predate the gate; the gate adds the hang consequence). Reachable shape:
 
 - Goroutine A of process p1 calls Crash("p2"): it holds callerGate.RLock and
   parks at procTeardownMu because B holds that mutex inside crashHost("h") —
@@ -15,10 +15,6 @@ predate the gate; the gate adds the hang consequence). Two reachable shapes:
   sema-parked; the sema dequeue skips crashed waiters, so A never resumes
   and its deferred RUnlock is stranded. leaveSimulation's callerGate.Lock
   then blocks forever — the run hangs at deactivation.
-- dstMappingFault calls dstCrashProcessPid from the signal path with no
-  procTeardownMu at all, so a sibling goroutine's mapping-fault crash can
-  kill a reader parked at procTeardownMu with no serialization.
-
 Concurrent fault APIs are exactly what procTeardownMu exists to serialize,
 so the interleaving is in-spec reachable.
 

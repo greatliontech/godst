@@ -705,7 +705,9 @@ fd; protection is **hardware**, per view: a store through a read-only mapping fa
 mapping — a store through a read-only view, or an access to a page the file does not have — is the
 simulated process's death: unswallowable (checked ahead of `recover`'s reach, `debug.SetPanicOnFault`
 included), killing exactly the touching process while peers and the harness run on, as production SIGBUS
-does. **Mapping addresses are a pure function of the schedule**: every mapping is carved `MAP_FIXED` from
+does. Mapping-fault death runs the same exactly-once lifecycle as explicit process crash: all invocation
+threads die, files/fds/flocks/mappings/connections/listeners close, and cwd/environment state is discarded
+before a same-name restart. **Mapping addresses are a pure function of the schedule**: every mapping is carved `MAP_FIXED` from
 a canonical reserved region at bump-allocated offsets, reset at the run boundary, so one seed yields one
 address within a process and across invocations — the address is observable (the SUT holds the slice), so
 replay-exactness owns it; region exhaustion is therefore also deterministic and reports `ENOMEM`.

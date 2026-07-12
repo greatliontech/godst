@@ -60,6 +60,9 @@ func dstProcessTeardown(proc uint32)
 //go:linkname dstProcessStateTeardown runtime.dstProcessStateTeardown
 func dstProcessStateTeardown(proc uint32)
 
+//go:linkname dstSetMappingFaultTeardownHook runtime.dstSetMappingFaultTeardownHook
+func dstSetMappingFaultTeardownHook(fn func(proc uint32))
+
 //go:linkname dstSelfCrashed runtime.dstSelfCrashed
 func dstSelfCrashed() bool
 
@@ -273,6 +276,26 @@ var activeProcs struct {
 // Level 2 exploration, whose access-granularity scheduling can yield inside
 // this package's instrumented accesses.
 var procTeardownMu sync.Mutex
+var mappingFaultTeardownRuns uint64
+
+func init() { dstSetMappingFaultTeardownHook(mappingFaultProcessTeardown) }
+
+func mappingFaultProcessTeardown(proc uint32) {
+	procTeardownMu.Lock()
+	defer procTeardownMu.Unlock()
+	pids := activeProcPIDs(proc)
+	if len(pids) == 0 {
+		return
+	}
+	mappingFaultTeardownRuns++
+	activeProcClearAll(proc)
+	for _, pid := range pids {
+		dstCrashProcessPid(pid)
+	}
+	dstProcessTeardown(proc)
+	dstNetPartitionOp(partOpResetProc, proc, 0)
+	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+}
 
 func nodeRegReset() {
 	nodeReg.mu.Lock()
@@ -578,8 +601,8 @@ func crashProcess(name string) {
 // is descheduled permanently (no defers run — a killed process does not
 // unwind), its pids read dead (Kill(pid, 0) answers ESRCH and the /proc
 // entries disappear), its open simulated files and virtual fds close, fd-owned
-// flocks release, writable shared mappings copy back to file state (page cache
-// belongs to the kernel) and unregister, its connections RESET — the peer
+// flocks release, shared mappings unregister (their bytes already are the
+// kernel page-cache pages), its connections RESET — the peer
 // observes ECONNRESET — and its listeners close. The host filesystem survives
 // untouched, unsynced writes included: a process crash does not tear the disk;
 // only the host-crash fault restores the durable image. If the calling
@@ -725,8 +748,8 @@ func CrashHost(name string) {
 // fresh per-process pid (os.Getpid) for the dynamic extent of f and restores them on
 // return, labeling the whole subtree. The body's return (or panic) is the process's
 // EXIT: goroutines it started that are still running are killed, its open simulated
-// files and virtual fds close (releasing flocks; writable shared mappings write back
-// and unregister — page-cache contents survive the exit), its listeners close, and
+// files and virtual fds close (releasing flocks; shared mappings unregister while
+// their page-cache contents survive the exit), its listeners close, and
 // its connections close with the kernel's conditional — an end holding unread
 // received data answers the peer with RST (ECONNRESET), otherwise the peer drains
 // buffered bytes then reads io.EOF — so a
