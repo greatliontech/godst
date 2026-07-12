@@ -583,6 +583,11 @@ func crashProcess(name string) {
 		}
 		return
 	}
+	for _, pid := range pids {
+		if dstPidOwnsBubbleMain(pid) {
+			panic("testing/simulation: Crash would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
+		}
+	}
 	activeProcClearAll(proc)
 	// Kernel teardown order: the threads die first, then exit_files closes fds
 	// (releasing flocks, unmapping (the bytes are the page cache's; nothing to write back)) and the sockets

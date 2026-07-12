@@ -226,11 +226,54 @@ func TestDSTCrashSelf(t *testing.T) {
 // whole-binary "all goroutines are asleep" fatal with no diagnostic.
 func TestDSTCrashKillingTheRunMainPanics(t *testing.T) {
 	var got any
+	var killErr, procfsErr, writeErr, listenerCloseErr error
+	var livePIDs int
+	var refusalValues []any
 	Run(1, func() {
 		func() {
-			defer func() { got = recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					got = r
+				}
+			}()
 			Process("inline", func() {
-				Crash("inline")
+				mainPID := os.Getpid()
+				ln, err := net.Listen("tcp", ":0")
+				if err != nil {
+					panic(err)
+				}
+				f, err := os.Create("/still-live")
+				if err != nil {
+					panic(err)
+				}
+				siblingStarted := make(chan struct{})
+				releaseSibling := make(chan struct{})
+				siblingDone := make(chan struct{})
+				go Process("inline", func() {
+					close(siblingStarted)
+					<-releaseSibling
+					close(siblingDone)
+				})
+				<-siblingStarted
+				for range 2 {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								got = r
+								refusalValues = append(refusalValues, r)
+							}
+						}()
+						Crash("inline")
+					}()
+				}
+				killErr = syscall.Kill(mainPID, 0)
+				_, procfsErr = os.ReadFile("/proc/" + strconv.Itoa(mainPID) + "/stat")
+				_, writeErr = f.Write([]byte("alive"))
+				listenerCloseErr = ln.Close()
+				livePIDs = len(activeProcPIDs(internProc("inline")))
+				close(releaseSibling)
+				<-siblingDone
+				f.Close()
 			})
 		}()
 	})
@@ -240,6 +283,18 @@ func TestDSTCrashKillingTheRunMainPanics(t *testing.T) {
 	msg, _ := got.(string)
 	if !strings.Contains(msg, "would kill the run's main goroutine") {
 		t.Fatalf("panic = %v, want the run-main refusal naming the fix", got)
+	}
+	if len(refusalValues) != 2 {
+		t.Fatalf("repeated run-main crashes produced %d refusals, want 2", len(refusalValues))
+	}
+	for i, refusal := range refusalValues {
+		msg, _ := refusal.(string)
+		if !strings.Contains(msg, "would kill the run's main goroutine") {
+			t.Fatalf("refusal %d = %v, want the run-main diagnostic", i+1, refusal)
+		}
+	}
+	if killErr != nil || procfsErr != nil || writeErr != nil || listenerCloseErr != nil || livePIDs != 2 {
+		t.Fatalf("refused crash mutated live state: kill=%v procfs=%v write=%v listenerClose=%v livePIDs=%d", killErr, procfsErr, writeErr, listenerCloseErr, livePIDs)
 	}
 }
 

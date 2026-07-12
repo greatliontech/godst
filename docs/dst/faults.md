@@ -893,6 +893,8 @@ Silently ending the run instead would let a test's post-crash assertions vanish 
 refusal guards `CrashHost` for the machine the run's main goroutine runs on, and — because a host crash
 has many victims — both faults pre-scan every victim and refuse *before* the first teardown step, so a
 refused fault never leaves half a universe destroyed.
+Process-crash refusal likewise preflights every live invocation before clearing any PID, registration,
+or resource; recovering the refusal observes the entire logical process unchanged.
 
 **A host is not a process.** `CrashHost` kills the union of two goroutine sets: every goroutine of a
 process declared on the host (pid-keyed — which also catches a goroutine of that process momentarily

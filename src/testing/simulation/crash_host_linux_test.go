@@ -1004,6 +1004,7 @@ func TestDSTCrashHostSparesAppClosedConns(t *testing.T) {
 					t.Errorf("victim accept: %v", err)
 					return
 				}
+				<-dialed // keep the accepted endpoint live through the complete handshake
 				if _, err := c.Write([]byte("abc")); err != nil {
 					t.Errorf("victim write: %v", err)
 					return
