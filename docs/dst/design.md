@@ -470,7 +470,8 @@ the family wildcard form — `0.0.0.0:p` / `[::]:p`, dialable back to the listen
 maps to internally), and error identity is production-shaped
 throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listens `EADDRINUSE`; every
 operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
-reads from a gracefully closed peer drain buffered data then return `io.EOF` — but a `Close()` of an
+reads from a gracefully closed peer drain buffered data then return `io.EOF`; FIN/EOF is persistent
+state, so every concurrently blocked reader wakes to consume data or observe EOF without another event — but a `Close()` of an
 end whose receive queue holds UNREAD data answers with RST instead of FIN, and the peer's next read
 fails `ECONNRESET` without draining (the kernel's close(2) conditional; bytes still in flight count
 as queued — the recorded collapse: the sim RSTs immediately, one of the two orderings the real

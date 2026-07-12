@@ -254,7 +254,8 @@ func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wa
 		// in-flight. A woken second reader either grabs arrived bytes (re-waking
 		// again) or arms a timer for the in-flight head; either terminates. A reader
 		// that pops nothing does not re-wake, so there is no spin.
-		return n, len(s.segs) > 0, false, 0
+		terminal := s.closed && s.closeAt <= maxArrival && len(s.segs) == 0
+		return n, len(s.segs) > 0 || terminal, false, 0
 	}
 	if s.closed && s.closeAt <= maxArrival && len(s.segs) == 0 {
 		return 0, false, true, 0
@@ -473,6 +474,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			return n, nil
 		}
 		if eof {
+			e.in.wake() // EOF is persistent: hand the condition to another blocked reader.
 			return 0, io.EOF
 		}
 		// A retransmit-horizon death surfaces only after deliverable data and a

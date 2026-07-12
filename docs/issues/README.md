@@ -14,7 +14,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [foreign Process exit teardown can span a run activation](./dst-sim-process-exit-teardown-spans-activation.md) | M | teardown cannot execute into an undeclared-in run, or acceptance recorded |
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
-| [graceful EOF can strand a concurrent reader](./dst-net-concurrent-eof-strands-reader.md) | H | persistent EOF wakes every eligible reader |
 | [SYN-ACK traversal ignores cancellation and teardown](./dst-net-synack-ignores-cancel-and-teardown.md) | H | full handshake observes context and endpoint death |
 | [accept handoff precedes connection ownership](./dst-net-accept-handoff-precedes-ownership.md) | H | endpoints are lifecycle-owned before handoff is observable |
 | [concurrent same-name Process starts can acquire two hosts](./dst-process-cross-host-admission-race.md) | H | different-host validation and registration are atomic |

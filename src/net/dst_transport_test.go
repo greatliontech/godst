@@ -5,6 +5,7 @@
 package net
 
 import (
+	"internal/synctest"
 	"io"
 	"strings"
 	"sync"
@@ -41,6 +42,60 @@ func dialLoopback(t *testing.T) (server, client Conn) {
 		t.Fatalf("Dial: %v", err)
 	}
 	return <-accepted, client
+}
+
+func TestDSTConcurrentReadersAllObserveEOF(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for _, withData := range []bool{false, true} {
+		name := "empty"
+		if withData {
+			name = "final-buffer"
+		}
+		t.Run(name, func(t *testing.T) {
+			for seed := uint64(1); seed <= 20; seed++ {
+				simulation.Run(seed, func() {
+					server, client := dialLoopback(t)
+					defer server.Close()
+					server.SetReadDeadline(time.Now().Add(time.Second))
+					type result struct {
+						n   int
+						err error
+					}
+					results := make(chan result, 2)
+					started := make(chan struct{}, 2)
+					for i := 0; i < 2; i++ {
+						go func() {
+							started <- struct{}{}
+							b := make([]byte, 1)
+							n, err := server.Read(b)
+							results <- result{n, err}
+						}()
+					}
+					<-started
+					<-started
+					synctest.Wait() // both readers are parked in Read before FIN/data arrives
+					if withData {
+						if _, err := client.Write([]byte("x")); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := client.Close(); err != nil {
+						t.Fatal(err)
+					}
+					a, b := <-results, <-results
+					if withData {
+						if !((a.n == 1 && a.err == nil && b.n == 0 && b.err == io.EOF) || (b.n == 1 && b.err == nil && a.n == 0 && a.err == io.EOF)) {
+							t.Fatalf("reader results = (%d,%v), (%d,%v); want data and EOF", a.n, a.err, b.n, b.err)
+						}
+					} else if a.n != 0 || a.err != io.EOF || b.n != 0 || b.err != io.EOF {
+						t.Fatalf("reader results = (%d,%v), (%d,%v); want two EOFs", a.n, a.err, b.n, b.err)
+					}
+				})
+			}
+		})
+	}
 }
 
 // TestDSTNetSameHostMutualWrite is the H3 regression: two co-located peers each
