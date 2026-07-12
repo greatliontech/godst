@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"context"
+	"fmt"
 	"internal/synctest"
 	"internal/testenv"
 	"os"
@@ -940,6 +941,41 @@ func TestExplorePrefixDivergenceReportsForeignIdleWindow(t *testing.T) {
 	isolated := prefixDivergenceMessageForRun(false, false)
 	if strings.Contains(isolated, "incomplete exploration") || !strings.Contains(isolated, "internal error") {
 		t.Fatalf("foreign-free divergence message = %q", isolated)
+	}
+}
+
+func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
+	called := false
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		ExploreWith(1, ExploreOptions{Mode: ExploreMode(99), CrashTear: true}, func() bool {
+			called = true
+			return false
+		})
+	}()
+	if got == nil || !strings.Contains(fmt.Sprint(got), "unknown ExploreMode") {
+		t.Fatalf("panic = %v, want unknown ExploreMode", got)
+	}
+	if called {
+		t.Fatal("invalid mode invoked SUT")
+	}
+	invocations := 0
+	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 20}, func() bool {
+		invocations++
+		var wg sync.WaitGroup
+		wg.Add(3)
+		for i := 0; i < 3; i++ {
+			go func() {
+				defer wg.Done()
+				runtime.Gosched()
+			}()
+		}
+		wg.Wait()
+		return false
+	})
+	if invocations != 20 || res.Schedules != 20 {
+		t.Fatalf("valid exploration after rejection = invocations %d, schedules %d; want 20, 20", invocations, res.Schedules)
 	}
 }
 

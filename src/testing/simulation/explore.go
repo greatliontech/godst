@@ -216,6 +216,9 @@ func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
 // report BudgetHit and never report Exhausted for truncated coverage. It has the
 // same process-global non-overlap restriction as Explore.
 func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResult {
+	if opts.Mode != Exhaustive && opts.Mode != DPOR {
+		panic("testing/simulation: ExploreWith unknown ExploreMode")
+	}
 	enterSimulation("Explore", "testing/simulation: Explore requires building with -tags dst")
 	defer leaveSimulation()
 	setCrashTear(opts.CrashTear)

@@ -615,8 +615,9 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    and a real reduction (atomicity 180→10; 2-goroutine counter 180→10; 3-goroutine counter 20160→539).
    Foreclosure: a strategy at the seam.
 4. **`Explore` outer loop + API** (D4; **VALIDATED [V]**). `simulation.Explore(seed, mode, sut)` drives
-   repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
-   DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
+    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
+   DPOR modes share the loop. Any other `ExploreMode` panics before simulation state or the SUT is
+   entered; unknown values never fall back to Exhaustive. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
     `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
     simulation decisions downgrade `Exhausted` — reported, never silent, and conservative: with
     simulation membership a STICKY per-goroutine property, consecutive singleton no-choice yields
