@@ -106,7 +106,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 51. different-host liveness validation and active-process registration are atomic (`dst-process-cross-host-admission-race`)
 - [x] 52. process-crash preflight rejects run-main victims before any registration or pid mutation (`dst-crash-main-refusal-mutates-state`)
 - [x] 53. normal exit orders invocation-thread death and pid/procfs liveness coherently, and closes logical-process resources only on the last invocation (`dst-process-exit-publishes-dead-too-early`)
-- [ ] 54. a pre-run Process exit cannot tear into a newly active run (`dst-sim-process-exit-teardown-spans-activation`)
+- [x] 54. a pre-run Process exit cannot tear into a newly active run (`dst-sim-process-exit-teardown-spans-activation`)
 - [ ] 55. PID exhaustion rolls back node identity and victim registration completely (`dst-process-pid-exhaustion-leaks-stamp`)
 
 ## Simulation Host and caller-gate functions

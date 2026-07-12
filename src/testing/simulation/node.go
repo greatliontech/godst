@@ -30,6 +30,9 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
 //go:linkname dstCurrentNode runtime.dstCurrentNode
 func dstCurrentNode() (host, proc uint32)
 
+//go:linkname dstNetEpoch runtime.dstNetEpoch
+func dstNetEpoch() uint64
+
 //go:linkname dstReestablishHostClock runtime.dstReestablishHostClock
 func dstReestablishHostClock(host uint32, offset, ppb int64) bool
 
@@ -778,6 +781,11 @@ func CrashHost(name string) {
 // seed (see Host).
 func Process(name string, f func()) {
 	release := requireBubbleDeclCaller("Process")
+	declaredActive := runActive.Load()
+	var declaredEpoch uint64
+	if declaredActive {
+		declaredEpoch = dstNetEpoch()
+	}
 	// The gate covers the declaration mutations below and releases before f
 	// (ordinary goroutine code) runs; the flag keeps the panic paths covered.
 	// Registered FIRST so it runs LAST at unwind — by which point either the
@@ -845,6 +853,14 @@ func Process(name string, f func()) {
 		// waiter (the sema dequeue additionally skips crashed waiters).
 		dstSetProcessPid(oldPid)
 		dstSetNode(oldH, oldP)
+		// Teardown belongs to the run admitted under callerGate. A pre-run
+		// Process body may span activation, but its stale proc/PID identity must
+		// never apply to that new run.
+		callerGate.RLock()
+		defer callerGate.RUnlock()
+		if !declaredActive || !runActive.Load() || dstNetEpoch() != declaredEpoch {
+			return
+		}
 		// The last-invocation decision and the teardown it triggers are one
 		// critical section (procTeardownMu): a same-name restart cannot
 		// register between the two and have its fresh resources closed by the
@@ -865,15 +881,13 @@ func Process(name string, f func()) {
 		// Outside an active run there is nothing to exit — the registries hold a
 		// finished run's leaked state (deterministic, host-isolated, meaningless),
 		// which teardown must not disturb.
-		if runActive.Load() {
-			dstStopProcessThreads(simPid)
-			if last {
-				dstProcessTeardown(proc)
-				dstNetPartitionOp(partOpCloseProcConns, proc, 0)
-				dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
-			}
-			dstSetPidLive(simPid, false)
+		dstStopProcessThreads(simPid)
+		if last {
+			dstProcessTeardown(proc)
+			dstNetPartitionOp(partOpCloseProcConns, proc, 0)
+			dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 		}
+		dstSetPidLive(simPid, false)
 		activeProcClear(proc, simPid)
 	}()
 	dstSetPidLive(simPid, true)

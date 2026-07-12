@@ -413,9 +413,8 @@ for its failing arbitration at the flip's edge; a bubble caller landing in exact
 parks briefly at wall-clock timing, a perturbation confined to the winner's first instants.) (`TestDSTRunActivationExcludesInFlightGuardedOps`,
 `TestDSTRunDeactivationExcludesInFlightGuardedOps`). The declaration APIs hold the gate through
 their declaration mutations, not through `f`: user code inside `Host`/`Process` bodies runs
-ungated, and so does `Process`'s exit teardown at `f`'s return — a foreign pre-run `Process`
-whose `f` spans a run activation can therefore still tear into the new run at exit, a known
-open window tracked outside this contract.
+ungated. `Process` latches the admitted run epoch and reacquires the gate for exit teardown, so a
+pre-run body spanning activation cannot apply stale PID or process identity to the new run.
 
 ### The fault model: policies at existing seams
 
