@@ -475,6 +475,43 @@ func TestDSTClockDriftN1(t *testing.T) {
 	}
 }
 
+func TestDSTClockDriftLazyTimerTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ppb          int64
+		wantAtAnchor time.Duration
+		wantDelayed  time.Duration
+	}{
+		{"fast", 1_000_000_000, -500 * time.Millisecond, -time.Second},
+		{"slow", -500_000_000, time.Second, 2 * time.Second},
+	} {
+		for _, armAfter := range []time.Duration{0, time.Second} {
+			for _, receiveAt := range []time.Duration{2 * time.Second, 3 * time.Second} {
+				t.Run(tc.name+"/arm-"+armAfter.String()+"/receive-"+receiveAt.String(), func(t *testing.T) {
+					var offset time.Duration
+					Run(1, func() {
+						Host("h", HostConfig{Clock: Drift(tc.ppb)}, func() {
+							time.Sleep(armAfter)
+							start := time.Now()
+							timer := time.NewTimer(time.Second)
+							time.Sleep(receiveAt)
+							stamp := <-timer.C
+							offset = time.Duration(stamp.UnixNano() - start.Add(time.Second).UnixNano())
+						})
+					})
+					want := tc.wantAtAnchor
+					if armAfter != 0 {
+						want = tc.wantDelayed
+					}
+					if offset != want {
+						t.Fatalf("lazy timer timestamp offset = %v, want %v", offset, want)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestDSTClockDriftLargeDuration exercises the overflow-safe conversion: a long sleep on
 // a drifting host converts without int64 overflow (d*1e9 would overflow naively).
 func TestDSTClockDriftLargeDuration(t *testing.T) {

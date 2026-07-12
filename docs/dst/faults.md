@@ -725,7 +725,21 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   converted at all (it never re-arms) and a periodic timer's conversion move is recorded on the
   timer and added back to the delivery delay — an overdue tick or timer crossing a rate change
   reports the same due time it would have reported without the change
-  (`TestDSTClockDriftClockOverdueDeliveredTimestamp`). The conversion skips the `when == 0` "not running"
+  (`TestDSTClockDriftClockOverdueDeliveredTimestamp`). For a STANDING non-unit rate, a channel timer
+  first received after its due base instant retains the fake-timer callback's mixed clock domains:
+  `sendTime` runs in root/base clock context and reconstructs the base-coordinate due instant. If a
+  host duration `d` arms at converted base duration `D=ceil(d/rate)`, and host wall minus base wall at
+  arm is `C`, the delivered wall timestamp is displaced from the host-perceived due timestamp by
+  `D-C-d`. At a zero-offset drift anchor (`C=0`) this is approximately `(1-rate)*D`; floor/ceil
+  composition contributes less than 2 ns beyond that term, so only in that anchored case is the
+  absolute displacement bounded by `abs(ppb)*D/1e9 + 2ns`. Standing drift, skew, and steps contribute
+  through `C`; there is no duration-only bound independent of that clock offset. The displacement does
+  not grow with additional lazy-receive delay. This is
+  the modeled timestamp behavior, distinct from the deadline contract (the timer still becomes
+  eligible never-early in host time), and avoids pretending the runtime retains historical
+  wall-at-due state that it does not store. Enforced for exactly divisible fast and slow rates by
+  `TestDSTClockDriftLazyTimerTimestamp`, including delayed-arm cases with accumulated nonzero `C`.
+  The conversion skips the `when == 0` "not running"
   sentinel and clamps its result above it — an extreme slowdown can remap the remainder past the
   whole base epoch, and the sentinel value would wedge the lazy fire;
   `TestDSTClockDriftClockOverdueTicker` (dividing and non-dividing rates, exact-multiple and

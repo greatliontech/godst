@@ -43,7 +43,7 @@ grouped by the functions they change. WIP = 1.
 ## Runtime clock functions
 
 - [x] 20. `dstFakeTimersRoll` and `dstRegisterFakeTimer` preserve new-epoch registrations under multi-P activation (`dst-clock-fake-timer-roll-loses-registration`)
-- [ ] 21. lazy-fire timestamp semantics on drifted hosts are implemented or recorded with their bound (`dst-clock-lazy-fire-timestamp-drift`)
+- [x] 21. lazy-fire timestamp semantics on drifted hosts are implemented or recorded with their bound (`dst-clock-lazy-fire-timestamp-drift`)
 
 ## Runtime scheduling functions
 
