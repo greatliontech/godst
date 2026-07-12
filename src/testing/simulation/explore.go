@@ -111,6 +111,9 @@ type ExploreResult struct {
 	// coverage is conservatively best-effort: Exhausted is false —
 	// reported, never silently capped.
 	ForeignSched bool
+	// UnattributedRaces counts process-global race reports observed during runs
+	// in which foreign work was scheduled. They are not replayable SUT failures.
+	UnattributedRaces int
 	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
 	BudgetHit bool
@@ -556,20 +559,18 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 	var carriedRace []Failure
 	totalSchedules := 0
 	foreignSeen := false
+	unattributedRaces := 0
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true, ForeignSched: foreignSeen}
+			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces)
 		}
 		res, grew := exhaustiveExplorePass(seed, sut, forces, passCfg)
-		totalSchedules += res.Schedules
-		res.Schedules = totalSchedules
+		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces)
 		// Churn is cross-pass state: coverage in the FINAL pass is built on
 		// forces promoted (and race failures carried) from earlier passes, so
 		// churn during any pass taints the whole result even if the foreign
 		// goroutine exited before the last pass.
-		foreignSeen = foreignSeen || res.ForeignSched
-		res.ForeignSched = foreignSeen
 		if foreignSeen {
 			res.Exhausted = false
 		}
@@ -596,6 +597,19 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 			}
 		}
 	}
+}
+
+func mergeExplorePass(res *ExploreResult, totalSchedules *int, foreignSeen *bool, unattributedRaces *int) {
+	*totalSchedules += res.Schedules
+	res.Schedules = *totalSchedules
+	*foreignSeen = *foreignSeen || res.ForeignSched
+	res.ForeignSched = *foreignSeen
+	*unattributedRaces += res.UnattributedRaces
+	res.UnattributedRaces = *unattributedRaces
+}
+
+func exploreBudgetResult(schedules int, failures []Failure, foreign bool, unattributedRaces int) ExploreResult {
+	return ExploreResult{Schedules: schedules, Failures: failures, BudgetHit: true, ForeignSched: foreign, UnattributedRaces: unattributedRaces}
 }
 
 // checkReplayPrefix verifies DST-L2-2 over a replayed schedule prefix: each frame's
@@ -737,8 +751,12 @@ func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessFor
 	if r.failed {
 		res.Failures = append(res.Failures, newFailure(prefix, false, "", "", forces))
 	}
-	for i := 0; i < r.raceCount; i++ {
-		res.Failures = append(res.Failures, newFailure(prefix, true, "", "", forces))
+	if r.tr.foreignSched {
+		res.UnattributedRaces += r.raceCount
+	} else {
+		for i := 0; i < r.raceCount; i++ {
+			res.Failures = append(res.Failures, newFailure(prefix, true, "", "", forces))
+		}
 	}
 	if r.panic != "" {
 		res.Failures = append(res.Failures, newFailure(prefix, false, r.panic, "", forces))
@@ -924,17 +942,15 @@ func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult 
 	var carriedRace []Failure
 	totalSchedules := 0
 	foreignSeen := false
+	unattributedRaces := 0
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return ExploreResult{Schedules: totalSchedules, Failures: carriedRace, BudgetHit: true, ForeignSched: foreignSeen}
+			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces)
 		}
 		res, grew := dporExplorePass(seed, sut, forces, passCfg)
-		totalSchedules += res.Schedules
-		res.Schedules = totalSchedules
+		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces)
 		// See exhaustiveExplore: churn in any pass taints the whole result.
-		foreignSeen = foreignSeen || res.ForeignSched
-		res.ForeignSched = foreignSeen
 		if foreignSeen {
 			res.Exhausted = false
 		}

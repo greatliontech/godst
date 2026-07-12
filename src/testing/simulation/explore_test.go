@@ -899,6 +899,39 @@ func TestExploreForeignSchedReported(t *testing.T) {
 	}
 }
 
+func TestExploreRaceAttributionRequiresForeignFreeRun(t *testing.T) {
+	var foreign ExploreResult
+	appendRunFailures(&foreign, []uint64{1}, nil, runResult{
+		raceCount: 2,
+		tr:        exploreTrace{foreignSched: true},
+	})
+	if foreign.UnattributedRaces != 2 || len(foreign.Failures) != 0 {
+		t.Fatalf("foreign race aggregation = unattributed %d, failures %v", foreign.UnattributedRaces, foreign.Failures)
+	}
+
+	var isolated ExploreResult
+	appendRunFailures(&isolated, []uint64{1}, nil, runResult{raceCount: 2})
+	if isolated.UnattributedRaces != 0 || len(isolated.Failures) != 2 || !isolated.Failures[0].Race || !isolated.Failures[1].Race {
+		t.Fatalf("isolated race aggregation = unattributed %d, failures %v", isolated.UnattributedRaces, isolated.Failures)
+	}
+}
+
+func TestExploreUnattributedRacesAccumulateAcrossPasses(t *testing.T) {
+	total, unattributed := 0, 0
+	foreign := false
+	first := ExploreResult{Schedules: 2, ForeignSched: true, UnattributedRaces: 3}
+	mergeExplorePass(&first, &total, &foreign, &unattributed)
+	second := ExploreResult{Schedules: 4, UnattributedRaces: 2}
+	mergeExplorePass(&second, &total, &foreign, &unattributed)
+	if second.Schedules != 6 || !second.ForeignSched || second.UnattributedRaces != 5 {
+		t.Fatalf("merged pass = schedules %d, foreign %v, unattributed %d", second.Schedules, second.ForeignSched, second.UnattributedRaces)
+	}
+	budget := exploreBudgetResult(total, nil, foreign, unattributed)
+	if !budget.BudgetHit || budget.UnattributedRaces != 5 {
+		t.Fatalf("budget result = %+v", budget)
+	}
+}
+
 func TestExploreResetsScheduledIdentityAcrossRuns(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")

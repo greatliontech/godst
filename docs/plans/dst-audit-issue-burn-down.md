@@ -53,7 +53,7 @@ grouped by the functions they change. WIP = 1.
 
 - [x] 23. panic, deadlock, access, ready-edge, and sync-event recorders all key on active simulation membership (`dst-explore-recorder-gates-not-membership-keyed`)
 - [x] 24. race-build tests independently reach and kill each foreign access and sync-event membership mutant, or record structural unreachability (`dst-explore-race-door-reaching-arms`)
-- [ ] 25. race failures are attributed to the active simulation rather than process-global foreign races (`dst-explore-foreign-races-misattributed`)
+- [x] 25. race failures are attributed to the active simulation rather than process-global foreign races (`dst-explore-foreign-races-misattributed`)
 - [ ] 26. buffered direct handoff records the slot reuse HB relation used by the race detector (`dst-explore-buffered-direct-handoff-misses-hb`)
 
 ## Exploration scheduling functions

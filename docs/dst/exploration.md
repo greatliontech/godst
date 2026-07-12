@@ -482,8 +482,9 @@ deterministic function of the seed/schedule (same seed → 100/100 identical nor
    by the SUT's own assertions in the same explored interleaving.
 
 Wired into `Explore`: `runOnce` reads `runtime.RaceErrors()` (via the build-tagged
-`dstRaceErrors` — real under `-race`, 0 otherwise) before and after each scheduled Run; each NEW race
-count increment appends one `Failure` with `Race=true`. The detector dedups by signature, so each distinct
+`dstRaceErrors` — real under `-race`, 0 otherwise) before and after each scheduled Run. In a foreign-free
+run each NEW race count increment appends one `Failure` with `Race=true`; if foreign work was scheduled,
+the process-global increment instead contributes to `UnattributedRaces` and creates no replay token. The detector dedups by signature, so each distinct attributable
 race yields exactly one `Race` failure — the first schedule that exhibits it, including any access-force set
 active in that pass so `simulation.Replay` can reproduce it in a fresh process even if later passes do not
 re-report due to TSan dedup. Enforced by `TestDSTExploreRaceOracle`: an
@@ -633,6 +634,9 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    deadlock propagates through that bubble unchanged and is never consumed or attributed to Explore;
    its accesses and synchronization never become simulation transitions. An observed foreign-bubble
    synchronization endpoint forces conservative filtering rather than supplying an unrepresentable HB edge.
+   TSan's race counter is process-global: increments observed in a run that scheduled foreign work are
+   reported as `ExploreResult.UnattributedRaces`, never as replayable `Failure.Race` tokens. A foreign-free
+   run still records each new increment as an ordinary replayable race failure.
    *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 
