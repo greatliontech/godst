@@ -9,12 +9,87 @@ package net
 import (
 	"errors"
 	"io"
+	"slices"
 	"strconv"
 	"syscall"
 	"testing"
 	"testing/simulation"
 	"time"
 )
+
+func TestDSTNetEphemeralAllocatorsAreHostScoped(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	run := func(priorA bool) (listenPort, dialPort int) {
+		simulation.Run(1, func() {
+			allocate := func(host string) (int, int) {
+				ln, err := Listen("tcp", ":0")
+				if err != nil {
+					panic(err)
+				}
+				lp := ln.Addr().(*TCPAddr).Port
+				accepted := make(chan struct{})
+				go func() {
+					c, err := ln.Accept()
+					if err == nil {
+						c.Close()
+					}
+					close(accepted)
+				}()
+				c, err := Dial("tcp", simulation.HostIP(host)+":"+strconv.Itoa(lp))
+				if err != nil {
+					panic(err)
+				}
+				dp := c.LocalAddr().(*TCPAddr).Port
+				c.Close()
+				ln.Close()
+				<-accepted
+				return lp, dp
+			}
+			if priorA {
+				simulation.Host("A", simulation.HostConfig{}, func() { allocate("A") })
+			}
+			simulation.Host("B", simulation.HostConfig{}, func() {
+				listenPort, dialPort = allocate("B")
+			})
+		})
+		return
+	}
+	wantListen, wantDial := run(false)
+	gotListen, gotDial := run(true)
+	if gotListen != wantListen || gotDial != wantDial {
+		t.Fatalf("host B first ports after host A allocation = listen %d, dial %d; want independent sequence %d, %d", gotListen, gotDial, wantListen, wantDial)
+	}
+	if gotListen != dstListenEphemeralStart || gotDial != dstDialEphemeralStart {
+		t.Fatalf("host B first ports = listen %d, dial %d; want starts %d, %d", gotListen, gotDial, dstListenEphemeralStart, dstDialEphemeralStart)
+	}
+}
+
+func TestDSTNetEphemeralAllocatorSharedByHostProcesses(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var ports []int
+	simulation.Run(1, func() {
+		simulation.Host("H", simulation.HostConfig{}, func() {
+			for _, process := range []string{"p1", "p2"} {
+				simulation.Process(process, func() {
+					ln, err := Listen("tcp", ":0")
+					if err != nil {
+						panic(err)
+					}
+					ports = append(ports, ln.Addr().(*TCPAddr).Port)
+					ln.Close()
+				})
+			}
+		})
+	})
+	want := []int{dstListenEphemeralStart, dstListenEphemeralStart + 1}
+	if !slices.Equal(ports, want) {
+		t.Fatalf("successive processes on one host received ports %v, want shared host sequence %v", ports, want)
+	}
+}
 
 // dstBindTestTarget declares host "srv" with a listener at an EXPLICIT port
 // and returns its dialable address plus a closer the test calls before the run
@@ -818,7 +893,8 @@ func TestDSTNetListenPortAllocatorWrapsAndReclaims(t *testing.T) {
 
 			dstNet.mu.Lock()
 			dstNetRoll()
-			dstNet.nextListenPort = 65535 // one candidate before the wrap
+			host, _ := dstNetCurrentNode()
+			dstNet.nextListenPort[host] = 65535 // one candidate before the wrap
 			dstNet.mu.Unlock()
 
 			for i := 0; i < 2; i++ { // 65535, then wrap -> the reclaimed 10000

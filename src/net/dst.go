@@ -52,8 +52,8 @@ var dstNet struct {
 	mu             sync.Mutex
 	epoch          uint64
 	listeners      map[string]*dstListener
-	nextPort       int // deterministic ephemeral local port for dialers
-	nextListenPort int // deterministic ephemeral port for listeners bound to :0
+	nextPort       map[uint32]int // host → deterministic ephemeral local port for dialers
+	nextListenPort map[uint32]int // host → deterministic ephemeral port for listeners bound to :0
 }
 
 const (
@@ -74,10 +74,13 @@ func dstAllocEphemeralPort(host uint32, localIP IP) int {
 	scope := dstNetScope(host)
 	const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
 	for tried := 0; tried < span; tried++ {
-		p := dstNet.nextPort
-		dstNet.nextPort++
-		if dstNet.nextPort > dstDialEphemeralEnd {
-			dstNet.nextPort = dstDialEphemeralStart
+		p := dstNet.nextPort[host]
+		if p == 0 {
+			p = dstDialEphemeralStart
+		}
+		dstNet.nextPort[host] = p + 1
+		if dstNet.nextPort[host] > dstDialEphemeralEnd {
+			dstNet.nextPort[host] = dstDialEphemeralStart
 		}
 		if dstLocalBindInUse(host, localIP, p) {
 			continue
@@ -95,8 +98,8 @@ func dstNetRoll() {
 	if e := dstNetEpoch(); e != dstNet.epoch || dstNet.listeners == nil {
 		dstNet.epoch = e
 		dstNet.listeners = make(map[string]*dstListener)
-		dstNet.nextPort = dstDialEphemeralStart
-		dstNet.nextListenPort = dstListenEphemeralStart
+		dstNet.nextPort = make(map[uint32]int)
+		dstNet.nextListenPort = make(map[uint32]int)
 	}
 }
 
@@ -442,10 +445,13 @@ func dstListenerConflict(scope, network string, ip IP, key string, port int, wil
 func dstAllocateListenPort(scope, network string, ip IP, host uint32, wildcard, dual bool) (port int, keys []string, err error) {
 	const span = 65535 - dstListenEphemeralStart + 1
 	for tried := 0; tried < span; tried++ {
-		p := dstNet.nextListenPort
-		dstNet.nextListenPort++
-		if dstNet.nextListenPort > 65535 {
-			dstNet.nextListenPort = dstListenEphemeralStart
+		p := dstNet.nextListenPort[host]
+		if p == 0 {
+			p = dstListenEphemeralStart
+		}
+		dstNet.nextListenPort[host] = p + 1
+		if dstNet.nextListenPort[host] > 65535 {
+			dstNet.nextListenPort[host] = dstListenEphemeralStart
 		}
 		if dstListenConnConflict(host, network, ip, p, wildcard, dual) {
 			continue // a dialer-end conn occupies the port (no SO_REUSEADDR)
