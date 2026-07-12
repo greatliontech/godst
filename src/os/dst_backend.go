@@ -4,7 +4,9 @@
 
 package os
 
-import "time"
+import (
+	"time"
+)
 
 type dstFDKey struct {
 	epoch uint64
@@ -37,4 +39,22 @@ type dstFileBackend interface {
 	chdirHandle() error
 	chmodHandle(mode FileMode) error
 	setDeadline(rd, wd bool, t time.Time) error
+}
+
+func dstCloseCaller(file *file) error {
+	if file == nil {
+		return nil
+	}
+	backend := file.dstBackend()
+	if backend == nil {
+		if dstFenceActive() && !dstHostIOActive() {
+			return dstHostCloseError()
+		}
+		return nil
+	}
+	gate, ok := backend.(interface{ closeCaller() error })
+	if !ok {
+		return nil
+	}
+	return gate.closeCaller()
 }

@@ -42,8 +42,7 @@ import "unsafe"
 // trampoline still meets the fence; that is the documented shape.
 //
 // Anything outside the dispatched set — an unmodeled operation, a host fd, an
-// address that is not a simulated mapping — is refused, or falls through to the
-// existing allowlist/fence decision exactly as before.
+// address that is not a simulated mapping — falls through to the fence.
 
 // dstRawDispatch answers whether a raw syscall is the simulation's, and if so
 // performs it. handled=false means "not mine, proceed to the kernel", and is
@@ -79,7 +78,7 @@ func dstRawDispatch(trap, a1, a2, a3 uintptr) (r1 uintptr, err Errno, handled bo
 		return dstRawMapping(trap, data, a3)
 	case SYS_FSYNC, SYS_FDATASYNC, SYS_FLOCK, SYS_CLOSE:
 		if a1 < dstVirtualFDBase || a1 >= dstVirtualFDBase+dstVirtualFDCount {
-			return 0, 0, false // a host descriptor: the allowlist decides
+			return 0, 0, false // a host descriptor: the fence decides
 		}
 		return dstRawFD(trap, int(a1), a2)
 	}
@@ -93,8 +92,8 @@ func dstRawDispatch(trap, a1, a2, a3 uintptr) (r1 uintptr, err Errno, handled bo
 
 // dstRawMapping performs a mapping operation the simulation owns. It never
 // reports handled=false: a bubble goroutine's madvise/mprotect/munmap on a range
-// that is NOT a simulated mapping names host memory, which the boundary refuses
-// (these traps were never on the allowlist), so refusing here issues exactly the
+// that is NOT a simulated mapping names host memory, which the boundary refuses,
+// so refusing here issues exactly the
 // fence's refusal — and issuing it here rather than falling through preserves
 // the "no splittable call before a fall-through" rule.
 //

@@ -8,36 +8,10 @@ package syscall
 
 import _ "unsafe" // for go:linkname
 
-// dstSyscallAllowedTrap reports whether trap is in the I/O-on-an-existing-fd
-// allowlist: the family that may name a pre-run host handle, so it is the
-// sanctioned inherited-handle stance. Active virtual fd numbers are checked
-// separately and refused at the raw boundary before host dispatch. See
-// design.md "The interception boundary". Everything outside the family is
-// fenced: read/write on inherited handles keep working, but a bubble
-// goroutine minting a new host resource (open, socket, pipe, dup, mmap, execve)
-// is refused. close is in the family so a daemonize-style sweep stays the
-// EBADF loop it is in production, but a real-number close is answered before
-// this allowlist is consulted and never dispatched (dstSyscallHostClose).
-// ioctl is excluded entirely: request numbers are device-specific, so no
-// numeric request proves read-only, non-minting behavior for an arbitrary fd.
-//
-// nosplit so the raw-syscall trampolines can call it without growing their
-// uintptrkeepalive stack.
-//
-//go:nosplit
-func dstSyscallAllowedTrap(trap uintptr) bool {
-	switch trap {
-	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
-		SYS_FCNTL, SYS_PREAD64, SYS_PWRITE64:
-		return true
-	}
-	return dstSyscallAllowedArchTrap(trap)
-}
-
 const dstVirtualFDBase = 1 << 30
 const dstVirtualFDCount = 1 << 20
 
-// dstSyscallVirtualFDTrap reports whether an allowlisted fd-carrying trap names
+// dstSyscallVirtualFDTrap reports whether an fd-carrying trap names
 // a number in the reserved virtual-fd range [dstVirtualFDBase,
 // dstVirtualFDBase+dstVirtualFDCount). The WHOLE range is refused at the raw
 // boundary — issued or not — matching the named-wrapper side, which owns the
@@ -61,7 +35,7 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
 	return dstSyscallVirtualFDArchTrap(trap)
 }
 
-// dstSyscallPageCacheFDTrap reports whether an allowlisted fd-carrying trap
+// dstSyscallPageCacheFDTrap reports whether an fd-carrying trap
 // names a live harness page-cache descriptor. Those fds are INVISIBLE in the
 // simulated fd namespace: the caller answers EBADF — exactly what a fd the
 // SUT never opened would get — never a panic, because sweeping unknown fd
@@ -105,21 +79,6 @@ func dstSyscallHostClose(trap, fd uintptr) bool {
 		return false
 	}
 	return fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount
-}
-
-// dstSyscallMintingFcntl reports whether an allowlisted raw fcntl carries a
-// descriptor-MINTING command: F_DUPFD/F_DUPFD_CLOEXEC duplicate a host fd — a
-// minted host resource, the class the interception boundary refuses — while
-// the probe commands (F_GETFL-style, the reason fcntl is allowlisted at all)
-// stay allowed on inherited handles. Argument-aware because the trap alone
-// cannot separate probe from mint.
-//
-//go:nosplit
-func dstSyscallMintingFcntl(trap, cmd uintptr) bool {
-	if trap != SYS_FCNTL && !dstSyscallFcntlArchTrap(trap) {
-		return false
-	}
-	return cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC
 }
 
 // dstSyscallRefuse panics with the standard unsupported-under-simulation shape,

@@ -635,7 +635,7 @@ func TestDSTPipeDeadline(t *testing.T) {
 }
 
 // TestDSTPipeCopyInterplay: io.Copy across backends — pipe<->tree through
-// the gated funnels, pipe->host across the mixed-handle stance (the
+// the gated funnels, pipe->explicit host capability (the
 // zero-copy fast paths must bail to the generic loop whenever either side
 // is simulated; on the host these pairs would take splice/copy_file_range).
 func TestDSTPipeCopyInterplay(t *testing.T) {
@@ -648,6 +648,11 @@ func TestDSTPipeCopyInterplay(t *testing.T) {
 
 	const payload = "zero-copy interplay payload"
 	simulation.Run(1, func() {
+		hostCapability, err := simulation.InheritFile(host)
+		if err != nil {
+			t.Fatalf("InheritFile: %v", err)
+		}
+		defer hostCapability.Close()
 		// Tree file -> pipe (File.ReadFrom on the write end).
 		src, err := os.Create("/src")
 		if err != nil {
@@ -679,14 +684,13 @@ func TestDSTPipeCopyInterplay(t *testing.T) {
 			t.Fatalf("round trip = %q, %v", got, err)
 		}
 
-		// Pipe -> pre-run HOST file: simulated source, host sink — the
-		// mixed-handle stance; the host half does real I/O.
+		// Pipe -> explicitly inherited host file: simulated source, host sink.
 		r2, w2, _ := os.Pipe()
 		go func() {
 			w2.WriteString(payload)
 			w2.Close()
 		}()
-		if n, err := io.Copy(host, r2); n != int64(len(payload)) || err != nil {
+		if n, err := io.Copy(hostCapability, r2); n != int64(len(payload)) || err != nil {
 			t.Fatalf("Copy(host, pipe) = %d, %v", n, err)
 		}
 		r2.Close()

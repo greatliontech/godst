@@ -16,5 +16,6 @@ func dstSimGetgid() (int, bool)         { return 0, false }
 func dstSimGeteuid() (int, bool)        { return 0, false }
 func dstSimGetegid() (int, bool)        { return 0, false }
 func dstFenceActive() bool              { return false }
+func dstHostIOActive() bool             { return false }
 
 var errDSTUnsupported error

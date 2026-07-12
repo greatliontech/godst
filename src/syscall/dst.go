@@ -25,6 +25,9 @@ const dstSimFenced = true
 //go:linkname dstFenceActive runtime.dstFenceActive
 func dstFenceActive() bool
 
+//go:linkname dstHostIOActive runtime.dstHostIOActive
+func dstHostIOActive() bool
+
 // dstPageCacheFDReserved reports whether fd is a live harness page-cache
 // descriptor (see runtime.dstPageCacheFDReserved). Nosplit, alloc-free and
 // lock-free, callable from the raw trampolines like dstFenceActive.

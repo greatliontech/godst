@@ -733,6 +733,9 @@ func (f *File) SyscallConn() (syscall.RawConn, error) {
 		if dstf := f.file.dstBackend(); dstf != nil {
 			return nil, f.wrapErr("syscallconn", dstErrUnsupportedFS)
 		}
+		if dstFenceActive() {
+			return nil, f.wrapErr("syscallconn", dstErrUnsupportedFS)
+		}
 	}
 	return newRawConn(f)
 }

@@ -2353,6 +2353,20 @@ func dstFenceActive() bool {
 	return gp.bubble != nil && gp.bubble == dstSimBubble
 }
 
+//go:linkname dstSetHostIO
+func dstSetHostIO(active bool) (old bool) {
+	gp := getg()
+	old = gp.dstHostIO
+	gp.dstHostIO = active
+	return old
+}
+
+//go:nosplit
+//go:linkname dstHostIOActive
+func dstHostIOActive() bool {
+	return dstBuild && getg().dstHostIO
+}
+
 // dstInSimBubble reports whether the calling goroutine belongs to the ACTIVE
 // simulation's bubble — not merely any synctest bubble: a FOREIGN bubble
 // running concurrently with a simulation is a distinct scheduling domain, and

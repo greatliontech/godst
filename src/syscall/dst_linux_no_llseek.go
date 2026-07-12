@@ -7,16 +7,8 @@
 package syscall
 
 //go:nosplit
-func dstSyscallAllowedArchTrap(trap uintptr) bool {
-	return trap == SYS_FSTAT
-}
-
-//go:nosplit
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
 	return trap == SYS_FSTAT
 }
 
-//go:nosplit
-func dstSyscallFcntlArchTrap(trap uintptr) bool {
-	return false // no separate fcntl64 trap on these arches
-}
+func dstSyscallFstatTrap() uintptr { return SYS_FSTAT }

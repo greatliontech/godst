@@ -61,12 +61,12 @@ func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:norace
 //go:linkname RawSyscall6
 func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
-	// Interception-boundary fence: a bubble goroutine minting a host resource
-	// (open/socket/pipe/dup/mmap/execve) or otherwise leaving the sandbox is
-	// refused; I/O on an inherited host fd (the allowlist) is not. This is the
-	// choke point that also catches golang.org/x/sys/unix, whose asm calls this
-	// directly. Folds away in stock builds (dstSimFenced const). See design.md.
-	if dstSimFenced && dstFenceActive() {
+	// Interception-boundary fence: a bubble goroutine using a numeric real fd,
+	// minting a host resource, or otherwise leaving the sandbox is refused. This
+	// is the choke point that also catches golang.org/x/sys/unix entries whose asm
+	// calls it directly. Folds away in stock builds (dstSimFenced const). See
+	// design.md.
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
@@ -81,9 +81,7 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 			// passed-through close races the harness reusing the number.
 			return ^uintptr(0), 0, EBADF
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
-			dstSyscallRefuse(trap)
-		}
+		dstSyscallRefuse(trap)
 	}
 	var errno uintptr
 	r1, r2, errno = linux.Syscall6(trap, a1, a2, a3, a4, a5, a6)
@@ -97,7 +95,7 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall so the refusal panics in a clean scheduling
 	// state (see RawSyscall6). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() {
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
@@ -118,9 +116,7 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 			// passed-through close races the harness reusing the number.
 			return ^uintptr(0), 0, EBADF
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
-			dstSyscallRefuse(trap)
-		}
+		dstSyscallRefuse(trap)
 	}
 	runtime_entersyscall()
 	// N.B. Calling RawSyscall here is unsafe with atomic coverage
@@ -145,7 +141,7 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:linkname Syscall6
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall (see Syscall). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() {
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
@@ -166,9 +162,7 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) 
 			// passed-through close races the harness reusing the number.
 			return ^uintptr(0), 0, EBADF
 		}
-		if dstSyscallVirtualFDTrap(trap, a1) || !dstSyscallAllowedTrap(trap) || dstSyscallMintingFcntl(trap, a2) {
-			dstSyscallRefuse(trap)
-		}
+		dstSyscallRefuse(trap)
 	}
 	runtime_entersyscall()
 	r1, r2, err = RawSyscall6(trap, a1, a2, a3, a4, a5, a6)

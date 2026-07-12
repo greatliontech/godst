@@ -97,12 +97,13 @@ func testDSTIoctlDescriptorMintRefused(t *testing.T) {
 	if err := syscall.Close(int(peer)); err != nil {
 		t.Fatalf("closing support-probe peer fd: %v", err)
 	}
+	masterFD := master.Fd()
 
 	startForeign := make(chan struct{})
 	foreignDone := make(chan error, 1)
 	go func() {
 		<-startForeign
-		peer, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), ioctlPeerRequest(), flags)
+		peer, _, errno := syscall.Syscall(syscall.SYS_IOCTL, masterFD, ioctlPeerRequest(), flags)
 		if errno != 0 {
 			foreignDone <- errno
 			return
@@ -121,7 +122,7 @@ func testDSTIoctlDescriptorMintRefused(t *testing.T) {
 	var panicValue any
 	Run(1, func() {
 		panicValue = captureIoctlPanic(func() {
-			peer, _, errno = syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), ioctlPeerRequest(), flags)
+			peer, _, errno = syscall.Syscall(syscall.SYS_IOCTL, masterFD, ioctlPeerRequest(), flags)
 		})
 	})
 	after := ioctlHostFDs(t)

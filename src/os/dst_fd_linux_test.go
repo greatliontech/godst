@@ -1828,14 +1828,12 @@ func TestDSTFSVirtualFDRawSyscallSemantics(t *testing.T) {
 // dispatched close of a then-free number races the harness assigning that
 // number to a newborn host fd, so bubble-originated destruction of host fds
 // is refused for the whole real-fd space. The handle surviving the run is the
-// recorded accepted divergence of the inherited-handle stance (design.md
-// "The interception boundary"); the non-close allowlist family still reaches
-// the host (pinned elsewhere — the post-run fcntl below runs outside the
-// fence and proves only that the fd survived).
+// recorded accepted divergence for an ungranted real handle (design.md "The
+// interception boundary"); the post-run fcntl below runs outside the fence and
+// proves only that the fd survived.
 func TestDSTRawSyscallHostFdSurvivesBubbleClose(t *testing.T) {
-	// A real descriptor of our own, opened BEFORE the run (the inherited-handle
-	// stance) and owned by nothing else: dup a descriptor rather than borrowing
-	// one the test harness tracks.
+	// A real descriptor of our own, opened before the run and owned by nothing
+	// else: dup a descriptor rather than borrowing one the test harness tracks.
 	dup, err := syscall.Dup(0)
 	if err != nil {
 		t.Skipf("dup(0): %v", err)

@@ -15,7 +15,7 @@
 // taking the address of the return value newoffset.
 // Underlying system call is
 //	llseek(int fd, int offhi, int offlo, int64 *result, int whence)
-TEXT ·seek(SB),NOSPLIT,$0-28
+TEXT ·rawSeek(SB),NOSPLIT,$0-28
 	BL	runtime·entersyscall(SB)
 	MOVW	$SYS__LLSEEK, R7	// syscall entry
 	MOVW	fd+0(FP), R0

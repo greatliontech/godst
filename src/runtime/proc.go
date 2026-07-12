@@ -6888,8 +6888,9 @@ func retake(now int64) uint32 {
 		// wall-dependent point). Resume without taking the P, so the syscall serializes
 		// the bubble — the M keeps its P and re-runs on it when the syscall returns:
 		// one deterministic execution. Mirrors the preemptone gate above; a real
-		// syscall that never returns (e.g. reading host stdin) wedges the run, the
-		// documented inherited-handle risk (docs/dst/design.md).
+		// syscall that never returns (e.g. reading an explicitly inherited host
+		// input) wedges the run, the documented host-capability risk
+		// (docs/dst/design.md).
 		if dstActive() {
 			thread.resume()
 			goto done

@@ -30,9 +30,14 @@ func init() {
 func DSTDiskReplay() {
 	seed := dstSeedEnv()
 	simulation.Run(seed, func() {
+		out, err := simulation.InheritFile(os.Stdout)
+		if err != nil {
+			panic(err)
+		}
+		defer out.Close()
 		f, err := os.OpenFile("/replay.log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 		if err != nil {
-			fmt.Println("open:", err)
+			fmt.Fprintln(out, "open:", err)
 			return
 		}
 		var mu sync.Mutex
@@ -54,17 +59,17 @@ func DSTDiskReplay() {
 		}
 		wg.Wait()
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			fmt.Println("seek:", err)
+			fmt.Fprintln(out, "seek:", err)
 			return
 		}
 		all, err := io.ReadAll(f)
 		if err != nil {
-			fmt.Println("read:", err)
+			fmt.Fprintln(out, "read:", err)
 			return
 		}
 		f.Close()
-		fmt.Printf("content=%s\n", all)
-		fmt.Printf("sizes=%v\n", sizes)
+		fmt.Fprintf(out, "content=%s\n", all)
+		fmt.Fprintf(out, "sizes=%v\n", sizes)
 
 		// Namespace transcript: concurrent per-goroutine subtrees, then a
 		// deterministic listing walk and a rename.
@@ -84,11 +89,11 @@ func DSTDiskReplay() {
 		os.Rename("/n0", "/renamed")
 		ents, err := os.ReadDir("/")
 		if err != nil {
-			fmt.Println("readdir:", err)
+			fmt.Fprintln(out, "readdir:", err)
 			return
 		}
 		for _, e := range ents {
-			fmt.Printf("ent=%s dir=%v\n", e.Name(), e.IsDir())
+			fmt.Fprintf(out, "ent=%s dir=%v\n", e.Name(), e.IsDir())
 		}
 	})
 }

@@ -36,9 +36,14 @@ func init() {
 func DSTPipeReplay() {
 	seed := dstSeedEnv()
 	simulation.Run(seed, func() {
+		out, err := simulation.InheritFile(os.Stdout)
+		if err != nil {
+			panic(err)
+		}
+		defer out.Close()
 		r, w, err := os.Pipe()
 		if err != nil {
-			fmt.Println("pipe:", err)
+			fmt.Fprintln(out, "pipe:", err)
 			return
 		}
 		var wg sync.WaitGroup
@@ -49,7 +54,7 @@ func DSTPipeReplay() {
 				for i := 0; i < 6; i++ {
 					pad := strings.Repeat(string(rune('a'+g)), 5+(g*7+i*3)%40)
 					if _, err := fmt.Fprintf(w, "[g%d:%d:%s]", g, i, pad); err != nil {
-						fmt.Println("write:", err)
+						fmt.Fprintln(out, "write:", err)
 						return
 					}
 				}
@@ -74,27 +79,27 @@ func DSTPipeReplay() {
 				break
 			}
 		}
-		fmt.Printf("content=%s\n", content)
-		fmt.Printf("sips=%v\n", sips)
-		fmt.Printf("end=%v total=%d\n", end, len(content))
+		fmt.Fprintf(out, "content=%s\n", content)
+		fmt.Fprintf(out, "sips=%v\n", sips)
+		fmt.Fprintf(out, "end=%v total=%d\n", end, len(content))
 		fi, err := r.Stat()
 		if err != nil {
-			fmt.Println("stat:", err)
+			fmt.Fprintln(out, "stat:", err)
 			return
 		}
-		fmt.Printf("stat=%v size=%d\n", fi.Mode(), fi.Size())
+		fmt.Fprintf(out, "stat=%v size=%d\n", fi.Mode(), fi.Size())
 		r.Close()
 
 		// A deadline event: fires at the exact virtual instant.
 		r2, w2, err := os.Pipe()
 		if err != nil {
-			fmt.Println("pipe2:", err)
+			fmt.Fprintln(out, "pipe2:", err)
 			return
 		}
 		start := time.Now()
 		r2.SetReadDeadline(start.Add(3 * time.Second))
 		_, derr := r2.Read(make([]byte, 1))
-		fmt.Printf("deadline: +%v err=%v\n", time.Since(start), derr)
+		fmt.Fprintf(out, "deadline: +%v err=%v\n", time.Since(start), derr)
 		r2.Close()
 		w2.Close()
 	})

@@ -411,14 +411,10 @@ func TestDSTFSVirtualFDFlockFailedNBConversionLosesLock(t *testing.T) {
 	})
 }
 
-// TestDSTRawFcntlDupFenced: the raw trampolines allowlist fcntl so probe
-// commands on inherited host fds keep working, but F_DUPFD/F_DUPFD_CLOEXEC
-// MINT a new host descriptor — the resource-minting class the interception
-// boundary refuses. The fence is argument-aware: dup commands panic, probe
-// commands still reach the host.
-func TestDSTRawFcntlDupFenced(t *testing.T) {
+// TestDSTRawFcntlFenced pins that a numeric real fd carries no capability,
+// regardless of whether the fcntl command probes or mints a descriptor.
+func TestDSTRawFcntlFenced(t *testing.T) {
 	simulation.Run(1, func() {
-		// fd 1 is an inherited pre-run host handle (the sanctioned stance).
 		expectDSTRawSyscallPanic(t, func() {
 			syscall.Syscall(syscall.SYS_FCNTL, 1, syscall.F_DUPFD, 0)
 		})
@@ -428,10 +424,9 @@ func TestDSTRawFcntlDupFenced(t *testing.T) {
 		expectDSTRawSyscallPanic(t, func() {
 			syscall.RawSyscall(syscall.SYS_FCNTL, 1, syscall.F_DUPFD, 0)
 		})
-		// A probe command still passes through to the host fd.
-		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, 1, syscall.F_GETFD, 0); errno != 0 {
-			t.Fatalf("fcntl(1, F_GETFD) = %v, want success (probe commands stay allowlisted)", errno)
-		}
+		expectDSTRawSyscallPanic(t, func() {
+			syscall.Syscall(syscall.SYS_FCNTL, 1, syscall.F_GETFD, 0)
+		})
 	})
 }
 

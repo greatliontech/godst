@@ -30,8 +30,8 @@ processes share their host's filesystem and network identity but **never share G
 communicate only through files and the network, exactly like real processes with separate address
 spaces. This is not merely a convention: it is what *makes* the crash model sound (a crashed process
 holds no in-memory resource a sibling waits on), and a SUT that passes a Go channel/pointer between two
-`Process` trees is out of model (program discipline — the concurrent dual of the inherited-handle
-stance).
+`Process` trees is out of model (program discipline — the concurrent dual of the explicit
+host-capability stance).
 
 ### Identity primitives (the shared contract every fault axis targets)
 
@@ -905,7 +905,7 @@ footgun-free contract); `ppid` is `1`/reparented unless a supervision tree is mo
 through the simulated network and host filesystem* — the distributed model the whole feature targets. If a
 SUT shares an in-process `sync.Mutex` (or channel, or Go memory) *across* `Process` trees, a crash leaves
 it abandoned and another process may block on it forever — but that coupling is not two processes; it is
-out of model (program discipline, the concurrent dual of the inherited-handle stance, and the very reason
+out of model (program discipline, the concurrent dual of the explicit host-capability stance, and the reason
 a process is the memory-isolation unit). Within the model a crashed process holds no in-memory resource a
 sibling waits on, so abandonment is sound. File locks are modeled as per-process fd-owned resources;
 process crash must also release that process's `flock`s — the kernel does on process death — and the

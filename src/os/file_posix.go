@@ -21,6 +21,11 @@ func (f *File) Close() error {
 	if f == nil {
 		return ErrInvalid
 	}
+	if dstSimEnabled {
+		if err := dstCloseCaller(f.file); err != nil {
+			return f.wrapErr("close", err)
+		}
+	}
 	return f.file.close()
 }
 
@@ -299,6 +304,9 @@ func (f *File) setDeadline(t time.Time) error {
 		if dstf := f.file.dstBackend(); dstf != nil {
 			return dstf.setDeadline(true, true, t)
 		}
+		if dstFenceActive() {
+			return dstErrUnsupportedFS
+		}
 	}
 	return f.pfd.SetDeadline(t)
 }
@@ -312,6 +320,9 @@ func (f *File) setReadDeadline(t time.Time) error {
 		if dstf := f.file.dstBackend(); dstf != nil {
 			return dstf.setDeadline(true, false, t)
 		}
+		if dstFenceActive() {
+			return dstErrUnsupportedFS
+		}
 	}
 	return f.pfd.SetReadDeadline(t)
 }
@@ -324,6 +335,9 @@ func (f *File) setWriteDeadline(t time.Time) error {
 	if dstSimEnabled {
 		if dstf := f.file.dstBackend(); dstf != nil {
 			return dstf.setDeadline(false, true, t)
+		}
+		if dstFenceActive() {
+			return dstErrUnsupportedFS
 		}
 	}
 	return f.pfd.SetWriteDeadline(t)

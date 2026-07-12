@@ -13,8 +13,9 @@
 // the process identity a program observes (os.Getpid/Getppid/Hostname,
 // os.Getuid/Getgid/Geteuid/Getegid, os/user.Current, runtime.NumCPU), and TCP
 // net.Dial/net.Listen through the in-memory deterministic network. It does not
-// make wall-clock time, real file I/O, unsupported network kinds, or cgo
-// deterministic; programs under test model those surfaces in-memory or avoid them.
+// make wall-clock time, explicitly inherited host-file I/O, unsupported network
+// kinds, or cgo deterministic; programs under test model those surfaces
+// in-memory, grant a host file deliberately, or avoid them.
 //
 // The determinism boundary is Run/Test itself: these are virtualized only inside
 // a simulation. Nondeterminism a program captures *before* simulation — e.g.

@@ -130,7 +130,7 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 //go:uintptrkeepalive
 //go:nosplit
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+	if dstSimFenced && dstFenceActive() {
 		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)
@@ -139,7 +139,7 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 //go:uintptrkeepalive
 //go:nosplit
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+	if dstSimFenced && dstFenceActive() {
 		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)

@@ -20,7 +20,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 7. `dstTryClockGettime` returns kernel-shaped EFAULT for invalid time32/time64 output ranges (`dst-clock-gettime-invalid-pointer-faults`)
 - [x] 8. `dstRawDispatch` gives zero-length mapping operations one named/raw ownership and errno contract (`dst-raw-zero-mapping-bypasses-ownership`)
 - [x] 9. `AllThreadsSyscall` and `AllThreadsSyscall6` cannot bypass the active-run fence (`dst-syscall-allthreads-bypasses-fence`)
-- [ ] 10. allowlisted non-close fd dispatch cannot straddle host-fd creation (`dst-fd-inflight-io-straddles-creation`)
+- [x] 10. allowlisted non-close fd dispatch cannot straddle host-fd creation
 
 ## Runtime allocation and GC functions
 

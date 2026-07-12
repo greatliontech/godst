@@ -23,7 +23,15 @@ func setTimeval(sec, usec int64) Timeval {
 
 // Underlying system call writes to newoffset via pointer.
 // Implemented in assembly to avoid allocation.
-func seek(fd int, offset int64, whence int) (newoffset int64, err Errno)
+func rawSeek(fd int, offset int64, whence int) (newoffset int64, err Errno)
+
+//go:linkname seek
+func seek(fd int, offset int64, whence int) (newoffset int64, err Errno) {
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+		dstSyscallRefuse(SYS__LLSEEK)
+	}
+	return rawSeek(fd, offset, whence)
+}
 
 func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
 	newoffset, errno := seek(fd, offset, whence)

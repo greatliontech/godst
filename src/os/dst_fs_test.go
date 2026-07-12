@@ -1551,8 +1551,8 @@ func TestDSTFSTempDir(t *testing.T) {
 	}
 }
 
-// TestDSTFSMixedHandleCopy: io.Copy pairing a simulated source with a
-// pre-run host destination takes the generic loop (the spec's mixed-handle
+// TestDSTFSMixedHandleCopy: io.Copy pairing a simulated source with an
+// explicitly inherited host destination takes the generic loop (the mixed-handle
 // rule); the zero-copy fast paths must bail on the simulated side seen
 // through wrappers (fileWithoutWriteTo, LimitedReader), not only bare *File.
 func TestDSTFSMixedHandleCopy(t *testing.T) {
@@ -1562,14 +1562,19 @@ func TestDSTFSMixedHandleCopy(t *testing.T) {
 	}
 	defer host.Close()
 	simulation.Run(1, func() {
+		dst, err := simulation.InheritFile(host)
+		if err != nil {
+			t.Fatalf("InheritFile: %v", err)
+		}
+		defer dst.Close()
 		src, _ := os.Create("/payload")
 		src.WriteString("across-the-boundary")
 		src.Seek(0, io.SeekStart)
-		if n, err := io.Copy(host, src); n != 19 || err != nil {
+		if n, err := io.Copy(dst, src); n != 19 || err != nil {
 			t.Fatalf("io.Copy(host, sim) = %d, %v (zero-copy fast path leaked through?)", n, err)
 		}
 		src.Seek(0, io.SeekStart)
-		if n, err := io.CopyN(host, src, 6); n != 6 || err != nil {
+		if n, err := io.CopyN(dst, src, 6); n != 6 || err != nil {
 			t.Fatalf("io.CopyN(host, sim, 6) = %d, %v", n, err)
 		}
 		src.Close()

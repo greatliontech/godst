@@ -74,7 +74,15 @@ func mmap(addr uintptr, length uintptr, prot int, flags int, fd int, offset int6
 
 // Underlying system call writes to newoffset via pointer.
 // Implemented in assembly to avoid allocation.
-func seek(fd int, offset int64, whence int) (newoffset int64, err Errno)
+func rawSeek(fd int, offset int64, whence int) (newoffset int64, err Errno)
+
+//go:linkname seek
+func seek(fd int, offset int64, whence int) (newoffset int64, err Errno) {
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+		dstSyscallRefuse(SYS__LLSEEK)
+	}
+	return rawSeek(fd, offset, whence)
+}
 
 func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
 	newoffset, errno := seek(fd, offset, whence)
@@ -148,7 +156,7 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 //go:nosplit
 //go:linkname socketcall
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+	if dstSimFenced && dstFenceActive() {
 		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)
@@ -158,7 +166,7 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 //go:nosplit
 //go:linkname rawsocketcall
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstSyscallAllowedTrap(SYS_SOCKETCALL) {
+	if dstSimFenced && dstFenceActive() {
 		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)

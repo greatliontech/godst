@@ -93,7 +93,7 @@ func TestDSTSyscallFence(t *testing.T) {
 		t.Errorf("syscall.Bind in bubble did not panic: the socket-wrapper path bypasses the fence")
 	}
 	if allowedPanicked {
-		t.Errorf("raw SYS_CLOSE in bubble panicked: the inherited-handle allowlist is broken")
+		t.Errorf("raw SYS_CLOSE in bubble panicked: real-number close must retain its EBADF refusal shape")
 	}
 	if forkPanicked {
 		t.Errorf("ForkExec in bubble panicked: it must be refused via the error shape at the entry fence, before forking")

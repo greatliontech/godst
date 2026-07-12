@@ -48,6 +48,9 @@ func dstSimGetegid() (int, bool)
 //go:linkname dstFenceActive runtime.dstFenceActive
 func dstFenceActive() bool
 
+//go:linkname dstHostIOActive runtime.dstHostIOActive
+func dstHostIOActive() bool
+
 // errDSTUnsupported is the refusal for os operations fenced by the interception
 // boundary whose signature carries an error channel — process spawn
 // (startProcess) and os.Executable — the standard "unsupported under

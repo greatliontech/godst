@@ -81,21 +81,22 @@ func TestDSTClockGettime32OverflowPrecedesCopyout(t *testing.T) {
 	}
 }
 
-// TestDSTRawFcntl64Probes: these arches' fcntl is SYS_FCNTL64 — probe commands
-// on an inherited host fd pass the allowlist, while the descriptor-minting
-// F_DUPFD is refused, exactly like SYS_FCNTL on 64-bit arches.
-func TestDSTRawFcntl64Probes(t *testing.T) {
-	var probeErrno syscall.Errno
-	var dupPanic any
+// TestDSTRawFcntl64Fenced pins the numeric-fd fence on architectures whose
+// fcntl entry is SYS_FCNTL64.
+func TestDSTRawFcntl64Fenced(t *testing.T) {
+	var probePanic, dupPanic any
 	simulation.Run(1, func() {
-		_, _, probeErrno = syscall.Syscall(syscall.SYS_FCNTL64, 1, syscall.F_GETFD, 0)
+		func() {
+			defer func() { probePanic = recover() }()
+			syscall.Syscall(syscall.SYS_FCNTL64, 1, syscall.F_GETFD, 0)
+		}()
 		func() {
 			defer func() { dupPanic = recover() }()
 			syscall.Syscall(syscall.SYS_FCNTL64, 1, syscall.F_DUPFD, 0)
 		}()
 	})
-	if probeErrno != 0 {
-		t.Fatalf("fcntl64(1, F_GETFD) = %v, want success (probe commands allowlisted)", probeErrno)
+	if probePanic == nil || !strings.Contains(fmt.Sprint(probePanic), "unsupported under deterministic simulation") {
+		t.Fatalf("fcntl64(1, F_GETFD) panic = %v, want the fence shape", probePanic)
 	}
 	if dupPanic == nil || !strings.Contains(fmt.Sprint(dupPanic), "unsupported under deterministic simulation") {
 		t.Fatalf("fcntl64(1, F_DUPFD) panic = %v, want the fence shape (minting command refused)", dupPanic)

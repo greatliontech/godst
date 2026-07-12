@@ -21,6 +21,9 @@ func Fstat(fd int, stat *Stat_t) (err error) {
 		}
 		return
 	}
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+		dstSyscallRefuse(dstSyscallFstatTrap())
+	}
 	return fstatFD(fd, stat)
 }
 
@@ -31,6 +34,9 @@ func Seek(fd int, offset int64, whence int) (off int64, err error) {
 			err = errnoErr(e1)
 		}
 		return
+	}
+	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+		dstSyscallRefuse(SYS_LSEEK)
 	}
 	return seekFD(fd, offset, whence)
 }

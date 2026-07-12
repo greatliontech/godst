@@ -7,16 +7,8 @@
 package syscall
 
 //go:nosplit
-func dstSyscallAllowedArchTrap(trap uintptr) bool {
-	return false
-}
-
-//go:nosplit
 func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
 	return false
 }
 
-//go:nosplit
-func dstSyscallFcntlArchTrap(trap uintptr) bool {
-	return false // loong64 has no fcntl64 trap
-}
+func dstSyscallFstatTrap() uintptr { return SYS_STATX }

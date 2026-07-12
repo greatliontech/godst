@@ -30,7 +30,7 @@ discipline to **runtime enforcement**, so determinism holds with *many* runnable
 What DST does **not** virtualize: unsupported network kinds, cgo, raw syscalls, processes, and
 signals — each **fenced** (a loud, deterministic refusal for bubble goroutines; see "The
 interception boundary") rather than silently reaching the host — and, deliberately, the standard
-streams (pre-run host handles under the inherited-handle stance; see "Deterministic pipes and the
+streams explicitly granted through an inherited-file capability; see "Deterministic pipes and the
 stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
 network below, the filesystem by the in-memory deterministic filesystem, and `os.Pipe` by the
 in-memory deterministic pipe (all per-bubble, all reset by the run epoch); what remains is modeled
@@ -196,9 +196,9 @@ process state here: `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clear
 per-process copy-on-write view, initialized from the host environment at `Run` entry. Writes are
 isolated — a `Setenv` in one process is never observable from another process or host (env must not
 be a back-channel two real machines never had; this is the environment leg of DST-NODE-ISOLATION).
-Reads of *unmodified* variables return host values: those are machine state, exactly like the
-pre-run stdio handles — deterministic per machine, and cross-machine reproducibility of a SUT that
-branches on them is program discipline (recorded, like the inherited-handle stance). Note
+Reads of *unmodified* variables return host values: those are machine state, exactly like data read
+through an explicitly granted host-file capability — deterministic per machine, and cross-machine
+reproducibility of a SUT that branches on them is program discipline. Note
 `os.UserHomeDir` (host `$HOME`) and `user.Current().HomeDir` (`/home/sim`) can therefore disagree
 in-run; acquire identity through `os/user` for coherence. `os.TempDir` stays fixed at the simulated
 `/tmp` (see the filesystem section). The simulated
@@ -760,18 +760,32 @@ Symlinks and unsupported file-locking surfaces are fenced until modeled — "not
 "reaches the host": within this feature's surface (the os file and namespace API; `os/exec`'s process
 surface is its own roadmap item), every handle-producing or namespace-touching entry point is either
 implemented in-sim or fails with the unsupported shape while a run is active
-(`os.Pipe` is simulated — see "Deterministic pipes and the stdio stance"). A `File` or `Root` opened
-BEFORE the run is a host-backed handle and stays outside the base model, exactly as inherited fds are
-for the network — program discipline, recorded here as the inherited-handle stance — and
-symmetrically, a simulated `File` or `Root` leaked OUT of its run is refused like a closed handle
+(`os.Pipe` is simulated — see "Deterministic pipes and the stdio stance"). On Linux, a host-backed `File`
+carries no authority inside a run unless `simulation.InheritFile` explicitly grants
+the root simulation body a capability. `Host` and `Process` bodies cannot grant host files: that would
+create a cross-node channel outside the simulated filesystem and network. The capability owns a hidden duplicate of the granted open-file description,
+so closing the source does not revoke it and the grant extends that description's lifetime until the
+capability closes. Numeric real fds, including the source and the hidden duplicate, are never authority:
+`Fd`/`SyscallConn` are unavailable on the capability, `SyscallConn` and deadline mutation are fenced
+on ungranted host files, and raw real-fd operations are fenced. A `Root`
+opened before the run remains unsupported. Admission holds the source `File`'s operation reference
+across duplication, so an ordinary concurrent `File.Close` cannot retarget the grant; code that mutates
+the source descriptor behind the `File` through foreign assembly or cgo is outside the same API trust
+boundary as every other externally-corrupted `os.File`. Symmetrically, a simulated `File` or `Root` leaked OUT of
+its run is refused like a closed handle
 (both carry the run epoch; the run's nodes are released with the run — lazily, at the next run's
 first filesystem op) — deterministic and
 host-isolated, the same discipline applied in reverse, and never a read of a prior run's tree nor a
 dereference of its released page caches (`TestDSTRootLeakedAcrossRuns`). An
-operation pairing a simulated handle with a pre-run host handle behaves as its two halves: the
-simulated side goes through the gated funnels and the host side does real I/O (`io.Copy` from a
-simulated file to an inherited stdout takes the generic loop — the zero-copy fast paths bail whenever
-either side is simulated).
+operation pairing a simulated handle with an inherited-file capability behaves as its two halves: the
+simulated side goes through the gated funnels and the capability side does the explicitly granted host
+I/O (`io.Copy` takes the generic loop because the zero-copy fast paths bail whenever either side is
+simulated).
+
+The inherited capability supports the typed operations represented by the file-backend seam: reads,
+writes, positional reads/writes, seek, stat, sync, truncate, chmod, directory reads, deadlines,
+and close. Other `os.File` methods retain the simulated-file unsupported behavior. The capability is
+Linux-only until another operating system enforces the same no-numeric-authority boundary.
 
 ### Deterministic pipes and the stdio stance (the third I/O feature)
 
@@ -822,23 +836,21 @@ channels — rather than silently nondeterministic. Enforced by the
 exactness, PIPE_BUF atomicity under concurrency, fd census, leak fences, same-seed transcript
 equality).
 
-**Stdio is not virtualized — settled here.** `os.Stdin`/`Stdout`/`Stderr` are created at process
-init, before any run: they are pre-run host handles, covered verbatim by the recorded
-inherited-handle stance, and the fork does not swap them under a run. Writes to them are
-outbound, schedule-ordered side effects that feed no nondeterminism back into the run — DST's own
-cross-process replay fixtures print their transcripts through real stdout from inside runs.
+**Stdio is not implicitly inherited.** `os.Stdin`/`Stdout`/`Stderr` are ordinary pre-run host files,
+so their methods are fenced inside a run. Code that deliberately needs host stdio calls
+`simulation.InheritFile` inside the run and uses or installs the returned capability; captured or fully
+deterministic stdio instead assigns the package variables to simulated files. Capability writes are
+outbound, schedule-ordered side effects that feed no nondeterminism back into the run.
 The blocked case is covered too: a host write that blocks (a full pipe, a slow terminal) delays
 the run in *wall* time but cannot reorder it, because sysmon's **syscall-handoff retake is gated
 under an active run** exactly as its preemption retake is (`retake`, `proc.go`) — without that gate,
 whether a host write returns within sysmon's 10 ms
 window would decide whether the P is handed off mid-syscall, a wall-clock-dependent schedule fork.
-A real syscall thus *serializes* the bubble for its duration: one legal execution, deterministic.
-The dual failure mode is recorded plainly: a goroutine blocked **reading** a host handle (real
-stdin) is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
+A capability's real syscall thus *serializes* the bubble for its duration: one legal execution,
+deterministic. The dual failure mode is recorded plainly: a goroutine blocked **reading** an inherited
+capability is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
 nor declare deadlock, so the run hangs until the read returns. Reading the real terminal under a
-run is program discipline, exactly like using any inherited handle; a program that wants captured
-or deterministic stdio assigns the package variables to a simulated file inside the run (the
-backend seam makes that work with no extra machinery).
+run is therefore an explicit capability choice, not an accidental numeric-fd escape.
 Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
 `ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
 `Getpid` are Options-pinned; env APIs operate on the per-process simulated environment (see the
@@ -880,13 +892,13 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   remain live and the caller stack cannot move before kernel dispatch, including through the entry
   symbols used by external assembly callers.
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
-  way — this is the choke point that catches `golang.org/x/sys/unix` — except an allowlist by
-  syscall number covering the I/O-on-an-existing-fd family (read/write/close, lseek,
-  pread64/pwrite64, fstat, fcntl) so
-  operations **on pre-run host handles** keep working (`close` excepted — it mutates the shared fd
-  table rather than doing I/O on a handle; see the host-close paragraph below). The fcntl allowlisting is
-  **argument-aware**: its descriptor-MINTING commands (`F_DUPFD`/`F_DUPFD_CLOEXEC`) are refused —
-  duplication mints a host fd, the class the fence exists for — while probe commands stay allowed.
+  way — this is the choke point that catches `golang.org/x/sys/unix`. A numeric real fd is never a
+  capability: read/write/close, lseek, pread64/pwrite64, fstat, fcntl, and every other operation are
+  refused before host dispatch. Explicit inherited-file capabilities perform their host operations
+  through a scoped trusted path and never expose their hidden descriptor. This is an API boundary,
+  not an adversarial machine-code sandbox: a dependency that executes a syscall instruction in its
+  own assembly (rather than entering the standard `syscall` symbols, as ordinary `x/sys/unix`
+  wrappers do) is outside the model like cgo and unsafe host-memory access.
   `ioctl` is refused entirely: request numbers are interpreted by the target device, so no numeric
   request can prove read-only, non-minting behavior for an arbitrary inherited handle. Terminal
   probing therefore requires a modeled terminal capability rather than host passthrough. The reserved virtual-fd number range never reaches
@@ -900,14 +912,13 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
   dispatch them to the simulated backend. The harness's own page-cache descriptors (the memfds
   backing simulated files) are **invisible in the simulated fd namespace**: a bubble goroutine's
-  allowlisted fd operation naming one answers `EBADF` at the trampolines — exactly what a fd the
+  close naming one answers `EBADF` at the trampolines — exactly what a fd the
   process never opened would get, so the daemonize-style close sweep stays the harmless loop it is
   in production — never host I/O, which would kill a live file's cache (fatal at the next resize or
   mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
   page cache admits (32-bit hosts are refused before any memfd exists), every named fd wrapper
   bottoms out in the same trampolines, so one chokepoint covers both surfaces; non-bubble callers
-  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). `close` goes further
-  than the per-number invisibility check: a bubble goroutine's close of **any** real
+  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). A bubble goroutine's close of **any** real
   (non-virtual) fd number is answered `EBADF` at the trampolines and **never dispatched to the
   kernel**. The invisibility check alone cannot protect a fd that does not exist yet — the fence
   check and the kernel entry are not atomic across Ms, so a dispatched close of a then-free
@@ -915,14 +926,14 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   the runtime's lazily-created netpoll epoll fd) and can land after the assignment, killing the
   newborn. Refusing dispatch outright removes bubble-originated *destruction* of host fds
   entirely — a close that is never dispatched cannot straddle a creation — for the whole host-fd
-  space rather than one fd class. (An in-flight allowlisted *read/write* naming a then-free real
-  number can still straddle a creation and land on the newborn fd; that residual window is a
-  recorded gap this mechanism does not cover.) `EBADF` is sound
+  space rather than one fd class. Refusing every other numeric real-fd operation removes the same
+  check-to-dispatch alias window for reads, writes, seeks, stats, and fcntl: no admitted operation can
+  straddle creation of a newborn harness descriptor. `EBADF` for close is sound
   because a bubble goroutine can never *mint* a host fd (the fence refuses open/socket/pipe/dup),
   so it owns no real fd to legitimately close: every bubble close of a real number is the
   daemonize-sweep shape, and `EBADF` is exactly what production gives that sweep. The
-  knowingly-accepted divergence: a bubble close of an *inherited* pre-run handle (real stdio and
-  the like) reports `EBADF` where production reports success, and the handle stays open — so a
+  knowingly-accepted divergence: a bubble close of a real pre-run handle reports `EBADF` where
+  production reports success, and the handle stays open — so a
   non-bubble peer waiting on that handle's closure (an EOF on a harness pipe whose write end the
   bubble "closed") waits forever, and a write-then-close integrity idiom sees the `EBADF` — a
   host-table mutation the bubble is not allowed to make, in exchange for closing the
@@ -1163,7 +1174,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
-| standard streams (stdio) | pre-run host handles (inherited-handle stance; swap the package vars in-program to capture); syscall-retake gated so a blocked host write serializes, never reorders | ⛔ (program discipline) |
+| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile`; swap package vars to simulated files for capture; syscall-retake gated so a blocked capability write serializes, never reorders | ✅ |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
@@ -1171,7 +1182,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
 | faults: seeded clock drift (`Drift`/`BoundedDrift` declared, `DriftClock` mid-run) | per-host rate over the base clock (see [faults.md](./faults.md)) | ✅ |
 | faults: OOM kill, scheduling (straggler) | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
-| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: minting entry points + `Syscall*` trampolines refuse loudly (see "The interception boundary"); read/write on host fds stay (inherited-handle stance); close of a real fd is answered `EBADF`, never dispatched | ✅ |
+| raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: numeric real fds carry no authority; explicit inherited-file capabilities are typed `os.File` values with no raw descriptor surface; close of a real fd is answered `EBADF`, never dispatched | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
 | signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
 | `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ✅ |
@@ -1359,8 +1370,8 @@ later steps add, never rewrite.
   is an in-memory stream behind the `os.File` backend seam the disk feature built — Linux anonymous
   pipe semantics host-probed end to end (64 KiB capacity, PIPE_BUF atomicity under contention, the
   full error-precedence ladders, fake-clock deadlines, partial counts, SameFile across the pair),
-  synctest-durable blocking, no host descriptor ever. Stdio is settled as NOT virtualized (the
-  inherited-handle stance covers the package streams; programs swap them in-run for capture), and
+  synctest-durable blocking, no host descriptor ever. Stdio is settled as NOT implicitly inherited
+  (programs explicitly grant a host file or swap the package streams in-run for capture), and
   the remaining OS-backed I/O surface is audited closed — `/dev/null` stays `ENOENT` under a run
   (recorded gap; `io.Discard` or a tree file is the in-sim idiom). See the "Deterministic pipes and
   the stdio stance" section above; tested by the `TestDSTPipe*` family and the cross-process
