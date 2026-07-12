@@ -15,6 +15,7 @@ died.
 ## Required outcome
 
 Mapping-fault death has the same complete, ordered lifecycle as process crash:
-threads stop, liveness changes coherently, and resources close exactly once.
+threads stop, liveness changes coherently, resources close exactly once, and the
+process-owned cwd and environment view are discarded before restart.
 A subprocess test faults while owning each resource class and proves a restart
 can reacquire them.

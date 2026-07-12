@@ -11,7 +11,16 @@ import _ "unsafe" // for go:linkname
 //go:linkname dstSetProcessTeardownHook runtime.dstSetProcessTeardownHook
 func dstSetProcessTeardownHook(fn func(proc uint32))
 
-func init() { dstSetProcessTeardownHook(dstApplyProcessTeardown) }
+//go:linkname dstSetProcessStateTeardownHook runtime.dstSetProcessStateTeardownHook
+func dstSetProcessStateTeardownHook(fn func(proc uint32))
+
+//go:linkname dstEnvProcessTeardown syscall.dstEnvProcessTeardown
+func dstEnvProcessTeardown(proc uint32)
+
+func init() {
+	dstSetProcessTeardownHook(dstApplyProcessTeardown)
+	dstSetProcessStateTeardownHook(dstApplyProcessStateTeardown)
+}
 
 func dstApplyProcessTeardown(proc uint32) {
 	if !dstFSActive() {
@@ -20,4 +29,17 @@ func dstApplyProcessTeardown(proc uint32) {
 	dstCloseProcFiles(proc)
 	dstReleaseProcFDs(proc)
 	dstMMapReleaseProc(proc)
+	dstApplyProcessStateTeardown(proc)
+}
+
+func dstApplyProcessStateTeardown(proc uint32) {
+	dstFS.mu.Lock()
+	dstFSRoll()
+	for key := range dstFS.cwds {
+		if key[1] == proc {
+			delete(dstFS.cwds, key)
+		}
+	}
+	dstFS.mu.Unlock()
+	dstEnvProcessTeardown(proc)
 }

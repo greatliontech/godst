@@ -29,8 +29,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [ephemeral port allocation couples independent hosts](./dst-net-port-allocator-cross-host-coupling.md) | M | allocator state is host-scoped |
 | [blackhole cannot override an existing refuse cut](./dst-net-blackhole-cannot-override-refuse.md) | M | overlapping cuts preserve blackhole dominance |
 | [network handles cross run epochs](./dst-net-handles-cross-run-epochs.md) | M | connections and listeners reject stale epochs |
-| [process restart inherits cwd](./dst-process-restart-inherits-cwd.md) | M | process teardown resets cwd |
-| [process restart inherits environment](./dst-process-restart-inherits-environment.md) | M | process teardown resets environment state |
 | [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |
 | [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
 | [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |

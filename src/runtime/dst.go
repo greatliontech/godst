@@ -2231,17 +2231,22 @@ func dstNetHostDead(host uint32) bool {
 	return dstNetHostDeadHook != nil && dstNetHostDeadHook(host)
 }
 
-// dstProcessTeardownHook is os's handler for process-owned resource teardown
-// (open simulated Files, virtual fds/flocks, and mmap registrations). Runtime is
+// dstProcessTeardownHook is os's handler for all process-owned state and resources.
+// dstProcessStateTeardownHook is the logical cwd/environment subset used by host
+// power loss, which must not run resource cleanup that writes mappings back. Runtime is
 // the dependency-free relay so testing/simulation can drive process death without
 // importing os.
 var dstProcessTeardownHook func(proc uint32)
+var dstProcessStateTeardownHook func(proc uint32)
 
 // dstSetProcessTeardownHook registers os's process resource teardown handler.
 // Reached via //go:linkname from os's init.
 //
 //go:linkname dstSetProcessTeardownHook
 func dstSetProcessTeardownHook(fn func(proc uint32)) { dstProcessTeardownHook = fn }
+
+//go:linkname dstSetProcessStateTeardownHook
+func dstSetProcessStateTeardownHook(fn func(proc uint32)) { dstProcessStateTeardownHook = fn }
 
 // dstProcessTeardown invokes os's resource teardown handler. Reached via
 // //go:linkname from testing/simulation's process-teardown path.
@@ -2250,6 +2255,13 @@ func dstSetProcessTeardownHook(fn func(proc uint32)) { dstProcessTeardownHook = 
 func dstProcessTeardown(proc uint32) {
 	if dstProcessTeardownHook != nil {
 		dstProcessTeardownHook(proc)
+	}
+}
+
+//go:linkname dstProcessStateTeardown
+func dstProcessStateTeardown(proc uint32) {
+	if dstProcessStateTeardownHook != nil {
+		dstProcessStateTeardownHook(proc)
 	}
 }
 

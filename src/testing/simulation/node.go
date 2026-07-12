@@ -57,6 +57,9 @@ func dstCrashProcessPid(pid int32)
 //go:linkname dstProcessTeardown runtime.dstProcessTeardown
 func dstProcessTeardown(proc uint32)
 
+//go:linkname dstProcessStateTeardown runtime.dstProcessStateTeardown
+func dstProcessStateTeardown(proc uint32)
+
 //go:linkname dstSelfCrashed runtime.dstSelfCrashed
 func dstSelfCrashed() bool
 
@@ -656,6 +659,7 @@ func crashHost(name string) {
 			dstCrashProcessPid(pid)
 		}
 		activeProcClearAll(proc)
+		dstProcessStateTeardown(proc)
 	}
 	dstMarkHostGoroutinesCrashed(host)
 	// Kernel order, as in a process crash: the threads stop, then the kernel's

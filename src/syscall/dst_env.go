@@ -12,6 +12,19 @@ import (
 	_ "unsafe" // for go:linkname
 )
 
+//go:linkname dstEnvProcessTeardown
+func dstEnvProcessTeardown(proc uint32) {
+	ep := dstEnvRunEpoch()
+	dstEnvMu.Lock()
+	defer dstEnvMu.Unlock()
+	if dstEnvByProc == nil || ep != dstEnvEpoch {
+		dstEnvByProc = make(map[uint32]*dstProcEnv)
+		dstEnvEpoch = ep
+		return
+	}
+	delete(dstEnvByProc, proc)
+}
+
 // dstEnvEnabled is the compile-time gate for the per-process copy-on-write
 // environment; a stock build folds it to false and DCEs the branch in each
 // env_unix.go entry point.

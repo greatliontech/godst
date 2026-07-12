@@ -196,6 +196,8 @@ process state here: `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clear
 per-process copy-on-write view, initialized from the host environment at `Run` entry. Writes are
 isolated — a `Setenv` in one process is never observable from another process or host (env must not
 be a back-channel two real machines never had; this is the environment leg of DST-NODE-ISOLATION).
+A process invocation's view is discarded on normal exit, explicit process crash, or host crash; a same-name restart copies the
+run-entry host baseline again, never its predecessor's `Setenv`, `Unsetenv`, or `Clearenv` mutations.
 Reads of *unmodified* variables return host values: those are machine state, exactly like data read
 through an explicitly granted host-file capability — deterministic per machine, and cross-machine
 reproducibility of a SUT that branches on them is program discipline. Note
@@ -541,8 +543,9 @@ under `/tmp` — fsync(file) then fsync(`/tmp`), with no fsync of `/` — surviv
 (`TestDSTCrashHostPreservesMkfsImage`, torn variant included); a tree born unsynced would erase
 `/tmp` at the first crash, recoverable only by fsyncing `/` — which no POSIX-disciplined program
 does for a pre-existing directory.
-Paths resolve against a per-bubble working directory (initially `/`; `Getwd`/`Chdir` are
-per-bubble). **Resolution is component-wise (physical), as the kernel walks:** every intermediate
+Paths resolve against a per-process working directory (initially `/`; normal exit, explicit process
+crash, or host crash discards
+it, so a same-name restart begins at `/`). **Resolution is component-wise (physical), as the kernel walks:** every intermediate
 component must exist and be a directory — `/missing/../tmp` is `ENOENT` (the walk reaches `missing`
 first), `/file/../other` and `/file/sub` are `ENOTDIR`, and a trailing slash asserts directory-ness
 (`open("/regularfile/")` is `ENOTDIR`; `open("/new/", O_CREATE)` is `EISDIR` — a trailing slash cannot
