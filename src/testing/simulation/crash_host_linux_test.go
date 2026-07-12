@@ -650,6 +650,32 @@ func TestDSTCrashHostClosesRootProcessResources(t *testing.T) {
 // entered a nested Host body) is still a thread of a process on the dying
 // machine — it must die with it. Host-keyed marking alone would miss it, which
 // is why the kill is the union of the host's goroutines and its processes'.
+func TestDSTRootClosesOnHostCrash(t *testing.T) {
+	var leaked *os.Root
+	Test(t, 1, func(t *testing.T) {
+		ready := make(chan *os.Root, 1)
+		Host("h", HostConfig{}, func() {
+			go Process("owner", func() {
+				os.Mkdir("/d", 0o755)
+				r, err := os.OpenRoot("/d")
+				if err != nil {
+					t.Fatal(err)
+				}
+				ready <- r
+				select {}
+			})
+			leaked = <-ready
+		})
+		CrashHost("h")
+		Host("h", HostConfig{}, func() {
+			Process("reboot", func() {})
+		})
+		if _, err := leaked.Stat("."); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Root.Stat after host crash = %v, want ErrClosed", err)
+		}
+	})
+}
+
 func TestDSTCrashHostKillsProcessGoroutineStampedElsewhere(t *testing.T) {
 	var ranAfter atomic.Bool
 	Test(t, 1, func(t *testing.T) {

@@ -120,6 +120,7 @@ func dstUnregisterOpenFile(f *file) {
 // dstCloseProcFiles closes the files a PROCESS opened (process crash, or exit).
 func dstCloseProcFiles(proc uint32) {
 	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.proc == proc })
+	dstCloseProcRoots(proc)
 }
 
 // dstCloseHostFiles closes every file opened on a HOST, whichever process
@@ -127,6 +128,7 @@ func dstCloseProcFiles(proc uint32) {
 // gone). See dstOpenFileEntry for why this cannot key on proc.
 func dstCloseHostFiles(host uint32) {
 	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.host == host })
+	dstCloseHostRoots(host)
 }
 
 func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {

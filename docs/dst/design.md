@@ -763,6 +763,9 @@ from that captured node; absolute paths and `..` walks above the opened root fai
 against the process cwd, the tree root, or the host filesystem. Rooted file, directory, metadata,
 removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
 contracts as the named `os` surface.
+A simulated `Root` is an owned open capability: normal process exit, process crash, and host crash close
+every Root created by that process or kernel. Retained values then fail every rooted operation with
+`ErrClosed`, exactly like an explicitly closed Root; a reboot never revives the directory capability.
 
 Symlinks and unsupported file-locking surfaces are fenced until modeled — "not yet modeled" never means
 "reaches the host": within this feature's surface (the os file and namespace API; `os/exec`'s process

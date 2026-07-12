@@ -31,7 +31,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [network handles cross run epochs](./dst-net-handles-cross-run-epochs.md) | M | connections and listeners reject stale epochs |
 | [process restart inherits cwd](./dst-process-restart-inherits-cwd.md) | M | process teardown resets cwd |
 | [process restart inherits environment](./dst-process-restart-inherits-environment.md) | M | process teardown resets environment state |
-| [Root handles are not owned by teardown](./dst-root-not-owned-by-process-or-host.md) | M | Root participates in process and host teardown |
 | [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |
 | [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
 | [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |

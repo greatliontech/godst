@@ -76,7 +76,7 @@ grouped by the functions they change. WIP = 1.
 
 ## File, Root, and process-state functions
 
-- [ ] 36. `dstRoot` records host/process ownership and closes on process and host teardown (`dst-root-not-owned-by-process-or-host`)
+- [x] 36. `dstRoot` records host/process ownership and closes on process and host teardown (`dst-root-not-owned-by-process-or-host`)
 - [ ] 37. process teardown removes cwd and environment views before a same-name restart (`dst-process-restart-inherits-cwd`, `dst-process-restart-inherits-environment`)
 - [ ] 38. environment host/COW dispatch is atomic with activation and deactivation (`dst-env-dispatch-straddles-run-edge`)
 - [ ] 39. mapping-fault death invokes the complete process resource lifecycle exactly once (`dst-mapping-fault-skips-resource-teardown`)

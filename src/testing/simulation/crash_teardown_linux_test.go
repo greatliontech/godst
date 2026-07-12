@@ -167,6 +167,41 @@ func TestDSTCrashProcessReleasesFileResources(t *testing.T) {
 	}
 }
 
+func TestDSTRootClosesOnProcessExitAndCrash(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		name := "exit"
+		if crash {
+			name = "crash"
+		}
+		t.Run(name, func(t *testing.T) {
+			var leaked *os.Root
+			Test(t, 1, func(t *testing.T) {
+				Host("h", HostConfig{}, func() {
+					ready := make(chan *os.Root, 1)
+					go Process("owner", func() {
+						os.Mkdir("/d", 0o755)
+						r, err := os.OpenRoot("/d")
+						if err != nil {
+							t.Fatal(err)
+						}
+						ready <- r
+						if crash {
+							select {}
+						}
+					})
+					leaked = <-ready
+					if crash {
+						crashProcess("owner")
+					}
+					if _, err := leaked.Stat("."); !errors.Is(err, os.ErrClosed) {
+						t.Fatalf("Root.Stat after process %s = %v, want ErrClosed", name, err)
+					}
+				})
+			})
+		})
+	}
+}
+
 func TestDSTCrashProcessClosesListeners(t *testing.T) {
 	var restartListenErr error
 	Test(t, 1, func(t *testing.T) {

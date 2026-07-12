@@ -10,6 +10,10 @@ import "time"
 
 type dstRoot struct{}
 
+func dstUnregisterRoot(*root)  {}
+func dstCloseProcRoots(uint32) {}
+func dstCloseHostRoots(uint32) {}
+
 func dstRootActive(r *Root) bool { return false }
 
 func dstOpenRoot(name string) (*Root, bool, error) { return nil, false, nil }

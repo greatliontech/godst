@@ -10,6 +10,7 @@ import (
 	"errors"
 	"path"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -29,12 +30,65 @@ type dstRoot struct {
 	epoch uint64
 }
 
+var dstOpenRoots struct {
+	mu    sync.Mutex
+	epoch uint64
+	roots map[*root]dstOpenFileEntry
+}
+
+func dstOpenRootsRollLocked() {
+	if e := dstFSEpoch(); e != dstOpenRoots.epoch || dstOpenRoots.roots == nil {
+		dstOpenRoots.epoch = e
+		dstOpenRoots.roots = make(map[*root]dstOpenFileEntry)
+	}
+}
+
+func dstRegisterRoot(r *root) {
+	host, proc := dstFSCurrentNode()
+	dstOpenRoots.mu.Lock()
+	dstOpenRootsRollLocked()
+	dstOpenRoots.roots[r] = dstOpenFileEntry{host: host, proc: proc}
+	dstOpenRoots.mu.Unlock()
+}
+
+func dstUnregisterRoot(r *root) {
+	dstOpenRoots.mu.Lock()
+	dstOpenRootsRollLocked()
+	delete(dstOpenRoots.roots, r)
+	dstOpenRoots.mu.Unlock()
+}
+
+func dstCloseRoots(match func(dstOpenFileEntry) bool) {
+	dstOpenRoots.mu.Lock()
+	dstOpenRootsRollLocked()
+	var roots []*root
+	for r, entry := range dstOpenRoots.roots {
+		if match(entry) {
+			roots = append(roots, r)
+			delete(dstOpenRoots.roots, r)
+		}
+	}
+	dstOpenRoots.mu.Unlock()
+	for _, r := range roots {
+		_ = r.Close()
+	}
+}
+
+func dstCloseProcRoots(proc uint32) {
+	dstCloseRoots(func(e dstOpenFileEntry) bool { return e.proc == proc })
+}
+
+func dstCloseHostRoots(host uint32) {
+	dstCloseRoots(func(e dstOpenFileEntry) bool { return e.host == host })
+}
+
 func dstRootActive(r *Root) bool {
 	return r != nil && r.root != nil && r.root.dst != nil
 }
 
 func dstNewRoot(name string, node *dstFSNode, disk *dstFSDisk) *Root {
 	r := &Root{&root{fd: -1, name: name, dst: &dstRoot{node: node, disk: disk, epoch: dstFSEpoch()}}}
+	dstRegisterRoot(r.root)
 	runtime.SetFinalizer(r.root, (*root).Close)
 	return r
 }

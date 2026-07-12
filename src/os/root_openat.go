@@ -31,6 +31,9 @@ type root struct {
 }
 
 func (r *root) Close() error {
+	if r.dst != nil {
+		dstUnregisterRoot(r)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.closed && r.refs == 0 && r.dst == nil {
