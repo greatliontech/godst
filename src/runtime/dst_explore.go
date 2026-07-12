@@ -60,7 +60,7 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	// access under -race (so any -tags dst -race run, not just Explore, reaches here).
 	// Gating to dstSchedScheduled confines access yields to Explore; non-scheduled
 	// strategies are byte-for-byte unaffected.
-	if !dstActive() || dstSchedKind != dstSchedScheduled || gp.bubble == nil || gp.bubble != dstSimBubble {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || !gp.dstSimG {
 		// Membership, not mere bubble-ness: a FOREIGN synctest bubble's
 		// accesses are not simulation transitions — foreign goroutines never
 		// enter schedules, so their conflicts prune nothing, and recording
@@ -945,7 +945,13 @@ func dstRecordAccess(seq uint64, addr, size uintptr, write bool, pc uintptr, cou
 // switch (readier == getg()); skips when either end is not a bubble goroutine
 // (a system/driver wake carries no application HB). Allocation-free.
 func dstRecordReadyEdge(readier, readied *g) {
-	if readier == nil || readied == nil || readier.bubble == nil || readied.bubble == nil {
+	if readier == nil || readied == nil {
+		return
+	}
+	if !readier.dstSimG || !readied.dstSimG {
+		if readier.bubble != nil || readied.bubble != nil {
+			dstFilterConservative = true
+		}
 		return
 	}
 	from := dstEnsureSeq(readier)
@@ -999,7 +1005,13 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	if !dstActive() || dstSchedKind != dstSchedScheduled {
 		return
 	}
-	if gp == nil || gp.bubble == nil || id == 0 {
+	if gp == nil || id == 0 {
+		return
+	}
+	if !gp.dstSimG {
+		if gp.bubble != nil {
+			dstFilterConservative = true
+		}
 		return
 	}
 	// The HB shadow honors the EXECUTING goroutine's raceignore, exactly as
@@ -1063,7 +1075,7 @@ func dstExploreRecordUncaughtPanic(v any) bool {
 		return false
 	}
 	gp := getg()
-	if gp == nil || gp.bubble == nil || gp == gp.bubble.root {
+	if gp == nil || !gp.dstSimG || gp.bubble != dstSimBubble || gp == gp.bubble.root {
 		return false
 	}
 	if gp == gp.bubble.gcDrain {
@@ -1091,7 +1103,7 @@ func dstExploreDropPanicDefers(gp *g) {
 }
 
 func dstExploreRecordDeadlock(reason string, bubble *synctestBubble) bool {
-	if !dstActive() || dstSchedKind != dstSchedScheduled || bubble == nil {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || bubble == nil || bubble != dstSimBubble {
 		return false
 	}
 	if dstExploreDeadlock == "" {

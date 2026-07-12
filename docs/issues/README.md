@@ -14,7 +14,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [foreign work in a sim-idle window diverges replay](./dst-explore-foreign-idle-window-divergence.md) | M | idle-window composition replays deterministically, or diagnosed and recorded |
 | [IP-less explicit LocalAddr collapses to a concrete-IP bind](./dst-net-wildcard-localaddr-bind-collapse.md) | L | wildcard bind conflict modeled, or the collapse recorded in design.md |
 | [foreign Process exit teardown can span a run activation](./dst-sim-process-exit-teardown-spans-activation.md) | M | teardown cannot execute into an undeclared-in run, or acceptance recorded |
-| [explore recording gates key on bubble-ness, not membership](./dst-explore-recorder-gates-not-membership-keyed.md) | H | recorders keyed on sim membership, or per-gate unreachability recorded |
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |

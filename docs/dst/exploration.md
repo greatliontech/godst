@@ -627,7 +627,12 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
    child-before-parent-continuation failures are not silently skipped. Child-goroutine and drain-callback
    panics are recorded in the runtime after ordinary defers; scheduled deadlocks are converted inside
-   `synctestRun` before `Run` returns.
+   `synctestRun` before `Run` returns. Every panic, deadlock, access, ready-edge, and sync-event recorder
+   keys on active-simulation ownership: per-goroutine surfaces use sticky membership, while deadlock
+   recording uses exact bubble identity and panic recording requires both. A concurrent foreign bubble's panic or
+   deadlock propagates through that bubble unchanged and is never consumed or attributed to Explore;
+   its accesses and synchronization never become simulation transitions. An observed foreign-bubble
+   synchronization endpoint forces conservative filtering rather than supplying an unrepresentable HB edge.
    *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 

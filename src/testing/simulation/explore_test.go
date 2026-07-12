@@ -5,9 +5,11 @@
 package simulation
 
 import (
+	"context"
 	"internal/synctest"
 	"internal/testenv"
 	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -383,6 +385,64 @@ func TestExploreForeignBubbleSyncChurn(t *testing.T) {
 	if !reflect.DeepEqual(trAlone.procs, trChurned.procs) || !reflect.DeepEqual(trAlone.enabled, trChurned.enabled) {
 		t.Fatalf("foreign bubble visible in the recorded schedule:\nalone   procs=%v enabled=%v\nchurned procs=%v enabled=%v",
 			trAlone.procs, trAlone.enabled, trChurned.procs, trChurned.enabled)
+	}
+}
+
+func TestExploreDoesNotConsumeForeignBubbleFailure(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	mode := os.Getenv("DST_FOREIGN_FAILURE")
+	if mode != "" {
+		var trigger, done, propagated atomic.Bool
+		go func() {
+			defer done.Store(true)
+			defer func() { propagated.Store(recover() != nil) }()
+			synctest.Run(func() {
+				for !trigger.Load() {
+					runtime.Gosched()
+				}
+				if mode == "panic" {
+					go func() { panic("foreign panic") }()
+					for {
+						runtime.Gosched()
+					}
+				}
+				select {}
+			})
+		}()
+		result := Explore(1, Exhaustive, func() bool {
+			trigger.Store(true)
+			for !done.Load() {
+				runtime.Gosched()
+			}
+			return false
+		})
+		if !propagated.Load() {
+			t.Fatal("foreign bubble failure was consumed")
+		}
+		if len(result.Failures) != 0 {
+			t.Fatalf("foreign bubble failure attributed to exploration: %v", result.Failures)
+		}
+		return
+	}
+	for _, mode := range []string{"panic", "deadlock"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestExploreDoesNotConsumeForeignBubbleFailure$")
+			cmd.Env = append(os.Environ(), "DST_FOREIGN_FAILURE="+mode)
+			out, err := cmd.CombinedOutput()
+			if mode == "panic" {
+				if ctx.Err() != nil || err == nil || !strings.Contains(string(out), "foreign panic") {
+					t.Fatalf("foreign panic did not propagate: err=%v output=%s", err, out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("foreign deadlock propagation helper failed: %v\n%s", err, out)
+			}
+		})
 	}
 }
 
