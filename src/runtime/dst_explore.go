@@ -20,6 +20,8 @@
 
 package runtime
 
+import "internal/runtime/atomic"
+
 import (
 	"internal/runtime/sys"
 	"unsafe" // for go:linkname and the access-yield hook
@@ -283,15 +285,14 @@ func dstSetPostGoYield(enabled bool) bool {
 	return old
 }
 
-// dstSeqCtr assigns stable per-bubble goroutine indices for the scheduled
+// dstSeqCtr assigns stable per-bubble goroutine creation indices for every seeded
 // strategy. goid is a process-global monotonic counter, so the SAME logical
 // goroutine gets a DIFFERENT goid in each bubble re-execution — useless as a
 // schedule identity for replay. Instead each bubble goroutine gets a per-bubble
-// index (its dstSeq, storing index+1; 0 = unassigned) the first time it appears as
-// a scheduling candidate, in deterministic first-candidacy order. Following a
-// fixed prefix reproduces the same execution → the same candidacy order → the same
-// indices, so a recorded schedule replays exactly. Reset per bubble.
-var dstSeqCtr uint64
+// index (its dstSeq, storing index+1; 0 = unassigned) when it joins the simulation.
+// Creation order is itself schedule-controlled, so replay reproduces the indices.
+// Reset per bubble.
+var dstSeqCtr atomic.Uint64
 
 // Pre-sized trace buffers (allocated by dstExploreInit, never under the lock). The
 // enabled sets are stored flat: decision i's enabled dstSeq indices are
@@ -461,7 +462,7 @@ const (
 	dstAccLargeMax     = 64
 )
 
-// dstEnsureSeq lazily assigns gp's stable per-bubble index. THE membership
+// dstEnsureSeq assigns gp's stable per-bubble creation index. THE membership
 // chokepoint: only goroutines of the ACTIVE simulation's bubble receive one —
 // a foreign goroutine (no bubble, or a foreign synctest bubble live
 // concurrently with the simulation) gets 0, so it can neither consume the
@@ -484,8 +485,7 @@ func dstEnsureSeq(gp *g) uint64 {
 		return 0
 	}
 	if gp.dstSeq == 0 {
-		dstSeqCtr++
-		gp.dstSeq = dstSeqCtr
+		gp.dstSeq = dstSeqCtr.Add(1)
 	}
 	return gp.dstSeq
 }
@@ -1193,7 +1193,6 @@ func dstScheduleReset() {
 	dstTraceFlatN = 0
 	dstTraceOverflow = false
 	dstTraceEnabOverflow = false
-	dstSeqCtr = 0
 	dstEdgeN = 0
 	dstEdgeOverflow = false
 	dstHBEventN = 0
@@ -1257,7 +1256,7 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		if gp := c.at(k); gp != nil {
 			if !dstIsInfraCandidate(gp) {
 				dstEnsureSeq(gp)
-			} else if !dstTransparentScheduledCandidate(gp) {
+			} else if !dstTransparentCandidate(gp) {
 				dstSchedForeignSeen = true
 			}
 		}
@@ -1395,8 +1394,8 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 	return sel
 }
 
-func dstTransparentScheduledCandidate(gp *g) bool {
-	return dstSchedKind == dstSchedScheduled && gp.dstSimG && dstSimBubble != nil &&
+func dstTransparentCandidate(gp *g) bool {
+	return gp.dstSimG && dstSimBubble != nil &&
 		(gp.dstGCInternal || dstSimBubble.gcDrain == gp || dstSimBubble.root == gp)
 }
 

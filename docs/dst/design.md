@@ -1289,15 +1289,16 @@ later steps add, never rewrite.
   (a plain bubble live concurrently with the simulation — `g.bubble != dstSimBubble`) are scheduled by
   a fixed RNG-free policy (`dstFindRunnable` prefers them in candidate order). Infrastructure-first is
   **bounded**: after an infrastructure pick, a runnable simulation candidate gets the next decision,
-  selected over the sim-only subset — which order-preserving removal keeps identical to the
-  foreign-free enumeration, so the hand-off changes only when the simulation's decisions happen,
+  selected over the sim-only subset in stable simulation creation-index order, so physical
+  local/global/runnext placement and the hand-off change only when decisions happen,
   never which goroutine one picks. **Exception: the simulation's own drain.** Under the scheduled
-  strategy the bubble's finalizer/cleanup drain is infra-classified but has sim-visible effects
+  strategies the bubble's finalizer/cleanup drain is infra-classified but has sim-visible effects
   (user callbacks), so it is exempt from the alternation in both directions: it outranks every other
   infrastructure candidate, and its pick neither owes the simulation the next slot nor can be
   displaced by the hand-off — the drain runs at the same logical points, uninterrupted between its
   yields, as in a foreign-free execution (its scheduling is not an interleaving degree of freedom
-  the explorer models). A persistently-runnable foreign goroutine (a user Gosched loop, a
+  the scheduler models). The root driver and transient GC-internal execution are transparent by the
+  same rule, so they consume neither Random draws nor PCT steps. A persistently-runnable foreign goroutine (a user Gosched loop, a
   spinning foreign bubble) gets at most every other non-drain slot and cannot starve the bubble —
   the livelock an unconditional infrastructure-first policy would produce, undiagnosable because the
   bubble stays runnable and the durably-blocked deadlock detection never fires. Under the scheduled

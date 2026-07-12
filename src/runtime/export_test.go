@@ -621,6 +621,50 @@ func DSTFakeTimersTestRemap(host uint32, now, oldPPB, newPPB int64, timers ...*D
 	return when
 }
 
+func DSTTestStableCandidateSelection(physical []uint64, ordinal uint32) uint64 {
+	gs := make([]g, len(physical))
+	var pp p
+	for i, seq := range physical {
+		gs[i].dstSimG = true
+		gs[i].dstSeq = seq
+		pp.runq[i].set(&gs[i])
+	}
+	c := dstCandidates{pp: &pp, ringN: uint32(len(physical))}
+	return c.at(c.simSeqIdx(uint32(len(physical)), ordinal)).dstSeq
+}
+
+func DSTTestPCTTieSelection(physicalSeq, physicalGoid []uint64) uint64 {
+	gs := make([]g, len(physicalSeq))
+	var pp p
+	for i, seq := range physicalSeq {
+		gs[i].dstSimG = true
+		gs[i].dstSeq = seq
+		gs[i].goid = physicalGoid[i]
+		gs[i].dstPrio = 1
+		pp.runq[i].set(&gs[i])
+	}
+	old := dstPCT
+	dstPCT = dstPCTState{}
+	defer func() { dstPCT = old }()
+	c := dstCandidates{pp: &pp, ringN: uint32(len(physicalSeq))}
+	return c.at(dstPCTSelect(&c, uint32(len(physicalSeq)))).dstSeq
+}
+
+func DSTTestHarnessTransparency(strategy int) [3]bool {
+	oldKind, oldBubble := dstSchedKind, dstSimBubble
+	defer func() { dstSchedKind, dstSimBubble = oldKind, oldBubble }()
+	if strategy == 0 {
+		dstSchedKind = dstSchedRandom
+	} else {
+		dstSchedKind = dstSchedPCT
+	}
+	root := &g{dstSimG: true}
+	drain := &g{dstSimG: true}
+	gc := &g{dstSimG: true, dstGCInternal: true}
+	dstSimBubble = &synctestBubble{root: root, gcDrain: drain}
+	return [3]bool{dstIsInfraCandidate(root), dstIsInfraCandidate(drain), dstIsInfraCandidate(gc)}
+}
+
 type Sudog = sudog
 
 type XRegPerG = xRegPerG

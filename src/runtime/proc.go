@@ -5514,8 +5514,11 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// claim itself (synctestRun).
 		newg.dstSimG = newg.bubble != nil && newg.bubble == dstSimBubble
 		dstClearSchedState(newg)
+		if newg.dstSimG {
+			dstEnsureSeq(newg)
+		}
 		if dstSchedKind == dstSchedPCT && gomaxprocs == 1 &&
-			(callergp.bubble == dstSimBubble || (callergp == dstSimRootG && dstSimBubble == nil)) {
+			(newg.dstSimG || (callergp == dstSimRootG && dstSimBubble == nil)) {
 			// PCT: give the new goroutine a random base priority from the scheduling
 			// RNG (a scheduling property, not part of the per-g logical stream). The
 			// creation order is deterministic, so the draw sequence is too. Gated on
@@ -7948,16 +7951,15 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	// bubble is runnable, so the durably-blocked deadlock detection never
 	// fires). After an infrastructure pick, if a simulation candidate is
 	// runnable, the next decision is handed to the simulation, selecting over
-	// the sim-only subset (dstSchedSelect with mixed=true). Order-preserving
-	// candidate removal keeps that subset identical to the set a foreign-free
-	// execution enumerates, so the hand-off changes only WHEN the simulation's
+	// the sim-only subset in stable creation-index order. Physical queue
+	// placement cannot reorder that subset, so the hand-off changes only WHEN the simulation's
 	// decisions happen, never WHICH goroutine a decision picks — the seeded
 	// interleaving stays a pure function of the seed, and a persistently
 	// runnable foreign goroutine gets at most every other slot (matching the
 	// round-robin progress upstream GOMAXPROCS=1 scheduling gives the same
 	// shape). Pinned by TestDSTSchedForeignSpinner.
-	// The simulation bubble's own drain goroutine (gcDrain, infra-classified
-	// under the scheduled strategy only) is exempt from the alternation in
+	// The simulation bubble's own drain goroutine (gcDrain, transparent under
+	// every strategy) is exempt from the alternation in
 	// both directions: it outranks every other infrastructure candidate in
 	// firstSystemG's scan, and its pick neither sets dstSchedPrevSys nor can
 	// be skipped by the hand-off. The drain runs user callbacks with
@@ -7972,9 +7974,9 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	if sysOK {
 		gp := c.at(sysK)
 		// The SIM bubble's root driver, drain, and a member's GC-internal
-		// disassociation scope are transparent to exploration. A foreign
+		// disassociation scope are transparent to seeded scheduling. A foreign
 		// bubble's corresponding goroutines remain unrelated process activity.
-		sysTransparent = dstTransparentScheduledCandidate(gp)
+		sysTransparent = dstTransparentCandidate(gp)
 	}
 	if sysOK && (sysTransparent || !dstSchedPrevSys || !c.hasSimG(total)) {
 		sel = sysK
@@ -8000,7 +8002,7 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 		// Either a pure simulation set (the common case), or fairness: the
 		// previous decision ran infrastructure and a simulation candidate is
 		// runnable, so this one is the simulation's (sysOK == mixed set).
-		sel = dstSchedSelect(&c, total, sysOK)
+		sel = dstSchedSelect(&c, total)
 		dstSchedPrevSys = false
 	}
 	gp, inheritTime = c.removeAt(sel)
@@ -8012,27 +8014,21 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 // under the active scheduling strategy. Random draws uniformly; PCT runs the
 // highest-priority candidate and fires any due priority-change point.
 //
-// mixed reports that infrastructure candidates are present in [0,total) (the
-// starvation-fairness hand-off in dstFindRunnable): every strategy then
-// selects over the sim-only subset in candidate order, which order-preserving
-// removal keeps identical to the foreign-free enumeration — the same seed
-// picks the same goroutine with or without foreign candidates present.
-func dstSchedSelect(c *dstCandidates, total uint32, mixed bool) uint32 {
+// Every seeded strategy selects over the simulation-only subset in stable
+// creation-index order, independent of physical queue segment placement.
+func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
 	switch dstSchedKind {
 	case dstSchedPCT:
 		return dstPCTSelect(c, total)
 	case dstSchedScheduled:
 		return dstScheduledSelect(c, total)
 	}
-	if !mixed {
-		return dstSchedRandn(total)
-	}
-	return c.simIdx(total, dstSchedRandn(c.simCount(total)))
+	return c.simSeqIdx(total, dstSchedRandn(c.simCount(total)))
 }
 
 // dstPCTSelect implements the PCT choice: advance the step counter, pick the
-// runnable candidate with the highest priority (ties broken by goid, for
-// determinism), and if this step is a priority-change point, deprioritize the
+// runnable candidate with the highest priority (ties broken by stable simulation
+// creation index), and if this step is a priority-change point, deprioritize the
 // chosen goroutine (it still runs this step but sorts low afterward), creating
 // the priority inversion that exposes a depth-d bug.
 func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
@@ -8048,14 +8044,15 @@ func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
 	// value-domain fact.
 	best := ^uint32(0)
 	var bestPrio int64
-	var bestGoid uint64
+	var bestSeq uint64
 	for k := uint32(0); k < total; k++ {
 		g := c.at(k)
 		if g == nil || dstIsInfraCandidate(g) {
 			continue
 		}
-		if best == ^uint32(0) || g.dstPrio > bestPrio || (g.dstPrio == bestPrio && g.goid < bestGoid) {
-			best, bestPrio, bestGoid = k, g.dstPrio, g.goid
+		seq := dstEnsureSeq(g)
+		if best == ^uint32(0) || g.dstPrio > bestPrio || (g.dstPrio == bestPrio && seq < bestSeq) {
+			best, bestPrio, bestSeq = k, g.dstPrio, seq
 		}
 	}
 	if best == ^uint32(0) {
@@ -8070,6 +8067,35 @@ func dstPCTSelect(c *dstCandidates, total uint32) uint32 {
 		}
 	}
 	return best
+}
+
+// simSeqIdx returns the nth simulation candidate in stable creation-index order,
+// independent of which physical run-queue segment currently contains it.
+func (c *dstCandidates) simSeqIdx(total, n uint32) uint32 {
+	var after uint64
+	for ordinal := uint32(0); ordinal <= n; ordinal++ {
+		best := ^uint32(0)
+		var bestSeq uint64
+		for k := uint32(0); k < total; k++ {
+			gp := c.at(k)
+			if gp == nil || dstIsInfraCandidate(gp) {
+				continue
+			}
+			seq := dstEnsureSeq(gp)
+			if seq > after && (best == ^uint32(0) || seq < bestSeq) {
+				best, bestSeq = k, seq
+			}
+		}
+		if best == ^uint32(0) {
+			throw("dst: simulation candidate ordinal out of range")
+		}
+		if ordinal == n {
+			return best
+		}
+		after = bestSeq
+	}
+	throw("dst: unreachable simulation candidate selection")
+	return 0
 }
 
 // dstCandidates is a stack-allocated view of the unified runnable set for one
@@ -8089,28 +8115,24 @@ type dstCandidates struct {
 
 // firstSystemG returns the index of the first candidate that should be scheduled
 // RNG-free as infrastructure rather than as part of the simulated program:
-// goroutines outside any synctest bubble (g.bubble == nil), and — under the
-// scheduled (exploration) strategy only — the bubble's root driver, finalizer
+// goroutines outside any synctest bubble (g.bubble == nil), and the bubble's root driver, finalizer
 // drain, and transient GC-disassociated execution. Those states drive the
 // harness/runtime rather than a SUT interleaving; isolating them here keeps
 // physical quiescence and GC timing out of the recorded schedule/DPOR search. Returns
-// false if no candidate qualifies. Random/PCT deliberately leave these states in the seeded selection:
-// its scheduling is already deterministic there, so isolating it would change
-// their interleavings without removing any nondeterminism.
+// false if no candidate qualifies. Harness/runtime turns consume no Random draw
+// or PCT step, so host timing cannot shift later SUT choices.
 func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 	// The simulation's own drain outranks every other infrastructure
 	// candidate: it has sim-visible effects (user finalizers/cleanups), so a
-	// foreign entry ahead of it in candidate order must not displace it (see
-	// dstFindRunnable). Only the scheduled strategy classifies it as
-	// infrastructure at all (dstIsInfraCandidate).
-	if dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain != nil {
+	// foreign entry ahead of it in candidate order must not displace it.
+	if dstSimBubble != nil && dstSimBubble.gcDrain != nil {
 		for k := uint32(0); k < total; k++ {
 			if c.at(k) == dstSimBubble.gcDrain {
 				return k, true
 			}
 		}
 	}
-	if dstSchedKind == dstSchedScheduled {
+	if dstSimBubble != nil {
 		best := ^uint32(0)
 		var bestSeq uint64
 		for k := uint32(0); k < total; k++ {
@@ -8126,7 +8148,7 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 			return best, true
 		}
 	}
-	if dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.root != nil {
+	if dstSimBubble != nil && dstSimBubble.root != nil {
 		for k := uint32(0); k < total; k++ {
 			if c.at(k) == dstSimBubble.root {
 				return k, true
@@ -8150,23 +8172,22 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 // bubble (a plain synctest bubble live concurrently with the simulation) —
 // such goroutines must not consume seed draws, or the schedule would depend
 // on unrelated process activity and the run would not reproduce in isolation
-// — and, under the scheduled (exploration) strategy only, the bubble's
-// finalizer-drain goroutine (see firstSystemG). The complement is the
+// — plus the simulation's root driver, finalizer drain, and transient GC work.
+// The complement is the
 // simulation's own candidate set, which the seeded/PCT/scheduled selections
 // range over; the two classifications must stay in lockstep (fairness in
 // dstFindRunnable selects over the complement of exactly this predicate).
 func dstIsInfraCandidate(gp *g) bool {
-	if dstTransparentScheduledCandidate(gp) {
+	if dstTransparentCandidate(gp) {
 		return true
 	}
 	if !gp.dstSimG {
 		// Sticky membership, not the live gp.bubble field: temporary GC
 		// disassociation must never make a simulation member foreign. The
-		// scheduled strategy handles that scope as explicitly transparent;
-		// Random and PCT continue to classify it by sticky membership here.
+		// scheduler handles that scope as explicitly transparent.
 		return true
 	}
-	return dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain == gp
+	return false
 }
 
 // hasSimG reports whether any candidate is a simulation goroutine (the

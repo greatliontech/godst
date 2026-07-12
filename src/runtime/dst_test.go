@@ -1302,6 +1302,23 @@ func TestDSTScheduleDeterministic(t *testing.T) {
 	}
 }
 
+func TestDSTSchedulerCanonicalCandidateIdentity(t *testing.T) {
+	physical := []uint64{30, 10, 20}
+	for ordinal, want := range []uint64{10, 20, 30} {
+		if got := runtime.DSTTestStableCandidateSelection(physical, uint32(ordinal)); got != want {
+			t.Fatalf("ordinal %d selected creation index %d, want %d", ordinal, got, want)
+		}
+	}
+	if got := runtime.DSTTestPCTTieSelection([]uint64{20, 10}, []uint64{1, 2}); got != 10 {
+		t.Fatalf("PCT tie selected creation index %d, want 10", got)
+	}
+	for _, strategy := range []int{0, 1} {
+		if got := runtime.DSTTestHarnessTransparency(strategy); got != [3]bool{true, true, true} {
+			t.Fatalf("strategy %d harness transparency = %v, want all true", strategy, got)
+		}
+	}
+}
+
 // TestDSTScheduleDiversity verifies seed-varied scheduling, for every strategy:
 // the interleaving is seed-*varied*, so different seeds explore different sound
 // interleavings (the completeness gain — before the seeded scheduling draw,

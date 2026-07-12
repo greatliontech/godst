@@ -47,7 +47,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Runtime scheduling functions
 
-- [ ] 22. same-seed scheduler and network-reset-order probes replay identically under focused and contended full-suite repetition, with their load-dependent inputs eliminated (`dst-schedule-broadcast-replay-flake`, `dst-scheduler-load-replay-flakes`)
+- [x] 22. same-seed scheduler and network-reset-order probes replay identically under focused repetition and controlled host contention, with their load-dependent inputs eliminated (`dst-schedule-broadcast-replay-flake`, `dst-scheduler-load-replay-flakes`)
 
 ## Exploration recorder functions
 

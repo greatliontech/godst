@@ -509,7 +509,7 @@ type g struct {
 	goid          uint64
 	dstrand       uint64  // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
 	dstPrio       int64   // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
-	dstSeq        uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
+	dstSeq        uint64  // DST stable per-bubble goroutine creation index+1 (0 = unassigned); canonicalizes Random/PCT choices and scheduled replay
 	dstHost       uint32  // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1; identity, not RNG; unused when DST off. Also keys the per-host wall-clock offset table (dst.go dstHostClock): a host's clock is mutable (StepClock) so it lives in a per-host table, not on g, and is read by g.dstHost
 	dstProc       uint32  // DST process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1; identity, not RNG; unused when DST off
 	dstPid        int32   // DST per-process simulated pid (os.Getpid); set per-invocation by testing/simulation.Process, inherited parent→child at newproc1; a restart gets a fresh pid (no stable-pid); unused when DST off

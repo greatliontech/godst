@@ -59,15 +59,16 @@ steal-synchronizing CAS.
 **Strategies (the `simulation.RunWith` control surface).** The strategy is a per-run choice consulted at the
 unified seam, `dstSchedSelect(candidates) → index`:
 - **Random** (default; `simulation.Run` and `simulation.RunWith{Strategy:Random}`): uniform pick over the runnable
-  set from the scheduling RNG. Different seeds → different sound interleavings.
+  set from the scheduling RNG. The random ordinal is mapped through stable simulation creation indices,
+  not local/global/runnext queue position. Different seeds → different sound interleavings.
 - **PCT** (`simulation.RunWith{Strategy:PCT, Depth:d, Steps:K}`): Probabilistic Concurrency Testing. Each
   **simulation-bubble** goroutine gets a random base priority at creation (`g.dstPrio`, drawn from the
   scheduling RNG in `newproc1`, well above the change-point low band) — the creation-side draw is gated
-  on `callergp.bubble == dstSimBubble` exactly as the selection side is (system-goroutine isolation,
+  on the child's sticky simulation membership exactly as the selection side is (system-goroutine isolation,
   design.md): a foreign or non-bubble goroutine created mid-run consumes **no** scheduling-RNG draw,
   else every later PCT priority would shift with process-composition noise
   (`TestDSTPCTNonBubbleCreation`). The seam runs the highest-priority runnable
-  goroutine (ties by goid, for determinism). `d−1` **priority-change points** are placed at random
+  goroutine (ties by stable simulation creation index). `d−1` **priority-change points** are placed at random
   steps in `[1,K]` (re-rooted per bubble); when the step counter reaches one, the goroutine scheduled
   at that step is dropped to a low priority — the priority inversion that exposes a depth-`d` bug. PCT
   gives a probabilistic guarantee (≈ `1/(n·K^{d−1})`) of hitting a depth-`d` interleaving per seed,
@@ -79,6 +80,8 @@ unified seam, `dstSchedSelect(candidates) → index`:
 Both strategies share the seam's soundness (only runnable goroutines are ever chosen) and determinism
 (every draw is from the seeded scheduling RNG, advanced in a deterministic order at P=1). `g.dstPrio`
 and the PCT state are unused under Random and when DST is off.
+The synctest root driver, finalizer/cleanup drain, and transient GC-internal execution are harness turns,
+not SUT choices: every strategy runs them RNG-free without advancing Random draws or PCT steps.
 
 **Scheduling faults (5c) are folded into the fault-orchestration feature, not built here (deliberate,
 Spec-first).** A scheduling fault splits into two shapes on opposite sides of the foreclosure line.
@@ -629,8 +632,8 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 
 **As built — the substrate + brain are proven on the manual hook:** the stable
-per-bubble index (`g.dstSeq`, lazily assigned at first candidacy — goid is process-global and drifts
-across re-executions, so it cannot key a replayable schedule; assignment is MEMBERSHIP-gated at its
+per-bubble creation index (`g.dstSeq` — goid is process-global and drifts across re-executions, so it
+cannot key a replayable schedule; assignment is MEMBERSHIP-gated at its
 single chokepoint, `dstEnsureSeq`: only goroutines of the active simulation's bubble receive an
 index, so a foreign synctest bubble live concurrently with an exploration can neither consume the
 per-episode counter at foreign-timing-dependent points nor carry a stale index into a later

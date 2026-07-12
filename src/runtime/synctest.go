@@ -210,7 +210,7 @@ func synctestRun(f func()) {
 
 	gp.bubble = bubble
 	defer func() {
-		if dstActive() && dstSchedKind == dstSchedScheduled {
+		if dstActive() {
 			dstClearSchedState(gp)
 		}
 		if dstBuild && dstSimBubble == bubble {
@@ -242,6 +242,7 @@ func synctestRun(f func()) {
 			// the GC assist paths temporarily nil (see g.dstSimG).
 			bubble.main.dstSimG = true
 			gp.dstSimG = true
+			dstSeqCtr.Store(0)
 			// Re-root the per-g DST tree at this bubble so the bubble's
 			// randomness is independent of what ran before it in this process: a
 			// bubble (test) is then reproducible in isolation. Without this,
@@ -292,6 +293,8 @@ func synctestRun(f func()) {
 				// before the Run and persists across the re-root. See dst_explore.go.
 				dstScheduleReset()
 			}
+			dstEnsureSeq(bubble.main)
+			dstEnsureSeq(gp)
 		}
 		pp := getg().m.p.ptr()
 		runqput(pp, bubble.main, true)
