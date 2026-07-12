@@ -48,6 +48,9 @@ func dstSetHostIdent(host uint32, hostname string, numcpu int)
 //go:linkname dstAllocPid runtime.dstAllocPid
 func dstAllocPid() int32
 
+//go:linkname dstCheckPidAvailable runtime.dstCheckPidAvailable
+func dstCheckPidAvailable()
+
 //go:linkname dstSetProcessPid runtime.dstSetProcessPid
 func dstSetProcessPid(pid int32) (old int32)
 
@@ -798,17 +801,7 @@ func Process(name string, f func()) {
 			release()
 		}
 	}()
-	host, _ := dstCurrentNode()
-	if host == 0 {
-		host = internHost(name)
-		setHostIdent(host, name, 0) // implicit host: hostname = process name, default NumCPU
-		// Deliberately NO clock re-establishment here: a process restart does not
-		// reboot its host — the host's clock (rate, offset, applied StepClock
-		// faults) survives Process re-invocation; only a Host re-declaration models
-		// the reboot. A first-ever implicit host reads the per-run table's zero
-		// entry (in-sync, rate 1) with no call needed.
-	}
-	proc := internProc(name)
+	var host, proc uint32
 	var oldH, oldP uint32
 	var simPid, oldPid int32
 	func() {
@@ -817,6 +810,13 @@ func Process(name string, f func()) {
 		// a second host.
 		procTeardownMu.Lock()
 		defer procTeardownMu.Unlock()
+		dstCheckPidAvailable()
+		host, _ = dstCurrentNode()
+		if host == 0 {
+			host = internHost(name)
+			setHostIdent(host, name, 0)
+		}
+		proc = internProc(name)
 		if runActive.Load() && activeProcLivesElsewhere(proc, host) {
 			panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
 		}

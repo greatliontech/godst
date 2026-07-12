@@ -1581,6 +1581,13 @@ func dstAllocPid() int32 {
 	}
 }
 
+//go:linkname dstCheckPidAvailable
+func dstCheckPidAvailable() {
+	if dstSimPidNext.Load() == dstMaxSimPID {
+		panic("testing/simulation: simulated pid allocation overflows OS pid field")
+	}
+}
+
 // dstSetPidLive marks a simulated pid live or dead for Kill(pid, 0). Reached from
 // testing/simulation.Process by //go:linkname.
 //

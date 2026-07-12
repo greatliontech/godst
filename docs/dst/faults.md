@@ -163,7 +163,8 @@ tolerate*, so it cannot be a single global clock.
   pids: live process pids succeed, completed or unknown pids return `ESRCH`, and host pids are never probed.
   Procfs identity follows the same pid registry: `/proc/<pid>/stat` exposes a deterministic field-22
   starttime only for live simulated pids, and `/proc/self/ns/pid` readlink exposes a stable deterministic
-  namespace identity with no host `/proc` passthrough.
+  namespace identity with no host `/proc` passthrough. Exhausting the finite PID field fails before a
+  `Process` declaration interns names, stamps identity, registers liveness, or runs its body.
   Host 0 / unconfigured uses the run defaults (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is
   unchanged.
 - **Memory accounting** — **landed**. Per-process **allocation accounting** extends the existing
