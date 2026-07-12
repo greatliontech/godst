@@ -424,6 +424,10 @@ canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated loca
 checked against live local bindings on a **2-tuple** (local addr:port) basis, as the real path refuses:
 Go binds an explicit `LocalAddr` without `SO_REUSEADDR`, so `bind(2)` fails `EADDRINUSE` on a local
 collision even when the destinations differ (a per-4-tuple rule here would admit sim-only successes).
+A concrete source IP must belong to the dialing host (its loopback range or routable address), otherwise
+the bind fails `EADDRNOTAVAIL`. A valid explicit tuple is reserved before partition, handshake, or backlog
+waiting begins; concurrent dials and listeners observe that reservation, and every failed connect releases
+it before returning.
 Conns and listeners share ONE port space per host, in both directions: a dial's local bind — explicit
 or ephemeral — conflicts with a live listener at the port (exact or wildcard, same family:
 `TestDSTNetDialLocalBindListenerPortEADDRINUSE`, `TestDSTNetEphemeralDialSkipsListenerPort`), and a

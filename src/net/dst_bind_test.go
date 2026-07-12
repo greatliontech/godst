@@ -7,6 +7,7 @@
 package net
 
 import (
+	"context"
 	"errors"
 	"io"
 	"slices"
@@ -16,6 +17,247 @@ import (
 	"testing/simulation"
 	"time"
 )
+
+func TestDSTNetDialLocalAddrRejectsForeignHostIP(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var dialErr error
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("A")), Port: 35000}}
+			_, dialErr = d.Dial("tcp", simulation.HostIP("A")+":"+<-port)
+		})
+	})
+	if !errors.Is(dialErr, syscall.EADDRNOTAVAIL) {
+		t.Fatalf("dial with another host's source IP = %v, want EADDRNOTAVAIL", dialErr)
+	}
+}
+
+func TestDSTNetDialLocalBindConflictPrecedesPartitionWait(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var secondErr error
+	var secondDuration time.Duration
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		accepted := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				close(accepted)
+				defer c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			target := simulation.HostIP("A") + ":" + <-port
+			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+			first, err := d.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			<-accepted
+			simulation.Partition("A", "B")
+			start := time.Now()
+			_, secondErr = d.Dial("tcp", target)
+			secondDuration = time.Since(start)
+			first.Close()
+		})
+	})
+	if !errors.Is(secondErr, syscall.EADDRINUSE) || secondDuration != 0 {
+		t.Fatalf("occupied bind across partition = %v after %v, want immediate EADDRINUSE", secondErr, secondDuration)
+	}
+}
+
+func TestDSTNetPendingLocalBindReservedAndReleased(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var secondErr, firstErr, afterReleaseErr error
+	var secondDuration time.Duration
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			target := simulation.HostIP("A") + ":" + <-port
+			simulation.Partition("A", "B")
+			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+			ctx, cancel := context.WithCancel(context.Background())
+			firstDone := make(chan struct{})
+			go func() {
+				_, firstErr = d.DialContext(ctx, "tcp", target)
+				close(firstDone)
+			}()
+			time.Sleep(time.Nanosecond)
+			start := time.Now()
+			_, secondErr = d.Dial("tcp", target)
+			secondDuration = time.Since(start)
+			cancel()
+			<-firstDone
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer retryCancel()
+			_, afterReleaseErr = d.DialContext(retryCtx, "tcp", target)
+		})
+	})
+	if !errors.Is(secondErr, syscall.EADDRINUSE) || secondDuration != 0 {
+		t.Fatalf("second pending bind = %v after %v, want immediate EADDRINUSE", secondErr, secondDuration)
+	}
+	if !errors.Is(firstErr, context.Canceled) {
+		t.Fatalf("canceled first pending bind = %v, want context.Canceled", firstErr)
+	}
+	if !errors.Is(afterReleaseErr, context.DeadlineExceeded) {
+		t.Fatalf("bind after cancellation = %v, want partition timeout proving reservation release", afterReleaseErr)
+	}
+}
+
+func TestDSTNetPendingLocalBindReleasedOnProcessCrash(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var retryErr error
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			target := simulation.HostIP("A") + ":" + <-port
+			simulation.Partition("A", "B")
+			started := make(chan struct{})
+			go simulation.Process("worker", func() {
+				close(started)
+				d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+				d.Dial("tcp", target)
+			})
+			<-started
+			time.Sleep(time.Nanosecond)
+			simulation.Crash("worker")
+			simulation.Process("replacement", func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+				defer cancel()
+				d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+				_, retryErr = d.DialContext(ctx, "tcp", target)
+			})
+		})
+	})
+	if !errors.Is(retryErr, context.DeadlineExceeded) {
+		t.Fatalf("bind after process crash = %v, want partition timeout proving reservation release", retryErr)
+	}
+}
+
+func TestDSTNetPendingLocalBindReleasedOnHostReboot(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var retryErr error
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		started := make(chan struct{})
+		var target string
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			target = simulation.HostIP("A") + ":" + <-port
+			simulation.Partition("A", "B")
+			go simulation.Process("worker", func() {
+				close(started)
+				d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+				d.Dial("tcp", target)
+			})
+		})
+		<-started
+		time.Sleep(time.Nanosecond)
+		simulation.CrashHost("B")
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
+			_, retryErr = d.DialContext(ctx, "tcp", target)
+		})
+	})
+	if !errors.Is(retryErr, context.DeadlineExceeded) {
+		t.Fatalf("bind after host reboot = %v, want partition timeout proving reservation release", retryErr)
+	}
+}
+
+func TestDSTNetPendingLocalBindVisibleToListenerAndEphemeralDial(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var listenErr error
+	var ephemeralPort int
+	simulation.Run(1, func() {
+		aPort := make(chan string, 1)
+		cPort := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			aPort <- p
+		})
+		simulation.Host("C", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			cPort <- p
+			go func() {
+				c, _ := ln.Accept()
+				if c != nil {
+					c.Close()
+				}
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			targetA := simulation.HostIP("A") + ":" + <-aPort
+			targetC := simulation.HostIP("C") + ":" + <-cPort
+			simulation.Partition("A", "B")
+			ctx, cancel := context.WithCancel(context.Background())
+			pendingDone := make(chan struct{})
+			go func() {
+				d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: dstDialEphemeralStart}}
+				d.DialContext(ctx, "tcp", targetA)
+				close(pendingDone)
+			}()
+			time.Sleep(time.Nanosecond)
+			ln, err := Listen("tcp", JoinHostPort(simulation.HostIP("B"), strconv.Itoa(dstDialEphemeralStart)))
+			listenErr = err
+			if ln != nil {
+				ln.Close()
+			}
+			c, err := Dial("tcp", targetC)
+			if err != nil {
+				panic(err)
+			}
+			ephemeralPort = c.LocalAddr().(*TCPAddr).Port
+			c.Close()
+			cancel()
+			<-pendingDone
+		})
+	})
+	if !errors.Is(listenErr, syscall.EADDRINUSE) {
+		t.Fatalf("listener over pending explicit bind = %v, want EADDRINUSE", listenErr)
+	}
+	if ephemeralPort != dstDialEphemeralStart+1 {
+		t.Fatalf("ephemeral dial with %d pending received %d, want %d", dstDialEphemeralStart, ephemeralPort, dstDialEphemeralStart+1)
+	}
+}
 
 func TestDSTNetEphemeralAllocatorsAreHostScoped(t *testing.T) {
 	if !dstNetEnabled {

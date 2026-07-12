@@ -311,6 +311,7 @@ func dstResetHost(h uint32) {
 // dstCloseHostListeners closes every listener on host h — the whole port space
 // dies with the machine, whichever of its processes bound it.
 func dstCloseHostListeners(h uint32) {
+	dstReleasePendingBinds(func(key dstBindKey, _ uint32) bool { return key.host == h })
 	dstCloseListeners(func(l *dstListener) bool { return l.host == h })
 }
 
@@ -385,7 +386,19 @@ func dstResetBothEnds(c *dstConn) {
 }
 
 func dstCloseProcListeners(p uint32) {
+	dstReleasePendingBinds(func(_ dstBindKey, proc uint32) bool { return proc == p })
 	dstCloseListeners(func(l *dstListener) bool { return l.proc == p })
+}
+
+func dstReleasePendingBinds(match func(dstBindKey, uint32) bool) {
+	dstNet.mu.Lock()
+	defer dstNet.mu.Unlock()
+	dstNetRoll()
+	for key, proc := range dstNet.pendingBinds {
+		if match(key, proc) {
+			delete(dstNet.pendingBinds, key)
+		}
+	}
 }
 
 func dstCloseListeners(match func(*dstListener) bool) {

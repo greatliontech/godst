@@ -52,8 +52,16 @@ var dstNet struct {
 	mu             sync.Mutex
 	epoch          uint64
 	listeners      map[string]*dstListener
-	nextPort       map[uint32]int // host → deterministic ephemeral local port for dialers
-	nextListenPort map[uint32]int // host → deterministic ephemeral port for listeners bound to :0
+	nextPort       map[uint32]int        // host → deterministic ephemeral local port for dialers
+	nextListenPort map[uint32]int        // host → deterministic ephemeral port for listeners bound to :0
+	pendingBinds   map[dstBindKey]uint32 // bind → owning process
+}
+
+type dstBindKey struct {
+	host   uint32
+	family string
+	ip     string
+	port   int
 }
 
 const (
@@ -72,6 +80,7 @@ const (
 // dstNet.mu; the conn probe nests dstConns.mu under it (a fixed lock order).
 func dstAllocEphemeralPort(host uint32, localIP IP) int {
 	scope := dstNetScope(host)
+	family := dstTCPAddrFamily(localIP)
 	const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
 	for tried := 0; tried < span; tried++ {
 		p := dstNet.nextPort[host]
@@ -83,6 +92,9 @@ func dstAllocEphemeralPort(host uint32, localIP IP) int {
 			dstNet.nextPort[host] = dstDialEphemeralStart
 		}
 		if dstLocalBindInUse(host, localIP, p) {
+			continue
+		}
+		if _, reserved := dstNet.pendingBinds[dstBindKey{host: host, family: family, ip: localIP.String(), port: p}]; reserved {
 			continue
 		}
 		if dstListenerConflict(scope, "tcp", localIP, dstListenerKey("tcp", localIP, p, false), p, false) {
@@ -100,6 +112,7 @@ func dstNetRoll() {
 		dstNet.listeners = make(map[string]*dstListener)
 		dstNet.nextPort = make(map[uint32]int)
 		dstNet.nextListenPort = make(map[uint32]int)
+		dstNet.pendingBinds = make(map[dstBindKey]uint32)
 	}
 }
 
@@ -294,6 +307,18 @@ func dstResolveLocalTCPAddr(network string, remoteIP IP, local Addr) (*TCPAddr, 
 	return &TCPAddr{IP: append(IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}, nil
 }
 
+func dstLocalIPOwnedByHost(host uint32, ip IP) bool {
+	if ip.IsLoopback() {
+		return true
+	}
+	owner, ok := dstHostForRoutableIP(ip)
+	return ok && owner == host
+}
+
+func dstExplicitBindKey(host uint32, network string, ip IP, port int) dstBindKey {
+	return dstBindKey{host: host, family: dstAddrFamily(network, ip), ip: ip.String(), port: port}
+}
+
 func dstDialOptionsError(d *Dialer, network string, source, addr Addr) error {
 	if d.ControlContext != nil {
 		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.ControlContext")
@@ -478,6 +503,15 @@ func dstAllocateListenPort(scope, network string, ip IP, host uint32, wildcard, 
 // inherit the listener's SO_REUSEADDR and never block (a restarted server
 // re-binds its port while old connections drain). Caller holds dstNet.mu.
 func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcard, dual bool) bool {
+	family := dstAddrFamily(network, ip)
+	for bind := range dstNet.pendingBinds {
+		if bind.host != host || bind.port != port {
+			continue
+		}
+		if dual || bind.family == family && (wildcard || bind.ip == ip.String()) {
+			return true
+		}
+	}
 	switch {
 	case dual:
 		return dstConnBindInUse(host, nil, port, "", true)
@@ -944,6 +978,52 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	if err := dstDialOptionsError(d, network, localTCPAddr.opAddr(), serverAddr); err != nil {
 		return nil, err
 	}
+	dialerHost, dialerProc := dstNetCurrentNode()
+	targetHost := dialerHost
+	if h, ok := dstHostForRoutableIP(ip); ok {
+		targetHost = h
+	}
+	localIP := IPv4(127, 0, 0, 1)
+	if _, routable := dstHostForRoutableIP(ip); routable {
+		localIP = dstHostRoutableIP(dialerHost)
+	} else if dstAddrFamily(network, ip) == "tcp6" {
+		localIP = IPv6loopback
+	}
+	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {
+		if !dstLocalIPOwnedByHost(dialerHost, localTCPAddr.IP) {
+			return nil, &OpError{Op: "dial", Net: network, Source: d.LocalAddr, Addr: serverAddr, Err: syscall.EADDRNOTAVAIL}
+		}
+		localIP = localTCPAddr.IP
+	}
+	localPort := 0
+	if localTCPAddr != nil {
+		localPort = localTCPAddr.Port
+	}
+	var reserved *dstBindKey
+	if localPort != 0 {
+		key := dstExplicitBindKey(dialerHost, network, localIP, localPort)
+		dstNet.mu.Lock()
+		dstNetRoll()
+		dialerScope := dstNetScope(dialerHost)
+		conflict := dstLocalBindInUse(dialerHost, localIP, localPort) ||
+			dstTimeWaitHeld(dialerHost, localIP, localPort) ||
+			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, false), localPort, false)
+		_, pending := dstNet.pendingBinds[key]
+		if conflict || pending {
+			dstNet.mu.Unlock()
+			src := &TCPAddr{IP: localIP, Port: localPort, Zone: localTCPAddr.Zone}
+			return nil, &OpError{Op: "dial", Net: network, Source: src, Addr: serverAddr, Err: syscall.EADDRINUSE}
+		}
+		dstNet.pendingBinds[key] = dialerProc
+		dstNet.mu.Unlock()
+		reserved = &key
+		defer func() {
+			dstNet.mu.Lock()
+			dstNetRoll()
+			delete(dstNet.pendingBinds, *reserved)
+			dstNet.mu.Unlock()
+		}()
+	}
 	// Fire the nettrace connect callbacks around the simulated connect with
 	// the RESOLVED address, as production does per connect attempt — and not
 	// at all for addresses that fail validation above.
@@ -956,7 +1036,6 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 		}
 	}
 
-	dialerHost, dialerProc := dstNetCurrentNode()
 	// Partition on connect: a Dial across a cut link either REFUSES (the peer answers
 	// RST → ECONNREFUSED, fast) or BLACKHOLES (the SYN is dropped → the dial blocks
 	// until the link heals, the context/deadline expires, or the retransmit horizon
@@ -966,10 +1045,6 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	// checked in BOTH handshake directions (SYN dialer→target, SYN-ACK target→dialer)
 	// so a one-directional partition of either also fails the connect. The target host
 	// is the routable IP's owner; a loopback/own-host target is never partitioned.
-	targetHost := dialerHost
-	if h, ok := dstHostForRoutableIP(ip); ok {
-		targetHost = h
-	}
 	retransNs := dstNetRetransmitTimeoutNs()
 	// redial re-enters the blackhole wait and the listener lookup after a
 	// refusal point discovers the target host is powered off: a crash landing
@@ -1022,27 +1097,11 @@ redial:
 		}
 	}
 	scope := dstDialScope(ip, dialerHost)
-	// The dialer's source IP is known without the registry lock.
-	localIP := IPv4(127, 0, 0, 1)
-	if _, routable := dstHostForRoutableIP(ip); routable {
-		// Cross-host dial: the source address is the dialer's own routable IP.
-		localIP = dstHostRoutableIP(dialerHost)
-	} else if dstAddrFamily(network, ip) == "tcp6" {
-		localIP = IPv6loopback
-	}
-	if localTCPAddr != nil && localTCPAddr.IP != nil && !localTCPAddr.IP.IsUnspecified() {
-		localIP = localTCPAddr.IP
-	}
-
 	dstNet.mu.Lock()
 	dstNetRoll()
 	l := dstNet.listeners[scope+dstListenerKey(network, ip, portnum, false)]
 	if l == nil {
 		l = dstNet.listeners[scope+dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
-	}
-	localPort := 0
-	if localTCPAddr != nil {
-		localPort = localTCPAddr.Port
 	}
 	if localPort != 0 {
 		// An explicit LocalAddr binds without SO_REUSEADDR: bind(2) fails EADDRINUSE

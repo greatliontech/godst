@@ -433,10 +433,8 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 	}
 	simulation.Run(1, func() {
 		// Listen on a host-owned address (loopback): under the per-host network a
-		// host cannot bind an IP it does not own, and 10.0.0.1 is now host 1's
-		// routable IP, not an arbitrary address. Dialer.LocalAddr (the source
-		// address, below) is still exercised with a distinct value; it is reported,
-		// not bound, so it need not be a local interface address.
+		// host cannot bind an IP it does not own. Use a distinct address from its
+		// host-owned loopback range to exercise explicit source reporting.
 		ln, err := Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -452,7 +450,7 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 			}
 			defer c.Close()
 			remote := c.RemoteAddr().(*TCPAddr)
-			if !remote.IP.Equal(IPv4(10, 0, 0, 2)) {
+			if !remote.IP.Equal(IPv4(127, 0, 0, 2)) {
 				acceptErr <- &AddrError{Err: "server saw wrong remote IP", Addr: remote.String()}
 				return
 			}
@@ -463,15 +461,15 @@ func TestDSTNetDialerLocalAddr(t *testing.T) {
 			acceptErr <- nil
 		}()
 
-		d := Dialer{LocalAddr: &TCPAddr{IP: IPv4(10, 0, 0, 2), Port: 23456}}
+		d := Dialer{LocalAddr: &TCPAddr{IP: IPv4(127, 0, 0, 2), Port: 23456}}
 		c, err := d.DialContext(context.Background(), "tcp", ln.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer c.Close()
 		local := c.LocalAddr().(*TCPAddr)
-		if !local.IP.Equal(IPv4(10, 0, 0, 2)) {
-			t.Fatalf("Dialer.LocalAddr IP ignored: got %v, want 10.0.0.2", local.IP)
+		if !local.IP.Equal(IPv4(127, 0, 0, 2)) {
+			t.Fatalf("Dialer.LocalAddr IP ignored: got %v, want 127.0.0.2", local.IP)
 		}
 		if local.Port != 23456 {
 			t.Fatalf("Dialer.LocalAddr port ignored: got %v, want 23456", local.Port)
