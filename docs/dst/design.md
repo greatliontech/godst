@@ -520,7 +520,10 @@ sockets under DST).
 already deterministic — no new seed, no new RNG. The registry is keyed by a per-run epoch (`dstNetEpoch`,
 bumped in `dstActivate`) so it resets between runs with no teardown hook. Enforced by `TestDSTNet`
 (a two-node exchange replays byte-identically across processes; the per-run reset lets a second run
-re-Listen the same address). This is the reliable, in-order **base** on which network faults layer
+re-Listen the same address). Connections and listeners are stateful capabilities of their creation
+epoch: stale reads, writes, accepts, and deadline changes fail as closed without touching transport or
+current-run state. Address accessors retain creation-time metadata, while stale `Close` performs only
+wrapper-local idempotent cleanup. This is the reliable, in-order **base** on which network faults layer
 later as policies on the same registry+conns — and because the base is reliable, in-order TCP, the
 sound faults are **flow-granular** (latency, partition/blackhole, connection reset, throttle), *not*
 byte/message-granular: dropping, reordering, or duplicating bytes on a live stream is not a degree of

@@ -42,6 +42,9 @@ const dstNetEnabled = true
 //go:linkname dstActive runtime.dstActive
 func dstActive() bool
 
+//go:linkname dstInSimBubble runtime.dstInSimBubble
+func dstInSimBubble() bool
+
 //go:linkname dstNetEpoch runtime.dstNetEpoch
 func dstNetEpoch() uint64
 
@@ -548,6 +551,7 @@ func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcar
 // wrapping os.ErrDeadlineExceeded with the connection's network and addresses.
 type dstConn struct {
 	Conn
+	epoch         uint64
 	network       string
 	local, remote Addr
 	closed        atomic.Bool  // this end was Closed by its user
@@ -591,11 +595,22 @@ func dstOwnConnPair(dialer, server *dstConn) *dstOwnedConn {
 	return &dstOwnedConn{conn: server}
 }
 
-func (c *dstConn) LocalAddr() Addr  { return c.local }
-func (c *dstConn) RemoteAddr() Addr { return c.remote }
+func dstCloneAddr(addr Addr) Addr {
+	if tcp, ok := addr.(*TCPAddr); ok {
+		clone := *tcp
+		clone.IP = append(IP(nil), tcp.IP...)
+		return &clone
+	}
+	return addr
+}
+
+func (c *dstConn) LocalAddr() Addr  { return dstCloneAddr(c.local) }
+func (c *dstConn) RemoteAddr() Addr { return dstCloneAddr(c.remote) }
+
+func (c *dstConn) stale() bool { return !dstInSimBubble() || c.epoch != dstNetEpoch() }
 
 func (c *dstConn) opError(op string, err error) error {
-	return &OpError{Op: op, Net: c.network, Source: c.local, Addr: c.remote, Err: err}
+	return &OpError{Op: op, Net: c.network, Source: dstCloneAddr(c.local), Addr: dstCloneAddr(c.remote), Err: err}
 }
 
 // resetConn tears the connection down as a reset: the peer's subsequent reads
@@ -635,6 +650,9 @@ func (c *dstConn) mapConnErr(op string, err error) error {
 }
 
 func (c *dstConn) Read(b []byte) (int, error) {
+	if c.stale() {
+		return 0, c.opError("read", errClosed)
+	}
 	if c.closed.Load() {
 		return 0, c.opError("read", errClosed)
 	}
@@ -646,6 +664,9 @@ func (c *dstConn) Read(b []byte) (int, error) {
 }
 
 func (c *dstConn) Write(b []byte) (int, error) {
+	if c.stale() {
+		return 0, c.opError("write", errClosed)
+	}
 	if c.closed.Load() {
 		return 0, c.opError("write", errClosed)
 	}
@@ -654,8 +675,14 @@ func (c *dstConn) Write(b []byte) (int, error) {
 }
 
 func (c *dstConn) Close() error {
+	if !dstInSimBubble() && dstActive() && c.epoch == dstNetEpoch() {
+		return c.opError("close", errClosed)
+	}
 	if c.closed.Swap(true) {
 		return c.opError("close", errClosed)
+	}
+	if c.stale() {
+		return nil
 	}
 	// The kernel's close(2) conditional: an end whose receive queue holds
 	// unread data answers the peer with RST — the peer's next read fails
@@ -709,7 +736,10 @@ func (c *dstConn) timeWaitHold() {
 // so the local endpoint remains live until terminal state arrives.
 func (c *dstConn) setDeadline(set func(time.Time) error, t time.Time) error {
 	// Production shape for a set-deadline failure: Source nil, Addr local.
-	closedErr := &OpError{Op: "set", Net: c.network, Source: nil, Addr: c.local, Err: errClosed}
+	closedErr := &OpError{Op: "set", Net: c.network, Source: nil, Addr: dstCloneAddr(c.local), Err: errClosed}
+	if c.stale() {
+		return closedErr
+	}
 	if c.closed.Load() {
 		return closedErr
 	}
@@ -740,6 +770,7 @@ func (c *dstConn) SetWriteDeadline(t time.Time) error {
 // (plain "tcp" on a wildcard host) registers under both family keys.
 type dstListener struct {
 	network string
+	epoch   uint64
 	addr    *TCPAddr
 	keys    []string
 	accept  chan *dstOwnedConn
@@ -750,10 +781,15 @@ type dstListener struct {
 }
 
 func (l *dstListener) opError(op string, err error) error {
-	return &OpError{Op: op, Net: l.network, Source: nil, Addr: l.addr, Err: err}
+	return &OpError{Op: op, Net: l.network, Source: nil, Addr: dstCloneAddr(l.addr), Err: err}
 }
 
+func (l *dstListener) stale() bool { return !dstInSimBubble() || l.epoch != dstNetEpoch() }
+
 func (l *dstListener) Accept() (Conn, error) {
+	if l.stale() {
+		return nil, l.opError("accept", errClosed)
+	}
 	// Closed-first: production Accept after Close always fails with ErrClosed,
 	// even if connections were still queued in the backlog (Close reset them).
 	select {
@@ -790,8 +826,14 @@ func (l *dstListener) Accept() (Conn, error) {
 }
 
 func (l *dstListener) Close() error {
+	if !dstInSimBubble() && dstActive() && l.epoch == dstNetEpoch() {
+		return l.opError("close", errClosed)
+	}
 	if l.closed.Swap(true) {
 		return l.opError("close", errClosed)
+	}
+	if l.stale() {
+		return nil
 	}
 	close(l.done)
 	dstNet.mu.Lock()
@@ -818,7 +860,7 @@ func (l *dstListener) Close() error {
 	}
 }
 
-func (l *dstListener) Addr() Addr { return l.addr }
+func (l *dstListener) Addr() Addr { return dstCloneAddr(l.addr) }
 
 // dstListen is net.Listen under DST: register a simulated listener.
 func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
@@ -902,6 +944,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 	}
 	l := &dstListener{
 		network: network,
+		epoch:   dstNetEpoch(),
 		addr:    addr,
 		keys:    scoped,
 		accept:  make(chan *dstOwnedConn, 128), // backlog
@@ -1225,8 +1268,9 @@ redial:
 	}
 	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host)
 	reset := new(atomic.Bool)
-	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP)}
-	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP)}
+	epoch := dstNetEpoch()
+	dialer := &dstConn{Conn: p1, epoch: epoch, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP)}
+	server := &dstConn{Conn: p2, epoch: epoch, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP)}
 	// Publish lifecycle ownership before the server endpoint can enter the
 	// backlog or become visible to Accept. Failed establishment removes both
 	// registrations through the idempotent cleanup below.
