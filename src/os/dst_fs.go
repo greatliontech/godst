@@ -977,7 +977,8 @@ type dstFile struct {
 	dirpos int // directory read cursor (sorted-name index)
 	rd, wr bool
 	app    bool
-	osync  bool // O_SYNC: a write that wrote (n > 0) commits the durable image
+	osync  bool // full O_SYNC
+	odsync bool // O_DSYNC: data and size, but not timestamps
 	closed bool
 	// epoch is the run this handle belongs to, stamped at creation
 	// (dstNewFile). enter() refuses a handle from a dead run as it refuses a
@@ -1059,14 +1060,16 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		}
 	}
 
+	osync, odsync := dstSyncModes(flag)
 	d := &dstFile{
-		node:  node,
-		disk:  dstFSDiskHere(),
-		path:  dstFSAbs(name),
-		rd:    flag&O_WRONLY == 0,
-		wr:    accWrite,
-		app:   flag&O_APPEND != 0,
-		osync: flag&O_SYNC != 0,
+		node:   node,
+		disk:   dstFSDiskHere(),
+		path:   dstFSAbs(name),
+		rd:     flag&O_WRONLY == 0,
+		wr:     accWrite,
+		app:    flag&O_APPEND != 0,
+		osync:  osync,
+		odsync: odsync,
 	}
 	return dstNewFile(d, name), true, nil
 }
@@ -1323,14 +1326,18 @@ func (d *dstFile) write(b []byte) (int, error) {
 		return n, werr
 	}
 	d.off += int64(n)
-	if d.osync && n > 0 {
+	if (d.osync || d.odsync) && n > 0 {
 		// generic_write_sync fires only for ret > 0: a zero-length write, or
 		// one the ENOSPC cap fully refused, syncs nothing on real Linux. A
 		// PARTIAL write (0 < n < len(b), the disk filling mid-write) still
 		// commits its n bytes, matching the kernel. Without the guard a crash
 		// after Write(nil) on an O_SYNC handle would durably preserve prior
 		// unsynced writes hardware could lose, narrowing the crash-tear surface.
-		d.node.commitLocked()
+		if d.osync {
+			d.node.commitLocked()
+		} else {
+			d.node.commitDataLocked()
+		}
 	}
 	if n < len(b) {
 		// The disk filled: the remaining bytes fail ENOSPC, reported together with
@@ -1377,13 +1384,17 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if werr != nil {
 		return n, werr
 	}
-	if d.osync && n > 0 {
+	if (d.osync || d.odsync) && n > 0 {
 		// generic_write_sync fires only for ret > 0 (see write). On this
 		// path n == 0 is unreachable — a zero-length WriteAt is diverted
 		// before the backend (dstFDPwrite's len==0 short-circuit) and a
 		// fully-refused write already returned ENOSPC above — so the n > 0
 		// term is defensive parity with write, not a live branch.
-		d.node.commitLocked()
+		if d.osync {
+			d.node.commitLocked()
+		} else {
+			d.node.commitDataLocked()
+		}
 	}
 	return n, nil
 }

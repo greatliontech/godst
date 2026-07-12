@@ -618,7 +618,11 @@ which re-bases the durable image to the platter's post-crash state — see the c
 but only for a write that WROTE (`n > 0`, matching Linux's `generic_write_sync`): a zero-length
 write, or one the ENOSPC cap fully refused, commits nothing (a partial write still commits its `n`
 bytes) — so the pending unsynced data stays out of the durable image and a crash can lose it as hardware
-would, keeping the crash-tear surface honest (`TestDSTDiskOSyncZeroWriteDoesNotCommit` asserts the
+would. Linux `O_DSYNC` uses the same `n > 0` rule but commits only file data and size; mtime remains
+unsynced and rolls back on crash (`TestDSTFODSyncCommitsDataWithoutMetadata`).
+On Linux architectures where `O_SYNC` aliases `O_DSYNC`, the sole exposed flag value has data-sync
+semantics; a distinct full-sync request is not representable by that platform's API.
+This keeps the crash-tear surface honest (`TestDSTDiskOSyncZeroWriteDoesNotCommit` asserts the
 durable image directly — the loss a crash then exposes is unconditional, where a tear restore only
 MAY drop the pages).
 ftruncate is deliberately not covered (POSIX synchronized I/O is for writes — committing on

@@ -67,7 +67,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 30. `dstRemove`, `dstRemoveAll`, and `dstRename` resolve physical intermediates before terminal dot restrictions (`dst-fs-terminal-dot-bypasses-walk`)
 - [x] 31. named and rooted create functions preserve the special mode bits Chmod can represent (`dst-fs-create-drops-special-mode-bits`)
 - [x] 32. `dstChdir` pays one SlowDisk path traversal delay (`dst-disk-latency-skips-chdir`)
-- [ ] 33. the O_DSYNC data-only contract is modeled or its O_SYNC conflation is recorded (`dst-fs-odsync-conflates-osync`)
+- [x] 33. the O_DSYNC data-only contract is modeled or its O_SYNC conflation is recorded (`dst-fs-odsync-conflates-osync`)
 
 ## Filesystem crash-image functions
 

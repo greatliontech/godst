@@ -237,14 +237,16 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 			return wrap(err)
 		}
 	}
+	osync, odsync := dstSyncModes(flag)
 	d := &dstFile{
-		node:  node,
-		disk:  r.disk,
-		path:  joinPath(root.Name(), name),
-		rd:    flag&O_WRONLY == 0,
-		wr:    accWrite,
-		app:   flag&O_APPEND != 0,
-		osync: flag&O_SYNC != 0,
+		node:   node,
+		disk:   r.disk,
+		path:   joinPath(root.Name(), name),
+		rd:     flag&O_WRONLY == 0,
+		wr:     accWrite,
+		app:    flag&O_APPEND != 0,
+		osync:  osync,
+		odsync: odsync,
 	}
 	f := dstNewFile(d, d.path)
 	f.inRoot = true
