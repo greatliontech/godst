@@ -6,15 +6,44 @@ package net
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"testing"
 	"testing/simulation"
 	"time"
 )
+
+func TestDSTConnectDelayOverflowWaitsForContext(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.RunWith(2, simulation.Options{}, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		defer cancel()
+		if err := dstConnectSYN(ctx, math.MaxInt64, 2); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("overflowing SYN delay returned %v, want context deadline", err)
+		}
+	})
+}
+
+func TestDSTBaseTimerClampsAtRepresentableDeadline(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var base int64
+	simulation.RunWith(1, simulation.Options{}, func() {
+		<-dstNewBaseTimer(math.MaxInt64).C
+		base = dstBaseNanos()
+	})
+	if base != math.MaxInt64 {
+		t.Fatalf("base timer advanced clock to %d, want representable maximum %d", base, int64(math.MaxInt64))
+	}
+}
 
 // These tests exercise the simulated network's base cross-host link latency (the
 // fake-clock-gated delivery-queue wire, dst_wire.go) and the connection host

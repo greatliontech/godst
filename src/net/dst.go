@@ -881,7 +881,7 @@ func dstAnyListenerConflict(scope, network string, ip IP, keys []string, port in
 // mid-flight is not re-checked, so the connect still completes — the safe direction (the
 // sim succeeds where production might drop the SYN), a narrow race not worth the reload.
 func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
-	d := latencyNs + dstFaultRandN(jitterNs)
+	d := dstLinkDelay(latencyNs, jitterNs)
 	if d <= 0 {
 		return nil
 	}
@@ -902,7 +902,7 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 // and is not ctx-interruptible — like the buffered wire delays that follow. Same-host
 // (zero latency/jitter) returns instantly and draws nothing.
 func dstConnectSYNACK(latencyNs, jitterNs int64) {
-	if d := latencyNs + dstFaultRandN(jitterNs); d > 0 {
+	if d := dstLinkDelay(latencyNs, jitterNs); d > 0 {
 		t := dstNewBaseTimer(time.Duration(d))
 		<-t.C
 		t.Stop()

@@ -86,7 +86,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 40. `dstStream` persistent EOF signaling wakes all legal concurrent readers (`dst-net-concurrent-eof-strands-reader`)
 - [x] 41. FIN is a delayed control event and pays the configured one-way link latency/jitter (`dst-net-fin-bypasses-link-delay`)
 - [x] 42. link delivery and handshake timers consume universe base time under host drift while the sender-clock retransmission rule remains intact (`dst-net-base-delay-scaled-by-host-drift`)
-- [ ] 43. throttle and delivery timestamp arithmetic clamps or rejects every signed overflow (`dst-net-delay-arithmetic-overflows`)
+- [x] 43. throttle and delivery timestamp arithmetic clamps or rejects every signed overflow (`dst-net-delay-arithmetic-overflows`)
 
 ## Network partition and bind functions
 

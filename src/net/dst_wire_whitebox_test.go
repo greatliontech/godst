@@ -68,6 +68,7 @@ func TestDSTTransmitNanosOverflowSafe(t *testing.T) {
 		{20_000_000_000, 1_000_000_000},    // 20 GB push: nbytes*1e9 overflows, q carries it
 		{maxI64 - 1, maxI64},               // r ≈ maxI64 (stresses the 128-bit high word < bps invariant)
 		{1_000_000_000_000, 9_200_000_000}, // ~73 Gbit/s boundary, multi-second q
+		{maxI64, 1},                        // mathematical duration exceeds int64 and must saturate
 	}
 	for _, c := range cases {
 		got := dstTransmitNanos(c.nbytes, c.bps)
@@ -78,14 +79,47 @@ func TestDSTTransmitNanosOverflowSafe(t *testing.T) {
 		if r.Sign() != 0 {
 			want = new(bigint.Int).Add(q, bigint.NewInt(1))
 		}
-		if !want.IsInt64() {
-			t.Fatalf("test case %v has an out-of-int64 result; pick in-domain inputs", c)
+		wantI64 := maxI64
+		if want.IsInt64() {
+			wantI64 = want.Int64()
 		}
-		if got != want.Int64() {
-			t.Errorf("dstTransmitNanos(%d, %d) = %d, want %d (ceil, overflow-safe)", c.nbytes, c.bps, got, want.Int64())
+		if got != wantI64 {
+			t.Errorf("dstTransmitNanos(%d, %d) = %d, want %d (ceil, overflow-safe)", c.nbytes, c.bps, got, wantI64)
 		}
 		if c.nbytes > 0 && got < 1 {
 			t.Errorf("dstTransmitNanos(%d, %d) = %d; a nonzero payload must cost ≥1 ns (never faster than B)", c.nbytes, c.bps, got)
 		}
+	}
+}
+
+func TestDSTDelayArithmeticSaturates(t *testing.T) {
+	const maxI64 = int64(1<<63 - 1)
+	for _, tc := range []struct {
+		base, delay, want int64
+	}{
+		{0, 0, 0},
+		{-1, 5, 5},
+		{10, 20, 30},
+		{maxI64 - 1, 1, maxI64},
+		{maxI64 - 1, 2, maxI64},
+		{maxI64, 1, maxI64},
+	} {
+		if got := dstDelayAdd(tc.base, tc.delay); got != tc.want {
+			t.Errorf("dstDelayAdd(%d, %d) = %d, want %d", tc.base, tc.delay, got, tc.want)
+		}
+
+	}
+	if got := dstDelayAdd(dstDelayAdd(maxI64-2, 1), 2); got != maxI64 {
+		t.Errorf("three-term near-limit delay sum = %d, want %d", got, maxI64)
+	}
+
+	s := &dstStream{linkFreeAt: maxI64 - 1}
+	s.pushLocked([]byte("x"), maxI64, 0, 1)
+	if s.linkFreeAt != maxI64 || s.segs[0].deliverAt != maxI64 {
+		t.Fatalf("saturated push: linkFreeAt=%d deliverAt=%d, want both %d", s.linkFreeAt, s.segs[0].deliverAt, maxI64)
+	}
+	s.closeWrite(maxI64, 0)
+	if s.closeAt != maxI64 {
+		t.Fatalf("saturated FIN deadline = %d, want %d", s.closeAt, maxI64)
 	}
 }

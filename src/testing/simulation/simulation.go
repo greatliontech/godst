@@ -74,6 +74,7 @@ import (
 	"internal/msan"
 	"internal/race"
 	"internal/synctest"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -349,7 +350,8 @@ type NetworkConfig struct {
 	// simulated TCP connection between two DISTINCT hosts; same-host and loopback
 	// connections are always instant. The zero value is instant cross-host
 	// delivery — byte-identical to a connection with no latency machinery, so it
-	// does not perturb the N=1 collapse or any test that does not set it.
+	// does not perturb the N=1 collapse or any test that does not set it. Negative
+	// values are also disabled.
 	//
 	// It is measured in universe BASE (virtual) time: a per-host clock skew
 	// (HostConfig.Clock) shifts what time.Now reads on a host but never the wire
@@ -367,7 +369,9 @@ type NetworkConfig struct {
 	// overtakes an earlier one, so a reliable in-order stream is never reordered).
 	// Deterministic per seed and stream-isolated: enabling it never shifts the
 	// goroutine interleaving. The zero value is no jitter (same-host is always
-	// jitter-free). Per-link jitter arrives with the L4 targeting API.
+	// jitter-free); negative values are also disabled. A run is rejected before
+	// admission if CrossHostLatency plus the largest possible jitter draw cannot
+	// fit in time.Duration. Per-link jitter arrives with the L4 targeting API.
 	CrossHostJitter time.Duration
 
 	// CrossHostBandwidth, if > 0, is the bandwidth limit in BYTES PER SECOND for
@@ -377,8 +381,9 @@ type NetworkConfig struct {
 	// apply). A receiver therefore gets bytes no faster than this rate — the
 	// throttle fault, modeling a finite-capacity link. It is deterministic (no
 	// random draw) and FIFO-preserving. The zero value is unlimited (same-host is
-	// always unlimited). Shared-link contention (one budget across a host-pair's
-	// flows) is the L4 per-link refinement; this is per-flow.
+	// always unlimited); negative values are also unlimited. Shared-link
+	// contention (one budget across a host-pair's flows) is the L4 per-link
+	// refinement; this is per-flow.
 	CrossHostBandwidth int64
 
 	// SendBuffer is the per-direction send-buffer capacity in bytes on every
@@ -601,8 +606,8 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
-	sendBuf, retransNs := resolveNetConfig(opts.Network)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, opts.CrashTear, nil, f)
+	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("RunWith", opts.Network)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -611,6 +616,7 @@ func RunWith(seed uint64, opts Options, f func()) {
 // and T.Deadline must not be called.
 func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("TestWith", opts)
+	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("TestWith", opts.Network)
 	if testingSimulationCleanupStarted(t) {
 		// Reject on the caller goroutine, before the bubble exists: the
 		// equivalent check inside the bubble would panic on the bubble main
@@ -621,8 +627,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	defer leaveSimulation()
 	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
 	var ok bool
-	sendBuf, retransNs := resolveNetConfig(opts.Network)
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, opts.Network.CrossHostLatency.Nanoseconds(), opts.Network.CrossHostJitter.Nanoseconds(), opts.Network.CrossHostBandwidth, sendBuf, retransNs, nil, true, func() {
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	if !ok {
@@ -686,7 +691,13 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 // values the runtime globals want: sendBuf 0 = unbounded (default 1 MiB when the field
 // is 0, unbounded when it is negative); retransNs 0 = no horizon (default 2 minutes
 // when the field is 0, disabled when it is negative).
-func resolveNetConfig(n NetworkConfig) (sendBuf, retransNs int64) {
+func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwidth, sendBuf, retransNs int64) {
+	latencyNs = max(0, n.CrossHostLatency.Nanoseconds())
+	jitterNs = max(0, n.CrossHostJitter.Nanoseconds())
+	bandwidth = max(0, n.CrossHostBandwidth)
+	if jitterNs > 0 && latencyNs > math.MaxInt64-(jitterNs-1) {
+		panic("testing/simulation: " + api + " Network latency plus jitter overflows time.Duration")
+	}
 	switch {
 	case n.SendBuffer == 0:
 		sendBuf = 1 << 20 // default 1 MiB

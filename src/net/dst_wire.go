@@ -8,6 +8,7 @@ package net
 
 import (
 	"io"
+	"math"
 	"math/bits"
 	"os"
 	"sync"
@@ -168,10 +169,10 @@ func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64
 		if s.linkFreeAt > transmitEnd {
 			transmitEnd = s.linkFreeAt
 		}
-		transmitEnd += dstTransmitNanos(int64(len(b)), bandwidthBps)
+		transmitEnd = dstDelayAdd(transmitEnd, dstTransmitNanos(int64(len(b)), bandwidthBps))
 		s.linkFreeAt = transmitEnd
 	}
-	at := transmitEnd + latencyNs + dstFaultRandN(jitterNs)
+	at := dstDelayAdd(dstDelayAdd(transmitEnd, latencyNs), dstFaultRandN(jitterNs))
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
 	s.buffered += int64(len(data))
 }
@@ -192,7 +193,31 @@ func dstTransmitNanos(nbytes, bps int64) int64 {
 	lo, carry := bits.Add64(lo, uint64(bps)-1, 0) // + (bps-1) before the divide = ceil
 	hi += carry
 	frac, _ := bits.Div64(hi, lo, uint64(bps))
-	return q*1_000_000_000 + int64(frac)
+	if q > math.MaxInt64/1_000_000_000 {
+		return math.MaxInt64
+	}
+	return dstDelayAdd(q*1_000_000_000, int64(frac))
+}
+
+// dstDelayAdd saturates nonnegative duration and absolute-time composition at
+// the latest representable timer deadline. Network delay inputs are
+// nonnegative; treating a negative value as zero keeps this internal boundary
+// monotone if a caller violates that precondition.
+func dstDelayAdd(base, delay int64) int64 {
+	if base < 0 {
+		base = 0
+	}
+	if delay <= 0 {
+		return base
+	}
+	if base >= math.MaxInt64-delay {
+		return math.MaxInt64
+	}
+	return base + delay
+}
+
+func dstLinkDelay(latencyNs, jitterNs int64) int64 {
+	return dstDelayAdd(latencyNs, dstFaultRandN(jitterNs))
 }
 
 // closeWrite marks the writer end gracefully closed at the current base time (the
@@ -202,7 +227,7 @@ func dstTransmitNanos(nbytes, bps int64) int64 {
 func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
 	s.mu.Lock()
 	s.closed = true
-	s.closeAt = dstBaseNanos() + latencyNs + dstFaultRandN(jitterNs)
+	s.closeAt = dstDelayAdd(dstDelayAdd(dstBaseNanos(), latencyNs), dstFaultRandN(jitterNs))
 	s.mu.Unlock()
 	s.wake()
 }

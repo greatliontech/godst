@@ -316,6 +316,12 @@ retransmission-horizon, and connect-cost legs are landed; the FIN/RST leg and th
 no-declared-host connect timeout land with a follow-on (both marked below). The wire
 models a TCP socket pair, not a message queue:
 
+Network delay configuration is validated before a run publishes simulation state. Nonpositive
+latency, jitter, and bandwidth components are disabled. A latency plus the largest possible jitter
+draw that cannot fit in `time.Duration` is rejected. Runtime delay arithmetic that also depends on
+the current base clock or a write's size saturates at the latest representable virtual-time deadline;
+it never wraps a positive delay into an earlier delivery.
+
 - **Byte stream, not messages.** The receive side is a byte buffer: one `Read` returns delivered
   contiguous bytes, up to the buffer's length — reads **coalesce across write
   boundaries** exactly as TCP does. Write-boundary framing is *not* a guarantee the harness gives
