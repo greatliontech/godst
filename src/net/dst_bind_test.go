@@ -1085,6 +1085,7 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 	var fullErr error
 	var fullDur time.Duration
 	var freedErr error
+	var beforeFull, afterFull int
 	simulation.RunWith(1, opts, func() {
 		var ln Listener
 		ready := make(chan struct{})
@@ -1102,9 +1103,17 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 					panic(err)
 				}
 			}
+			dstConns.mu.Lock()
+			dstConnsRoll()
+			beforeFull = len(dstConns.set)
+			dstConns.mu.Unlock()
 			t0 := time.Now()
 			_, fullErr = Dial("tcp", target) // one past the backlog: the queue never drains
 			fullDur = time.Since(t0)
+			dstConns.mu.Lock()
+			dstConnsRoll()
+			afterFull = len(dstConns.set)
+			dstConns.mu.Unlock()
 
 			// Free one slot mid-retry: the next dial's "retransmitted SYN"
 			// lands and the connect completes.
@@ -1125,6 +1134,9 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 	}
 	if fullDur != time.Second {
 		t.Errorf("full-backlog dial failed after %v, want the 1s retransmit horizon", fullDur)
+	}
+	if afterFull != beforeFull {
+		t.Errorf("full-backlog timeout changed registry size from %d to %d; failed pair ownership leaked", beforeFull, afterFull)
 	}
 	if freedErr != nil {
 		t.Errorf("dial with a slot freed mid-retry = %v, want success (the retransmitted SYN lands)", freedErr)

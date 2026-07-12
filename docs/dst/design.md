@@ -383,7 +383,9 @@ it never wraps a positive delay into an earlier delivery.
   mid-handshake); the SYN-ACK half remains context-interruptible and aborts if either endpoint is
   reset or torn down before it arrives. It then delays the dialer's return, so the server sees the conn at
   ½ RTT and the dialer returns at one full RTT (`TestDSTNetConnectPaysRTT`). Same-host connects are
-  instant. A dial across a **partition** blackholes: it blocks until the link heals, the
+  instant. Both endpoints become lifecycle-owned before the server endpoint enters the accept backlog,
+  so process or host teardown cannot miss a queued or already accepted connection. A dial across a
+  **partition** blackholes: it blocks until the link heals, the
   context/deadline expires, or the retransmit horizon fires `ETIMEDOUT`
   (`TestDSTNetDialPartitionHorizonTimesOut`) — so a deadline-less dial into a permanent cut fails in
   bounded virtual time rather than hanging. A dial to a **declared** host with no listener on the

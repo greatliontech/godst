@@ -9,12 +9,144 @@ package net
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/simulation"
 	"time"
 )
+
+func TestDSTNetConnectionPairOwnershipPublishesAtomically(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for seed := uint64(1); seed <= 100; seed++ {
+		halfOwned := false
+		simulation.RunWith(seed, simulation.Options{}, func() {
+			reset := new(atomic.Bool)
+			dialer := &dstConn{reset: reset}
+			server := &dstConn{reset: reset}
+			done := make(chan struct{})
+			go func() {
+				dstConnRegisterPair(dialer, server)
+				close(done)
+			}()
+			for {
+				dstConns.mu.Lock()
+				dstConnsRoll()
+				owned := 0
+				for candidate := range dstConns.set {
+					if candidate.reset == reset {
+						owned++
+					}
+				}
+				dstConns.mu.Unlock()
+				if owned == 1 {
+					halfOwned = true
+				}
+				if owned == 2 {
+					break
+				}
+				runtime.Gosched()
+			}
+			<-done
+			dstConnDeregister(dialer)
+			dstConnDeregister(server)
+		})
+		if halfOwned {
+			t.Fatalf("seed %d: teardown observer saw a half-owned connection pair", seed)
+		}
+	}
+}
+
+func TestDSTNetAcceptHandoffIsLifecycleOwned(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for seed := uint64(1); seed <= 100; seed++ {
+		owned := false
+		simulation.RunWith(seed, simulation.Options{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			inspected := make(chan struct{})
+			release := make(chan struct{})
+			go func() {
+				c, _ := ln.Accept()
+				dc := c.(*dstConn)
+				dstConns.mu.Lock()
+				dstConnsRoll()
+				ends := 0
+				for candidate := range dstConns.set {
+					if candidate.reset == dc.reset {
+						ends++
+					}
+				}
+				dstConns.mu.Unlock()
+				owned = ends == 2
+				close(inspected)
+				<-release
+				c.Close()
+			}()
+			c, err := Dial("tcp", ln.Addr().String())
+			if err != nil {
+				panic(err)
+			}
+			<-inspected
+			close(release)
+			c.Close()
+			ln.Close()
+		})
+		if !owned {
+			t.Fatalf("seed %d: Accept exposed connection before both ends were lifecycle-owned", seed)
+		}
+	}
+}
+
+func TestDSTNetAcceptedCloseBeforeDialReturnCleansOwnership(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for seed := uint64(1); seed <= 50; seed++ {
+		var dialErr error
+		var conn Conn
+		var leaked int
+		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+			port := make(chan string, 1)
+			closed := make(chan struct{})
+			var accepted *dstConn
+			simulation.Host("A", simulation.HostConfig{}, func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p
+				go func() {
+					c, _ := ln.Accept()
+					accepted = c.(*dstConn)
+					c.Close()
+					close(closed)
+				}()
+			})
+			simulation.Host("B", simulation.HostConfig{}, func() {
+				conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			})
+			<-closed
+			dstConns.mu.Lock()
+			dstConnsRoll()
+			for candidate := range dstConns.set {
+				if candidate.reset == accepted.reset {
+					leaked++
+				}
+			}
+			dstConns.mu.Unlock()
+		})
+		if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
+			t.Fatalf("seed %d: accepted close returned (%v, %v), want nil ECONNRESET", seed, conn, dialErr)
+		}
+		if leaked != 0 {
+			t.Fatalf("seed %d: accepted close left %d registered endpoint(s)", seed, leaked)
+		}
+	}
+}
 
 // TestDSTNetResetOrderDeterministic is the H4 regression: when a reset matches
 // several conns, they are torn down in registration (Dial) order — the wake order of

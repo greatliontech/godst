@@ -582,6 +582,15 @@ type dstConn struct {
 	acceptState *atomic.Int32
 }
 
+type dstOwnedConn struct {
+	conn *dstConn
+}
+
+func dstOwnConnPair(dialer, server *dstConn) *dstOwnedConn {
+	dstConnRegisterPair(dialer, server)
+	return &dstOwnedConn{conn: server}
+}
+
 func (c *dstConn) LocalAddr() Addr  { return c.local }
 func (c *dstConn) RemoteAddr() Addr { return c.remote }
 
@@ -733,7 +742,7 @@ type dstListener struct {
 	network string
 	addr    *TCPAddr
 	keys    []string
-	accept  chan Conn
+	accept  chan *dstOwnedConn
 	done    chan struct{}
 	closed  atomic.Bool
 	host    uint32 // the host that owns this listener (its network identity)
@@ -754,8 +763,9 @@ func (l *dstListener) Accept() (Conn, error) {
 	}
 	for {
 		select {
-		case c := <-l.accept:
-			if dc, ok := c.(*dstConn); ok && dc.acceptState != nil && !dc.acceptState.CompareAndSwap(0, 1) {
+		case owned := <-l.accept:
+			c := owned.conn
+			if c.acceptState != nil && !c.acceptState.CompareAndSwap(0, 1) {
 				// Torn down (reset/refused) while queued; never hand it out.
 				continue
 			}
@@ -768,11 +778,7 @@ func (l *dstListener) Accept() (Conn, error) {
 			// drain skip it, so the reset is ours to perform.
 			select {
 			case <-l.done:
-				if dc, ok := c.(*dstConn); ok {
-					dc.resetConn()
-				} else {
-					c.Close()
-				}
+				c.resetConn()
 				return nil, l.opError("accept", errClosed)
 			default:
 			}
@@ -801,13 +807,10 @@ func (l *dstListener) Close() error {
 	// durably forever on a connection no one will ever accept.
 	for {
 		select {
-		case c := <-l.accept:
-			if dc, ok := c.(*dstConn); ok {
-				if dc.acceptState == nil || dc.acceptState.CompareAndSwap(0, 2) {
-					dc.resetConn()
-				}
-			} else {
-				c.Close()
+		case owned := <-l.accept:
+			c := owned.conn
+			if c.acceptState == nil || c.acceptState.CompareAndSwap(0, 2) {
+				c.resetConn()
 			}
 		default:
 			return nil
@@ -901,7 +904,7 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		network: network,
 		addr:    addr,
 		keys:    scoped,
-		accept:  make(chan Conn, 128), // backlog
+		accept:  make(chan *dstOwnedConn, 128), // backlog
 		done:    make(chan struct{}),
 		host:    listeningHost,
 		proc:    listeningProc,
@@ -1224,6 +1227,14 @@ redial:
 	reset := new(atomic.Bool)
 	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP)}
 	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP)}
+	// Publish lifecycle ownership before the server endpoint can enter the
+	// backlog or become visible to Accept. Failed establishment removes both
+	// registrations through the idempotent cleanup below.
+	ownedServer := dstOwnConnPair(dialer, server)
+	cleanup := func() {
+		dialer.resetConn()
+		server.resetConn()
+	}
 	// A FULL accept backlog drops the SYN (tcp_abort_on_overflow=0, the
 	// default): the dialer retransmits and either a slot frees in time (the
 	// send below lands) or its retries exhaust — connect fails ETIMEDOUT at
@@ -1245,14 +1256,23 @@ redial:
 	select {
 	case <-ctx.Done():
 		stopBacklogHorizon()
-		p1.Close()
-		p2.Close()
+		cleanup()
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
 	case <-backlogHorizonC:
-		p1.Close()
-		p2.Close()
+		cleanup()
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
-	case l.accept <- server:
+	case <-p1.(*dstWireEnd).localDone:
+		stopBacklogHorizon()
+		cleanup()
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNRESET}
+	case <-p1.(*dstWireEnd).remoteDone:
+		stopBacklogHorizon()
+		cleanup()
+		if dstHostDead(l.host) {
+			goto redial
+		}
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNRESET}
+	case l.accept <- ownedServer:
 		stopBacklogHorizon()
 		select {
 		case <-l.done:
@@ -1262,26 +1282,15 @@ redial:
 			// already Accepted it before we resumed. Claim it: if it is still
 			// queued, refuse the dial; if Accept won, the connection stands.
 			if server.acceptState.CompareAndSwap(0, 2) {
-				server.resetConn()
-				p1.Close()
+				cleanup()
 				goto refused
 			}
-			// Register both ends once the conn is live (the dial is about to return
-			// it). Registration intentionally trails the l.accept handoff: a Reset
-			// racing a conn still in establishment benignly misses it — under-firing
-			// a reset is sound (a real RST can miss a conn mid-handshake too), whereas
-			// the failure paths above never register, so a reset never over-fires.
-			dstConnRegister(dialer) // accepted before teardown: a live conn
-			dstConnRegister(server)
 		default:
-			dstConnRegister(dialer) // queued: a live conn
-			dstConnRegister(server)
 		}
 		// SYN-ACK: the acknowledgment travels back; context expiry or endpoint
 		// teardown before its arrival aborts the connect and tears down both ends.
 		if err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset); err != nil {
-			dialer.resetConn()
-			server.resetConn()
+			cleanup()
 			if dstHostDead(l.host) {
 				goto redial
 			}
@@ -1290,8 +1299,7 @@ redial:
 		return dialer, nil
 	case <-l.done:
 		stopBacklogHorizon()
-		p1.Close()
-		p2.Close()
+		cleanup()
 		goto refused
 	}
 refused:

@@ -165,17 +165,19 @@ func dstConnsRoll() { // caller holds mu
 	}
 }
 
-func dstConnRegister(c *dstConn) {
+func dstConnRegisterPair(dialer, server *dstConn) {
 	dstConns.mu.Lock()
+	defer dstConns.mu.Unlock()
 	dstConnsRoll()
-	// Stamp a per-run registration sequence so a multi-victim reset can order its
-	// victims deterministically. Both ends of one conn register, so each gets its
-	// own seq; the reset iterates the whole registry, and ordering by seq is a pure
-	// function of Dial order (schedule-determined), never of pointer/heap address.
+	// Publish both ends in one critical section. Their consecutive sequence
+	// numbers preserve deterministic teardown order without exposing a half-owned
+	// pair to reset or lifecycle teardown.
 	dstConns.seq++
-	c.regSeq = dstConns.seq
-	dstConns.set[c] = struct{}{}
-	dstConns.mu.Unlock()
+	dialer.regSeq = dstConns.seq
+	dstConns.set[dialer] = struct{}{}
+	dstConns.seq++
+	server.regSeq = dstConns.seq
+	dstConns.set[server] = struct{}{}
 }
 
 func dstConnDeregister(c *dstConn) {
