@@ -856,6 +856,11 @@ body — a thread of a dead process never resumes. **A crashed goroutine never u
 functions do not run, exactly as a killed process's threads abandon their stacks. So a `Crash` whose
 caller belongs to the victim (a **self-crash** — the shape an allocation-triggered OOM takes, the victim
 dying where its own workload takes it) never returns, and the code after it is unreachable.
+Although the parked stack allocation and execution state remain intact, a crashed goroutine's stack is
+not a GC root: after the GC suspends and owns the goroutine for root processing, it records the stack job
+complete without tracing the abandoned frames or defers. Process memory reachable only from dead threads
+is therefore collectible without resuming, unwinding, clearing, or recycling those stacks. Enforced by
+`TestDSTCrashDropsVictimStackRoots` and `TestDSTCrashDropsVictimDeferredRoots`.
 Victim enumeration keys on sticky active-simulation membership, not the live bubble pointer: GC entry
 and assist may temporarily clear `g.bubble`, but that disassociation cannot let a process or host thread
 escape death. Enforced by `TestDSTCrashMarksDisassociatedProcessMember` and

@@ -21,7 +21,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |
-| [crashed stacks retain process memory as GC roots](./dst-crash-retains-stacks-and-process-memory.md) | H | crashed invocation stacks no longer retain process memory |
 | [mapping-fault process death skips resource teardown](./dst-mapping-fault-skips-resource-teardown.md) | H | mapping faults route through complete process teardown |
 | [graceful EOF can strand a concurrent reader](./dst-net-concurrent-eof-strands-reader.md) | H | persistent EOF wakes every eligible reader |
 | [SYN-ACK traversal ignores cancellation and teardown](./dst-net-synack-ignores-cancel-and-teardown.md) | H | full handshake observes context and endpoint death |

@@ -303,7 +303,9 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			if gp.gcscandone {
 				throw("g already scanned")
 			}
-			workDone += scanstack(gp, gcw)
+			if !dstBuild || gp.dstPid >= 0 {
+				workDone += scanstack(gp, gcw)
+			}
 			gp.gcscandone = true
 			resumeG(stopped)
 
