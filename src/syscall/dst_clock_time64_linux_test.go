@@ -60,6 +60,27 @@ func TestDSTClockGettime64Virtual(t *testing.T) {
 	}
 }
 
+func TestDSTClockGettime64InvalidPointers(t *testing.T) {
+	type kernelTimespec struct{ Sec, Nsec int64 }
+	runDSTClockInvalidPointerForms(t, sysClockGettime64, unsafe.Sizeof(kernelTimespec{}))
+}
+
+func TestDSTClockGettime32OverflowPrecedesCopyout(t *testing.T) {
+	for _, pointer := range []uintptr{0, 1} {
+		t.Run(fmt.Sprintf("pointer_%d", pointer), func(t *testing.T) {
+			var r1, r2 uintptr
+			var errno syscall.Errno
+			simulation.Run(1, func() {
+				time.Sleep((1 << 31) * time.Second)
+				r1, r2, errno = syscall.Syscall(syscall.SYS_CLOCK_GETTIME, dstClockMonotonic, pointer, 0)
+			})
+			if r1 != ^uintptr(0) || r2 != 0 || errno != syscall.EOVERFLOW {
+				t.Fatalf("overflowing native time32 with pointer %#x = (%#x, %#x, %v), want (%#x, 0, EOVERFLOW)", pointer, r1, r2, errno, ^uintptr(0))
+			}
+		})
+	}
+}
+
 // TestDSTRawFcntl64Probes: these arches' fcntl is SYS_FCNTL64 — probe commands
 // on an inherited host fd pass the allowlist, while the descriptor-minting
 // F_DUPFD is refused, exactly like SYS_FCNTL on 64-bit arches.

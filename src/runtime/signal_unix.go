@@ -914,6 +914,9 @@ func sigpanic() {
 	if !canpanic() {
 		throw("unexpected signal during runtime execution")
 	}
+	if dstClockCopyoutFault(gp) {
+		panicmemAddr(gp.sigcode1)
+	}
 
 	// A fault inside a simulated file mapping is that file's end-of-file, or its
 	// read-only protection, enforced by the MMU. It kills the simulated process

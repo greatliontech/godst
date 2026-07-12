@@ -266,6 +266,42 @@ func dstVirtualMonotonicNow() (int64, bool) {
 	return gp.bubble.now, true
 }
 
+// dstClockCopyoutG identifies the one goroutine copying a virtual clock value
+// to a caller-provided address. DST runs one simulated goroutine at a time, so
+// a single marker is sufficient and keeps the signal path allocation-free.
+var dstClockCopyoutG atomic.Uintptr
+
+// dstClockCopyout copies virtual clock bytes to a raw syscall address. A fault
+// is converted to a recoverable panic by sigpanic only while this marker names
+// the faulting goroutine, then reported to syscall as EFAULT.
+//
+//go:linkname dstClockCopyout
+//go:nosplit
+func dstClockCopyout(dst, src unsafe.Pointer, n uintptr) (ok bool) {
+	gp := getg()
+	g := uintptr(unsafe.Pointer(gp))
+	if !dstClockCopyoutG.CompareAndSwap(0, g) {
+		throw("nested DST clock copyout")
+	}
+	defer func() {
+		dstClockCopyoutG.Store(0)
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	memmove(dst, src, n)
+	return true
+}
+
+// dstClockCopyoutFault reports whether gp may recover the current memory fault
+// as a failed virtual clock copyout.
+//
+//go:nosplit
+func dstClockCopyoutFault(gp *g) bool {
+	return dstBuild && dstClockCopyoutG.Load() == uintptr(unsafe.Pointer(gp))
+}
+
 // dstMaxSimHosts bounds the distinct hosts (Host names) a single run may declare
 // for per-host clock state. Like dstMaxSimProcs it fixes the clock table's size so
 // the time.Now read path never races a table growth; a run that declares more panics

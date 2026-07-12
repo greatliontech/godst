@@ -926,7 +926,12 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   `CLOCK_BOOTTIME` is also selected and split-safe — at the 32-bit-time trap on every arch AND the
   time64 trap (`clock_gettime64`, `__kernel_timespec`) on the 32-bit arches that have one: it
   returns the DST virtual base clock, and
-  boottime coincides with monotonic time until a suspend model exists.
+  boottime coincides with monotonic time until a suspend model exists. Native and time64 output
+  ranges retain kernel copyout semantics once the value is representable: an invalid, read-only,
+  partial, or wrapping range returns `EFAULT` rather than becoming a Go panic, fatal fault, or
+  simulated-process death; native time32 retains `EOVERFLOW` precedence for unrepresentable
+  seconds. Valid unaligned ranges receive the virtual value, and any bytes written before a partial
+  copy faults come from that virtual value rather than a host clock.
   Anything outside the family is fenced, deliberately erring loud.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*

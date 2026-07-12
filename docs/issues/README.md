@@ -40,6 +40,7 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [Crash refusal mutates run-main process state](./dst-crash-main-refusal-mutates-state.md) | H | crash preflight is state-neutral for every victim |
 | [host crash misses a nested root-process goroutine](./dst-host-crash-misses-nested-root-goroutine.md) | H | host ancestry makes every machine thread killable |
 | [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | chunk 61, with qemu-user available for the runtime witness |
+| [MIPS clock_gettime64 lacks a runtime witness](./dst-mips-clock-gettime64-runtime-unverified.md) | L | chunk 61, with qemu-user available for the runtime witness |
 | [fake-timer rollover can erase a registration](./dst-clock-fake-timer-roll-loses-registration.md) | M | epoch rollover preserves every new-epoch timer |
 | [discarded callbacks count as executed](./dst-gc-discarded-callbacks-count-as-executed.md) | M | discard and execution metrics are distinct |
 | [foreign races can be attributed to the SUT](./dst-explore-foreign-races-misattributed.md) | M | reported races are simulation-attributed or explicitly foreign |
@@ -60,7 +61,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |
 | [environment dispatch straddles run edges](./dst-env-dispatch-straddles-run-edge.md) | M | environment world selection is atomic with run edges |
 | [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | chunk 62, with qemu-user available for the runtime witness |
-| [virtual clock_gettime faults on invalid pointers](./dst-clock-gettime-invalid-pointer-faults.md) | M | invalid output addresses return EFAULT |
 | [buffered direct handoff omits HB events](./dst-explore-buffered-direct-handoff-misses-hb.md) | L | every buffered slot reuse records the same HB relation |
 | [Host NumCPU wraps through int32](./dst-host-numcpu-wraps-int32.md) | L | accepted NumCPU values are exact or fail loudly |
 | [network delay arithmetic can overflow](./dst-net-delay-arithmetic-overflows.md) | L | accepted network delay arithmetic cannot wrap |

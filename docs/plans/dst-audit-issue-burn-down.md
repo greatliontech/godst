@@ -17,7 +17,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 4. MIPS `Syscall9` fence implementation and runtime verification are assigned to the final architecture-verification chunk
 - [x] 5. `dstSyscallAllowedTrap` refuses ioctl because device-specific requests cannot prove read-only, non-minting behavior
 - [x] 6. loong64 `fstatFD` isolation implementation and runtime verification are assigned to the final architecture-verification chunk
-- [ ] 7. `dstTryClockGettime` returns kernel-shaped EFAULT for invalid time32/time64 output ranges (`dst-clock-gettime-invalid-pointer-faults`)
+- [x] 7. `dstTryClockGettime` returns kernel-shaped EFAULT for invalid time32/time64 output ranges (`dst-clock-gettime-invalid-pointer-faults`)
 - [ ] 8. `dstRawDispatch` gives zero-length mapping operations one named/raw ownership and errno contract (`dst-raw-zero-mapping-bypasses-ownership`)
 - [ ] 9. `AllThreadsSyscall` and `AllThreadsSyscall6` cannot bypass the active-run fence (`dst-syscall-allthreads-bypasses-fence`)
 - [ ] 10. allowlisted non-close fd dispatch cannot straddle host-fd creation (`dst-fd-inflight-io-straddles-creation`)
@@ -119,5 +119,5 @@ grouped by the functions they change. WIP = 1.
 
 ## Deferred architecture verification
 
-- [ ] 61. linux/mips and linux/mipsle `Syscall9` enter the same fence and dispatch policy as the generic trampolines, with the kernel-facing behavior executed under qemu-user (`dst-mips-syscall9-bypasses-fence`)
+- [ ] 61. linux/mips and linux/mipsle `Syscall9` enter the same fence and dispatch policy as the generic trampolines, and `clock_gettime64` copyout behavior executes under qemu-user (`dst-mips-syscall9-bypasses-fence`, `dst-mips-clock-gettime64-runtime-unverified`)
 - [ ] 62. linux/loong64 `fstatFD` applies virtual and page-cache descriptor classification before direct statx, with the kernel-facing behavior executed under qemu-user (`dst-loong64-fstat-exposes-pagecache-fd`)

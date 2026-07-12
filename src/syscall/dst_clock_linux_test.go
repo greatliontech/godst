@@ -7,7 +7,11 @@
 package syscall_test
 
 import (
+	"bytes"
 	"fmt"
+	"internal/testenv"
+	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -107,6 +111,186 @@ func TestDSTClockGettimeVirtualMonotonic(t *testing.T) {
 	}
 	if got := dstTimespecNsec(hostMonoAfter) - dstTimespecNsec(hostMonoBefore); got != 0 {
 		t.Fatalf("host CLOCK_MONOTONIC delta after StepClock = %d, want 0", got)
+	}
+}
+
+func TestDSTClockGettimeInvalidPointers(t *testing.T) {
+	runDSTClockInvalidPointerForms(t, syscall.SYS_CLOCK_GETTIME, unsafe.Sizeof(syscall.Timespec{}))
+}
+
+func TestDSTClockGettimeCopyoutAllocationFree(t *testing.T) {
+	var allocs float64
+	var errno syscall.Errno
+	simulation.Run(1, func() {
+		allocs = testing.AllocsPerRun(10, func() {
+			var ts syscall.Timespec
+			_, _, errno = syscall.Syscall(syscall.SYS_CLOCK_GETTIME, dstClockMonotonic, uintptr(unsafe.Pointer(&ts)), 0)
+		})
+	})
+	if errno != 0 {
+		t.Fatalf("clock_gettime errno = %v, want 0", errno)
+	}
+	if allocs != 0 {
+		t.Fatalf("clock_gettime copyout allocations = %v, want 0", allocs)
+	}
+}
+
+func TestDSTClockGettimeInvalidPointerChild(t *testing.T) {
+	form := os.Getenv("GO_DST_CLOCK_FORM")
+	if form == "" {
+		t.Skip("clock pointer child")
+	}
+	trap64, err := strconv.ParseUint(os.Getenv("GO_DST_CLOCK_TRAP"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size64, err := strconv.ParseUint(os.Getenv("GO_DST_CLOCK_SIZE"), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trap, size := uintptr(trap64), uintptr(size64)
+	pageSize := syscall.Getpagesize()
+
+	unmapped, err := syscall.Mmap(-1, 0, pageSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unmappedAddr := uintptr(unsafe.Pointer(&unmapped[0]))
+	if err := syscall.Munmap(unmapped); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := syscall.Mmap(-1, 0, pageSize, syscall.PROT_READ, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Munmap(readOnly)
+
+	partial, err := syscall.Mmap(-1, 0, 2*pageSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mprotect(partial[pageSize:], syscall.PROT_NONE); err != nil {
+		t.Fatal(err)
+	}
+	partialWritable := partial[pageSize-int(size/2) : pageSize]
+	for i := range partialWritable {
+		partialWritable[i] = 0xcc
+	}
+	defer func() {
+		syscall.Mprotect(partial[pageSize:], syscall.PROT_READ|syscall.PROT_WRITE)
+		syscall.Munmap(partial)
+	}()
+
+	valid, err := syscall.Mmap(-1, 0, int(size)+2, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Munmap(valid)
+	valid[0], valid[len(valid)-1] = 0xa5, 0x5a
+
+	call := func(pointer uintptr) (uintptr, uintptr, syscall.Errno) {
+		switch form {
+		case "Syscall":
+			return syscall.Syscall(trap, dstClockMonotonic, pointer, 0)
+		case "Syscall6":
+			return syscall.Syscall6(trap, dstClockMonotonic, pointer, 0, 0, 0, 0)
+		case "RawSyscall":
+			return syscall.RawSyscall(trap, dstClockMonotonic, pointer, 0)
+		case "RawSyscall6":
+			return syscall.RawSyscall6(trap, dstClockMonotonic, pointer, 0, 0, 0, 0)
+		default:
+			t.Fatalf("unknown form %q", form)
+			return 0, 0, 0
+		}
+	}
+
+	var virtualValue []byte
+	invalid := []struct {
+		name    string
+		pointer uintptr
+	}{
+		{"nil", 0},
+		{"low", 1},
+		{"unmapped", unmappedAddr},
+		{"read-only", uintptr(unsafe.Pointer(&readOnly[0]))},
+		{"partial", uintptr(unsafe.Pointer(&partial[pageSize-int(size/2)]))},
+		{"wrapping", ^uintptr(0) - (size - 2)},
+	}
+	simulation.Run(1, func() {
+		r1, r2, errno := call(uintptr(unsafe.Pointer(&valid[1])))
+		if r1 != 0 || r2 != 0 || errno != 0 {
+			t.Fatalf("%s valid unaligned = (%#x, %#x, %v), want success", form, r1, r2, errno)
+		}
+		virtualValue = append(virtualValue, valid[1:1+int(size)]...)
+
+		if unsafe.Sizeof(uintptr(0)) == 8 {
+			f, err := os.OpenFile("/clock-copyout", os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatalf("OpenFile simulated mapping: %v", err)
+			}
+			defer f.Close()
+			if _, err := f.Write(make([]byte, size)); err != nil {
+				t.Fatalf("Write simulated mapping: %v", err)
+			}
+			simulated, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("Mmap simulated mapping: %v", err)
+			}
+			defer syscall.Munmap(simulated)
+			r1, r2, errno = call(uintptr(unsafe.Pointer(&simulated[0])))
+			if r1 != ^uintptr(0) || r2 != 0 || errno != syscall.EFAULT {
+				t.Errorf("%s simulated read-only mapping = (%#x, %#x, %v), want (%#x, 0, EFAULT)", form, r1, r2, errno, ^uintptr(0))
+			}
+			if err := syscall.Mprotect(simulated, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
+				t.Fatalf("Mprotect simulated mapping: %v", err)
+			}
+			r1, r2, errno = call(uintptr(unsafe.Pointer(&simulated[0])))
+			if r1 != 0 || r2 != 0 || errno != 0 {
+				t.Errorf("%s simulated writable mapping = (%#x, %#x, %v), want success", form, r1, r2, errno)
+			} else if !bytes.Equal(simulated, virtualValue) {
+				t.Errorf("%s simulated writable mapping = %x, want virtual value %x", form, simulated, virtualValue)
+			}
+		}
+
+		for _, tc := range invalid {
+			r1, r2, errno = call(tc.pointer)
+			if r1 != ^uintptr(0) || r2 != 0 || errno != syscall.EFAULT {
+				t.Errorf("%s %s = (%#x, %#x, %v), want (%#x, 0, EFAULT)", form, tc.name, r1, r2, errno, ^uintptr(0))
+			}
+			if tc.name == "partial" {
+				for i, got := range partialWritable {
+					if got != 0xcc && got != virtualValue[i] {
+						t.Errorf("%s partial byte %d = %#x, want unchanged %#x or virtual byte %#x", form, i, got, byte(0xcc), virtualValue[i])
+					}
+				}
+			}
+		}
+	})
+	if valid[0] != 0xa5 || valid[len(valid)-1] != 0x5a {
+		t.Fatalf("%s valid unaligned write changed canaries: first=%#x last=%#x", form, valid[0], valid[len(valid)-1])
+	}
+}
+
+func runDSTClockInvalidPointerForms(t *testing.T, trap, size uintptr) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("-short: skips invalid-pointer subprocesses")
+	}
+	testenv.MustHaveExec(t)
+	for _, form := range []string{"Syscall", "Syscall6", "RawSyscall", "RawSyscall6"} {
+		t.Run(form, func(t *testing.T) {
+			cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestDSTClockGettimeInvalidPointerChild$")
+			cmd = testenv.CleanCmdEnv(cmd)
+			cmd.Env = append(cmd.Env,
+				"GO_DST_CLOCK_FORM="+form,
+				"GO_DST_CLOCK_TRAP="+strconv.FormatUint(uint64(trap), 10),
+				"GO_DST_CLOCK_SIZE="+strconv.FormatUint(uint64(size), 10),
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("invalid-pointer child failed: %v\n%s", err, out)
+			}
+		})
 	}
 }
 
