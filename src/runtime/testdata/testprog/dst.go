@@ -43,6 +43,7 @@ func init() {
 	register("DSTGCFinDiscovery", DSTGCFinDiscovery)
 	register("DSTGCPerCycle", DSTGCPerCycle)
 	register("DSTGCPoolCarryover", DSTGCPoolCarryover)
+	register("DSTGCDeferPoolCarryover", DSTGCDeferPoolCarryover)
 	register("DSTMemLimitPerCycle", DSTMemLimitPerCycle)
 	register("DSTFinChanOp", DSTFinChanOp)
 	register("DSTFinRunSet", DSTFinRunSet)
@@ -460,6 +461,67 @@ func DSTGCPoolCarryover() {
 	p2, t2 := run()
 	os.Stdout.WriteString(strconv.FormatUint(p1, 10) + " " + strconv.FormatUint(p2, 10) + " " +
 		strconv.FormatUint(t1, 10) + " " + strconv.FormatUint(t2, 10) + "\n")
+}
+
+func dstHeapDeferNoop() {}
+
+//go:noinline
+func dstHeapDeferChurn(n int) {
+	for i := 0; i < n; i++ {
+		defer dstHeapDeferNoop()
+	}
+}
+
+// DSTGCDeferPoolCarryover isolates the _defer leg of the pooled-allocation
+// cancellation. A defer in a loop is heap-lowered through newdefer: the first
+// run allocates fresh _defer structs and the second reuses those structs from
+// the per-P/central defer pools. A forced mark after the churn snapshots the
+// fresh run's defers in dstPooledMarked; subtracting that snapshot from the
+// GOGC target makes the following finalizer workload's discovery fingerprint
+// equal to the warm run, whose inherited defers are already in the baseline.
+func DSTGCDeferPoolCarryover() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	// Remove one-time simulation/runtime finalizers before the cold defer run;
+	// this setup creates only the small fixed number of defers in Run itself,
+	// leaving the 12k heap-defer pool effectively cold.
+	simulation.Run(n, func() { runtime.GC() })
+	run := func() (uint64, uint64) {
+		var partial, total uint64
+		simulation.Run(n, func() {
+			big := make([]byte, 16<<20)
+			runtime.GC()
+			dstHeapDeferChurn(12000)
+			runtime.GC()
+			const N, K = 80000, 512
+			ring := make([]*dstFinObj, K)
+			for i := 0; i < N; i++ {
+				o := &dstFinObj{}
+				o.b[0] = byte(i)
+				runtime.SetFinalizer(o, func(p *dstFinObj) { _ = p.b[0] })
+				ring[i%K] = o
+				if i == 7*N/8 {
+					partial = dstBubbleFinqFP()
+				}
+			}
+			total = dstBubbleFinqFP()
+			runtime.KeepAlive(big)
+			runtime.KeepAlive(ring)
+		})
+		return partial, total
+	}
+	p1, t1 := run()
+	p2, t2 := run()
+	if p1 == 0 || p2 == 0 {
+		os.Stdout.WriteString("defer discovery sample did not cross a GC boundary\n")
+		return
+	}
+	if p1 != p2 || t1 != t2 {
+		os.Stdout.WriteString("defer cold/warm discovery diverged: run1=" +
+			strconv.FormatUint(p1, 10) + "/" + strconv.FormatUint(t1, 10) + " run2=" +
+			strconv.FormatUint(p2, 10) + "/" + strconv.FormatUint(t2, 10) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
 }
 
 // dstSliceSink forces the allocations in DSTGCAllocBound to escape to the heap

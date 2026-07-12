@@ -732,7 +732,9 @@ the channel-light workloads that first validated it (both **landed**):
   cached type descriptors): whether one is allocated or reused is a pooling artifact, not SUT heap
   growth, and stacks are already excluded (`stackalloc`, not `mallocgc`), so this makes the trigger
   consistently reflect the SUT's own objects with no leak. Pinned by `TestDSTGCPoolCarryoverDeterministic`
-  (two in-process runs at one seed whose inherited `g`/`sudog` pools would otherwise shift the crossing).
+  (two in-process runs at one seed whose inherited `g`/`sudog` pools would otherwise shift the crossing)
+  and `TestDSTPooledDeferAccounting`/`TestDSTGCDeferPoolCarryoverDeterministic` (loop-lowered heap
+  defers reach the pooled counter and marked snapshot, then preserve the cold/warm fingerprint).
   The exclusion has a **marked-side counterpart**: the pooled structs a run allocates fresh stay live at
   every in-run mark (`g`s are counted at their `allgadd` publication, so only `allgs`-pinned —
   process-immortal — g's enter the tracker; an `allocm`-created g0/gsignal can die via `sched.freem`

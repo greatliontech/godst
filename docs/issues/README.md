@@ -24,7 +24,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
 | [forced-GC entry funnels pinned only structurally](./dst-gc-forced-entry-funnels-unpinned.md) | L | mid-run foreign arms for both funneled entries, or funnel reliance recorded |
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |
-| [pooled cancellation's _defer leg has no killing test](./dst-gc-pooled-defer-leg-unpinned.md) | L | heap-defer shape pins the arm, or untested status recorded |
 | [GC counter gates key on the live bubble field](./dst-gc-counter-gates-live-bubble-field.md) | L | gates keyed on the sticky bit, or per-window unreachability recorded |
 | [crash scans skip temporarily disassociated simulation goroutines](./dst-runtime-crash-skips-disassociated-members.md) | H | crash victim scans key on sticky simulation membership |
 | [crashed stacks retain process memory as GC roots](./dst-crash-retains-stacks-and-process-memory.md) | H | crashed invocation stacks no longer retain process memory |

@@ -538,6 +538,22 @@ func TestDSTGCPoolCarryoverDeterministic(t *testing.T) {
 	}
 }
 
+// TestDSTGCDeferPoolCarryoverDeterministic reaches the heap-lowered _defer arm
+// of the pooled-struct cancellation independently of g and sudog churn. The
+// first same-seed run allocates loop defers fresh; the second reuses them. Both
+// the per-object trigger exclusion and dstPooledMarked subtraction are required
+// for their per-cycle finalizer-discovery fingerprints to match.
+//
+// TestDSTPooledDeferAccounting independently pins that the loop defers reach
+// both the pooled allocation counter and its marked-side snapshot; this test
+// asserts the resulting cold/warm behavior end to end.
+func TestDSTGCDeferPoolCarryoverDeterministic(t *testing.T) {
+	out := runTestProgDST(t, "DSTGCDeferPoolCarryover", "DSTSEED=12345", "GOGC=100")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("heap-defer pool moved the DST trigger (got %q, want \"done\")", out)
+	}
+}
+
 // TestDSTFinalizerBlockedDrainQuiescence verifies the drain wake guard:
 // when a finalizer blocks on a bubble channel, the drain is parked inside the
 // channel wait, and a later quiescence with finalizer work still pending must

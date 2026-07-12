@@ -2168,7 +2168,9 @@ func DstFaultSchedRootsDiffer(seed uint64) bool { return dstFaultRoot(seed) != d
 // a scannable size past MinSizeForMallocHeader, then the size-class elemsize) so a
 // regression in either regime — dropping the header add, or reverting to bare
 // roundupsize — splits the two.
-func DstFreshGHeapBytes() uint64 { return dstFreshGHeapBytes() }
+func DstFreshGHeapBytes() uint64   { return dstFreshGHeapBytes() }
+func DstPooledAllocBytes() uint64  { return dstPooledAlloc.Load() }
+func DstPooledMarkedBytes() uint64 { return dstPooledMarked.Load() }
 func DstFreshGHeapBytesWant() uint64 {
 	s := abi.TypeFor[g]().Size_
 	if s > minSizeForMallocHeader {
