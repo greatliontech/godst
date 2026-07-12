@@ -549,7 +549,9 @@ first), `/file/../other` and `/file/sub` are `ENOTDIR`, and a trailing slash ass
 mint a regular file). `..` is evaluated against the tree during the walk, never
 erased lexically first — a purely lexical `path.Clean` would make sim-only successes out of path
 bugs a real kernel rejects. (`..` at the root stays at the root, as POSIX resolves it.) The working
-directory is a PATH, not a node reference: renaming a directory out from
+directory is walked before operation-specific terminal `.`/`..` restrictions are applied: removal
+and rename report an earlier missing or non-directory intermediate first.
+The working directory is a PATH, not a node reference: renaming a directory out from
 under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,
 recorded here as contractual (the host's fchdir-tracked inode semantics are not promised). A
 `DirEntry` from a listing carries its listing-time `Info` snapshot rather than re-statting lazily

@@ -68,6 +68,49 @@ func TestDSTFSPhysicalPathWalk(t *testing.T) {
 	})
 }
 
+func TestDSTFSTerminalDotErrorPrecedence(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.Mkdir("/dir", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile("/file", []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile("/dir/source", []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name string
+			run  func() error
+			want error
+		}{
+			{"remove-missing-dot", func() error { return os.Remove("/missing/.") }, syscall.ENOENT},
+			{"remove-missing-dotdot", func() error { return os.Remove("/missing/..") }, syscall.ENOENT},
+			{"remove-file-dot", func() error { return os.Remove("/file/.") }, syscall.ENOTDIR},
+			{"remove-file-dotdot", func() error { return os.Remove("/file/..") }, syscall.ENOTDIR},
+			{"removeall-missing-dot", func() error { return os.RemoveAll("/missing/.") }, nil},
+			{"removeall-missing-dotdot", func() error { return os.RemoveAll("/missing/..") }, nil},
+			{"removeall-file-dot", func() error { return os.RemoveAll("/file/.") }, syscall.ENOTDIR},
+			{"removeall-file-dotdot", func() error { return os.RemoveAll("/file/..") }, syscall.ENOTDIR},
+			{"rename-old-missing-dot", func() error { return os.Rename("/missing/.", "/target") }, syscall.ENOENT},
+			{"rename-old-missing-dotdot", func() error { return os.Rename("/missing/..", "/target") }, syscall.ENOENT},
+			{"rename-old-file-dot", func() error { return os.Rename("/file/.", "/target") }, syscall.ENOTDIR},
+			{"rename-old-file-dotdot", func() error { return os.Rename("/file/..", "/target") }, syscall.ENOTDIR},
+			{"rename-new-missing-dot", func() error { return os.Rename("/dir/source", "/missing/.") }, syscall.ENOENT},
+			{"rename-new-missing-dotdot", func() error { return os.Rename("/dir/source", "/missing/..") }, syscall.ENOENT},
+			{"rename-new-file-dot", func() error { return os.Rename("/dir/source", "/file/.") }, syscall.ENOTDIR},
+			{"rename-new-file-dotdot", func() error { return os.Rename("/dir/source", "/file/..") }, syscall.ENOTDIR},
+			{"rename-old-terminal-precedes-new-missing", func() error { return os.Rename("/dir/.", "/missing/..") }, syscall.EBUSY},
+		}
+		for _, tc := range cases {
+			err := tc.run()
+			if !errors.Is(err, tc.want) {
+				t.Errorf("%s: error = %v, want %v", tc.name, err, tc.want)
+			}
+		}
+	})
+}
+
 // TestDSTFSOpenTruncDirEISDIR is the M11 regression: O_TRUNC on a directory is EISDIR
 // regardless of access mode, and must not mutate the directory (not even its mtime) —
 // an open real Linux rejects before any state change.

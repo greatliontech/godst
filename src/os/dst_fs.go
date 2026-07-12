@@ -600,17 +600,15 @@ func dstRemove(name string) (handled bool, err error) {
 	if name == "" {
 		return wrap(syscall.ENOENT)
 	}
-	if base := path.Base(name); base == "." || base == ".." {
-		// unlink/rmdir of "." and ".." are rejected by the host (EINVAL /
-		// ENOTEMPTY); EINVAL is os.Remove's observed shape for ".".
-		return wrap(syscall.EINVAL)
-	}
 	parent, base, node, errno := dstFSResolve(name)
 	if errno != nil {
 		return wrap(errno)
 	}
 	if node == nil {
 		return wrap(syscall.ENOENT)
+	}
+	if terminal := path.Base(name); terminal == "." || terminal == ".." {
+		return wrap(syscall.EINVAL)
 	}
 	if dstFSIsRoot(node) {
 		return wrap(syscall.EBUSY)
@@ -642,10 +640,6 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	if name == "" {
 		return true, nil // RemoveAll("") is a no-op success, like the host
 	}
-	if base := path.Base(name); base == "." || base == ".." {
-		// The host's removeall rejects trailing-dot paths with EINVAL.
-		return true, &PathError{Op: "RemoveAll", Path: name, Err: syscall.EINVAL}
-	}
 	parent, base, node, errno := dstFSResolve(name)
 	if errno != nil {
 		if errno == syscall.ENOENT {
@@ -655,6 +649,9 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	}
 	if node == nil {
 		return true, nil
+	}
+	if terminal := path.Base(name); terminal == "." || terminal == ".." {
+		return true, &PathError{Op: "RemoveAll", Path: name, Err: syscall.EINVAL}
 	}
 	if dstFSIsRoot(node) {
 		// Match RemoveAll("/"): refuse to destroy the root.
@@ -685,12 +682,6 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if oldname == "" || newname == "" {
 		return wrap(syscall.ENOENT)
 	}
-	if b := path.Base(oldname); b == "." || b == ".." {
-		return wrap(syscall.EBUSY) // rename(2): oldpath/newpath "." or ".."
-	}
-	if b := path.Base(newname); b == "." || b == ".." {
-		return wrap(syscall.EBUSY)
-	}
 	oldParent, oldBase, oldNode, errno := dstFSResolve(oldname)
 	if errno != nil {
 		return wrap(errno)
@@ -698,10 +689,16 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if oldNode == nil {
 		return wrap(syscall.ENOENT)
 	}
+	if terminal := path.Base(oldname); terminal == "." || terminal == ".." {
+		return wrap(syscall.EBUSY)
+	}
 	_, newTrailingSlash := dstFSComponents(newname)
 	newParent, newBase, newNode, errno := dstFSResolve(newname)
 	if errno != nil {
 		return wrap(errno)
+	}
+	if terminal := path.Base(newname); terminal == "." || terminal == ".." {
+		return wrap(syscall.EBUSY)
 	}
 	if newTrailingSlash && newNode == nil {
 		return wrap(syscall.ENOTDIR)
