@@ -1025,6 +1025,25 @@ var dstFinqBase atomic.Uint64
 // net allocation since the last collection.
 var dstHeapAlloc atomic.Uint64
 
+type dstDisassociatedAllocProbe [1024]byte
+
+// dstDisassociatedAllocFP allocates while the caller's live bubble pointer is
+// cleared, reproducing the ownership view used inside GC disassociation paths.
+// Sticky membership must keep the allocation in dstHeapAlloc.
+//
+//go:linkname dstDisassociatedAllocFP
+func dstDisassociatedAllocFP() (before, after uint64) {
+	gp := getg()
+	old := gp.bubble
+	defer func() { gp.bubble = old }()
+	before = dstHeapAlloc.Load()
+	gp.bubble = nil
+	p := newobject(abi.TypeFor[dstDisassociatedAllocProbe]())
+	after = dstHeapAlloc.Load()
+	KeepAlive(p)
+	return before, after
+}
+
 // dstPooledAlloc is the count of bytes of runtime-internal pooled structs
 // allocated since activation on behalf of simulation-bubble goroutines:
 // sudog/_defer by allocation type (user stack, acquireSudog/newdefer), g by

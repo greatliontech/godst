@@ -23,6 +23,9 @@ func dstGoroutineLeakGCFP()
 //go:linkname dstGoroutineLeakPendingFP runtime.dstGoroutineLeakPendingFP
 func dstGoroutineLeakPendingFP() bool
 
+//go:linkname dstDisassociatedAllocFP runtime.dstDisassociatedAllocFP
+func dstDisassociatedAllocFP() (before, after uint64)
+
 // TestDSTFaultFromNonBubbleGoroutinePanics: every fault-injection and
 // clock-fault API invoked during an active run from a goroutine OUTSIDE the
 // run's bubble fails loudly — never executing at an OS wall-clock instant the
@@ -235,6 +238,19 @@ func TestDSTForeignGCControlPanics(t *testing.T) {
 			t.Errorf("foreign %s panic = %q, want caller-position refusal", tc.name, msg)
 		}
 	}
+}
+
+func TestDSTDisassociatedAllocationCounts(t *testing.T) {
+	oldPercent := debug.SetGCPercent(100)
+	defer debug.SetGCPercent(oldPercent)
+
+	Test(t, 1, func(t *testing.T) {
+		runtime.GC()
+		before, after := dstDisassociatedAllocFP()
+		if after <= before {
+			t.Fatalf("dstHeapAlloc did not advance while bubble pointer was cleared: before=%d after=%d", before, after)
+		}
+	})
 }
 
 // TestDSTRunActivationExcludesInFlightGuardedOps: the run-START activation

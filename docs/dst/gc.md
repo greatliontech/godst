@@ -744,7 +744,10 @@ the channel-light workloads that first validated it (both **landed**):
   (`bubbleMarked`), giving a COLD process a larger target than a warmed one at the same seed and
   shifting the last cycle's discovery boundary while the earlier, floor-clamped targets hide the
   difference. The trigger therefore counts pooled bytes allocated for bubble goroutines since
-  activation (`dstPooledAlloc`, on either stack — `malg` allocates the `g` struct on systemstack),
+  activation (`dstPooledAlloc`, on either stack — `malg` allocates the `g` struct on systemstack).
+  Both the per-object and pooled counters key on sticky simulation membership (`g.dstSimG`), not the
+  live bubble pointer: GC start and assist paths temporarily clear that pointer, but disassociation
+  does not turn work performed for a simulation goroutine into foreign work. The trigger
   snapshots the counter at each mark termination (`dstPooledMarked`, the same STW that sets
   `heapMarked`), and subtracts the snapshot from `bubbleMarked` in both the GOGC target and the
   `MemoryLimit` crossing: the nondeterministic cold-vs-warm term cancels exactly (the g's

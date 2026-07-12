@@ -27,7 +27,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 11. `userArena.alloc`/`newUserArenaChunk` feed deterministic heap and process counters, or simulation entry rejects arena builds
 - [x] 12. the pooled `_defer` exclusion and marked-side accounting have a reaching mutation test
 - [x] 13. foreign `SetGCPercent` and `runtime.GC` cannot move active-run trigger state; direct foreign arms pin `debug.FreeOSMemory` and the goroutine-leak entry, including scavenge and leak-mode flags (`dst-gc-foreign-setgcpercent-perturbs-trigger`, `dst-gc-forced-entry-funnels-unpinned`)
-- [ ] 14. GC allocation and execution counters key on sticky simulation membership at every transient bubble-clear window (`dst-gc-counter-gates-live-bubble-field`)
+- [x] 14. GC allocation and execution counters key on sticky simulation membership at every transient bubble-clear window (`dst-gc-counter-gates-live-bubble-field`)
 - [ ] 15. the foreign-GC exploration workload replays stably in normal and race builds, with the mechanism or bound recorded (`dst-explore-gc-workload-churn-flake`)
 
 ## Runtime callback functions
@@ -47,7 +47,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Runtime scheduling functions
 
-- [ ] 22. same-seed scheduler probes replay identically under focused and contended full-suite repetition, with their load-dependent inputs eliminated (`dst-schedule-broadcast-replay-flake`, `dst-scheduler-load-replay-flakes`)
+- [ ] 22. same-seed scheduler and network-reset-order probes replay identically under focused and contended full-suite repetition, with their load-dependent inputs eliminated (`dst-schedule-broadcast-replay-flake`, `dst-scheduler-load-replay-flakes`)
 
 ## Exploration recorder functions
 

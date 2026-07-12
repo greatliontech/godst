@@ -713,7 +713,7 @@ func allgadd(gp *g) {
 		// for the process lifetime — enter the counter: an allocm-created
 		// g0/gsignal also allocates with a bubble m.curg but can die via
 		// sched.freem, which would break counted-implies-live.
-		if cur := getg().m.curg; cur != nil && cur.bubble != nil && cur.bubble == dstSimBubble {
+		if cur := getg().m.curg; cur != nil && cur.dstSimG {
 			dstPooledAlloc.Add(int64(dstPooledGBytes))
 		}
 	}

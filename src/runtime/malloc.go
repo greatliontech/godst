@@ -1222,12 +1222,10 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		// every heap allocation passes through here exactly once with elemsize set. x
 		// is already published (publicationBarrier/gcmarknewobject ran and mp.mallocing
 		// is reset), so a GC started here will not collect it.
-		if cur := getg().m.curg; cur != nil && cur.bubble != nil && cur.bubble == dstSimBubble {
+		if cur := getg().m.curg; cur != nil && cur.dstSimG {
 			// Only the simulation bubble's own allocations reach the counters
-			// and the trigger: a non-bubble goroutine (or a foreign synctest
-			// bubble) allocating mid-run would otherwise move the cycle
-			// boundary and make NumGC and which cycle discovers a finalizer
-			// depend on unrelated process activity.
+			// and the trigger. Sticky membership remains set while GC paths
+			// temporarily clear cur.bubble; foreign goroutines never acquire it.
 			if dstIsInternalPooledType(typ) {
 				if typ != dstInternalPooledTypes.g {
 					// sudog/_defer count here by type. g's count at their
