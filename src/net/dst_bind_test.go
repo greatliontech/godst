@@ -231,7 +231,7 @@ func TestDSTNetPendingLocalBindVisibleToListenerAndEphemeralDial(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			pendingDone := make(chan struct{})
 			go func() {
-				d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: dstDialEphemeralStart}}
+				d := Dialer{LocalAddr: &TCPAddr{Port: dstDialEphemeralStart}}
 				d.DialContext(ctx, "tcp", targetA)
 				close(pendingDone)
 			}()
@@ -256,6 +256,176 @@ func TestDSTNetPendingLocalBindVisibleToListenerAndEphemeralDial(t *testing.T) {
 	}
 	if ephemeralPort != dstDialEphemeralStart+1 {
 		t.Fatalf("ephemeral dial with %d pending received %d, want %d", dstDialEphemeralStart, ephemeralPort, dstDialEphemeralStart+1)
+	}
+}
+
+func TestDSTNetWildcardLocalAddrConflictsAcrossHostAddresses(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var liveErr, timeWaitErr error
+	simulation.Run(1, func() {
+		remotePort := make(chan string, 1)
+		releaseRemote := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			remotePort <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-releaseRemote
+				c.Close()
+			}()
+		})
+		simulation.Host("H", simulation.HostConfig{}, func() {
+			loopback, _ := Listen("tcp", "127.0.0.1:0")
+			defer loopback.Close()
+			target := simulation.HostIP("A") + ":" + <-remotePort
+			bound := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("H")), Port: 33000}}
+			first, err := bound.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			wildcard := Dialer{LocalAddr: &TCPAddr{Port: 33000}}
+			_, liveErr = wildcard.Dial("tcp", loopback.Addr().String())
+			first.Close()
+			_, timeWaitErr = wildcard.Dial("tcp", loopback.Addr().String())
+			close(releaseRemote)
+		})
+	})
+	if !errors.Is(liveErr, syscall.EADDRINUSE) {
+		t.Fatalf("IP-less LocalAddr over live routable bind = %v, want EADDRINUSE", liveErr)
+	}
+	var opErr *OpError
+	if !errors.As(liveErr, &opErr) {
+		t.Fatalf("IP-less LocalAddr error type = %T, want *OpError", liveErr)
+	}
+	source, ok := opErr.Source.(*TCPAddr)
+	if !ok || source.Port != 33000 || source.IP != nil && !source.IP.IsUnspecified() {
+		t.Fatalf("IP-less LocalAddr error source = %#v, want wildcard port 33000", opErr.Source)
+	}
+	if !errors.Is(timeWaitErr, syscall.EADDRINUSE) {
+		t.Fatalf("IP-less LocalAddr over routable TIME_WAIT hold = %v, want EADDRINUSE", timeWaitErr)
+	}
+}
+
+func TestDSTNetEstablishedWildcardBindBlocksConcreteAddress(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var liveErr, timeWaitErr error
+	simulation.Run(1, func() {
+		remotePort := make(chan string, 1)
+		releaseRemote := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			remotePort <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-releaseRemote
+				c.Close()
+			}()
+		})
+		simulation.Host("H", simulation.HostConfig{}, func() {
+			loopback, _ := Listen("tcp", "127.0.0.1:0")
+			defer loopback.Close()
+			target := simulation.HostIP("A") + ":" + <-remotePort
+			wildcard := Dialer{LocalAddr: &TCPAddr{Port: 33000}}
+			first, err := wildcard.Dial("tcp", target)
+			if err != nil {
+				panic(err)
+			}
+			if got := first.LocalAddr().(*TCPAddr).IP; !got.Equal(ParseIP(simulation.HostIP("H"))) {
+				t.Fatalf("wildcard-bound connection reported source %v, want route-selected %s", got, simulation.HostIP("H"))
+			}
+			concrete := Dialer{LocalAddr: &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 33000}}
+			_, liveErr = concrete.Dial("tcp", loopback.Addr().String())
+			first.Close()
+			_, timeWaitErr = concrete.Dial("tcp", loopback.Addr().String())
+			close(releaseRemote)
+		})
+	})
+	if !errors.Is(liveErr, syscall.EADDRINUSE) {
+		t.Fatalf("concrete bind over live wildcard socket = %v, want EADDRINUSE", liveErr)
+	}
+	if !errors.Is(timeWaitErr, syscall.EADDRINUSE) {
+		t.Fatalf("concrete bind over wildcard TIME_WAIT hold = %v, want EADDRINUSE", timeWaitErr)
+	}
+}
+
+func TestDSTNetWildcardLocalAddrDoesNotCrossAddressFamilies(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var listenErr error
+	simulation.Run(1, func() {
+		ln6, err := Listen("tcp6", "[::1]:0")
+		if err != nil {
+			panic(err)
+		}
+		accepted := make(chan struct{})
+		go func() {
+			c, _ := ln6.Accept()
+			close(accepted)
+			defer c.Close()
+		}()
+		d := Dialer{LocalAddr: &TCPAddr{Port: 33000}}
+		c, err := d.Dial("tcp6", ln6.Addr().String())
+		if err != nil {
+			panic(err)
+		}
+		<-accepted
+		ln4, err := Listen("tcp4", "127.0.0.1:33000")
+		listenErr = err
+		if ln4 != nil {
+			ln4.Close()
+		}
+		c.Close()
+		ln6.Close()
+	})
+	if listenErr != nil {
+		t.Fatalf("tcp4 listener beside live wildcard tcp6 dialer = %v, want success", listenErr)
+	}
+}
+
+func TestDSTNetAcceptedTimeWaitDoesNotCrossAddressFamilies(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var dialErr error
+	simulation.Run(1, func() {
+		ln6, _ := Listen("tcp6", "[::1]:33000")
+		ln4, _ := Listen("tcp4", "127.0.0.1:0")
+		accepted6Closed := make(chan struct{})
+		go func() {
+			c, _ := ln6.Accept()
+			c.Close()
+			close(accepted6Closed)
+		}()
+		client6, err := Dial("tcp6", ln6.Addr().String())
+		if err != nil {
+			panic(err)
+		}
+		<-accepted6Closed
+		ln6.Close()
+		go func() {
+			c, _ := ln4.Accept()
+			if c != nil {
+				c.Close()
+			}
+		}()
+		d := Dialer{LocalAddr: &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 33000}}
+		client4, err := d.Dial("tcp4", ln4.Addr().String())
+		dialErr = err
+		if client4 != nil {
+			client4.Close()
+		}
+		client6.Close()
+		ln4.Close()
+	})
+	if dialErr != nil {
+		t.Fatalf("tcp4 bind beside accepted-end tcp6 TIME_WAIT = %v, want success", dialErr)
 	}
 }
 

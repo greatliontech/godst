@@ -65,6 +65,8 @@ type dstTimeWait struct {
 	host     uint32
 	ip       IP
 	port     int
+	family   string
+	wildcard bool
 	expireAt int64 // universe base-time ns (dstBaseNanos)
 }
 
@@ -77,7 +79,7 @@ const dstTimeWaitNs = 60_000_000_000
 // dstTimeWaitAdd records an actively-closed conn end's local 2-tuple. Prunes
 // expired entries once the slice has doubled since the last prune, so a run
 // that never consults the probe still holds only a bounded window of churn.
-func dstTimeWaitAdd(host uint32, ip IP, port int) {
+func dstTimeWaitAdd(host uint32, ip IP, port int, family string, wildcard bool) {
 	dstConns.mu.Lock()
 	now := dstBaseNanos()
 	dstConnsRoll()
@@ -85,7 +87,7 @@ func dstTimeWaitAdd(host uint32, ip IP, port int) {
 		dstTimeWaitPrune(now)
 	}
 	dstConns.timeWait = append(dstConns.timeWait, dstTimeWait{
-		host: host, ip: ip, port: port, expireAt: now + dstTimeWaitNs,
+		host: host, ip: ip, port: port, family: family, wildcard: wildcard, expireAt: now + dstTimeWaitNs,
 	})
 	dstConns.mu.Unlock()
 }
@@ -128,6 +130,10 @@ func dstTimeWaitDropHost(h uint32) {
 // pruning expired entries as it scans. ip nil means any IP at the port,
 // matching the live-conn probe's convention.
 func dstTimeWaitHeld(host uint32, ip IP, port int) bool {
+	return dstTimeWaitBindHeld(host, ip, port, "")
+}
+
+func dstTimeWaitBindHeld(host uint32, ip IP, port int, family string) bool {
 	dstConns.mu.Lock()
 	defer dstConns.mu.Unlock()
 	dstConnsRoll()
@@ -137,7 +143,10 @@ func dstTimeWaitHeld(host uint32, ip IP, port int) bool {
 		if w.host != host || w.port != port {
 			continue
 		}
-		if ip != nil && !w.ip.Equal(ip) {
+		if family != "" && w.family != "" && w.family != family {
+			continue
+		}
+		if ip != nil && !w.wildcard && !w.ip.Equal(ip) {
 			continue
 		}
 		held = true
@@ -249,10 +258,14 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 		if !ok || la.Port != port {
 			continue
 		}
-		if ip != nil && !la.IP.Equal(ip) {
+		connFamily := c.bindFamily
+		if connFamily == "" {
+			connFamily = dstAddrFamily("", la.IP)
+		}
+		if family != "" && connFamily != family {
 			continue
 		}
-		if family != "" && dstAddrFamily("", la.IP) != family {
+		if ip != nil && !c.bindWildcard && !la.IP.Equal(ip) {
 			continue
 		}
 		return true

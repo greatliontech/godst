@@ -428,6 +428,9 @@ A concrete source IP must belong to the dialing host (its loopback range or rout
 the bind fails `EADDRNOTAVAIL`. A valid explicit tuple is reserved before partition, handshake, or backlog
 waiting begins; concurrent dials and listeners observe that reservation, and every failed connect releases
 it before returning.
+An explicit port with no source IP retains bind(2)'s wildcard identity: it conflicts with every
+same-family pending, live, or TIME_WAIT binding at that host and port even though a successful
+connection reports the route-selected concrete source address.
 Conns and listeners share ONE port space per host, in both directions: a dial's local bind — explicit
 or ephemeral — conflicts with a live listener at the port (exact or wildcard, same family:
 `TestDSTNetDialLocalBindListenerPortEADDRINUSE`, `TestDSTNetEphemeralDialSkipsListenerPort`), and a

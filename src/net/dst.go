@@ -58,10 +58,11 @@ var dstNet struct {
 }
 
 type dstBindKey struct {
-	host   uint32
-	family string
-	ip     string
-	port   int
+	host     uint32
+	family   string
+	ip       string
+	port     int
+	wildcard bool
 }
 
 const (
@@ -94,7 +95,7 @@ func dstAllocEphemeralPort(host uint32, localIP IP) int {
 		if dstLocalBindInUse(host, localIP, p) {
 			continue
 		}
-		if _, reserved := dstNet.pendingBinds[dstBindKey{host: host, family: family, ip: localIP.String(), port: p}]; reserved {
+		if dstPendingBindInUse(dstBindKey{host: host, family: family, ip: localIP.String(), port: p}) {
 			continue
 		}
 		if dstListenerConflict(scope, "tcp", localIP, dstListenerKey("tcp", localIP, p, false), p, false) {
@@ -315,8 +316,22 @@ func dstLocalIPOwnedByHost(host uint32, ip IP) bool {
 	return ok && owner == host
 }
 
-func dstExplicitBindKey(host uint32, network string, ip IP, port int) dstBindKey {
-	return dstBindKey{host: host, family: dstAddrFamily(network, ip), ip: ip.String(), port: port}
+func dstExplicitBindKey(host uint32, network string, ip IP, port int, wildcard bool) dstBindKey {
+	key := dstBindKey{host: host, family: dstAddrFamily(network, ip), port: port, wildcard: wildcard}
+	if !wildcard {
+		key.ip = ip.String()
+	}
+	return key
+}
+
+func dstPendingBindInUse(key dstBindKey) bool {
+	for bind := range dstNet.pendingBinds {
+		if bind.host == key.host && bind.family == key.family && bind.port == key.port &&
+			(bind.wildcard || key.wildcard || bind.ip == key.ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func dstDialOptionsError(d *Dialer, network string, source, addr Addr) error {
@@ -508,7 +523,7 @@ func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcar
 		if bind.host != host || bind.port != port {
 			continue
 		}
-		if dual || bind.family == family && (wildcard || bind.ip == ip.String()) {
+		if dual || bind.family == family && (wildcard || bind.wildcard || bind.ip == ip.String()) {
 			return true
 		}
 	}
@@ -518,7 +533,7 @@ func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcar
 	case wildcard:
 		return dstConnBindInUse(host, nil, port, dstAddrFamily(network, ip), true)
 	default:
-		return dstConnBindInUse(host, ip, port, "", true)
+		return dstConnBindInUse(host, ip, port, dstAddrFamily(network, ip), true)
 	}
 }
 
@@ -550,6 +565,8 @@ type dstConn struct {
 	// on exactly that process's conns (DST-FAULT-VICTIM, the process leg).
 	localHost, remoteHost uint32
 	localProc, remoteProc uint32
+	bindWildcard          bool
+	bindFamily            string
 
 	// regSeq is the per-run registration sequence, stamped at dstConnRegister, so a
 	// multi-victim reset orders its victims deterministically (registration order =
@@ -674,7 +691,7 @@ func (c *dstConn) timeWaitHold() {
 	if !ok || e.timedOut.Load() || isClosedChan(e.remoteDone) {
 		return
 	}
-	dstTimeWaitAdd(c.localHost, la.IP, la.Port)
+	dstTimeWaitAdd(c.localHost, la.IP, la.Port, c.bindFamily, c.bindWildcard)
 }
 
 // setDeadline applies a deadline with production error identity: after a
@@ -999,19 +1016,25 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	if localTCPAddr != nil {
 		localPort = localTCPAddr.Port
 	}
+	wildcardBind := localPort != 0 && (localTCPAddr.IP == nil || localTCPAddr.IP.IsUnspecified())
 	var reserved *dstBindKey
 	if localPort != 0 {
-		key := dstExplicitBindKey(dialerHost, network, localIP, localPort)
+		key := dstExplicitBindKey(dialerHost, network, localIP, localPort, wildcardBind)
+		bindIP := localIP
+		if wildcardBind {
+			bindIP = nil
+		}
+		family := dstAddrFamily(network, localIP)
 		dstNet.mu.Lock()
 		dstNetRoll()
 		dialerScope := dstNetScope(dialerHost)
-		conflict := dstLocalBindInUse(dialerHost, localIP, localPort) ||
-			dstTimeWaitHeld(dialerHost, localIP, localPort) ||
-			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, false), localPort, false)
-		_, pending := dstNet.pendingBinds[key]
+		conflict := dstConnBindInUse(dialerHost, bindIP, localPort, family, false) ||
+			dstTimeWaitBindHeld(dialerHost, bindIP, localPort, family) ||
+			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, wildcardBind), localPort, wildcardBind)
+		pending := dstPendingBindInUse(key)
 		if conflict || pending {
 			dstNet.mu.Unlock()
-			src := &TCPAddr{IP: localIP, Port: localPort, Zone: localTCPAddr.Zone}
+			src := &TCPAddr{IP: append(IP(nil), localTCPAddr.IP...), Port: localPort, Zone: localTCPAddr.Zone}
 			return nil, &OpError{Op: "dial", Net: network, Source: src, Addr: serverAddr, Err: syscall.EADDRINUSE}
 		}
 		dstNet.pendingBinds[key] = dialerProc
@@ -1112,14 +1135,16 @@ redial:
 		// (exact or wildcard, same family; the listener's own SO_REUSEADDR does not
 		// help a peer socket that lacks it).
 		dialerScope := dstNetScope(dialerHost)
-		if dstLocalBindInUse(dialerHost, localIP, localPort) ||
-			dstTimeWaitHeld(dialerHost, localIP, localPort) ||
-			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, false), localPort, false) {
+		bindIP := localIP
+		if wildcardBind {
+			bindIP = nil
+		}
+		family := dstAddrFamily(network, localIP)
+		if dstConnBindInUse(dialerHost, bindIP, localPort, family, false) ||
+			dstTimeWaitBindHeld(dialerHost, bindIP, localPort, family) ||
+			dstListenerConflict(dialerScope, network, localIP, dstListenerKey(network, localIP, localPort, wildcardBind), localPort, wildcardBind) {
 			dstNet.mu.Unlock()
-			src := &TCPAddr{IP: localIP, Port: localPort}
-			if localTCPAddr != nil {
-				src.Zone = localTCPAddr.Zone
-			}
+			src := &TCPAddr{IP: append(IP(nil), localTCPAddr.IP...), Port: localPort, Zone: localTCPAddr.Zone}
 			return nil, &OpError{Op: "dial", Net: network, Source: src, Addr: serverAddr, Err: syscall.EADDRINUSE}
 		}
 	} else {
@@ -1181,8 +1206,8 @@ redial:
 	}
 	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host)
 	reset := new(atomic.Bool)
-	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc}
-	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc}
+	dialer := &dstConn{Conn: p1, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP)}
+	server := &dstConn{Conn: p2, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP)}
 	// A FULL accept backlog drops the SYN (tcp_abort_on_overflow=0, the
 	// default): the dialer retransmits and either a slot frees in time (the
 	// send below lands) or its retries exhaust — connect fails ETIMEDOUT at
