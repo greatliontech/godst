@@ -942,6 +942,7 @@ func dstChdir(dir string) (handled bool, err error) {
 	if dstProcReserved(dir) {
 		return true, &PathError{Op: "chdir", Path: dir, Err: dstErrUnsupportedFS}
 	}
+	dstDiskDelayHere()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()

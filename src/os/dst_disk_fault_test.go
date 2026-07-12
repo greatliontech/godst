@@ -966,6 +966,20 @@ func TestDSTDiskLatencyAllOps(t *testing.T) {
 			measure("chmod-handle", func() { fw.Chmod(0o600) })
 			measure("open", func() { g, _ := os.Open("/g"); g.Close() })
 			measure("stat", func() { os.Stat("/g") })
+			measure("chdir", func() { mustOK(t, "Chdir", os.Chdir("/d")) })
+			measure("chdir-missing", func() {
+				if err := os.Chdir("/missing"); !errors.Is(err, syscall.ENOENT) {
+					t.Errorf("Chdir missing = %v, want ENOENT", err)
+				}
+			})
+			t0 := time.Now()
+			if _, err := os.Getwd(); err != nil || time.Since(t0) != 0 {
+				t.Errorf("Getwd after Chdir = %v, elapsed %v; want success, 0", err, time.Since(t0))
+			}
+			t0 = time.Now()
+			if err := os.Chdir("/proc/self/stat"); err == nil || time.Since(t0) != 0 {
+				t.Errorf("reserved Chdir = %v, elapsed %v; want error, 0", err, time.Since(t0))
+			}
 			measure("mkdir", func() { os.Mkdir("/d2", 0o755) })
 			measure("remove", func() { os.Remove("/d2") })
 			measure("removeAll", func() { os.RemoveAll("/rr") })
@@ -976,7 +990,7 @@ func TestDSTDiskLatencyAllOps(t *testing.T) {
 			// os.Rename does an internal Lstat(newname) before the rename itself,
 			// so on a slow disk it pays the latency twice — two real disk ops, the
 			// faithful result (not double-counting one op).
-			t0 := time.Now()
+			t0 = time.Now()
 			mustOK(t, "Rename", os.Rename("/g", "/g2"))
 			if d := time.Since(t0); d != 2*lat {
 				t.Errorf("rename took %v, want %v (Lstat + rename)", d, 2*lat)

@@ -625,7 +625,7 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
   sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op
   that reads/writes content, traverses directories, or allocates a node (read/write/sync, open, named
-  stat — the path walk touches the disk — mkdir, remove, rename, readdir, truncate, chmod, chtimes);
+  stat and `Chdir` — their path walks touch the disk — mkdir, remove, rename, readdir, truncate, chmod, chtimes);
   pure in-memory ops (seek, `Getwd`, a closed-fd read that returns EBADF without I/O, and an **open
   handle's `File.Stat`** — fstat reads the in-core inode, which a slow disk does not delay) are not
   delayed, as a real slow disk would not delay them. The sleep
