@@ -8,7 +8,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"testing"
 	"testing/simulation"
 	"time"
@@ -72,6 +74,162 @@ func dstPingPong(t *testing.T, seed uint64, opts simulation.Options) (oneWay, rt
 		})
 	})
 	return serverReadAt.Sub(writeAt), clientRespAt.Sub(writeAt)
+}
+
+func TestDSTNetFINPaysLinkLatency(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const latency = 100 * time.Millisecond
+	var closedAt, eofAt time.Time
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+		port := make(chan string, 1)
+		accepted := make(chan struct{})
+		serverDone := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, err := Listen("tcp", ":0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				close(accepted)
+				c.SetReadDeadline(time.Now().Add(latency / 2))
+				if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Errorf("read before FIN arrival = %v, want deadline", err)
+				}
+				c.SetReadDeadline(time.Time{})
+				b := make([]byte, 1)
+				if n, err := c.Read(b); n != 1 || err != nil || b[0] != 'x' {
+					t.Errorf("queued read at FIN arrival = %q, %v", b[:n], err)
+				}
+				if _, err := c.Read(b); err != io.EOF {
+					t.Errorf("read after queued data = %v, want EOF", err)
+				}
+				eofAt = time.Now()
+				c.Close()
+				ln.Close()
+				close(serverDone)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			c, err := Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			<-accepted
+			closedAt = time.Now()
+			c.Write([]byte("x"))
+			c.Close()
+			<-serverDone
+		})
+	})
+	if got := eofAt.Sub(closedAt); got != latency {
+		t.Fatalf("FIN delay = %v, want %v", got, latency)
+	}
+}
+
+func TestDSTNetFINJitterDeterministic(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const base, jitter = 20 * time.Millisecond, 40 * time.Millisecond
+	run := func(seed uint64) (delays []time.Duration) {
+		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: base, CrossHostJitter: jitter}}, func() {
+			for i := 0; i < 10; i++ {
+				var closedAt, eofAt time.Time
+				port := make(chan string, 1)
+				accepted := make(chan struct{})
+				done := make(chan struct{})
+				simulation.Host("A", simulation.HostConfig{}, func() {
+					ln, _ := Listen("tcp", ":0")
+					_, p, _ := SplitHostPort(ln.Addr().String())
+					port <- p
+					go func() {
+						c, _ := ln.Accept()
+						close(accepted)
+						_, err := c.Read(make([]byte, 1))
+						if err != io.EOF {
+							t.Errorf("FIN read = %v", err)
+						}
+						eofAt = time.Now()
+						c.Close()
+						ln.Close()
+						close(done)
+					}()
+				})
+				simulation.Host("B", simulation.HostConfig{}, func() {
+					c, _ := Dial("tcp", simulation.HostIP("A")+":"+<-port)
+					<-accepted
+					closedAt = time.Now()
+					c.Close()
+					<-done
+				})
+				delays = append(delays, eofAt.Sub(closedAt))
+			}
+		})
+		return delays
+	}
+	a, b := run(7), run(7)
+	if !slices.Equal(a, b) {
+		t.Fatalf("same-seed FIN jitter streams differ: %v vs %v", a, b)
+	}
+	for i, d := range a {
+		if d < base || d >= base+jitter {
+			t.Fatalf("FIN jitter delay %d = %v, want [%v,%v)", i, d, base, base+jitter)
+		}
+	}
+}
+
+func TestDSTNetPartitionHoldsFINAtCutBoundary(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.Run(1, func() {
+		port := make(chan string, 1)
+		accepted := make(chan struct{})
+		timedOut := make(chan struct{})
+		healed := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				close(accepted)
+				if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Errorf("cut FIN read = %v", err)
+				}
+				close(timedOut)
+				<-healed
+				c.SetReadDeadline(time.Time{})
+				if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+					t.Errorf("healed FIN read = %v", err)
+				}
+				c.Close()
+				ln.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			<-accepted
+			simulation.Partition("A", "B")
+			c.Close() // closeAt == cutStart: strict boundary must be held.
+			<-timedOut
+			simulation.Heal("A", "B")
+			close(healed)
+			<-done
+		})
+	})
 }
 
 // TestDSTNetCrossHostLatency: a cross-host connection delivers each byte exactly

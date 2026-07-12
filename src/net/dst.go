@@ -638,9 +638,9 @@ func (c *dstConn) timeWaitHold() {
 }
 
 // setDeadline applies a deadline with production error identity: after a
-// local Close it fails with net.ErrClosed; after a peer close it succeeds (a
-// peer FIN does not invalidate the local endpoint — subsequent reads return
-// EOF/ECONNRESET immediately anyway, so the dropped deadline is unobservable).
+// local Close it fails with net.ErrClosed; after a peer close it still succeeds
+// and applies: FIN may be delayed or partition-held,
+// so the local endpoint remains live until terminal state arrives.
 func (c *dstConn) setDeadline(set func(time.Time) error, t time.Time) error {
 	// Production shape for a set-deadline failure: Source nil, Addr local.
 	closedErr := &OpError{Op: "set", Net: c.network, Source: nil, Addr: c.local, Err: errClosed}

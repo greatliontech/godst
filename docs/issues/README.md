@@ -22,7 +22,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | chunk 61, with qemu-user available for the runtime witness |
 | [MIPS clock_gettime64 lacks a runtime witness](./dst-mips-clock-gettime64-runtime-unverified.md) | L | chunk 61, with qemu-user available for the runtime witness |
 | [network base delays scale with host drift](./dst-net-base-delay-scaled-by-host-drift.md) | M | all network waits consume universe base time |
-| [FIN bypasses link delay](./dst-net-fin-bypasses-link-delay.md) | M | graceful close pays link latency and jitter |
 | [LocalAddr lacks a complete bind lifecycle](./dst-net-local-bind-lifecycle-incomplete.md) | M | explicit binds validate, reserve, and release atomically |
 | [ephemeral port allocation couples independent hosts](./dst-net-port-allocator-cross-host-coupling.md) | M | allocator state is host-scoped |
 | [blackhole cannot override an existing refuse cut](./dst-net-blackhole-cannot-override-refuse.md) | M | overlapping cuts preserve blackhole dominance |

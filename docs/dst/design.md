@@ -398,8 +398,10 @@ models a TCP socket pair, not a message queue:
   `ECONNREFUSED`. This case is reachable only via a hand-constructed literal `10.x` IP (`HostIP`
   panics on an undeclared host), so it needs net to learn the declared-host set (a query hook like
   the partition hook) before it can distinguish refuse from blackhole.
-- **Peer close (FIN) semantics — pending (lands with the FIN/RST follow-on).** Reads after a peer's
-  graceful close drain buffered data, then `io.EOF` (landed). The intended write side: the **first
+- **Peer close FIN read semantics — landed; post-FIN write/reset semantics pending.** Reads after a peer's
+  graceful close drain buffered data, then `io.EOF` (landed). FIN is a delayed control event: its
+  arrival pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
+  read deadline fires first; partitions hold a not-yet-arrived FIN like data. The intended write side: the **first
   write after the peer's full close succeeds locally** (the FIN closed the peer's send direction; the
   write is accepted into the send buffer and elicits the peer's RST); the reset then errors
   **subsequent** operations with `ECONNRESET` — matching the RST round trip of a real stack, rather

@@ -196,10 +196,10 @@ func dstTransmitNanos(nbytes, bps int64) int64 {
 // FIN's arrival): the reader drains queued segments at their delivery times, then
 // sees EOF — but a partition holds the FIN too, so EOF is withheld until heal unless
 // the close arrived before the cut (closeAt <= cut-start), exactly like a data byte.
-func (s *dstStream) closeWrite() {
+func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
 	s.mu.Lock()
 	s.closed = true
-	s.closeAt = dstBaseNanos()
+	s.closeAt = dstBaseNanos() + latencyNs + dstFaultRandN(jitterNs)
 	s.mu.Unlock()
 	s.wake()
 }
@@ -259,6 +259,9 @@ func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wa
 	}
 	if s.closed && s.closeAt <= maxArrival && len(s.segs) == 0 {
 		return 0, false, true, 0
+	}
+	if s.closed && len(s.segs) == 0 && s.closeAt > maxArrival {
+		return 0, false, false, time.Duration(s.closeAt - maxArrival)
 	}
 	return 0, false, false, -1
 }
@@ -673,13 +676,13 @@ func (e *dstWireEnd) Close() error {
 		close(e.localDone)
 		// Stop accepting reads/writes locally (localDone) and let the peer drain
 		// what we already sent, then see EOF (closeWrite on our out = peer's in).
-		e.out.closeWrite()
+		e.out.closeWrite(e.latencyNs, e.jitterNs)
 	})
 	return nil
 }
 
 func (e *dstWireEnd) SetDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+	if isClosedChan(e.localDone) {
 		return io.ErrClosedPipe
 	}
 	e.rdDead.set(t)
@@ -688,7 +691,7 @@ func (e *dstWireEnd) SetDeadline(t time.Time) error {
 }
 
 func (e *dstWireEnd) SetReadDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+	if isClosedChan(e.localDone) {
 		return io.ErrClosedPipe
 	}
 	e.rdDead.set(t)
@@ -696,7 +699,7 @@ func (e *dstWireEnd) SetReadDeadline(t time.Time) error {
 }
 
 func (e *dstWireEnd) SetWriteDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+	if isClosedChan(e.localDone) {
 		return io.ErrClosedPipe
 	}
 	e.wrDead.set(t)
