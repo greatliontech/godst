@@ -1675,6 +1675,13 @@ func dstCrashProcessPid(pid int32) {
 	dstMarkProcessGoroutinesCrashed(pid)
 }
 
+//go:linkname dstStopProcessThreads
+func dstStopProcessThreads(pid int32) {
+	if pid > 0 {
+		dstMarkProcessGoroutinesCrashed(pid)
+	}
+}
+
 // dstSelfCrashed reports whether the CALLING goroutine belongs to a crashed
 // process invocation (the crash mark flipped its pid negative). A self-crash
 // — the OOM shape: the victim's own goroutine triggers the fault — leaves the

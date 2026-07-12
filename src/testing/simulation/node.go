@@ -54,6 +54,9 @@ func dstSetPidLive(pid int32, live bool)
 //go:linkname dstCrashProcessPid runtime.dstCrashProcessPid
 func dstCrashProcessPid(pid int32)
 
+//go:linkname dstStopProcessThreads runtime.dstStopProcessThreads
+func dstStopProcessThreads(pid int32)
+
 //go:linkname dstProcessTeardown runtime.dstProcessTeardown
 func dstProcessTeardown(proc uint32)
 
@@ -334,6 +337,13 @@ func activeProcLivesElsewhere(proc, host uint32) bool {
 	defer activeProcs.mu.Unlock()
 	old, ok := activeProcs.host[proc]
 	return ok && old != host && len(activeProcs.pids[proc]) > 0
+}
+
+func activeProcLastInvocation(proc uint32, pid int32) bool {
+	activeProcs.mu.Lock()
+	defer activeProcs.mu.Unlock()
+	pids := activeProcs.pids[proc]
+	return len(pids) == 1 && pids[0] == pid
 }
 
 // activeProcsOnHost returns the live processes running on host, in process-id
@@ -828,11 +838,7 @@ func Process(name string, f func()) {
 			dstParkCrashedSelf()
 		}
 	}()
-	live := false
 	defer func() {
-		if live {
-			dstSetPidLive(simPid, false)
-		}
 		// Restore identity BEFORE parking on the teardown mutex: a goroutine
 		// waiting here carries its caller's pid, not the dying invocation's,
 		// so a concurrent crash of this logical process cannot mark the parked
@@ -845,7 +851,7 @@ func Process(name string, f func()) {
 		// predecessor's teardown.
 		procTeardownMu.Lock()
 		defer procTeardownMu.Unlock()
-		last := activeProcClear(proc, simPid)
+		last := activeProcLastInvocation(proc, simPid)
 		// A returning (or panicking) body models process EXIT: the kernel kills
 		// the invocation's remaining threads, then closes its fds — releasing
 		// flocks, unmapping (writable MAP_SHARED bytes persist: page cache
@@ -860,16 +866,17 @@ func Process(name string, f func()) {
 		// finished run's leaked state (deterministic, host-isolated, meaningless),
 		// which teardown must not disturb.
 		if runActive.Load() {
-			dstCrashProcessPid(simPid)
+			dstStopProcessThreads(simPid)
 			if last {
 				dstProcessTeardown(proc)
 				dstNetPartitionOp(partOpCloseProcConns, proc, 0)
 				dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 			}
+			dstSetPidLive(simPid, false)
 		}
+		activeProcClear(proc, simPid)
 	}()
 	dstSetPidLive(simPid, true)
-	live = true
 	released = true
 	release()
 	f()

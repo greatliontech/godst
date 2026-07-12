@@ -10,12 +10,158 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestDSTProcessExitPublishesPIDDeathAfterThreadsAndResources(t *testing.T) {
+	var duringKill, duringProcfs, duringWrite error
+	var afterKill, afterWrite, afterDial error
+	Run(1, func() {
+		type state struct {
+			pid  int
+			file *os.File
+			addr string
+		}
+		ready := make(chan state, 1)
+		returnBody := make(chan struct{})
+		probeChild := make(chan struct{})
+		childResponded := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			Process("p", func() {
+				f, _ := os.Create("/exit-order")
+				ln, _ := net.Listen("tcp", ":0")
+				go func() {
+					<-probeChild
+					close(childResponded)
+					select {}
+				}()
+				ready <- state{pid: os.Getpid(), file: f, addr: ln.Addr().String()}
+				<-returnBody
+			})
+			close(done)
+		}()
+		s := <-ready
+		procTeardownMu.Lock()
+		close(returnBody)
+		for range 10 {
+			runtime.Gosched() // let the invocation reach the contended exit transaction
+		}
+		close(probeChild)
+		<-childResponded
+		duringKill = syscall.Kill(s.pid, 0)
+		_, duringProcfs = os.ReadFile("/proc/" + strconv.Itoa(s.pid) + "/stat")
+		_, duringWrite = s.file.Write([]byte("live"))
+		procTeardownMu.Unlock()
+		<-done
+		afterKill = syscall.Kill(s.pid, 0)
+		_, afterWrite = s.file.Write([]byte("dead"))
+		_, afterDial = net.Dial("tcp", s.addr)
+	})
+	if duringKill != nil || duringProcfs != nil || duringWrite != nil {
+		t.Fatalf("exit published early state: kill=%v procfs=%v write=%v", duringKill, duringProcfs, duringWrite)
+	}
+	if !errors.Is(afterKill, syscall.ESRCH) || !errors.Is(afterWrite, os.ErrClosed) || !errors.Is(afterDial, syscall.ECONNREFUSED) {
+		t.Fatalf("completed exit state: kill=%v write=%v dial=%v", afterKill, afterWrite, afterDial)
+	}
+}
+
+func TestDSTProcessNonLastExitPreservesSharedResources(t *testing.T) {
+	var duringKill, afterKill, survivorDialErr error
+	Run(1, func() {
+		survivorReady := make(chan string, 1)
+		releaseSurvivor := make(chan struct{})
+		survivorDone := make(chan struct{})
+		go func() {
+			Process("p", func() {
+				ln, _ := net.Listen("tcp", ":0")
+				survivorReady <- ln.Addr().String()
+				<-releaseSurvivor
+			})
+			close(survivorDone)
+		}()
+		addr := <-survivorReady
+		_, port, _ := net.SplitHostPort(addr)
+		target := net.JoinHostPort(HostIP("p"), port)
+		targetReady := make(chan int, 1)
+		returnTarget := make(chan struct{})
+		probeChild := make(chan struct{})
+		childResponded := make(chan struct{})
+		targetDone := make(chan struct{})
+		go func() {
+			Process("p", func() {
+				go func() {
+					<-probeChild
+					close(childResponded)
+					select {}
+				}()
+				targetReady <- os.Getpid()
+				<-returnTarget
+			})
+			close(targetDone)
+		}()
+		pid := <-targetReady
+		procTeardownMu.Lock()
+		close(returnTarget)
+		for range 10 {
+			runtime.Gosched()
+		}
+		close(probeChild)
+		<-childResponded
+		duringKill = syscall.Kill(pid, 0)
+		procTeardownMu.Unlock()
+		<-targetDone
+		afterKill = syscall.Kill(pid, 0)
+		if c, err := net.Dial("tcp", target); err == nil {
+			c.Close()
+		} else {
+			survivorDialErr = err
+		}
+		close(releaseSurvivor)
+		<-survivorDone
+	})
+	if duringKill != nil || !errors.Is(afterKill, syscall.ESRCH) || survivorDialErr != nil {
+		t.Fatalf("non-last exit lifecycle: duringKill=%v afterKill=%v survivorDial=%v", duringKill, afterKill, survivorDialErr)
+	}
+}
+
+func TestDSTProcessPanicUsesNormalExitLifecycle(t *testing.T) {
+	var pid int
+	var file *os.File
+	var addr string
+	var recovered any
+	Run(1, func() {
+		func() {
+			defer func() { recovered = recover() }()
+			Process("p", func() {
+				pid = os.Getpid()
+				file, _ = os.Create("/panic-exit")
+				ln, _ := net.Listen("tcp", ":0")
+				addr = ln.Addr().String()
+				go func() { select {} }()
+				panic("exit panic")
+			})
+		}()
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("panicked process Kill = %v, want ESRCH", err)
+		}
+		if _, err := file.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("panicked process file Write = %v, want os.ErrClosed", err)
+		}
+		if _, err := net.Dial("tcp", addr); !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("panicked process listener dial = %v, want ECONNREFUSED", err)
+		}
+	})
+	if recovered != "exit panic" {
+		t.Fatalf("Process panic = %v, want exit panic", recovered)
+	}
+}
 
 // TestDSTProcessExitKillsSleepingSubtree: a Process body's return kills its
 // still-running subtree — including a goroutine parked in time.Sleep. The

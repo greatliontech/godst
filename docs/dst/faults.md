@@ -840,13 +840,14 @@ machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so
 out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect cost; *enforced:*
 `TestDSTCrashHostDialBlackholes`).
 
-Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit: the
-active process invocation's pid is marked dead for `Kill(pid, 0)` and procfs, that invocation's goroutines
-are removed from the scheduler/deadlock-visible set, process-owned simulated files and virtual fds close,
+Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit. On
+normal exit, the invocation's goroutines are removed from the scheduler/deadlock-visible set first; if it
+is the last live invocation, process-owned simulated files and virtual fds close,
 fd-owned `flock`s release, process-owned mappings unregister (their `MAP_SHARED` bytes already are the
 host page-cache pages; teardown performs no copy-back), and the process's
-connections go down. Teardown follows the kernel's order: the goroutines (threads) die first, then the
-resources close. A `Process` body's normal return (or panic unwind) IS the process's exit and routes
+connections go down. Only then is its pid marked dead for `Kill(pid, 0)` and procfs. Teardown follows the
+kernel's order: the goroutines (threads) die first, then resources close, then PID death is published. A
+`Process` body's normal return (or panic unwind) IS the process's exit and routes
 through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn
 ends (the kernel close()s a dying process's sockets) with the kernel's own conditional per end — an end
 whose receive queue holds unread data answers the peer with RST: the peer's next read fails ECONNRESET
