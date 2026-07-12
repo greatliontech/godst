@@ -763,8 +763,10 @@ the channel-light workloads that first validated it (both **landed**):
   trigger checks are disabled while a run is active, so a foreign allocation can never start a
   DST-armed cycle (`TestDSTGCForeignStart`: with the trigger condition held persistently true, NumGC
   is identical with and without a foreign allocator churning tiny, small, pointerful, and large
-  objects; the user-arena site is gated identically but not exercised — arenas need their own
-  GOEXPERIMENT). Two consequences: a user-forced `runtime.GC()` (`gcTriggerCycle`) is bubble-controlled too —
+  objects. Binaries built with `GOEXPERIMENT=arenas` are rejected by the common simulation-entry
+  preflight before run state publication: user-arena objects bypass both `dstHeapAlloc` and the
+  per-process allocation counter, so admitting them would violate the trigger and OOM contracts.
+  Two consequences: a user-forced `runtime.GC()` (`gcTriggerCycle`) is bubble-controlled too —
   from a bubble goroutine it is sanctioned (the cycle runs at that call's deterministic point in the
   schedule); from any other goroutine it panics, the fault APIs' caller-position rule (a foreign
   forced cycle would mark the bubble's heap, discovering its finalizers/weaks, and zero

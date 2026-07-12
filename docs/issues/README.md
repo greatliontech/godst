@@ -27,7 +27,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [pooled cancellation's _defer leg has no killing test](./dst-gc-pooled-defer-leg-unpinned.md) | L | heap-defer shape pins the arm, or untested status recorded |
 | [GC counter gates key on the live bubble field](./dst-gc-counter-gates-live-bubble-field.md) | L | gates keyed on the sticky bit, or per-window unreachability recorded |
 | [crash scans skip temporarily disassociated simulation goroutines](./dst-runtime-crash-skips-disassociated-members.md) | H | crash victim scans key on sticky simulation membership |
-| [user-arena allocations bypass DST accounting](./dst-gc-user-arena-bypasses-accounting.md) | H | arena bytes feed deterministic heap and process accounting, or arena builds are refused |
 | [crashed stacks retain process memory as GC roots](./dst-crash-retains-stacks-and-process-memory.md) | H | crashed invocation stacks no longer retain process memory |
 | [callbacks can run after their process exits](./dst-process-callbacks-run-after-exit.md) | H | dead-process callbacks cannot execute after exit |
 | [mapping-fault process death skips resource teardown](./dst-mapping-fault-skips-resource-teardown.md) | H | mapping faults route through complete process teardown |

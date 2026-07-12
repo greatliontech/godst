@@ -75,6 +75,35 @@ func main() {
 }
 `
 
+const arenaProbeSrc = `package main
+
+import (
+	"arena"
+	"fmt"
+	"testing/simulation"
+)
+
+func attempt() (panicValue any, entered bool) {
+	defer func() { panicValue = recover() }()
+	simulation.RunWith(12345, simulation.Options{MemoryLimit: 1}, func() {
+		entered = true
+		a := arena.NewArena()
+		defer a.Free()
+		for i := 0; i < 32; i++ {
+			_ = arena.New[[1 << 20]byte](a)
+		}
+	})
+	return nil, entered
+}
+
+func main() {
+	for i := 1; i <= 2; i++ {
+		panicValue, entered := attempt()
+		fmt.Printf("attempt=%d panic=%v entered=%v\n", i, panicValue, entered)
+	}
+}
+`
+
 // buildAndRunSizeSpecializedProbe builds the probe against this GOROOT with
 // GOEXPERIMENT=sizespecializedmalloc plus the given extra build flags, runs
 // it, and returns the run's combined output and error. The build re-derives
@@ -101,6 +130,40 @@ func buildAndRunSizeSpecializedProbe(t *testing.T, extraBuildFlags ...string) (s
 	}
 	out, err := testenv.CleanCmdEnv(testenv.Command(t, exe)).CombinedOutput()
 	return string(out), err
+}
+
+func buildAndRunArenaProbe(t *testing.T) (string, error) {
+	t.Helper()
+	testenv.MustHaveGoBuild(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(arenaProbeSrc), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "probe")
+	cmd := testenv.CleanCmdEnv(testenv.Command(t, testenv.GoToolPath(t), "build", "-tags", "dst", "-o", exe, "main.go"))
+	cmd.Dir = dir
+	cmd.Env = append(cmd.Env, "GOEXPERIMENT=arenas", "GOFLAGS=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build under GOEXPERIMENT=arenas: %v\n%s", err, out)
+	}
+	out, err := testenv.CleanCmdEnv(testenv.Command(t, exe)).CombinedOutput()
+	return string(out), err
+}
+
+func TestDSTArenasRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skips GOEXPERIMENT std rebuild")
+	}
+	out, err := buildAndRunArenaProbe(t)
+	if err != nil {
+		t.Fatalf("probe run: %v\n%s", err, out)
+	}
+	const refusal = "testing/simulation: Run is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)"
+	want := "attempt=1 panic=" + refusal + " entered=false\n" +
+		"attempt=2 panic=" + refusal + " entered=false\n"
+	if out != want {
+		t.Fatalf("arena entry refusal transcript = %q, want %q", out, want)
+	}
 }
 
 // TestDSTSizeSpecializedMallocRefused: a plain (uninstrumented) -tags dst

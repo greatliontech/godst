@@ -457,6 +457,13 @@ func enterSimulation(api, buildPanic string) {
 		// loud instead — one GODEBUG is all it takes to be in this mode.
 		panic("testing/simulation: " + api + " is unsupported in FIPS 140 mode (GODEBUG fips140=on)")
 	}
+	if goexperiment.Arenas {
+		// User arenas reserve objects directly from arena chunks, bypassing both
+		// the per-object DST heap trigger and per-process allocation accounting.
+		// Reject before publishing any run state until arenas have one complete
+		// deterministic accounting path.
+		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)")
+	}
 	if goexperiment.SizeSpecializedMalloc && !race.Enabled && !msan.Enabled && !asan.Enabled {
 		// The experiment makes the compiler emit direct size-specialized
 		// malloc calls in USER packages, bypassing the mallocgc dispatcher

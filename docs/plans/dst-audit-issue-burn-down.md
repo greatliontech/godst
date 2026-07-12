@@ -24,7 +24,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Runtime allocation and GC functions
 
-- [ ] 11. `userArena.alloc`/`newUserArenaChunk` feed deterministic heap and process counters, or simulation entry rejects arena builds (`dst-gc-user-arena-bypasses-accounting`)
+- [x] 11. `userArena.alloc`/`newUserArenaChunk` feed deterministic heap and process counters, or simulation entry rejects arena builds
 - [ ] 12. the pooled `_defer` exclusion and marked-side accounting have a reaching mutation test (`dst-gc-pooled-defer-leg-unpinned`)
 - [ ] 13. foreign `SetGCPercent` and `runtime.GC` cannot move active-run trigger state; direct foreign arms pin `debug.FreeOSMemory` and the goroutine-leak entry, including scavenge and leak-mode flags (`dst-gc-foreign-setgcpercent-perturbs-trigger`, `dst-gc-forced-entry-funnels-unpinned`)
 - [ ] 14. GC allocation and execution counters key on sticky simulation membership at every transient bubble-clear window (`dst-gc-counter-gates-live-bubble-field`)
