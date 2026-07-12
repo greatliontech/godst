@@ -503,9 +503,10 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   two mode variants: `PartitionRefuse(a,b)` — a Dial across the cut fails `ECONNREFUSED` fast rather than
   blackholing (`TestDSTNetPartitionRefuseConnect`) — and `PartitionOneWay(from,to)` — an **asymmetric** cut
   of only `from→to` while `to→from` still flows (`TestDSTNetPartitionOneWay`). (The declarative
-  `Options.Faults` + per-fault mode is L4.) It drives a per-run **directional** cut table in net
-  (`net/dst_partition.go`, `dstPart.dirs` keyed by ordered `from→to` with a per-cut `refuse` mode; a
-  symmetric cut sets both directions) — keyed by the conn's host attribution
+  `Options.Faults` + per-fault mode is L4.) Cut state is **directional**: a symmetric cut sets both
+  directions, while overlapping sources remain independently active in each direction. The earliest
+  active source controls which bytes predate the cut, and any blackhole source dominates refusal. Cut
+  targeting uses the conn's host attribution
   (`dstConn.localHost`/`remoteHost`), so a cut touches exactly the targeted pair's cross-host conns in the
   cut direction (DST-FAULT-VICTIM). A dial checks BOTH handshake directions (SYN dialer→target, SYN-ACK
   target→dialer), so a one-directional cut of either fails the connect. A refuse cut fails the dial

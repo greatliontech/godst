@@ -90,7 +90,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Network partition and bind functions
 
-- [ ] 44. directional cut state composes refuse and blackhole sources with blackhole dominance (`dst-net-blackhole-cannot-override-refuse`)
+- [x] 44. directional cut state composes refuse and blackhole sources with blackhole dominance (`dst-net-blackhole-cannot-override-refuse`)
 - [ ] 45. dialer and listener ephemeral counters are host-scoped (`dst-net-port-allocator-cross-host-coupling`)
 - [ ] 46. explicit LocalAddr validates source ownership, reserves before parking, and releases on every failure (`dst-net-local-bind-lifecycle-incomplete`)
 - [ ] 47. IP-less wildcard LocalAddr behavior is modeled or recorded (`dst-net-wildcard-localaddr-bind-collapse`)

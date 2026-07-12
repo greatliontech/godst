@@ -116,13 +116,14 @@ var dstPart struct {
 	wake chan struct{}
 }
 
-// dstCut is one directional cut: the base time it began and the connect mode a Dial
-// across it observes — blackhole (the SYN is dropped, the dial blocks) or refuse
-// (the peer answers RST, the dial fails ECONNREFUSED). The mode governs only connect;
-// an established conn's read/write hold is the same for both (the link is cut).
+// dstCut composes the active modes on one direction. Each mode retains the time
+// its source first cut the link; blackhole dominates refusal for connect, while
+// the earliest start across both modes governs established-stream delivery.
 type dstCut struct {
-	start  int64
-	refuse bool
+	blackholeStart int64
+	refuseStart    int64
+	blackhole      bool
+	refuse         bool
 }
 
 // dstDirKey is the key for an ORDERED direction from→to (no canonicalization — a
@@ -190,13 +191,26 @@ func dstApplyPartitionOp(op, a, b uint32) {
 	dstPart.mu.Unlock()
 }
 
-// dstCutDir records a cut on direction from→to. First-cut-wins: a redundant re-cut
-// is a no-op (it must not move the cut-start boundary, nor flip the mode of an
-// existing cut). Caller holds mu.
+// dstCutDir records one mode on direction from→to. A redundant re-cut of that
+// mode is a no-op, while the other mode remains independently representable.
+// Caller holds mu.
 func dstCutDir(from, to uint32, now int64, refuse bool) {
-	if _, cut := dstPart.dirs[dstDirKey(from, to)]; !cut {
-		dstPart.dirs[dstDirKey(from, to)] = dstCut{start: now, refuse: refuse}
+	key := dstDirKey(from, to)
+	cut := dstPart.dirs[key]
+	if refuse {
+		if cut.refuse {
+			return
+		}
+		cut.refuse = true
+		cut.refuseStart = now
+	} else {
+		if cut.blackhole {
+			return
+		}
+		cut.blackhole = true
+		cut.blackholeStart = now
 	}
+	dstPart.dirs[key] = cut
 }
 
 // dstPartCutStartDir reports whether the DIRECTED link from→to is currently cut and,
@@ -233,7 +247,8 @@ func dstPartCutStartDir(from, to uint32) (start int64, cut, blackhole bool) {
 	tb, okb := dstPart.isolated[to]
 	consider(tb, okb, true)
 	if c, ok := dstPart.dirs[dstDirKey(from, to)]; ok {
-		consider(c.start, true, !c.refuse) // blackhole-mode cut drops; refuse-mode cut emits RST
+		consider(c.refuseStart, c.refuse, false)
+		consider(c.blackholeStart, c.blackhole, true)
 	}
 	return
 }

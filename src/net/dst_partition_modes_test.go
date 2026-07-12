@@ -167,3 +167,81 @@ func TestDSTNetPartitionRefuseWithIsolateBlackholes(t *testing.T) {
 		t.Errorf("dial into a refuse+isolated peer = %v; want ETIMEDOUT (blackhole dominates refuse)", dialErr)
 	}
 }
+
+func TestDSTNetPartitionModesComposePerDirection(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for _, tc := range []struct {
+		name string
+		ops  []uint32
+	}{
+		{"refuse then blackhole", []uint32{dstPartOpPartitionRefuse, dstPartOpPartition}},
+		{"blackhole then refuse", []uint32{dstPartOpPartition, dstPartOpPartitionRefuse}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			simulation.RunWith(1, simulation.Options{}, func() {
+				for _, op := range tc.ops {
+					dstApplyPartitionOp(op, 1, 2)
+				}
+				if cut, refuse := dstDialCut(1, 2); !cut || refuse {
+					t.Errorf("composed cut = (%v, refuse=%v), want blackhole", cut, refuse)
+				}
+			})
+		})
+	}
+	simulation.RunWith(1, simulation.Options{}, func() {
+		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
+		first := dstBaseNanos()
+		time.Sleep(10 * time.Millisecond)
+		dstApplyPartitionOp(dstPartOpPartition, 1, 2)
+		start, cut, blackhole := dstPartCutStartDir(1, 2)
+		if !cut || !blackhole || start != first {
+			t.Errorf("staggered overlap = (start=%v, cut=%v, blackhole=%v), want earliest start %v and blackhole", time.Duration(start), cut, blackhole, time.Duration(first))
+		}
+	})
+	simulation.RunWith(1, simulation.Options{}, func() {
+		dstApplyPartitionOp(dstPartOpPartition, 1, 2)
+		first := dstBaseNanos()
+		time.Sleep(10 * time.Millisecond)
+		dstApplyPartitionOp(dstPartOpPartition, 1, 2)
+		start, _, _ := dstPartCutStartDir(1, 2)
+		if start != first {
+			t.Errorf("redundant blackhole moved start to %v, want %v", time.Duration(start), time.Duration(first))
+		}
+	})
+}
+
+func TestDSTNetPartitionModeOneWayOverlapAndPartialHeal(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	simulation.RunWith(1, simulation.Options{}, func() {
+		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
+		dstApplyPartitionOp(dstPartOpPartitionOneWay, 1, 2)
+		if _, cut, blackhole := dstPartCutStartDir(1, 2); !cut || !blackhole {
+			t.Errorf("overlapped 1→2 direction = (cut=%v, blackhole=%v), want blackhole", cut, blackhole)
+		}
+		if _, cut, blackhole := dstPartCutStartDir(2, 1); !cut || blackhole {
+			t.Errorf("reverse 2→1 direction = (cut=%v, blackhole=%v), want pure refuse", cut, blackhole)
+		}
+
+		dstApplyPartitionOp(dstPartOpIsolate, 1, 0)
+		dstApplyPartitionOp(dstPartOpHeal, 1, 2)
+		if cut, refuse := dstDialCut(1, 2); !cut || refuse {
+			t.Errorf("pair heal with isolation active = (%v, refuse=%v), want blackhole", cut, refuse)
+		}
+		dstApplyPartitionOp(dstPartOpHealHost, 1, 0)
+		if cut, _ := dstDialCut(1, 2); cut {
+			t.Error("healing the remaining isolation left the pair cut")
+		}
+	})
+	simulation.RunWith(1, simulation.Options{}, func() {
+		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
+		dstApplyPartitionOp(dstPartOpIsolate, 1, 0)
+		dstApplyPartitionOp(dstPartOpHealHost, 1, 0)
+		if cut, refuse := dstDialCut(1, 2); !cut || !refuse {
+			t.Errorf("isolation heal with refuse pair active = (%v, refuse=%v), want pure refuse", cut, refuse)
+		}
+	})
+}

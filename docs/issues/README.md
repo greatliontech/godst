@@ -23,7 +23,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [MIPS clock_gettime64 lacks a runtime witness](./dst-mips-clock-gettime64-runtime-unverified.md) | L | chunk 61, with qemu-user available for the runtime witness |
 | [LocalAddr lacks a complete bind lifecycle](./dst-net-local-bind-lifecycle-incomplete.md) | M | explicit binds validate, reserve, and release atomically |
 | [ephemeral port allocation couples independent hosts](./dst-net-port-allocator-cross-host-coupling.md) | M | allocator state is host-scoped |
-| [blackhole cannot override an existing refuse cut](./dst-net-blackhole-cannot-override-refuse.md) | M | overlapping cuts preserve blackhole dominance |
 | [network handles cross run epochs](./dst-net-handles-cross-run-epochs.md) | M | connections and listeners reject stale epochs |
 | [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |
 | [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
