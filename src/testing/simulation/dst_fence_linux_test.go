@@ -9,6 +9,7 @@ package simulation
 import (
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -156,6 +157,81 @@ func TestDSTFenceIsBubbleScoped(t *testing.T) {
 	}
 }
 
+func TestDSTAllThreadsSyscallFence(t *testing.T) {
+	const (
+		prGetKeepCaps = 7
+		prSetKeepCaps = 8
+	)
+	getKeepCaps := func(t *testing.T) uintptr {
+		t.Helper()
+		value, _, errno := syscall.Syscall(syscall.SYS_PRCTL, prGetKeepCaps, 0, 0)
+		if errno != 0 {
+			t.Fatalf("PR_GET_KEEPCAPS: %v", errno)
+		}
+		return value
+	}
+	wantPanic := "syscall: raw syscall " + strconv.FormatUint(uint64(syscall.SYS_PRCTL), 10) + " unsupported under deterministic simulation"
+	forms := []struct {
+		name string
+		call func(uintptr) (uintptr, uintptr, syscall.Errno)
+	}{
+		{name: "AllThreadsSyscall", call: func(value uintptr) (uintptr, uintptr, syscall.Errno) {
+			return syscall.AllThreadsSyscall(syscall.SYS_PRCTL, prSetKeepCaps, value, 0)
+		}},
+		{name: "AllThreadsSyscall6", call: func(value uintptr) (uintptr, uintptr, syscall.Errno) {
+			return syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetKeepCaps, value, 0, 0, 0, 0)
+		}},
+	}
+
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			before := getKeepCaps(t)
+			target := before ^ 1
+			defer form.call(before)
+
+			var panicValue any
+			Run(1, func() {
+				panicValue = dstPanicValue(func() {
+					form.call(target)
+				})
+			})
+			if panicValue != wantPanic {
+				t.Errorf("panic = %v, want %q", panicValue, wantPanic)
+			}
+			if after := getKeepCaps(t); after != before {
+				t.Errorf("PR_GET_KEEPCAPS after refused call = %d, want unchanged %d", after, before)
+			}
+		})
+	}
+}
+
+func TestDSTAllThreadsSyscallFenceIsBubbleScoped(t *testing.T) {
+	const invalidTrap = ^uintptr(0)
+	var panicked atomic.Bool
+	proceed := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		<-proceed
+		defer func() {
+			if recover() != nil {
+				panicked.Store(true)
+			}
+		}()
+		syscall.AllThreadsSyscall(invalidTrap, 0, 0, 0)
+		syscall.AllThreadsSyscall6(invalidTrap, 0, 0, 0, 0, 0, 0)
+	}()
+
+	Run(1, func() {
+		close(proceed)
+		<-finished
+	})
+	if panicked.Load() {
+		t.Error("non-bubble AllThreadsSyscall was fenced during an active run")
+	}
+}
+
 // TestDSTOSProcessFence checks the os-level interception fences (design.md "The
 // interception boundary"): from a bubble goroutine, os.StartProcess is refused
 // with the error shape (before the pidfd probe and the attr.Files Fd() loop),
@@ -235,4 +311,12 @@ func dstDidPanic(f func()) (panicked bool) {
 	}()
 	f()
 	return
+}
+
+func dstPanicValue(f func()) (value any) {
+	defer func() {
+		value = recover()
+	}()
+	f()
+	return nil
 }

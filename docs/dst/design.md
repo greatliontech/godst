@@ -937,6 +937,10 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   seconds. Valid unaligned ranges receive the virtual value, and any bytes written before a partial
   copy faults come from that virtual value rather than a host clock.
   Anything outside the family is fenced, deliberately erring loud.
+- **All-thread syscalls**: `AllThreadsSyscall` and `AllThreadsSyscall6` are fenced at entry for a
+  bubble goroutine, before cgo selection or runtime all-thread dispatch. Applying a syscall to every
+  host thread is process-wide host mutation, not a simulatable raw-kernel operation; non-bubble
+  harness callers remain untouched while a run is active.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
   wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
   (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when

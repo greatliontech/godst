@@ -21,7 +21,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [same-seed broadcast scheduling can diverge across runs](./dst-schedule-broadcast-replay-flake.md) | H | random broadcast scheduling replays identically under focused and full-suite repetition |
 | [same-seed scheduler probes diverge under host contention](./dst-scheduler-load-replay-flakes.md) | H | foreign-bubble, PCT, and exploration-sweep schedules replay under contention |
 | [foreign SetGCPercent mid-run silently perturbs the trigger](./dst-gc-foreign-setgcpercent-perturbs-trigger.md) | M | mutation refused or latched out of the trigger, with a test arm |
-| [AllThreadsSyscall bypasses the interception boundary](./dst-syscall-allthreads-bypasses-fence.md) | M | fenced at entry, or recorded as an accepted bypass at the boundary spec |
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
 | [forced-GC entry funnels pinned only structurally](./dst-gc-forced-entry-funnels-unpinned.md) | L | mid-run foreign arms for both funneled entries, or funnel reliance recorded |
