@@ -453,7 +453,7 @@ type cleanupQueue struct {
 	//
 	// Read and updated atomically.
 	executed  atomic.Uint64
-	discarded atomic.Uint64 // callbacks not invoked because their process invocation died
+	discarded atomic.Uint64 // callbacks discarded without invocation
 }
 
 // addWork indicates that n units of parallelizable work have been added to the queue.
@@ -839,6 +839,7 @@ func runCleanupBlock(b *cleanupBlock) {
 	}
 
 	onCleanupG := findfunc(getg().startpc).funcID == abi.FuncID_runCleanups
+	onDrain := dstBuild && !onCleanupG && getg().bubble != nil && getg() == getg().bubble.gcDrain
 	if onCleanupG {
 		gcCleanups.beginRunningCleanups()
 	}
@@ -871,6 +872,16 @@ func runCleanupBlock(b *cleanupBlock) {
 		if dstBuild {
 			invoked = dstCallbackOwnerAlive(c.dstEpoch, c.dstPid)
 		}
+		if onDrain {
+			if invoked {
+				gcCleanups.executed.Add(1)
+			} else {
+				gcCleanups.discarded.Add(1)
+			}
+			if dstActive() {
+				dstCleanupRunExecuted.Add(1)
+			}
+		}
 		if invoked {
 			if dstBuild {
 				gp := getg()
@@ -894,8 +905,10 @@ func runCleanupBlock(b *cleanupBlock) {
 	if onCleanupG {
 		gcCleanups.endRunningCleanups()
 	}
-	gcCleanups.executed.Add(int64(executed))
-	gcCleanups.discarded.Add(int64(uint64(b.n) - executed))
+	if !onDrain {
+		gcCleanups.executed.Add(int64(executed))
+		gcCleanups.discarded.Add(int64(uint64(b.n) - executed))
+	}
 
 	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
 	gcCleanups.free.push(&b.lfnode)
@@ -915,7 +928,6 @@ func dstDrainCleanups() {
 	dstSortCleanupsBySeq()
 	for gcCleanups.tryTakeWork() {
 		b := (*cleanupBlock)(gcCleanups.full.pop()) // non-nil after tryTakeWork
-		n := uint64(b.n)
 		// Publish the block so a callback panic or Goexit — which abandons this
 		// frame before runCleanupBlock's end-of-block accounting and free —
 		// leaves it discoverable for dstDiscardQueuedCleanups instead of
@@ -931,9 +943,6 @@ func dstDrainCleanups() {
 		dstDrainingCleanup = b
 		runCleanupBlock(b)
 		dstDrainingCleanup = nil
-		if dstActive() {
-			dstCleanupRunExecuted.Add(int64(n))
-		}
 	}
 }
 
@@ -1030,7 +1039,7 @@ var dstDrainingCleanup *cleanupBlock
 // dstDiscardQueuedCleanups discards every cleanup queued by the run — the full
 // queue plus the block a dying drain abandoned mid-run — without running them.
 // The cleanup analog of dstDiscardQueuedFinq (invariant DST-CLEANUP-1); blocks
-// are accounted as executed and freed so the ledger stays exact and markroot
+// are accounted as discarded and freed so the ledger stays exact and markroot
 // stops scanning them.
 func dstDiscardQueuedCleanups() {
 	if b := dstDrainingCleanup; b != nil {
@@ -1045,12 +1054,16 @@ func dstDiscardQueuedCleanups() {
 
 func dstDiscardCleanupBlock(b *cleanupBlock) {
 	n := atomic.Load(&b.n)
+	var discarded uint64
 	for i := 0; i < int(n); i++ {
+		if b.cleanups[i].call != nil {
+			discarded++
+		}
 		b.cleanups[i] = cleanupFn{}
 	}
-	gcCleanups.executed.Add(int64(n))
+	gcCleanups.discarded.Add(int64(discarded))
 	if dstActive() {
-		dstCleanupRunExecuted.Add(int64(n))
+		dstCleanupRunExecuted.Add(int64(discarded))
 	}
 	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
 	gcCleanups.free.push(&b.lfnode)

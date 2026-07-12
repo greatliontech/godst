@@ -587,8 +587,8 @@ func TestDSTFinalizerGoexitDrain(t *testing.T) {
 
 // TestDSTFinalizerGoexitLedger verifies the finalizer queue ledger stays exact
 // when the drain dies mid-block: already-run entries are accounted per-entry in
-// runFinqBlocks, the unrun remainder by the teardown discard, so queued ==
-// executed.
+// runFinqBlocks, while the unrun remainder closes the internal discard ledger
+// without inflating the public executed metric.
 //
 // Teeth: with per-entry accounting reverted to the block-end add (which a
 // mid-block death skips), the already-run entries are never counted —
@@ -598,6 +598,13 @@ func TestDSTFinalizerGoexitLedger(t *testing.T) {
 	out := runTestProgDST(t, "DSTFinGoexitLedger", "DSTSEED=12345")
 	if strings.TrimSpace(out) != "done" {
 		t.Fatalf("mid-block drain-death ledger failed (got %q, want \"done\")", out)
+	}
+}
+
+func TestDSTCleanupGoexitLedger(t *testing.T) {
+	out := runTestProgDST(t, "DSTCleanupGoexitLedger", "DSTSEED=12345")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("cleanup drain-death ledger failed (got %q, want \"done\")", out)
 	}
 }
 

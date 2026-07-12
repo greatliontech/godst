@@ -51,7 +51,7 @@ var (
 	finptrmask   [finBlockSize / goarch.PtrSize / 8]byte
 	finqueued    uint64 // monotonic count of queued finalizers
 	finexecuted  uint64 // monotonic count of executed finalizers
-	findiscarded uint64 // monotonic count discarded because the owning process invocation died
+	findiscarded uint64 // monotonic count of callbacks discarded without invocation
 
 	// Finalizers queued before a DST run are process-level work, not part of the
 	// run's bubble. They are detached before dstActive is set, ignored by the
@@ -384,6 +384,20 @@ func runFinqBlocks(fb *finBlock) {
 			if dstBuild {
 				invoked = dstCallbackOwnerAlive(f.dstEpoch, f.dstPid)
 			}
+			if onDrain {
+				lock(&finlock)
+				if invoked {
+					finexecuted++
+				} else {
+					findiscarded++
+				}
+				unlock(&finlock)
+				if dstActive() {
+					dstFinqRunExecuted.Add(1)
+				}
+				// Mark this entry handled before user code can terminate the drain.
+				f.dstEpoch = 0
+			}
 			if invoked {
 				if dstBuild {
 					oldPid := gp.dstPid
@@ -409,18 +423,6 @@ func runFinqBlocks(fb *finBlock) {
 			f.arg = nil
 			f.ot = nil
 			atomic.Store(&fb.cnt, i-1)
-			if onDrain {
-				lock(&finlock)
-				if invoked {
-					finexecuted++
-				} else {
-					findiscarded++
-				}
-				unlock(&finlock)
-				if dstActive() {
-					dstFinqRunExecuted.Add(1)
-				}
-			}
 		}
 		next := fb.next
 		lock(&finlock)
@@ -440,9 +442,8 @@ func runFinqBlocks(fb *finBlock) {
 
 // finPending reports whether any finalizers have been queued but not yet
 // executed. Used by the DST quiescence drain to decide whether to wake the drain
-// goroutine and to detect when the finalizer fixpoint is reached. finqueued and
-// finexecuted are process-cumulative, but their equality is exact: they are equal
-// iff finq is empty and no finalizer is mid-run.
+// goroutine and to detect when the finalizer fixpoint is reached. The
+// process-cumulative queue is settled by executed plus discarded callbacks.
 func finPending() bool {
 	if dstActive() {
 		lock(&finlock)
@@ -621,7 +622,7 @@ func dstSortFinalizersBySeq(a []finalizer) {
 // bubble-stamped callbacks on a bubble-less goroutine, which fatals on a bubble
 // channel op (invariant DST-FIN-1). Finalizers are best-effort by the
 // SetFinalizer contract; the discard is deterministic. Entries are accounted as
-// executed so the queue ledger stays exact, and the blocks are returned to the
+// discarded so the queue ledger stays exact, and the blocks are returned to the
 // free cache so markroot stops pinning their arguments.
 func dstDiscardQueuedFinq() {
 	lock(&finlock)
@@ -646,7 +647,7 @@ func dstDiscardQueuedFinq() {
 }
 
 // dstDiscardFinChainLocked nils the entries of every block in the chain,
-// accounts them as executed in the process-global ledger, and returns the
+// accounts them as discarded in the process-global ledger, and returns the
 // blocks to the free cache. Caller holds finlock. Returns the number of
 // entries discarded.
 func dstDiscardFinChainLocked(fb *finBlock) uint64 {
@@ -656,17 +657,19 @@ func dstDiscardFinChainLocked(fb *finBlock) uint64 {
 		cnt := atomic.Load(&fb.cnt)
 		for i := cnt; i > 0; i-- {
 			f := &fb.fin[i-1]
+			if f.dstEpoch != 0 {
+				n++
+			}
 			f.fn = nil
 			f.arg = nil
 			f.ot = nil
 		}
-		n += uint64(cnt)
 		atomic.Store(&fb.cnt, 0)
 		fb.next = finc
 		finc = fb
 		fb = next
 	}
-	finexecuted += n
+	findiscarded += n
 	return n
 }
 

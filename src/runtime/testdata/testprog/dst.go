@@ -51,6 +51,7 @@ func init() {
 	register("DSTFinBlockedDrain", DSTFinBlockedDrain)
 	register("DSTFinGoexitDrain", DSTFinGoexitDrain)
 	register("DSTFinGoexitLedger", DSTFinGoexitLedger)
+	register("DSTCleanupGoexitLedger", DSTCleanupGoexitLedger)
 	register("DSTFinStuckDrainRunEnd", DSTFinStuckDrainRunEnd)
 	register("DSTFinAbandonedChainReuse", DSTFinAbandonedChainReuse)
 	register("DSTFinStuckDrainResidue", DSTFinStuckDrainResidue)
@@ -758,34 +759,30 @@ func dstFinReadLedger() (queued, executed uint64) {
 }
 
 // dstMakeFinGoexitBatch allocates count finalizable objects in one batch (one GC
-// cycle, one finBlock): count-1 plain finalizers are registered FIRST, then one that
-// calls runtime.Goexit is registered LAST. The DST bubble drain runs its batch in
-// REGISTRATION-sequence order (finalizer.dstSeq — heap-address-independent), so the
-// plain finalizers run BEFORE the Goexit one. That ordering gives the ledger test its
-// teeth: entries already run when the drain dies must already be accounted (per-entry),
-// or queued != executed forever.
+// cycle, one finBlock): the Goexit finalizer is registered first, followed by
+// count-1 plain finalizers. Registration-sequence order therefore enters Goexit
+// first and leaves a deterministic discarded remainder.
 //
 //go:noinline
 func dstMakeFinGoexitBatch(count int, ran *atomic.Int64) {
+	o := &dstFinObj{}
+	runtime.SetFinalizer(o, func(*dstFinObj) {
+		ran.Add(1)
+		runtime.Goexit()
+	})
 	for i := 1; i < count; i++ {
 		p := &dstFinObj{}
 		runtime.SetFinalizer(p, func(*dstFinObj) {
 			ran.Add(1)
 		})
 	}
-	o := &dstFinObj{}
-	runtime.SetFinalizer(o, func(*dstFinObj) {
-		runtime.Goexit()
-	})
 }
 
 // DSTFinGoexitLedger verifies the drain's finalizer queue ledger stays exact
-// across a mid-block drain death: several plain finalizers run, then one calls
-// runtime.Goexit, killing the drain with the block partially run. The
-// already-run entries must be accounted per-entry and the unrun remainder
-// accounted by the discard, so queued == executed afterwards — otherwise
-// finPending() never clears and the Run-end fixpoint cannot terminate. Prints
-// "done" plus the in-run ledger deltas.
+// across a mid-block drain death: the first finalizer calls runtime.Goexit. The
+// entered callback must be counted as executed and the unrun remainder as
+// discarded, so the internal queue settles without inflating the public
+// executed metric. Prints "done" plus the in-run ledger deltas.
 func DSTFinGoexitLedger() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
 	const batch = 8
@@ -795,27 +792,65 @@ func DSTFinGoexitLedger() {
 		q0, e0 := dstFinReadLedger()
 		dstMakeFinGoexitBatch(batch, &ran)
 		runtime.GC()
-		time.Sleep(time.Millisecond) // quiescence: plain finalizers run, then Goexit kills the drain
+		time.Sleep(time.Millisecond) // quiescence: Goexit kills the drain at the first callback
 		time.Sleep(time.Millisecond) // quiescence: dead drain — remainder discarded, ledger closed
 		q1, e1 := dstFinReadLedger()
 		dq, de = q1-q0, e1-e0
 	})
-	if dq != batch || de != batch {
+	if dq != batch || de != uint64(ran.Load()) {
 		os.Stdout.WriteString("ledger mismatch: queued " + strconv.FormatUint(dq, 10) +
 			" executed " + strconv.FormatUint(de, 10) + " ran " + strconv.FormatInt(ran.Load(), 10) + "\n")
 		return
 	}
-	if ran.Load() != batch-1 {
-		// The scenario's teeth require the plain finalizers to run BEFORE the
-		// Goexit one (mid-block death with already-run entries). The ledger check
-		// alone is order-independent; ran==batch-1 also pins the drain's
-		// REGISTRATION-SEQUENCE sort (gc.md D4 / H6): the plain finalizers are
-		// registered first, the Goexit one last, so reg order runs the plain ones
-		// first (ran=batch-1). Without the sort the drain runs heap-address sweep
-		// order — the last-allocated Goexit object is highest-addressed, so it runs
-		// FIRST (ran=0) — and this fails loudly instead of going vacuous.
+	if ran.Load() != 1 {
+		// Registration order runs the Goexit callback first, so every later
+		// callback is discarded and only the entered Goexit callback is executed.
 		os.Stdout.WriteString("order drift: ran " + strconv.FormatInt(ran.Load(), 10) +
-			", want " + strconv.Itoa(batch-1) + "\n")
+			", want 1\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+//go:noinline
+func dstMakeCleanupGoexitBatch(count int, ran *atomic.Int64) {
+	o := new([1024]byte)
+	runtime.AddCleanup(o, func(counter *atomic.Int64) {
+		counter.Add(1)
+		runtime.Goexit()
+	}, ran)
+	for i := 1; i < count; i++ {
+		p := new([1024]byte)
+		runtime.AddCleanup(p, func(counter *atomic.Int64) { counter.Add(1) }, ran)
+	}
+}
+
+func dstCleanupReadLedger() (queued, executed uint64) {
+	samples := []metrics.Sample{
+		{Name: "/gc/cleanups/queued:cleanups"},
+		{Name: "/gc/cleanups/executed:cleanups"},
+	}
+	metrics.Read(samples)
+	return samples[0].Value.Uint64(), samples[1].Value.Uint64()
+}
+
+func DSTCleanupGoexitLedger() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	const batch = 8
+	var ran atomic.Int64
+	var dq, de uint64
+	simulation.Run(n, func() {
+		q0, e0 := dstCleanupReadLedger()
+		dstMakeCleanupGoexitBatch(batch, &ran)
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond)
+		q1, e1 := dstCleanupReadLedger()
+		dq, de = q1-q0, e1-e0
+	})
+	if dq != batch || de != uint64(ran.Load()) || ran.Load() != 1 {
+		os.Stdout.WriteString("cleanup ledger mismatch: queued " + strconv.FormatUint(dq, 10) +
+			" executed " + strconv.FormatUint(de, 10) + " ran " + strconv.FormatInt(ran.Load(), 10) + "\n")
 		return
 	}
 	os.Stdout.WriteString("done\n")

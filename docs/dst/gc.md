@@ -298,7 +298,8 @@ Why this is the faithful collapse, dimension by dimension:
   (`dstDiscardQueuedFinq`/`dstDiscardQueuedCleanups`, accounted so the queue ledger stays exact — as
   *discarded*, never as *executed*: `finexecuted` and the cleanup executed counter feed
   `runtime/metrics`, and counting never-run callbacks there falsifies a public observable post-run;
-  the ledger-exactness check gets its own discard leg instead — `TestDSTFinalizerGoexitLedger`) —
+  the ledger-exactness check gets its own discard leg instead — `TestDSTFinalizerGoexitLedger` and
+  `TestDSTCleanupGoexitLedger`) —
   never leaked to the bubble-less async workers (DST-FIN-1/DST-CLEANUP-1). A finalizer that **spawns** a
   goroutine: the child inherits `g.bubble` via `newproc1` (normal goroutines inherit; only system
   goroutines skip it at `proc.go:5390`), so it is bubble-accounted and deterministically scheduled.
@@ -383,8 +384,8 @@ wall-clock). So the achievable invariant is **set-at-quiescence, not per-cycle**
 > `finalizer.dstSeq`) by which `dstDrainFinq` re-lays the detached `finq` chain (`dstSortFinqBySeq`, a
 > bottom-up merge sort — package `runtime` cannot import `sort`) before `runFinqBlocks` runs it, so
 > execution is ascending registration order; the block structure is preserved, so the discard/ledger
-> machinery is untouched. Pinned by `TestDSTFinalizerGoexitLedger` (the Goexit finalizer registered LAST
-> runs LAST → `ran==batch-1`; sweep order would run it FIRST → `ran==0`). **Landed for cleanups too:**
+> machinery is untouched. Pinned by `TestDSTFinalizerGoexitLedger` (the Goexit finalizer registered first
+> runs first, so its seven successors are discarded and only one execution is reported). **Landed for cleanups too:**
 > `dstDrainCleanups` calls `dstSortCleanupsBySeq`, which pops every `full` cleanup block, sorts all their
 > `cleanupFn`s ACROSS blocks by `cleanupFn.dstSeq` (`dstSortCleanupFnsBySeq`, the same merge sort), re-lays
 > them into the same blocks, and re-pushes so the `full` LIFO pop yields the lowest-seq block first —

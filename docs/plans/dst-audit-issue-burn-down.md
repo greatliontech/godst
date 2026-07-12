@@ -33,7 +33,7 @@ grouped by the functions they change. WIP = 1.
 ## Runtime callback functions
 
 - [x] 16. finalizer and cleanup metadata carries process lifecycle ownership so exit/crash cannot run post-mortem callbacks (`dst-process-callbacks-run-after-exit`)
-- [ ] 17. callback discard keeps queue ledgers exact without incrementing public executed metrics (`dst-gc-discarded-callbacks-count-as-executed`)
+- [x] 17. callback discard keeps queue ledgers exact without incrementing public executed metrics (`dst-gc-discarded-callbacks-count-as-executed`)
 
 ## Runtime crash and membership functions
 
