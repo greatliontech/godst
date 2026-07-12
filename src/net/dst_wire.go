@@ -75,6 +75,9 @@ func dstNetCrossHostBandwidthBps() int64
 //go:linkname dstFaultRandN runtime.dstFaultRandN
 func dstFaultRandN(n int64) int64
 
+//go:linkname dstNewBaseTimer time.newDSTBaseTimer
+func dstNewBaseTimer(d time.Duration) *time.Timer
+
 // dstBaseNanos is the current universe BASE virtual time in nanoseconds: the
 // calling goroutine's host wall clock (time.Now) minus its host clock offset.
 // Delivery is gated in base time so a configured latency is the same wire delay
@@ -516,7 +519,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		var timerC <-chan time.Time
 		var timer *time.Timer
 		if wait > 0 {
-			timer = time.NewTimer(wait)
+			timer = dstNewBaseTimer(wait)
 			timerC = timer.C
 		}
 		// Note: the peer closing is NOT a wake case here. A graceful peer close

@@ -90,6 +90,7 @@ type timer struct {
 	blocked      uint32 // number of goroutines blocked on timer's channel
 	rand         uint32 // randomizes order of timers at same instant; only set when isFake
 	dstHost      uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
+	dstBase      bool   // DST: this fake timer measures universe base time and is therefore excluded from host-rate re-mapping
 	dstReg       uint64 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
 	dstFakeNext  *timer // DST: intrusive link in the per-run fake-timer list (dst.go dstFakeTimers); set once per run at registration. Unused when DST off / not a fake timer
 	dstWhenShift int64  // DST: base-ns the DriftClock overdue conversion moved when TOWARD now (new-old, accumulated across changes); added back to the fire-time delay so the DELIVERED timestamp keeps the original due time while the re-arm catch-up uses the converted anchor. Cleared at fire and at modify. Unused when DST off / not a fake timer
@@ -417,6 +418,15 @@ type timeTimer struct {
 //
 //go:linkname newTimer time.newTimer
 func newTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
+	return newTimerOwned(when, period, f, arg, c, false)
+}
+
+//go:linkname newBaseTimer time.newBaseTimer
+func newBaseTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
+	return newTimerOwned(when, period, f, arg, c, true)
+}
+
+func newTimerOwned(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan, base bool) *timeTimer {
 	t := new(timeTimer)
 	t.timer.init(nil, nil)
 	t.trace("new")
@@ -434,6 +444,7 @@ func newTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg
 	if bubble := getg().bubble; bubble != nil {
 		t.isFake = true
 	}
+	t.dstBase = base
 	t.modify(when, period, f, arg, 0)
 	t.init = true
 	return t
@@ -626,7 +637,9 @@ func (t *timer) modify(when, period int64, f func(arg any, seq uintptr, delay in
 		// simulated timers are in base time; a real-FD poll deadline (non-fake) carries
 		// real-monotonic time, which must not be rate-converted against bubble.now (real
 		// I/O in a bubble is out of the simulation).
-		when, period = dstTimerArmForDrift(when, period)
+		if !t.dstBase {
+			when, period = dstTimerArmForDrift(when, period)
+		}
 	}
 	async := debug.asynctimerchan.Load() != 0
 

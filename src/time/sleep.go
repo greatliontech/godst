@@ -71,6 +71,9 @@ func when(d Duration) int64 {
 //go:linkname newTimer
 func newTimer(when, period int64, f func(any, uintptr, int64), arg any, cp unsafe.Pointer) *Timer
 
+//go:linkname newBaseTimer
+func newBaseTimer(when, period int64, f func(any, uintptr, int64), arg any, cp unsafe.Pointer) *Timer
+
 //go:linkname stopTimer
 func stopTimer(*Timer) bool
 
@@ -143,6 +146,17 @@ func (t *Timer) Stop() bool {
 func NewTimer(d Duration) *Timer {
 	c := make(chan Time, 1)
 	t := newTimer(when(d), 0, sendTime, c, syncTimer(c))
+	t.C = c
+	return t
+}
+
+// newDSTBaseTimer creates an internal timer whose duration is universe base
+// time rather than time perceived by the calling DST host.
+//
+//go:linkname newDSTBaseTimer
+func newDSTBaseTimer(d Duration) *Timer {
+	c := make(chan Time, 1)
+	t := newBaseTimer(when(d), 0, sendTime, c, syncTimer(c))
 	t.C = c
 	return t
 }

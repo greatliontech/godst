@@ -512,6 +512,142 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 	}
 }
 
+func TestDSTNetBaseDelaysIgnoreEndpointDrift(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const latency = 100 * time.Millisecond
+	var dialBase, deliveryBase, changedDriftBase, roundedBase, ordinaryBase time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+		port := make(chan string, 1)
+		startDial := make(chan struct{})
+		dialed := make(chan struct{})
+		startWrite := make(chan struct{})
+		wrote := make(chan struct{})
+		read := make(chan struct{})
+		startBaseTimer := make(chan struct{})
+		baseTimerArmed := make(chan struct{})
+		baseTimerFired := make(chan struct{})
+		startRoundedTimer := make(chan struct{})
+		roundedTimerFired := make(chan struct{})
+		startOrdinaryTimer := make(chan struct{})
+		ordinaryTimerFired := make(chan struct{})
+
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					panic(err)
+				}
+				buf := make([]byte, 1)
+				if _, err := c.Read(buf); err != nil {
+					panic(err)
+				}
+				close(read)
+				c.Close()
+			}()
+			go func() {
+				<-startBaseTimer
+				t := dstNewBaseTimer(latency)
+				close(baseTimerArmed)
+				<-t.C
+				close(baseTimerFired)
+			}()
+			go func() {
+				<-startRoundedTimer
+				t := dstNewBaseTimer(time.Nanosecond)
+				<-t.C
+				close(roundedTimerFired)
+			}()
+			go func() {
+				<-startOrdinaryTimer
+				t := time.NewTimer(latency)
+				<-t.C
+				close(ordinaryTimerFired)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			go func() {
+				p := <-port
+				<-startDial
+				c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+				if err != nil {
+					panic(err)
+				}
+				close(dialed)
+				<-startWrite
+				if _, err := c.Write([]byte("x")); err != nil {
+					panic(err)
+				}
+				close(wrote)
+				<-read
+				c.Close()
+			}()
+		})
+
+		// A fast dialer's timers would otherwise consume only half of each
+		// configured handshake leg in universe base time.
+		simulation.DriftClock("B", 1_000_000_000)
+		start := time.Now()
+		close(startDial)
+		<-dialed
+		dialBase = time.Since(start)
+
+		// A slow receiver's delivery timer would otherwise consume twice the
+		// configured wire delay. Measure both cases on the unskewed root clock.
+		simulation.DriftClock("A", -500_000_000)
+		start = time.Now()
+		close(startWrite)
+		<-wrote
+		<-read
+		deliveryBase = time.Since(start)
+
+		// A base timer already in flight retains its deadline if the endpoint's
+		// rate changes. The arm signal makes the remapping branch reachable.
+		simulation.DriftClock("A", -500_000_000)
+		start = time.Now()
+		close(startBaseTimer)
+		<-baseTimerArmed
+		time.Sleep(latency / 2)
+		simulation.DriftClock("A", 0)
+		<-baseTimerFired
+		changedDriftBase = time.Since(start)
+
+		// Base ownership is established before the initial arm, avoiding a
+		// lossy base-to-host-to-base duration round trip at fractional rates.
+		simulation.DriftClock("A", -500_000_000)
+		start = time.Now()
+		close(startRoundedTimer)
+		<-roundedTimerFired
+		roundedBase = time.Since(start)
+
+		// Base ownership is selective: ordinary timers on the same slow host
+		// still measure host-perceived time, as sender-clock retransmission does.
+		start = time.Now()
+		close(startOrdinaryTimer)
+		<-ordinaryTimerFired
+		ordinaryBase = time.Since(start)
+	})
+	if dialBase != 2*latency {
+		t.Errorf("dial handshake under fast endpoint drift took %v base time, want %v", dialBase, 2*latency)
+	}
+	if deliveryBase != latency {
+		t.Errorf("payload delivery under slow endpoint drift took %v base time, want %v", deliveryBase, latency)
+	}
+	if changedDriftBase != latency {
+		t.Errorf("base timer spanning endpoint drift change took %v base time, want %v", changedDriftBase, latency)
+	}
+	if roundedBase != time.Nanosecond {
+		t.Errorf("1ns base timer under non-integral endpoint drift took %v base time, want 1ns", roundedBase)
+	}
+	if ordinaryBase != 2*latency {
+		t.Errorf("ordinary timer under slow endpoint drift took %v base time, want %v", ordinaryBase, 2*latency)
+	}
+}
+
 // TestDSTNetLatencyDeadline: a read deadline shorter than the link latency times
 // out before delivery (the wire blocks on the fake clock and honors deadlines);
 // a deadline past the latency delivers. This is the soundness check that latency

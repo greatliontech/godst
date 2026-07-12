@@ -729,7 +729,7 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 	// under its own lock.
 	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
 		t.lock()
-		if t.dstReg == epoch && t.dstHost == host {
+		if t.dstReg == epoch && t.dstHost == host && !t.dstBase {
 			// The period is re-mapped for EVERY owned timer, not only pending
 			// ones: a periodic timer due exactly at the change instant
 			// (when == now, unfired — channel timers fire lazily on access)

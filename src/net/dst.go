@@ -885,7 +885,7 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 	if d <= 0 {
 		return nil
 	}
-	t := time.NewTimer(time.Duration(d))
+	t := dstNewBaseTimer(time.Duration(d))
 	defer t.Stop()
 	select {
 	case <-t.C:
@@ -903,7 +903,9 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 // (zero latency/jitter) returns instantly and draws nothing.
 func dstConnectSYNACK(latencyNs, jitterNs int64) {
 	if d := latencyNs + dstFaultRandN(jitterNs); d > 0 {
-		time.Sleep(time.Duration(d))
+		t := dstNewBaseTimer(time.Duration(d))
+		<-t.C
+		t.Stop()
 	}
 }
 
