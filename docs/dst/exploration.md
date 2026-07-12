@@ -587,7 +587,8 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    (allocation-free, gated so Random/PCT/non-dst/dst-without-race are unaffected); the DPOR engine builds vector clocks **offline** from those events +
    program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to *concurrent*
    conflicting pairs only. Mutex/channel-serialized conflicts are pruned, including non-waking edges such
-   as uncontended mutex `Unlock`→`Lock`, buffered channel slot send→receive, unbuffered rendezvous, and
+   as uncontended mutex `Unlock`→`Lock`, buffered channel slot send→receive and receive→slot-reusing send
+   (including an empty-buffer direct handoff to a waiting receiver), unbuffered rendezvous, and
    close→closed-receive. Measured on `twoPairSUT`
    (two channel-ordered producer/consumer pairs interleaving freely): exhaustive 4032, address-only DPOR
    21, **HB-DPOR 4** — all 0 failures (`TestDSTExploreHBPrunes`, mutation-verified: the `<=10` bound fails

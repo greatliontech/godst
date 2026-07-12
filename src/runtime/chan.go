@@ -357,6 +357,14 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			// the head/tail locations only when raceenabled.
 			racenotify(c, c.recvx, nil)
 			racenotify(c, c.recvx, sg)
+			if dstBuild {
+				id := uintptr(unsafe.Pointer(c))
+				aux := uintptr(c.recvx) + 1
+				dstRecordSyncAcquireID(id, aux)
+				dstRecordSyncReleaseID(id, aux)
+				dstRecordSyncEventForGID(dstSyncEventAcquire, id, aux, sg.g)
+				dstRecordSyncEventForGID(dstSyncEventRelease, id, aux, sg.g)
+			}
 			c.recvx++
 			if c.recvx == c.dataqsiz {
 				c.recvx = 0

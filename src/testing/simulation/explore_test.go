@@ -1651,12 +1651,24 @@ func TestExploreRecordsBufferedSlotReuseEdges(t *testing.T) {
 		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
 	}
 	dstExploreInit(256, 1024, 256, 1024)
+	var senderSeq, receiverSeq uint64
 	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		senderSeq = dstCurrentSeqFP()
 		ch := make(chan int, 1)
 		ch <- 1
 		<-ch
-		ch <- 2
-		<-ch
+		ready := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			receiverSeq = dstCurrentSeqFP()
+			close(ready)
+			<-ch
+			close(done)
+		}()
+		<-ready
+		time.Sleep(time.Nanosecond)
+		ch <- 2 // empty-buffer direct handoff to the waiting receiver
+		<-done
 		return false
 	})
 	slotReleases, slotAcquires := 0, 0
@@ -1671,12 +1683,24 @@ func TestExploreRecordsBufferedSlotReuseEdges(t *testing.T) {
 			slotAcquires++
 		}
 	}
-	// Two sends + two receives, each recording both directions on slot 1:
-	// four releases and four acquires. Without the reuse edges, only the two
-	// send-releases and two receive-acquires exist.
+	// The initial buffered send/receive and both halves of the direct handoff
+	// each record both directions on slot 1: four releases and four acquires.
 	if slotReleases < 4 || slotAcquires < 4 {
 		t.Fatalf("buffered slot-reuse edges missing: releases=%d acquires=%d aux=%v kind=%v",
 			slotReleases, slotAcquires, tr.syncAux, tr.syncKind)
+	}
+	var kinds []uint8
+	var seqs []uint64
+	for i := range tr.syncKind {
+		if tr.syncAux[i] != 0 && tr.syncAux[i] != ^uintptr(0) {
+			kinds = append(kinds, tr.syncKind[i])
+			seqs = append(seqs, tr.syncSeq[i])
+		}
+	}
+	wantKinds := []uint8{syncEventAcquire, syncEventRelease, syncEventAcquire, syncEventRelease}
+	wantSeqs := []uint64{senderSeq, senderSeq, receiverSeq, receiverSeq}
+	if len(kinds) < 4 || !reflect.DeepEqual(kinds[len(kinds)-4:], wantKinds) || !reflect.DeepEqual(seqs[len(seqs)-4:], wantSeqs) {
+		t.Fatalf("direct handoff slot events = kinds %v seqs %v, want suffix kinds %v seqs %v", kinds, seqs, wantKinds, wantSeqs)
 	}
 }
 
