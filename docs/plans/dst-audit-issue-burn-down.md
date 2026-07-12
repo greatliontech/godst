@@ -37,7 +37,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Runtime crash and membership functions
 
-- [ ] 18. `dstMarkProcessGoroutinesCrashed` and `dstMarkHostGoroutinesCrashed` scan sticky members across GC disassociation (`dst-runtime-crash-skips-disassociated-members`)
+- [x] 18. `dstMarkProcessGoroutinesCrashed` and `dstMarkHostGoroutinesCrashed` scan sticky members across GC disassociation (`dst-runtime-crash-skips-disassociated-members`)
 - [ ] 19. crashed goroutine stacks stop contributing process roots while remaining permanently unrunnable and non-unwinding (`dst-crash-retains-stacks-and-process-memory`)
 
 ## Runtime clock functions

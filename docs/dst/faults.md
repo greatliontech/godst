@@ -856,6 +856,10 @@ body — a thread of a dead process never resumes. **A crashed goroutine never u
 functions do not run, exactly as a killed process's threads abandon their stacks. So a `Crash` whose
 caller belongs to the victim (a **self-crash** — the shape an allocation-triggered OOM takes, the victim
 dying where its own workload takes it) never returns, and the code after it is unreachable.
+Victim enumeration keys on sticky active-simulation membership, not the live bubble pointer: GC entry
+and assist may temporarily clear `g.bubble`, but that disassociation cannot let a process or host thread
+escape death. Enforced by `TestDSTCrashMarksDisassociatedProcessMember` and
+`TestDSTCrashHostMarksDisassociatedMember`.
 
 One process is not crashable: the one whose goroutine set contains the run's **main** goroutine — a
 `Process` declared inline in the run body rather than on a goroutine of its own. Killing it would leave

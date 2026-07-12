@@ -1044,6 +1044,18 @@ func dstDisassociatedAllocFP() (before, after uint64) {
 	return before, after
 }
 
+//go:linkname dstDisassociatedWaitFP
+func dstDisassociatedWaitFP(entered, release *uint32) {
+	gp := getg()
+	old := gp.bubble
+	defer func() { gp.bubble = old }()
+	gp.bubble = nil
+	atomic.Store(entered, 1)
+	for atomic.Load(release) == 0 {
+		Gosched()
+	}
+}
+
 // dstPooledAlloc is the count of bytes of runtime-internal pooled structs
 // allocated since activation on behalf of simulation-bubble goroutines:
 // sudog/_defer by allocation type (user stack, acquireSudog/newdefer), g by
@@ -1785,7 +1797,7 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 	var total, running int
 	var waiterCrashed bool
 	forEachG(func(gp *g) {
-		if gp.bubble != bubble || gp.dstHost != host || gp.dstPid < 0 {
+		if !gp.dstSimG || gp.dstHost != host || gp.dstPid < 0 {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
@@ -1841,7 +1853,7 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 	var waiterCrashed bool
 	var drainCrashed bool
 	forEachG(func(gp *g) {
-		if gp.bubble != bubble || gp.dstPid != pid {
+		if !gp.dstSimG || gp.dstPid != pid {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
