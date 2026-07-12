@@ -1376,6 +1376,13 @@ func (c *gcControllerState) setGCPercent(in int32) int32 {
 
 //go:linkname setGCPercent runtime/debug.setGCPercent
 func setGCPercent(in int32) (out int32) {
+	if dstBuild {
+		lock(&dstGCControlLock)
+		if dstForeignForcedGC() {
+			unlock(&dstGCControlLock)
+			dstPanicForeignForcedGC()
+		}
+	}
 	// Run on the system stack since we grab the heap lock.
 	systemstack(func() {
 		lock(&mheap_.lock)
@@ -1383,6 +1390,9 @@ func setGCPercent(in int32) (out int32) {
 		gcControllerCommit()
 		unlock(&mheap_.lock)
 	})
+	if dstBuild {
+		unlock(&dstGCControlLock)
+	}
 
 	// If we just disabled GC, wait for any concurrent GC mark to
 	// finish so we always return with no GC running.

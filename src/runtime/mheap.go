@@ -1811,6 +1811,10 @@ func (h *mheap) scavengeAll() {
 
 //go:linkname runtime_debug_freeOSMemory runtime/debug.freeOSMemory
 func runtime_debug_freeOSMemory() {
+	// Refuse before either forced action. GC also carries this guard, but keep
+	// it at the funnel entry so reordering the scavenge cannot expose foreign
+	// wall-clock memory reclamation during a simulation.
+	dstRefuseForeignForcedGC()
 	GC()
 	systemstack(func() { mheap_.scavengeAll() })
 }

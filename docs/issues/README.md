@@ -19,10 +19,8 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [explore recording gates key on bubble-ness, not membership](./dst-explore-recorder-gates-not-membership-keyed.md) | H | recorders keyed on sim membership, or per-gate unreachability recorded |
 | [same-seed broadcast scheduling can diverge across runs](./dst-schedule-broadcast-replay-flake.md) | H | random broadcast scheduling replays identically under focused and full-suite repetition |
 | [same-seed scheduler probes diverge under host contention](./dst-scheduler-load-replay-flakes.md) | H | foreign-bubble, PCT, and exploration-sweep schedules replay under contention |
-| [foreign SetGCPercent mid-run silently perturbs the trigger](./dst-gc-foreign-setgcpercent-perturbs-trigger.md) | M | mutation refused or latched out of the trigger, with a test arm |
 | [caller-gate per-API hold extent has no killing tests](./dst-sim-guard-hold-extent-unpinned.md) | M | representative site-local release regressions each fail a test, or convention recorded |
 | [gate reader killed while parked strands deactivation](./dst-sim-guarded-reader-killed-while-parked.md) | M | release precedes kill-exposed parks, or the kill path drains stranded readers |
-| [forced-GC entry funnels pinned only structurally](./dst-gc-forced-entry-funnels-unpinned.md) | L | mid-run foreign arms for both funneled entries, or funnel reliance recorded |
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |
 | [GC counter gates key on the live bubble field](./dst-gc-counter-gates-live-bubble-field.md) | L | gates keyed on the sticky bit, or per-window unreachability recorded |
 | [crash scans skip temporarily disassociated simulation goroutines](./dst-runtime-crash-skips-disassociated-members.md) | H | crash victim scans key on sticky simulation membership |

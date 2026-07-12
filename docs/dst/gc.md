@@ -782,8 +782,14 @@ the channel-light workloads that first validated it (both **landed**):
   the seed store); the runtime's own
   activation/quiescence cycles use an internal entry, `debug.FreeOSMemory` and pprof's goroutine-leak
   GC funnel through the guarded one (the leak entry refuses before arming its process-global mode
-  flag, which a recovered panic would otherwise leak into the run's own next cycle). Pinned by
+  flag, which a recovered panic would otherwise leak into the run's own next cycle). The same caller
+  rule guards `debug.SetGCPercent` before it mutates the live `gcPercent`/`heapMinimum` values the DST
+  trigger reads: bubble calls remain sanctioned at their deterministic schedule point; foreign calls
+  panic rather than changing later crossings at wall-clock timing. The complete mutation is serialized
+  with activation, so a call admitted before activation finishes before trigger baselining, while a call
+  arriving afterward observes the active run and is refused. Pinned by
   `TestDSTForeignRuntimeGCPanics` (mid-run, both foreign positions) and
+  `TestDSTForeignGCControlPanics` (`SetGCPercent`, `FreeOSMemory`, and goroutine-leak flag state), plus
   `TestDSTForeignGCActivationStretch` (the entry stretch). And during an active run foreign/process heap growth never
   TRIGGERS a collection (the physical `heapLive` trigger is unreachable under `dstActive` and forcegc
   is neutralized) — foreign garbage is reclaimed only by bubble-armed (or user-forced) cycles, so a

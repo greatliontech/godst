@@ -51,6 +51,12 @@ func dstIsInternalPooledType(typ *_type) bool {
 // the per-g routing hot paths and by sysmon.
 var dstSeed atomic.Uint64
 
+// dstGCControlLock serializes process-wide GC-control changes with simulation
+// activation. A call admitted before activation must finish before the run
+// snapshots its trigger state; one arriving afterward observes the active run
+// and is refused.
+var dstGCControlLock mutex
+
 // dstRunEpoch is a monotonic counter bumped once per run (dstActivate), so a
 // consumer can detect a new run and reset per-run in-memory state.
 var dstRunEpoch atomic.Uint64
@@ -217,7 +223,9 @@ func dstActivate(seed uint64) {
 	dstInternalPooledTypes.g = abi.TypeFor[g]()
 	dstInternalPooledTypes.sudog = abi.TypeFor[sudog]()
 	dstInternalPooledTypes.defr = abi.TypeFor[_defer]()
+	lock(&dstGCControlLock)
 	dstSeed.Store(seed)
+	unlock(&dstGCControlLock)
 	// Establish the per-bubble heap baseline: a full GC here (STW now that DST is
 	// active) collects pre-bubble garbage so gcController.heapMarked is the
 	// process *live* set, and we snapshot it as the baseline the relative heap
@@ -2401,9 +2409,17 @@ func dstInSimBubble() bool {
 // debug.FreeOSMemory funnels through GC, and sysmon's forcegc is neutralized
 // separately.
 func dstRefuseForeignForcedGC() {
-	if dstBuild && dstActive() && dstSimEnvSet && !dstInSimBubble() {
-		panic("runtime: GC forced during an active simulation from outside the run's bubble")
+	if dstForeignForcedGC() {
+		dstPanicForeignForcedGC()
 	}
+}
+
+func dstForeignForcedGC() bool {
+	return dstBuild && dstActive() && dstSimEnvSet && !dstInSimBubble()
+}
+
+func dstPanicForeignForcedGC() {
+	panic("runtime: GC forced during an active simulation from outside the run's bubble")
 }
 
 // dstCgoRefuse panics with the interception-boundary unsupported shape for a

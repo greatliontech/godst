@@ -10,10 +10,18 @@ import (
 	"fmt"
 	"internal/synctest"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
+	_ "unsafe" // for go:linkname
 )
+
+//go:linkname dstGoroutineLeakGCFP runtime.dstGoroutineLeakGCFP
+func dstGoroutineLeakGCFP()
+
+//go:linkname dstGoroutineLeakPendingFP runtime.dstGoroutineLeakPendingFP
+func dstGoroutineLeakPendingFP() bool
 
 // TestDSTFaultFromNonBubbleGoroutinePanics: every fault-injection and
 // clock-fault API invoked during an active run from a goroutine OUTSIDE the
@@ -170,6 +178,62 @@ func TestDSTForeignRuntimeGCPanics(t *testing.T) {
 	}
 	if !inBubble {
 		t.Error("in-bubble runtime.GC() did not complete")
+	}
+}
+
+func TestDSTForeignGCControlPanics(t *testing.T) {
+	oldPercent := debug.SetGCPercent(100)
+	defer debug.SetGCPercent(oldPercent)
+
+	inject := make(chan func())
+	result := make(chan string)
+	go func() {
+		for call := range inject {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						result <- fmt.Sprint(r)
+					} else {
+						result <- ""
+					}
+				}()
+				call()
+			}()
+		}
+	}()
+	defer close(inject)
+
+	calls := []struct {
+		name string
+		call func()
+	}{
+		{name: "SetGCPercent", call: func() { debug.SetGCPercent(50) }},
+		{name: "FreeOSMemory", call: debug.FreeOSMemory},
+		{name: "goroutineLeakGC", call: dstGoroutineLeakGCFP},
+	}
+	panics := make(map[string]string)
+	Test(t, 1, func(t *testing.T) {
+		for _, tc := range calls {
+			inject <- tc.call
+			panics[tc.name] = <-result
+		}
+		if got := debug.SetGCPercent(100); got != 100 {
+			t.Errorf("foreign SetGCPercent changed live GOGC to %d", got)
+		}
+		if got := debug.SetGCPercent(80); got != 100 {
+			t.Errorf("bubble SetGCPercent old value = %d, want 100", got)
+		}
+		if got := debug.SetGCPercent(100); got != 80 {
+			t.Errorf("bubble SetGCPercent restore old value = %d, want 80", got)
+		}
+		if dstGoroutineLeakPendingFP() {
+			t.Error("foreign goroutineLeakGC armed the pending flag")
+		}
+	})
+	for _, tc := range calls {
+		if msg := panics[tc.name]; !strings.Contains(msg, "outside the run's bubble") {
+			t.Errorf("foreign %s panic = %q, want caller-position refusal", tc.name, msg)
+		}
 	}
 }
 
