@@ -727,7 +727,11 @@ production SIGBUS), the partial page's tail zeroes, and bytes a shrink dropped n
 re-growth. The mapping region is also the model's capability ceiling: a file size or mapping set the
 region cannot hold (2^40 bytes on the wide architectures, per-run, views and reservations together) is a
 loud deterministic refusal — a harness limit stated here so it is never mistaken for a modeled errno.
-`Mprotect` and `Madvise` on a subrange whose file offset is not 4096-aligned are `EINVAL` (the deterministic analog of the kernel's page-aligned-address requirement).
+Empty `Mprotect`, `Madvise`, and `Munmap` ranges return `EINVAL` through both named wrappers and
+raw-ABI `Syscall`/`Syscall6`: an empty range names no mapping, so its address cannot establish
+simulated ownership. `RawSyscall`/`RawSyscall6` retain the boundary's no-P refusal rule.
+`Mprotect` and `Madvise` on a non-empty subrange whose file offset is not 4096-aligned are `EINVAL`
+(the deterministic analog of the kernel's page-aligned-address requirement).
 `Mprotect` may set any R/W protection the mapping's file DESCRIPTOR allowed at map time —
 VM_MAYWRITE follows the fd's access mode, not the map-time prot, so an `O_RDWR`-backed read-only
 mapping may upgrade to `PROT_READ|PROT_WRITE` and `PROT_NONE` is always permitted, while an

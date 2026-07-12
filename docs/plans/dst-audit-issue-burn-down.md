@@ -18,7 +18,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 5. `dstSyscallAllowedTrap` refuses ioctl because device-specific requests cannot prove read-only, non-minting behavior
 - [x] 6. loong64 `fstatFD` isolation implementation and runtime verification are assigned to the final architecture-verification chunk
 - [x] 7. `dstTryClockGettime` returns kernel-shaped EFAULT for invalid time32/time64 output ranges (`dst-clock-gettime-invalid-pointer-faults`)
-- [ ] 8. `dstRawDispatch` gives zero-length mapping operations one named/raw ownership and errno contract (`dst-raw-zero-mapping-bypasses-ownership`)
+- [x] 8. `dstRawDispatch` gives zero-length mapping operations one named/raw ownership and errno contract (`dst-raw-zero-mapping-bypasses-ownership`)
 - [ ] 9. `AllThreadsSyscall` and `AllThreadsSyscall6` cannot bypass the active-run fence (`dst-syscall-allthreads-bypasses-fence`)
 - [ ] 10. allowlisted non-close fd dispatch cannot straddle host-fd creation (`dst-fd-inflight-io-straddles-creation`)
 

@@ -68,4 +68,3 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [creation drops special mode bits](./dst-fs-create-drops-special-mode-bits.md) | L | create and Chmod preserve the same modeled bits |
 | [SlowDisk skips Chdir](./dst-disk-latency-skips-chdir.md) | L | Chdir pays one path traversal delay |
 | [unknown Explore modes fall back to Exhaustive](./dst-explore-unknown-mode-falls-back.md) | L | unknown modes fail before SUT execution |
-| [zero-length raw mappings bypass ownership](./dst-raw-zero-mapping-bypasses-ownership.md) | L | named and raw empty-range operations agree |

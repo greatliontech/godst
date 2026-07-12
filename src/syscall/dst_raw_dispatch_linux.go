@@ -62,14 +62,11 @@ import "unsafe"
 func dstRawDispatch(trap, a1, a2, a3 uintptr) (r1 uintptr, err Errno, handled bool) {
 	switch trap {
 	case SYS_MADVISE, SYS_MPROTECT, SYS_MUNMAP:
-		// A zero-length range names no mapping, so no lookup can decide it: the
-		// kernel's own answer is the model's. madvise and mprotect of nothing
-		// succeed; munmap of nothing is EINVAL.
+		// A zero-length range names no mapping, so neither its address nor the
+		// operation can establish simulated ownership. Match the named wrappers:
+		// every empty mapping operation is EINVAL.
 		if a2 == 0 {
-			if trap == SYS_MUNMAP {
-				return 0, EINVAL, true
-			}
-			return 0, 0, true
+			return 0, EINVAL, true
 		}
 		// A length that cannot be a Go slice is not a simulated mapping, and
 		// unsafe.Slice would panic on it rather than refuse cleanly.

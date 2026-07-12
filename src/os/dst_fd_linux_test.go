@@ -1815,8 +1815,8 @@ func TestDSTFSVirtualFDRawSyscallSemantics(t *testing.T) {
 			if _, _, e := syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0); e != 0 {
 				t.Fatalf("raw close: %v", e)
 			}
-			if _, _, e := syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0); e != syscall.EBADF {
-				t.Fatalf("raw fsync after raw close = %v, want EBADF", e)
+			if r1, r2, e := syscall.Syscall(syscall.SYS_FSYNC, fd, 0, 0); r1 != ^uintptr(0) || r2 != 0 || e != syscall.EBADF {
+				t.Fatalf("raw fsync after raw close = (%#x, %#x, %v), want (%#x, 0, EBADF)", r1, r2, e, ^uintptr(0))
 			}
 		})
 	})
