@@ -112,10 +112,10 @@ func (r *Root) Create(name string) (*File, error) {
 // OpenFile opens the named file in the root.
 // See [OpenFile] for more details.
 //
-// If perm contains bits other than the nine least-significant bits (0o777),
+// If perm contains bits other than permissions, setuid, setgid, and sticky,
 // OpenFile returns an error.
 func (r *Root) OpenFile(name string, flag int, perm FileMode) (*File, error) {
-	if perm&0o777 != perm {
+	if perm&rootCreateModeMask != perm {
 		return nil, &PathError{Op: "openat", Path: name, Err: errors.New("unsupported file mode")}
 	}
 	r.logOpen(name)
@@ -144,10 +144,10 @@ func (r *Root) Chmod(name string, mode FileMode) error {
 // with the specified name and permission bits (before umask).
 // See [Mkdir] for more details.
 //
-// If perm contains bits other than the nine least-significant bits (0o777),
+// If perm contains bits other than permissions, setuid, setgid, and sticky,
 // Mkdir returns an error.
 func (r *Root) Mkdir(name string, perm FileMode) error {
-	if perm&0o777 != perm {
+	if perm&rootCreateModeMask != perm {
 		return &PathError{Op: "mkdirat", Path: name, Err: errors.New("unsupported file mode")}
 	}
 	return rootMkdir(r, name, perm)
@@ -156,14 +156,16 @@ func (r *Root) Mkdir(name string, perm FileMode) error {
 // MkdirAll creates a new directory in the root, along with any necessary parents.
 // See [MkdirAll] for more details.
 //
-// If perm contains bits other than the nine least-significant bits (0o777),
+// If perm contains bits other than permissions, setuid, setgid, and sticky,
 // MkdirAll returns an error.
 func (r *Root) MkdirAll(name string, perm FileMode) error {
-	if perm&0o777 != perm {
+	if perm&rootCreateModeMask != perm {
 		return &PathError{Op: "mkdirat", Path: name, Err: errors.New("unsupported file mode")}
 	}
 	return rootMkdirAll(r, name, perm)
 }
+
+const rootCreateModeMask = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
 
 // Chown changes the numeric uid and gid of the named file in the root.
 // See [Chown] for more details.

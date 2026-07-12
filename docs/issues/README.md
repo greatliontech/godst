@@ -42,5 +42,4 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | chunk 62, with qemu-user available for the runtime witness |
 | [Host NumCPU wraps through int32](./dst-host-numcpu-wraps-int32.md) | L | accepted NumCPU values are exact or fail loudly |
 | [network delay arithmetic can overflow](./dst-net-delay-arithmetic-overflows.md) | L | accepted network delay arithmetic cannot wrap |
-| [creation drops special mode bits](./dst-fs-create-drops-special-mode-bits.md) | L | create and Chmod preserve the same modeled bits |
 | [SlowDisk skips Chdir](./dst-disk-latency-skips-chdir.md) | L | Chdir pays one path traversal delay |

@@ -67,6 +67,8 @@ var dstFS struct {
 	backed []*dstFSNode
 }
 
+const dstFSModeMask = rootCreateModeMask
+
 var dstOpenFiles struct {
 	mu    sync.Mutex
 	epoch uint64
@@ -559,7 +561,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if dstFSDiskHere().diskFullForCreate() {
 		return wrap(syscall.ENOSPC)
 	}
-	parent.entries[base] = dstFSNewNode(true, ModeDir|perm&ModePerm)
+	parent.entries[base] = dstFSNewNode(true, ModeDir|perm&dstFSModeMask)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -849,8 +851,7 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 // durable metadata image moves only on sync. ModTime is untouched: chmod(2)
 // updates ctime only, which is not modeled.
 func (node *dstFSNode) chmodLocked(mode FileMode) {
-	const changeable = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
-	node.mode = node.mode&^changeable | mode&changeable
+	node.mode = node.mode&^dstFSModeMask | mode&dstFSModeMask
 }
 
 // dstChmod implements the named Chmod.
@@ -1044,7 +1045,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		if dstFSDiskHere().diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = dstFSNewNode(false, perm&ModePerm)
+		node = dstFSNewNode(false, perm&dstFSModeMask)
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}

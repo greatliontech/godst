@@ -1284,6 +1284,59 @@ func TestDSTDiskEIOFsyncgateTornCrash(t *testing.T) {
 	}
 }
 
+func TestDSTFSCreatePreservesSpecialModeBitsAcrossCrash(t *testing.T) {
+	const special = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	wantFile := special | 0o640
+	wantDir := os.ModeDir | special | 0o750
+	createDirMode := special | 0o750
+	paths := []struct {
+		path string
+		want os.FileMode
+	}{{"/named-file", wantFile}, {"/named-dir", wantDir}, {"/rooted-file", wantFile}, {"/rooted-dir", wantDir}, {"/rooted-tree", wantDir}, {"/rooted-tree/leaf", wantDir}}
+	check := func() {
+		for _, p := range paths {
+			fi, err := os.Stat(p.path)
+			mustOK(t, "Stat "+p.path, err)
+			if fi.Mode() != p.want {
+				t.Fatalf("%s mode = %v, want %v", p.path, fi.Mode(), p.want)
+			}
+		}
+	}
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("p", func() {
+				f, err := os.OpenFile("/named-file", os.O_CREATE|os.O_RDWR, wantFile)
+				mustOK(t, "create named file", err)
+				f.Close()
+				mustOK(t, "create named dir", os.Mkdir("/named-dir", createDirMode))
+				root, err := os.OpenRoot("/")
+				mustOK(t, "open root", err)
+				f, err = root.OpenFile("rooted-file", os.O_CREATE|os.O_RDWR, wantFile)
+				mustOK(t, "create rooted file", err)
+				f.Close()
+				mustOK(t, "create rooted dir", root.Mkdir("rooted-dir", createDirMode))
+				mustOK(t, "create rooted tree", root.MkdirAll("rooted-tree/leaf", createDirMode))
+				root.Close()
+				check()
+				for _, p := range paths {
+					f, err := os.Open(p.path)
+					mustOK(t, "open for sync "+p.path, err)
+					mustOK(t, "sync "+p.path, f.Sync())
+					f.Close()
+				}
+				rootDir, err := os.Open("/")
+				mustOK(t, "open namespace root", err)
+				mustOK(t, "sync namespace root", rootDir.Sync())
+				rootDir.Close()
+			})
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("p", check)
+		})
+	})
+}
+
 // TestDSTDiskEIOFsyncgateShrinkRegrow: pages a shrink destroys leave the
 // dropped set — a regrow gives holes (zeros) back, never the dead platter
 // bytes a stale dropped mark would restore at the next sync.

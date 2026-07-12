@@ -94,7 +94,7 @@ func rootOpenFileNolog(root *Root, name string, flag int, perm FileMode) (*File,
 	fd, err := doInRoot(root, name, 0, nil, func(parent int, name string, endsInSlash bool) (fd int, err error) {
 		ignoringEINTR(func() error {
 			openFlag := syscall.O_NOFOLLOW | syscall.O_CLOEXEC | flag
-			fd, err = unix.Openat(parent, name, openFlag, uint32(perm))
+			fd, err = unix.Openat(parent, name, openFlag, syscallMode(perm))
 			if err != nil {
 				// Never follow symlinks when O_CREATE|O_EXCL, no matter
 				// what error the OS returns.
