@@ -1049,6 +1049,11 @@ func TestRunWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 			opts: Options{Strategy: Strategy(99)},
 			want: "unknown Strategy",
 		},
+		{
+			name: "pct depth above maximum",
+			opts: Options{Strategy: PCT, Depth: 17},
+			want: "PCT Depth exceeds maximum 16",
+		},
 	}
 	if strconv.IntSize > 32 {
 		tooLarge := int(maxStrategyParam)
@@ -1057,7 +1062,7 @@ func TestRunWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 			testCase{
 				name: "pct depth overflow",
 				opts: Options{Strategy: PCT, Depth: tooLarge},
-				want: "PCT Depth overflows",
+				want: "PCT Depth exceeds maximum 16",
 			},
 			testCase{
 				name: "pct steps overflow",
@@ -1316,6 +1321,11 @@ func TestTestWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 			opts: Options{Strategy: Strategy(99)},
 			want: "TestWith unknown Strategy",
 		},
+		{
+			name: "pct depth above maximum",
+			opts: Options{Strategy: PCT, Depth: 17},
+			want: "TestWith PCT Depth exceeds maximum 16",
+		},
 	}
 	if strconv.IntSize > 32 {
 		tooLarge := int(maxStrategyParam)
@@ -1325,7 +1335,7 @@ func TestTestWithRejectsInvalidOptionsBeforeActivation(t *testing.T) {
 				name string
 				opts Options
 				want string
-			}{name: "pct depth overflow", opts: Options{Strategy: PCT, Depth: tooLarge}, want: "TestWith PCT Depth overflows"},
+			}{name: "pct depth overflow", opts: Options{Strategy: PCT, Depth: tooLarge}, want: "TestWith PCT Depth exceeds maximum 16"},
 			struct {
 				name string
 				opts Options

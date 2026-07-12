@@ -76,6 +76,8 @@ unified seam, `dstSchedSelect(candidates) → index`:
   scheduling-decision count: if `K` overshoots the run length the change points fall past the end and
   never fire (PCT degenerates to a fixed seeded priority order — still sound, diverse, deterministic,
   but without the depth mechanism).
+  Accepted depths are 1 through 16 (non-positive selects the default 3); larger values panic before
+  the SUT runs because the runtime stores the `d-1` change points in a fixed-capacity array.
 
 Both strategies share the seam's soundness (only runnable goroutines are ever chosen) and determinism
 (every draw is from the seeded scheduling RNG, advanced in a deterministic order at P=1). `g.dstPrio`

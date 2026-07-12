@@ -252,7 +252,7 @@ type Options struct {
 	// bug needs, i.e. the number of priority-change points used. Ignored unless
 	// Strategy==PCT. Default 3. Higher d targets deeper bugs but lowers the
 	// per-seed hit probability. A value <= 0 selects the default; positive values
-	// must fit in the runtime scheduler's int32 strategy field.
+	// must be at most 16.
 	Depth int
 	// Steps is the PCT estimate of the number of scheduling decisions in a simulation;
 	// the priority-change points are placed uniformly in [1,Steps]. Ignored unless
@@ -581,8 +581,8 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 // RunWith is Run with an explicit exploration Strategy (Random or PCT). Use it to
 // direct interleaving exploration — e.g. Strategy PCT to bias toward exposing
 // deep concurrency bugs — while keeping the same per-seed determinism and replay
-// guarantees as Run. Unknown Strategy values, and PCT Depth/Steps values that do
-// not fit the runtime scheduler field, panic before the run starts. The zero
+// guarantees as Run. Unknown Strategy values, PCT depths above 16, and PCT Steps
+// values that do not fit the runtime scheduler field panic before the run starts. The zero
 // Options is exactly Run. It has the same process-global non-overlap restriction
 // as Run.
 //
@@ -639,8 +639,8 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 		kind = kindPCT
 		depth, steps = 3, 1000 // defaults
 		if opts.Depth > 0 {
-			if opts.Depth > maxStrategyParam {
-				panic("testing/simulation: " + api + " PCT Depth overflows runtime strategy field")
+			if opts.Depth > 16 {
+				panic("testing/simulation: " + api + " PCT Depth exceeds maximum 16")
 			}
 			depth = int32(opts.Depth)
 		}

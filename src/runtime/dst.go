@@ -1328,7 +1328,8 @@ func dstSetSchedStrategy(kind uint8, depth, steps int32) {
 }
 
 // dstPCTMaxDepth bounds the change-point arrays so PCT state is fixed-size (no
-// allocation that could perturb GC). Bug depths beyond this are clamped.
+// allocation that could perturb GC). Public validation rejects larger depths;
+// the runtime throws if an internal caller violates that bound.
 const dstPCTMaxDepth = 16
 
 // dstPCT is the per-bubble PCT scheduler state. Priorities live per goroutine
@@ -1358,7 +1359,7 @@ func dstSchedRootPCT() {
 		d = 1
 	}
 	if d > dstPCTMaxDepth {
-		d = dstPCTMaxDepth
+		throw("dst: PCT depth exceeds runtime capacity")
 	}
 	k := dstPCTSteps
 	if k < 1 {

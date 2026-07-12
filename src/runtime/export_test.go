@@ -665,6 +665,14 @@ func DSTTestHarnessTransparency(strategy int) [3]bool {
 	return [3]bool{dstIsInfraCandidate(root), dstIsInfraCandidate(drain), dstIsInfraCandidate(gc)}
 }
 
+func DSTTestPCTChangeCount(depth int) int {
+	oldDepth, oldSteps, oldPCT, oldRand := dstPCTDepth, dstPCTSteps, dstPCT, dstSchedRand
+	defer func() { dstPCTDepth, dstPCTSteps, dstPCT, dstSchedRand = oldDepth, oldSteps, oldPCT, oldRand }()
+	dstPCTDepth, dstPCTSteps = int32(depth), 100
+	dstSchedRootPCT()
+	return int(dstPCT.nchange)
+}
+
 type Sudog = sudog
 
 type XRegPerG = xRegPerG

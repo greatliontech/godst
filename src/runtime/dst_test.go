@@ -1396,6 +1396,12 @@ func TestDSTSchedulePCTChangePoints(t *testing.T) {
 	}
 }
 
+func TestDSTSchedulePCTMaximumDepth(t *testing.T) {
+	if got := runtime.DSTTestPCTChangeCount(16); got != 15 {
+		t.Fatalf("depth 16 change points = %d, want 15", got)
+	}
+}
+
 // TestDSTProcessIdentity verifies the simulation fixes os.Getpid/os.Hostname to a
 // deterministic identity inside Run (a default, or the Options value), and
 // restores the real machine's identity afterward. Closes the determinism hole a
