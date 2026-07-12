@@ -903,6 +903,8 @@ so no pid names "the threads on this machine"). The root process's pid therefore
 declared processes' pids die. Correspondingly, **one logical process lives on one machine at a time**:
 a same-name invocation live on a second host is refused, because a host crash would otherwise scope its
 victims by whichever home was recorded last and silently spare a pid on the machine that lost power.
+Different-host validation and live registration are one admission transaction, so concurrent starts
+cannot both publish.
 
 What a reboot keeps is what the *hardware* keeps. The durable image is the disk; the **disk faults** — a
 bad sector (`FailDisk`/`FailFile`), a full disk (`LimitDisk`), a slow device (`SlowDisk`) — are physical

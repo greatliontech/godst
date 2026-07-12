@@ -786,27 +786,29 @@ func Process(name string, f func()) {
 		// entry (in-sync, rate 1) with no call needed.
 	}
 	proc := internProc(name)
-	if runActive.Load() && activeProcLivesElsewhere(proc, host) {
-		panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
-	}
-	if runActive.Load() && dstNetHostDead(host) {
-		// A process cannot run on a powered-off machine. A process restart does
-		// not reboot the host (only a Host re-declaration does — it also
-		// re-establishes the clock), so restarting a CrashHost victim's process
-		// without the reboot would yield a half-alive machine: its server
-		// running and listening while every dial to it blackholes.
-		panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
-	}
-	dstProcAllocEnsure(proc) // per-process allocation counter exists before the body allocates
-	oldH, oldP := dstSetNode(host, proc)
-	simPid := dstAllocPid()
-	oldPid := dstSetProcessPid(simPid)
-	// Registration serializes with any in-flight teardown of this logical
-	// process (procTeardownMu): a restart must not become live — nor open
-	// resources — while its predecessor's exit/crash teardown is mid-flight.
-	procTeardownMu.Lock()
-	activeProcSet(proc, host, simPid)
-	procTeardownMu.Unlock()
+	var oldH, oldP uint32
+	var simPid, oldPid int32
+	func() {
+		// Admission is one transaction with teardown and competing starts: no
+		// caller can validate against the old liveness map and register later on
+		// a second host.
+		procTeardownMu.Lock()
+		defer procTeardownMu.Unlock()
+		if runActive.Load() && activeProcLivesElsewhere(proc, host) {
+			panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
+		}
+		if runActive.Load() && dstNetHostDead(host) {
+			// A process cannot run on a powered-off machine. A process restart does
+			// not reboot the host (only a Host re-declaration does — it also
+			// re-establishes the clock).
+			panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
+		}
+		dstProcAllocEnsure(proc)
+		oldH, oldP = dstSetNode(host, proc)
+		simPid = dstAllocPid()
+		oldPid = dstSetProcessPid(simPid)
+		activeProcSet(proc, host, simPid)
+	}()
 	// Registered FIRST so it runs LAST — after the exit-teardown defer below
 	// has completed and released procTeardownMu (parking while holding it
 	// would strand every later teardown). If the ENCLOSING invocation died
