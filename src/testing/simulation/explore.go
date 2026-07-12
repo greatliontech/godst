@@ -246,7 +246,7 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	setCrashTear(failure.CrashTear)
 	cfg := defaultExploreConfig()
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
-	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg)
+	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg, failure.ForeignSched)
 	if r.panic != "" {
 		panic(r.panic)
 	}
@@ -429,10 +429,10 @@ func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, su
 	// as this internal entry carries no options — so it never inherits the
 	// previous run's setting.
 	setCrashTear(false)
-	return runOnceResultLocked(seed, prefix, forces, sut, cfg)
+	return runOnceResultLocked(seed, prefix, forces, sut, cfg, false)
 }
 
-func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
+func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig, originForeign bool) (out runResult) {
 	racesBefore := dstRaceErrors()
 	installAccessForces(forces)
 	var failed bool
@@ -461,8 +461,7 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 			excused := out.panic != "" &&
 				(out.tr.panicStep < 0 || out.tr.abortStep < 0 || out.tr.abortStep >= out.tr.panicStep)
 			if !excused {
-				panic("testing/simulation: internal error: schedule prefix diverged on replay " +
-					"(a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation")
+				panic(prefixDivergenceMessageForRun(originForeign, out.tr.foreignSched))
 			}
 		}
 	}()
@@ -483,6 +482,17 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 		failed = sut()
 	})
 	return out
+}
+
+func prefixDivergenceMessage(foreign bool) string {
+	if foreign {
+		return "testing/simulation: incomplete exploration: foreign work occupied a simulation-idle time-advance window; schedule prefix diverged on replay — DST-L2-2"
+	}
+	return "testing/simulation: internal error: schedule prefix diverged on replay (a goroutine in the prefix was not enabled at its decision) — DST-L2-2 violation"
+}
+
+func prefixDivergenceMessageForRun(originForeign, replayForeign bool) string {
+	return prefixDivergenceMessage(originForeign || replayForeign)
 }
 
 func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
@@ -681,8 +691,9 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 	type queued struct {
 		prefix        []uint64
 		parentEnabled [][]uint64
+		originForeign bool
 	}
-	stack := []queued{{nil, nil}}
+	stack := []queued{{}}
 	for len(stack) > 0 {
 		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
 			res.BudgetHit = true
@@ -696,7 +707,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 			visited[k] = true
 		}
 		prefix := q.prefix
-		r := runOnceResultLocked(seed, prefix, forces, sut, cfg)
+		r := runOnceResultLocked(seed, prefix, forces, sut, cfg, q.originForeign)
 		tr := r.tr
 		checkReplayEnabled(prefix, q.parentEnabled, tr)
 		res.Schedules++
@@ -729,7 +740,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 				child := make([]uint64, i+1)
 				copy(child, tr.procs[:i])
 				child[i] = g
-				stack = append(stack, queued{child, tr.enabled[:i+1]})
+				stack = append(stack, queued{child, tr.enabled[:i+1], tr.foreignSched})
 			}
 		}
 	}
@@ -885,12 +896,13 @@ func indepSets(a, b []dporTrans) bool {
 // accesses the chosen goroutine performed in its interval (the access-log entries with
 // accStep == this decision's index + 1).
 type dporFrame struct {
-	proc      uint64                 // the goroutine currently chosen at this decision
-	enabled   []uint64               // enabled goroutines at this decision (deterministic order)
-	backtrack map[uint64]bool        // goroutines that must be explored here (source set)
-	done      map[uint64]bool        // goroutines already explored here
-	doneTrans map[uint64][]dporTrans // explored goroutines' interval access-set here (for sleep propagation)
-	sleep     map[uint64][]dporTrans // goroutines asleep here (their interval access-set): redundant to explore — skip
+	proc          uint64                 // the goroutine currently chosen at this decision
+	enabled       []uint64               // enabled goroutines at this decision (deterministic order)
+	backtrack     map[uint64]bool        // goroutines that must be explored here (source set)
+	done          map[uint64]bool        // goroutines already explored here
+	doneTrans     map[uint64][]dporTrans // explored goroutines' interval access-set here (for sleep propagation)
+	sleep         map[uint64][]dporTrans // goroutines asleep here (their interval access-set): redundant to explore — skip
+	originForeign bool                   // trace that introduced this prefix frame observed foreign scheduling
 }
 
 // dporExplore is iterative stateless SOURCE-DPOR with SLEEP SETS (Abdulla, Aronis,
@@ -993,7 +1005,11 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		for i, fr := range stack {
 			prefix[i] = fr.proc
 		}
-		r := runOnceResultLocked(seed, prefix, forces, sut, cfg)
+		originForeign := false
+		for _, fr := range stack {
+			originForeign = originForeign || fr.originForeign
+		}
+		r := runOnceResultLocked(seed, prefix, forces, sut, cfg, originForeign)
 		tr := r.tr
 		res.Schedules++
 		if tr.budgetHit {
@@ -1059,12 +1075,13 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 				}
 			}
 			stack = append(stack, &dporFrame{
-				proc:      tr.procs[d],
-				enabled:   tr.enabled[d],
-				backtrack: map[uint64]bool{tr.procs[d]: true},
-				done:      map[uint64]bool{},
-				doneTrans: map[uint64][]dporTrans{},
-				sleep:     sleep,
+				proc:          tr.procs[d],
+				enabled:       tr.enabled[d],
+				backtrack:     map[uint64]bool{tr.procs[d]: true},
+				done:          map[uint64]bool{},
+				doneTrans:     map[uint64][]dporTrans{},
+				sleep:         sleep,
+				originForeign: tr.foreignSched,
 			})
 		}
 		// Source-set race analysis over the ACCESS LOG: for every reversible race (a
@@ -1128,7 +1145,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 					if _, asleep := top.sleep[g]; useSleep && asleep {
 						continue
 					}
-					top.proc = g
+					dporSelectBacktrack(top, g, tr.foreignSched)
 					picked = true
 					break
 				}
@@ -1144,6 +1161,11 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 	}
 	res.Exhausted = !res.Overflow && !res.BudgetHit && !res.ForeignSched
 	return res, false
+}
+
+func dporSelectBacktrack(frame *dporFrame, proc uint64, originForeign bool) {
+	frame.proc = proc
+	frame.originForeign = originForeign
 }
 
 // dporHB reports whether access a happens-before access b (a → b) per the vector

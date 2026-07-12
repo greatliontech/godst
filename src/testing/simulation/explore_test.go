@@ -932,6 +932,29 @@ func TestExploreUnattributedRacesAccumulateAcrossPasses(t *testing.T) {
 	}
 }
 
+func TestExplorePrefixDivergenceReportsForeignIdleWindow(t *testing.T) {
+	foreign := prefixDivergenceMessageForRun(true, false)
+	if !strings.Contains(foreign, "incomplete exploration") || !strings.Contains(foreign, "foreign work occupied a simulation-idle time-advance window") {
+		t.Fatalf("foreign divergence message = %q", foreign)
+	}
+	isolated := prefixDivergenceMessageForRun(false, false)
+	if strings.Contains(isolated, "incomplete exploration") || !strings.Contains(isolated, "internal error") {
+		t.Fatalf("foreign-free divergence message = %q", isolated)
+	}
+}
+
+func TestDPORBacktrackCarriesTraceProvenance(t *testing.T) {
+	frame := &dporFrame{proc: 1}
+	dporSelectBacktrack(frame, 2, true)
+	if frame.proc != 2 || !frame.originForeign {
+		t.Fatalf("selected frame = proc %d, foreign %v", frame.proc, frame.originForeign)
+	}
+	dporSelectBacktrack(frame, 3, false)
+	if frame.proc != 3 || frame.originForeign {
+		t.Fatalf("reselected frame = proc %d, foreign %v", frame.proc, frame.originForeign)
+	}
+}
+
 func TestExploreResetsScheduledIdentityAcrossRuns(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")

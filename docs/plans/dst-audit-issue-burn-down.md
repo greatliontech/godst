@@ -58,7 +58,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Exploration scheduling functions
 
-- [ ] 27. idle-window foreign work cannot diverge replay, or produces the precise reported incomplete condition (`dst-explore-foreign-idle-window-divergence`)
+- [x] 27. idle-window foreign work cannot diverge replay, or produces the precise reported incomplete condition (`dst-explore-foreign-idle-window-divergence`)
 - [ ] 28. `dstSchedRootPCT` and public option validation support one depth range without silent clamping (`dst-pct-depth-silently-clamped`)
 - [ ] 29. `ExploreWith` rejects unknown modes before publishing exploration state (`dst-explore-unknown-mode-falls-back`)
 

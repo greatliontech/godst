@@ -1312,8 +1312,8 @@ later steps add, never rewrite.
   are coalesced after their first attributed transition; enabled sets are ordered by stable goroutine
   index rather than run-queue position; and the synctest root driver plus transient GC-disassociated
   execution are scheduled transparently. These rules remove the physical-order inputs that used to
-  shrink `-race` coverage under churn and report foreign work where none ran. The downgrade stays conservative (the time-advance machinery's
-  churn sensitivity is a recorded open divergence) — coverage under churn is best-effort and says
+  shrink `-race` coverage under churn and report foreign work where none ran. The downgrade stays conservative (foreign turns inside a
+  simulation-idle fake-time-advance window can move a later decision across timer-wake publication and produce the explicit `DST-L2-2` prefix-divergence panic) — coverage under churn is best-effort and says
   so, never a silent cap. Enforced by `TestDSTSchedForeignSpinner` (run completes under a spinner;
   fingerprints with/without the spinner identical, random and PCT), `TestExploreForeignSpinner`
   (exploration completes with identical coverage and byte-identical recorded traces under spinners,

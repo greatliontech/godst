@@ -615,7 +615,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 4. **`Explore` outer loop + API** (D4; **VALIDATED [V]**). `simulation.Explore(seed, mode, sut)` drives
    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
    DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
-   `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
+    `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
     simulation decisions downgrade `Exhausted` — reported, never silent, and conservative: with
     simulation membership a STICKY per-goroutine property, consecutive singleton no-choice yields
     coalesced after their first attributed transition, enabled sets canonicalized by stable index,
@@ -626,7 +626,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    -race coverage under churn and reporting foreign work where none ran;
    `TestExploreForeignGCWorkloadInsensitive`, `TestExploreForeignPriorRootSpinner`), top-level and child-goroutine SUT panics as
    `Failure.Panic`, synctest deadlocks as `Failure.Deadlock`, and one `Failure.Race` per new `RaceErrors`
-   increment. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
+    increment attributable to a foreign-free run. The scheduled post-`go` boundary is active in non-race builds too, so assertion-only
    child-before-parent-continuation failures are not silently skipped. Child-goroutine and drain-callback
    panics are recorded in the runtime after ordinary defers; scheduled deadlocks are converted inside
    `synctestRun` before `Run` returns. Every panic, deadlock, access, ready-edge, and sync-event recorder
@@ -638,6 +638,17 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    TSan's race counter is process-global: increments observed in a run that scheduled foreign work are
    reported as `ExploreResult.UnattributedRaces`, never as replayable `Failure.Race` tokens. A foreign-free
    run still records each new increment as an ordinary replayable race failure.
+   **Foreign idle-window boundary.** If every simulation goroutine is blocked on fake time while foreign
+   work remains runnable, physical foreign turns can occur between bubble-idle recognition and publication
+   of the timer-created runnable set. That can move a later logical decision across the time advance: a
+   prefix captured with the foreign turn may name a goroutine not yet enabled when replayed. This condition
+   requires both foreign scheduling and a simulation interval with no runnable member; churn with an always-
+   runnable simulation member and foreign-free fake-time advancement remain replay-stable. Explore never
+   turns the mismatch into coverage: when the originating trace observed foreign scheduling, prefix
+   validation aborts when either the prefix-producing trace or its replay observed foreign scheduling,
+   with the explicit `DST-L2-2` “incomplete exploration: foreign work occupied a
+   simulation-idle time-advance window” panic. A foreign-free prefix mismatch retains the internal-error
+   determinism-violation panic instead.
    *(After 4: increment 2's HB pruning + increment 6's filtering
    cut the still-inflated counts; then 1's compiler half so real SUTs need no hand-annotation.)*
 
