@@ -711,8 +711,7 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if newNode == oldNode {
 		return true, nil // same file: POSIX no-op success
 	}
-	oldAbs, newAbs := dstFSAbs(oldname), dstFSAbs(newname)
-	if newAbs == oldAbs || (len(newAbs) > len(oldAbs) && newAbs[:len(oldAbs)] == oldAbs && newAbs[len(oldAbs)] == '/') {
+	if oldNode.isDir && dstNodeContains(oldNode, newParent) {
 		return wrap(syscall.EINVAL) // new is inside old
 	}
 	if newNode != nil {

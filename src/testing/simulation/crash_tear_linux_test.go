@@ -474,6 +474,51 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 	}
 }
 
+func TestDSTCrashTearDirectoryAliasesCannotFormCycle(t *testing.T) {
+	sawAlias := false
+	for seed := uint64(1); seed <= 64; seed++ {
+		RunWith(seed, Options{CrashTear: true}, func() {
+			done := make(chan struct{})
+			Host("h", HostConfig{}, func() {
+				go Process("db", func() {
+					os.Mkdir("/a", 0o755)
+					os.Mkdir("/b", 0o755)
+					os.Mkdir("/a/d", 0o755)
+					syncDir(t, "/")
+					syncDir(t, "/a")
+					os.Rename("/a/d", "/b/d")
+					close(done)
+					select {}
+				})
+				<-done
+			})
+			CrashHost("h")
+			Host("h", HostConfig{}, func() {
+				Process("recover", func() {
+					a, aerr := os.Stat("/a/d")
+					b, berr := os.Stat("/b/d")
+					if aerr != nil || berr != nil {
+						return
+					}
+					sawAlias = true
+					if !os.SameFile(a, b) {
+						t.Fatalf("seed %d: recovered directories are not aliases", seed)
+					}
+					if err := os.Rename("/a/d", "/b/d/child"); !errors.Is(err, syscall.EINVAL) {
+						t.Fatalf("seed %d: rename alias into itself = %v, want EINVAL", seed, err)
+					}
+					if err := os.RemoveAll("/a/d"); err != nil {
+						t.Fatalf("seed %d: traversal after rejected cycle = %v", seed, err)
+					}
+				})
+			})
+		})
+	}
+	if !sawAlias {
+		t.Fatal("seed sweep did not recover both directory aliases")
+	}
+}
+
 // dstTearPolicySeed: a seed whose two-dirty-page tear draw is MIXED (one page
 // live, one durable) — the strongest anchor: it proves the page-granular tear
 // ran, not merely that the policy stayed true.

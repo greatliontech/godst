@@ -586,7 +586,9 @@ are separate — fsync the file, fsync the directory), committed by syncing an o
 directory (`File.Sync` or Linux virtual-fd `syscall.Fsync`). `Fdatasync` on a simulated directory is a
 deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` is atomic in the namespace
 (observers see old or new, never neither/both); its durability rides the parent directories' sync state
-like any other entry change. A simulated **host crash** (`CrashHost`, power loss) restores exactly the durable image:
+like any other entry change. Crash recovery may retain old and new aliases for one renamed inode, but
+rename containment is checked by node reachability, so no alias spelling can move a directory into itself
+and create a cycle. A simulated **host crash** (`CrashHost`, power loss) restores exactly the durable image:
 synced state survives byte-exactly; unsynced data and entries are lost — including an unsynced
 REMOVAL, which the crash undoes, since the removal itself was never on the disk. The restore
 **commits the restored image as the new durable image** — it is, by definition, what the platter
