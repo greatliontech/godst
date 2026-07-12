@@ -133,8 +133,8 @@ mechanism — the public name is a testing construct, not a `runtime` sub-packag
   reproduce. This is the only non-`Run` entry and is not a user surface. Because this path runs at
   `GOMAXPROCS>1`, every DST runtime structure reachable while it is active must be safe under real
   parallelism — "in-bubble single-P cooperative access" is a `Run`-only precondition no shared DST
-  list may assume (concretely: the armed-fake-timer registration list, `dstFakeTimers`, is a
-  lock-free CAS-prepend stack, not an append-racy slice).
+  list may assume (concretely: the armed-fake-timer registration list, `dstFakeTimers`, serializes
+  epoch rollover and intrusive-list publication in one short critical section, not an append-racy slice).
 
 ### Deterministic process identity (`Options.Hostname` / `Options.PID` / `Options.NumCPU`)
 
@@ -1002,8 +1002,8 @@ simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's
 finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
 pattern and were objdump-verified at the change. The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
 fourteen per-goroutine DST words (the six identity/RNG stamps, the seven race-access staging
-fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries four fake-timer words (arming
-host, registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
+fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries fake-timer state (arming
+host, full-width registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
 bookkeeping, `specialfinalizer` carries epoch+sequence+PID, `specialCleanup` carries epoch while its
 embedded cleanup carries sequence+PID, and `finalizer`/`cleanupFn` each carry registration sequence
 plus run-epoch/process-invocation ownership (so untagged builds fit slightly

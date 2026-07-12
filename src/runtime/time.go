@@ -90,8 +90,8 @@ type timer struct {
 	blocked      uint32 // number of goroutines blocked on timer's channel
 	rand         uint32 // randomizes order of timers at same instant; only set when isFake
 	dstHost      uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
-	dstReg       uint32 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
-	dstFakeNext  *timer // DST: intrusive link in the per-run fake-timer list (dst.go dstFakeTimers), a lock-free prepend stack; set once per run at registration. Unused when DST off / not a fake timer
+	dstReg       uint64 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
+	dstFakeNext  *timer // DST: intrusive link in the per-run fake-timer list (dst.go dstFakeTimers); set once per run at registration. Unused when DST off / not a fake timer
 	dstWhenShift int64  // DST: base-ns the DriftClock overdue conversion moved when TOWARD now (new-old, accumulated across changes); added back to the fire-time delay so the DELIVERED timestamp keeps the original due time while the re-arm catch-up uses the converted anchor. Cleared at fire and at modify. Unused when DST off / not a fake timer
 
 	// Timer wakes up at when, and then at when+period, ... (period > 0 only)

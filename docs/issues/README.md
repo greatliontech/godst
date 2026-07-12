@@ -30,7 +30,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [host crash misses a nested root-process goroutine](./dst-host-crash-misses-nested-root-goroutine.md) | H | host ancestry makes every machine thread killable |
 | [MIPS Syscall9 bypasses the fence](./dst-mips-syscall9-bypasses-fence.md) | H | chunk 61, with qemu-user available for the runtime witness |
 | [MIPS clock_gettime64 lacks a runtime witness](./dst-mips-clock-gettime64-runtime-unverified.md) | L | chunk 61, with qemu-user available for the runtime witness |
-| [fake-timer rollover can erase a registration](./dst-clock-fake-timer-roll-loses-registration.md) | M | epoch rollover preserves every new-epoch timer |
 | [foreign races can be attributed to the SUT](./dst-explore-foreign-races-misattributed.md) | M | reported races are simulation-attributed or explicitly foreign |
 | [PCT silently clamps depths above sixteen](./dst-pct-depth-silently-clamped.md) | M | public PCT validation matches runtime capacity |
 | [network base delays scale with host drift](./dst-net-base-delay-scaled-by-host-drift.md) | M | all network waits consume universe base time |

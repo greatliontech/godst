@@ -736,7 +736,10 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   already be at the new rate; `TestDSTClockDriftClockDueTicker`). Because a channel timer is heaped only while a goroutine is blocked on
   it, the re-map enumerates a per-run list of armed fake timers (`runtime.dstFakeTimers`), not just the heap,
   so a held `NewTimer`/`NewTicker` or a ticker between ticks is re-mapped too; the re-map is in place under the
-  timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). **Host
+  timer lock, preserving a zombie (it does not resurrect an unblocked channel timer). Epoch rollover,
+  old-list reset, and new-epoch registration are serialized, so multi-P white-box activation cannot
+  publish a timer between the new epoch and a later destructive head reset
+  (`TestDSTFakeTimerRollPreservesNewEpochRegistration`). **Host
   re-declaration re-establishes the clock completely**: declaring `Host(name, config)` for an
   already-declared name applies the declared clock in full:
   re-map the host's armed timers from the surviving rate to the declared one, overwrite the offset

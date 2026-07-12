@@ -562,6 +562,65 @@ func NextArenaHint() (uintptr, bool) {
 
 type G = g
 
+type DSTFakeTimer = timer
+
+func DSTFakeTimersTestReset(epoch uint64) uint64 {
+	lock(&dstFakeTimers.lock)
+	old := dstRunEpoch.Load()
+	dstRunEpoch.Store(epoch)
+	dstFakeTimers.epoch.Store(epoch - 1)
+	dstFakeTimers.head.Store(nil)
+	unlock(&dstFakeTimers.lock)
+	return old
+}
+
+func DSTFakeTimersTestRestore(epoch uint64) {
+	lock(&dstFakeTimers.lock)
+	dstFakeTimers.head.Store(nil)
+	dstFakeTimers.epoch.Store(epoch)
+	dstRunEpoch.Store(epoch)
+	unlock(&dstFakeTimers.lock)
+}
+
+func DSTFakeTimersTestRegister(t *DSTFakeTimer) {
+	dstRegisterFakeTimer(t)
+}
+
+func DSTFakeTimersTestRollPaused(t *DSTFakeTimer, entered, release *uint32) {
+	dstFakeTimersRollTestRelease.Store(release)
+	dstFakeTimersRollTestEntered.Store(entered)
+	dstFakeTimersRoll()
+	dstRegisterFakeTimer(t)
+	dstFakeTimersRollTestRelease.Store(nil)
+}
+
+func DSTFakeTimersTestCount() int {
+	lock(&dstFakeTimers.lock)
+	defer unlock(&dstFakeTimers.lock)
+	n := 0
+	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
+		n++
+	}
+	return n
+}
+
+func DSTFakeTimersTestInit(t *DSTFakeTimer, host uint32, when, period int64) {
+	t.dstHost = host
+	t.when = when
+	t.period = period
+}
+
+func DSTFakeTimersTestRemap(host uint32, now, oldPPB, newPPB int64, timers ...*DSTFakeTimer) []int64 {
+	dstRemapHostTimers(host, now, oldPPB, newPPB)
+	when := make([]int64, len(timers))
+	for i, t := range timers {
+		t.lock()
+		when[i] = t.when
+		t.unlock()
+	}
+	return when
+}
+
 type Sudog = sudog
 
 type XRegPerG = xRegPerG

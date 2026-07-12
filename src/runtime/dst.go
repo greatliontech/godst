@@ -580,26 +580,41 @@ func dstStepHostClock(host uint32, delta int64) bool {
 // epoch) — acceptable for the simulation path, where it removes the need to hook every
 // timer disarm.
 //
-// It is a LOCK-FREE intrusive prepend stack (head is an atomic pointer, timers linked by
-// t.dstFakeNext): the single-P Run path never contends, but the white-box dstActivate
+// It is an intrusive prepend stack protected with its epoch by lock: the single-P Run
+// path never contends, but the white-box dstActivate
 // path runs at GOMAXPROCS>1 (its documented purpose), where two goroutines in different
 // synctest bubbles on different Ms could arm fake timers concurrently and race a plain
-// slice append. CAS-prepend serializes it with no lock, so it adds no lock-rank edge (the
-// register path is reached from (*timer).modify BEFORE modify takes the timer's own
-// lock). A given timer is armed by one goroutine, so its own t.dstReg/t.dstFakeNext are
-// never concurrently written; only the shared head races, which the CAS handles.
+// slice append. The register path releases this lock before (*timer).modify takes the
+// timer's own lock, so no nested lock-rank edge is introduced.
 var dstFakeTimers struct {
+	lock  mutex
 	epoch atomic.Uint64
 	head  atomic.Pointer[timer]
 }
 
-// dstFakeTimersRoll resets the stack at the start of a new run (epoch change). The CAS
-// makes the reset fire exactly once across concurrent arrivals at a new epoch.
+var dstFakeTimersRollTestEntered atomic.Pointer[uint32]
+var dstFakeTimersRollTestRelease atomic.Pointer[uint32]
+
+// dstFakeTimersRoll resets the stack at the start of a new run (epoch change).
 func dstFakeTimersRoll() {
+	lock(&dstFakeTimers.lock)
+	dstFakeTimersRollLocked()
+	unlock(&dstFakeTimers.lock)
+}
+
+func dstFakeTimersRollLocked() {
 	e := dstRunEpoch.Load()
-	old := dstFakeTimers.epoch.Load()
-	if e != old && dstFakeTimers.epoch.CompareAndSwap(old, e) {
+	if e != dstFakeTimers.epoch.Load() {
+		if dstBuild {
+			if entered := dstFakeTimersRollTestEntered.Load(); entered != nil && dstFakeTimersRollTestEntered.CompareAndSwap(entered, nil) {
+				atomic.Store(entered, 1)
+				for release := dstFakeTimersRollTestRelease.Load(); release != nil && atomic.Load(release) == 0; {
+					procyield(10)
+				}
+			}
+		}
 		dstFakeTimers.head.Store(nil)
+		dstFakeTimers.epoch.Store(e)
 	}
 }
 
@@ -609,8 +624,10 @@ func dstFakeTimersRoll() {
 // the chain (a reused timer overwrites its own dstFakeNext at next registration, so
 // clearing here only matters for timers not re-armed).
 func dstFakeTimersReset() {
+	lock(&dstFakeTimers.lock)
+	defer unlock(&dstFakeTimers.lock)
 	t := dstFakeTimers.head.Load()
-	dstFakeTimers.head.Store(nil) // single-threaded Run boundary: no concurrent prepend
+	dstFakeTimers.head.Store(nil)
 	for t != nil {
 		next := t.dstFakeNext
 		t.dstFakeNext = nil
@@ -622,23 +639,18 @@ func dstFakeTimersReset() {
 // Called from (*timer).modify under dstActive && t.isFake (before modify takes t's own
 // lock). On the Run path, single-P cooperative scheduling serializes both the t.dstReg
 // dedup and the head prepend; the only concurrency is the white-box GOMAXPROCS>1 arm
-// path, where distinct timers race the shared head — a CAS-prepend serializes that
-// lock-free (a given timer is armed by one goroutine, so its own dstReg/dstFakeNext are
-// not concurrently written).
+// path, where the shared epoch/list lock serializes distinct timers.
 func dstRegisterFakeTimer(t *timer) {
-	dstFakeTimersRoll()
-	e := uint32(dstFakeTimers.epoch.Load())
+	lock(&dstFakeTimers.lock)
+	defer unlock(&dstFakeTimers.lock)
+	dstFakeTimersRollLocked()
+	e := dstFakeTimers.epoch.Load()
 	if t.dstReg == e {
 		return
 	}
 	t.dstReg = e
-	for {
-		head := dstFakeTimers.head.Load()
-		t.dstFakeNext = head
-		if dstFakeTimers.head.CompareAndSwap(head, t) {
-			return
-		}
-	}
+	t.dstFakeNext = dstFakeTimers.head.Load()
+	dstFakeTimers.head.Store(t)
 }
 
 // dstDriftHostClock changes host's clock rate to ppb parts-per-billion mid-run
@@ -710,11 +722,11 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 		return // identity re-map
 	}
 	dstFakeTimersRoll()
-	epoch := uint32(dstFakeTimers.epoch.Load())
+	epoch := dstFakeTimers.epoch.Load()
 	// DriftClock runs only on the single-P Run path, so the stack is not being
-	// prepended concurrently here; walk it directly from the atomic head. (The
-	// lock-free head exists for the white-box GOMAXPROCS>1 arm path, which never
-	// calls DriftClock.) Each timer is re-mapped under its own lock.
+	// prepended concurrently here; walk it directly from the atomic head. The
+	// white-box GOMAXPROCS>1 arm path never calls DriftClock. Each timer is re-mapped
+	// under its own lock.
 	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
 		t.lock()
 		if t.dstReg == epoch && t.dstHost == host {
