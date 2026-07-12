@@ -447,27 +447,24 @@ func TestExploreDoesNotConsumeForeignBubbleFailure(t *testing.T) {
 }
 
 // TestExploreForeignBubbleSyncChurnRace is the RACE-BUILD arm of the
-// membership pins: under -race the auto-instrumented access path and the
-// sync-event recording sites (chan.go's raceenabled-gated
-// dstRecordSyncEventForGID calls) are live, and a foreign-bubble goroutine's
-// instrumented access can reach the inline filtered commit — dstCommitAccess
-// with seq 0 — through dstAccessShouldYield's early false, burning log space
-// and forcing the filter conservative for the whole episode. The yield
-// gate's membership term and the sync-event degrade must keep every foreign
-// entry out of the logs. Trace-byte equality is NOT asserted (the -race
+// membership nets: under -race the auto-instrumented access path and the
+// sync-event recording sites are live while a foreign bubble churns. The log
+// cleanliness assertions guard the resulting trace, but the membership mutants
+// do not themselves have reachable log-producing doors, as explained below.
+// Trace-byte equality is NOT asserted (the -race
 // yield placement is foreign-sensitive; ForeignSched reports it) — the pins
 // are the logs' cleanliness. The SUT is race-free so tRunner survives.
 //
-// KNOWN COVERAGE CAP: the log-cleanliness assertions cannot fire under a
-// membership-gate regression in THIS shape, because the shape shields its
-// own doors — the foreign rendezvous wakes set the conservative filter flag
-// (the edge degrade) before any foreign access reaches
-// dstAccessShouldYield, whose first line then routes every auto access to
-// the pending path, which never commits for an infra-picked goroutine. An
-// edge-free foreign shape (pure instrumented-write churn, no rendezvous)
-// would leave the flag clear and open the inline-commit door
-// (dstAccessMaybeShared false, early false, inline dstCommitAccess with
-// seq 0); until such an arm exists, the assertions stay as nets.
+// The access-gate mutant has no log-producing door: race instrumentation omits
+// nonescaping stack locals, while every instrumented foreign access is outside
+// the current stack. dstAccessMaybeShared therefore returns true, seq 0 forces
+// conservative pending mode, and an infrastructure-picked goroutine never
+// commits that pending access. The membership guard remains structural defense;
+// the access-log assertions below are nets, not a killing arm. The sync-event
+// seq-zero fallback is likewise unreachable from foreign work after the sticky
+// membership gate: a non-member returns before indexing, while dstEnsureSeq
+// returns nonzero for every member. It remains defensive conservative handling
+// for an internal invariant break, not a separately reachable foreign door.
 func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
