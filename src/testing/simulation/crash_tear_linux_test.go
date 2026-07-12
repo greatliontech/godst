@@ -8,10 +8,12 @@ package simulation
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -398,6 +400,7 @@ func TestDSTCrashTearTruncateDown(t *testing.T) {
 // therefore show identical content.
 func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 	const page = 4096
+	sawAlias := false
 	for seed := uint64(1); seed <= 24; seed++ {
 		var src, dst []byte
 		var srcErr, dstErr error
@@ -431,6 +434,27 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 				Process("recover", func() {
 					src, srcErr = os.ReadFile("/a/f")
 					dst, dstErr = os.ReadFile("/b/f")
+					if srcErr == nil && dstErr == nil {
+						sawAlias = true
+						a, _ := os.Stat("/a/f")
+						b, _ := os.Stat("/b/f")
+						if !os.SameFile(a, b) {
+							t.Fatalf("seed %d: recovered aliases are not one inode", seed)
+						}
+						LimitDisk("h", page+1)
+						f, err := os.OpenFile("/b/f", os.O_WRONLY|os.O_APPEND, 0)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if n, err := f.Write([]byte("xy")); n != 1 || !errors.Is(err, syscall.ENOSPC) {
+							t.Fatalf("seed %d: alias-capacity write = %d, %v; want 1, ENOSPC", seed, n, err)
+						}
+						f.Close()
+						fi, _ := os.Stat("/a/f")
+						if fi.Size() != page+1 {
+							t.Fatalf("seed %d: alias size = %d, want %d", seed, fi.Size(), page+1)
+						}
+					}
 				})
 			})
 		})
@@ -444,6 +468,9 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 				}
 			}
 		}
+	}
+	if !sawAlias {
+		t.Fatal("seed sweep did not recover both rename aliases")
 	}
 }
 

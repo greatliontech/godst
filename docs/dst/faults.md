@@ -611,7 +611,8 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   produce for a regular file, and the SUT's `errors.Is(err, ENOSPC)` recovery path does not fire on
   exactly the write the fault was injected to exercise (and `Write` vs `WriteAt`, which has its own
   loop, would disagree — a state no kernel produces). Space in use is summed on demand from the live
-  tree (`residentLocked`), **not** tracked incrementally, so a delete or truncate-down frees room for the
+  tree (`residentLocked`) by unique inode identity — a crash-tear rename image may contain both old and
+  new names for one inode, whose bytes count once — and is **not** tracked incrementally, so a delete or truncate-down frees room for the
   next write with no accounting in the mutation paths — and never the false ENOSPC a budget-that-ignores-
   frees would produce (DoF: a full disk; sound because in-place overwrites consume nothing, frees are
   honored, and the partial-fill matches real short-write semantics). A write whose effective slice

@@ -31,7 +31,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [network handles cross run epochs](./dst-net-handles-cross-run-epochs.md) | M | connections and listeners reject stale epochs |
 | [process restart inherits cwd](./dst-process-restart-inherits-cwd.md) | M | process teardown resets cwd |
 | [process restart inherits environment](./dst-process-restart-inherits-environment.md) | M | process teardown resets environment state |
-| [crash aliases double-count disk capacity](./dst-fs-crash-alias-double-counts-capacity.md) | M | resident bytes count unique nodes |
 | [crash directory aliases permit a cycle](./dst-fs-crash-directory-alias-allows-cycle.md) | M | rename containment is node-based and acyclic |
 | [Root handles are not owned by teardown](./dst-root-not-owned-by-process-or-host.md) | M | Root participates in process and host teardown |
 | [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |

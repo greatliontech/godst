@@ -1193,14 +1193,19 @@ func (d *dstFile) diskEIO() error {
 // residentLocked sums the live byte size of every regular file on the disk — the
 // space a capacity is measured against. Summed on demand (not tracked incrementally)
 // so a delete or truncate-down frees space for the next write with no accounting in
-// the mutation paths; each node has exactly one name (no hard links — os.Link is
-// fenced under simulation), so the walk counts each file once. Removed-but-open files
+// the mutation paths. Crash recovery can leave two names for one renamed inode,
+// so identity tracking counts each reachable node once. Removed-but-open files
 // are not in the tree and so are not counted, which only ever under-counts space in
 // use — never a false ENOSPC. Caller holds dstFS.mu.
 func (disk *dstFSDisk) residentLocked() int64 {
 	var total int64
+	seen := make(map[*dstFSNode]bool)
 	var walk func(n *dstFSNode)
 	walk = func(n *dstFSNode) {
+		if seen[n] {
+			return
+		}
+		seen[n] = true
 		if n.isDir {
 			for _, c := range n.entries {
 				walk(c)

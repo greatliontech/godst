@@ -71,7 +71,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Filesystem crash-image functions
 
-- [ ] 34. `residentLocked` counts unique nodes in every crash-tear alias image (`dst-fs-crash-alias-double-counts-capacity`)
+- [x] 34. `residentLocked` counts unique nodes in every crash-tear alias image (`dst-fs-crash-alias-double-counts-capacity`)
 - [ ] 35. `dstRename` uses node containment so crash-recovered directory aliases cannot form cycles (`dst-fs-crash-directory-alias-allows-cycle`)
 
 ## File, Root, and process-state functions
