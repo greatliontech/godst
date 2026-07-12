@@ -13,6 +13,9 @@ package syscall
 
 const dstEnvEnabled = false
 
+func dstEnvDispatchLock()   {}
+func dstEnvDispatchUnlock() {}
+
 func dstGetenv(key string) (value string, found, handled bool) { return "", false, false }
 func dstSetenv(key, value string) (err error, handled bool)    { return nil, false }
 func dstUnsetenv(key string) (err error, handled bool)         { return nil, false }

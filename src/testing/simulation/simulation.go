@@ -187,6 +187,12 @@ func dstSetSimEnv(hostname string, pid, numcpu int)
 //go:linkname dstClearSimEnv runtime.dstClearSimEnv
 func dstClearSimEnv()
 
+//go:linkname dstEnvDispatchLock runtime.dstEnvDispatchLock
+func dstEnvDispatchLock()
+
+//go:linkname dstEnvDispatchUnlock runtime.dstEnvDispatchUnlock
+func dstEnvDispatchUnlock()
+
 //go:linkname dstSetMemLimit runtime.dstSetMemLimit
 func dstSetMemLimit(limit int64)
 
@@ -717,6 +723,8 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numc
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
 }
 
+var dstEnvRunEdgeHook func(activating bool)
+
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
 func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
@@ -732,18 +740,32 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	if kind == kindScheduled {
 		dstSetSchedule(prefix)
 	}
-	dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
-	dstSetMemLimit(memLimit)
-	dstSetNetCrossHostLatency(netLatencyNs)
-	dstSetNetCrossHostJitter(netJitterNs)
-	dstSetNetCrossHostBandwidth(netBandwidthBps)
-	dstSetNetSendBuffer(netSendBuf)
-	dstSetNetRetransmitTimeout(netRetransNs)
-	dstActivate(seed)
+	if dstEnvRunEdgeHook != nil {
+		dstEnvRunEdgeHook(true)
+	}
+	func() {
+		dstEnvDispatchLock()
+		defer dstEnvDispatchUnlock()
+		dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
+		dstSetMemLimit(memLimit)
+		dstSetNetCrossHostLatency(netLatencyNs)
+		dstSetNetCrossHostJitter(netJitterNs)
+		dstSetNetCrossHostBandwidth(netBandwidthBps)
+		dstSetNetSendBuffer(netSendBuf)
+		dstSetNetRetransmitTimeout(netRetransNs)
+		dstActivate(seed)
+	}()
 	defer func() {
-		dstDeactivate()
-		dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
-		dstClearSimEnv()
+		if dstEnvRunEdgeHook != nil {
+			dstEnvRunEdgeHook(false)
+		}
+		func() {
+			dstEnvDispatchLock()
+			defer dstEnvDispatchUnlock()
+			dstDeactivate()
+			dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
+			dstClearSimEnv()
+		}()
 		dstSetMemLimit(0)
 		dstSetNetCrossHostLatency(0)
 		dstSetNetCrossHostJitter(0)

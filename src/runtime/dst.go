@@ -1463,6 +1463,8 @@ const (
 	dstSimHomeDir  = "/home/sim"
 )
 
+var dstEnvDispatchGate atomic.Uint32
+
 // dstSetSimEnv records the simulated process identity for the next run. Called by
 // testing/simulation.run before dstActivate; cleared by dstClearSimEnv on return.
 //
@@ -2077,6 +2079,16 @@ func dstSimGetegid() (int, bool) { return dstSimGID, dstSimEnvSet }
 //
 //go:linkname dstSimEnvProc
 func dstSimEnvProc() (proc uint32, ok bool) { return getg().dstProc, dstSimEnvSet }
+
+//go:linkname dstEnvDispatchLock
+func dstEnvDispatchLock() {
+	for !dstEnvDispatchGate.CompareAndSwap(0, 1) {
+		Gosched()
+	}
+}
+
+//go:linkname dstEnvDispatchUnlock
+func dstEnvDispatchUnlock() { dstEnvDispatchGate.Store(0) }
 
 // dstSimUser is read by os/user.Current to return the simulated current user. It
 // returns uid/gid as ints from the single source of truth; os/user formats them.

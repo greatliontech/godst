@@ -32,7 +32,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [Host declaration failure is not atomic](./dst-host-declaration-failure-not-atomic.md) | M | failed Host declarations publish no partial state |
 | [PID exhaustion leaks a process stamp](./dst-process-pid-exhaustion-leaks-stamp.md) | M | failed Process declarations restore caller identity |
 | [process exit publishes dead pid too early](./dst-process-exit-publishes-dead-too-early.md) | M | exit liveness follows thread and resource teardown coherently |
-| [environment dispatch straddles run edges](./dst-env-dispatch-straddles-run-edge.md) | M | environment world selection is atomic with run edges |
 | [loong64 Fstat exposes page-cache descriptors](./dst-loong64-fstat-exposes-pagecache-fd.md) | M | chunk 62, with qemu-user available for the runtime witness |
 | [Host NumCPU wraps through int32](./dst-host-numcpu-wraps-int32.md) | L | accepted NumCPU values are exact or fail loudly |
 | [network delay arithmetic can overflow](./dst-net-delay-arithmetic-overflows.md) | L | accepted network delay arithmetic cannot wrap |

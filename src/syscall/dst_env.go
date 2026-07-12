@@ -30,6 +30,12 @@ func dstEnvProcessTeardown(proc uint32) {
 // env_unix.go entry point.
 const dstEnvEnabled = true
 
+//go:linkname dstEnvDispatchLock runtime.dstEnvDispatchLock
+func dstEnvDispatchLock()
+
+//go:linkname dstEnvDispatchUnlock runtime.dstEnvDispatchUnlock
+func dstEnvDispatchUnlock()
+
 //go:linkname dstSimEnvProc runtime.dstSimEnvProc
 func dstSimEnvProc() (proc uint32, ok bool)
 

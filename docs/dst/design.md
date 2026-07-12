@@ -213,6 +213,10 @@ the host, so run determinism additionally requires that no foreign goroutine wri
 mid-run. This holds by construction — a SUT's own goroutines run inside the bubble (deterministically
 ordered), and the harness does not `Setenv` mid-run — and is the write-side analogue of the read-only
 "harmless" argument below.
+Environment dispatch is atomic with run activation and deactivation: each API operation holds one
+runtime gate from host-versus-simulated selection through its read or mutation, while publishing or
+clearing the simulated environment takes the same gate. An operation therefore belongs wholly to the
+host or to one run epoch; it cannot choose one world and complete in the other.
 This is a deliberate gating asymmetry: identity is gated on `dstSimEnvSet` (set only by
 `testing/simulation.run`), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
 by `dstActivate` too). So a white-box run sees seeded RNG, scheduling, and crypto/rand but the *real*
