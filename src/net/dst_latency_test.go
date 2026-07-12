@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"syscall"
 	"testing"
 	"testing/simulation"
 	"time"
@@ -29,6 +30,184 @@ func TestDSTConnectDelayOverflowWaitsForContext(t *testing.T) {
 			t.Errorf("overflowing SYN delay returned %v, want context deadline", err)
 		}
 	})
+}
+
+func TestDSTNetSYNACKObservesContextDeadline(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	const latency = 100 * time.Millisecond
+	var conn Conn
+	var dialErr error
+	var dialDuration time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+		port := make(chan string, 1)
+		release := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-release
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			conn, dialErr = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("A")+":"+<-port)
+			dialDuration = time.Since(start)
+			close(release)
+		})
+	})
+	if conn != nil || !errors.Is(dialErr, context.DeadlineExceeded) {
+		t.Fatalf("deadline during SYN-ACK returned (%v, %v), want nil context deadline", conn, dialErr)
+	}
+	if dialDuration != 150*time.Millisecond {
+		t.Fatalf("SYN-ACK context deadline returned after %v, want 150ms", dialDuration)
+	}
+}
+
+func TestDSTNetSYNACKObservesReset(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var conn Conn
+	var dialErr error
+	var dialDuration time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				simulation.Reset("A", "B")
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			start := time.Now()
+			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			dialDuration = time.Since(start)
+		})
+	})
+	if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
+		t.Fatalf("reset during SYN-ACK returned (%v, %v), want nil ECONNRESET", conn, dialErr)
+	}
+	if dialDuration != 100*time.Millisecond {
+		t.Fatalf("SYN-ACK reset returned after %v, want one-way 100ms", dialDuration)
+	}
+}
+
+func TestDSTNetSYNACKObservesServerProcessExit(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var conn Conn
+	var dialErr error
+	var dialDuration time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			go simulation.Process("server", func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p
+				_, _ = ln.Accept()
+			})
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			start := time.Now()
+			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			dialDuration = time.Since(start)
+		})
+	})
+	if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
+		t.Fatalf("server process exit during SYN-ACK returned (%v, %v), want nil ECONNRESET", conn, dialErr)
+	}
+	if dialDuration != 100*time.Millisecond {
+		t.Fatalf("server exit during SYN-ACK returned after %v, want one-way 100ms", dialDuration)
+	}
+}
+
+func TestDSTNetSYNACKObservesHostCrash(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var conn Conn
+	var dialErr error
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		accepted := make(chan struct{})
+		dialDone := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				close(accepted)
+				defer c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+				conn, dialErr = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("A")+":"+<-port)
+				close(dialDone)
+			}()
+		})
+		<-accepted
+		simulation.CrashHost("A")
+		<-dialDone
+	})
+	if conn != nil || dialErr == nil {
+		t.Fatalf("host crash during SYN-ACK returned (%v, %v), want nil error", conn, dialErr)
+	}
+}
+
+func TestDSTNetSYNACKSurvivesListenerCloseAfterAccept(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var conn Conn
+	var dialErr error
+	var dialDuration time.Duration
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		release := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				ln.Close()
+				<-release
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			start := time.Now()
+			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			dialDuration = time.Since(start)
+			close(release)
+			if conn != nil {
+				conn.Close()
+			}
+		})
+	})
+	if dialErr != nil || conn == nil {
+		t.Fatalf("listener close after Accept returned (%v, %v), want live connection", conn, dialErr)
+	}
+	if dialDuration != 200*time.Millisecond {
+		t.Fatalf("listener close after Accept completed in %v, want full 200ms RTT", dialDuration)
+	}
 }
 
 func TestDSTBaseTimerClampsAtRepresentableDeadline(t *testing.T) {

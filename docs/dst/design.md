@@ -380,7 +380,8 @@ it never wraps a positive delay into an earlier delivery.
   link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + a jitter draw;
   throttle exempts the zero-payload control segments) — the SYN half is paid before the server's
   Accept unblocks and is context-interruptible (a connect deadline shorter than the RTT fails
-  mid-handshake); the SYN-ACK half then delays the dialer's return, so the server sees the conn at
+  mid-handshake); the SYN-ACK half remains context-interruptible and aborts if either endpoint is
+  reset or torn down before it arrives. It then delays the dialer's return, so the server sees the conn at
   ½ RTT and the dialer returns at one full RTT (`TestDSTNetConnectPaysRTT`). Same-host connects are
   instant. A dial across a **partition** blackholes: it blocks until the link heals, the
   context/deadline expires, or the retransmit horizon fires `ETIMEDOUT`

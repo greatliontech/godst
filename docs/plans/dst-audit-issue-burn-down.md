@@ -97,7 +97,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Network establishment and handle functions
 
-- [ ] 48. the SYN-ACK traversal observes cancellation, reset, process exit, and host crash before success (`dst-net-synack-ignores-cancel-and-teardown`)
+- [x] 48. the SYN-ACK traversal observes cancellation, reset, process exit, and host crash before success (`dst-net-synack-ignores-cancel-and-teardown`)
 - [ ] 49. connection ownership publishes atomically with listener handoff and teardown visibility (`dst-net-accept-handoff-precedes-ownership`)
 - [ ] 50. stateful connection/listener operations reject stale epochs; address accessors stay immutable and Close remains local cleanup (`dst-net-handles-cross-run-epochs`)
 

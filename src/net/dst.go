@@ -952,18 +952,34 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 	}
 }
 
-// dstConnectSYNACK sleeps out the second half of the connect round trip (the SYN-ACK
-// travelling back to the dialer), so a cross-host dial returns one full RTT after it
-// began. It runs AFTER the accept handoff, where establishment commits (the existing
-// model treats the handoff as the commit point), so it only delays the dialer's return
-// and is not ctx-interruptible — like the buffered wire delays that follow. Same-host
-// (zero latency/jitter) returns instantly and draws nothing.
-func dstConnectSYNACK(latencyNs, jitterNs int64) {
-	if d := dstLinkDelay(latencyNs, jitterNs); d > 0 {
-		t := dstNewBaseTimer(time.Duration(d))
-		<-t.C
-		t.Stop()
+// dstConnectSYNACK waits for the second handshake traversal while the connect
+// context and both transport endpoints remain live.
+func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWireEnd, reset *atomic.Bool) error {
+	d := dstLinkDelay(latencyNs, jitterNs)
+	if d <= 0 {
+		if err := ctx.Err(); err != nil {
+			return mapErr(err)
+		}
+		if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+			return syscall.ECONNRESET
+		}
+		return nil
 	}
+	t := dstNewBaseTimer(time.Duration(d))
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	case <-e.localDone:
+	case <-e.remoteDone:
+	}
+	if err := ctx.Err(); err != nil {
+		return mapErr(err)
+	}
+	if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+		return syscall.ECONNRESET
+	}
+	return nil
 }
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
@@ -1261,10 +1277,16 @@ redial:
 			dstConnRegister(dialer) // queued: a live conn
 			dstConnRegister(server)
 		}
-		// SYN-ACK: the acknowledgment travels back; the connect completes one full RTT
-		// after it began. Committed at the handoff above, so this only delays the
-		// dialer's return (not ctx-interruptible), like the wire delays that follow.
-		dstConnectSYNACK(latency, jitter)
+		// SYN-ACK: the acknowledgment travels back; context expiry or endpoint
+		// teardown before its arrival aborts the connect and tears down both ends.
+		if err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset); err != nil {
+			dialer.resetConn()
+			server.resetConn()
+			if dstHostDead(l.host) {
+				goto redial
+			}
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
+		}
 		return dialer, nil
 	case <-l.done:
 		stopBacklogHorizon()
