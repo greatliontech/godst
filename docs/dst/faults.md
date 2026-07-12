@@ -844,7 +844,10 @@ FIN-then-RST arm is not generated. Goroutine teardown is per-invocation (pid-key
 resource teardown is per logical process (proc-keyed), so with concurrent same-name invocations it runs
 when the LAST live invocation dies. The logical process id remains stable for targeting
 and resource registries, while the pid is the invocation generation; a same-name restart gets a fresh pid and
-does not revive the crashed goroutines.
+does not revive the crashed goroutines. Finalizers and cleanups registered by an invocation carry its
+run epoch and PID through GC discovery and queueing; once PID death is published, queued or later-discovered callbacks
+are discarded rather than executed by the root drain. A live sibling with the same logical process id
+retains its own callbacks.
 
 Two consequences of pid-keyed goroutine death, both contractual. **A goroutine cannot outlive its
 process.** One that escaped the pid-keyed mark because it was inside a NESTED `Process` body when its

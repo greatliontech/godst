@@ -44,13 +44,14 @@ const (
 )
 
 var (
-	finlock     mutex     // protects the following variables
-	fing        *g        // goroutine that runs finalizers
-	finq        *finBlock // list of finalizers that are to be executed
-	finc        *finBlock // cache of free blocks
-	finptrmask  [finBlockSize / goarch.PtrSize / 8]byte
-	finqueued   uint64 // monotonic count of queued finalizers
-	finexecuted uint64 // monotonic count of executed finalizers
+	finlock      mutex     // protects the following variables
+	fing         *g        // goroutine that runs finalizers
+	finq         *finBlock // list of finalizers that are to be executed
+	finc         *finBlock // cache of free blocks
+	finptrmask   [finBlockSize / goarch.PtrSize / 8]byte
+	finqueued    uint64 // monotonic count of queued finalizers
+	finexecuted  uint64 // monotonic count of executed finalizers
+	findiscarded uint64 // monotonic count discarded because the owning process invocation died
 
 	// Finalizers queued before a DST run are process-level work, not part of the
 	// run's bubble. They are detached before dstActive is set, ignored by the
@@ -76,32 +77,14 @@ var allfin *finBlock // list of all blocks
 
 // NOTE: Layout known to queuefinalizer.
 type finalizer struct {
-	fn     *funcval       // function to call (may be a heap pointer)
-	arg    unsafe.Pointer // ptr to object (may be a heap pointer)
-	nret   uintptr        // bytes of return values from fn
-	fint   *_type         // type of first argument of fn
-	ot     *ptrtype       // type of ptr to object (may be a heap pointer)
-	dstSeq uintptr        // DST per-run registration sequence (from specialfinalizer.dstSeq); the bubble drain sorts by it. 0 for non-DST/foreign. uintptr = 1 word on every arch (finalizer1 assumes 6 words).
-}
-
-var finalizer1 = [...]byte{
-	// Each Finalizer is 6 words, ptr ptr INT ptr ptr INT (INT = uintptr here; the
-	// trailing INT is DST's non-pointer dstSeq). Each byte describes 8 words.
-	// Need 4 Finalizers described by 3 bytes before the pattern repeats (24 words):
-	//	ptr ptr INT ptr ptr INT
-	//	ptr ptr INT ptr ptr INT
-	//	ptr ptr INT ptr ptr INT
-	//	ptr ptr INT ptr ptr INT
-	// aka
-	//
-	//	ptr ptr INT ptr ptr INT ptr ptr
-	//	INT ptr ptr INT ptr ptr INT ptr
-	//	ptr INT ptr ptr INT ptr ptr INT
-	//
-	// Assumptions about Finalizer layout checked below.
-	1<<0 | 1<<1 | 0<<2 | 1<<3 | 1<<4 | 0<<5 | 1<<6 | 1<<7,
-	0<<0 | 1<<1 | 1<<2 | 0<<3 | 1<<4 | 1<<5 | 0<<6 | 1<<7,
-	1<<0 | 0<<1 | 1<<2 | 1<<3 | 0<<4 | 1<<5 | 1<<6 | 0<<7,
+	fn       *funcval       // function to call (may be a heap pointer)
+	arg      unsafe.Pointer // ptr to object (may be a heap pointer)
+	nret     uintptr        // bytes of return values from fn
+	fint     *_type         // type of first argument of fn
+	ot       *ptrtype       // type of ptr to object (may be a heap pointer)
+	dstSeq   uintptr        // DST per-run registration sequence (from specialfinalizer.dstSeq); the bubble drain sorts by it. 0 for non-DST/foreign.
+	dstEpoch uint64         // DST run generation paired with dstPid
+	dstPid   int32          // DST process invocation owner; 0 for process-level or foreign work
 }
 
 // lockRankMayQueueFinalizer records the lock ranking effects of a
@@ -110,7 +93,7 @@ func lockRankMayQueueFinalizer() {
 	lockWithRankMayAcquire(&finlock, getLockRank(&finlock))
 }
 
-func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64, dstSeq uintptr) {
+func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64, dstSeq uintptr, dstPid int32) {
 	if gcphase != _GCoff {
 		// Currently we assume that the finalizer queue won't
 		// grow during marking so we don't have to rescan it
@@ -152,6 +135,8 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 	f.ot = ot
 	f.arg = p
 	f.dstSeq = dstSeq // carried from the special; the bubble drain sorts its batch by it
+	f.dstEpoch = dstEpoch
+	f.dstPid = dstPid
 	finqueued++
 	unlock(&finlock)
 	if !deferred {
@@ -172,17 +157,27 @@ func finAllocBlockLocked() *finBlock {
 		if finptrmask[0] == 0 {
 			// Build pointer mask for Finalizer array in block.
 			// Check assumptions made in finalizer1 array above.
-			if (unsafe.Sizeof(finalizer{}) != 6*goarch.PtrSize ||
+			words := unsafe.Sizeof(finalizer{}) / goarch.PtrSize
+			if (words != 8 && words != 9 ||
 				unsafe.Offsetof(finalizer{}.fn) != 0 ||
 				unsafe.Offsetof(finalizer{}.arg) != goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.nret) != 2*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.fint) != 3*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.dstSeq) != 5*goarch.PtrSize) {
+				unsafe.Offsetof(finalizer{}.dstSeq) != 5*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.dstEpoch) != 6*goarch.PtrSize ||
+				unsafe.Offsetof(finalizer{}.dstPid) != 6*goarch.PtrSize+unsafe.Sizeof(uint64(0))) {
 				throw("finalizer out of sync")
 			}
 			for i := range finptrmask {
-				finptrmask[i] = finalizer1[i%len(finalizer1)]
+				var mask byte
+				for bit := 0; bit < 8; bit++ {
+					word := i*8 + bit
+					if word%int(words) == 0 || word%int(words) == 1 || word%int(words) == 3 || word%int(words) == 4 {
+						mask |= 1 << bit
+					}
+				}
+				finptrmask[i] = mask
 			}
 		}
 	}
@@ -328,6 +323,7 @@ func runFinqBlocks(fb *finBlock) {
 			dstDrainingFinq = fb
 		}
 		n := fb.cnt
+		var executed uint64
 		for i := n; i > 0; i-- {
 			for dstBuild && onFing && dstParkFingIfBlocked() {
 			}
@@ -384,7 +380,23 @@ func runFinqBlocks(fb *finBlock) {
 			if onFing {
 				fingStatus.Or(fingRunningFinalizer)
 			}
-			reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
+			invoked := true
+			if dstBuild {
+				invoked = dstCallbackOwnerAlive(f.dstEpoch, f.dstPid)
+			}
+			if invoked {
+				if dstBuild {
+					oldPid := gp.dstPid
+					if onDrain && f.dstPid > 0 {
+						gp.dstPid = f.dstPid
+					}
+					reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
+					gp.dstPid = oldPid
+				} else {
+					reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
+				}
+				executed++
+			}
 			if onFing {
 				fingStatus.And(^fingRunningFinalizer)
 			}
@@ -399,7 +411,11 @@ func runFinqBlocks(fb *finBlock) {
 			atomic.Store(&fb.cnt, i-1)
 			if onDrain {
 				lock(&finlock)
-				finexecuted++
+				if invoked {
+					finexecuted++
+				} else {
+					findiscarded++
+				}
 				unlock(&finlock)
 				if dstActive() {
 					dstFinqRunExecuted.Add(1)
@@ -409,7 +425,8 @@ func runFinqBlocks(fb *finBlock) {
 		next := fb.next
 		lock(&finlock)
 		if !onDrain {
-			finexecuted += uint64(n)
+			finexecuted += executed
+			findiscarded += uint64(n) - executed
 		}
 		fb.next = finc
 		finc = fb
@@ -434,7 +451,7 @@ func finPending() bool {
 		return queued != dstFinqRunExecuted.Load()
 	}
 	lock(&finlock)
-	pending := finqueued != finexecuted
+	pending := finqueued != finexecuted+findiscarded
 	unlock(&finlock)
 	return pending
 }

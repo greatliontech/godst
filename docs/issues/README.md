@@ -23,7 +23,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [O_DSYNC conflates to full O_SYNC](./dst-fs-odsync-conflates-osync.md) | L | data-only commit wired, or conflation recorded |
 | [crash scans skip temporarily disassociated simulation goroutines](./dst-runtime-crash-skips-disassociated-members.md) | H | crash victim scans key on sticky simulation membership |
 | [crashed stacks retain process memory as GC roots](./dst-crash-retains-stacks-and-process-memory.md) | H | crashed invocation stacks no longer retain process memory |
-| [callbacks can run after their process exits](./dst-process-callbacks-run-after-exit.md) | H | dead-process callbacks cannot execute after exit |
 | [mapping-fault process death skips resource teardown](./dst-mapping-fault-skips-resource-teardown.md) | H | mapping faults route through complete process teardown |
 | [graceful EOF can strand a concurrent reader](./dst-net-concurrent-eof-strands-reader.md) | H | persistent EOF wakes every eligible reader |
 | [SYN-ACK traversal ignores cancellation and teardown](./dst-net-synack-ignores-cancel-and-teardown.md) | H | full handshake observes context and endpoint death |

@@ -305,9 +305,8 @@ type cleanupBlock struct {
 	cleanups [(cleanupBlockSize - unsafe.Sizeof(cleanupBlockHeader{})) / unsafe.Sizeof(cleanupFn{})]cleanupFn
 }
 
-// cleanupFn is 4 words: call,fn,arg (pointers) then dstSeq (non-pointer). cleanupFnPtrMask
-// scans a single cleanupFn; cleanupBlockPtrMask (built in gcinit) is 0x77 (two per byte).
-var cleanupFnPtrMask = [...]uint8{0b0111}
+// cleanupFn starts with three pointers followed by non-pointer DST metadata.
+var cleanupFnPtrMask = [...]uint8{0b00111}
 
 // cleanupFn represents a cleanup function with it's argument, yet to be called.
 type cleanupFn struct {
@@ -318,7 +317,9 @@ type cleanupFn struct {
 	// dstSeq is the DST per-run registration sequence (dstNextCallbackSeq at AddCleanup);
 	// the bubble drain sorts its batch by it (gc.md D4). uintptr = 1 word on every arch;
 	// a non-pointer tail, so cleanupFnPtrMask/cleanupBlockPtrMask mark it 0.
-	dstSeq uintptr
+	dstSeq   uintptr
+	dstEpoch uint64
+	dstPid   int32
 }
 
 var cleanupBlockPtrMask [cleanupBlockSize / goarch.PtrSize / 8]byte
@@ -451,7 +452,8 @@ type cleanupQueue struct {
 	// executed is a monotonic count of executed cleanups.
 	//
 	// Read and updated atomically.
-	executed atomic.Uint64
+	executed  atomic.Uint64
+	discarded atomic.Uint64 // callbacks not invoked because their process invocation died
 }
 
 // addWork indicates that n units of parallelizable work have been added to the queue.
@@ -478,6 +480,7 @@ func (q *cleanupQueue) tryTakeWork() bool {
 //
 // Called by the sweeper, and only the sweeper.
 func (q *cleanupQueue) enqueue(c cleanupFn, dstEpoch uint64) {
+	c.dstEpoch = dstEpoch
 	mp := acquirem()
 	pp := mp.p.ptr()
 	if dstActive() && dstEpoch != dstRunEpoch.Load() {
@@ -839,6 +842,7 @@ func runCleanupBlock(b *cleanupBlock) {
 	if onCleanupG {
 		gcCleanups.beginRunningCleanups()
 	}
+	var executed uint64
 	for i := 0; i < int(b.n); i++ {
 		for onCleanupG && dstCallbackWorkersBlocked() {
 			gcCleanups.endRunningCleanups()
@@ -862,8 +866,25 @@ func runCleanupBlock(b *cleanupBlock) {
 			raceacquire(unsafe.Pointer(c.arg))
 		}
 
-		// Execute the next cleanup.
-		c.call(c.fn, c.arg)
+		// Execute the next cleanup unless its registering invocation exited.
+		invoked := true
+		if dstBuild {
+			invoked = dstCallbackOwnerAlive(c.dstEpoch, c.dstPid)
+		}
+		if invoked {
+			if dstBuild {
+				gp := getg()
+				oldPid := gp.dstPid
+				if !onCleanupG && c.dstPid > 0 {
+					gp.dstPid = c.dstPid
+				}
+				c.call(c.fn, c.arg)
+				gp.dstPid = oldPid
+			} else {
+				c.call(c.fn, c.arg)
+			}
+			executed++
+		}
 
 		if raceenabled {
 			// Restore the old context.
@@ -873,7 +894,8 @@ func runCleanupBlock(b *cleanupBlock) {
 	if onCleanupG {
 		gcCleanups.endRunningCleanups()
 	}
-	gcCleanups.executed.Add(int64(b.n))
+	gcCleanups.executed.Add(int64(executed))
+	gcCleanups.discarded.Add(int64(uint64(b.n) - executed))
 
 	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.
 	gcCleanups.free.push(&b.lfnode)
@@ -1126,7 +1148,7 @@ func cleanupPending() bool {
 	if dstActive() {
 		return queued-dstCleanupRunBaseQueued.Load() != dstCleanupRunExecuted.Load()
 	}
-	return queued != executed
+	return queued != executed+gcCleanups.discarded.Load()
 }
 
 // blockUntilEmpty blocks until either the cleanup queue is emptied

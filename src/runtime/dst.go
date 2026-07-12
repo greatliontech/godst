@@ -1478,10 +1478,7 @@ func dstClearSimEnv() {
 // dstPidLivePublishRace and dstPidLiveLoadRace bracket every publish/load of
 // dstPidLive for the race detector: the table pointer moves through
 // runtime-internal atomics, which carry no TSan happens-before annotation,
-// while the Go-map operations INSIDE the table do fire the map runtime's race
-// hooks — so without an explicit release edge at each publish, matched by an
-// acquire at each load, TSan reports every cross-goroutine publish/read pair
-// as a race the CPU-level atomics have already ordered.
+// while map operations inside the table do fire race hooks.
 func dstPidLivePublishRace() {
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(&dstPidLive))
@@ -1604,6 +1601,23 @@ func dstPidAlive(pid int32) bool {
 	}
 	dstPidLiveLoadRace()
 	return t.live[pid]
+}
+
+func dstCallbackPid() int32 {
+	gp := getg().m.curg
+	if dstCallbackEpoch() == 0 || gp == nil || gp.dstProc == 0 || gp.dstPid <= 0 {
+		return 0
+	}
+	return gp.dstPid
+}
+
+func dstCallbackOwnerAlive(epoch uint64, pid int32) bool {
+	return pid == 0 || epoch == dstRunEpoch.Load() && dstPidAlive(pid)
+}
+
+//go:linkname dstCallbacksPendingFP
+func dstCallbacksPendingFP() bool {
+	return finPending() || cleanupPending()
 }
 
 // dstPidStarttime reports the deterministic procfs starttime for a live simulated
@@ -1825,6 +1839,7 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 	}
 	var total, running int
 	var waiterCrashed bool
+	var drainCrashed bool
 	forEachG(func(gp *g) {
 		if gp.bubble != bubble || gp.dstPid != pid {
 			return
@@ -1833,6 +1848,9 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 		gp.dstPid = -pid
 		if gp == bubble.waiter {
 			waiterCrashed = true
+		}
+		if gp == bubble.gcDrain {
+			drainCrashed = true
 		}
 		if status == _Gdead || status == _Gdeadextra {
 			return
@@ -1853,6 +1871,10 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 		// active again and the bubble could never idle. A crashed waiter is not
 		// waiting for anything: clear it, and let the wake fall to the root.
 		bubble.waiter = nil
+	}
+	if drainCrashed {
+		bubble.gcDrain = nil
+		bubble.gcDrainDied = true
 	}
 	bubble.total -= total
 	bubble.running -= running

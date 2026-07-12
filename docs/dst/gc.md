@@ -249,6 +249,20 @@ The unifying invariant — the load-bearing piece of Tier 2:
 > function of the run's own activity — foreign registrations can neither appear in it nor advance the
 > drain's per-g RNG stream (`TestDSTForeignCallbackDeferred`).
 
+Registration ownership also includes the simulated process invocation's `(run epoch, PID)`. That pair is carried from
+the finalizer/cleanup special into its queued entry, and every drain or async worker discards the entry if its owner
+has exited or crashed, whether discovery happened before or after death. Logical process identity is insufficient because concurrent
+same-name invocations share it, while PID alone is insufficient because numeric PIDs repeat across runs. Root and foreign
+registrations retain PID zero and their existing process-level asynchronous semantics. Thus an old
+invocation's callback cannot run under the root drain after exit or attach side effects to a live
+sibling or restart. While user callback code runs, the drain temporarily carries that PID; exit or
+crash therefore kills a blocked/runnable callback like any other thread, marks the drain dead, and
+the existing dead-drain path discards its published remainder. Enforced by
+`TestDSTProcessCallbacksStopAtExit`, `TestDSTProcessCallbackOwnershipIsPerInvocation`,
+`TestDSTProcessCrashStopsRunningCallback`, `TestDSTProcessCrashStopsRunningCleanup`, and
+`TestDSTProcessExitStopsRunningCallback`, `TestDSTProcessExitStopsRunningCleanup`,
+`TestDSTProcessCallbacksDoNotEscapeRun`, and `TestDSTProcessCallbackEpochPreventsPIDReuse`.
+
 Why this is the faithful collapse, dimension by dimension:
 
 - **Determinism (3).** Async `fing` completes a nondeterministic *count* by any given point (probe: 7

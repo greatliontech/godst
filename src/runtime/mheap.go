@@ -2120,6 +2120,7 @@ type specialfinalizer struct {
 	// queued finalizer by queuefinalizer, since the special is freed at sweep. uintptr
 	// to match finalizer.dstSeq (1 word on every arch).
 	dstSeq uintptr
+	dstPid int32
 }
 
 // Adds a finalizer to the object p. Returns true if it succeeded.
@@ -2134,6 +2135,7 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s.ot = ot
 	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
 	s.dstSeq = dstNextCallbackSeq() // per-run registration sequence for the drain's reg-order sort
+	s.dstPid = dstCallbackPid()
 	if addspecial(p, &s.special, false) {
 		// This is responsible for maintaining the same
 		// GC-related invariants as markrootSpans in any
@@ -2202,6 +2204,7 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
 	s.cleanup.dstSeq = dstNextCallbackSeq() // per-run registration sequence; carried into the queue for the drain's reg-order sort
+	s.cleanup.dstPid = dstCallbackPid()
 	s.id = id
 	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
 
@@ -2809,7 +2812,7 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 	switch s.kind {
 	case _KindSpecialFinalizer:
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
-		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot, sf.dstEpoch, sf.dstSeq)
+		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot, sf.dstEpoch, sf.dstSeq, sf.dstPid)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
 		unlock(&mheap_.speciallock)

@@ -1004,11 +1004,12 @@ pattern and were objdump-verified at the change. The DATA layout is NOT zero-foo
 fourteen per-goroutine DST words (the six identity/RNG stamps, the seven race-access staging
 fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries four fake-timer words (arming
 host, registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
-bookkeeping, `specialfinalizer` carries epoch+seq, `specialCleanup` carries epoch, and
-`finalizer`/`cleanupFn` each carry one registration-sequence word (so untagged builds fit slightly
+bookkeeping, `specialfinalizer` carries epoch+sequence+PID, `specialCleanup` carries epoch while its
+embedded cleanup carries sequence+PID, and `finalizer`/`cleanupFn` each carry registration sequence
+plus run-epoch/process-invocation ownership (so untagged builds fit slightly
 fewer entries per block). Restoring the untagged layouts would fork per-tag variants of the runtime's central `g`
-struct and of hand-maintained GC bitmap constants (`finalizer1`'s word pattern;
-`cleanupBlockPtrMask`, whose two-per-byte packing is load-bearing on the 4-word `cleanupFn`) — an
+struct and of hand-maintained GC bitmap construction (`finptrmask` and
+`cleanupBlockPtrMask`, whose repeating patterns are load-bearing on queued callback layouts) — an
 unsafe-critical duplication for a few words per object; recorded here as the deliberate limit, with
 the rationale at the claim in `runtime/dst.go`.
 
