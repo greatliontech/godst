@@ -1305,10 +1305,12 @@ later steps add, never rewrite.
   (`ExploreResult.ForeignSched`, downgrading `Exhausted`): for the pinned workload classes —
   including the GC/finalizer class that used to diverge — recorded traces are byte-identical with
   and without churn in BOTH build modes — simulation membership is a sticky per-goroutine property
-  (`g.dstSimG`), so a simulation goroutine parked inside the GC assist paths (which transiently nil
-  `gp.bubble`) stays a seed-scheduled simulation candidate instead of becoming churn-displaceable
-  infrastructure, the misclassification that used to shrink `-race` coverage under churn and report
-  foreign work where none ran. The downgrade stays conservative (the time-advance machinery's
+  (`g.dstSimG`), so a simulation goroutine parked inside GC-assist paths that transiently nil
+  `gp.bubble` never becomes churn-displaceable infrastructure; consecutive singleton no-choice yields
+  are coalesced after their first attributed transition; enabled sets are ordered by stable goroutine
+  index rather than run-queue position; and the synctest root driver plus transient GC-disassociated
+  execution are scheduled transparently. These rules remove the physical-order inputs that used to
+  shrink `-race` coverage under churn and report foreign work where none ran. The downgrade stays conservative (the time-advance machinery's
   churn sensitivity is a recorded open divergence) — coverage under churn is best-effort and says
   so, never a silent cap. Enforced by `TestDSTSchedForeignSpinner` (run completes under a spinner;
   fingerprints with/without the spinner identical, random and PCT), `TestExploreForeignSpinner`

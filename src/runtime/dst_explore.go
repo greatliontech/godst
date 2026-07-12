@@ -1184,6 +1184,8 @@ func dstScheduleReset() {
 	dstScheduleStep = 0
 	dstScheduleAborted = false
 	dstSchedForeignSeen = false
+	dstLastDecisionSeq = 0
+	dstLastDecisionSingleton = false
 	dstExplorePanicValue = nil
 	dstExplorePanicSet = false
 	dstExploreDeadlock = ""
@@ -1226,6 +1228,8 @@ func dstScheduleReset() {
 // scheduled strategy's recorded decisions this run. Read per episode by the
 // explore harness (dstSchedForeignSeenFP), reset by dstScheduleReset.
 var dstSchedForeignSeen bool
+var dstLastDecisionSeq uint64
+var dstLastDecisionSingleton bool
 
 //go:linkname dstSchedForeignSeenFP
 func dstSchedForeignSeenFP() bool { return dstSchedForeignSeen }
@@ -1253,9 +1257,33 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		if gp := c.at(k); gp != nil {
 			if !dstIsInfraCandidate(gp) {
 				dstEnsureSeq(gp)
-			} else if !(gp.dstSimG && dstSimBubble != nil && dstSimBubble.gcDrain == gp) {
+			} else if !dstTransparentScheduledCandidate(gp) {
 				dstSchedForeignSeen = true
 			}
+		}
+	}
+	simTotal := c.simCount(total)
+	if simTotal == 1 && dstLastDecisionSingleton {
+		for k := uint32(0); k < total; k++ {
+			gp := c.at(k)
+			if gp == nil || dstIsInfraCandidate(gp) || gp.dstSeq != dstLastDecisionSeq {
+				continue
+			}
+			// A sole simulation candidate offers no interleaving choice. Its
+			// physical yield count may vary with GC/runtime progress, so commit
+			// the announced access in the current interval without minting a
+			// replay step whose presence could vary between episodes.
+			addr, pc, count := uintptr(0), uintptr(0), uint64(0)
+			size := uintptr(0)
+			write, auto := false, false
+			if gp.dstAccPend {
+				addr, size, write = gp.dstAccAddr, gp.dstAccSize, gp.dstAccWrite
+				pc, count, auto = gp.dstAccPC, gp.dstAccCount, gp.dstAccAuto
+			}
+			dstCommitAccess(gp, gp.dstSeq, addr, size, write, pc, count, auto, dstScheduleStep)
+			gp.dstAccAddr, gp.dstAccSize, gp.dstAccPC = 0, 0, 0
+			gp.dstAccWrite, gp.dstAccPend, gp.dstAccAuto = false, false, false
+			return k
 		}
 	}
 	var sel uint32
@@ -1281,7 +1309,6 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 	// Record the decision (enabled set in candidate order + chosen id), bounded.
 	// The enabled set is the simulation's candidates only (see the doc above);
 	// with a pure set simTotal == total.
-	simTotal := c.simCount(total)
 	if !dstTraceOverflow && dstTraceN < len(dstTraceChosen) && dstTraceFlatN+int(simTotal) > len(dstTraceEnabFlat) {
 		// The decision would fit, but its enabled set would not: fan-out
 		// overflow, distinct from running out of decisions.
@@ -1342,18 +1369,35 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		chosen.dstAccAuto = false
 		dstTraceEnabOff[dstTraceN] = int32(dstTraceFlatN)
 		dstTraceEnabLen[dstTraceN] = int32(simTotal)
-		for k := uint32(0); k < total; k++ {
-			if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) {
-				dstTraceEnabFlat[dstTraceFlatN] = gp.dstSeq
-				dstTraceFlatN++
+		var after uint64
+		for range simTotal {
+			var next uint64
+			for k := uint32(0); k < total; k++ {
+				gp := c.at(k)
+				if gp == nil || dstIsInfraCandidate(gp) || gp.dstSeq <= after {
+					continue
+				}
+				if next == 0 || gp.dstSeq < next {
+					next = gp.dstSeq
+				}
 			}
+			dstTraceEnabFlat[dstTraceFlatN] = next
+			dstTraceFlatN++
+			after = next
 		}
 		dstTraceN++
 	} else {
 		dstTraceOverflow = true
 	}
 	dstScheduleStep++
+	dstLastDecisionSeq = c.at(sel).dstSeq
+	dstLastDecisionSingleton = simTotal == 1
 	return sel
+}
+
+func dstTransparentScheduledCandidate(gp *g) bool {
+	return dstSchedKind == dstSchedScheduled && gp.dstSimG && dstSimBubble != nil &&
+		(gp.dstGCInternal || dstSimBubble.gcDrain == gp || dstSimBubble.root == gp)
 }
 
 // dstLowestSeqIdx returns the candidate index with the smallest stable index

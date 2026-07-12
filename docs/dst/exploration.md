@@ -290,6 +290,17 @@ mutex is sound and is exactly the interleaving Gap A needs.
      nondeterminism (a "must never happen" condition), so they are defense-in-depth without an
      injected-nondeterminism trigger test; the legitimate panic-truncation path they preserve is
      covered by the sweep's panicking SUTs.
+  5. **Schedules preserve transition ownership without runtime stutter.** The first selection of a
+     sole simulation candidate remains a replay step, anchoring that goroutine's access interval;
+     consecutive singleton yields by the same goroutine commit into that interval without minting
+     redundant steps. Multi-candidate enabled sets are serialized in ascending
+     stable-goroutine index order, never physical run-queue order. The synctest root driver, its
+     finalizer/cleanup drain, and a simulation member temporarily executing in GC-disassociated
+     runtime code are transparent under the scheduled strategy: their physical wake/yield timing is
+     not a SUT choice and cannot permute or shift a replay prefix. Enforced by
+     `TestExploreCoalescesSingletonStutter`, the canonical-enabled-set assertions in
+     `TestExploreForeignGCWorkloadInsensitive`, `TestDSTExploreTimerHB`, and
+     `TestExploreForeignSpinnerDrainCallback`.
 - **DST-L2-4 (clause-explicit: production untouched).** Level-2 hooks are build-mode inert outside
   `-tags dst -race`: a non-`dst-race` build emits no compiler-inserted `dstAccessYield`,
   `dstAccessYieldRange`, or `dstAtomicYield` calls, and runtime sync-decision/HB hooks are inactive unless DST is active under
@@ -600,8 +611,10 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    repeated bubble re-executions; `runOnce` follows a prefix and copies out the trace. Exhaustive and
    DPOR modes share the loop. Reports `Schedules`/`Failures`/`Exhausted`/`Overflow`/`BudgetHit`/
    `ForeignSched` (exhausted vs budget-hit distinct — no silent cap; foreign goroutines runnable at
-   simulation decisions downgrade `Exhausted` — reported, never silent, and conservative: with
-   simulation membership a STICKY per-goroutine property, coverage and single-episode traces are
+    simulation decisions downgrade `Exhausted` — reported, never silent, and conservative: with
+    simulation membership a STICKY per-goroutine property, consecutive singleton no-choice yields
+    coalesced after their first attributed transition, enabled sets canonicalized by stable index,
+    and the synctest driver/GC-internal execution domains transparent, coverage and single-episode traces are
    churn-invariant even for GC/finalizer workloads whose goroutines park inside the GC assist
    paths — the assist "disassociation" transiently nils `gp.bubble`, and classification through
    the live field used to demote an assist-parked simulation goroutine to infrastructure, shrinking
@@ -836,4 +849,3 @@ relation.
   EXTENSION-SKIP leg — a truncated trace spawns no new frames — is pinned separately by
   `TestExploreDPORTruncatedChildNoExtensionExplosion`: k recorded conflicts before an unconditional
   truncating fan-out stay bounded with the skip and grow ~3^k without it (k=6 → 729).
-

@@ -570,6 +570,15 @@ func TestExploreForeignGCWorkloadInsensitive(t *testing.T) {
 	spun := Explore(1, Exhaustive, sut)
 	close(stop)
 	done.Wait()
+	for name, tr := range map[string]exploreTrace{"alone": trAlone, "spun": trSpun} {
+		for step, enabled := range tr.enabled {
+			for i := 1; i < len(enabled); i++ {
+				if enabled[i-1] >= enabled[i] {
+					t.Fatalf("%s enabled set %d is not canonical: %v", name, step, enabled)
+				}
+			}
+		}
+	}
 	if !spun.ForeignSched || spun.Exhausted {
 		t.Fatalf("exploration under churn misreported: foreignSched=%v exhausted=%v", spun.ForeignSched, spun.Exhausted)
 	}
@@ -579,6 +588,23 @@ func TestExploreForeignGCWorkloadInsensitive(t *testing.T) {
 	if !reflect.DeepEqual(trAlone.procs, trSpun.procs) || !reflect.DeepEqual(trAlone.enabled, trSpun.enabled) {
 		t.Fatalf("foreign churn diverged the GC-workload trace:\nalone procs=%v enabled=%v\nspun  procs=%v enabled=%v",
 			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
+	}
+}
+
+func TestExploreCoalescesSingletonStutter(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		for range 8 {
+			runtime.Gosched()
+		}
+		return false
+	}
+	Explore(1, Exhaustive, sut)
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
+	if len(tr.procs) != 1 || len(tr.enabled) != 1 || len(tr.enabled[0]) != 1 || tr.procs[0] != tr.enabled[0][0] {
+		t.Fatalf("single-goroutine stutter was not coalesced to one attributed transition: procs=%v enabled=%v", tr.procs, tr.enabled)
 	}
 }
 
@@ -665,7 +691,10 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 		// TestExploreForeignSchedReported.
 		t.Skip("non-race trace regression")
 	}
+	var mainRan atomic.Bool
+	var drainInterrupted atomic.Bool
 	sut := func() bool {
+		mainRan.Store(false)
 		ch1 := make(chan struct{}, 1)
 		ch2 := make(chan struct{}, 1)
 		var wg sync.WaitGroup
@@ -684,11 +713,15 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 				// instead of {main, helper} and the traces diverge.
 				ch1 <- struct{}{}
 				runtime.Gosched()
+				if mainRan.Load() {
+					drainInterrupted.Store(true)
+				}
 				ch2 <- struct{}{}
 			})
 		}()
 		runtime.GC()
 		<-ch1
+		mainRan.Store(true)
 		wg.Wait()
 		return false
 	}
@@ -715,15 +748,16 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 		t.Fatalf("foreign spinner displaced the drain in the recorded schedule:\nalone procs=%v enabled=%v\nspun  procs=%v enabled=%v",
 			trAlone.procs, trAlone.enabled, trSpun.procs, trSpun.enabled)
 	}
+	if drainInterrupted.Load() {
+		t.Fatal("a woken simulation goroutine ran between the drain callback's two halves")
+	}
 	// Drain atomicity between its yields: the drain must not be interrupted
-	// by the fairness hand-off (its scheduling is not an interleaving degree
-	// of freedom the explorer models), so the callback's two wakes land
-	// before either woken goroutine runs. Semantic pin: after the helper
-	// disappears from the enabled sets (blocked on ch2), its REAPPEARANCE set
-	// must also contain main — both were woken by the same uninterrupted
-	// callback. A drain interruptible after its yield wakes main first (main
-	// runs and blocks again before ch2 is sent), so the helper reappears in a
-	// singleton set.
+	// by the fairness hand-off, so the callback's two wakes land before either
+	// woken goroutine runs. Consecutive singleton no-choice selections coalesce
+	// after their first transition; the startup and post-callback decisions must
+	// both contain main and helper. If the drain is interrupted after waking
+	// main, main runs and blocks before helper is woken, so no second joint set
+	// appears.
 	contains := func(e []uint64, s uint64) bool {
 		for _, v := range e {
 			if v == s {
@@ -747,25 +781,14 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 	if helperSeq == 0 {
 		t.Fatalf("no multi-candidate startup decision found: enabled=%v", trAlone.enabled)
 	}
-	seen, absent, reappeared := false, false, false
+	joint := 0
 	for _, e := range trAlone.enabled {
-		has := contains(e, helperSeq)
-		if has && seen && absent {
-			reappeared = true
-			if !contains(e, mainSeq) {
-				t.Fatalf("drain tail did not complete before the woken goroutines ran (helper reappeared without main co-enabled): enabled=%v", trAlone.enabled)
-			}
-			break
-		}
-		if has {
-			seen = true
-		}
-		if seen && !has {
-			absent = true
+		if contains(e, mainSeq) && contains(e, helperSeq) {
+			joint++
 		}
 	}
-	if !reappeared {
-		t.Fatalf("helper never reappeared after blocking — test shape no longer exercises the drain callback: enabled=%v", trAlone.enabled)
+	if joint < 2 {
+		t.Fatalf("drain tail did not wake main and helper before either ran: enabled=%v", trAlone.enabled)
 	}
 }
 

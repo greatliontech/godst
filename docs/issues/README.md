@@ -15,7 +15,6 @@ promotes any load-bearing rationale inline and deletes the resolved entry.
 | [lazy-fire timestamp mixes regimes on drifted hosts](./dst-clock-lazy-fire-timestamp-drift.md) | L | delivered-value contract for rate≠1 lazily-fired timers stated in faults.md |
 | [IP-less explicit LocalAddr collapses to a concrete-IP bind](./dst-net-wildcard-localaddr-bind-collapse.md) | L | wildcard bind conflict modeled, or the collapse recorded in design.md |
 | [foreign Process exit teardown can span a run activation](./dst-sim-process-exit-teardown-spans-activation.md) | M | teardown cannot execute into an undeclared-in run, or acceptance recorded |
-| [foreign-GC-workload invariance test flakes ~20%](./dst-explore-gc-workload-churn-flake.md) | H | test stable in both modes with mechanism diagnosed, or contract narrowed with bound recorded |
 | [explore recording gates key on bubble-ness, not membership](./dst-explore-recorder-gates-not-membership-keyed.md) | H | recorders keyed on sim membership, or per-gate unreachability recorded |
 | [same-seed broadcast scheduling can diverge across runs](./dst-schedule-broadcast-replay-flake.md) | H | random broadcast scheduling replays identically under focused and full-suite repetition |
 | [same-seed scheduler probes diverge under host contention](./dst-scheduler-load-replay-flakes.md) | H | foreign-bubble, PCT, exploration-sweep, and network-reset-order probes replay under contention |

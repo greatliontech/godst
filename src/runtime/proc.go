@@ -7968,17 +7968,18 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	// not delay it behind a simulation pick it would otherwise precede.
 	var sel uint32
 	sysK, sysOK := c.firstSystemG(total)
-	sysDrain := false
+	sysTransparent := false
 	if sysOK {
-		// Only the SIM bubble's drain is exempt: a foreign bubble's drain is
-		// unrelated process activity like any other foreign goroutine.
 		gp := c.at(sysK)
-		sysDrain = gp.dstSimG && dstSimBubble != nil && dstSimBubble.gcDrain == gp
+		// The SIM bubble's root driver, drain, and a member's GC-internal
+		// disassociation scope are transparent to exploration. A foreign
+		// bubble's corresponding goroutines remain unrelated process activity.
+		sysTransparent = dstTransparentScheduledCandidate(gp)
 	}
-	if sysOK && (sysDrain || !dstSchedPrevSys || !c.hasSimG(total)) {
+	if sysOK && (sysTransparent || !dstSchedPrevSys || !c.hasSimG(total)) {
 		sel = sysK
 		dstSchedSysScheds++
-		if !sysDrain {
+		if !sysTransparent {
 			dstSchedPrevSys = true
 			if dstSchedKind == dstSchedScheduled {
 				// A USER foreign goroutine (not runtime infrastructure)
@@ -8089,13 +8090,11 @@ type dstCandidates struct {
 // firstSystemG returns the index of the first candidate that should be scheduled
 // RNG-free as infrastructure rather than as part of the simulated program:
 // goroutines outside any synctest bubble (g.bubble == nil), and — under the
-// scheduled (exploration) strategy only — the bubble's finalizer-drain goroutine
-// (gcDrain). gcDrain records no application memory access, and its scheduling is
-// not an interleaving degree of freedom the explorer should branch on (it
-// runs-and-parks at bubble start, then only at deterministic quiescence points);
-// isolating it here keeps it out of the recorded schedule/DPOR search. Returns
-// false if no candidate qualifies. Scanned in candidate order, so the choice is
-// deterministic. Random/PCT deliberately leave gcDrain in the seeded selection:
+// scheduled (exploration) strategy only — the bubble's root driver, finalizer
+// drain, and transient GC-disassociated execution. Those states drive the
+// harness/runtime rather than a SUT interleaving; isolating them here keeps
+// physical quiescence and GC timing out of the recorded schedule/DPOR search. Returns
+// false if no candidate qualifies. Random/PCT deliberately leave these states in the seeded selection:
 // its scheduling is already deterministic there, so isolating it would change
 // their interleavings without removing any nondeterminism.
 func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
@@ -8107,6 +8106,29 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 	if dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain != nil {
 		for k := uint32(0); k < total; k++ {
 			if c.at(k) == dstSimBubble.gcDrain {
+				return k, true
+			}
+		}
+	}
+	if dstSchedKind == dstSchedScheduled {
+		best := ^uint32(0)
+		var bestSeq uint64
+		for k := uint32(0); k < total; k++ {
+			gp := c.at(k)
+			if gp == nil || !gp.dstSimG || !gp.dstGCInternal {
+				continue
+			}
+			if best == ^uint32(0) || gp.dstSeq < bestSeq {
+				best, bestSeq = k, gp.dstSeq
+			}
+		}
+		if best != ^uint32(0) {
+			return best, true
+		}
+	}
+	if dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.root != nil {
+		for k := uint32(0); k < total; k++ {
+			if c.at(k) == dstSimBubble.root {
 				return k, true
 			}
 		}
@@ -8134,15 +8156,14 @@ func (c *dstCandidates) firstSystemG(total uint32) (uint32, bool) {
 // range over; the two classifications must stay in lockstep (fairness in
 // dstFindRunnable selects over the complement of exactly this predicate).
 func dstIsInfraCandidate(gp *g) bool {
+	if dstTransparentScheduledCandidate(gp) {
+		return true
+	}
 	if !gp.dstSimG {
-		// Sticky membership, not the live gp.bubble field: the GC assist
-		// paths temporarily nil the field while assisting (mgc.go/mgcmark.go
-		// "disassociate"), and an assist-parked SIMULATION goroutine must
-		// stay a simulation candidate — through the field it transiently
-		// became infrastructure: resumed RNG-free, foreign-reported
-		// (ForeignSched true with no foreign work), and racing real foreign
-		// churn for the infra alternation slots (the -race foreign
-		// sensitivity's classification leg).
+		// Sticky membership, not the live gp.bubble field: temporary GC
+		// disassociation must never make a simulation member foreign. The
+		// scheduled strategy handles that scope as explicitly transparent;
+		// Random and PCT continue to classify it by sticky membership here.
 		return true
 	}
 	return dstSchedKind == dstSchedScheduled && dstSimBubble != nil && dstSimBubble.gcDrain == gp

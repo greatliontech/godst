@@ -503,28 +503,29 @@ type g struct {
 	//    closure in the runtime is forbidden.
 	// 4. When a panic is recovered and control returns to the respective frame,
 	//    param may point to a savedOpenDeferState.
-	param        unsafe.Pointer
-	atomicstatus atomic.Uint32
-	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
-	goid         uint64
-	dstrand      uint64  // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
-	dstPrio      int64   // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
-	dstSeq       uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
-	dstHost      uint32  // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1; identity, not RNG; unused when DST off. Also keys the per-host wall-clock offset table (dst.go dstHostClock): a host's clock is mutable (StepClock) so it lives in a per-host table, not on g, and is read by g.dstHost
-	dstProc      uint32  // DST process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1; identity, not RNG; unused when DST off
-	dstPid       int32   // DST per-process simulated pid (os.Getpid); set per-invocation by testing/simulation.Process, inherited parent→child at newproc1; a restart gets a fresh pid (no stable-pid); unused when DST off
-	dstAccAddr   uintptr // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR; unused otherwise
-	dstAccSize   uintptr // DST pending memory-access size in bytes; paired with dstAccAddr for interval-overlap dependencies
-	dstAccWrite  bool    // DST pending access is a write (vs read); paired with dstAccAddr
-	dstAccPC     uintptr // DST pending access hook call-site PC; paired with dstAccAddr
-	dstAccCount  uint64  // DST per-bubble access ordinal for forced replay yield points; unused otherwise
-	dstAccPend   bool    // DST pending transition came from a hook call; false means a synthetic coarse decision
-	dstAccAuto   bool    // DST pending transition came from dst-race memory auto-instrumentation; stack addresses are private for this path
-	dstHostIO    bool    // DST explicit inherited-file capability is performing one trusted host operation; scoped on the calling g and never inherited
-	dstSimG      bool    // DST sticky membership in the ACTIVE simulation's bubble: set at creation-inheritance (newproc1) and at the bubble claim (synctestRun), cleared at gdestroy. The scheduler classification (dstIsInfraCandidate) keys on THIS, not the live gp.bubble field, because the GC assist paths temporarily nil the field (mgc.go/mgcmark.go "disassociate") — an assist-parked simulation goroutine must not transiently become infrastructure (RNG-free resumption, foreign-report, churn-displaceable slot). Unused when DST off
-	schedlink    guintptr
-	waitsince    int64      // approx time when the g become blocked
-	waitreason   waitReason // if status==Gwaiting
+	param         unsafe.Pointer
+	atomicstatus  atomic.Uint32
+	stackLock     uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
+	goid          uint64
+	dstrand       uint64  // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
+	dstPrio       int64   // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
+	dstSeq        uint64  // DST stable per-bubble goroutine index+1 (0 = unassigned); used by the scheduled strategy (dst_explore.go) for replayable schedules; unused otherwise
+	dstHost       uint32  // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1; identity, not RNG; unused when DST off. Also keys the per-host wall-clock offset table (dst.go dstHostClock): a host's clock is mutable (StepClock) so it lives in a per-host table, not on g, and is read by g.dstHost
+	dstProc       uint32  // DST process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1; identity, not RNG; unused when DST off
+	dstPid        int32   // DST per-process simulated pid (os.Getpid); set per-invocation by testing/simulation.Process, inherited parent→child at newproc1; a restart gets a fresh pid (no stable-pid); unused when DST off
+	dstAccAddr    uintptr // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR; unused otherwise
+	dstAccSize    uintptr // DST pending memory-access size in bytes; paired with dstAccAddr for interval-overlap dependencies
+	dstAccWrite   bool    // DST pending access is a write (vs read); paired with dstAccAddr
+	dstAccPC      uintptr // DST pending access hook call-site PC; paired with dstAccAddr
+	dstAccCount   uint64  // DST per-bubble access ordinal for forced replay yield points; unused otherwise
+	dstAccPend    bool    // DST pending transition came from a hook call; false means a synthetic coarse decision
+	dstAccAuto    bool    // DST pending transition came from dst-race memory auto-instrumentation; stack addresses are private for this path
+	dstHostIO     bool    // DST explicit inherited-file capability is performing one trusted host operation; scoped on the calling g and never inherited
+	dstSimG       bool    // DST sticky membership in the ACTIVE simulation's bubble: set at creation-inheritance (newproc1) and at the bubble claim (synctestRun), cleared at gdestroy. The scheduler classification (dstIsInfraCandidate) keys on THIS, not the live gp.bubble field, because the GC assist paths temporarily nil the field (mgc.go/mgcmark.go "disassociate") — an assist-parked simulation goroutine must not transiently become infrastructure (RNG-free resumption, foreign-report, churn-displaceable slot). Unused when DST off
+	dstGCInternal bool    // DST simulation member is executing inside a GC disassociation scope; scheduled exploration runs this state transparently rather than recording physical GC progress as a SUT transition
+	schedlink     guintptr
+	waitsince     int64      // approx time when the g become blocked
+	waitreason    waitReason // if status==Gwaiting
 
 	preempt       bool // preemption signal, duplicates stackguard0 = stackpreempt
 	preemptStop   bool // transition to _Gpreempted on preemption; otherwise, just deschedule

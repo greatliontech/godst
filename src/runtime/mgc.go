@@ -899,8 +899,11 @@ func gcStart(trigger gcTrigger) {
 		// This is less elegant than incrementing the group's active count,
 		// but avoids any contamination between GC and synctest.
 		bubble := gp.bubble
+		gcInternal := gp.dstGCInternal
 		gp.bubble = nil
+		gp.dstGCInternal = gp.dstSimG
 		defer func() {
+			gp.dstGCInternal = gcInternal
 			gp.bubble = bubble
 		}()
 	}
