@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dst && linux && (386 || arm)
+//go:build dst && linux && (386 || arm || mips || mipsle)
 
 package syscall_test
 
@@ -15,11 +15,6 @@ import (
 	"time"
 	"unsafe"
 )
-
-// sysClockGettime64 is the 64-bit-time clock_gettime trap on 386/arm (the
-// syscall package does not export it; mips carries the o32 4000 base and is
-// covered by the same dispatch).
-const sysClockGettime64 = 403
 
 // TestDSTClockGettime64Virtual: the time64 clock_gettime trap returns the DST
 // virtual base clock for CLOCK_MONOTONIC/CLOCK_BOOTTIME in __kernel_timespec

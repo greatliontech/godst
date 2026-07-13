@@ -936,7 +936,8 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   remain live and the caller stack cannot move before kernel dispatch, including through the entry
   symbols used by external assembly callers.
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
-  way — this is the choke point that catches `golang.org/x/sys/unix`. A numeric real fd is never a
+  way — as is linux/mips's additional `Syscall9` entry, before its assembly calls `entersyscall` —
+  and this is the choke point that catches `golang.org/x/sys/unix`. A numeric real fd is never a
   capability: read/write/close, lseek, pread64/pwrite64, fstat, fcntl, and every other operation are
   refused before host dispatch. Explicit inherited-file capabilities perform their host operations
   through a scoped trusted path and never expose their hidden descriptor. This is an API boundary,

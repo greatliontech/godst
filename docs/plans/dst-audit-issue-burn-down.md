@@ -119,5 +119,5 @@ grouped by the functions they change. WIP = 1.
 
 ## Deferred architecture verification
 
-- [ ] 61. linux/mips and linux/mipsle `Syscall9` enter the same fence and dispatch policy as the generic trampolines, and `clock_gettime64` copyout behavior executes under qemu-user (`dst-mips-syscall9-bypasses-fence`, `dst-mips-clock-gettime64-runtime-unverified`)
+- [x] 61. linux/mips and linux/mipsle `Syscall9` enter the same fence and dispatch policy as the generic trampolines, and `clock_gettime64` copyout behavior executes under qemu-user (`dst-mips-syscall9-bypasses-fence`, `dst-mips-clock-gettime64-runtime-unverified`)
 - [ ] 62. linux/loong64 `fstatFD` applies virtual and page-cache descriptor classification before direct statx, with the kernel-facing behavior executed under qemu-user (`dst-loong64-fstat-exposes-pagecache-fd`)
