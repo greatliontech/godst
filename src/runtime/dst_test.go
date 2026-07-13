@@ -790,9 +790,9 @@ func TestDSTPooledGBytesExact(t *testing.T) {
 
 // TestDSTMemfdFDIsolation: the harness's page-cache memfds are invisible in
 // the simulated fd namespace — a bubble goroutine gets exactly EBADF for
-// them on every fenced surface (named wrappers via Syscall, Pread via
-// Syscall6, RawSyscall — all bottoming out in the trampolines' single
-// chokepoint), a daemonize-style close sweep is the harmless loop it is in
+// them on every fenced surface (named wrappers, Pread via Syscall6, and
+// RawSyscall — through the trampolines or loong64 Fstat's equivalent direct
+// classifier), a daemonize-style close sweep is the harmless loop it is in
 // production, and resizes and reads of the open simulated file keep working.
 // Mutation: dropping the trampoline check fails at the white-box probe
 // ("got nil, want EBADF" — the probe's own close then host-closes the

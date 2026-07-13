@@ -21,9 +21,6 @@ func Fstat(fd int, stat *Stat_t) (err error) {
 		}
 		return
 	}
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		dstSyscallRefuse(dstSyscallFstatTrap())
-	}
 	return fstatFD(fd, stat)
 }
 

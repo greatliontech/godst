@@ -87,6 +87,12 @@ func Fstatat(fd int, path string, stat *Stat_t, flags int) (err error) {
 
 func fstatFD(fd int, stat *Stat_t) (err error) {
 	if dstSimFenced && dstFenceActive() {
+		if !dstHostIOActive() {
+			if dstPageCacheFDReserved(uintptr(fd)) {
+				return errnoErr(EBADF)
+			}
+			dstSyscallRefuse(SYS_STATX)
+		}
 		return fstatFDDST(fd, stat)
 	}
 	return fstatat(fd, "", stat, _AT_EMPTY_PATH)

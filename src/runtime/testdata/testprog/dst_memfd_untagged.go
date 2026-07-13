@@ -6,7 +6,11 @@
 
 package main
 
+import "syscall"
+
 // The runtime page-cache registry exists only under dst && linux; the probe
 // that uses this (DSTMemfdFDIsolation) runs only under the tag, so the stub
 // just keeps the untagged binary linking.
 func dstPageCacheFDReservedFP(fd uintptr) bool { return false }
+
+func dstPageCacheFstatRawFP(fd int) error { return syscall.ENOSYS }

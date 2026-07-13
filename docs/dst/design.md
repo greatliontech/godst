@@ -961,8 +961,9 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   process never opened would get, so the daemonize-style close sweep stays the harmless loop it is
   in production — never host I/O, which would kill a live file's cache (fatal at the next resize or
   mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
-  page cache admits (32-bit hosts are refused before any memfd exists), every named fd wrapper
-  bottoms out in the same trampolines, so one chokepoint covers both surfaces; non-bubble callers
+  page cache admits (32-bit hosts are refused before any memfd exists), named fd wrappers bottom out
+  in the same trampolines except loong64 `Fstat`, which applies equivalent classification before its
+  direct `statx`; non-bubble callers
   are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). A bubble goroutine's close of **any** real
   (non-virtual) fd number is answered `EBADF` at the trampolines and **never dispatched to the
   kernel**. The invisibility check alone cannot protect a fd that does not exist yet — the fence

@@ -33,7 +33,7 @@ func Syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr,
 			}
 			return r1, 0, err
 		}
-		if dstSyscallPageCacheFDTrap(trap, a1) {
+		if dstSyscallPageCacheFDTrap(trap, a1, a3) {
 			return ^uintptr(0), 0, EBADF
 		}
 		if dstSyscallHostClose(trap, a1) {

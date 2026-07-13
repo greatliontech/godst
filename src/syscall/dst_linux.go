@@ -45,7 +45,7 @@ func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
 // memfd_create would silently alias another file's bytes.
 //
 //go:nosplit
-func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool {
+func dstSyscallPageCacheFDTrap(trap, fd, a3 uintptr) bool {
 	if !dstPageCacheFDReserved(fd) {
 		return false
 	}
@@ -54,7 +54,7 @@ func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool {
 		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
 		return true
 	}
-	return dstSyscallVirtualFDArchTrap(trap)
+	return dstSyscallPageCacheFDArchTrap(trap, a3)
 }
 
 // dstSyscallHostClose reports whether a bubble goroutine is closing a real

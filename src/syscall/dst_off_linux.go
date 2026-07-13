@@ -12,7 +12,7 @@ package syscall
 
 func dstSyscallVirtualFDTrap(trap, fd uintptr) bool { return false }
 
-func dstSyscallPageCacheFDTrap(trap, fd uintptr) bool { return false }
+func dstSyscallPageCacheFDTrap(trap, fd, a3 uintptr) bool { return false }
 
 func dstSyscallHostClose(trap, fd uintptr) bool { return false }
 

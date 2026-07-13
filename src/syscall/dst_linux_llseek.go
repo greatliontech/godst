@@ -11,4 +11,9 @@ func dstSyscallVirtualFDArchTrap(trap uintptr) bool {
 	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64 || trap == SYS_FCNTL64
 }
 
+//go:nosplit
+func dstSyscallPageCacheFDArchTrap(trap, _ uintptr) bool {
+	return trap == SYS__LLSEEK || trap == SYS_FSTAT || trap == SYS_FSTAT64 || trap == SYS_FCNTL64
+}
+
 func dstSyscallFstatTrap() uintptr { return SYS_FSTAT64 }
