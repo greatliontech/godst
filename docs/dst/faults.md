@@ -50,7 +50,9 @@ DST, calling `Host`/`Process` mid-run **is** how a SUT models a node joining (me
 is stamped+inherited, so a process started mid-run, or added to an existing host, just works; the body
 scopes *declaration*, the goroutines it starts outlive it. Mid-run declarations come from goroutines
 the simulation schedules — a foreign caller panics, like the fault APIs (see "Fault callers fail
-loud too").
+loud too"). An explicit or implicit host declaration validates its candidate ID before publishing
+the name or identity. `Host` also validates its complete clock configuration before publishing the
+caller stamp, timer remap, or reboot. Every rejected declaration is state-neutral.
 
 ```go
 simulation.Host("h1", simulation.HostConfig{IP: "10.0.0.1", NumCPU: 4, Clock: simulation.Skew(50*ms)}, func() {

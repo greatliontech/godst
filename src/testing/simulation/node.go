@@ -416,9 +416,14 @@ func internHost(name string) uint32 {
 	if id, ok := nodeReg.hosts[name]; ok {
 		return id
 	}
-	nodeReg.nextHost++
-	nodeReg.hosts[name] = nodeReg.nextHost
-	return nodeReg.nextHost
+	host := nodeReg.nextHost + 1
+	// An implicit host has the zero clock configuration. Establish it before
+	// publishing the name so table exhaustion leaves the registry untouched.
+	dstReestablishHostClock(host, 0, 0)
+	nodeReg.nextHost = host
+	nodeReg.hosts[name] = host
+	setHostIdent(host, name, 0)
+	return host
 }
 
 func internProc(name string) uint32 {
@@ -458,36 +463,46 @@ func internProc(name string) uint32 {
 func Host(name string, config HostConfig, f func()) {
 	release := requireBubbleDeclCaller("Host")
 	var oldH, oldP uint32
+	stamped := false
+	defer func() {
+		if stamped {
+			dstSetNode(oldH, oldP)
+		}
+	}()
 	declare := func() {
 		// Scoped so the gate covers exactly the declaration mutations —
 		// through the host-up relay — and releases on the panic path too; f
 		// below is ordinary goroutine code, run outside the gate.
 		defer release()
-		hid := internHost(name)
+		nodeReg.mu.Lock()
+		defer nodeReg.mu.Unlock()
+		hid, exists := nodeReg.hosts[name]
+		if !exists {
+			hid = nodeReg.nextHost + 1
+		}
+		offset := config.Clock.offsetNanos(hid)
+		ppb := config.Clock.driftPPBForHost(hid)
 		hostname := config.Hostname
 		if hostname == "" {
 			hostname = name
 		}
+		if !dstReestablishHostClock(hid, offset, ppb) {
+			panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
+		}
+		if !exists {
+			if nodeReg.hosts == nil {
+				nodeReg.hosts = make(map[string]uint32)
+			}
+			nodeReg.nextHost = hid
+			nodeReg.hosts[name] = hid
+		}
 		setHostIdent(hid, hostname, config.NumCPU)
 		_, curProc := dstCurrentNode()
 		oldH, oldP = dstSetNode(hid, curProc)
-		// Establish the host's configured clock (offset, and rate) in the per-host table
-		// (keyed by host id). No save/restore: the clock is read via g.dstHost, which
-		// dstSetNode already saves and restores, so after f returns the caller reads its
-		// own host's clock again; the table entry persists for hid's long-lived goroutines
-		// that outlive this call. A re-declaration (restart) re-establishes the clock
-		// COMPLETELY (docs/dst/faults.md "Clock faults", Host re-declaration): the rate is
-		// applied through the DriftClock path unconditionally — including rate 1 for a
-		// zero config — so a surviving stale rate/anchor is folded and cleared and the
-		// host's armed timers are re-mapped to the declared rate; then the offset is
-		// overwritten to the declared value, discarding prior steps and folded drift.
-		// Setting only the offset (the earlier shape) left a "restarted, in-sync" host
-		// reading ahead of base and sleeping at the old rate — self-consistent to its own
-		// probes, wrong against the base clock.
-		if !dstReestablishHostClock(hid, config.Clock.offsetNanos(hid), config.Clock.driftPPBForHost(hid)) {
-			dstSetNode(oldH, oldP)
-			panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
-		}
+		stamped = true
+		// Clock commit precedes identity and caller stamping and rejects without
+		// applying any clock or timer change, so every remaining step publishes
+		// an already-valid declaration.
 		// The declaration boots (or reboots) the machine: if it was crashed, it is
 		// reachable again — dials find its kernel (ECONNREFUSED until a listener is
 		// up, then connect), and any dial blocked blackholing on the dead machine
@@ -498,7 +513,6 @@ func Host(name string, config HostConfig, f func()) {
 		}
 	}
 	declare()
-	defer dstSetNode(oldH, oldP)
 	f()
 }
 
@@ -814,7 +828,6 @@ func Process(name string, f func()) {
 		host, _ = dstCurrentNode()
 		if host == 0 {
 			host = internHost(name)
-			setHostIdent(host, name, 0)
 		}
 		proc = internProc(name)
 		if runActive.Load() && activeProcLivesElsewhere(proc, host) {

@@ -111,7 +111,7 @@ grouped by the functions they change. WIP = 1.
 
 ## Simulation Host and caller-gate functions
 
-- [ ] 56. Host declaration validation and publication are all-or-nothing on invalid clocks and table exhaustion (`dst-host-declaration-failure-not-atomic`)
+- [x] 56. Host declaration validation and publication are all-or-nothing on invalid clocks and table exhaustion (`dst-host-declaration-failure-not-atomic`)
 - [ ] 57. Host NumCPU is exact over its accepted public range or rejected before publication (`dst-host-numcpu-wraps-int32`)
 - [ ] 58. CrashHost tracks root-process host ancestry through nested Host bodies (`dst-host-crash-misses-nested-root-goroutine`)
 - [ ] 59. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
