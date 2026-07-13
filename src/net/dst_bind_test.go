@@ -1145,16 +1145,18 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 
 // TestDSTNetCloseWithUnreadDataResetsPeer: the kernel's close(2) conditional
 // on the USER-CALLED Close path — an end closed with unread received data
-// answers the peer with RST: the peer's next read fails ECONNRESET WITHOUT
-// draining (a reply the closer sent moments earlier is destroyed with the
-// receive queue, the same no-drain rule every RST teardown follows).
+// answers the peer with RST. The peer still DRAINS the reply the closer sent
+// before closing (it travels ahead of the RST on the in-order link, and
+// tcp_recvmsg reports pending data before the socket error — host-probed);
+// only then do its reads fail ECONNRESET.
 func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
 	var n int
-	var readErr error
+	var buf [8]byte
+	var firstErr, secondErr error
 	simulation.RunWith(1, opts, func() {
 		var ln Listener
 		ready := make(chan struct{})
@@ -1166,7 +1168,7 @@ func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 			go func() {
 				c, _ := ln.Accept()
 				time.Sleep(300 * time.Millisecond) // the client's "data" is delivered, UNREAD
-				c.Write([]byte("resp"))            // in flight when the close lands
+				c.Write([]byte("resp"))            // sent before the close: ahead of the RST
 				c.Close()                          // unread inbound -> RST, not FIN
 				close(closed)
 			}()
@@ -1180,14 +1182,18 @@ func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 			}
 			c.Write([]byte("data"))
 			<-closed
-			n, readErr = c.Read(make([]byte, 8))
+			n, firstErr = c.Read(buf[:])
+			_, secondErr = c.Read(make([]byte, 8))
 			close(readDone)
 			c.Close()
 		})
 		<-readDone
 	})
-	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
-		t.Errorf("read after the peer closed with unread data = (%d, %v), want (0, ECONNRESET): the RST destroys the receive queue, nothing drains", n, readErr)
+	if n != 4 || string(buf[:4]) != "resp" || firstErr != nil {
+		t.Errorf("read after the peer closed with unread data = (%d, %q, %v), want (4, %q, nil): the pre-close reply outruns the RST and drains", n, buf[:n], firstErr, "resp")
+	}
+	if !errors.Is(secondErr, syscall.ECONNRESET) {
+		t.Errorf("read after the drain = %v, want ECONNRESET (the RST surfaces once pending data is consumed)", secondErr)
 	}
 }
 

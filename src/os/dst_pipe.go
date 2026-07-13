@@ -38,6 +38,15 @@ const (
 	dstPipeBuf = 4096  // PIPE_BUF: a write of at most this size is atomic
 )
 
+// The buffer is a byte-exact ring; the kernel's is a ring of 16 page slots
+// whose fragmentation (partially-read head, merge-overflow spills,
+// interrupted writes' tails) can admit page-granular slack less than the
+// byte count suggests. Byte-exactness is the recorded stance (design.md, the
+// pipe section): the divergence is one-directional (the simulation admits at
+// least what the kernel would — never a sim-only block, i.e. never a false
+// positive), and mirroring the slot ring would couple the model to
+// kernel-version-dependent merge semantics.
+
 // dstPipe is the shared stream: one per os.Pipe call, referenced by both
 // ends — the analogue of the single pipe inode both host fds share (which is
 // also why SameFile(rfi, wfi) is true, via the FileInfo identity field).

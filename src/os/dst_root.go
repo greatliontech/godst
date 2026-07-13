@@ -587,7 +587,10 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	if newBase == "." || newParent == nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EBUSY}
 	}
-	if newTrailingSlash && newNode == nil {
+	if newTrailingSlash && newNode == nil && !oldNode.isDir {
+		// A trailing slash on a missing newpath is legal when the SOURCE
+		// is a directory (renameat shares rename(2)'s source-type rule;
+		// host-probed through os.Root.Rename on ext4 and tmpfs).
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
 	}
 	if newNode == oldNode {

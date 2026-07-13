@@ -16,9 +16,12 @@ import (
 // dstApplyNetFaultOp, exactly like partition. A reset enumerates the active
 // connections matching the victim — a host-pair (all conns between hosts a and b)
 // or a process (all conns that process owns either end of) — and tears each down
-// via the connection's existing resetConn(). A reset hits BOTH ends, closing each
-// transport, so a subsequent read returns the close (ECONNRESET) before draining
-// any buffered bytes — in-flight data is dropped, as a real RST discards it.
+// via the connection's existing resetConn(). An injected reset hits BOTH ends,
+// closing each transport, so a subsequent read returns the close (ECONNRESET)
+// before draining any buffered bytes — the recorded fault-model collapse
+// (faults.md): the injected fault destroys the conn outright, where a real
+// RST's receiver would still drain its queued bytes (the close(2) conditional
+// models that kernel shape — see dstResetBothEnds).
 // Matching is by the connection's host/process attribution (dstConn.localHost/
 // remoteHost/localProc/remoteProc), so a reset touches exactly the victim's conns
 // (DST-FAULT-VICTIM).
@@ -29,15 +32,15 @@ import (
 // dstConn. resetConn tears down the END it is called on — that end's transport
 // closes; the shared reset flag only maps the peer's eventual EOF to ECONNRESET
 // identity, it does NOT close the peer's transport, so a peer whose own dstConn
-// is not reset still DRAINS queued bytes before seeing the error. The no-drain
-// RST teardown therefore requires resetting each end's own dstConn — every
-// RST teardown of an ESTABLISHED conn reaches both ends (the fault matchers
-// match both;
-// the close(2) conditional's RST arm goes through dstResetBothEnds; the host
-// matcher spares a survivor's end whose victim end already closed — see
-// dstResetHost). Only the close conditional's FIN arm — and the
-// listener-backlog teardown of a never-accepted server end, toward whose
-// dialer nothing can yet be queued — is per-end. resetConn
+// is not reset still DRAINS queued bytes before seeing the error. That drain is
+// the kernel-real shape for an RST's RECEIVER (tcp_recvmsg reports pending data
+// before the socket error, host-probed), so the close(2) conditional's RST arm
+// (dstResetBothEnds) resets only the emitting end and merely deregisters the
+// peer. The FAULT matchers instead keep the no-drain both-ends teardown —
+// resetting each end's own dstConn — as their recorded fault-model collapse
+// (the host matcher spares a survivor's end whose victim end already closed —
+// see dstResetHost). The listener-backlog teardown of a never-accepted server
+// end, toward whose dialer nothing can yet be queued, is per-end. resetConn
 // is idempotent when both ends are reset: an atomic flag store, a sync.Once
 // close, a map delete.
 var dstConns struct {
@@ -385,18 +388,26 @@ func dstConnPeer(c *dstConn) *dstConn {
 	return nil
 }
 
-// dstResetBothEnds is the RST teardown: the emitting end resets, and so does
-// the surviving peer's OWN dstConn — its transport closes, so its next read
-// fails ECONNRESET WITHOUT draining, queued and in-flight bytes alike, as a
-// real RST destroys the receive queue (the same both-ends rule the fault
-// matchers follow; a single-end reset presents at the peer as a graceful
-// write-close and the peer drains first). A peer that already closed needs
-// nothing (dstConnPeer returns nil).
+// dstResetBothEnds is the close(2) conditional's RST teardown: the EMITTING
+// end resets (transport closed, deregistered); the RST-RECEIVING peer keeps
+// its transport and only loses its registration. An incoming RST cannot
+// destroy bytes the receiver's kernel already queued — tcp_recvmsg drains
+// pending data before reporting the socket error (host-probed; the same rule
+// the retransmit-horizon death follows) — and bytes the emitter wrote before
+// closing travel ahead of its RST on the in-order link, so they drain too.
+// The emitter's transport close ends the byte stream (the peer drains, sees
+// EOF, and the SHARED reset flag stored by resetConn maps that EOF — and its
+// failed writes — to the stable ECONNRESET identity); deregistering the peer
+// now mirrors production releasing the tuple when the RST moves the socket to
+// CLOSED, before any close(2). The fault-injection matchers (host/pair/
+// process reset) keep their recorded both-ends no-drain teardown — a fault-
+// model collapse, not this kernel conditional. A peer that already closed
+// needs nothing (dstConnPeer returns nil).
 func dstResetBothEnds(c *dstConn) {
 	peer := dstConnPeer(c)
 	c.resetConn()
 	if peer != nil {
-		peer.resetConn()
+		dstConnDeregister(peer)
 	}
 }
 

@@ -467,8 +467,21 @@ func dstFSFencedLink(op, oldname, newname string) (error, bool) {
 // the base name, and the target node (nil if absent). Caller holds dstFS.mu. Errors
 // are bare errnos; callers wrap.
 func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
+	return dstFSResolveWalk(name, true)
+}
+
+// dstFSResolveWalk is dstFSResolve with the FINAL component's trailing-slash
+// directory assertion optional. rename(2) needs it suppressed: the kernel
+// checks both paths' trailing slashes against the SOURCE's type only after
+// both parent walks and the old final's lookup (fs/namei.c do_renameat2's
+// "unless the source is a directory trailing slashes give -ENOTDIR"), so a
+// resolve-time assertion would fire ahead of errors that precede it
+// (host-probed: rename("missing", "existingfile/") is ENOENT, not ENOTDIR).
+// Intermediate-component walk errors are unaffected.
+func dstFSResolveWalk(name string, assertFinalSlash bool) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
 	root := dstFSDiskHere().root
 	comps, trailingSlash := dstFSComponents(name)
+	trailingSlash = trailingSlash && assertFinalSlash
 	// stack holds the directory chain from root; names[i] is stack[i]'s name in its
 	// parent (names[0] is the sentinel "/"). A `..` pops toward root; at root it
 	// stays (POSIX: `/..` == `/`).
@@ -592,11 +605,13 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 // dstFSMarkUnlinked marks a node removed from the namespace — and, for a
 // directory subtree (RemoveAll), every directory under it — so entry creation
 // through a still-open handle (a captured Root) fails ENOENT as the kernel's
-// does in an rmdir'd directory. The entries clear too: the host's RemoveAll
-// unlinks bottom-up, so a removed directory reads EMPTY through a surviving
-// handle — leaving the detached children visible would be a sim-only listing.
-// (Unlinked-but-open file CONTENT is untouched: it lives on the node, and
-// open handles keep it per the POSIX contract.) Caller holds dstFS.mu.
+// does in an rmdir'd directory. The entries clear too: they remain
+// load-bearing for Root-relative lookups (a captured Root addresses the node,
+// and a lookup inside a removed directory must find nothing) — directory
+// LISTINGS through a surviving handle answer ENOENT via the unlinked flag
+// (the kernel's dead-directory refusal), they never see the entries either
+// way. (Unlinked-but-open file CONTENT is untouched: it lives on the node,
+// and open handles keep it per the POSIX contract.) Caller holds dstFS.mu.
 func dstFSMarkUnlinked(node *dstFSNode) {
 	if !node.isDir {
 		return
@@ -707,29 +722,50 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 	if oldname == "" || newname == "" {
 		return wrap(syscall.ENOENT)
 	}
-	oldParent, oldBase, oldNode, errno := dstFSResolve(oldname)
+	// Check order mirrors rename(2), which resolves BOTH parent walks
+	// (old first, then new) and the terminal-dot restrictions before it
+	// looks up the old final component: a destination walk error
+	// (ENOTDIR through a file, ENOENT through a missing directory)
+	// precedes the missing-source ENOENT, and either path's "." / ".."
+	// terminal is EBUSY ahead of it too. Trailing slashes on EITHER
+	// path's final component are checked against the SOURCE's type,
+	// after the old final's existence check (fs/namei.c do_renameat2:
+	// "unless the source is a directory trailing slashes give
+	// -ENOTDIR") — so rename("missing", "x/") is ENOENT, not ENOTDIR,
+	// and a DIRECTORY source renames onto a trailing-slash missing
+	// newpath successfully (host-probed on ext4 and tmpfs alike). The
+	// final-slash walk assertion is therefore suppressed here and
+	// applied at the source-type stage below.
+	oldParent, oldBase, oldNode, errno := dstFSResolveWalk(oldname, false)
 	if errno != nil {
 		return wrap(errno)
 	}
-	if oldNode == nil {
-		return wrap(syscall.ENOENT)
-	}
-	if terminal := path.Base(oldname); terminal == "." || terminal == ".." {
-		return wrap(syscall.EBUSY)
+	_, oldTrailingSlash := dstFSComponents(oldname)
+	newParent, newBase, newNode, errno := dstFSResolveWalk(newname, false)
+	if errno != nil {
+		return wrap(errno)
 	}
 	_, newTrailingSlash := dstFSComponents(newname)
-	newParent, newBase, newNode, errno := dstFSResolve(newname)
-	if errno != nil {
-		return wrap(errno)
+	if terminal := path.Base(oldname); terminal == "." || terminal == ".." {
+		return wrap(syscall.EBUSY)
 	}
 	if terminal := path.Base(newname); terminal == "." || terminal == ".." {
 		return wrap(syscall.EBUSY)
 	}
-	if newTrailingSlash && newNode == nil {
-		return wrap(syscall.ENOTDIR)
+	if oldNode == nil {
+		return wrap(syscall.ENOENT)
 	}
 	if dstFSIsRoot(oldNode) || dstFSIsRoot(newNode) {
+		// Before the source-type slash check: a root-resolving path is
+		// EBUSY (the kernel's LAST_ROOT refusal), never ENOTDIR. The
+		// shape is unreachable through os.Rename — its preamble
+		// intercepts every existing-dir newname (EEXIST) and errors a
+		// missing "/" oldname in the preamble stat — so this arm pins
+		// the internal ladder's order, not a surface behavior.
 		return wrap(syscall.EBUSY)
+	}
+	if !oldNode.isDir && (oldTrailingSlash || newTrailingSlash) {
+		return wrap(syscall.ENOTDIR)
 	}
 	if newNode == oldNode {
 		return true, nil // same file: POSIX no-op success
@@ -1570,6 +1606,12 @@ func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
 	defer d.leave()
 	if !d.node.isDir {
 		return nil, nil, syscall.ENOTDIR
+	}
+	if d.node.unlinked {
+		// Linux's iterate_dir refuses a dead directory (IS_DEADDIR):
+		// getdents on an rmdir'd directory is ENOENT (host-probed on
+		// tmpfs and ext alike), never an empty listing.
+		return nil, nil, syscall.ENOENT
 	}
 	all := d.sortedEntryNamesLocked()
 	if d.dirpos > len(all) {

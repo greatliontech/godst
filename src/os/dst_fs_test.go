@@ -1014,6 +1014,21 @@ func TestDSTFSOpenRoot(t *testing.T) {
 			t.Fatalf(`Root.Rename("sub/dir/renamed", "missing/") = %v, want ENOTDIR`, err)
 		}
 		mustNotExist("/root/missing")
+		// A DIRECTORY source renames onto a trailing-slash missing newpath
+		// (renameat shares rename(2)'s source-type rule; host-probed
+		// through os.Root.Rename).
+		if err := r.Mkdir("dmv", 0o755); err != nil {
+			t.Fatalf("Root.Mkdir dmv: %v", err)
+		}
+		if err := r.Rename("dmv", "dmoved/"); err != nil {
+			t.Fatalf(`Root.Rename("dmv", "dmoved/") = %v, want success (dir source)`, err)
+		}
+		if fi, err := r.Stat("dmoved"); err != nil || !fi.IsDir() {
+			t.Fatalf("Root.Stat renamed dir = %v, %v; want a directory", fi, err)
+		}
+		if err := r.Remove("dmoved"); err != nil {
+			t.Fatalf("Root.Remove dmoved: %v", err)
+		}
 		if err := r.Rename("sub/dir/renamed", "../outside"); err == nil {
 			t.Fatalf("Root.Rename escape succeeded")
 		}
@@ -1792,6 +1807,35 @@ func TestDSTFSDirectorySeek(t *testing.T) {
 		}
 		if !slices.Equal(names, all) {
 			t.Fatalf("listing after rewind = %v, want %v", names, all)
+		}
+	})
+}
+
+// TestDSTFSReaddirRemovedDirENOENT: getdents on an rmdir'd directory is the
+// kernel's dead-directory refusal (iterate_dir's IS_DEADDIR): every listing
+// through a handle opened before the removal answers ENOENT — never an empty
+// success — while fstat through the same handle keeps working.
+func TestDSTFSReaddirRemovedDirENOENT(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.MkdirAll("/dead/sub", 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		dir, err := os.Open("/dead")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer dir.Close()
+		if err := os.RemoveAll("/dead"); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+		if _, err := dir.Readdirnames(-1); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Readdirnames on removed dir = %v, want ENOENT", err)
+		}
+		if _, err := dir.ReadDir(1); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("ReadDir on removed dir = %v, want ENOENT", err)
+		}
+		if _, err := dir.Stat(); err != nil {
+			t.Fatalf("Stat on removed dir handle = %v, want success", err)
 		}
 	})
 }

@@ -492,11 +492,14 @@ throughout `errors.Is`: refused connects are `ECONNREFUSED` and duplicate listen
 operation on a locally closed connection or listener (including a second `Close`) is `net.ErrClosed`;
 reads from a gracefully closed peer drain buffered data then return `io.EOF`; FIN/EOF is persistent
 state, so every concurrently blocked reader wakes to consume data or observe EOF without another event — but a `Close()` of an
-end whose receive queue holds UNREAD data answers with RST instead of FIN, and the peer's next read
-fails `ECONNRESET` without draining (the kernel's close(2) conditional; bytes still in flight count
-as queued — the recorded collapse: the sim RSTs immediately, one of the two orderings the real
-close-vs-arrival race produces, `TestDSTNetCloseBeforeDeliveryStillResets`;
-`TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — writes after a peer's
+end whose receive queue holds UNREAD data answers with RST instead of FIN (the kernel's close(2)
+conditional; bytes still in flight toward the closer count as queued for that decision — the
+recorded collapse: the sim RSTs immediately, one of the two orderings the real close-vs-arrival
+race produces, `TestDSTNetCloseBeforeDeliveryStillResets`). The RST's RECEIVER still drains bytes
+already delivered to it — and bytes the closer wrote before closing, which travel ahead of the RST
+on the in-order link — before its reads fail `ECONNRESET`, exactly as tcp_recvmsg reports pending
+data before the socket error (host-probed; the same drain rule the retransmit-horizon death
+follows; `TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — writes after a peer's
 close follow the FIN/RST shape above (first accepted, subsequent `ECONNRESET`), and any operation on
 a reset connection carries `ECONNRESET`; deadline failures are `*net.OpError` wrapping
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
@@ -584,7 +587,19 @@ mint a regular file). `..` is evaluated against the tree during the walk, never
 erased lexically first — a purely lexical `path.Clean` would make sim-only successes out of path
 bugs a real kernel rejects. (`..` at the root stays at the root, as POSIX resolves it.) The working
 directory is walked before operation-specific terminal `.`/`..` restrictions are applied: removal
-and rename report an earlier missing or non-directory intermediate first.
+and rename report an earlier missing or non-directory intermediate first. Rename orders its checks
+as rename(2) does — both parent walks (old, then new), then either terminal's `.`/`..` `EBUSY`,
+then the missing-old-final `ENOENT`, then the trailing-slash source-type check — so a
+destination-walk `ENOTDIR` precedes a missing source's `ENOENT`. Trailing slashes in a rename are
+checked against the SOURCE's type, not asserted per path: a trailing slash on either the oldpath
+or the newpath final is `ENOTDIR` only when the source is NOT a directory (fs/namei.c
+do_renameat2's "unless the source is a directory trailing slashes give -ENOTDIR"), so
+`rename("dir", "missing/")` succeeds while `rename("file", "missing/")`, `rename("file", "file2/")`,
+and `rename("file/", "x")` are `ENOTDIR`, and `rename("missing", "existingfile/")` is `ENOENT`
+(the old final's existence check precedes the slash rule). All host-probed, ext4 and tmpfs
+agreeing; note the portable `os.Rename` preamble Lstats an existing-directory newname first and
+reports the OLDNAME error — `EEXIST` when the old name resolves — before any of this reaches the
+tree, on host and simulation alike.
 The working directory is a PATH, not a node reference: renaming a directory out from
 under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,
 recorded here as contractual (the host's fchdir-tracked inode semantics are not promised). A
@@ -605,7 +620,12 @@ production-shaped throughout `errors.Is`: `*PathError`/
 `os.ErrClosed` on use-after-close, exactly as the host would shape them — including `EISDIR` for
 `O_TRUNC` on a directory regardless of access mode (an open real kernels reject may not mutate
 simulated state, not even a mtime), and `os.Remove` of a non-empty directory surfacing rmdir's
-`ENOTEMPTY` (`EINVAL` is reserved for `"."`, as on the host). POSIX namespace
+`ENOTEMPTY` (`EINVAL` is reserved for `"."`, as on the host). One recorded shape divergence:
+`RemoveAll` under a run is a single atomic subtree unlink on the tree (the portable
+implementation's openat-family recursion never reaches the gated funnels), so its failures carry
+`*PathError` Op `"removeall"` where the host surfaces the failing step's name (`unlinkat`,
+`openat`, …); the wrapped errno identity is preserved (the terminal-`"."` refusal keeps the
+host's `Op: "RemoveAll"`, `EINVAL`). POSIX namespace
 semantics hold where databases depend on them: an open file removed from the namespace
 (`Remove`, or replaced by `Rename`) keeps its content readable and writable through the open
 handle until close — content lives on the node, names are references.
@@ -702,7 +722,12 @@ post-fork with no P) still refuse. Everything else on a virtual fd — `read`/`w
 `lseek`/`fstat`, whose argument shapes ride the 6-argument form or vary per arch — stays fenced at the
 raw boundary and is reached through `os.File`, whose named wrappers dispatch. A raw operation on a HOST
 fd, on a non-mapping address, or outside this set meets the fence exactly as before. The virtual fd table is per process; close releases the
-descriptor. Process teardown — on crash AND on normal body return, which models process **exit** (see
+descriptor, and `Fd()` on a CLOSED simulated file reports -1 — there is no live descriptor to
+name — so a raw syscall naming that -1 meets the raw boundary's fence (the loud unsupported
+refusal) where the host kernel answers `EBADF` for a closed real descriptor: a deliberate
+loud-refusal divergence (in-range `EBADF` is reserved for live-table misses and, at the
+trampolines, for the daemonize close sweep — never for a handle the program provably held and
+closed, where a silent errno would hide the stale-capability bug the fence exists to surface). Process teardown — on crash AND on normal body return, which models process **exit** (see
 the crash contract in faults.md) — closes every simulated file owned by the victim process and releases its
 virtual descriptors, so stale fd capabilities fail as closed/bad-fd and any fd-owned kernel state is
 dropped with the process.
@@ -794,7 +819,10 @@ the directory node identity, so a `Root` keeps addressing that node across names
 than re-resolving the path string passed to `OpenRoot`. A captured node REMOVED from the namespace
 (`Remove`/`RemoveAll`, or replaced by `Rename`) is an rmdir'd directory: entry creation in it —
 create, mkdir, rename-into — fails `ENOENT` through the still-open `Root`, as openat(2) answers on
-the host; reads of the (empty) node itself keep working. Root-relative paths are walked component-wise
+the host; metadata reads (stat) of the node itself keep working, while directory LISTINGS of a
+removed directory answer `ENOENT` through any open handle — the kernel's dead-directory refusal
+(`iterate_dir`'s `IS_DEADDIR`; host-probed: getdents on an rmdir'd directory is `ENOENT` on tmpfs
+and ext alike, never an empty listing). Root-relative paths are walked component-wise
 from that captured node; absolute paths and `..` walks above the opened root fail instead of resolving
 against the process cwd, the tree root, or the host filesystem. Rooted file, directory, metadata,
 removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
@@ -848,7 +876,18 @@ inside the bubble, so a blocked pipe read or write is **synctest-durably blocked
 clock advances over it and deadlock detection stays sound.
 
 The model is the Linux anonymous pipe, host-probed: capacity 64 KiB (a write blocks at a full
-buffer until a read frees space); writes of at most `PIPE_BUF` (4096) bytes are **atomic** —
+buffer until a read frees space). **The simulated buffer is a byte-exact 64 KiB ring; the
+kernel's is a ring of 16 page slots** (a partially-read head page's remainder is unwritable, and
+appending merges only into the last-written page's tail), so under fragmentation the host can
+admit less than the byte count suggests (each stranded partial page — a partially-read head, a
+merge-overflow spill, an interrupted write's tail — wastes its remainder, so the slack is
+page-granular and bounded only by the 16-slot ring): the partial count of a deadline- or
+close-interrupted oversize write may run HIGHER in simulation by that fragmentation slack, never
+lower — the simulation admits at least what the kernel would, so a sim-blocked write is
+host-blocked too (never a false positive; the slack is a recorded false-negative window, and
+exact mirroring would couple the model to kernel-version-dependent merge semantics). The
+conformance harness allowlists exactly this one-directional window (`pipe-ring-byte-exact`).
+Writes of at most `PIPE_BUF` (4096) bytes are **atomic** —
 concurrent small writes never interleave, the guarantee logging and record-framing patterns
 depend on — while larger writes chunk and may interleave with other writers, exactly as POSIX
 allows. Error identity is production-shaped throughout `errors.Is`, in the host's *probed
@@ -1145,6 +1184,19 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via
   `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
   load-bearing for this invariant.
+- **`test:conformance`** (`go test -tags dst -count=1 -timeout 30m testing/simulation/conformance`,
+  Linux): the differential host-vs-sim conformance harness — seeded op-grammar sequences over the
+  modeled pipe, TCP, and filesystem surfaces, executed against real Linux primitives outside a run
+  (build-mode inertness) and inside `simulation.Run`, with normalized outcomes diffed. Its
+  allowlist is machine-checked spec: every entry is one divergence THIS document records as
+  deliberate, with a citation; an unallowlisted divergence fails the leg with the op sequence as
+  reproducer, and an applicable entry that never fires fails as stale (the spec outran the list).
+  The default sweep is bounded (4 seeds per domain); `DST_CONFORMANCE_SEEDS=<n>` widens it. Scope
+  bounds are recorded in the package's doc.go (crash/durability and fault injection have no host
+  leg; they stay with the fork's own suites). Crash-tear visibility in particular is structurally
+  outside the harness — a differential leg requires a host counterpart for every op, and host
+  power-loss cannot be injected — so the sim-side tear model remains pinned by its unit suites,
+  not by this leg.
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the other three legs
   sequentially and fail-fast.

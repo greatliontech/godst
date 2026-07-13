@@ -685,9 +685,11 @@ func (c *dstConn) Close() error {
 		return nil
 	}
 	// The kernel's close(2) conditional: an end whose receive queue holds
-	// unread data answers the peer with RST — the peer's next read fails
-	// ECONNRESET without draining — otherwise the close FINs and the peer
-	// drains buffered bytes to io.EOF. Bytes still in flight count as queued
+	// unread data answers the peer with RST — the peer drains bytes already
+	// delivered (and any this end wrote before closing, which travel ahead
+	// of the RST on the in-order link), then fails ECONNRESET — otherwise
+	// the close FINs and the peer drains buffered bytes to io.EOF. Bytes
+	// still in flight TOWARD this end count as queued for the RST decision
 	// (the recorded collapse: the sim RSTs immediately, one of the two
 	// orderings the real close-vs-arrival race produces). The type assertion
 	// is the same wire-backed transport contract dstCloseProcConns records.

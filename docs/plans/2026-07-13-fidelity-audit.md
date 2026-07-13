@@ -32,7 +32,7 @@ by slog (consumers need a relay they must discover by data loss);
   consumer pipeline stays the consumer's to guard, with the relay
   idiom named in the spec). Gate: fork legs + protodb smoke with `-v`
   usable.
-- [ ] **2 — Differential conformance harness (the false-negative
+- [x] **2 — Differential conformance harness (the false-negative
   net).** A host-vs-sim differential runner: the same op-grammar
   executed against real Linux primitives and the simulation, outcomes
   diffed (error identity via errors.Is chains, partial-count

@@ -373,14 +373,15 @@ func TestDSTProcessExitLastInvocationScopesResources(t *testing.T) {
 	}
 }
 
-// TestDSTProcessExitResetDropsInFlightBytes: the exit-close RST arm resets the
-// conn at BOTH ends — the surviving peer's next read fails ECONNRESET without
-// draining, even for a reply the dying process sent moments before exiting
-// (the RST destroys the receive queue; a single-end teardown would present as
-// a graceful write-close and let the peer drain first).
-func TestDSTProcessExitResetDropsInFlightBytes(t *testing.T) {
+// TestDSTProcessExitResetDeliversPreExitBytesThenResets: the exit-close RST
+// arm resets the dying end, but a reply the process sent before exiting
+// travels ahead of its RST on the in-order link and tcp_recvmsg reports
+// pending data before the socket error (host-probed) — so the surviving peer
+// drains the reply, and only then do its reads fail ECONNRESET.
+func TestDSTProcessExitResetDeliversPreExitBytesThenResets(t *testing.T) {
 	var n int
-	var readErr error
+	var buf [8]byte
+	var readErr, secondErr error
 	RunWith(1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		addrCh := make(chan string, 1)
 		readDone := make(chan struct{})
@@ -416,9 +417,10 @@ func TestDSTProcessExitResetDropsInFlightBytes(t *testing.T) {
 					return
 				}
 				c.Write([]byte("data"))
-				// Blocks until the server's exit-close resets our end (no data
-				// can arrive first: the reply's delivery lies past the reset).
-				n, readErr = c.Read(make([]byte, 8))
+				// Blocks until the pre-exit reply delivers (it outruns the
+				// exit-close's RST on the in-order link).
+				n, readErr = c.Read(buf[:])
+				_, secondErr = c.Read(make([]byte, 8))
 				close(readDone)
 				c.Close()
 			})
@@ -427,7 +429,10 @@ func TestDSTProcessExitResetDropsInFlightBytes(t *testing.T) {
 		// runs then. Wait for the whole sequence via the client's read.
 		<-readDone
 	})
-	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
-		t.Fatalf("first read after the peer exited with unread data = (%d, %v), want (0, ECONNRESET): the exit RST drops in-flight bytes, not drains them", n, readErr)
+	if n != 4 || string(buf[:4]) != "resp" || readErr != nil {
+		t.Fatalf("first read after the peer exited with unread data = (%d, %q, %v), want (4, %q, nil): the pre-exit reply outruns the RST and drains", n, buf[:n], readErr, "resp")
+	}
+	if !errors.Is(secondErr, syscall.ECONNRESET) {
+		t.Fatalf("read after the drain = %v, want ECONNRESET (the exit-close RST surfaces once pending data is consumed)", secondErr)
 	}
 }

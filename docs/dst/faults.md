@@ -532,9 +532,11 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
   `ResetProcess(p)` (process), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
   host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
-  exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). A reset hits **both ends**, so
-  each closes and a subsequent read returns `ECONNRESET` before draining — **in-flight bytes are dropped**,
-  as a real RST discards them (DST-FAULT-SOUND). When a reset matches **several** conns, the victims are
+  exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). An injected reset hits **both
+  ends**, so each closes and a subsequent read returns `ECONNRESET` before draining — queued and in-flight
+  bytes alike: the fault destroys the conn outright, a recorded fault-model collapse (a real kernel's
+  tcp_recvmsg would still drain a receiver's already-queued bytes before reporting the error — the
+  drain-then-reset shape the non-fault close(2) conditional models). When a reset matches **several** conns, the victims are
   reset in **connection-registration order** (a per-run sequence id recorded at establishment,
   `dstConn.regSeq`; the victims are collected from the registry and sorted by it —
   `TestDSTNetResetVictimOrderByRegSeq`) — never in
@@ -836,8 +838,11 @@ carries, so the peer drains and reads `io.EOF` (or whatever error the pre-crash 
 exactly as if the crash never happened to that conn (DST-FAULT-SOUND: no real RST exists for an
 app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns`. The RST applies to
 the connections the victim still holds open, at the surviving peer's own end — its next read fails
-`ECONNRESET` **without draining**, queued and in-flight bytes alike, as a real RST destroys the
-receive queue. *Enforced:* `TestDSTCrashHostDropsInFlightBytes`, `TestDSTCrashHostFreesVictimPorts`
+`ECONNRESET` **without draining**, queued and in-flight bytes alike: the fault destroys the conn
+outright, a recorded fault-model collapse (a real kernel's tcp_recvmsg would still drain the
+survivor's already-queued bytes before reporting the error — the shape the non-fault close(2)
+conditional models).
+*Enforced:* `TestDSTCrashHostDropsInFlightBytes`, `TestDSTCrashHostFreesVictimPorts`
 (the victim's port space clears with the machine). And until a Host re-declaration reboots the
 machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so the connect times
 out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect cost; *enforced:*
@@ -853,11 +858,12 @@ kernel's order: the goroutines (threads) die first, then resources close, then P
 `Process` body's normal return (or panic unwind) IS the process's exit and routes
 through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn
 ends (the kernel close()s a dying process's sockets) with the kernel's own conditional per end — an end
-whose receive queue holds unread data answers the peer with RST: the peer's next read fails ECONNRESET
-WITHOUT draining, queued and in-flight bytes alike, as every RST teardown destroys the receive queue
-at both ends (`TestDSTProcessExitResetDropsInFlightBytes`); otherwise the close FINs
-and the peer drains buffered bytes then reads EOF — while crash RESETS them unconditionally, and both
-close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process
+whose receive queue holds unread data answers the peer with RST: the peer still DRAINS bytes already
+delivered to it, and bytes the dying process wrote before exiting (they travel ahead of the RST on the
+in-order link, and tcp_recvmsg reports pending data before the socket error — host-probed), and only
+then do its reads fail ECONNRESET (`TestDSTProcessExitResetDeliversPreExitBytesThenResets`); otherwise
+the close FINs and the peer drains buffered bytes then reads EOF — while crash RESETS them
+unconditionally with the fault layer's no-drain teardown, and both close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process
 (`TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — close(2) is
 close(2), whoever calls it. The in-flight-counts-as-queued collapse is pinned by
 `TestDSTNetCloseBeforeDeliveryStillResets`. One recorded collapse of the conditional: bytes still in flight count as queued —

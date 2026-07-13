@@ -203,9 +203,10 @@ func TestDSTFSOpenRootRemovedDirectory(t *testing.T) {
 			t.Fatalf("removed dir visible again: Stat = %v, want not-exist", err)
 		}
 
-		// The RemoveAll form marks the whole subtree, and a removed directory
-		// reads EMPTY through a surviving Root — the host unlinks bottom-up, so
-		// the detached children are not a visible listing.
+		// The RemoveAll form marks the whole subtree: lookups through a
+		// surviving Root find nothing — the host unlinks bottom-up, so the
+		// detached children are unreachable (and listings answer ENOENT,
+		// the kernel's dead-directory refusal).
 		if err := os.MkdirAll("/x/y", 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}

@@ -100,7 +100,29 @@ func TestDSTFSTerminalDotErrorPrecedence(t *testing.T) {
 			{"rename-new-missing-dotdot", func() error { return os.Rename("/dir/source", "/missing/..") }, syscall.ENOENT},
 			{"rename-new-file-dot", func() error { return os.Rename("/dir/source", "/file/.") }, syscall.ENOTDIR},
 			{"rename-new-file-dotdot", func() error { return os.Rename("/dir/source", "/file/..") }, syscall.ENOTDIR},
-			{"rename-old-terminal-precedes-new-missing", func() error { return os.Rename("/dir/.", "/missing/..") }, syscall.EBUSY},
+			// rename(2) resolves BOTH parent walks before the terminal-dot
+			// EBUSY and old-final existence checks (host-probed: a new-path
+			// walk error beats the old terminal's EBUSY, EBUSY beats the
+			// missing old final, and the missing old final beats the
+			// new-final trailing-slash assertion).
+			{"rename-new-walk-precedes-old-terminal", func() error { return os.Rename("/dir/.", "/missing/..") }, syscall.ENOENT},
+			{"rename-new-walk-notdir-precedes-old-terminal", func() error { return os.Rename("/dir/.", "/file/sub") }, syscall.ENOTDIR},
+			{"rename-new-walk-precedes-old-missing", func() error { return os.Rename("/missing", "/file/sub") }, syscall.ENOTDIR},
+			// os.Rename's portable preamble (file_unix.go rename) Lstats an
+			// existing-directory newname and returns the OLDNAME error before
+			// any rename reaches the tree — raw rename(2) would say EBUSY
+			// here, but the Go surface says ENOENT on host and sim alike.
+			{"rename-existing-dir-newname-reports-oldname-error", func() error { return os.Rename("/missing", "/dir/.") }, syscall.ENOENT},
+			{"rename-old-missing-precedes-new-trailing-slash", func() error { return os.Rename("/missing", "/newname/") }, syscall.ENOENT},
+			{"rename-old-terminal-when-both-walks-clean", func() error { return os.Rename("/dir/.", "/target") }, syscall.EBUSY},
+			// Terminal-dot EBUSY precedes the trailing-slash source check:
+			// a directory source would make "/newname2/" legal, but the
+			// "." terminal refuses first (host-probed).
+			{"rename-old-terminal-precedes-new-trailing-slash", func() error { return os.Rename("/dir/.", "/newname2/") }, syscall.EBUSY},
+			// Old trailing slash on a file with an existing-dir newname:
+			// the os.Rename preamble Lstats the newname (a directory) and
+			// reports the OLDNAME error — raw rename(2) would say EBUSY.
+			{"rename-preamble-reports-oldname-slash-error", func() error { return os.Rename("/file/", "/dir/.") }, syscall.ENOTDIR},
 		}
 		for _, tc := range cases {
 			err := tc.run()
@@ -172,15 +194,94 @@ func TestDSTFSCreateTrailingSlashEISDIR(t *testing.T) {
 	})
 }
 
-func TestDSTFSRenameTrailingSlashMissing(t *testing.T) {
+// TestDSTFSRenameTrailingSlash pins rename(2)'s trailing-slash rule at the
+// os.Rename surface: trailing slashes on either path's final component are
+// checked against the SOURCE's type after the old final's existence check
+// ("unless the source is a directory trailing slashes give -ENOTDIR"), so a
+// DIRECTORY source renames onto a trailing-slash missing newpath while a
+// file source is refused. Every row is host-probed (ext4 and tmpfs agree);
+// rows an os.Rename preamble intercepts are marked.
+func TestDSTFSRenameTrailingSlash(t *testing.T) {
 	simulation.Run(1, func() {
-		if err := os.WriteFile("/file", []byte("x"), 0o644); err != nil {
-			t.Fatalf("WriteFile: %v", err)
+		mk := func() {
+			os.RemoveAll("/fx")
+			if err := os.MkdirAll("/fx/d", 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			for _, f := range []string{"/fx/d/sub", "/fx/f", "/fx/existf"} {
+				if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+			if err := os.Mkdir("/fx/empty", 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			if err := os.Mkdir("/fx/nonempty", 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			if err := os.WriteFile("/fx/nonempty/kid", []byte("k"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
 		}
-		if err := os.Rename("/file", "/new/"); !errors.Is(err, syscall.ENOTDIR) {
-			t.Fatalf(`Rename("/file", "/new/") = %v, want ENOTDIR`, err)
+		cases := []struct {
+			name     string
+			old, new string
+			want     error // nil = must succeed
+		}{
+			{"dir-to-missing-slash", "/fx/d", "/fx/miss/", nil},
+			{"dir-slash-to-missing-slash", "/fx/d/", "/fx/miss/", nil},
+			{"dir-slash-to-missing", "/fx/d/", "/fx/miss", nil},
+			{"file-to-missing-slash", "/fx/f", "/fx/miss/", syscall.ENOTDIR},
+			{"file-slash-to-missing", "/fx/f/", "/fx/miss", syscall.ENOTDIR},
+			{"missing-to-missing-slash", "/fx/miss", "/fx/x/", syscall.ENOENT},
+			{"missing-slash-to-missing", "/fx/miss/", "/fx/x", syscall.ENOENT},
+			{"dir-to-existing-file-slash", "/fx/d", "/fx/existf/", syscall.ENOTDIR},
+			{"file-to-existing-file-slash", "/fx/f", "/fx/existf/", syscall.ENOTDIR},
+			// Old-final ENOENT precedes the trailing-slash source check,
+			// even when the slash names an existing regular file.
+			{"missing-to-existing-file-slash", "/fx/miss", "/fx/existf/", syscall.ENOENT},
+			// Self-renames: the slash rule still keys on the source type.
+			{"file-to-self-slash", "/fx/f", "/fx/f/", syscall.ENOTDIR},
+			{"dir-to-self-slash", "/fx/d", "/fx/d/", nil}, // preamble SameFile fall-through; no-op
+			// EINVAL (new inside old) is reachable for a dir source: the
+			// slash rule does not apply and the containment check fires.
+			{"dir-into-own-subtree-slash", "/fx/d", "/fx/d/inner/", syscall.EINVAL},
+			// Existing-DIRECTORY newnames never reach rename(2) at this
+			// surface: the os.Rename preamble Lstats them and answers
+			// EEXIST (raw rename(2) would replace an empty directory).
+			{"dir-to-empty-dir-slash", "/fx/d", "/fx/empty/", syscall.EEXIST},
+			{"file-to-empty-dir-slash", "/fx/f", "/fx/empty/", syscall.EEXIST},
+			{"dir-to-nonempty-dir-slash", "/fx/d", "/fx/nonempty/", syscall.EEXIST},
 		}
-		if _, err := os.Stat("/new"); err == nil {
+		for _, tc := range cases {
+			mk()
+			err := os.Rename(tc.old, tc.new)
+			if tc.want == nil {
+				if err != nil {
+					t.Errorf("%s: Rename(%q, %q) = %v, want success", tc.name, tc.old, tc.new, err)
+				}
+				continue
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("%s: Rename(%q, %q) = %v, want %v", tc.name, tc.old, tc.new, err, tc.want)
+			}
+		}
+		// The dir-source success actually moved the tree, and the refused
+		// file-source rename minted nothing.
+		mk()
+		if err := os.Rename("/fx/d", "/fx/moved/"); err != nil {
+			t.Fatalf(`Rename("/fx/d", "/fx/moved/") = %v, want success (dir source)`, err)
+		}
+		if got, err := os.ReadFile("/fx/moved/sub"); err != nil || string(got) != "x" {
+			t.Fatalf("moved dir content = %q, %v; want intact", got, err)
+		}
+		if _, err := os.Stat("/fx/d"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("source dir still present after rename: %v", err)
+		}
+		if err := os.Rename("/fx/f", "/fx/new/"); !errors.Is(err, syscall.ENOTDIR) {
+			t.Fatalf(`Rename("/fx/f", "/fx/new/") = %v, want ENOTDIR (file source)`, err)
+		}
+		if _, err := os.Stat("/fx/new"); err == nil {
 			t.Fatalf("a file was created despite the trailing slash")
 		}
 	})

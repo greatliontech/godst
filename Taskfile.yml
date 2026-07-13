@@ -24,6 +24,11 @@
 # path; quote RUN's expansion if that ever changes.)
 version: '3'
 
+# test:conformance runs a BOUNDED differential sweep by default (4 seeds per
+# domain); set DST_CONFORMANCE_SEEDS=<n> in the environment for a wider sweep
+# (the harness reads it before any simulation starts; see
+# src/testing/simulation/conformance/doc.go).
+
 vars:
   RUN: 'GOROOT={{.ROOT_DIR}} TMPDIR={{.ROOT_DIR}}/.tmp {{.ROOT_DIR}}/bin/go'
 
@@ -33,11 +38,12 @@ tasks:
     cmds:
       - mkdir -p {{.ROOT_DIR}}/.tmp
   test:
-    desc: The fast enforcing legs (untagged, dst, dst-race), sequential and fail-fast; test:inert-std runs separately
+    desc: The fast enforcing legs (untagged, dst, dst-race, conformance), sequential and fail-fast; test:inert-std runs separately
     cmds:
       - task: test:untagged
       - task: test:dst
       - task: test:dst-race
+      - task: test:conformance
 
   test:untagged:
     desc: Untagged -short runtime — DST hooks inert; testprog stays cgo-free (deadlock crash tests live)
@@ -59,6 +65,13 @@ tasks:
     deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -tags dst -race -count=1 testing/simulation'
+
+  test:conformance:
+    desc: Host-vs-sim differential conformance harness (pipes/TCP/fs) — bounded seed sweep; DST_CONFORMANCE_SEEDS widens
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - '{{.RUN}} test -tags dst -count=1 -timeout 30m testing/simulation/conformance'
 
   test:inert-std:
     desc: Untagged -short std — build-mode inertness across all of std (heavy; not in `task test`)
