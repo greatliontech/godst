@@ -18,7 +18,7 @@ InheritFile capability's node-scoped refusal being swallowed silently
 by slog (consumers need a relay they must discover by data loss);
 `/dev/null` ENOENT (recorded gap, common legal shape).
 
-- [ ] **1 — False-positive burn: the testing-framework stdio seam.**
+- [x] **1 — False-positive burn: the testing-framework stdio seam.**
   The `-v` chatty printer and `t.Log`-adjacent framework writes are
   go-test plumbing, not SUT code — they must not trip the SUT's
   stdio fence. Fix at the testing-package seam (a pre-granted
