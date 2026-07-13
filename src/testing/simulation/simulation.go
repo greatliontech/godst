@@ -420,8 +420,8 @@ const (
 // async-preempt, and GOMAXPROCS are all process-wide for the duration of a run.
 var runActive atomic.Bool
 
-// callerGate orders the caller-position guards (requireBubbleFaultCaller,
-// requireBubbleDeclCaller) against the runActive flips. An inactive caller
+// callerGate orders the caller-position guards (withBubbleFaultCaller,
+// withBubbleDeclCaller) against the runActive flips. An inactive caller
 // retains the read side through its mutation, so the activation-edge TOCTOU —
 // guard loads false, the CAS lands, the op executes torn into the newly-active
 // run — is unrepresentable. An admitted active bubble caller validates on a

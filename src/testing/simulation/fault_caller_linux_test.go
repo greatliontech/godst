@@ -268,13 +268,23 @@ func TestDSTDisassociatedAllocationCounts(t *testing.T) {
 func TestDSTRunActivationExcludesInFlightGuardedOps(t *testing.T) {
 	for _, g := range []struct {
 		name string
-		hold func() func()
+		call func(func())
 	}{
-		{"fault-guard", func() func() { return requireBubbleFaultCaller("gate-probe") }},
-		{"decl-guard", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+		{"fault-guard", func(op func()) { withBubbleFaultCaller("gate-probe", op) }},
+		{"decl-guard", func(op func()) { withBubbleDeclCaller("gate-probe", op) }},
 	} {
 		t.Run(g.name, func(t *testing.T) {
-			release := g.hold() // no run active: passes, holds the gate
+			opEntered := make(chan struct{})
+			releaseOp := make(chan struct{})
+			opDone := make(chan struct{})
+			go func() {
+				g.call(func() {
+					close(opEntered)
+					<-releaseOp
+				})
+				close(opDone)
+			}()
+			<-opEntered
 			done := make(chan struct{})
 			go func() {
 				Run(1, func() {})
@@ -284,14 +294,48 @@ func TestDSTRunActivationExcludesInFlightGuardedOps(t *testing.T) {
 			// while the guarded op is in flight.
 			for i := 0; i < 50; i++ {
 				if runActive.Load() {
-					release()
+					close(releaseOp)
+					<-opDone
 					<-done
 					t.Fatal("Run activated while a guarded op held callerGate")
 				}
 				time.Sleep(time.Millisecond)
 			}
-			release()
+			close(releaseOp)
+			<-opDone
 			<-done // and with the gate released, activation and the run complete
+		})
+	}
+}
+
+func TestDSTInactiveCallerCallbacksOwnCompleteExtent(t *testing.T) {
+	for _, guard := range []struct {
+		name string
+		call func(func())
+	}{
+		{"fault", func(op func()) { withBubbleFaultCaller("gate-probe", op) }},
+		{"declaration", func(op func()) { withBubbleDeclCaller("gate-probe", op) }},
+	} {
+		t.Run(guard.name, func(t *testing.T) {
+			guard.call(func() {
+				if callerGate.TryLock() {
+					callerGate.Unlock()
+					t.Error("inactive guard released before its callback completed")
+				}
+			})
+			if !callerGate.TryLock() {
+				t.Fatal("inactive guard retained callerGate after its callback returned")
+			}
+			callerGate.Unlock()
+
+			func() {
+				defer func() { recover() }()
+				guard.call(func() { panic("callback panic") })
+			}()
+			if !callerGate.TryLock() {
+				t.Fatal("panicking callback stranded callerGate")
+			}
+			callerGate.Unlock()
 		})
 	}
 }
@@ -300,18 +344,17 @@ func TestDSTActiveCallerGuardsReleaseAfterValidation(t *testing.T) {
 	Run(1, func() {
 		for _, guard := range []struct {
 			name string
-			call func() func()
+			call func(func())
 		}{
-			{"fault", func() func() { return requireBubbleFaultCaller("gate-probe") }},
-			{"declaration", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+			{"fault", func(op func()) { withBubbleFaultCaller("gate-probe", op) }},
+			{"declaration", func(op func()) { withBubbleDeclCaller("gate-probe", op) }},
 		} {
-			release := guard.call()
-			if !callerGate.TryLock() {
-				release()
-				t.Fatalf("active %s guard retained callerGate after validation", guard.name)
-			}
-			callerGate.Unlock()
-			release()
+			guard.call(func() {
+				if !callerGate.TryLock() {
+					t.Fatalf("active %s guard retained callerGate during its callback", guard.name)
+				}
+				callerGate.Unlock()
+			})
 		}
 	})
 }
@@ -319,10 +362,10 @@ func TestDSTActiveCallerGuardsReleaseAfterValidation(t *testing.T) {
 func TestDSTActiveCallerGuardsDoNotAcquireBehindWriter(t *testing.T) {
 	for _, guard := range []struct {
 		name string
-		call func() func()
+		call func(func())
 	}{
-		{"fault", func() func() { return requireBubbleFaultCaller("gate-probe") }},
-		{"declaration", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+		{"fault", func(op func()) { withBubbleFaultCaller("gate-probe", op) }},
+		{"declaration", func(op func()) { withBubbleDeclCaller("gate-probe", op) }},
 	} {
 		t.Run(guard.name, func(t *testing.T) {
 			bodyEntered := make(chan struct{})
@@ -334,9 +377,7 @@ func TestDSTActiveCallerGuardsDoNotAcquireBehindWriter(t *testing.T) {
 				Run(1, func() {
 					close(bodyEntered)
 					<-writerHeld
-					release := guard.call()
-					release()
-					close(guardDone)
+					guard.call(func() { close(guardDone) })
 					<-finish
 				})
 				close(runDone)

@@ -468,7 +468,6 @@ func internProc(name string) uint32 {
 // fault APIs — a mid-run declaration is a reboot, and a reboot at a wall-clock
 // instant the seed does not control would silently diverge replay.
 func Host(name string, config HostConfig, f func()) {
-	release := requireBubbleDeclCaller("Host")
 	var oldH, oldP uint32
 	stamped := false
 	defer func() {
@@ -477,10 +476,6 @@ func Host(name string, config HostConfig, f func()) {
 		}
 	}()
 	declare := func() {
-		// An inactive declaration retains the gate through these mutations and
-		// releases on panic too; an active declaration's no-op release reflects
-		// that bubble liveness protects the same extent. f is ordinary code.
-		defer release()
 		nodeReg.mu.Lock()
 		defer nodeReg.mu.Unlock()
 		hid, exists := nodeReg.hosts[name]
@@ -519,11 +514,11 @@ func Host(name string, config HostConfig, f func()) {
 			dstNetPartitionOp(partOpHostUp, hid, 0)
 		}
 	}
-	declare()
+	withBubbleDeclCaller("Host", declare)
 	f()
 }
 
-// requireBubbleFaultCaller is the fault APIs' caller-position guard, run as
+// withBubbleFaultCaller is the fault APIs' caller-position guard, run as
 // each one's first act (before victim lookup). A fault invoked during an
 // active run from a goroutine outside the RUN'S bubble — no bubble at all, or
 // a foreign synctest bubble, itself a distinct scheduling domain — would
@@ -533,34 +528,34 @@ func Host(name string, config HostConfig, f func()) {
 // victim-naming rule already panics on. Outside a run the APIs stay
 // documented no-ops.
 //
-// An inactive caller retains callerGate's read side through its mutation, so
-// activation cannot split a pre-run operation into the new run. An admitted
-// active bubble caller validates without acquiring the gate: its bubble
-// liveness excludes deactivation while it can continue, and crash marking
-// prevents a killed waiter from ever resuming.
-func requireBubbleFaultCaller(api string) func() {
+// op is the complete state transition: its first validation or lookup through
+// its final mutation. An inactive caller retains callerGate throughout op. An
+// admitted active bubble caller validates without acquiring the gate and relies
+// on bubble liveness. Moving validation or mutation outside op reintroduces the
+// activation-edge tear. User code and self-crash parking stay outside op.
+func withBubbleFaultCaller(api string, op func()) {
 	if runActive.Load() {
 		if !dstInSimBubble() {
 			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 		}
-		return releaseCallerGateNoop
+		op()
+		return
 	}
 	callerGate.RLock()
 	if runActive.Load() {
-		if !dstInSimBubble() {
-			callerGate.RUnlock()
-			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
-		}
 		callerGate.RUnlock()
-		return releaseCallerGateNoop
+		if dstInSimBubble() {
+			op()
+			return
+		}
+		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 	}
-	return callerGate.RUnlock
+	defer callerGate.RUnlock()
+	op()
 }
 
-func releaseCallerGateNoop() {}
-
-// requireBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
-// requireBubbleFaultCaller, run as each one's first act — before the intern
+// withBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
+// withBubbleFaultCaller, run as each one's first act — before the intern
 // tables are touched. A mid-run Host re-declaration relays the host-up op (a
 // reboot: HealHost plus clock re-establishment) and Process starts SUT
 // goroutines; from a goroutine outside the run's bubble both would mutate run
@@ -568,27 +563,28 @@ func releaseCallerGateNoop() {}
 // silent-nondeterminism class the fault guard kills, through a declaration
 // API. Outside a run the APIs keep their documented no-run behavior.
 //
-// Like requireBubbleFaultCaller, an inactive declaration retains the read side
-// through its mutations, while an active bubble declaration never acquires it.
-// No declaration retains it while running f: user code is outside
-// the declaration state transition.
-func requireBubbleDeclCaller(api string) func() {
+// op contains the complete Host declaration or Process admission transition;
+// moving its first validation or final publication outside op reintroduces the
+// activation-edge tear. User f and Process exit teardown stay outside.
+func withBubbleDeclCaller(api string, op func()) {
 	if runActive.Load() {
 		if !dstInSimBubble() {
 			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 		}
-		return releaseCallerGateNoop
+		op()
+		return
 	}
 	callerGate.RLock()
 	if runActive.Load() {
-		if !dstInSimBubble() {
-			callerGate.RUnlock()
-			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
-		}
 		callerGate.RUnlock()
-		return releaseCallerGateNoop
+		if dstInSimBubble() {
+			op()
+			return
+		}
+		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 	}
-	return callerGate.RUnlock
+	defer callerGate.RUnlock()
+	op()
 }
 
 // lookupHost resolves an already-declared host name for a fault or inspection API,
@@ -678,14 +674,7 @@ func crashProcess(name string) {
 // leave the simulation with no driver, so the crash is refused before anything
 // is torn down. Crash is a no-op outside a run.
 func Crash(name string) {
-	release := requireBubbleFaultCaller("Crash")
-	func() {
-		// Scoped so the gate is released (panic paths included) BEFORE a
-		// self-crash parks this goroutine forever — a parked reader would
-		// deadlock the run's deactivation flip.
-		defer release()
-		crashProcess(name)
-	}()
+	withBubbleFaultCaller("Crash", func() { crashProcess(name) })
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
 	}
@@ -786,12 +775,7 @@ func crashHost(name string) {
 // run on an undeclared host name, and on a host owning the run's main goroutine
 // (see Crash); it is a no-op outside a run.
 func CrashHost(name string) {
-	release := requireBubbleFaultCaller("CrashHost")
-	func() {
-		// Scoped like Crash's: released before the self-crash park.
-		defer release()
-		crashHost(name)
-	}()
+	withBubbleFaultCaller("CrashHost", func() { crashHost(name) })
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
 	}
@@ -820,29 +804,16 @@ func CrashHost(name string) {
 // APIs — it would start SUT goroutines outside the bubble, unscheduled by the
 // seed (see Host).
 func Process(name string, f func()) {
-	release := requireBubbleDeclCaller("Process")
-	declaredActive := runActive.Load()
+	var declaredActive bool
 	var declaredEpoch uint64
-	if declaredActive {
-		declaredEpoch = dstNetEpoch()
-	}
-	// Inactive admission retains the gate through the declaration mutations;
-	// active admission never acquired it. Neither retains
-	// it while f (ordinary goroutine code) runs; the flag covers panic paths.
-	// Registered FIRST so it runs LAST at unwind — by which point either the
-	// explicit release already ran (released=true; the park-forever defer
-	// below can then never strand a gate reader) or a declaration panic is
-	// unwinding and this releases.
-	released := false
-	defer func() {
-		if !released {
-			release()
-		}
-	}()
 	var host, proc uint32
 	var oldH, oldP uint32
 	var simPid, oldPid int32
-	func() {
+	withBubbleDeclCaller("Process", func() {
+		declaredActive = runActive.Load()
+		if declaredActive {
+			declaredEpoch = dstNetEpoch()
+		}
 		// Admission is one transaction with teardown and competing starts: no
 		// caller can validate against the old liveness map and register later on
 		// a second host.
@@ -868,7 +839,8 @@ func Process(name string, f func()) {
 		simPid = dstAllocPid()
 		oldPid = dstSetProcessPid(simPid)
 		activeProcSet(proc, host, simPid)
-	}()
+		dstSetPidLive(simPid, true)
+	})
 	// Registered FIRST so it runs LAST — after the exit-teardown defer below
 	// has completed and released procTeardownMu (parking while holding it
 	// would strand every later teardown). If the ENCLOSING invocation died
@@ -926,8 +898,5 @@ func Process(name string, f func()) {
 		dstSetPidLive(simPid, false)
 		activeProcClear(proc, simPid)
 	}()
-	dstSetPidLive(simPid, true)
-	released = true
-	release()
 	f()
 }
