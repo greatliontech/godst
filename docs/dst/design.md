@@ -559,16 +559,19 @@ mechanism as the network registry. All operations execute synchronously on the c
 no new scheduler choices, no new RNG (the Soundness invariant's "take over, never add" principle);
 determinism rides the schedule exactly as it does for the network.
 
-**The tree starts empty — except `/tmp`.** A run observes a root `/` containing one empty `/tmp`
-directory (mode `1777`): the host filesystem is NEVER visible (no passthrough, no testdata reads —
+**The tree starts empty — except `/tmp` and `/dev/null`.** A run observes a root `/` containing an
+empty `/tmp` directory (mode `1777`) and a `/dev` directory (mode `0755`) holding the null device:
+the host filesystem is NEVER visible (no passthrough, no testdata reads —
 a host path is machine state, and reading it would make runs machine-dependent), and `os.TempDir()`
 reports the fixed simulated `/tmp` during a run rather than the host's `$TMPDIR`-derived string
 (itself machine state), so `CreateTemp`/`MkdirTemp` work unmodified and deterministically — their
 random names draw from the seeded runtime stream. A program needing other fixture files creates
-them inside the run. **The mkfs image is part of the durable image**: the initial tree (root and
-`/tmp`) is on the platter from birth, so a host crash preserves it and fsync-disciplined state
+them inside the run. **The mkfs image is part of the durable image**: the initial tree (root,
+`/tmp`, and `/dev/null`) is on the platter from birth, so a host crash preserves it and
+fsync-disciplined state
 under `/tmp` — fsync(file) then fsync(`/tmp`), with no fsync of `/` — survives byte-exactly
-(`TestDSTCrashHostPreservesMkfsImage`, torn variant included); a tree born unsynced would erase
+(`TestDSTCrashHostPreservesMkfsImage`, torn variant included; `TestDSTDevNullSurvivesHostCrash`,
+torn variant included, for the device); a tree born unsynced would erase
 `/tmp` at the first crash, recoverable only by fsyncing `/` — which no POSIX-disciplined program
 does for a pre-existing directory.
 Paths resolve against a per-process working directory (initially `/`; normal exit, explicit process
@@ -885,6 +888,54 @@ so their methods are fenced inside a run. Code that deliberately needs host stdi
 `simulation.InheritFile` inside the run and uses or installs the returned capability; captured or fully
 deterministic stdio instead assigns the package variables to simulated files. Capability writes are
 outbound, schedule-ordered side effects that feed no nondeterminism back into the run.
+An inherited capability is **node-scoped to the root simulation body** that holds the grant: operated
+from a `Host` or `Process` body it refuses with a distinguishable node-scoped error naming the relay
+idiom — never the closed-file shape, because the capability is not closed and a closed-shape refusal
+misdirects diagnosis toward close bugs while an error-swallowing log pipeline silently drops every
+record a cluster node emits. Two real machines cannot share an open file description, so cross-node
+use is the cross-node-channel escape the grant contract forbids, with no production error to mimic.
+Cross-node output (a cluster node's logging) is relayed in-model — over the simulated network or a
+shared channel — to the root body, which owns the capability (`TestDSTInheritFileRunOwnership`).
+The SUT fence does not apply to the **testing framework's own output stream**: the `-v` chatty
+printer (and the benchmark `b.Log` output branch) is framework-owned host plumbing, constructed
+from the pre-run host stdout before any run exists, and under `-v` its writes (t.Log routing,
+status lines) execute on bubble goroutines. An in-bubble framework write goes out through a raw
+descriptor captured at printer construction, as granted RAW write syscalls through the same scoped
+host-I/O path as capability writes — outbound and schedule-ordered, serializing the bubble for
+their duration exactly as a capability write does, and scheduler-INVISIBLE: the raw form opens no
+entersyscall window, so no wall-timed host event (a host M reclaiming the shared P through its own
+exitsyscall, a pending stop-the-world claiming `_Psyscall` Ps) can force the returning bubble
+goroutine through a wall-clock-dependent reschedule. Two constraints keep the seeded schedule
+sovereign: the bubble path never blocks on state a host goroutine can hold across wall-clock work
+(not the printer's host-side name mutex, not the poll layer's fd mutex — a bubble goroutine parked
+on a host-held lock would wake at a wall-clock-dependent point in the schedule), and its execution
+profile is a function of bubble-deterministic state only — which is why every in-bubble log line
+carries an UNCONDITIONAL `=== NAME` attribution header in the same write as its payload: the
+stream's "current test" context is shared with concurrent host writers, so any header decision
+either reads host-coupled state (the bytes and allocations feeding the deterministic GC trigger
+would then vary with host activity) or goes stale the moment a host line lands, misattributing the
+bubble line; a constant decision is deterministic by construction and always self-attributing.
+Atomicity is chunk-bounded: each emitted chunk (header included) stays within PIPE_BUF (4096
+bytes, the POSIX pipe-write atomicity bound), split at line boundaries, so concurrent host lines
+interleave only at chunk boundaries where the next chunk re-identifies itself — only a single line
+longer than the budget can tear mid-line. The cosmetic costs are exactly these: one redundant
+header line per in-bubble log write, and — the untouched host leg tracking only its own writes — a
+host-parallel test's lines that follow a bubble write may read under the bubble test's context in
+name-tracking parsers until the host next changes name; test results themselves ride
+name-carrying status lines and are never misattributed. In-bubble framework writes REQUIRE the
+captured descriptor: a printer whose stream is not a file — unreachable under any real `go test`
+wiring — refuses with the fence's loud unsupported-panic shape rather than silently falling back
+to the host-lock path. So `-v` streams from inside a run without perturbing the schedule:
+same-seed transcripts are byte-identical with `-v` on, with `-v` off, and under `-v` with a
+host-parallel test hammering the shared printer. The grant is enacted only around these unexported
+framework writes, which SUT code cannot reach — their inputs are strings the framework formatted
+before the grant opens — so a SUT write to `os.Stdout`/`os.Stderr` under `-v` is fenced exactly as
+without it. Enforced by the `TestVerbose*` suite in
+`src/testing/simulation/verbose_linux_test.go` (in-bubble streaming, the SUT-fence pin, the
+benchmark arm, the header-adjacency attribution pin under host-parallel contention, and the three
+same-seed transcript-equality pins — `-v` solo, `-v` on-vs-off, and `-v` under contention — whose
+shared program crosses the deterministic GC trigger repeatedly, so an alloc-coupling regression
+shifts them).
 The blocked case is covered too: a host write that blocks (a full pipe, a slow terminal) delays
 the run in *wall* time but cannot reorder it, because sysmon's **syscall-handoff retake is gated
 under an active run** exactly as its preemption retake is (`retake`, `proc.go`) — without that gate,
@@ -901,11 +952,22 @@ Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure m
 identity section); `os.Executable` is **fenced** under a run (it reads `/proc/self/exe` — a host
 path that names nothing in the simulated namespace); processes and signals are fenced (see the
 interception boundary below).
-One recorded gap: **`os.DevNull`** — the tree starts empty except `/tmp` (that contract stands),
-so opening `/dev/null` under a run is `ENOENT`; the in-sim idioms are `io.Discard` for a sink or
-an ordinary tree file, and the main host consumer of `/dev/null` (process spawning) is out of
-scope here. If a modeled `/dev/null` ever earns its place, it is a new node kind behind the same
-seam — an increment, not a retrofit.
+**`os.DevNull` is modeled** — the node-kind increment the original gap note reserved: every host
+tree is born with `/dev/null`, a character-device node behind the same `dstFile` seam, with the
+real Linux null device's host-probed ladder. Reads are `io.EOF` at every offset (behind the
+wrong-direction `EBADF`); writes and positional writes discard and report the full count; the file
+position is pinned at 0 — `Seek` returns `(0, nil)` for every whence and offset, including negative
+targets a regular file would refuse `EINVAL`; truncate (by handle or name) and `Sync`/fdatasync are
+`EINVAL`; `Stat` reports `ModeDevice|ModeCharDevice|0666`, size 0, an mtime writes never move, and
+one inode for every name and handle; the raw virtual-fd fstat carries `S_IFCHR` with the fixed
+`(1, 3)` st_rdev; mmap is `ENODEV`; deadlines keep the non-pollable `ErrNoDeadline` shape; flock
+works; `O_TRUNC` on open is ignored as the kernel ignores it for non-regular files. The device
+stores nothing and is not on the disk: disk faults (EIO, capacity, latency) never apply to device
+I/O, and the device is part of the mkfs durable image, so a host crash reboots with it intact.
+Removing it is an ordinary namespace operation — a subsequent `O_CREAT` mints a plain regular file
+at the path, exactly as on a real system after `rm /dev/null`. Enforced by the `TestDSTDevNull*`
+suite in `src/os/dst_devnull_linux_test.go`. Other device files stay unmodeled (`ENOENT`), and the
+main host consumer of `/dev/null` (process spawning) remains fenced at the process boundary.
 
 ### The interception boundary (raw syscalls, processes, signals, cgo)
 
@@ -999,9 +1061,10 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   host thread is process-wide host mutation, not a simulatable raw-kernel operation; non-bubble
   harness callers remain untouched while a run is active.
 - **Processes**: `os/exec` and `os.StartProcess` are fenced with the same shape (a real child is
-  wall-clock, host-visible work no seed controls). Today a spawn fails only *accidentally*
-  (a misleading simulated-FS `ENOENT` on the `/dev/null` stdin open, or the `Fd()` panic when
-  stdio is simulated); the fence makes the refusal designed and nameable.
+  wall-clock, host-visible work no seed controls). Before the fence, a spawn failed only
+  *accidentally* (an `Fd()` panic when stdio is simulated, or — before `/dev/null` was modeled — a
+  misleading simulated-FS `ENOENT` on the stdin open); the fence makes the refusal designed and
+  nameable.
 - **Signals**: the `os/signal` operations that touch the process's signal machinery from a bubble
   goroutine are fenced — `Notify`/`NotifyContext` (subscribe: a real signal delivery is an
   outside-bubble event on a wall clock; today it crashes the bubble only *if* a signal happens to
@@ -1046,7 +1109,8 @@ is a build constant, so every `if dstActive()`/`if dstBuild` guard — hot paths
 simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's drain legs, and
 `synctest`'s drain/teardown calls — is dead-code-eliminated. `TestDSTUntaggedCodeFootprint` pins the fold by objdump at the panic,
 finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
-pattern and were objdump-verified at the change. The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
+pattern and were objdump-verified at the change, as does `testing`'s framework-stream grant
+(`dstFrameworkStreamEnabled`, nm-verified at the change). The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
 fourteen per-goroutine DST words (the six identity/RNG stamps, the seven race-access staging
 fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries fake-timer state (arming
 host, full-width registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
@@ -1221,7 +1285,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
-| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile`; swap package vars to simulated files for capture; syscall-retake gated so a blocked capability write serializes, never reorders | ✅ |
+| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for capture; syscall-retake gated so a blocked capability write serializes, never reorders; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
@@ -1404,8 +1468,8 @@ later steps add, never rewrite.
   lookups fail under DST rather than touching host resolver state.
 
 - **Disk (in-memory deterministic filesystem). LANDED (second I/O feature).** Under DST the exported
-  `os` surface operates on a per-bubble in-memory tree (empty root + a pre-seeded `/tmp`; fixed
-  `os.TempDir`), reset by the run epoch: the full file-handle surface, the namespace ops with sorted
+  `os` surface operates on a per-bubble in-memory tree (empty root + a pre-seeded `/tmp` and
+  `/dev/null`; fixed `os.TempDir`), reset by the run epoch: the full file-handle surface, the namespace ops with sorted
   deterministic listings and a per-bubble path-model cwd, unlinked-but-open POSIX semantics, named
   metadata ops, and the durability representation with its enforced monotonicity invariant (the
   synced/unsynced split crash faults will tear along). Everything not modeled is fenced — host
@@ -1421,9 +1485,11 @@ later steps add, never rewrite.
   pipe semantics host-probed end to end (64 KiB capacity, PIPE_BUF atomicity under contention, the
   full error-precedence ladders, fake-clock deadlines, partial counts, SameFile across the pair),
   synctest-durable blocking, no host descriptor ever. Stdio is settled as NOT implicitly inherited
-  (programs explicitly grant a host file or swap the package streams in-run for capture), and
-  the remaining OS-backed I/O surface is audited closed — `/dev/null` stays `ENOENT` under a run
-  (recorded gap; `io.Discard` or a tree file is the in-sim idiom). See the "Deterministic pipes and
+  (programs explicitly grant a host file — node-scoped to the root simulation body — or swap the
+  package streams in-run for capture; the testing framework's own `-v` stream carries its
+  framework-stream grant), and the remaining OS-backed I/O surface is audited closed — `/dev/null`
+  is modeled (the host-probed null-device ladder behind the tree seam; see the stdio-stance
+  section). See the "Deterministic pipes and
   the stdio stance" section above; tested by the `TestDSTPipe*` family and the cross-process
   `TestDSTPipeReplay`. Caveats: a pipe end leaked out of its run is fenced (except `Close`);
   `os/exec` remains its own roadmap item.

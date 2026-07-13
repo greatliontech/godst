@@ -183,7 +183,7 @@ func TestDSTHostFSInspectionAllocatesNoInodes(t *testing.T) {
 // TestDSTNodeHostFS exercises the read-only HostFS inspector (idiom 2): the harness
 // reads a host's disk from outside that host. It also confirms the view is the
 // owning host's tree (not the caller's) and that an untouched host reports its
-// baseline (/tmp only).
+// baseline (/dev and /tmp only).
 func TestDSTNodeHostFS(t *testing.T) {
 	var (
 		data    []byte
@@ -205,7 +205,7 @@ func TestDSTNodeHostFS(t *testing.T) {
 			ns = append(ns, e.Name())
 		}
 		listing = strings.Join(ns, ",")
-		// Host hB exists but never touched its filesystem: baseline is /tmp only.
+		// Host hB exists but never touched its filesystem: baseline is /dev and /tmp.
 		simulation.Host("hB", simulation.HostConfig{}, func() {}) // declared: inspectors fail loud on undeclared names
 		bents, _ := fs.ReadDir(simulation.HostFS("hB"), ".")
 		for _, e := range bents {
@@ -216,10 +216,10 @@ func TestDSTNodeHostFS(t *testing.T) {
 	if readErr != nil || string(data) != "payload" {
 		t.Errorf("HostFS read /data = %q, err=%v; want %q", data, readErr, "payload")
 	}
-	if listing != "data,sub,tmp" {
-		t.Errorf("HostFS ReadDir(.) of hA = %q, want %q", listing, "data,sub,tmp")
+	if listing != "data,dev,sub,tmp" {
+		t.Errorf("HostFS ReadDir(.) of hA = %q, want %q", listing, "data,dev,sub,tmp")
 	}
-	if len(bList) != 1 || bList[0] != "tmp" {
-		t.Errorf("untouched host hB listing = %v, want [tmp]", bList)
+	if got := strings.Join(bList, ","); got != "dev,tmp" {
+		t.Errorf("untouched host hB listing = %v, want [dev tmp]", bList)
 	}
 }

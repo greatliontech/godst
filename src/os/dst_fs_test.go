@@ -803,12 +803,12 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 		for _, e := range ents {
 			names = append(names, e.Name())
 		}
-		want := "aa,bb,mm,sub,tmp,zz" // tmp is the pre-seeded temp dir
+		want := "aa,bb,dev,mm,sub,tmp,zz" // dev and tmp are the pre-seeded tree
 		if got := strings.Join(names, ","); got != want {
 			t.Fatalf("ReadDir order = %s, want %s", got, want)
 		}
-		if !ents[3].IsDir() || ents[3].Type()&os.ModeDir == 0 {
-			t.Fatalf("DirEntry sub not a dir: %v %v", ents[3].IsDir(), ents[3].Type())
+		if !ents[4].IsDir() || ents[4].Type()&os.ModeDir == 0 {
+			t.Fatalf("DirEntry sub not a dir: %v %v", ents[4].IsDir(), ents[4].Type())
 		}
 
 		// Chunked reads: stable cursor, io.EOF at exhaustion.
@@ -818,7 +818,7 @@ func TestDSTFSReadDirAndCwd(t *testing.T) {
 		}
 		n1, err1 := dh.Readdirnames(2)
 		n2, err2 := dh.Readdirnames(2)
-		n3, err3 := dh.Readdirnames(2)
+		n3, err3 := dh.Readdirnames(3)
 		_, err4 := dh.Readdirnames(2)
 		if err1 != nil || err2 != nil || err3 != nil {
 			t.Fatalf("chunked errs: %v %v %v", err1, err2, err3)

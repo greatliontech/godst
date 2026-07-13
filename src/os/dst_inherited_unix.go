@@ -30,6 +30,25 @@ type dstInheritedFile struct {
 	closed atomic.Bool
 }
 
+// dstErrNodeScoped is the refusal for an inherited-file capability operated
+// from a simulated Host or Process body other than the root simulation body
+// that holds the grant. Two real machines cannot share an open file
+// description, so cross-node use has no production error shape to mimic — it
+// is the cross-node-channel escape the grant contract forbids (design.md:
+// Host and Process bodies cannot hold host-file authority), refused with a
+// DISTINGUISHABLE error: a closed-file shape here misdirects diagnosis toward
+// close bugs, and a logging pipeline that swallows write errors would lose
+// every record with no thread to pull. The os layer wraps this into
+// *PathError like any backend error; it deliberately does not match
+// ErrClosed.
+var dstErrNodeScoped error = &dstNodeScopedError{}
+
+type dstNodeScopedError struct{}
+
+func (*dstNodeScopedError) Error() string {
+	return "inherited file capability is node-scoped to the root simulation body; relay cross-node I/O through the root"
+}
+
 //go:linkname dstInheritFile
 func dstInheritFile(src *File) (*File, error) {
 	if !dstFSActive() || !dstInSimBubble() {
@@ -79,9 +98,15 @@ func dstInheritFile(src *File) (*File, error) {
 }
 
 func (f *dstInheritedFile) begin() (bool, error) {
-	hostID, procID := dstFSCurrentNode()
-	if f.closed.Load() || !dstFSActive() || !dstInSimBubble() || f.epoch != dstFSEpoch() || f.hostID != hostID || f.procID != procID {
+	if f.closed.Load() || !dstFSActive() || !dstInSimBubble() || f.epoch != dstFSEpoch() {
 		return false, poll.ErrFileClosing
+	}
+	if hostID, procID := dstFSCurrentNode(); f.hostID != hostID || f.procID != procID {
+		// A live capability reached from inside a Host or Process body: the
+		// node-scoped refusal, not the closed shape — the capability is not
+		// closed, and the caller needs the actual diagnosis (see
+		// dstErrNodeScoped).
+		return false, dstErrNodeScoped
 	}
 	return dstSetHostIO(true), nil
 }
@@ -90,12 +115,15 @@ func (f *dstInheritedFile) closeCaller() error {
 	if !dstFSActive() {
 		return nil
 	}
-	hostID, procID := dstFSCurrentNode()
 	if !dstInSimBubble() {
 		return dstErrUnsupportedFS
 	}
-	if f.epoch != dstFSEpoch() || f.hostID != hostID || f.procID != procID {
+	if f.epoch != dstFSEpoch() {
 		return poll.ErrFileClosing
+	}
+	if hostID, procID := dstFSCurrentNode(); f.hostID != hostID || f.procID != procID {
+		// The node-scoped refusal, as in begin.
+		return dstErrNodeScoped
 	}
 	return nil
 }

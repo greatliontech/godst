@@ -9,6 +9,7 @@ package simulation
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 	"syscall"
@@ -410,8 +411,26 @@ func TestDSTInheritFileRunOwnership(t *testing.T) {
 			t.Fatalf("InheritFile: %v", err)
 		}
 		Process("other", func() {
-			if _, err := capability.Write(nil); !errors.Is(err, os.ErrClosed) {
-				t.Errorf("cross-process capability write = %v, want os.ErrClosed", err)
+			// Cross-node use is the node-scoped refusal: a distinguishable
+			// error naming the node scoping and the relay pattern — never
+			// the closed shape (the capability is open; a closed-file error
+			// misdirects diagnosis toward close bugs), and never host I/O.
+			_, err := capability.Write(nil)
+			if err == nil || errors.Is(err, os.ErrClosed) {
+				t.Errorf("cross-process capability write = %v, want the node-scoped refusal", err)
+			}
+			if err == nil || !strings.Contains(err.Error(), "node-scoped to the root simulation body") {
+				t.Errorf("cross-process capability write error = %v, want it to name the node scoping", err)
+			}
+			var pe *fs.PathError
+			if !errors.As(err, &pe) {
+				t.Errorf("cross-process capability write error = %T, want *fs.PathError", err)
+			}
+		})
+		Host("elsewhere", HostConfig{}, func() {
+			// The Host-body (proc 0 on another host) leg of the same scope.
+			if _, err := capability.Write(nil); err == nil || !strings.Contains(err.Error(), "node-scoped to the root simulation body") {
+				t.Errorf("cross-host capability write error = %v, want the node-scoped refusal", err)
 			}
 		})
 	})

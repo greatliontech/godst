@@ -83,6 +83,13 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 	// Advisory locks need no explicit clearing here: every flock is owned by a
 	// virtual descriptor, and dstCloseHostFilesFor released the host's entire
 	// descriptor table before the disk was restored — the locks went with it.
+	if node.isDevice() {
+		// A character device stores nothing (data, synced, and its page cache
+		// are nil for its whole life): the metadata restore above is the whole
+		// of its reboot, and the regular-file branch below would dereference
+		// the page cache it does not have.
+		return
+	}
 	if !node.isDir {
 		// In place, never by reassignment: node.data aliases the node's page
 		// cache, and the rewind must land where any still-registered mapping

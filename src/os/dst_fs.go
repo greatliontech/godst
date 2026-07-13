@@ -240,9 +240,13 @@ func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
 		syncedMode:    mode,
 		syncedModTime: now,
 	}
-	if isDir {
+	switch {
+	case isDir:
 		node.entries = make(map[string]*dstFSNode)
-	} else {
+	case node.isDevice():
+		// A character device has no page cache: it stores nothing (writes
+		// discard, reads are EOF), so there are no bytes to back or map.
+	default:
 		// A regular file's bytes live in its page cache from birth (see
 		// dst_pagecache_linux.go); both create paths hold dstFS.mu.
 		dstNodeBackLocked(node)
@@ -271,23 +275,30 @@ func dstFSDiskHere() *dstFSDisk {
 	return d
 }
 
-// newDstFSDisk builds a fresh host tree: an empty root containing only /tmp (mode
-// 1777), so TempDir-based CreateTemp/MkdirTemp work unmodified (the spec's
-// empty-tree clause). Every host gets its own /tmp; os.TempDir reports the fixed
-// path "/tmp" during a run.
+// newDstFSDisk builds a fresh host tree: an empty root containing /tmp (mode
+// 1777), so TempDir-based CreateTemp/MkdirTemp work unmodified, and /dev with
+// the null character device (the spec's initial-tree clause). Every host gets
+// its own /tmp and /dev/null; os.TempDir reports the fixed path "/tmp" during
+// a run.
 func newDstFSDisk() *dstFSDisk {
 	root := dstFSNewNode(true, ModeDir|0o755)
 	root.entries["tmp"] = dstFSNewNode(true, ModeDir|ModeSticky|0o777)
+	dev := dstFSNewNode(true, ModeDir|0o755)
+	dev.entries["null"] = dstFSNewNode(false, ModeDevice|ModeCharDevice|0o666)
+	root.entries["dev"] = dev
 	// The mkfs image is part of the durable image: a filesystem is born with
-	// its initial tree ON THE PLATTER, so a host crash preserves root and
-	// /tmp. Without this commit the tree is born unsynced and the first crash
-	// erases "tmp" — unrecoverable short of fsyncing "/", which no
+	// its initial tree ON THE PLATTER, so a host crash preserves root, /tmp,
+	// and /dev/null. Without this commit the tree is born unsynced and the
+	// first crash erases "tmp" — unrecoverable short of fsyncing "/", which no
 	// POSIX-disciplined program does for a pre-existing directory, so
 	// fsync-disciplined state under the one directory the spec guarantees
 	// exists would vanish (a false-positive generator for every
-	// crash-recovery SUT).
+	// crash-recovery SUT) — and "dev", whose loss would make post-reboot
+	// /dev/null opens fail with an ENOENT no real reboot produces.
 	root.commitLocked()
 	root.entries["tmp"].commitLocked()
+	dev.commitLocked()
+	dev.entries["null"].commitLocked()
 	return &dstFSDisk{root: root}
 }
 
@@ -314,6 +325,16 @@ func dstFSSetCwd(cwd string) {
 // cannot be removed or renamed). Caller holds dstFS.mu.
 func dstFSIsRoot(node *dstFSNode) bool {
 	return node == dstFSDiskHere().root
+}
+
+// isDevice reports whether the node is a character device (the pre-seeded
+// /dev/null — the only device the tree mints). The kind rides the mode's type
+// bits, which chmod preserves (chmodLocked), so there is no second field to
+// disagree with the mode. A device node stores nothing: data, synced, and pc
+// stay nil for its whole life, and the disk fault machinery (latency, EIO,
+// capacity) never applies — a real /dev/null does not live on the disk.
+func (node *dstFSNode) isDevice() bool {
+	return node.mode&ModeCharDevice != 0
 }
 
 // dstFSNode is one node of the simulated tree. Content lives on the node and
@@ -816,6 +837,10 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 	if node.isDir {
 		return wrap(syscall.EISDIR)
 	}
+	if node.isDevice() {
+		// truncate(2) on a character device is EINVAL (host-verified).
+		return wrap(syscall.EINVAL)
+	}
 	if err := node.truncateLocked(size); err != nil {
 		return wrap(err)
 	}
@@ -1052,10 +1077,12 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
-	if flag&O_TRUNC != 0 {
+	if flag&O_TRUNC != 0 && !node.isDevice() {
 		// Linux truncates even for O_RDONLY|O_TRUNC; match the host's shape.
 		// Truncation mutates current content only; the durable image moves
-		// on Sync, never on a mutation (the durability contract).
+		// on Sync, never on a mutation (the durability contract). On a
+		// character device the kernel ignores O_TRUNC (handle_truncate runs
+		// for regular files only; host-verified error-free).
 		if err := node.truncateLocked(0); err != nil {
 			return wrap(err)
 		}
@@ -1145,8 +1172,9 @@ func (d *dstFile) leave() {
 // slow disk). It reads the latency lock-free and sleeps OUTSIDE the tree lock — the
 // op takes dstFS.mu afterward — so a slow disk on one host never blocks another's
 // filesystem. The gate makes the no-fault path a single atomic load. A closed handle
-// is skipped: a closed fd returns EBADF without touching the disk, so a delay there
-// would be one a real slow disk never imposes (DST-FAULT-SOUND).
+// is skipped — a closed fd returns EBADF without touching the disk — and so is a
+// device handle (/dev/null is not on the disk): a delay on either would be one a
+// real slow disk never imposes (DST-FAULT-SOUND).
 func (d *dstFile) diskDelay() {
 	if !dstDiskSlow.Load() {
 		return
@@ -1156,9 +1184,9 @@ func (d *dstFile) diskDelay() {
 		return
 	}
 	d.mu.Lock()
-	closed := d.closed
+	skip := d.closed || (d.node != nil && d.node.isDevice())
 	d.mu.Unlock()
-	if !closed {
+	if !skip {
 		time.Sleep(time.Duration(lat))
 	}
 }
@@ -1277,6 +1305,12 @@ func (d *dstFile) read(b []byte) (int, error) {
 	if d.node.isDir {
 		return 0, syscall.EISDIR
 	}
+	if d.node.isDevice() {
+		// /dev/null: always empty — but the wrong-direction EBADF above
+		// still wins, as on the host. No diskEIO: the device is not on the
+		// disk.
+		return 0, io.EOF
+	}
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
@@ -1302,6 +1336,10 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 	if d.node.isDir {
 		return 0, syscall.EISDIR
 	}
+	if d.node.isDevice() {
+		// /dev/null: EOF at every offset (host-verified via ReadAt).
+		return 0, io.EOF
+	}
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
@@ -1319,6 +1357,13 @@ func (d *dstFile) write(b []byte) (int, error) {
 	defer d.leave()
 	if !d.wr {
 		return 0, syscall.EBADF
+	}
+	if d.node.isDevice() {
+		// /dev/null: the write discards its bytes and reports the full
+		// count. No disk coupling (EIO/ENOSPC/latency), no mtime movement,
+		// no O_SYNC commit — the device stores nothing and is not on the
+		// disk (all host-verified, including the unchanged mtime).
+		return len(b), nil
 	}
 	if err := d.diskEIO(); err != nil {
 		return 0, err
@@ -1365,6 +1410,11 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	defer d.leave()
 	if !d.wr {
 		return 0, syscall.EBADF
+	}
+	if d.node.isDevice() {
+		// /dev/null: discard and report the full count at any offset, as in
+		// write (host-verified via WriteAt).
+		return len(b), nil
 	}
 	if err := d.diskEIO(); err != nil {
 		return 0, err
@@ -1443,6 +1493,13 @@ func (d *dstFile) seek(offset int64, whence int) (int64, error) {
 		return 0, err
 	}
 	defer d.leave()
+	if d.node.isDevice() {
+		// /dev/null: lseek succeeds and the position is pinned at 0 — every
+		// whence, every offset, including negative ones that would be EINVAL
+		// on a regular file (host-verified: null_lseek returns 0
+		// unconditionally, and the file position never moves).
+		return 0, nil
+	}
 	var base int64
 	switch whence {
 	case io.SeekStart:
@@ -1573,6 +1630,10 @@ func (d *dstFile) truncate(size int64) error {
 	if size < 0 {
 		return syscall.EINVAL
 	}
+	if d.node.isDevice() {
+		// ftruncate on a character device is EINVAL (host-verified).
+		return syscall.EINVAL
+	}
 	return d.node.truncateLocked(size)
 }
 
@@ -1590,6 +1651,12 @@ func (d *dstFile) sync() error {
 		return err
 	}
 	defer d.leave()
+	if d.node.isDevice() {
+		// fsync on a character device is EINVAL — devtmpfs supplies no fsync
+		// op (host-verified). Nothing to commit: the device has no durable
+		// image.
+		return syscall.EINVAL
+	}
 	if err := d.diskEIO(); err != nil {
 		if !d.node.isDir {
 			// fsyncgate: the failed writeback marks the file's dirty pages
@@ -1611,6 +1678,11 @@ func (d *dstFile) datasync() error {
 	}
 	defer d.leave()
 	if d.node.isDir {
+		return syscall.EINVAL
+	}
+	if d.node.isDevice() {
+		// fdatasync on a character device is EINVAL, as in sync
+		// (host-verified).
 		return syscall.EINVAL
 	}
 	if err := d.diskEIO(); err != nil {

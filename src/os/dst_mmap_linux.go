@@ -116,7 +116,9 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		return nil, syscall.EINVAL, true
 	}
 	file, ok := entry.backend.(*dstFile)
-	if !ok || file.node == nil || file.node.isDir {
+	if !ok || file.node == nil || file.node.isDir || file.node.isDevice() {
+		// A device node is ENODEV like a directory: the real /dev/null has no
+		// mmap op (host-verified for MAP_SHARED and MAP_PRIVATE alike).
 		return nil, syscall.ENODEV, true
 	}
 

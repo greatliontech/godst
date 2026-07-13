@@ -54,12 +54,20 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 		stat.Ctim = syscall.Timespec{}
 	}
 	stat.Mode = syscallMode(info.Mode())
-	if info.IsDir() {
+	switch {
+	case info.IsDir():
 		stat.Mode |= syscall.S_IFDIR
 		// A directory's link count is at least 2 ("." and its parent's entry);
 		// per-subdirectory increments are not modeled (recorded in the spec).
 		stat.Nlink = 2
-	} else {
+	case info.Mode()&ModeCharDevice != 0:
+		// The simulated /dev/null. st_rdev is the DEVICE's identity, fixed by
+		// Linux at (major 1, minor 3) — machine-independent, unlike st_dev
+		// (host-verified rdev shape; minor lives in the low byte, major in
+		// the next twelve bits for small numbers).
+		stat.Mode |= syscall.S_IFCHR
+		stat.Rdev = 1<<8 | 3
+	default:
 		stat.Mode |= syscall.S_IFREG
 	}
 	mtime := info.ModTime()
