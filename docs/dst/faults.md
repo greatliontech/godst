@@ -408,18 +408,16 @@ mid-run `Host` re-declaration is a reboot (host-up relay plus clock re-establish
 `Process` starts SUT goroutines — so a foreign caller during an active run panics identically,
 while pre-run and outside-run calls keep their documented behavior.
 `TestDSTTopologyFromNonBubbleGoroutinePanics`. The guard's decision and the guarded op are
-**atomic against the run activation/deactivation edges**: every guarded API holds a
-reader-side gate from its check through its state mutation, and the `runActive` flips take the
-writer side, so a call that passed the guard just before a run started completes as the
-documented pre-run no-op before activation proceeds — never a torn op executing into the
-newly-activated run. (One transient exception to the writer side's mid-run absence: a doomed
-activation-tie loser — a second Run racing the winner, both loading inactive — holds the writer
-for its failing arbitration at the flip's edge; a bubble caller landing in exactly that window
-parks briefly at wall-clock timing, a perturbation confined to the winner's first instants.) (`TestDSTRunActivationExcludesInFlightGuardedOps`,
-`TestDSTRunDeactivationExcludesInFlightGuardedOps`). The declaration APIs hold the gate through
-their declaration mutations, not through `f`: user code inside `Host`/`Process` bodies runs
-ungated. `Process` latches the admitted run epoch and reacquires the gate for exit teardown, so a
-pre-run body spanning activation cannot apply stale PID or process identity to the new run.
+**atomic against the run activation/deactivation edges**. An inactive caller retains the reader-side
+gate through its mutation, so a call that passed the guard just before a run started completes as the
+documented pre-run no-op before activation proceeds. An admitted active bubble caller validates on a
+fast path without acquiring the gate: its bubble liveness excludes deactivation while it can continue, while
+a crash-marked parked or runnable caller never resumes and therefore cannot mutate after losing
+liveness. A foreign active caller panics before mutation. (`TestDSTRunActivationExcludesInFlightGuardedOps`,
+`TestDSTRunDeactivationExcludesInFlightGuardedOps`). Inactive declaration APIs retain the gate through
+their mutations; active declarations rely on bubble liveness after validation. Neither retains the gate
+through `f`: user code inside `Host`/`Process` bodies runs ungated. `Process` latches the admitted run epoch and validates it from the still-live bubble before teardown locking; a pre-run body spanning activation cannot apply stale PID or
+process identity to the new run, and a killed teardown waiter cannot strand deactivation.
 
 ### The fault model: policies at existing seams
 

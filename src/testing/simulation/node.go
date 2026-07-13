@@ -477,9 +477,9 @@ func Host(name string, config HostConfig, f func()) {
 		}
 	}()
 	declare := func() {
-		// Scoped so the gate covers exactly the declaration mutations —
-		// through the host-up relay — and releases on the panic path too; f
-		// below is ordinary goroutine code, run outside the gate.
+		// An inactive declaration retains the gate through these mutations and
+		// releases on panic too; an active declaration's no-op release reflects
+		// that bubble liveness protects the same extent. f is ordinary code.
 		defer release()
 		nodeReg.mu.Lock()
 		defer nodeReg.mu.Unlock()
@@ -533,20 +533,31 @@ func Host(name string, config HostConfig, f func()) {
 // victim-naming rule already panics on. Outside a run the APIs stay
 // documented no-ops.
 //
-// The guard holds callerGate's read side and returns the release; the caller
-// keeps it held through its state mutation (usually `defer ...()`), so the
-// guard's decision and the op land on one side of any runActive flip — a
-// guard that loaded false cannot have its op execute torn into a
-// newly-activated run (see callerGate). Ops that park forever release
-// explicitly BEFORE parking.
+// An inactive caller retains callerGate's read side through its mutation, so
+// activation cannot split a pre-run operation into the new run. An admitted
+// active bubble caller validates without acquiring the gate: its bubble
+// liveness excludes deactivation while it can continue, and crash marking
+// prevents a killed waiter from ever resuming.
 func requireBubbleFaultCaller(api string) func() {
+	if runActive.Load() {
+		if !dstInSimBubble() {
+			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		}
+		return releaseCallerGateNoop
+	}
 	callerGate.RLock()
-	if runActive.Load() && !dstInSimBubble() {
+	if runActive.Load() {
+		if !dstInSimBubble() {
+			callerGate.RUnlock()
+			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		}
 		callerGate.RUnlock()
-		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		return releaseCallerGateNoop
 	}
 	return callerGate.RUnlock
 }
+
+func releaseCallerGateNoop() {}
 
 // requireBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
 // requireBubbleFaultCaller, run as each one's first act — before the intern
@@ -557,16 +568,25 @@ func requireBubbleFaultCaller(api string) func() {
 // silent-nondeterminism class the fault guard kills, through a declaration
 // API. Outside a run the APIs keep their documented no-run behavior.
 //
-// Like requireBubbleFaultCaller, holds callerGate's read side and returns
-// the release. The declaration APIs release after their declaration
-// mutations and BEFORE running f: holding across user code would deadlock
-// run activation against an f that legally blocks, and f is ordinary
-// goroutine code, not declaration state.
+// Like requireBubbleFaultCaller, an inactive declaration retains the read side
+// through its mutations, while an active bubble declaration never acquires it.
+// No declaration retains it while running f: user code is outside
+// the declaration state transition.
 func requireBubbleDeclCaller(api string) func() {
+	if runActive.Load() {
+		if !dstInSimBubble() {
+			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		}
+		return releaseCallerGateNoop
+	}
 	callerGate.RLock()
-	if runActive.Load() && !dstInSimBubble() {
+	if runActive.Load() {
+		if !dstInSimBubble() {
+			callerGate.RUnlock()
+			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		}
 		callerGate.RUnlock()
-		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		return releaseCallerGateNoop
 	}
 	return callerGate.RUnlock
 }
@@ -806,8 +826,9 @@ func Process(name string, f func()) {
 	if declaredActive {
 		declaredEpoch = dstNetEpoch()
 	}
-	// The gate covers the declaration mutations below and releases before f
-	// (ordinary goroutine code) runs; the flag keeps the panic paths covered.
+	// Inactive admission retains the gate through the declaration mutations;
+	// active admission never acquired it. Neither retains
+	// it while f (ordinary goroutine code) runs; the flag covers panic paths.
 	// Registered FIRST so it runs LAST at unwind — by which point either the
 	// explicit release already ran (released=true; the park-forever defer
 	// below can then never strand a gate reader) or a declaration panic is
@@ -872,9 +893,8 @@ func Process(name string, f func()) {
 		// Teardown belongs to the run admitted under callerGate. A pre-run
 		// Process body may span activation, but its stale proc/PID identity must
 		// never apply to that new run.
-		callerGate.RLock()
-		defer callerGate.RUnlock()
-		if !declaredActive || !runActive.Load() || dstNetEpoch() != declaredEpoch {
+		valid := declaredActive && runActive.Load() && dstNetEpoch() == declaredEpoch
+		if !valid {
 			return
 		}
 		// The last-invocation decision and the teardown it triggers are one

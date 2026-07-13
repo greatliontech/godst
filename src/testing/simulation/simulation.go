@@ -421,30 +421,19 @@ const (
 var runActive atomic.Bool
 
 // callerGate orders the caller-position guards (requireBubbleFaultCaller,
-// requireBubbleDeclCaller) against the runActive flips. Every guarded API
-// holds the read side from its guard check through its state mutation;
-// enterSimulation and leaveSimulation hold the write side across the flip.
-// Mutual exclusion puts a guarded op's whole extent on one side of any flip:
-// before activation, the guard saw false and the op completed against
-// pre-run state (the documented no-op) before the run could observe it;
-// after, a foreign caller panics at the guard. The activation-edge TOCTOU —
-// guard loads false, the CAS lands, the op executes torn into the
-// newly-activated run — is unrepresentable. During a settled run the write
-// side is never taken (enterSimulation fast-paths the doomed overlap before
-// touching the gate), so bubble callers' RLock never contends and never
-// parks: no schedule perturbation. The one transient exception is a doomed
+// requireBubbleDeclCaller) against the runActive flips. An inactive caller
+// retains the read side through its mutation, so the activation-edge TOCTOU —
+// guard loads false, the CAS lands, the op executes torn into the newly-active
+// run — is unrepresentable. An admitted active bubble caller validates on a
+// fast path without acquiring the gate: bubble liveness excludes deactivation while it
+// can continue, and a crash-marked waiter never resumes. A foreign active
+// caller releases and panics before mutation. The one transient exception is a doomed
 // activation-tie loser — two activations that both loaded false — taking the
 // write side for the microseconds of its failing CAS at the flip's edge; it
-// holds no park and panics immediately. Ops that park forever (a self-crash,
-// a dead enclosing invocation) release BEFORE parking, and the declaration
-// APIs release before running f, so no reader outlives its op
-// (TestDSTRunActivationExcludesInFlightGuardedOps). One property is NOT yet
-// held and is tracked as an open issue: a guarded extent parks at
-// procTeardownMu, and a goroutine killed while parked there (its own
-// process crashed by a sibling fault, or a mapping-fault crash from the
-// signal path) never resumes — its release strands and the deactivation
-// flip hangs. Until that closes, a new park point inside a guarded extent
-// only widens the window.
+// holds no park and panics immediately. Process exit validates its admitted
+// run and epoch from the still-live bubble before teardown locking.
+// Thus no goroutine that crash marking can permanently deschedule owns reader
+// state needed by deactivation.
 var callerGate sync.RWMutex
 
 // fips140Mode is latched at startup, mirroring crypto/internal/fips140's own

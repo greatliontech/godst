@@ -7,8 +7,11 @@
 package simulation
 
 import (
+	"context"
 	"fmt"
 	"internal/synctest"
+	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -291,6 +294,178 @@ func TestDSTRunActivationExcludesInFlightGuardedOps(t *testing.T) {
 			<-done // and with the gate released, activation and the run complete
 		})
 	}
+}
+
+func TestDSTActiveCallerGuardsReleaseAfterValidation(t *testing.T) {
+	Run(1, func() {
+		for _, guard := range []struct {
+			name string
+			call func() func()
+		}{
+			{"fault", func() func() { return requireBubbleFaultCaller("gate-probe") }},
+			{"declaration", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+		} {
+			release := guard.call()
+			if !callerGate.TryLock() {
+				release()
+				t.Fatalf("active %s guard retained callerGate after validation", guard.name)
+			}
+			callerGate.Unlock()
+			release()
+		}
+	})
+}
+
+func TestDSTActiveCallerGuardsDoNotAcquireBehindWriter(t *testing.T) {
+	for _, guard := range []struct {
+		name string
+		call func() func()
+	}{
+		{"fault", func() func() { return requireBubbleFaultCaller("gate-probe") }},
+		{"declaration", func() func() { return requireBubbleDeclCaller("gate-probe") }},
+	} {
+		t.Run(guard.name, func(t *testing.T) {
+			bodyEntered := make(chan struct{})
+			writerHeld := make(chan struct{})
+			guardDone := make(chan struct{})
+			finish := make(chan struct{})
+			runDone := make(chan struct{})
+			go func() {
+				Run(1, func() {
+					close(bodyEntered)
+					<-writerHeld
+					release := guard.call()
+					release()
+					close(guardDone)
+					<-finish
+				})
+				close(runDone)
+			}()
+			<-bodyEntered
+			callerGate.Lock()
+			close(writerHeld)
+			timedOut := false
+			select {
+			case <-guardDone:
+			case <-time.After(time.Second):
+				timedOut = true
+			}
+			callerGate.Unlock()
+			if timedOut {
+				<-guardDone
+			}
+			close(finish)
+			<-runDone
+			if timedOut {
+				t.Fatal("active guard attempted RLock behind a pending writer")
+			}
+		})
+	}
+}
+
+func TestDSTActiveProcessExitDoesNotAcquireBehindWriter(t *testing.T) {
+	bodyEntered := make(chan struct{})
+	processReady := make(chan struct{})
+	exitNow := make(chan struct{})
+	processDone := make(chan struct{})
+	finish := make(chan struct{})
+	runDone := make(chan struct{})
+	go func() {
+		Run(1, func() {
+			go func() {
+				Process("p", func() {
+					close(processReady)
+					<-exitNow
+				})
+				close(processDone)
+			}()
+			<-processReady
+			close(bodyEntered)
+			<-finish
+		})
+		close(runDone)
+	}()
+	<-bodyEntered
+	callerGate.Lock()
+	close(exitNow)
+	timedOut := false
+	select {
+	case <-processDone:
+	case <-time.After(time.Second):
+		timedOut = true
+	}
+	callerGate.Unlock()
+	if timedOut {
+		<-processDone
+	}
+	close(finish)
+	<-runDone
+	if timedOut {
+		t.Fatal("active Process exit attempted RLock behind a pending writer")
+	}
+}
+
+func TestDSTKilledCallerGateWaitersDoNotStrandDeactivation(t *testing.T) {
+	if os.Getenv("DST_CALLER_GATE_KILLED_WAITER") == "1" {
+		runKilledCallerGateWaiters()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDSTKilledCallerGateWaitersDoNotStrandDeactivation$")
+	cmd.Env = append(os.Environ(), "DST_CALLER_GATE_KILLED_WAITER=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("run deactivation hung behind a killed caller-gate reader:\n%s", out)
+	}
+	if err != nil {
+		t.Fatalf("killed caller-gate waiter helper failed: %v\n%s", err, out)
+	}
+}
+
+func runKilledCallerGateWaiters() {
+	Run(1, func() {
+		p2Ready := make(chan struct{})
+		p2Stop := make(chan struct{})
+		p2Done := make(chan struct{})
+		Host("other", HostConfig{}, func() {
+			go func() {
+				Process("p2", func() {
+					close(p2Ready)
+					<-p2Stop
+				})
+				close(p2Done)
+			}()
+		})
+		<-p2Ready
+
+		exitReady := make(chan struct{})
+		exitNow := make(chan struct{})
+		Host("victim", HostConfig{}, func() {
+			go Process("exiting", func() {
+				close(exitReady)
+				<-exitNow
+			})
+		})
+		<-exitReady
+
+		procTeardownMu.Lock()
+		close(exitNow)
+		crashStarted := make(chan struct{})
+		go Host("victim", HostConfig{}, func() {
+			close(crashStarted)
+			Crash("p2")
+		})
+		<-crashStarted
+		for range 20 {
+			runtime.Gosched()
+		}
+		dstMarkHostGoroutinesCrashed(lookupHost("victim"))
+		procTeardownMu.Unlock()
+
+		close(p2Stop)
+		<-p2Done
+	})
 }
 
 // TestDSTRunDeactivationExcludesInFlightGuardedOps: the closing edge holds

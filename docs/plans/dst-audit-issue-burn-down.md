@@ -114,7 +114,7 @@ grouped by the functions they change. WIP = 1.
 - [x] 56. Host declaration validation and publication are all-or-nothing on invalid clocks and table exhaustion (`dst-host-declaration-failure-not-atomic`)
 - [x] 57. Host NumCPU is exact over its accepted public range or rejected before publication (`dst-host-numcpu-wraps-int32`)
 - [x] 58. CrashHost tracks root-process host ancestry through nested Host bodies (`dst-host-crash-misses-nested-root-goroutine`)
-- [ ] 59. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
+- [x] 59. caller-gate readers cannot be killed while parked holding the read side (`dst-sim-guarded-reader-killed-while-parked`)
 - [ ] 60. representative guarded APIs have killing tests for their complete hold extent (`dst-sim-guard-hold-extent-unpinned`)
 
 ## Deferred architecture verification
