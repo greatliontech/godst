@@ -262,6 +262,7 @@ func synctestRun(f func()) {
 			// clock offset is not a g field: host 0's offset is 0 (dstHostClockOffset
 			// returns 0 for host 0), so the bubble main is in sync with the base clock.
 			bubble.main.dstHost = 0
+			bubble.main.dstHostScope = nil
 			bubble.main.dstProc = 0
 			bubble.main.dstPid = int32(dstSimPID)
 			// Re-root the scheduling RNG at this bubble too, so the seeded

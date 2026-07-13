@@ -188,6 +188,7 @@ func dstActivate(seed uint64) {
 	// dstActivate path (GOMAXPROCS>1, no bubble) never reads identity — mirroring
 	// how it leaves the simulated process identity unset.
 	getg().dstHost = 0
+	getg().dstHostScope = nil
 	getg().dstProc = 0
 	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
@@ -239,10 +240,10 @@ func dstActivate(seed uint64) {
 }
 
 // dstSetNode stamps the calling goroutine's DST host/process identity and returns
-// the previous values, so testing/simulation.Host/Process can restore them when
-// their body returns. The identity inherits to child goroutines at newproc1 (the
-// labeled-subtree tree), so stamping the calling goroutine for the dynamic extent
-// of a Host/Process body labels its whole subtree. The runtime carries integer
+// the previous values, so testing/simulation.Process and white-box callers can
+// restore them when their body returns. The identity inherits to child goroutines
+// at newproc1. Host uses dstPushHostScope so entered-Host ancestry is inherited too.
+// The runtime carries integer
 // ids; the string↔id interning is in testing/simulation. Reached via //go:linkname.
 //
 //go:linkname dstSetNode
@@ -252,6 +253,44 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32) {
 	gp.dstHost = host
 	gp.dstProc = proc
 	return
+}
+
+// dstHostScope is an immutable entered-Host frame. Descendants retain the
+// chain they inherited even after the declaring goroutine leaves Host.
+type dstHostScope struct {
+	host   uint32
+	parent *dstHostScope
+}
+
+// dstPushHostScope stamps an entered Host extent and returns the prior current
+// identity. The frame is runtime topology metadata, so allocate it on the
+// system stack rather than charging it to SUT heap and process accounting.
+//
+//go:linkname dstPushHostScope
+func dstPushHostScope(host, proc uint32) (oldHost, oldProc uint32) {
+	gp := getg()
+	var scope *dstHostScope
+	systemstack(func() {
+		scope = new(dstHostScope)
+	})
+	scope.host = host
+	scope.parent = gp.dstHostScope
+	gp.dstHostScope = scope
+	oldHost, oldProc = gp.dstHost, gp.dstProc
+	gp.dstHost = host
+	gp.dstProc = proc
+	return
+}
+
+// dstPopHostScope restores the identity and entered-Host ancestry saved by the
+// matching dstPushHostScope.
+//
+//go:linkname dstPopHostScope
+func dstPopHostScope(oldHost, oldProc uint32) {
+	gp := getg()
+	gp.dstHost = oldHost
+	gp.dstProc = oldProc
+	gp.dstHostScope = gp.dstHostScope.parent
 }
 
 // dstCurrentNode returns the calling goroutine's DST host/process identity (0,0 is
@@ -1795,7 +1834,8 @@ func dstPidOwnsBubbleMain(pid int32) bool {
 	return bubble != nil && dstCrashKillsBubbleMain(bubble, pid)
 }
 
-// dstHostOwnsBubbleMain reports whether the run's main goroutine runs on host.
+// dstHostOwnsBubbleMain reports whether the run's main goroutine belongs to host
+// through its current identity or inherited entered-Host ancestry.
 // Crashing that host would destroy the machine the simulation driver runs on —
 // its filesystem, locks, and sockets would go while the driver kept running, a
 // state no power loss produces. Reached from testing/simulation by //go:linkname.
@@ -1803,11 +1843,24 @@ func dstPidOwnsBubbleMain(pid int32) bool {
 //go:linkname dstHostOwnsBubbleMain
 func dstHostOwnsBubbleMain(host uint32) bool {
 	bubble := dstSimBubble
-	return bubble != nil && bubble.main != nil && bubble.main.dstHost == host
+	return bubble != nil && bubble.main != nil && dstGoroutineBelongsToHost(bubble.main, host)
 }
 
-// dstMarkHostGoroutinesCrashed deschedules permanently every goroutine running
-// on host — the machine lost power, so every thread on it stops, whichever
+func dstGoroutineBelongsToHost(gp *g, host uint32) bool {
+	if gp.dstHost == host {
+		return true
+	}
+	for scope := gp.dstHostScope; scope != nil; scope = scope.parent {
+		if scope.host == host {
+			return true
+		}
+	}
+	return false
+}
+
+// dstMarkHostGoroutinesCrashed deschedules permanently every goroutine belonging
+// to host through its current identity or entered-Host ancestry — the machine
+// lost power, so every thread on it stops, whichever
 // process it belonged to. That includes the ROOT process's goroutines running a
 // Host body: they are threads on the dead machine, even though the root process
 // itself lives on (its pid stays live; it has goroutines on other hosts). The
@@ -1820,17 +1873,18 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 	if bubble == nil {
 		return
 	}
-	if bubble.main != nil && bubble.main.dstHost == host {
+	if bubble.main != nil && dstGoroutineBelongsToHost(bubble.main, host) {
 		panic("testing/simulation: CrashHost would kill the run's main goroutine")
 	}
 	var total, running int
 	var waiterCrashed bool
 	forEachG(func(gp *g) {
-		if !gp.dstSimG || gp.dstHost != host || gp.dstPid < 0 {
+		if !gp.dstSimG || !dstGoroutineBelongsToHost(gp, host) || gp.dstPid < 0 {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
 		gp.dstPid = -gp.dstPid
+		gp.dstHostScope = nil
 		if gp.dstPid == 0 {
 			// A goroutine that never carried a pid still must never run again;
 			// the scheduler filter keys on dstPid < 0, so give it the sentinel
@@ -1887,6 +1941,7 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 		}
 		status := readgstatus(gp) &^ _Gscan
 		gp.dstPid = -pid
+		gp.dstHostScope = nil
 		if gp == bubble.waiter {
 			waiterCrashed = true
 		}

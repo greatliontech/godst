@@ -35,8 +35,8 @@ host-capability stance).
 
 ### Identity primitives (the shared contract every fault axis targets)
 
-`g` gains **two** ids — `dstHost uint32` and `dstProc uint32` — both **inherited parent→child at
-`newproc1`**, alongside `g.dstrand` (`proc.go:5446`). The runtime carries integer ids; the string↔id
+`g` gains **two** ids — `dstHost uint32` and `dstProc uint32` — plus immutable entered-`Host` ancestry,
+all **inherited parent→child at `newproc1`**, alongside `g.dstrand` (`proc.go`). The runtime carries integer ids; the string↔id
 interning and the public API live in `testing/simulation`, so no Go string enters the hot `g` copy path
 (the same "lean runtime, public face" split as process identity and the scheduling strategy). Host 0 /
 process 0 is the default — the test driver — so the N=1 program is host 0, process 0, unchanged.
@@ -824,7 +824,8 @@ process** — so a process dying and the host losing power tear the disk differe
 | **Process crash** (`Crash("p")`) | that process's goroutines + memory + fds | **intact** — kernel survives, so un-fsync'd writes persist for host-siblings and the restart | its conns RST | a process dying / `kill -9` / OOM |
 | **Host crash** (`CrashHost("h")`, power loss) | **all** processes on the host | **tears to the fsync'd durable image** (the disk "Crash" above) | all their conns RST | power loss / kernel panic |
 
-Both, at the victim's next cooperative point: the targeted goroutines (`dstProc`/`dstHost == victim`) are
+Both, at the victim's next cooperative point: the targeted goroutines (process membership or current /
+inherited entered-Host membership names the victim) are
 **descheduled permanently** (the `dstSchedSelect` seam never selects them again; their in-flight blocking
 ops are abandoned — a crash does not, cannot in Go, force-unwind a goroutine mid-instruction; the sound
 model is *they never run again*, what a killed process's threads do), conns RST, fds drop, memory is gone.
@@ -904,9 +905,12 @@ or resource; recovering the refusal observes the entire logical process unchange
 **A host is not a process.** `CrashHost` kills the union of two goroutine sets: every goroutine of a
 process declared on the host (pid-keyed — which also catches a goroutine of that process momentarily
 stamped with another host, inside a nested `Host` body: it is still a thread of a process on the dying
-machine), and every goroutine stamped with the host (host-keyed — which catches the ROOT process's
-goroutines running the machine's `Host` body; proc 0 is the driver's own process, shared by every host,
-so no pid names "the threads on this machine"). The root process's pid therefore stays live while the
+machine), and every goroutine whose current or inherited entered-`Host` ancestry contains the host
+(host-keyed — which catches the ROOT process's goroutines running or descended from the machine's
+`Host` body even while nested in another `Host`; proc 0 is the driver's own process, shared by every
+host, so no pid names "the threads on this machine"). Host ancestry is an immutable chain inherited at
+goroutine creation, so a child retains its machine membership after its parent leaves the `Host` body.
+The root process's pid therefore stays live while the
 declared processes' pids die. Correspondingly, **one logical process lives on one machine at a time**:
 a same-name invocation live on a second host is refused, because a host crash would otherwise scope its
 victims by whichever home was recorded last and silently spare a pid on the machine that lost power.
@@ -1077,7 +1081,8 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   goroutines, fds, flocks, mappings, conns, and listeners — a host-sibling's lock on the same file node
   and the host filesystem itself are untouched (`TestDSTCrashProcessReleasesFileResources`,
   `TestDSTCrashProcessResetsConnections`, `TestDSTCrashAndRestartOverLiveHostFS`). The **host-crash leg**
-  keys goroutine death by `dstHost` and kernel-state death by the host id, so `CrashHost(h)` takes exactly
+  keys goroutine death by process membership or current/inherited entered-`Host` membership, and
+  kernel-state death by the host id, so `CrashHost(h)` takes exactly
   h's threads, disk, locks, mappings, sockets, and listeners while a sibling host's unsynced bytes, held
   lock, and connections among other hosts survive (`TestDSTCrashHostVictimScoping`,
   `TestDSTCrashHostClosesRootProcessResources`).

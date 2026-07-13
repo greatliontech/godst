@@ -707,6 +707,118 @@ func TestDSTCrashHostKillsProcessGoroutineStampedElsewhere(t *testing.T) {
 	}
 }
 
+func TestDSTCrashHostKillsNestedRootGoroutine(t *testing.T) {
+	var ranAfter atomic.Bool
+	Test(t, 1, func(t *testing.T) {
+		inside := make(chan struct{})
+		release := make(chan struct{})
+		Host("other", HostConfig{}, func() {})
+		go Host("victim", HostConfig{}, func() {
+			Host("other", HostConfig{}, func() {
+				close(inside)
+				<-release
+			})
+			ranAfter.Store(true)
+		})
+		<-inside
+		CrashHost("victim")
+		close(release)
+		for range 20 {
+			runtime.Gosched()
+		}
+	})
+	if ranAfter.Load() {
+		t.Fatal("root-process thread resumed after its outer host lost power")
+	}
+}
+
+func TestDSTCrashHostFindsInheritedMiddleHostScope(t *testing.T) {
+	var ranAfter atomic.Bool
+	Test(t, 1, func(t *testing.T) {
+		inside := make(chan struct{})
+		release := make(chan struct{})
+		Host("other", HostConfig{}, func() {})
+		Host("inner", HostConfig{}, func() {})
+		Host("outer", HostConfig{}, func() {
+			Host("victim", HostConfig{}, func() {
+				go func() {
+					Host("other", HostConfig{}, func() {
+						Host("inner", HostConfig{}, func() {
+							close(inside)
+							<-release
+						})
+					})
+					ranAfter.Store(true)
+				}()
+			})
+		})
+		<-inside
+		CrashHost("victim")
+		close(release)
+		for range 20 {
+			runtime.Gosched()
+		}
+	})
+	if ranAfter.Load() {
+		t.Fatal("inherited thread resumed after a middle host in its ancestry lost power")
+	}
+}
+
+func TestDSTCrashHostDoesNotKillExitedNestedScope(t *testing.T) {
+	var ranAfter atomic.Bool
+	Test(t, 1, func(t *testing.T) {
+		ready := make(chan struct{})
+		release := make(chan struct{})
+		Host("nested", HostConfig{}, func() {})
+		go Host("current", HostConfig{}, func() {
+			Host("nested", HostConfig{}, func() {})
+			close(ready)
+			<-release
+			ranAfter.Store(true)
+		})
+		<-ready
+		CrashHost("nested")
+		close(release)
+		for range 20 {
+			runtime.Gosched()
+		}
+	})
+	if !ranAfter.Load() {
+		t.Fatal("leaving a nested Host retained stale crash membership")
+	}
+}
+
+func TestDSTCrashHostRefusesNestedDriverMachine(t *testing.T) {
+	Run(1, func() {
+		Host("victim", HostConfig{}, func() {
+			pidc := make(chan int, 1)
+			stop := make(chan struct{})
+			go Process("victim-process", func() {
+				pidc <- os.Getpid()
+				<-stop
+			})
+			pid := <-pidc
+			Host("other", HostConfig{}, func() {
+				var got any
+				func() {
+					defer func() { got = recover() }()
+					CrashHost("victim")
+				}()
+				if msg, _ := got.(string); !strings.Contains(msg, "run's main goroutine") && !strings.Contains(msg, "machine the run's main") {
+					t.Fatalf("nested driver CrashHost panic = %v", got)
+				}
+				if dstNetHostDead(lookupHost("victim")) {
+					t.Fatal("refused nested-driver crash powered off the host")
+				}
+				if err := syscall.Kill(pid, 0); err != nil {
+					t.Fatalf("refused nested-driver crash killed a process before refusal: %v", err)
+				}
+				close(stop)
+			})
+		})
+	})
+}
+
 // TestDSTCrashHostKeepsCreationModeAndBadDisk: two properties a reboot must
 // preserve. (1) Metadata durability is an INODE property: once the parent
 // directory's fsync makes a file's NAME durable, power loss recovers the file

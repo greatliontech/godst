@@ -4599,6 +4599,7 @@ func gdestroy(gp *g) {
 	// unseeded-crypto gate keys on dstrand == 0, which a stale nonzero would defeat.
 	gp.dstrand = 0
 	gp.dstHost = 0
+	gp.dstHostScope = nil
 	gp.dstProc = 0
 	gp.dstPid = 0
 	gp.dstPrio = 0
@@ -5505,6 +5506,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		// host's CURRENT offset (including any later StepClock), which a per-g snapshot
 		// could not.
 		newg.dstHost = callergp.dstHost
+		newg.dstHostScope = callergp.dstHostScope
 		newg.dstProc = callergp.dstProc
 		newg.dstPid = callergp.dstPid
 		// Sticky simulation membership: inherited from the creator's LIVE

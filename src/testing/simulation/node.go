@@ -27,6 +27,12 @@ import (
 //go:linkname dstSetNode runtime.dstSetNode
 func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
 
+//go:linkname dstPushHostScope runtime.dstPushHostScope
+func dstPushHostScope(host, proc uint32) (oldHost, oldProc uint32)
+
+//go:linkname dstPopHostScope runtime.dstPopHostScope
+func dstPopHostScope(oldHost, oldProc uint32)
+
 //go:linkname dstCurrentNode runtime.dstCurrentNode
 func dstCurrentNode() (host, proc uint32)
 
@@ -467,7 +473,7 @@ func Host(name string, config HostConfig, f func()) {
 	stamped := false
 	defer func() {
 		if stamped {
-			dstSetNode(oldH, oldP)
+			dstPopHostScope(oldH, oldP)
 		}
 	}()
 	declare := func() {
@@ -499,7 +505,7 @@ func Host(name string, config HostConfig, f func()) {
 		}
 		setHostIdent(hid, hostname, config.NumCPU)
 		_, curProc := dstCurrentNode()
-		oldH, oldP = dstSetNode(hid, curProc)
+		oldH, oldP = dstPushHostScope(hid, curProc)
 		stamped = true
 		// Clock commit precedes identity and caller stamping and rejects without
 		// applying any clock or timer change, so every remaining step publishes
@@ -702,17 +708,13 @@ func crashHost(name string) {
 	//     goroutine of the host's process that is momentarily stamped with
 	//     ANOTHER host (it entered a nested Host body): it is still a thread of
 	//     a process on the dying machine, and must die with it.
-	//   - every goroutine stamped with this host (host-keyed), which catches the
-	//     ROOT process's goroutines running the machine's Host body. The root
-	//     process's own pid stays live — it is the driver, with goroutines on
-	//     other hosts — so the pid-keyed leg cannot reach them. A host is not a
-	//     process.
+	//   - every goroutine whose current or inherited entered-Host membership
+	//     contains this host, which catches the ROOT process's goroutines running
+	//     or descended from the machine's Host body even while nested in another
+	//     Host. The root process's own pid stays live — it is the driver, with
+	//     goroutines on other hosts — so the pid-keyed leg cannot reach them. A
+	//     host is not a process.
 	//
-	// One residual, recorded: a ROOT-process goroutine that is inside a nested
-	// Host body of ANOTHER machine at the instant this one dies is stamped with
-	// that other host and has no pid to key on, so it survives. It is a thread
-	// of the driver, not of any declared process, and reaching it would require
-	// nesting Host declarations on the driver's own goroutine.
 	for _, proc := range victims {
 		for _, pid := range activeProcPIDs(proc) {
 			dstCrashProcessPid(pid)
