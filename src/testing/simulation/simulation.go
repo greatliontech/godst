@@ -302,7 +302,8 @@ type Options struct {
 
 	// NumCPU is the default simulated runtime.NumCPU() within a simulation (default
 	// 8; any value <= 0 selects the default), used by every host that does not set
-	// HostConfig.NumCPU. GOMAXPROCS is independently forced to 1 for determinism, but
+	// HostConfig.NumCPU. A positive value is reported exactly. GOMAXPROCS is
+	// independently forced to 1 for determinism, but
 	// NumCPU is reported separately, so a SUT that sizes worker pools or shards by
 	// NumCPU still creates real concurrency for the simulation to explore — fixed
 	// here so it is reproducible across hosts rather than the real machine's core

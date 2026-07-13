@@ -150,7 +150,9 @@ publishes them to the bubble, and cleared on return).
 
 Three values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), and `NumCPU` (default `8`,
 reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
-real concurrency for the schedule to explore). A custom positive `PID` must fit in the OS pid field
+real concurrency for the schedule to explore). A positive `Options.NumCPU` or `HostConfig.NumCPU` is
+reported exactly; a non-positive value selects the applicable default. The positive range is the target
+architecture's `int` range. A custom positive `PID` must fit in the OS pid field
 (`int32`); non-positive values select the default, oversized values panic rather than wrapping, and a run
 that exhausts the finite pid field while allocating `Process` pids panics instead of reusing or wrapping
 pids. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,

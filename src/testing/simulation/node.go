@@ -126,8 +126,9 @@ type HostConfig struct {
 	// with no extra config; set it to override.
 	Hostname string
 
-	// NumCPU is runtime.NumCPU() on this host. A value <= 0 means the run default
-	// (Options.NumCPU, default 8). GOMAXPROCS stays 1 for determinism regardless.
+	// NumCPU is runtime.NumCPU() on this host. A positive value is reported exactly;
+	// a value <= 0 means the run default (Options.NumCPU, default 8). GOMAXPROCS
+	// stays 1 for determinism regardless.
 	NumCPU int
 }
 

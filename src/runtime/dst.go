@@ -1411,7 +1411,7 @@ var (
 // processes share a hostname/NumCPU while different hosts can differ.
 type dstHostIdentity struct {
 	hostname string
-	numcpu   int32
+	numcpu   int
 	set      bool
 }
 
@@ -1544,7 +1544,7 @@ func dstSetHostIdent(host uint32, hostname string, numcpu int) {
 		if old != nil {
 			copy(ent, old.ent)
 		}
-		ent[host] = dstHostIdentity{hostname: hostname, numcpu: int32(numcpu), set: true}
+		ent[host] = dstHostIdentity{hostname: hostname, numcpu: numcpu, set: true}
 		if dstHostIdent.CompareAndSwap(old, &dstHostIdentTable{ent: ent}) {
 			return
 		}
