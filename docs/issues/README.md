@@ -7,8 +7,9 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- [horizon-death-heal-resurrection.md](./horizon-death-heal-resurrection.md) —
-  a retransmit-horizon-killed end whose link heals drains post-death
-  deliveries to io.EOF, sidestepping its pended one-shot ETIMEDOUT (a
-  CLOSED socket never queues late segments). Lands: when the horizon kill
-  freezes the victim's receive direction at the death instant, pinned.
+- [dead-socket-blocked-peer-no-rst.md](./dead-socket-blocked-peer-no-rst.md) —
+  a peer parked in a blocked read/write when its counterpart socket dies at
+  the retransmit horizon is never re-probed and hangs where production's
+  probes/retransmissions elicit an RST (`ECONNRESET`). Recorded ⊆-real
+  completeness limit. Lands: when a parked op against a dead counterpart
+  stream over a live link is woken into the one-shot ECONNRESET, pinned.

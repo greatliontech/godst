@@ -365,7 +365,26 @@ it never wraps a positive delay into an earlier delivery.
   first observed (never earlier than the real first retransmission — errs toward later timeouts, the
   sound direction); a heal that delivers the bytes disarms it (`TestDSTNetHorizonHealDisarms`). A
   killed end still drains data the network already delivered before surfacing the error, as
-  tcp_recvmsg reports pending data first (`TestDSTNetHorizonDeathDrainsDeliveredData`). A
+  tcp_recvmsg reports pending data first (`TestDSTNetHorizonDeathDrainsDeliveredData`). The death is
+  **terminal in both directions** — tcp_done destroys the socket's kernel state. The killed end's
+  receive direction freezes at the death instant exactly as an injected RST does: a segment or FIN
+  that had not arrived by then meets a CLOSED socket and is never queued, so a later heal delivers
+  nothing and the killed end's reads drain only pre-death arrivals before the pended `ETIMEDOUT`
+  (`TestDSTNetHorizonDeathHealNoResurrection`). Its still-undelivered outbound bytes die too —
+  nothing retransmits them after tcp_done — so a heal never flushes them to the peer. A peer segment
+  that then meets the dead socket over a live link is answered with an RST: the send succeeds
+  locally, and subsequent ops carry the one-shot `ECONNRESET`
+  (`TestDSTNetHorizonDeathHealPeerNoResurrection`) — the RST lands with the same zero-round-trip
+  timing simplification the refuse-mode connect records (detected at the push, not after a wire
+  round trip). Under a cut of the peer→dead direction the segment never reaches the socket, and the
+  peer's own retransmissions of the destroyed (never-to-be-ACKed) bytes exhaust at ITS horizon
+  (`TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut`). Two peer shapes carry no failure signal,
+  both erring ⊆-real (a missed real failure, never a false one): a cut of only the RETURN
+  (dead→peer) direction swallows the RST — the recorded flow-level ACK-starvation limit (faults.md,
+  Partition) — and a peer already PARKED in a blocked read or write when the death lands is not
+  re-probed (production's retransmissions/zero-window probes against the CLOSED socket would elicit
+  the RST; the sim surfaces it only at the peer's next push — a finer-grained probe seam is a
+  possible follow-on). A
   deadline-less write or dial into a permanent partition therefore fails in bounded virtual time, as
   it does on a real kernel — it never succeeds-and-forgets. The horizon is **partition-gated**: a
   full send buffer behind a **live** peer that has merely stopped reading is TCP *zero-window

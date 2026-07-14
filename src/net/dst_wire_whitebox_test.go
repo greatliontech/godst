@@ -58,7 +58,16 @@ func TestDSTWirePopRemainNothingLeft(t *testing.T) {
 // dropped (in order, a FIN cannot overtake data — a jitter draw can invert
 // closeAt below an undelivered segment's deliverAt, and that FIN is still
 // behind the data on the wire). Manipulates the stream directly so each
-// conjunct is pinned free of scheduler timing.
+// conjunct is pinned free of scheduler timing. The preserved-arrived-FIN arm
+// is end-to-end reachable today only via an injected RST (the CLOSE_WAIT
+// identity, TestDSTNetResetInCloseWaitIsEPIPE): a retransmit-horizon death in
+// CLOSE_WAIT has no constructible geometry while the wrapper lacks half-close
+// (held outbound bytes written before the peer's Close take the close(2)-RST
+// arm — in-flight counts as queued — and a write after it takes the recorded
+// instant-ECONNRESET divergence). If CloseRead/CloseWrite is ever added, the
+// FIN-arrived-then-horizon-death ladder (reads stay EOF per SOCK_DONE, the
+// one-shot ETIMEDOUT surfaces on the write) becomes reachable and needs its
+// own end-to-end pin; this whitebox holds the freeze half meanwhile.
 func TestDSTWireFreezeAtHorizonFINArrival(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -81,12 +90,66 @@ func TestDSTWireFreezeAtHorizonFINArrival(t *testing.T) {
 		s.closed = tc.closed
 		s.closeAt = tc.closeAt
 		s.segs = append([]dstSeg(nil), tc.segs...)
+		dropped := 0
 		for _, seg := range tc.segs {
 			s.buffered += int64(len(seg.data))
+			if seg.deliverAt > tc.horizon {
+				dropped++
+			}
 		}
 		if got := s.freezeAtHorizon(tc.horizon); got != tc.want {
 			t.Errorf("%s: freezeAtHorizon(%d) finArrived = %v, want %v", tc.name, tc.horizon, got, tc.want)
 		}
+		// A FIN that had NOT arrived at the horizon dies with the in-flight
+		// bytes: the dead socket never receives it, so it must not stay
+		// recorded (its closeAt passing later would resurrect a clean EOF).
+		if s.closed != (tc.closed && tc.want) {
+			t.Errorf("%s: closed after freeze = %v, want %v (an unarrived FIN dies with the socket)", tc.name, s.closed, tc.closed && tc.want)
+		}
+		// Anything the freeze destroyed — a segment or the FIN — is
+		// permanently unacknowledged for the sender: deadDropped.
+		wantDead := dropped > 0 || (tc.closed && !tc.want)
+		if s.deadDropped != wantDead {
+			t.Errorf("%s: deadDropped after freeze = %v, want %v", tc.name, s.deadDropped, wantDead)
+		}
+	}
+}
+
+// TestDSTWireFrozenStreamIsTerminal pins the dead-socket push contract at the
+// stream level: a push after the freeze is discarded (dead=true) and marks
+// deadDropped — the destroyed bytes count as held for the sender's own
+// retransmit exhaustion (heldBeyond) even though no segment is queued — and a
+// post-freeze closeWrite records no FIN (a CLOSED socket queues neither data
+// nor a FIN, so neither can resurrect delivery or a clean EOF later).
+func TestDSTWireFrozenStreamIsTerminal(t *testing.T) {
+	s := newDstStream(0)
+	s.segs = []dstSeg{{data: []byte("pre"), deliverAt: 5}}
+	s.buffered = 3
+	s.freezeAtHorizon(5)
+	if s.deadDropped {
+		t.Fatalf("deadDropped after a freeze that dropped nothing = true, want false")
+	}
+	if dead := s.pushLocked([]byte("post"), 0, 0, 0); !dead {
+		t.Errorf("pushLocked on a frozen stream = dead=false, want true (the segment met a CLOSED socket)")
+	}
+	if len(s.segs) != 1 || string(s.segs[0].data) != "pre" || s.buffered != 3 {
+		t.Errorf("frozen stream after a post-freeze push: segs=%d buffered=%d, want the pre-death prefix only (1 seg, 3 bytes)", len(s.segs), s.buffered)
+	}
+	if !s.deadDropped {
+		t.Errorf("deadDropped after a discarded push = false, want true")
+	}
+	if !s.heldBeyond(100) {
+		t.Errorf("heldBeyond after a discarded push = false, want true (the real counterpart segments are permanently unacknowledged)")
+	}
+	s.closeWrite(0, 0)
+	if s.closed {
+		t.Errorf("closeWrite on a frozen stream recorded the FIN — a CLOSED socket never queues it, and its closeAt passing would resurrect a clean EOF")
+	}
+	// The kept pre-death prefix stays drainable (tcp_recvmsg reports pending
+	// data before the socket error).
+	buf := make([]byte, 8)
+	if n, _, eof, _ := s.pop(buf, 10); n != 3 || string(buf[:3]) != "pre" || eof {
+		t.Errorf("pop on the frozen stream = (%d, %q, eof=%v), want (3, %q, false)", n, buf[:n], eof, "pre")
 	}
 }
 

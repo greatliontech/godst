@@ -502,7 +502,9 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   *those* block durably on the fake clock, and writes fill the **bounded** send buffer (the transport
   model, design.md) then block, until the partition **heals** (held bytes flush in order; TCP buffers
   and recovers) or the **retransmission horizon** errors the conn `ETIMEDOUT` (a cut outlasting the
-  horizon kills the connection, as ~15 kernel retries do; a deadline/`Close` still errors it sooner).
+  horizon kills the connection, as ~15 kernel retries do; a deadline/`Close` still errors it sooner —
+  a death that is TERMINAL in both directions: the killed end's delivery freezes at the death
+  instant and a later heal resurrects nothing, design.md's Retransmission-horizon bullet).
   Bytes **already delivered** before the cut sit in the receiver's kernel buffer on a real machine, so
   they **stay readable during the cut** — a partition severs the link, never data the receiver already
   holds; blackholing pre-delivered bytes fails a read a real kernel serves (a sim-only failure, the

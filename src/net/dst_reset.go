@@ -242,6 +242,35 @@ func dstInjectReset(c *dstConn) {
 	dstConnDeregister(c)
 }
 
+// dstDeadPushRST delivers the RST a dead (CLOSED) peer socket answers a live
+// segment with — the sender-side consequence of a push into a frozen stream
+// over a live link (dstWireEnd.write's dead-push handling): the pushing end
+// receives it as any injected RST, draining its delivered bytes to the
+// one-shot ECONNRESET identity. Routed through the end's registered dstConn
+// when one exists so the shared reset flag and registration release follow
+// (dstInjectReset); an end already deregistered (its teardown ran) still gets
+// the wire-level injection, whose identity its earlier teardown already owns.
+// At most one registered conn wraps a given end, so the scan is deterministic.
+func dstDeadPushRST(e Conn) {
+	dstConns.mu.Lock()
+	var victim *dstConn
+	dstConnsRoll()
+	for c := range dstConns.set {
+		if c.Conn == e {
+			victim = c
+			break
+		}
+	}
+	dstConns.mu.Unlock()
+	if victim != nil {
+		dstInjectReset(victim)
+		return
+	}
+	if end, ok := e.(*dstWireEnd); ok {
+		end.injectRST()
+	}
+}
+
 // dstMatchedVictims collects the registered conns satisfying match and returns them
 // in registration-SEQUENCE order (never the registry map's pointer-address iteration
 // order — see dstResetMatching's note). Factored out so the ordering is directly

@@ -112,7 +112,15 @@ type dstStream struct {
 	space      chan struct{} // buffered(1) wakeup, pinged on pop (wakes a blocked WRITER)
 	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
 	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
-	frozen     bool          // an injected RST killed the receiving socket: later pushes are discarded (freezeAtHorizon)
+	frozen     bool          // the receiving socket died (injected RST or retransmit-horizon death): later pushes are discarded (freezeAtHorizon)
+
+	// deadDropped records that bytes (or a FIN) committed to this stream were
+	// destroyed by the receiver's death — dropped by freezeAtHorizon or
+	// discarded by a post-freeze push. The real sender's counterpart segments
+	// are permanently unacknowledged (a dead socket ACKs nothing), so its
+	// retransmissions into a cut exhaust: heldBeyond keeps reporting them held
+	// even though the segments themselves are gone from the queue.
+	deadDropped bool
 }
 
 func newDstStream(capacity int64) *dstStream {
@@ -149,14 +157,18 @@ func (s *dstStream) wakeWriter() {
 // delivered before an earlier one — head-of-line bunches it instead. The
 // write path holds s.mu across its capacity check and this append, one
 // atomic unit. bandwidthBps<=0 is unlimited; jitterNs<=0 draws nothing (so
-// an inactive jitter fault leaves the fault stream untouched).
-func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
+// an inactive jitter fault leaves the fault stream untouched). Returns
+// dead=true when the segment was discarded because the receiving socket is
+// gone (frozen) — the caller surfaces the sender-side consequence.
+func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64) (dead bool) {
 	if s.frozen {
-		// An injected RST killed the receiving socket: a late segment is
-		// answered with an RST, never queued (the sender's own end carries
-		// the failure once its injection lands — its local send still
-		// succeeds first, as a real send() into a doomed conn does).
-		return
+		// The receiving socket died (an injected RST or a retransmit-horizon
+		// death — a CLOSED socket): a late segment is answered with an RST,
+		// never queued. The local send still succeeds first, as a real send()
+		// into a doomed conn does; the sender-side failure is the caller's
+		// (write's dead-push handling, or the fault loop's own injection).
+		s.deadDropped = true
+		return true
 	}
 	data := append([]byte(nil), b...)
 	transmitEnd := dstBaseNanos()
@@ -176,6 +188,7 @@ func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64
 	at := dstDelayAdd(dstDelayAdd(transmitEnd, latencyNs), dstFaultRandN(jitterNs))
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
 	s.buffered += int64(len(data))
+	return false
 }
 
 // dstTransmitNanos returns ceil(nbytes * 1e9 / bps) — the base-time a bandwidth-limited
@@ -225,8 +238,15 @@ func dstLinkDelay(latencyNs, jitterNs int64) int64 {
 // FIN's arrival): the reader drains queued segments at their delivery times, then
 // sees EOF — but a partition holds the FIN too, so EOF is withheld until heal unless
 // the close arrived before the cut (closeAt <= cut-start), exactly like a data byte.
+// A FIN toward a frozen stream is discarded like any late segment (the receiving
+// socket is CLOSED; it answers with RST, it never queues) — recording it would
+// resurrect a clean EOF on a dead end.
 func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
 	s.mu.Lock()
+	if s.frozen {
+		s.mu.Unlock()
+		return
+	}
 	s.closed = true
 	s.closeAt = dstDelayAdd(dstDelayAdd(dstBaseNanos(), latencyNs), dstFaultRandN(jitterNs))
 	s.mu.Unlock()
@@ -326,8 +346,9 @@ type dstWireEnd struct {
 	horizonOnce   sync.Once
 	horizonKill   chan struct{}
 
-	// An injected RST (fault matcher or crash teardown) arrived at this
-	// end: reads drain the already-DELIVERED bytes first, then fail; writes
+	// An RST arrived at this end (fault matcher, crash teardown, or the RST a
+	// dead peer socket answers a live segment with — dstDeadPushRST): reads
+	// drain the already-DELIVERED bytes first, then fail; writes
 	// fail immediately. rstKill closes when the RST lands, waking blocked
 	// operations to observe rstArrived (the horizonKill pattern). See
 	// injectRST for the kernel contract; the receive queue itself is FROZEN
@@ -381,10 +402,17 @@ func (*dstWireEnd) RemoteAddr() Addr { return pipeAddr{} }
 // heldBeyond reports whether the stream still queues anything a cut beginning at
 // cutStart holds: a segment (or the FIN) whose delivery lies at or after the cut
 // (the same arrived-strictly-before-the-cut boundary pop uses). These are the
-// bytes a real sender would be retransmitting into the void.
+// bytes a real sender would be retransmitting into the void. Bytes the
+// receiver's death destroyed (deadDropped) count as held forever: the real
+// counterpart segments are permanently unacknowledged — a dead socket ACKs
+// nothing — so the sender's retransmissions into a cut still exhaust even
+// though the simulated segments are gone from the queue.
 func (s *dstStream) heldBeyond(cutStart int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deadDropped {
+		return true
+	}
 	for i := range s.segs {
 		if s.segs[i].deliverAt > cutStart-1 {
 			return true
@@ -459,11 +487,41 @@ func (e *dstWireEnd) horizonCheck() {
 	e.horizonMu.Lock()
 	e.horizonArmed = false // no AfterFunc pending past the kill
 	e.horizonMu.Unlock()
+	e.horizonDie()
+}
+
+// horizonDie kills this end at its retransmit horizon. Retransmission
+// exhaustion runs tcp_write_err → tcp_done: sk_err = ETIMEDOUT pends (the
+// one-shot identity — read/write consult timedOut) and the socket is CLOSED,
+// its kernel state gone, so the death is TERMINAL for this connection's
+// delivery in both directions. The receive direction freezes at the kill
+// instant exactly as an injected RST does — bytes delivered before the death
+// stay drainable (tcp_recvmsg reports pending data first), bytes in flight or
+// held by a cut die, and a later segment or FIN meets a CLOSED socket and is
+// never queued, so a heal after the death resurrects nothing. The send
+// direction's still-undelivered bytes die too: nothing retransmits them after
+// tcp_done, so a heal must never flush them to the peer (the peer keeps only
+// what had already arrived, per its own arrival horizon). Each direction's
+// death instant is capped at that direction's cut-start, the same
+// arrived-strictly-before-the-cut boundary pop and injectRST use. Wakes every
+// blocked operation on both ends so each re-evaluates.
+func (e *dstWireEnd) horizonDie() {
 	e.timedOut.Store(true)
+	inHorizon := dstBaseNanos()
+	if cutStart, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cutStart-1 < inHorizon {
+		inHorizon = cutStart - 1
+	}
+	e.in.freezeAtHorizon(inHorizon)
+	outHorizon := dstBaseNanos()
+	if cutStart, cut, _ := dstPartCutStartDir(e.localHost, e.peerHost); cut && cutStart-1 < outHorizon {
+		outHorizon = cutStart - 1
+	}
+	e.out.freezeAtHorizon(outHorizon)
 	e.horizonOnce.Do(func() { close(e.horizonKill) })
-	e.out.wake()
-	e.out.wakeWriter()
-	e.in.wake()
+	e.out.wake()       // the peer's blocked reader re-evaluates (its held bytes died)
+	e.out.wakeWriter() // this end's blocked writer observes timedOut
+	e.in.wake()        // this end's blocked reader observes timedOut
+	e.in.wakeWriter()  // the peer's blocked writer re-evaluates (the freeze freed space)
 }
 
 // injectRST delivers a fault-injected RST to this end — the kernel-faithful
@@ -503,20 +561,26 @@ func (e *dstWireEnd) injectRST() {
 }
 
 // freezeAtHorizon drops every segment not yet delivered at horizon and
-// FREEZES the stream — an injected RST destroys in-flight bytes, never the
-// receive queue, and the dead socket accepts nothing further: a push after
-// the freeze is discarded under the same lock (program order, not
-// timestamps — at zero latency a post-RST push carries deliverAt equal to
-// the horizon, so no timestamp comparison can separate it from a drainable
-// same-instant pre-RST byte). The receive queue kept is the longest FIFO
-// PREFIX whose every segment has arrived (head-of-line: a jitter draw can
-// give a later segment an earlier deliverAt, but it is readable only behind
-// its predecessors — exactly pop's delivery rule), so the scan stops at the
-// first undelivered segment and the whole remainder dies. The dropped
-// suffix is cleared so the backing array does not retain the dead buffers.
-// Reports whether the writer's FIN had ARRIVED at the horizon — closed with
-// closeAt within the horizon and no segment dropped (in order, a FIN cannot
-// overtake data): the RST-met-CLOSE_WAIT discriminant.
+// FREEZES the stream — a socket death (an injected RST, or a retransmit-
+// horizon kill: tcp_write_err → tcp_done, socket CLOSED) destroys in-flight
+// bytes, never the receive queue, and the dead socket accepts nothing
+// further: a push after the freeze is discarded under the same lock (program
+// order, not timestamps — at zero latency a post-death push carries
+// deliverAt equal to the horizon, so no timestamp comparison can separate it
+// from a drainable same-instant pre-death byte). The receive queue kept is
+// the longest FIFO PREFIX whose every segment has arrived (head-of-line: a
+// jitter draw can give a later segment an earlier deliverAt, but it is
+// readable only behind its predecessors — exactly pop's delivery rule), so
+// the scan stops at the first undelivered segment and the whole remainder
+// dies. The dropped suffix is cleared so the backing array does not retain
+// the dead buffers. A FIN that had NOT arrived at the horizon dies with the
+// in-flight bytes — the dead socket will never receive it, and keeping it
+// recorded would resurrect a clean EOF once its closeAt passes. Any drop
+// (segment or FIN) marks deadDropped: the sender's counterpart segments are
+// permanently unacknowledged (heldBeyond). Reports whether the writer's FIN
+// had ARRIVED at the horizon — closed with closeAt within the horizon and no
+// segment dropped (in order, a FIN cannot overtake data): the
+// RST-met-CLOSE_WAIT discriminant.
 func (s *dstStream) freezeAtHorizon(horizon int64) (finArrived bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -526,6 +590,13 @@ func (s *dstStream) freezeAtHorizon(horizon int64) (finArrived bool) {
 		live++
 	}
 	finArrived = s.closed && s.closeAt <= horizon && live == len(s.segs)
+	if s.closed && !finArrived {
+		s.closed = false
+		s.deadDropped = true
+	}
+	if live < len(s.segs) {
+		s.deadDropped = true
+	}
 	for i := live; i < len(s.segs); i++ {
 		s.buffered -= int64(len(s.segs[i].data))
 		s.segs[i] = dstSeg{}
@@ -728,7 +799,10 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 		// Re-check the injected-RST state on every chunk, not just at
 		// entry: under access-granularity (Level 2) scheduling the fault op
 		// can interleave between chunk pushes — a real kernel's destroyed
-		// connection can never carry the remaining bytes.
+		// connection can never carry the remaining bytes. (A horizon death
+		// needs no flag re-check here: horizonDie freezes this very stream, so
+		// a racing chunk is discarded under the stream lock — the push seam
+		// enforces it structurally.)
 		if e.rstArrived.Load() {
 			return total, io.ErrClosedPipe
 		}
@@ -750,7 +824,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				// retransmit timer running on the sender's own clock.
 				remaining := e.retransNs - (dstBaseNanos() - cutStart)
 				if remaining <= 0 {
-					e.timedOut.Store(true)
+					e.horizonDie()
 					return total, syscall.ETIMEDOUT
 				}
 				horizonT = time.NewTimer(time.Duration(remaining))
@@ -769,7 +843,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			case <-e.horizonKill:
 				return total, syscall.ETIMEDOUT
 			case <-horizonC:
-				e.timedOut.Store(true)
+				e.horizonDie()
 				return total, syscall.ETIMEDOUT
 			case <-e.wrDead.wait():
 				if horizonT != nil {
@@ -799,7 +873,9 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			// without it the resumed writer pushes post-RST bytes the peer
 			// could then read — a sim-only execution (a real kernel wakes a
 			// blocked sender with the pending socket error, and the
-			// destroyed connection never carries another byte).
+			// destroyed connection never carries another byte). A horizon
+			// death is covered structurally instead: horizonDie freezes this
+			// stream, so a racing push is discarded at the push seam.
 			if e.rstArrived.Load() {
 				return total, io.ErrClosedPipe
 			}
@@ -811,10 +887,27 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				room = avail
 			}
 		}
-		e.out.pushLocked(b[:room], e.latencyNs, e.jitterNs, e.bandwidthBps)
+		dead := e.out.pushLocked(b[:room], e.latencyNs, e.jitterNs, e.bandwidthBps)
 		roomRemains := e.out.capacity > 0 && e.out.buffered < e.out.capacity
 		e.out.mu.Unlock()
 		e.out.wake()
+		if dead && !e.timedOut.Load() && !e.rstArrived.Load() &&
+			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) {
+			// The segment met a dead (CLOSED) peer socket over a live link: the
+			// dead kernel answers it with an RST that reaches this end. The
+			// local send's success stands — a real send() into a doomed conn
+			// succeeds first — and subsequent operations carry the one-shot
+			// reset identity (ECONNRESET), exactly production's shape for a
+			// peer that timed out and died. Under a cut no RST can traverse:
+			// the segment is silently dropped and this end's own
+			// retransmissions exhaust at ITS horizon instead (deadDropped keeps
+			// the destroyed bytes counting as held — armHorizon below). A cut
+			// of only the RETURN direction swallows the RST too; that end
+			// neither resets nor times out here — the recorded flow-level
+			// ACK-starvation limit (faults.md, Partition), the safe ⊆-real
+			// direction.
+			dstDeadPushRST(e)
+		}
 		if roomRemains {
 			// Chain-wake another writer blocked on this direction: one drain frees one
 			// cap-1 space token, so a woken writer that leaves room must pass the baton —

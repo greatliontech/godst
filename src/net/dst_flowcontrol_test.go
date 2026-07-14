@@ -814,6 +814,248 @@ func TestDSTNetSameHostWriteWriteDeadlocks(t *testing.T) {
 // first read after the horizon death reports ETIMEDOUT, a second read plain
 // io.EOF, and writes the CLOSED-socket EPIPE. Mirrors
 // TestDSTNetResetDrainsDeliveredThenResets' ECONNRESET ladder.
+// TestDSTNetHorizonDeathHealNoResurrection: a horizon death is TERMINAL for
+// the killed end's receive direction — retransmission exhaustion runs
+// tcp_write_err → tcp_done, the socket is CLOSED, and a CLOSED socket never
+// queues a late segment. Bytes and a FIN the peer sent that had NOT arrived
+// before the death must never be delivered, even after the partition heals:
+// the killed end drains only what arrived before the death, then reports the
+// pended one-shot ETIMEDOUT — never the post-death bytes, never a clean EOF.
+func TestDSTNetHorizonDeathHealNoResurrection(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstN int
+	var firstErr, secondErr, thirdErr, writeErr error
+	var buf [16]byte
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		preSent := make(chan struct{})
+		cutMade := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				c.Write([]byte("pre")) // delivered before the cut: survives the death
+				close(preSent)
+				<-cutMade
+				c.Write([]byte("late")) // held at the cut: in flight when the horizon kills cli
+				<-done
+				c.Close() // post-death FIN: meets the CLOSED socket, never queued
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			<-preSent
+			time.Sleep(10 * time.Millisecond) // let "pre" arrive before the cut
+			simulation.Partition("srv", "cli")
+			close(cutMade)
+			c.Write([]byte("hi"))       // undeliverable: arms the watchdog
+			time.Sleep(2 * time.Second) // the 1s horizon kills this end
+			simulation.Heal("srv", "cli")
+			time.Sleep(100 * time.Millisecond) // held bytes would flush NOW if the death were not terminal
+			firstN, firstErr = c.Read(buf[:])
+			_, secondErr = c.Read(make([]byte, 16))
+			_, thirdErr = c.Read(make([]byte, 16))
+			_, writeErr = c.Write([]byte("after"))
+			close(done)
+			c.Close()
+		})
+	})
+	if firstN != 3 || string(buf[:firstN]) != "pre" || firstErr != nil {
+		t.Errorf("first read on the killed end after heal = (%d, %q, %v), want (3, %q, nil): only bytes that arrived BEFORE the death drain", firstN, buf[:firstN], firstErr, "pre")
+	}
+	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
+		t.Errorf("second read on the killed end after heal = %v, want ETIMEDOUT: the heal must not resurrect the held bytes or FIN (a CLOSED socket never queues late segments)", secondErr)
+	}
+	if thirdErr != io.EOF {
+		t.Errorf("read after the consumed timeout = %v, want io.EOF (the CLOSED-socket read identity)", thirdErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed timeout = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
+	}
+}
+
+// TestDSTNetHorizonDeathLiveInboundNoPostDeathDelivery: the receive-direction
+// freeze at the death instant, isolated from any peer-side death — a ONE-WAY
+// outbound cut kills only this end (the peer never arms), and the inbound
+// direction is live the whole time, so the peer's post-death bytes and FIN
+// arrive at full speed and meet the CLOSED socket: never queued, never
+// delivered. Only the peer's own death could otherwise mask a missing
+// receive-direction freeze (its outbound freeze covers the same stream); here
+// the peer survives, so this end's freeze is the only guard.
+func TestDSTNetHorizonDeathLiveInboundNoPostDeathDelivery(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstN int
+	var firstErr, secondErr, thirdErr, writeErr error
+	var buf [16]byte
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		preSent := make(chan struct{})
+		deadNow := make(chan struct{})
+		srvDone := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				c.Write([]byte("pre")) // delivered before the death: survives
+				close(preSent)
+				<-deadNow
+				c.Write([]byte("late")) // live inbound link, but the socket is CLOSED: never queued
+				c.Close()               // post-death FIN: same fate
+				close(srvDone)
+				<-done
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			<-preSent
+			time.Sleep(10 * time.Millisecond)        // let "pre" arrive
+			simulation.PartitionOneWay("cli", "srv") // outbound-only cut; inbound stays live
+			c.Write([]byte("hi"))                    // undeliverable: arms the watchdog
+			time.Sleep(2 * time.Second)              // the 1s horizon kills this end
+			close(deadNow)
+			<-srvDone
+			firstN, firstErr = c.Read(buf[:])
+			_, secondErr = c.Read(make([]byte, 16))
+			_, thirdErr = c.Read(make([]byte, 16))
+			_, writeErr = c.Write([]byte("after"))
+			close(done)
+			c.Close()
+		})
+	})
+	if firstN != 3 || string(buf[:firstN]) != "pre" || firstErr != nil {
+		t.Errorf("first read on the killed end = (%d, %q, %v), want (3, %q, nil): only pre-death arrivals drain", firstN, buf[:firstN], firstErr, "pre")
+	}
+	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
+		t.Errorf("second read on the killed end = %v, want ETIMEDOUT: post-death deliveries over the live inbound link must never be queued", secondErr)
+	}
+	if thirdErr != io.EOF {
+		t.Errorf("read after the consumed timeout = %v, want io.EOF (the CLOSED-socket read identity)", thirdErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed timeout = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
+	}
+}
+
+// TestDSTNetHorizonDeathHealPeerNoResurrection pins the OTHER direction of
+// terminal death: the killed end's outbound bytes held at the cut die with it
+// (nothing retransmits them after tcp_done), so a heal must never flush them
+// to the surviving peer. The peer's post-heal segment then meets the dead
+// CLOSED socket over the live link and is answered with an RST: the send
+// succeeds locally (a real send() into a doomed conn does), and subsequent
+// operations carry the one-shot ECONNRESET.
+func TestDSTNetHorizonDeathHealPeerNoResurrection(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var peekN int
+	var peekErr, firstWriteErr, secondWriteErr, readErr error
+	var firstWriteN int
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				time.Sleep(2 * time.Second) // the cli end dies at its 1s horizon
+				time.Sleep(200 * time.Millisecond)
+				// The heal (at 2s) must not deliver cli's held "hi".
+				c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+				var buf [8]byte
+				peekN, peekErr = c.Read(buf[:])
+				c.SetReadDeadline(time.Time{})
+				firstWriteN, firstWriteErr = c.Write([]byte("x")) // meets the dead socket: RST answered
+				_, secondWriteErr = c.Write([]byte("y"))
+				_, readErr = c.Read(buf[:])
+				close(done)
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi"))       // held at the cut: arms the watchdog
+			time.Sleep(2 * time.Second) // the 1s horizon kills this end
+			simulation.Heal("srv", "cli")
+			<-done // keep this end open (not app-Closed) while the peer probes
+			c.Close()
+		})
+	})
+	if peekN != 0 || !errors.Is(peekErr, os.ErrDeadlineExceeded) {
+		t.Errorf("peer read after the heal = (%d, %v), want (0, deadline exceeded): the dead end's held bytes must never flush", peekN, peekErr)
+	}
+	if firstWriteN != 1 || firstWriteErr != nil {
+		t.Errorf("peer's first post-heal write = (%d, %v), want (1, nil): the local send into the doomed conn succeeds first", firstWriteN, firstWriteErr)
+	}
+	if !errors.Is(secondWriteErr, syscall.ECONNRESET) {
+		t.Errorf("peer's second post-heal write = %v, want ECONNRESET: the dead CLOSED socket answered the first segment with an RST", secondWriteErr)
+	}
+	if readErr != io.EOF {
+		t.Errorf("peer read after the consumed reset = %v, want io.EOF (the CLOSED-socket read identity)", readErr)
+	}
+}
+
+// TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut: bytes a peer sends
+// into the cut AFTER the other end's horizon death are destroyed by the
+// frozen receive queue — but the real peer's counterpart segments are
+// permanently unacknowledged (a dead socket ACKs nothing), so under a
+// permanent cut the peer's own retransmissions still exhaust at ITS horizon.
+// The destroyed bytes must keep counting as held (deadDropped → heldBeyond),
+// or the peer's watchdog would disarm and its blocked read hang forever.
+func TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				time.Sleep(1500 * time.Millisecond) // past cli's death at 1s
+				c.Write([]byte("w"))                // meets the frozen queue under the cut: discarded, arms srv's watchdog
+				_, readErr = c.Read(make([]byte, 8))
+				close(done)
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli") // permanent
+			c.Write([]byte("hi"))              // arms cli's watchdog; cli dies at 1s
+			<-done
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Errorf("peer read blocked under the permanent cut after the other end's death = %v, want ETIMEDOUT at the peer's own horizon (its retransmissions of the destroyed bytes exhaust)", readErr)
+	}
+}
+
 func TestDSTNetHorizonOneShotReadFirst(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
