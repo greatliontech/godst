@@ -72,15 +72,6 @@ func TestDSTConformanceAllowlistMatchesOnlyRecordedShapes(t *testing.T) {
 			simMiss:  outcome{N: -1, State: "kind=f perm=0666 size=3"},
 		},
 		{
-			name:     "fdatasync-dir",
-			key:      "fs-fdatasync-dir",
-			op:       op{name: "fdatasync-dir(slot 1)"},
-			hostOK:   outcome{N: -1},
-			simOK:    outcome{Err: "errno:EINVAL", N: -1},
-			hostMiss: outcome{N: -1},
-			simMiss:  outcome{Err: "errno:EIO", N: -1},
-		},
-		{
 			name:     "pipe-fd",
 			key:      "pipe-fd-fenced",
 			op:       op{name: "pipe-fd(slot 3)"},
@@ -99,13 +90,22 @@ func TestDSTConformanceAllowlistMatchesOnlyRecordedShapes(t *testing.T) {
 			simMiss:  outcome{Err: "OpError(write)/errno:ECONNRESET", N: 0},
 		},
 		{
-			name:     "close-in-flight-first-write",
-			key:      "net-close-in-flight-first-write",
+			name:     "close-in-flight-write",
+			key:      "net-close-in-flight-fin-ordering",
 			op:       op{name: "post-reset-write(conn 2, 48 bytes)", writeSize: 48},
 			hostOK:   outcome{N: 48}, // the host end FINned: the write is accepted
 			simOK:    outcome{Err: "OpError(write)/errno:ECONNRESET", N: 0},
 			hostMiss: outcome{N: 48},
-			simMiss:  outcome{Err: "OpError(write)/errno:EPIPE", N: 0}, // not the sim's stable reset identity
+			simMiss:  outcome{Err: "OpError(write)/ErrClosed:net", N: 0}, // not a reset identity at all
+		},
+		{
+			name:     "close-in-flight-read",
+			key:      "net-close-in-flight-fin-ordering",
+			op:       op{name: "post-reset-read(conn 2, 8 bytes, guard 0s)"},
+			hostOK:   outcome{Err: "EOF", N: 0}, // the host end FINned: reads are io.EOF
+			simOK:    outcome{Err: "OpError(read)/errno:ECONNRESET", N: 0},
+			hostMiss: outcome{Err: "EOF", N: 0},
+			simMiss:  outcome{Err: "OpError(read)/errno:EPIPE", N: 0}, // reads never carry EPIPE
 		},
 		{
 			name: "pipe-ring",
@@ -129,7 +129,7 @@ func TestDSTConformanceAllowlistMatchesOnlyRecordedShapes(t *testing.T) {
 			if tc.key == "fs-create-umask" && hostUmask&0o777 != 0o022 {
 				t.Skipf("host umask %04o != 0022: the recorded-shape fixture assumes 022", hostUmask)
 			}
-			if tc.key == "net-close-in-flight-first-write" && !hostCloseInFlightCanFIN() {
+			if tc.key == "net-close-in-flight-fin-ordering" && !hostCloseInFlightCanFIN() {
 				t.Skip("host never produced the close-vs-arrival FIN ordering; entry inapplicable")
 			}
 			fired := map[string]int{}

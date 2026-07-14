@@ -25,8 +25,10 @@ import (
 //   - a reset delivers ECONNRESET to BOTH ends of every targeted conn;
 //   - each end is a SURVIVOR (no process died) and receives the RST as a real
 //     kernel would: bytes already DELIVERED to its receive queue drain first
-//     (tcp_recvmsg reports pending data before the socket error), then reads
-//     fail ECONNRESET and writes fail immediately — DST-FAULT-SOUND;
+//     (tcp_recvmsg reports pending data before the socket error), then the
+//     first failing op reports ECONNRESET and writes fail immediately — the
+//     kernel's ONE-SHOT sk_err (host-probed): later reads return io.EOF and
+//     later writes EPIPE, the CLOSED-socket identities — DST-FAULT-SOUND;
 //   - bytes still IN FLIGHT are dropped (the RST beat them to the socket, one
 //     of the real orderings an injected RST produces) — DST-FAULT-SOUND;
 //   - it touches exactly the victim's conns, no leak onto other pairs/processes
@@ -221,15 +223,17 @@ func TestDSTNetResetUnderPartitionDropsHeldBytes(t *testing.T) {
 // TestDSTNetResetDrainsDeliveredThenResets: bytes already DELIVERED to a
 // survivor's receive queue before an injected Reset drain first — a real RST
 // cannot destroy what the receiver's kernel already holds (tcp_recvmsg
-// reports pending data before the socket error) — and only then do reads
-// fail ECONNRESET; a write after the reset fails ECONNRESET immediately.
+// reports pending data before the socket error) — and only then does the
+// FIRST failing read report ECONNRESET, consuming the one-shot sk_err
+// (host-probed): the write after it carries the CLOSED-socket EPIPE and a
+// further read plain io.EOF.
 func TestDSTNetResetDrainsDeliveredThenResets(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
 	var n int
 	var buf [16]byte
-	var firstErr, secondErr, writeErr error
+	var firstErr, secondErr, writeErr, thirdErr error
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
 		reset := make(chan struct{})
@@ -244,6 +248,7 @@ func TestDSTNetResetDrainsDeliveredThenResets(t *testing.T) {
 				n, firstErr = c.Read(buf[:])
 				_, secondErr = c.Read(make([]byte, 16))
 				_, writeErr = c.Write([]byte("after"))
+				_, thirdErr = c.Read(make([]byte, 16))
 				c.Close()
 				close(done)
 			}()
@@ -262,11 +267,180 @@ func TestDSTNetResetDrainsDeliveredThenResets(t *testing.T) {
 	if n != 3 || string(buf[:3]) != "msg" || firstErr != nil {
 		t.Errorf("first read after reset = (%d, %q, %v), want (3, %q, nil): delivered bytes drain before the reset error", n, buf[:n], firstErr, "msg")
 	}
-	if !errors.Is(secondErr, syscall.ECONNRESET) {
-		t.Errorf("second read after drain = %v, want ECONNRESET", secondErr)
+	var opErr *OpError
+	if !errors.Is(secondErr, syscall.ECONNRESET) || !errors.As(secondErr, &opErr) || opErr.Op != "read" || opErr.Net != "tcp" {
+		t.Errorf("second read after drain = %v, want a tcp read *OpError wrapping ECONNRESET (the one-shot sk_err)", secondErr)
 	}
-	if !errors.Is(writeErr, syscall.ECONNRESET) {
-		t.Errorf("write after reset = %v, want ECONNRESET (the pending socket error fails sends immediately)", writeErr)
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed reset = %v, want EPIPE (sk_err consumed by the read; the CLOSED-socket write identity)", writeErr)
+	}
+	if thirdErr != io.EOF {
+		t.Errorf("read after the consumed reset = %v, want io.EOF (the CLOSED-socket read identity)", thirdErr)
+	}
+}
+
+// TestDSTNetResetWriteFirstConsumesSkErr: the one-shot sk_err is consumed by
+// whichever failing op comes FIRST — write-first here (host-probed ladder:
+// write ECONNRESET, then write EPIPE, then reads io.EOF). Complements the
+// read-first ladder in TestDSTNetResetDrainsDeliveredThenResets.
+func TestDSTNetResetWriteFirstConsumesSkErr(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var firstWriteErr, secondWriteErr, readErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			simulation.Reset("A", "B")
+			_, firstWriteErr = c.Write([]byte("one"))
+			_, secondWriteErr = c.Write([]byte("two"))
+			_, readErr = c.Read(make([]byte, 8))
+			close(done)
+			c.Close()
+		})
+	})
+	// Production error SHAPE, not just identity: both errno legs must be
+	// *net.OpError carrying the op and the connection's network — the shape
+	// SUTs unwrap with errors.As (a bare errno would satisfy errors.Is and
+	// silently lose it).
+	var opErr *OpError
+	if !errors.Is(firstWriteErr, syscall.ECONNRESET) || !errors.As(firstWriteErr, &opErr) || opErr.Op != "write" || opErr.Net != "tcp" {
+		t.Errorf("first write after reset = %v, want a tcp write *OpError wrapping ECONNRESET (consumes the one-shot sk_err)", firstWriteErr)
+	}
+	opErr = nil
+	if !errors.Is(secondWriteErr, syscall.EPIPE) || !errors.As(secondWriteErr, &opErr) || opErr.Op != "write" || opErr.Net != "tcp" {
+		t.Errorf("second write after reset = %v, want a tcp write *OpError wrapping EPIPE (sk_err consumed)", secondWriteErr)
+	}
+	if readErr != io.EOF {
+		t.Errorf("read after the consumed reset = %v, want io.EOF", readErr)
+	}
+}
+
+// TestDSTNetResetInCloseWaitIsEPIPE: an injected RST arriving AFTER the
+// peer's FIN was delivered meets a CLOSE_WAIT socket — tcp_reset pends EPIPE
+// there, not ECONNRESET, and the EPIPE consumption is indistinguishable from
+// the post-consumption identities (host-probed): reads drain then io.EOF
+// throughout, writes EPIPE throughout, no ECONNRESET arm at all.
+func TestDSTNetResetInCloseWaitIsEPIPE(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var n int
+	var buf [16]byte
+	var drainErr, readErr, writeErr, secondWriteErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		port := make(chan string, 1)
+		closed := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				c.Write([]byte("bye"))
+				c.Close() // clean close: FIN (nothing unread at this end)
+				close(closed)
+				<-done
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
+			<-closed // the FIN has arrived (zero latency): B is in CLOSE_WAIT
+			simulation.Reset("A", "B")
+			n, drainErr = c.Read(buf[:])
+			_, readErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("x"))
+			_, secondWriteErr = c.Write([]byte("y"))
+			close(done)
+			c.Close()
+		})
+	})
+	if n != 3 || string(buf[:3]) != "bye" || drainErr != nil {
+		t.Errorf("drain after CLOSE_WAIT reset = (%d, %q, %v), want (3, %q, nil): delivered bytes still drain", n, buf[:n], drainErr, "bye")
+	}
+	if readErr != io.EOF {
+		t.Errorf("read after CLOSE_WAIT reset = %v, want io.EOF (tcp_reset's CLOSE_WAIT arm pends EPIPE, which reads never surface)", readErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after CLOSE_WAIT reset = %v, want EPIPE (never ECONNRESET)", writeErr)
+	}
+	if !errors.Is(secondWriteErr, syscall.EPIPE) {
+		t.Errorf("second write after CLOSE_WAIT reset = %v, want EPIPE", secondWriteErr)
+	}
+}
+
+// TestDSTNetResetBeatsInFlightFIN: the CLOSE_WAIT discriminant's FALSE
+// direction — an injected RST that arrives while the peer's FIN (and its
+// preceding bytes) are still IN FLIGHT meets an ESTABLISHED socket, so the
+// identity is the one-shot ECONNRESET ladder, never the CLOSE_WAIT
+// EPIPE/EOF shape, and the in-flight bytes and FIN died with the RST
+// (nothing drains). Complements TestDSTNetResetInCloseWaitIsEPIPE.
+func TestDSTNetResetBeatsInFlightFIN(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var n int
+	var firstErr, secondErr, writeErr error
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		dialed := make(chan struct{})
+		closed := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-dialed // the dial must complete before this end closes (a close mid-handshake refuses the dial)
+				c.Write([]byte("x"))
+				c.Close() // FIN: in flight for the next 10ms
+				close(closed)
+				<-done
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				t.Errorf("dial: %v", err)
+				close(dialed)
+				close(done)
+				return
+			}
+			close(dialed)
+			<-closed
+			simulation.Reset("A", "B") // the RST beats the traveling byte and FIN
+			n, firstErr = c.Read(make([]byte, 8))
+			_, secondErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("y"))
+			close(done)
+			c.Close()
+		})
+	})
+	if n != 0 || !errors.Is(firstErr, syscall.ECONNRESET) {
+		t.Errorf("first read after RST-beats-FIN = (%d, %v), want (0, ECONNRESET): the socket was ESTABLISHED (the FIN never arrived) and the in-flight byte died", n, firstErr)
+	}
+	if secondErr != io.EOF {
+		t.Errorf("second read = %v, want io.EOF (sk_err consumed)", secondErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed reset = %v, want EPIPE", writeErr)
 	}
 }
 
@@ -561,10 +735,8 @@ func TestDSTNetCrashHostBlockedDialTimesOut(t *testing.T) {
 // hands it out and its first read fails ECONNRESET (host-probed: Linux keeps
 // an RST-aborted established child in the accept queue; accept(2) succeeds
 // and the first read reports the pending error). The write assertion pins
-// the sim's RECORDED stable-identity collapse (design.md: any operation on a
-// reset connection carries ECONNRESET) — the kernel's one-shot sk_err would
-// answer EPIPE once a read consumed the error; that divergence is recorded,
-// not host-probed here.
+// the kernel's one-shot sk_err (host-probed): the read consumed the error,
+// so the write carries the CLOSED-socket EPIPE.
 func TestDSTNetResetBacklogAcceptHandsOutResetChild(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
@@ -612,8 +784,8 @@ func TestDSTNetResetBacklogAcceptHandsOutResetChild(t *testing.T) {
 	if !errors.Is(readErr, syscall.ECONNRESET) {
 		t.Errorf("first read on the handed-out child = %v, want ECONNRESET", readErr)
 	}
-	if !errors.Is(writeErr, syscall.ECONNRESET) {
-		t.Errorf("write on the handed-out child = %v, want ECONNRESET", writeErr)
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write on the handed-out child = %v, want EPIPE (the read consumed the one-shot sk_err)", writeErr)
 	}
 }
 
@@ -736,6 +908,8 @@ func TestDSTNetResetFailsBlockedWrite(t *testing.T) {
 	if writeN != 4 || !errors.Is(writeErr, syscall.ECONNRESET) {
 		t.Errorf("blocked write across a reset = (%d, %v), want (4, ECONNRESET): the woken writer must observe the RST, never push the remainder", writeN, writeErr)
 	}
+	// The read is the PEER end's first failing op: sk_err is per socket, so
+	// the writer's consumption on its own end does not spend this end's shot.
 	if lateN != 0 || !errors.Is(lateErr, syscall.ECONNRESET) {
 		t.Errorf("post-reset read = (%d, %v), want (0, ECONNRESET): no post-RST byte may be delivered", lateN, lateErr)
 	}
@@ -744,7 +918,8 @@ func TestDSTNetResetFailsBlockedWrite(t *testing.T) {
 // TestDSTNetResetKeepsIdentityPastRetransmitHorizon: an injected RST
 // destroys the socket AND its retransmit timer — a partition-armed
 // retransmit watchdog expiring after the RST must not flip the conn's error
-// identity from ECONNRESET to ETIMEDOUT on later operations. The reachable
+// identity to ETIMEDOUT on later operations: the ladder stays the reset
+// one (first op ECONNRESET, then the CLOSED-socket EOF/EPIPE). The reachable
 // shape is a HOST-CRASH survivor: its outbound bytes written into the cut
 // stay held (only its inbound direction is truncated by the RST), so the
 // watchdog still sees them at its horizon; a pair reset truncates both
@@ -787,11 +962,11 @@ func TestDSTNetResetKeepsIdentityPastRetransmitHorizon(t *testing.T) {
 	if !errors.Is(firstErr, syscall.ECONNRESET) {
 		t.Errorf("read after the crash's RST = %v, want ECONNRESET", firstErr)
 	}
-	if !errors.Is(lateReadErr, syscall.ECONNRESET) {
-		t.Errorf("read past the retransmit horizon = %v, want ECONNRESET (the RST killed the timer with the socket)", lateReadErr)
+	if lateReadErr != io.EOF {
+		t.Errorf("read past the retransmit horizon = %v, want io.EOF (the RST killed the timer with the socket; never ETIMEDOUT)", lateReadErr)
 	}
-	if !errors.Is(lateWriteErr, syscall.ECONNRESET) {
-		t.Errorf("write past the retransmit horizon = %v, want ECONNRESET", lateWriteErr)
+	if !errors.Is(lateWriteErr, syscall.EPIPE) {
+		t.Errorf("write past the retransmit horizon = %v, want EPIPE (the reset ladder's CLOSED-socket identity; never ETIMEDOUT)", lateWriteErr)
 	}
 }
 

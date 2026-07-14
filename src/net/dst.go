@@ -546,8 +546,10 @@ func dstListenConnConflict(host uint32, network string, ip IP, port int, wildcar
 // errors (io.ErrClosedPipe, bare os.ErrDeadlineExceeded, OpError{Net:"pipe"})
 // would break production-shaped code: after a local Close every op must
 // satisfy errors.Is(err, net.ErrClosed); a connection reset (listener backlog
-// teardown) and writes to a closed peer must carry syscall.ECONNRESET; reads
-// from a gracefully closed peer return io.EOF; deadline errors are *OpError
+// teardown) and the first write to a closed peer carry syscall.ECONNRESET
+// once — the kernel's one-shot sk_err — and later ops the CLOSED-socket
+// identities (reads io.EOF, writes EPIPE; consumeSkErr); reads from a
+// gracefully closed peer return io.EOF; deadline errors are *OpError
 // wrapping os.ErrDeadlineExceeded with the connection's network and addresses.
 type dstConn struct {
 	Conn
@@ -556,6 +558,14 @@ type dstConn struct {
 	local, remote Addr
 	closed        atomic.Bool  // this end was Closed by its user
 	reset         *atomic.Bool // connection reset (shared by both ends)
+
+	// skErrConsumed is this end's one-shot pending-socket-error latch —
+	// production's sk_err, which the kernel reports ONCE: the first op that
+	// surfaces this end's teardown (a reset, or the write refusal after the
+	// peer's close) consumes the identity; later reads return io.EOF and
+	// later writes EPIPE, the CLOSED-socket identities (host-probed ladder;
+	// see consumeSkErr). Per end, as sk_err is per socket.
+	skErrConsumed atomic.Bool
 
 	// localHost/remoteHost attribute the connection's two ends to their owning
 	// hosts (this end's host and the peer's). Stamped at Dial — the dialer's host
@@ -618,12 +628,36 @@ func (c *dstConn) opError(op string, err error) error {
 	return &OpError{Op: op, Net: c.network, Source: dstCloneAddr(c.local), Addr: dstCloneAddr(c.remote), Err: err}
 }
 
-// resetConn tears the connection down as a reset: the peer's subsequent reads
-// and writes fail with ECONNRESET (production's RST), not EOF/closed-pipe.
+// resetConn tears the connection down as a reset: the peer's FIRST failing
+// read or write reports ECONNRESET (production's RST pending as sk_err), not
+// EOF/closed-pipe; later ops carry the CLOSED-socket identities (consumeSkErr).
 func (c *dstConn) resetConn() {
 	c.reset.Store(true)
 	c.Conn.Close()
 	dstConnDeregister(c)
+}
+
+// consumeSkErr shapes the error for an op that found this end's connection
+// torn down — a reset, or a write refused after the peer's close — following
+// the kernel's one-shot sk_err semantics (host-probed ladder): the FIRST such
+// op consumes the pending error and reports ECONNRESET; every later op gets
+// the CLOSED-socket identity — io.EOF for reads, EPIPE for writes. A reset
+// that arrived in CLOSE_WAIT (the peer's FIN already delivered) pends EPIPE,
+// not ECONNRESET (tcp_reset's CLOSE_WAIT arm), and an EPIPE consumption is
+// indistinguishable from the post-consumption identities, so that arm reads
+// EOF and writes EPIPE throughout — no ECONNRESET is ever reported.
+func (c *dstConn) consumeSkErr(op string) error {
+	closeWait := false
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		closeWait = e.rstCloseWait.Load()
+	}
+	if !closeWait && !c.skErrConsumed.Swap(true) {
+		return c.opError(op, syscall.ECONNRESET)
+	}
+	if op == "read" {
+		return io.EOF
+	}
+	return c.opError(op, syscall.EPIPE)
 }
 
 // mapConnErr converts a pipe-layer error into the production shape.
@@ -644,9 +678,15 @@ func (c *dstConn) mapConnErr(op string, err error) error {
 		return io.EOF // graceful peer close (a reset read is mapped in Read)
 	case err == io.ErrClosedPipe:
 		// Peer closed or connection reset while we operate: production
-		// surfaces a reset. (This also covers ops on a reset end itself: a
-		// reset closes the underlying pipe, so its own ops land here.)
-		return c.opError(op, syscall.ECONNRESET)
+		// surfaces the pending socket error ONCE, then the CLOSED-socket
+		// identities (consumeSkErr). This covers ops on a reset end itself
+		// (a reset closes the underlying pipe, so its own ops land here) and
+		// the write refused because the peer's FIN closed the stream — the
+		// sim's instant first-write ECONNRESET there is the recorded
+		// divergence (design.md: the succeed-then-RST round trip is the
+		// FIN/RST follow-on's work); its follow-up writes carry the kernel's
+		// post-reset EPIPE.
+		return c.consumeSkErr(op)
 	}
 	// Unreachable today: the pipe wraps only deadline errors (caught above) in
 	// its own OpError. Kept as a conservative wrap so a future pipe error
@@ -663,7 +703,10 @@ func (c *dstConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(b)
 	if err == io.EOF && c.reset.Load() {
-		return n, c.opError("read", syscall.ECONNRESET)
+		// The transport drained to EOF on a reset connection: the RST is the
+		// terminal event, surfaced with the one-shot sk_err semantics — the
+		// first post-drain read reports ECONNRESET, later reads io.EOF.
+		return n, c.consumeSkErr("read")
 	}
 	return n, c.mapConnErr("read", err)
 }

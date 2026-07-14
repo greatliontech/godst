@@ -928,8 +928,10 @@ func TestDSTNetListenerCloseSemantics(t *testing.T) {
 		if _, err := c.Read(buf); !errors.Is(err, syscall.ECONNRESET) {
 			t.Errorf("Read on backlog-reset conn = %v, want ECONNRESET", err)
 		}
-		if _, err := c.Write([]byte("x")); !errors.Is(err, syscall.ECONNRESET) {
-			t.Errorf("Write on backlog-reset conn = %v, want ECONNRESET", err)
+		// The read consumed the one-shot sk_err: the write carries the
+		// CLOSED-socket EPIPE, as on the host.
+		if _, err := c.Write([]byte("x")); !errors.Is(err, syscall.EPIPE) {
+			t.Errorf("Write on backlog-reset conn after the consumed reset = %v, want EPIPE", err)
 		}
 	})
 }
@@ -937,7 +939,8 @@ func TestDSTNetListenerCloseSemantics(t *testing.T) {
 // TestDSTNetConnErrorIdentity verifies established-connection error identity
 // matches production shape: ops after a local Close satisfy
 // errors.Is(err, net.ErrClosed); reads from a gracefully closed peer return
-// io.EOF; writes to a closed peer carry ECONNRESET; a second Close fails with
+// io.EOF; the first write to a closed peer carries ECONNRESET and later
+// writes the kernel's post-reset EPIPE (one-shot); a second Close fails with
 // net.ErrClosed; deadline errors are *OpError carrying os.ErrDeadlineExceeded
 // (a net.Error with Timeout() true) on the connection's network, driven by
 // the bubble's virtual clock.
@@ -1002,6 +1005,15 @@ func TestDSTNetConnErrorIdentity(t *testing.T) {
 		}
 		if _, err := client.Write([]byte("x")); !errors.Is(err, syscall.ECONNRESET) {
 			t.Errorf("Write after peer close = %v, want ECONNRESET", err)
+		}
+		// The first write consumed the minted one-shot: follow-up writes
+		// carry the kernel's post-reset EPIPE (host ladder from write #2 on),
+		// and reads stay io.EOF.
+		if _, err := client.Write([]byte("y")); !errors.Is(err, syscall.EPIPE) {
+			t.Errorf("second Write after peer close = %v, want EPIPE", err)
+		}
+		if _, err := client.Read(buf); err != io.EOF {
+			t.Errorf("Read after the failed writes = %v, want io.EOF (persistent)", err)
 		}
 		// A peer close does not invalidate the local endpoint: deadlines still
 		// apply cleanly, as in production.

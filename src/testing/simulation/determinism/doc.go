@@ -54,8 +54,22 @@
 // iteration order and other address-derived observables are program
 // discipline, outside the sweep; a pollable (source-nonblocking) inherited
 // capability's deadline waits ride host readiness and are host-coupled by
-// that mode's nature; foreign (non-bubble) goroutines are scheduled around
+// that mode's nature — same-seed transcript equality is NOT guaranteed
+// while a pollable capability deadline (or EAGAIN-park) is armed, a scoped
+// one-directional exclusion (design.md, "Determinism scope of the pollable
+// arm"): programs that never park a pollable capability keep the full
+// guarantee, and the sweep deliberately does not drive that arm; foreign
+// (non-bubble) goroutines are scheduled around
 // the simulation RNG-free, so their wall-timed wakes change when harness
 // work runs, never which simulation decision comes next; a wall-blocked
 // granted raw write delays the run in wall time only.
+//
+// A further recorded bound: PRE-RUN-minted entropy. Values drawn before a
+// run starts and captured for in-run use — init-time map group placement,
+// init-time maphash.MakeSeed / math/rand values, a pre-run-populated
+// sync.Map — are stream-position-dependent host randomness, excluded from
+// the same-seed guarantee (design.md, the sources table's pre-run
+// qualifiers); the sweep carries no pre-run-state axis, deliberately, until
+// pre-run entropy is seed-pure (an axis added first would flake at the
+// probe-demonstrated ~8% divergence rate). Mint inside the run.
 package determinism

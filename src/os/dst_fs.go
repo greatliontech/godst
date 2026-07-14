@@ -1761,7 +1761,16 @@ func (d *dstFile) datasync() error {
 	}
 	defer d.leave()
 	if d.node.isDir {
-		return syscall.EINVAL
+		// fdatasync on a directory commits entry durability exactly as
+		// directory fsync does (host-verified: Linux fdatasync succeeds on a
+		// directory fd — the create/rename-then-fdatasync-the-directory
+		// durability idiom is production-legal). Directory entry writeback
+		// keeps the full-commit model on EIO, as in sync.
+		if err := d.diskEIO(); err != nil {
+			return err
+		}
+		d.node.commitLocked()
+		return nil
 	}
 	if d.node.isDevice() {
 		// fdatasync on a character device is EINVAL, as in sync

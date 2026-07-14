@@ -371,6 +371,14 @@ func TestDSTInheritFileRejectsForeignUse(t *testing.T) {
 	}
 }
 
+// TestDSTInheritFilePreservesNonblockingPollability pins that InheritFile
+// preserves the source fd's O_NONBLOCK, so a nonblocking source stays a
+// poller-registered capability with working deadlines. The pollable arm is
+// supported with an explicit determinism boundary (design.md, "Determinism
+// scope of the pollable arm"): same-seed transcript equality is not
+// guaranteed while a pollable capability deadline is armed — the wake rides
+// host readiness, not the seeded schedule. This pin uses an already-expired
+// deadline, which fails without ever parking on the poller.
 func TestDSTInheritFilePreservesNonblockingPollability(t *testing.T) {
 	var fds [2]int
 	if err := syscall.Pipe2(fds[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {

@@ -42,7 +42,7 @@ interning and the public API live in `testing/simulation`, so no Go string enter
 process 0 is the default — the test driver — so the N=1 program is host 0, process 0, unchanged.
 
 **API (explicit, declarative, dynamic).** `simulation.Host(name, HostConfig{...}, f)` establishes a host
-(its FS, hostname, IP, NumCPU, clock offset, zone); `simulation.Process(name, ..., f)` runs a process. A
+(its FS, hostname, deterministically assigned IP, NumCPU, clock offset, zone); `simulation.Process(name, ..., f)` runs a process. A
 `Process` declared inside a `Host` body is on that host; a `Process` outside any `Host` gets an
 **implicit dedicated host** (the 1:1 "one process per machine" case — the common distributed topology,
 zero-config). Both are callable **at any time**, not only at setup: since there is no `os/exec` under
@@ -58,12 +58,16 @@ process bound below): exceeding it panics loudly and state-neutrally, never sile
 declaration (`TestDSTHostTableExhaustionIsStateNeutral`).
 
 ```go
-simulation.Host("h1", simulation.HostConfig{IP: "10.0.0.1", NumCPU: 4, Clock: simulation.Skew(50*ms)}, func() {
+simulation.Host("h1", simulation.HostConfig{NumCPU: 4, Clock: simulation.Skew(50 * ms)}, func() {
     simulation.Process("p1", p1main)   // shares h1's FS, IP, port space, clock
     simulation.Process("p2", p2main)
 })
 simulation.Process("n3", n3main)       // implicit dedicated host
+h1IP := simulation.HostIP("h1")        // the deterministically assigned routable IP
 ```
+
+(The example is compile-checked by `TestDSTHostConfigDocExample` in
+`testing/simulation`, so it cannot drift from the landed API.)
 
 ### Per-host filesystem (process isolation by construction)
 
@@ -98,8 +102,10 @@ Addressing is per-host (`net/dst.go` — the registry keys are host-scoped; land
   `p1` on `h1` dialing `localhost:80` reaches a listener on `h1`, never `h2`.
 - **Port space is per-host** — two processes on `h1` cannot both bind `:80` (`EADDRINUSE`); the same port
   on `h2` is independent. The registry keys by `(hostId, addr)`.
-- **Each host has a routable IP** (`HostConfig.IP`, or deterministically assigned like ephemeral ports
-  are now), so a process on `h2` dials `h1`'s service by `h1`'s IP:port. Hosts form an **implicit full
+- **Each host has a routable IP** — deterministically assigned (`10.0.0.<id>`, like ephemeral ports)
+  and queried by `simulation.HostIP(name)`; there is no per-host IP configuration knob (the
+  assignment-only contract: a configured IP would have to validate against the deterministic scheme
+  it duplicates), so a process on `h2` dials `h1`'s service by `simulation.HostIP("h1")`+port. Hosts form an **implicit full
   mesh** — every host's IP:port is dialable; "connecting" is ordinary `net.Listen`/`net.Dial`, unmodified
   code. There is **no "virtual switch"**: the network topology is the full mesh *minus active partition
   faults*, plus a base-latency matrix (fault section). A switch object would re-express, with extra
@@ -530,15 +536,19 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   not reproduce ACK-starvation (a real sender stalls and eventually `ETIMEDOUT`s when its ACKs travel the
   cut direction). This is a *completeness* limit (the sim MISSES a real fault — the safe, ⊆-real
   direction), never a false failure; ACK-level reverse death is a possible finer-grained follow-on.
-- **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns.
+- **Connection reset** — inject a connection reset (an RST, surfacing as the one-shot `ECONNRESET`)
+  on a process's or a host-pair's conns.
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
   `ResetProcess(p)` (process), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
   host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). An injected reset hits **both
   ends**, and each end receives it as a real kernel delivers an RST (both ends are SURVIVORS — these
   faults reset connections, not processes): bytes already **delivered** to that end's receive queue
-  drain first — tcp_recvmsg reports pending data before the socket error, host-probed — then reads
-  fail `ECONNRESET`; writes fail immediately with the pending error; bytes still **in flight** toward
+  drain first — tcp_recvmsg reports pending data before the socket error, host-probed — then the
+  first failing op reports `ECONNRESET` and later ops carry the CLOSED-socket identities (the
+  kernel's one-shot `sk_err`: later reads `io.EOF`, later writes `EPIPE`; an RST arriving after the
+  peer's FIN was delivered takes the `CLOSE_WAIT` arm — `EPIPE`/EOF throughout, no `ECONNRESET` —
+  see design.md's FIN/RST paragraph); writes fail immediately with the pending error; bytes still **in flight** toward
   either end are destroyed (the RST beat them to the socket — one of the orderings a real injection
   race produces, so executions stay ⊆-real), and the receive queue is FROZEN at the RST instant —
   a segment sent toward it afterward is never delivered (a CLOSED socket answers a late segment
@@ -548,7 +558,7 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   accept backlog takes the same survivor shape — the accept queue holds only ESTABLISHED children
   (a receive queue exists and may already hold the dialer's bytes), and the kernel does not unlink an
   RST-aborted child from the queue: a later `accept(2)` hands it out, its reads drain the delivered
-  bytes, then fail `ECONNRESET` (host-probed, with and without pre-accept data). *Enforced:*
+  bytes, then the one-shot `ECONNRESET` (host-probed, with and without pre-accept data). *Enforced:*
   `TestDSTNetResetBacklogAcceptHandsOutResetChild`, `TestDSTNetResetBacklogDrainsPreAcceptBytes`.
   A dial still blocked mid-establishment aborts promptly with `ECONNREFUSED` — the dialer's socket is
   in SYN_SENT, and `tcp_reset` maps an RST received in SYN_SENT to `ECONNREFUSED` (the
@@ -645,7 +655,21 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   (a refusal that grew the file would break the capacity invariant with no path to recover the
   budget; `TestDSTDiskENOSPCRefusedWriteDoesNotGrow`, `TestDSTFSZeroLengthWriteNoEffect`). Per-host victim isolation, frees,
   partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` (`os/dst_disk_fault_test.go`),
-  mutation-tested.
+  mutation-tested. **Recorded modeling boundary — logical bytes, not allocated blocks (sparse
+  files).** The cap counts a file's LOGICAL content length; a real filesystem charges allocated
+  blocks, and a hole allocates nothing (host: a sparse `Truncate`-grow shows `size=N blocks=0`).
+  Probe-verified consequences, both directions: (a) a sparse truncate-grow's hole bytes COUNT
+  against the cap, so the classic WAL/journal sparse-preallocation pattern can hit `ENOSPC` here
+  where a real disk at the same quota has all blocks free (a false-positive window); (b) a write
+  INTO a hole is a no-growth overwrite and is never charged, so filling preallocated holes
+  succeeds where a really-full disk would `ENOSPC` on block allocation (the paired false-negative
+  window); and (c) truncate GROWTH is charged to usage but not itself checked against the cap —
+  the disk silently enters the over-quota state, after which growth and creates fail until enough
+  is freed. Closing the window needs allocation-granular (extent/hole-aware) accounting — charge
+  on materialization, check truncate growth — a capacity-model rebuild, not an accounting-formula
+  tweak; until then LimitDisk models a full disk faithfully for densely-written files only, and a
+  SUT whose durability discipline relies on sparse preallocation is outside the fault's honest
+  surface.
 - **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set
   mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
   sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op
@@ -862,7 +886,8 @@ the connections the victim still holds open. The victim's own ends reset outrigh
 queues died with the process or kernel. The surviving peer's end receives the RST
 kernel-faithfully: bytes already **delivered** to the survivor's receive queue drain first (an
 incoming RST cannot destroy what the survivor's kernel already holds — tcp_recvmsg reports pending
-data before the socket error, host-probed), then its reads fail `ECONNRESET`; bytes still **in
+data before the socket error, host-probed), then its first failing op reports `ECONNRESET` (the
+one-shot `sk_err`; later reads `io.EOF`, later writes `EPIPE`); bytes still **in
 flight** die with the crashed sender (its kernel's send buffer and its emissions never complete —
 in the simulation's one-queue wire model every undelivered byte is destroyable in some real
 execution, so the collapse stays ⊆-real).
@@ -886,10 +911,11 @@ ends (the kernel close()s a dying process's sockets) with the kernel's own condi
 whose receive queue holds unread data answers the peer with RST: the peer still DRAINS bytes already
 delivered to it, and bytes the dying process wrote before exiting (they travel ahead of the RST on the
 in-order link, and tcp_recvmsg reports pending data before the socket error — host-probed), and only
-then do its reads fail ECONNRESET (`TestDSTProcessExitResetDeliversPreExitBytesThenResets`); otherwise
+then does its first read fail ECONNRESET (one-shot, as everywhere:
+`TestDSTProcessExitResetDeliversPreExitBytesThenResets`); otherwise
 the close FINs and the peer drains buffered bytes then reads EOF — while crash RESETS the still-open
 ends unconditionally (a recorded collapse: exit's per-end RST-vs-FIN conditional is not applied at a
-crash, every surviving peer of a still-open end gets `ECONNRESET`), with the survivor draining its
+crash, every surviving peer of a still-open end gets the reset), with the survivor draining its
 delivered bytes first and in-flight bytes dying, per the crash-RST contract above; exit and crash
 also differ in the in-flight bytes themselves (exit's close lets pre-exit writes travel ahead of the
 RST; a crash destroys them) — and both close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process

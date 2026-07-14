@@ -51,6 +51,45 @@ func TestDSTWirePopRemainNothingLeft(t *testing.T) {
 	}
 }
 
+// TestDSTWireFreezeAtHorizonFINArrival pins freezeAtHorizon's CLOSE_WAIT
+// discriminant, both directions and each conjunct: the FIN counts as ARRIVED
+// (finArrived=true — tcp_reset's CLOSE_WAIT arm, EPIPE identity) only when
+// the stream is closed, closeAt is within the horizon, AND no segment was
+// dropped (in order, a FIN cannot overtake data — a jitter draw can invert
+// closeAt below an undelivered segment's deliverAt, and that FIN is still
+// behind the data on the wire). Manipulates the stream directly so each
+// conjunct is pinned free of scheduler timing.
+func TestDSTWireFreezeAtHorizonFINArrival(t *testing.T) {
+	cases := []struct {
+		name    string
+		closed  bool
+		closeAt int64
+		segs    []dstSeg
+		horizon int64
+		want    bool
+	}{
+		{"fin-arrived-empty", true, 5, nil, 10, true},
+		{"fin-arrived-behind-delivered-data", true, 6, []dstSeg{{data: []byte("aa"), deliverAt: 5}}, 10, true},
+		{"fin-at-horizon-boundary", true, 10, nil, 10, true},                                           // closeAt == horizon is delivered (pop's inclusive rule)
+		{"data-at-horizon-boundary", true, 10, []dstSeg{{data: []byte("a"), deliverAt: 10}}, 10, true}, // deliverAt == horizon is delivered too (the live-scan's inclusive rule)
+		{"no-close", false, 0, nil, 10, false},
+		{"fin-in-flight", true, 11, nil, 10, false},                                                        // the RST beat the FIN: ESTABLISHED arm
+		{"fin-behind-undelivered-data", true, 5, []dstSeg{{data: []byte("aa"), deliverAt: 15}}, 10, false}, // jitter-inverted closeAt: the FIN is still behind the data
+	}
+	for _, tc := range cases {
+		s := newDstStream(0)
+		s.closed = tc.closed
+		s.closeAt = tc.closeAt
+		s.segs = append([]dstSeg(nil), tc.segs...)
+		for _, seg := range tc.segs {
+			s.buffered += int64(len(seg.data))
+		}
+		if got := s.freezeAtHorizon(tc.horizon); got != tc.want {
+			t.Errorf("%s: freezeAtHorizon(%d) finArrived = %v, want %v", tc.name, tc.horizon, got, tc.want)
+		}
+	}
+}
+
 // TestDSTTransmitNanosOverflowSafe pins the throttle transmit-time arithmetic against a
 // math/big oracle, including the two int64-overflow regimes the guard exists for: a
 // giant push (nbytes*1e9 wraps, split off via q) and a very high bandwidth (r*1e9 wraps,

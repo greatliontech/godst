@@ -90,6 +90,13 @@ func HealFile(host, path string) {
 // current usage is allowed (the disk is over quota: growth and creates fail until
 // enough is freed). bytes must be >= 0. UnlimitDisk removes the cap. Call from within
 // a Run.
+//
+// Recorded modeling boundary (docs/dst/faults.md, ENOSPC): the accounting is
+// LOGICAL bytes, not allocated blocks, so sparse files diverge from a real
+// disk in both directions — a sparse Truncate-grow's hole counts against the
+// cap (a real hole allocates nothing), writes filling a hole are never
+// charged, and truncate growth is charged but not itself ENOSPC-checked. A
+// SUT relying on sparse preallocation is outside this fault's honest surface.
 func LimitDisk(host string, bytes int64) {
 	withBubbleFaultCaller("LimitDisk", func() {
 		if bytes < 0 {

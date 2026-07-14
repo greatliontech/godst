@@ -18,8 +18,10 @@ import (
 // or a process (all conns that process owns either end of) — and tears each
 // end down KERNEL-FAITHFULLY (faults.md "Connection reset"): a SURVIVING end
 // receives the RST as a real kernel would deliver it — bytes already in its
-// receive queue drain first, then reads fail ECONNRESET; writes fail at once;
-// bytes still in flight toward it die (dstInjectReset). A DEAD end (its
+// receive queue drain first, then the first failing op reports ECONNRESET
+// (one-shot sk_err; later reads EOF, later writes EPIPE — consumeSkErr);
+// writes fail at once; bytes still in flight toward it die (dstInjectReset).
+// A DEAD end (its
 // process or host crashed) is torn down outright via resetConn — its receive
 // queue died with it and nothing will read it again. Matching is by the
 // connection's host/process attribution (dstConn.localHost/remoteHost/
@@ -30,7 +32,7 @@ import (
 // and deregistered on Close/reset. Keyed off the run epoch (dstNetEpoch) so it
 // resets each run. Both ends of a connection are registered, each as its own
 // dstConn. resetConn tears down the END it is called on — that end's transport
-// closes; the shared reset flag only maps the peer's eventual EOF to ECONNRESET
+// closes; the shared reset flag only maps the peer's eventual EOF to the reset
 // identity, it does NOT close the peer's transport, so a peer whose own dstConn
 // is not torn down still DRAINS queued bytes before seeing the error. That
 // drain is the kernel-real shape for an RST's RECEIVER (tcp_recvmsg reports
@@ -211,7 +213,7 @@ func dstResetMatching(match func(*dstConn) bool) {
 
 // dstInjectReset delivers a fault-injected RST to conn end c, the
 // kernel-faithful receiver teardown: already-delivered bytes drain to the
-// stable ECONNRESET identity (shared reset flag maps the post-drain failure),
+// one-shot ECONNRESET identity (shared reset flag maps the post-drain failure),
 // in-flight bytes die, writes fail immediately (dstWireEnd.injectRST), and
 // the registration is released as production releases the tuple when the RST
 // moves the socket to CLOSED. A server end still QUEUED in the accept
@@ -219,7 +221,7 @@ func dstResetMatching(match func(*dstConn) bool) {
 // ESTABLISHED children (the SYN queue is upstream of Dial's return), so the
 // dialer may already have written into its receive queue, and the kernel
 // does not unlink an RST-aborted child from the queue — accept(2) hands it
-// out and its reads drain the delivered bytes before failing ECONNRESET
+// out and its reads drain the delivered bytes before the one-shot ECONNRESET
 // (host-probed, with and without pre-accept data). acceptState deliberately
 // stays 0 so Accept's 0→1 claim succeeds — the handout IS the production
 // shape; only the listener-close teardown claims 0→2 (a closed listener can
@@ -321,7 +323,8 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 // again. Each SURVIVING peer end receives the injected RST kernel-faithfully
 // (dstInjectReset): bytes already delivered to the survivor's receive queue
 // drain first — an incoming RST cannot destroy what the survivor's kernel
-// already holds — then reads fail ECONNRESET; bytes still in flight died
+// already holds — then the first read fails ECONNRESET (one-shot sk_err);
+// bytes still in flight died
 // with the crashed sender. Tearing the survivor's end down outright instead
 // would destroy delivered bytes (an execution no real kernel produces), and
 // tearing down ONLY the victim's end would present at the peer as a graceful
@@ -482,7 +485,7 @@ func dstConnPeer(c *dstConn) *dstConn {
 // closing travel ahead of its RST on the in-order link, so they drain too.
 // The emitter's transport close ends the byte stream (the peer drains, sees
 // EOF, and the SHARED reset flag stored by resetConn maps that EOF — and its
-// failed writes — to the stable ECONNRESET identity); deregistering the peer
+// failed writes — to the one-shot ECONNRESET identity); deregistering the peer
 // now mirrors production releasing the tuple when the RST moves the socket to
 // CLOSED, before any close(2). The fault-injection matchers follow the same
 // tcp_recvmsg rule through dstInjectReset — a survivor always drains its

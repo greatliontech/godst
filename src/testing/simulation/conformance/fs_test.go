@@ -700,14 +700,6 @@ func fsAllowlist() []allowEntry {
 			},
 		},
 		{
-			key:  "fs-fdatasync-dir",
-			cite: `design.md §In-memory deterministic filesystem (durability): "Fdatasync on a simulated directory is a deterministic EINVAL; directory entry durability is through Fsync"`,
-			match: func(o op, host, sim outcome) bool {
-				return strings.HasPrefix(o.name, "fdatasync-dir(") &&
-					host.Err == "" && sim.Err == "errno:EINVAL"
-			},
-		},
-		{
 			key:        "fs-perm-not-enforced",
 			cite:       `design.md §In-memory deterministic filesystem: "Permission bits are stored and reported but not enforced in the base model (no simulated credential checks)"`,
 			applicable: func() bool { return os.Geteuid() != 0 },
@@ -1314,10 +1306,11 @@ func (g *fsGen) step() {
 		s := g.rng.IntN(len(g.slots))
 		if g.rng.IntN(2) == 0 {
 			g.add(fsSync(s))
-		} else if !g.slots[s].isDir {
-			// Random fdatasync stays off directories: the recorded
-			// divergence fires from the coverage ladder, keeping random
-			// allowlist hits shape-checked there.
+		} else if g.slots[s].isDir {
+			// Directory fdatasync succeeds on both legs (it commits entry
+			// durability exactly as directory fsync does — host-verified).
+			g.add(fsFdatasync("fdatasync-dir", s))
+		} else {
 			g.add(fsFdatasync("fdatasync-file", s))
 		}
 	default: // chtimes + mtime read-back

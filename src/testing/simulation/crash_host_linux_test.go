@@ -118,6 +118,83 @@ func TestDSTCrashHostRestoresDurableImage(t *testing.T) {
 	}
 }
 
+// TestDSTCrashHostFdatasyncDirCommitsEntries: fdatasync on a DIRECTORY fd
+// commits entry durability exactly as directory fsync does (host-verified:
+// Linux fdatasync succeeds on a directory), so the crash-safety idiom
+// "create/rename, then fdatasync the directory" survives power loss. The
+// control file whose directory was never synced loses its name — the commit
+// is fdatasync's doing, not a side effect of the file's own sync.
+func TestDSTCrashHostFdatasyncDirCommitsEntries(t *testing.T) {
+	var committedErr, controlErr error
+	var committedData string
+	Test(t, 1, func(t *testing.T) {
+		Host("h", HostConfig{}, func() {
+			go Process("db", func() {
+				if err := os.Mkdir("/wal", 0o755); err != nil {
+					t.Errorf("mkdir /wal: %v", err)
+					return
+				}
+				syncDir(t, "/") // /wal's entry is durable in the root
+
+				// The idiom under test: create+rename, fsync the file,
+				// FDATASYNC the directory.
+				f, err := os.Create("/wal/seg0.tmp")
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				f.Write([]byte("record"))
+				f.Sync()
+				f.Close()
+				if err := os.Rename("/wal/seg0.tmp", "/wal/seg0"); err != nil {
+					t.Errorf("rename: %v", err)
+					return
+				}
+				d, err := os.Open("/wal")
+				if err != nil {
+					t.Errorf("open /wal: %v", err)
+					return
+				}
+				if err := syscall.Fdatasync(int(d.Fd())); err != nil {
+					t.Errorf("fdatasync(/wal) = %v, want success (Linux fdatasync succeeds on a directory)", err)
+				}
+				d.Close()
+
+				// Control: data synced, directory never synced — the name
+				// must NOT survive (fdatasync above is the only committer).
+				g, err := os.Create("/wal/control.tmp")
+				if err != nil {
+					t.Errorf("create control: %v", err)
+					return
+				}
+				g.Write([]byte("bytes"))
+				g.Sync()
+				g.Close()
+				select {} // stay alive until the machine dies
+			})
+			for range 30 {
+				runtime.Gosched()
+			}
+		})
+
+		CrashHost("h")
+
+		Host("h", HostConfig{}, func() {
+			Process("db", func() {
+				b, err := os.ReadFile("/wal/seg0")
+				committedErr, committedData = err, string(b)
+				_, controlErr = os.Stat("/wal/control.tmp")
+			})
+		})
+	})
+	if committedErr != nil || committedData != "record" {
+		t.Fatalf("rename+fdatasync(dir) after reboot = %q, %v; want %q, nil (directory fdatasync commits entries)", committedData, committedErr, "record")
+	}
+	if !errors.Is(controlErr, os.ErrNotExist) {
+		t.Fatalf("unsynced-directory entry after reboot = %v, want not-exist (only fdatasync committed)", controlErr)
+	}
+}
+
 // TestDSTCrashHostPreservesMkfsImage: the initial tree a run boots with
 // (root and /tmp) is durable from birth — the mkfs image is on the platter,
 // so a host crash preserves /tmp, and fsync-disciplined state under it

@@ -339,6 +339,13 @@ type dstWireEnd struct {
 	rstOnce    sync.Once
 	rstKill    chan struct{}
 
+	// rstCloseWait records that the injected RST arrived with the peer's FIN
+	// already delivered — production CLOSE_WAIT, where tcp_reset pends EPIPE
+	// instead of ECONNRESET (host-probed: post-RST reads are plain EOF and
+	// writes EPIPE, with no ECONNRESET arm). Written once inside rstOnce;
+	// consumed by the dstConn wrapper's consumeSkErr.
+	rstCloseWait atomic.Bool
+
 	once       sync.Once
 	localDone  chan struct{}
 	remoteDone chan struct{} // the peer's localDone
@@ -464,7 +471,9 @@ func (e *dstWireEnd) horizonCheck() {
 // tcp_recvmsg reports pending data before the error, so bytes already
 // DELIVERED to this end's receive queue stay readable and drain first;
 // only then do reads fail (the dstConn wrapper maps the failure and the
-// drained-EOF to the stable ECONNRESET identity via the shared reset flag).
+// drained-EOF through the shared reset flag to the one-shot sk_err identity —
+// first failing op ECONNRESET, later reads EOF, later writes EPIPE; an RST
+// arriving after the peer's FIN takes the CLOSE_WAIT arm, rstCloseWait).
 // Writes fail immediately (the socket error is already pending). Bytes
 // still IN FLIGHT toward this end are destroyed: the RST reached the socket
 // before they did — one of the orderings a real injection race produces —
@@ -481,7 +490,11 @@ func (e *dstWireEnd) injectRST() {
 		if cutStart, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cutStart-1 < horizon {
 			horizon = cutStart - 1
 		}
-		e.in.freezeAtHorizon(horizon)
+		if e.in.freezeAtHorizon(horizon) {
+			// The peer's FIN (and everything ahead of it) had already arrived:
+			// the RST met a CLOSE_WAIT socket (tcp_reset pends EPIPE there).
+			e.rstCloseWait.Store(true)
+		}
 		e.rstArrived.Store(true)
 		close(e.rstKill)
 	})
@@ -501,7 +514,10 @@ func (e *dstWireEnd) injectRST() {
 // its predecessors — exactly pop's delivery rule), so the scan stops at the
 // first undelivered segment and the whole remainder dies. The dropped
 // suffix is cleared so the backing array does not retain the dead buffers.
-func (s *dstStream) freezeAtHorizon(horizon int64) {
+// Reports whether the writer's FIN had ARRIVED at the horizon — closed with
+// closeAt within the horizon and no segment dropped (in order, a FIN cannot
+// overtake data): the RST-met-CLOSE_WAIT discriminant.
+func (s *dstStream) freezeAtHorizon(horizon int64) (finArrived bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.frozen = true
@@ -509,6 +525,7 @@ func (s *dstStream) freezeAtHorizon(horizon int64) {
 	for live < len(s.segs) && s.segs[live].deliverAt <= horizon {
 		live++
 	}
+	finArrived = s.closed && s.closeAt <= horizon && live == len(s.segs)
 	for i := live; i < len(s.segs); i++ {
 		s.buffered -= int64(len(s.segs[i].data))
 		s.segs[i] = dstSeg{}
@@ -517,6 +534,7 @@ func (s *dstStream) freezeAtHorizon(horizon int64) {
 	if len(s.segs) == 0 {
 		s.segs = nil
 	}
+	return finArrived
 }
 
 // unreadInbound reports whether this end's receive direction still holds bytes
@@ -598,8 +616,8 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		// bytes above drained first (injectRST truncated everything else), and
 		// only then does the socket error surface — before any FIN wait, since
 		// the RST supersedes a still-traveling graceful close. The dstConn
-		// wrapper maps ErrClosedPipe to ECONNRESET (the shared reset flag holds
-		// the identity for the drained-EOF path too).
+		// wrapper maps ErrClosedPipe through the one-shot sk_err (consumeSkErr;
+		// the shared reset flag routes the drained-EOF path there too).
 		if e.rstArrived.Load() {
 			return 0, io.ErrClosedPipe
 		}
@@ -680,7 +698,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	case e.rstArrived.Load():
 		// An injected RST already landed: the socket error is pending and a
 		// send fails with it immediately (no drain applies to writes). The
-		// dstConn wrapper maps ErrClosedPipe to ECONNRESET.
+		// dstConn wrapper maps ErrClosedPipe through the one-shot sk_err.
 		return 0, io.ErrClosedPipe
 	case isClosedChan(e.localDone):
 		return 0, io.ErrClosedPipe

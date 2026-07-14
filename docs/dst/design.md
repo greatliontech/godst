@@ -415,14 +415,21 @@ it never wraps a positive delay into an earlier delivery.
   read deadline fires first; partitions hold a not-yet-arrived FIN like data. The intended write side: the **first
   write after the peer's full close succeeds locally** (the FIN closed the peer's send direction; the
   write is accepted into the send buffer and elicits the peer's RST); the reset then errors
-  **subsequent** operations with `ECONNRESET` — matching the RST round trip of a real stack, rather
+  **subsequent** operations — matching the RST round trip of a real stack, rather
   than failing the first write instantly (which no kernel does). **Today the first write after a peer
   close fails instantly with `ECONNRESET`** (the wire rejects a write whose peer end is gone); the
-  succeed-then-RST round trip is the follow-on's work. One recorded simplification of the target
-  shape: real stacks report the reset *once* (`SO_ERROR` consumed) and surface `EPIPE`/EOF on later
-  ops; the simulation keeps the stable `ECONNRESET` identity on every subsequent op so reset-handling
-  paths keying on it never miss — a SUT distinguishing `EPIPE` from `ECONNRESET` post-reset is
-  outside the model (recorded, not hidden).
+  succeed-then-RST round trip is the follow-on's work. **Post-reset op identity is the kernel's
+  one-shot `sk_err`** (host-probed ladder): the FIRST failing op on a reset connection — read or
+  write, after any receive-queue drain — consumes the pending error and reports `ECONNRESET`;
+  every later read returns `io.EOF` and every later write `EPIPE` (Go suppresses `SIGPIPE` on
+  sockets, so `EPIPE` is the returned errno), the CLOSED-socket identities. An RST that arrives
+  after the peer's FIN was already delivered (production `CLOSE_WAIT`) pends `EPIPE`, not
+  `ECONNRESET` (`tcp_reset`'s `CLOSE_WAIT` arm) — and since an `EPIPE` consumption is
+  indistinguishable from the post-consumption identities, that arm reads EOF and writes `EPIPE`
+  throughout, with no `ECONNRESET` ever reported (host-probed). The instant-fail first write after
+  a peer's graceful close mints the same one-shot: its `ECONNRESET` is the recorded divergence
+  above, and its follow-up writes carry the kernel's post-reset `EPIPE` — matching the host from
+  the second write on, once the first write's elicited RST has reached the host socket.
 
 `DialContext` keeps the public context contract (nil panics,
 canceled/deadline contexts error), `Dialer.LocalAddr` chooses the simulated local TCP address when set —
@@ -497,11 +504,13 @@ conditional; bytes still in flight toward the closer count as queued for that de
 recorded collapse: the sim RSTs immediately, one of the two orderings the real close-vs-arrival
 race produces, `TestDSTNetCloseBeforeDeliveryStillResets`). The RST's RECEIVER still drains bytes
 already delivered to it — and bytes the closer wrote before closing, which travel ahead of the RST
-on the in-order link — before its reads fail `ECONNRESET`, exactly as tcp_recvmsg reports pending
+on the in-order link — before its first failing read reports `ECONNRESET` (the one-shot `sk_err`;
+later reads `io.EOF`), exactly as tcp_recvmsg reports pending
 data before the socket error (host-probed; the same drain rule the retransmit-horizon death
 follows; `TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — writes after a peer's
-close follow the FIN/RST shape above (first accepted, subsequent `ECONNRESET`), and any operation on
-a reset connection carries `ECONNRESET`; deadline failures are `*net.OpError` wrapping
+close follow the FIN/RST shape above (today: first write `ECONNRESET`, later writes `EPIPE`), and a
+reset connection carries the one-shot `sk_err` identity (first failing op `ECONNRESET`, then reads
+`io.EOF` and writes `EPIPE` — see the FIN/RST paragraph); deadline failures are `*net.OpError` wrapping
 `os.ErrDeadlineExceeded` (a timeout `net.Error`) on the connection's network and addresses, driven by
 the bubble's virtual clock. A FULL accept backlog (128 pending connections) drops the dial's SYN, as
 `tcp_abort_on_overflow=0` does: the dial blocks (the retransmitted SYNs), connects if a slot frees
@@ -510,7 +519,8 @@ saturated listener fails in bounded virtual time, never a permanent sim-only han
 (`TestDSTNetBacklogFullDialTimesOut`; the horizon arms after the SYN traversal, so the bound is
 ½RTT + horizon — never earlier than a kernel's connect()-anchored timer). Closing a listener
 resets the connections still in its accept backlog (production's RST), so a dialer that already
-succeeded observes `ECONNRESET` instead of blocking durably forever, and `Accept` after `Close`
+succeeded observes `ECONNRESET` (the one-shot, on its first failing op) instead of blocking durably
+forever, and `Accept` after `Close`
 always fails with `net.ErrClosed` — including an `Accept` already blocked in its select when
 `Close` runs: the overlap linearizes to close-first (the pending
 accept unblocks with `net.ErrClosed` and its would-be connection is reset with the backlog, as
@@ -637,8 +647,10 @@ regular file's content and size durably; Linux virtual-fd `syscall.Fdatasync` is
 regular-file barrier, and currently commits the same gmdb-relevant durable image. A file's *name*
 becoming durable is a property of its **parent directory** (POSIX: data durability and entry durability
 are separate — fsync the file, fsync the directory), committed by syncing an open handle on the
-directory (`File.Sync` or Linux virtual-fd `syscall.Fsync`). `Fdatasync` on a simulated directory is a
-deterministic `EINVAL`; directory entry durability is through `Fsync`. `Rename` is atomic in the namespace
+directory (`File.Sync`, Linux virtual-fd `syscall.Fsync`, or Linux virtual-fd `syscall.Fdatasync` —
+host-verified: Linux `fdatasync` succeeds on a directory fd and commits its entries exactly as `fsync`
+does, so the create/rename-then-fdatasync-the-directory durability idiom works under simulation as in
+production). `Rename` is atomic in the namespace
 (observers see old or new, never neither/both); its durability rides the parent directories' sync state
 like any other entry change. Crash recovery may retain old and new aliases for one renamed inode, but
 rename containment is checked by node reachability, so no alias spelling can move a directory into itself
@@ -876,6 +888,23 @@ The inherited capability supports the typed operations represented by the file-b
 writes, positional reads/writes, seek, stat, sync, truncate, chmod, directory reads, deadlines,
 and close. Other `os.File` methods retain the simulated-file unsupported behavior. The capability is
 Linux-only until another operating system enforces the same no-numeric-authority boundary.
+**Determinism scope of the pollable arm (settled).** `InheritFile` preserves the source
+descriptor's `O_NONBLOCK`, so a nonblocking source becomes a POLLER-registered capability whose
+parked operations (a read against an empty pipe under a `SetDeadline`, an EAGAIN-park) wake off
+host timers and netpoll readiness — WALL instants by that mode's nature, not seeded schedule
+events. The pollable arm is supported, and its determinism boundary is explicit and
+one-directional: **same-seed transcript equality is NOT guaranteed while a pollable capability
+deadline (or EAGAIN-park) is armed** — the wake re-enters the seeded scheduler at a
+wall-time-dependent boundary, so the downstream pick order can differ across same-seed runs
+(probe-demonstrated on the deadline arm). Programs that never park a pollable capability keep the
+full same-seed guarantee: BLOCKING-mode capability I/O dispatches raw and scheduler-invisible
+(the serialization contract below — a granted write blocks in the syscall, never parks on the
+poller), and a pollable capability used without deadlines while data is available never parks.
+Capability reads/writes remain outbound, host-directed I/O either way — the exclusion is about
+WHEN the seeded schedule resumes, never about a value fed back into it. Making pollable wakes
+re-enter at seeded boundaries would be a virtual-poller integration; the recorded exclusion is
+the settled contract until such a mechanism is ever designed. (Recorded also in the determinism
+package's coverage bounds, `testing/simulation/determinism/doc.go`.)
 
 ### Deterministic pipes and the stdio stance (the third I/O feature)
 
@@ -1334,6 +1363,31 @@ re-root from the DST seed at `dstActivate`/bubble entry, not from the startup gl
 by `TestDSTMapHashKeyBuildInvariant` (a normal-`dst` and a `-race`-`dst` build iterate a 48-element map
 identically; reverting the key to `bootstrapRand` makes them diverge).
 
+**Recorded replay boundary — the hash FUNCTION, not just the key.** The key is build-invariant, but
+which hash function consumes it is CPU-feature-selected at startup (`aeshash` behind AES-NI, the
+generic `memhash` fallback otherwise), and the two produce different — each stable — multi-group
+(>8-element) map orders for the same key (probe-verified: `GODEBUG=cpu.aes=off` vs default diverge;
+cross-architecture replay diverges likewise). Same-machine, same-`GODEBUG` replay is unaffected;
+replaying a seed across machines with different CPU features (or across `GODEBUG=cpu.*` settings)
+does not reproduce multi-group map iteration order — a recorded boundary of the replay contract,
+not a same-seed escape.
+
+**Recorded boundary — pre-run-minted entropy is not seed-pure.** Draws made BEFORE a run
+(package `init`, `TestMain` outside `Run`) go through the fixed-seeded startup streams at whatever
+stream POSITION pre-run scheduling (GC, sysmon) has advanced them to — so any pre-run-minted value
+CAPTURED for in-run use is host-random, not a function of the DST seed (probe-demonstrated: a
+package-level map populated at init and ranged in-run produced two distinct same-seed iteration
+orders at ~8%; init-time `maphash.MakeSeed`, init-time `math/rand` values, and a pre-run-populated
+`sync.Map` shift together — the escape is per-map group-placement seeds and captured values; in-run
+map ITERATOR offsets draw from the per-g stream and are pure even over pre-run maps). The consumer
+rule is **mint inside the run**: create registry maps, `maphash` seeds, and random values within the
+`Run` body (or lazily on first in-run use), never at init. One adjacent knob is recorded rather than
+rejected: `GODEBUG=randautoseed=0` collapses v1 `math/rand` top-level values to seed-INDEPENDENT
+constants — reproducible, false-negative-direction only. The runtime rework making pre-run entropy
+seed-pure (position-independent pre-run draws) is not built; this boundary is the settled contract
+until it is, and the determinism sweep deliberately carries no pre-run-state axis meanwhile
+(`testing/simulation/determinism/doc.go`, coverage bounds).
+
 ## Top-tier contract (governing invariants)
 
 ### Soundness invariant (kind=entailed)
@@ -1397,9 +1451,10 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 |---|---|---|
 | Goroutine scheduling order | per-g RNG tree + single-P + sysmon neutralized + the get-side selection hook (Seq 5); system (non-bubble) goroutines isolated from the seeded RNG | ✅ |
 | `select` poll order | per-g `g.dstrand` | ✅ |
-| map iteration order (value-keyed) | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`); pointer-keyed maps are ⛔ — see the last row | ✅ |
-| `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
+| map iteration order (value-keyed) | per-g `g.dstrand` (`maps.rand`) + fixed process hash key (`-tags dst`) — for maps CREATED in-run; a map created PRE-run drew its group-placement seed at a scheduling-dependent stream position, so ranging it in-run is host-random (mint inside the run — see "Recorded boundary — pre-run-minted entropy"); in-run iterator offsets are per-g-pure even over pre-run maps; multi-group order is additionally CPU-feature-bound cross-machine (the hash-FUNCTION boundary); pointer-keyed maps are ⛔ — see the last row | ✅ |
+| `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream — for draws made IN-run; an init-time draw captured for in-run use is pre-run entropy (host-random, recorded boundary) | ✅ |
 | `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
+| `hash/maphash` (`MakeSeed`, `Hash`'s lazy seed) | draws through `runtime.rand` → per-g stream when minted IN-run; an init-time `MakeSeed` captured for in-run use is pre-run entropy (host-random, recorded boundary — mint inside the run) | ✅ |
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
 | `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | in-bubble the flip is measured on the waiter's own LOST-WAKEUP count, a pure function of the seeded schedule: a bubbled waiter that returns from semacquire without acquiring more than 64 times within one Lock call flips its mutex to starvation mode (`internal/sync` `lockSlow` + `dst_mutex_on.go`; the wall clock stays out of the schedule — its value was a demonstrated same-seed escape — and the fake clock cannot serve: mutex waits are non-durable, so fake time never passes mid-wait and a fake-clock flip would deterministically never fire, livelocking a production-legal SUT whose progress depends on the starvation handoff, undetectably). Sound in both directions: production flips after ANY wait >1ms, and N lost handoffs take >1ms of wall in some real execution, so a flipped in-sim execution is production-producible and an unflipped one is production below the threshold — the flip POINT differs from any given production run (starvation mode engages by contention depth, not elapsed wall), never the reachable behavior set. Liveness restored: a starvation-handoff-dependent SUT terminates in-sim (`TestMutexStarvationHandoffLiveness`); the wall clock stays out (`TestMutexStarvationHandoffDeterministic`); the count is same-seed stable (`TestMutexStarvationHandoffCountDeterministic`); programs whose waiters never cross the threshold are byte-identical to the prior barging-only determinization (the branch reads only waiter-local state). | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
@@ -1425,9 +1480,13 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 
 **Library randomness — seeded for free or needs a seam?** A dependency's randomness is covered with no
 patch iff it bottoms out in the `math/rand`/`math/rand/v2` **top-level** functions (`//go:linkname`'d to
-`runtime.rand`) or `crypto/rand` (routed through the `sysrand.Read` seam) — both draw from the per-g
-stream. It needs its own seam only if it holds a *private* `rand.New`/`NewSource`/`NewPCG` instance (or
-installs a non-default `crypto/rand.Reader`), which the runtime seed cannot reach. Find those with:
+`runtime.rand`), `hash/maphash`, or `crypto/rand` (routed through the `sysrand.Read` seam) — all draw
+from the per-g stream — AND the draw happens **inside the run**: a value the dependency mints at
+package init and caches for later use is pre-run entropy, host-random however it bottoms out (the
+recorded pre-run boundary above; the fix is minting inside the run or reseeding the cached state from
+an in-run draw). It needs its own seam if it holds a *private* `rand.New`/`NewSource`/`NewPCG`
+instance (or installs a non-default `crypto/rand.Reader`), which the runtime seed cannot reach. Find
+those with:
 `git grep -nE 'rand\.New\(|rand\.NewSource|rand\.NewPCG' -- '*.go' ':!*_test.go'`, then reseed the
 instance from a seeded source or inject it.
 

@@ -1082,14 +1082,14 @@ func TestDSTFSVirtualFDFsyncCommitsDirectoryEntries(t *testing.T) {
 			t.Fatalf("Open dir: %v", err)
 		}
 		defer dir.Close()
-		if err := syscall.Fdatasync(int(dir.Fd())); !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("Fdatasync dir = %v, want EINVAL", err)
-		}
-		if err := syscall.Fsync(int(dir.Fd())); err != nil {
-			t.Fatalf("Fsync dir: %v", err)
+		// Directory fdatasync commits entry durability exactly as directory
+		// fsync does (host-verified: Linux fdatasync succeeds on a directory
+		// fd — the create/rename-then-fdatasync-the-directory idiom).
+		if err := syscall.Fdatasync(int(dir.Fd())); err != nil {
+			t.Fatalf("Fdatasync dir = %v, want success (commits entries as Fsync does)", err)
 		}
 		if _, _, cur, synced, _, _, ok := os.DSTFSNodeState("/sync-dir"); !ok || len(cur) != 1 || cur[0] != "one" || len(synced) != 1 || synced[0] != "one" {
-			t.Fatalf("post-Fsync entries = %v/%v, ok=%v; want one/one", cur, synced, ok)
+			t.Fatalf("post-Fdatasync entries = %v/%v, ok=%v; want one/one", cur, synced, ok)
 		}
 		if err := os.Remove("/sync-dir/one"); err != nil {
 			t.Fatalf("Remove: %v", err)

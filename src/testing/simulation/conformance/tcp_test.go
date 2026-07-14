@@ -407,47 +407,44 @@ var hostCloseInFlightCanFIN = sync.OnceValue(func() bool {
 func tcpAllowlist() []allowEntry {
 	return []allowEntry{
 		{
-			key:        "net-close-in-flight-first-write",
-			cite:       `design.md §In-memory deterministic network: "a Close() of an end whose receive queue holds UNREAD data answers with RST instead of FIN (the kernel's close(2) conditional; bytes still in flight toward the closer count as queued for that decision — the recorded collapse: the sim RSTs immediately, one of the two orderings the real close-vs-arrival race produces)" — when the host's ordering runs the other way (close beats delivery), the host end FINs, so its peer's FIRST write is accepted where the sim's conn is already reset.`,
+			key:        "net-close-in-flight-fin-ordering",
+			cite:       `design.md §In-memory deterministic network: "a Close() of an end whose receive queue holds UNREAD data answers with RST instead of FIN (the kernel's close(2) conditional; bytes still in flight toward the closer count as queued for that decision — the recorded collapse: the sim RSTs immediately, one of the two orderings the real close-vs-arrival race produces)" — when the host's ordering runs the other way (close beats delivery), the host end FINs: its peer's writes are accepted until one elicits the RST and its reads see io.EOF, where the sim's conn is already reset (one-shot sk_err: ECONNRESET on the first failing op, then EOF/EPIPE, agreeing with the host again).`,
 			applicable: func() bool { return hostCloseInFlightCanFIN() },
 			match: func(o op, host, sim outcome) bool {
-				// Exactly the first write on a conn the generator model
-				// reset via close-with-in-flight: host accepted the full
-				// payload (its end saw a FIN), sim is already reset.
-				return strings.HasPrefix(o.name, "post-reset-write(") &&
-					host.Err == "" && host.N == o.writeSize &&
-					sim.Err == "OpError(write)/errno:ECONNRESET" && sim.N == 0
+				// The host-FIN-ordering window on a conn the generator model
+				// reset via close-with-in-flight. Write leg: the host accepts
+				// the payload (the RST-eliciting write) where the sim's reset
+				// conn refuses — ECONNRESET if this op consumes its one-shot
+				// sk_err, EPIPE if an earlier op already did. Read leg: the
+				// host reads the FIN's io.EOF where the sim's first failing
+				// read consumes ECONNRESET (later sim reads are io.EOF and
+				// agree exactly).
+				if strings.HasPrefix(o.name, "post-reset-write(") {
+					return host.Err == "" && host.N == o.writeSize &&
+						(sim.Err == "OpError(write)/errno:ECONNRESET" || sim.Err == "OpError(write)/errno:EPIPE") &&
+						sim.N == 0
+				}
+				if strings.HasPrefix(o.name, "post-reset-read(") {
+					return host.Err == "EOF" &&
+						sim.Err == "OpError(read)/errno:ECONNRESET" &&
+						host.N == sim.N
+				}
+				return false
 			},
 		},
 		{
 			key:  "net-first-write-after-fin",
 			cite: `design.md §In-memory deterministic network: "Today the first write after a peer close fails instantly with ECONNRESET (the wire rejects a write whose peer end is gone); the succeed-then-RST round trip is the follow-on's work."`,
 			match: func(o op, host, sim outcome) bool {
+				// Exactly the FIRST write after the peer's clean close: the
+				// host accepts it (the RST round trip is still in flight),
+				// the sim fails it instantly. From the second write on, both
+				// legs carry the kernel's one-shot post-reset identities
+				// (write EPIPE, read EOF) and must agree exactly — no
+				// allowlist entry exists for them.
 				return strings.HasPrefix(o.name, "write-after-peer-close#1(") &&
 					host.Err == "" &&
 					sim.Err == "OpError(write)/errno:ECONNRESET"
-			},
-		},
-		{
-			key:  "net-post-reset-identity",
-			cite: `design.md §In-memory deterministic network: "real stacks report the reset once (SO_ERROR consumed) and surface EPIPE/EOF on later ops; the simulation keeps the stable ECONNRESET identity on every subsequent op" (recorded simplification)`,
-			match: func(o op, host, sim outcome) bool {
-				// Everything after the reset carries the stable sim
-				// ECONNRESET; the host identity varies with the socket
-				// state the RST met (tcp_reset: CLOSE_WAIT → EPIPE, so
-				// a post-FIN write ladder sees EPIPE from write #2 on).
-				postReset := strings.HasPrefix(o.name, "post-reset-") ||
-					(strings.HasPrefix(o.name, "write-after-peer-close#") &&
-						!strings.HasPrefix(o.name, "write-after-peer-close#1("))
-				if !postReset {
-					return false
-				}
-				hostLegal := host.Err == "OpError(write)/errno:EPIPE" ||
-					host.Err == "OpError(write)/errno:ECONNRESET" ||
-					host.Err == "EOF" || host.Err == "OpError(read)/errno:ECONNRESET"
-				simReset := sim.Err == "OpError(write)/errno:ECONNRESET" ||
-					sim.Err == "OpError(read)/errno:ECONNRESET"
-				return hostLegal && simReset && host.N == sim.N
 			},
 		},
 	}
@@ -493,7 +490,9 @@ func tcpCoverageOps() []op {
 	add(tcpRead("read-eof", 0, 16, guardReady))
 	add(tcpRead("read-eof-again", 0, 16, 0)) // EOF is persistent state
 
-	// Post-FIN write ladder (the recorded follow-on gap).
+	// Post-FIN write ladder. Write #1 is the recorded follow-on gap (host
+	// accepts, sim fails instantly); from #2 on both legs carry the kernel's
+	// one-shot post-reset identities (write EPIPE, read EOF) exactly.
 	add(tcpWrite("write-after-peer-close#1", 0, pat(32, 55)))
 	add(tcpSettle(0, settleErr)) // the RST round trip
 	add(tcpWrite("write-after-peer-close#2", 0, pat(32, 56)))
@@ -507,16 +506,19 @@ func tcpCoverageOps() []op {
 	add(tcpSetReadDeadline(1, dlPast))
 	add(tcpCloseConn(0))
 
-	// RST ladder: close with unread receive data resets the peer.
+	// RST ladder: close with unread receive data resets the peer. The
+	// one-shot sk_err ladder is pinned end-to-end on both legs: first read
+	// ECONNRESET, later writes EPIPE, later reads persistently EOF.
 	add(tcpDial(0, true))                   // conn 2
 	add(tcpAccept(0, true))                 // conn 3
 	add(tcpWrite("write", 2, pat(500, 59))) // 3 never reads it
 	add(tcpSettle(3, settleData))           // the 500 bytes must be QUEUED at 3 for its close to RST
 	add(tcpCloseConn(3))                    // unread data: RST, not FIN
 	add(tcpSettle(2, settleErr))
-	add(tcpRead("read-after-rst", 2, 16, guardReady)) // ECONNRESET (2's receive queue is empty: nothing to drain before the error)
-	add(tcpWrite("post-reset-write", 2, pat(8, 60)))
-	add(tcpRead("post-reset-read", 2, 8, 0))
+	add(tcpRead("read-after-rst", 2, 16, guardReady)) // ECONNRESET, consuming sk_err (2's receive queue is empty: nothing to drain before the error)
+	add(tcpWrite("post-reset-write", 2, pat(8, 60)))  // EPIPE (sk_err consumed)
+	add(tcpRead("post-reset-read", 2, 8, 0))          // EOF (CLOSED-socket read)
+	add(tcpRead("post-reset-read", 2, 8, 0))          // EOF persists
 	add(tcpCloseConn(2))
 
 	// Accept FIFO order, pinned via a tag byte per dialer.
