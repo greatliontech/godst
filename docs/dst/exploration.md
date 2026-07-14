@@ -149,10 +149,109 @@ Single-tier: GOMAXPROCS=1 is the only tier; no distributed/clustered collapse ap
   seeded selection that draws from a load-dependent source (per-m RNG, or a global the system
   goroutines advance) makes the interleaving vary run-to-run, breaking replay. *Encoding:* the
   determinism probe (1 distinct over N same-seed runs), mutation-tested.
+- **DST-SCHED-3 (entailed: observation neutrality).** Enabling the seeded-decision trace (below)
+  leaves the run's schedule byte-identical. *violation:* a diagnostic that perturbs the schedule —
+  by drawing from a seeded stream, allocating into the deterministic GC trigger, or reordering a
+  decision — reports distributions for a run nobody executes, and a failure diagnosed with it does
+  not reproduce without it. *Encoding:* regression test (`TestSchedTraceNeutrality`: transcript
+  equality trace-off vs trace-on, Random and PCT), mutation-tested.
+- **DST-SCHED-4 (entailed: seed entropy reaches every seeded choice site).** Each seeded
+  schedule-bearing site — the scheduler pick, select poll order, the fake-timer tie-break — varies
+  its choice across seeds whenever the candidate set is multi-element. *violation:* a site whose
+  pick is a point mass regardless of seed — or whose seeded stream is frozen so every seed draws
+  the identical sequence — means N seeds explore fewer than N schedules while claiming otherwise:
+  an ordering bug behind the never-taken choice is invisible at every seed — the silent
+  false-negative class. *Encoding:* regression tests, mutation-tested. `TestSeededScheduleDiversity`
+  pins the per-g stream sites (select, timer): CROSS-SEED stream variation via an order-independent
+  draw fold — immune to schedule-order (though not draw-count) noise masking a frozen stream, which
+  holds because the sweep program's per-goroutine draw counts are schedule-independent — plus a
+  per-site multi-candidate choice-variation floor, a degenerate hot-spot floor, and a
+  distinct-schedule floor over a seed sweep. The frozen SCHEDULER stream is pinned by
+  `TestDSTScheduleDiversity` (runtime), whose select/timer-free scenarios derive their interleaving
+  from the scheduling RNG alone, so freezing it collapses every scenario to one seed-invariant
+  interleaving.
 
 Seed-*variation* (different seeds → different interleavings) is the feature 5a delivers, asserted by a
 diversity test; it is a completeness gain, not a safety invariant (a seed-invariant schedule is sound,
 just incomplete).
+
+### Measured seeded-path diversity (and the consumer-default question)
+
+A consumer (protodb) witnessed a seed-basin resonance: an election-livelock-class wedge reproducing
+at one seed while adjacent seeds passed the identical code. The suspicion that raises about the
+plain seeded (Random) path — the path consumers actually run — is decision-distribution collapse:
+hot spots where the choice is near-deterministic regardless of seed, so N seeds explore far fewer
+than N meaningfully-distinct schedules. Measured, not assumed, with the runtime's seeded-decision
+trace (below) over two programs: the determinism sweep's composed program (two hosts, TCP
+request/reply under cross-host latency, filesystem durability points, timers/tickers,
+channel/select races, seeded maps and RNG draws) and an election-shaped program built to the
+witnessed resonance shape (five candidates racing millisecond-granular randomized timeouts for
+eight terms, losers backing off and retrying). 256 seeds each:
+
+| measure | composed sweep | election shape |
+|---|---|---|
+| distinct schedules (whole-run fingerprints) | 256/256 | 256/256 |
+| distinct program outcomes | 256/256 | 254/256 (winner sequences, timestamps stripped) |
+| schedule prefixes distinct after 2 / 4 / 8 / 16 decisions | 1 / 11 / 253 / 256 | 5 / 59 / 252 / 256 |
+| scheduler decisions per run (mean) | 77 | 113 |
+| infrastructure picks (RNG-free pacing) | 38.5% | 62.6% |
+| forced scheduler decisions (candidate set = 1) | 42.2% | **82.6%** |
+| worst per-site entropy deficit, all sites/sizes | 2.963/3.000 bits (≥8-way bucket) | 2.994/3.000 bits |
+| max single-pick share on any multi-candidate row | 0.503 (2-way; uniform is 0.5) | 0.506 |
+
+Findings:
+
+- **No degeneracy.** Per-site chosen-index entropy sits at the uniform bound at every site and
+  every candidate-set size; no multi-candidate row concentrates on one pick (the trace's histogram
+  cap makes the ≥8-way bucket's small deficit a bucketing artifact, not a funnel). Seed entropy
+  demonstrably reaches all three seeded schedule-bearing sites.
+- **Full distinctness, early divergence.** Every seed is a distinct whole-run schedule on both
+  programs; schedules diverge within the first 4–8 decisions (the shared 1–2-decision prefix is
+  single-candidate startup, forced for every seed).
+- **The alternation pacing does not funnel.** Infrastructure picks are up to ~63% of decisions on
+  the election shape, but they are RNG-free pacing; the sim-site entropy at the uniform bound is
+  the direct measurement of the design argument that pacing decides only *when* a simulation
+  decision happens, never *which* goroutine it picks.
+- **The real structure is clock-forcing, not entropy loss.** On the election shape 82.6% of
+  scheduler decisions have a candidate set of one — the virtual clock, not the seed, sequences most
+  of the run. The seed's leverage concentrates in the sparse multi-candidate rendezvous plus the
+  *values* of the drawn timeouts.
+- **PCT adds nothing measurable on this shape.** Depth-1 and depth-3 leave the forced share
+  (82.6%), distinct-schedule and distinct-outcome counts, prefix-divergence profile, and per-site
+  entropy statistically unchanged: priority-based selection cannot create freedom where the
+  runnable set is a singleton. (Consistent with PCT's design point — it *directs* existing
+  freedom toward depth-d ordering bugs; it does not widen the freedom.)
+
+Assessment of a consumer-facing Explore tier (PCT depth-1 as the cluster-suite default): the
+measured premise for it is absent — the plain path is not degenerate, and PCT depth-1 does not
+increase diversity on the resonance shape. What the numbers say the witnessed basin was: not
+entropy collapse but a low-probability region of a healthy uniform schedule space — every seed IS
+a distinct schedule, and a narrow-basin failure is simply rarely drawn. The degrees of freedom an
+election-livelock class actually lives in are *which timeouts collide*, and the levers that
+reshape that clock-forced structure are the fault axes (net latency/jitter, clock skew/drift, the
+pending scheduling straggler and seeded `Options.FaultPolicy` layer) and, for small shapes,
+`Explore`'s systematic search. The standing options, all expressible today: (a) Random default,
+diversity bought by seed count (status quo); (b) `RunWith{Strategy: PCT, Depth: 1}` per suite —
+opt-in, determinism unchanged, no measured diversity yield on this class; (c) fault-axis
+diversification once the declarative fault-policy layer lands. Changing the consumer-facing
+default is a consumer/user ruling; the harness forecloses none of the three.
+
+### The seeded-decision trace (diagnostic surface)
+
+The measurement instrument is durable: a default-off, observation-only trace in the runtime
+(`dstTraceState`, `runtime/dst.go`) recording, per seeded schedule-bearing decision, the site
+(scheduler pick / select poll-order draw / fake-timer tie-break key), the candidate-set size, and
+the chosen index — folded into fixed-size histograms, a per-site FNV-1a decision-stream hash (the
+scheduler site's hash is a whole-run schedule fingerprint), an order-independent per-site draw
+fold (the frozen-stream detector DST-SCHED-4 leans on), and power-of-two prefix fingerprints.
+Recording draws no RNG value, allocates nothing, and takes no lock, so it cannot perturb the
+schedule it observes (DST-SCHED-3); when off, the cost is one global-bool branch at sites already
+DST-gated, and untagged builds fold the sites away entirely. White-box surface (linkname, no
+public API): `runtime.dstSchedTraceSetFP` enables it before a run (state resets at bubble start);
+`dstSchedTraceSummaryFP` / `dstSchedTraceCountFP` / `dstSchedTracePrefixFP` read a run's counts.
+Consumed by the determinism package's diversity suite (`TestSeededScheduleDiversity`,
+`TestElectionScheduleDiversity`), whose default 32-seed sweep is a bounded CI budget —
+`DST_DIVERSITY_SEEDS=<n>` widens it to reproduce the table above.
 
 ## Level 2 — access-granularity interleaving + DPOR (systematic concurrency testing)
 

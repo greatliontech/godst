@@ -35,6 +35,21 @@
 // processes by construction; the untagged legs keep upstream's per-process
 // key.
 //
+// The package also carries the schedule-DIVERSITY suite (the complement of
+// determinism: different seeds must explore genuinely different schedules,
+// or N seeds silently re-test one interleaving N times). It drives the
+// runtime's seeded-decision trace — a default-off, observation-only
+// diagnostic recording each seeded schedule-bearing decision's site,
+// candidate-set size, and chosen index (runtime/dst.go, dstTraceState;
+// measured record in docs/dst/exploration.md, "Measured seeded-path
+// diversity") — and pins two invariants: enabling the trace leaves the
+// schedule byte-identical (observation neutrality), and seed entropy
+// visibly reaches every seeded choice site (scheduler pick, select poll
+// order, fake-timer tie-break) with a distinct-schedule floor across the
+// sweep. The diversity sweep's default width (32 seeds) is a bounded CI
+// budget; DST_DIVERSITY_SEEDS=<n> in the environment widens it (read before
+// any simulation starts).
+//
 // Recorded coverage bounds (deliberate, per the spec): pointer-keyed map
 // iteration order and other address-derived observables are program
 // discipline, outside the sweep; a pollable (source-nonblocking) inherited

@@ -50,7 +50,7 @@ by slog (consumers need a relay they must discover by data loss);
   address sensitivity via map iteration); close the deferred
   drifted-lazy-timer-timestamps item (its definition landed — verify
   or fix); any wall-VALUE read reachable inside a run is a finding.
-- [ ] **4 — Seeded-schedule diversity (the quiet false negative).**
+- [x] **4 — Seeded-schedule diversity (the quiet false negative).**
   protodb witnessed seed-basin resonance (election-livelock class):
   one seed's schedule can systematically hide interleavings. Audit
   the plain seeded path's decision distribution (not Explore — the

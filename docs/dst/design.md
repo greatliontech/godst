@@ -1202,7 +1202,12 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   The package also pins that in-bubble `sync.Mutex` starvation switching is measured on the virtual
   clock (`TestMutexStarvationHandoffDeterministic`) — on the wall clock, whether a waiter's wait
   crossed the 1ms starvation threshold decided lock handoff order, a machine-speed- and
-  load-dependent same-seed schedule fork. Recorded coverage bounds live in the package's doc.go.
+  load-dependent same-seed schedule fork. The leg also carries the schedule-diversity suite
+  (determinism's complement: different seeds must explore genuinely different schedules), driving
+  the runtime's default-off seeded-decision trace; it pins trace observation-neutrality and that
+  seed entropy reaches every seeded choice site (measured record: exploration.md, "Measured
+  seeded-path diversity"). The diversity sweep is bounded by default (32 seeds);
+  `DST_DIVERSITY_SEEDS=<n>` widens it. Recorded coverage bounds live in the package's doc.go.
 - **`test:conformance`** (`go test -tags dst -count=1 -timeout 30m testing/simulation/conformance`,
   Linux): the differential host-vs-sim conformance harness — seeded op-grammar sequences over the
   modeled pipe, TCP, and filesystem surfaces, executed against real Linux primitives outside a run
@@ -1463,7 +1468,12 @@ later steps add, never rewrite.
   `findRunnable` seam from a per-bubble scheduling RNG; default strategy = seeded-random); **5b** the
   strategy hook at the same choice point (random → PCT, exposed via `RunWith(Options, f)`). **5c** sound
   scheduling faults (delay/deprioritize a runnable G) folds into the fault-orchestration feature below.
-  Turns reproducibility into *directed* exploration.
+  Turns reproducibility into *directed* exploration. The seeded path's decision distribution is
+  MEASURED, not assumed (exploration.md, "Measured seeded-path diversity"): per-site choice entropy
+  at the uniform bound, 256/256 distinct schedules over a 256-seed sweep on both a composed program
+  and an election-timeout resonance shape, no degenerate hot spot, and the alternation pacing
+  funnel-free; the consumer-facing-default question (Random vs a PCT tier) is recorded there with
+  the numbers and stays a consumer/user ruling.
 
 - **System-goroutine isolation (scheduling robustness). LANDED.** The seeded scheduling RNG
   (`dstSchedRand`) advances only for selections among the *simulation bubble's* goroutines;

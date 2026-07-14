@@ -816,7 +816,14 @@ func (t *timer) maybeAdd() {
 			// dstReadRandom's entropy gate relies on is destroyed. See
 			// dstrandUint64.
 			if dstActive() && getg().dstrand != 0 {
-				t.rand = uint32(dstrandUint64(getg()))
+				r := dstrandUint64(getg())
+				t.rand = uint32(r)
+				if dstSchedTraceOn {
+					// A tie-break KEY draw, not an index: recorded with
+					// n=dstTraceMaxN and the key's low bits as an 8-bucket
+					// uniformity histogram (see dstTraceState).
+					dstTraceRecord(dstTraceSiteTimer, dstTraceMaxN, uint32(r)&(dstTraceMaxN-1), r)
+				}
 			} else {
 				t.rand = cheaprand()
 			}

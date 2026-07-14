@@ -1298,6 +1298,147 @@ var dstSchedOvfPuts uint64
 
 func dstSchedStatsReset() {
 	dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws, dstSchedOvfPuts = 0, 0, 0, 0
+	if dstSchedTraceOn {
+		dstTrace = dstTraceState{}
+	}
+}
+
+// DST seeded-decision trace: a default-off, observation-only diagnostic that
+// quantifies how much of the seed's entropy reaches each seeded
+// schedule-bearing choice site (the design.md control-surface rows), per run.
+// It records, per decision: the site, the candidate-set size, and the chosen
+// index — folded into fixed-size histograms and a per-site running FNV-1a
+// hash of the decision stream (the scheduler site's hash is a whole-run
+// schedule fingerprint; two runs with equal fingerprints made the same
+// scheduling decisions). Recording draws no RNG value, allocates nothing, and
+// takes no lock, so enabling it cannot perturb the schedule it observes —
+// pinned by the determinism package's trace-neutrality test. Off by default;
+// the only cost when off is one global-bool branch at sites that are already
+// DST-gated (untagged builds fold the whole path away with dstActive). Enabled
+// via the white-box dstSchedTraceSetFP linkname, before a run; state resets at
+// bubble start (dstSchedStatsReset), so a run's readout never mixes with a
+// prior run's. Coverage bound: the scheduler site records the seeded Random
+// and PCT selections only — the Scheduled (exploration replay) strategy's
+// picks are prefix-driven, not seeded, and are not recorded; the select and
+// timer sites record under every strategy.
+const (
+	dstTraceSiteSched  = 0 // dstSchedSelect: which simulation candidate proceeds
+	dstTraceSiteSelect = 1 // select poll-order shuffle: per-case insertion draw
+	dstTraceSiteTimer  = 2 // fake-timer same-deadline tie-break key
+	dstTraceNumSites   = 3
+
+	// dstTraceMaxN caps the histogram axes: candidate-set sizes and chosen
+	// indices at or above the cap share the top bucket. The timer site draws a
+	// 32-bit tie-break KEY, not an index; it is recorded with n=dstTraceMaxN
+	// and the key's low three bits as an 8-bucket uniformity histogram.
+	dstTraceMaxN = 8
+
+	// Scheduler-site prefix fingerprints are snapshotted at decision counts
+	// 1<<0 .. 1<<(dstTracePrefixK-1): distinct-prefix counts across a seed
+	// sweep measure how early schedules diverge.
+	dstTracePrefixK = 21
+)
+
+var dstSchedTraceOn bool
+
+type dstTraceState struct {
+	hash [dstTraceNumSites]uint64
+	// xorIdent is the order-INDEPENDENT fold (xor of idents) per site: two
+	// runs whose per-goroutine draw multisets are identical have equal
+	// xorIdent even when the schedule interleaves the draws differently, so
+	// a cross-seed sweep can detect a choice site whose seeded stream is
+	// frozen (seed-invariant) behind schedule-order noise that still varies
+	// the order-dependent hash.
+	xorIdent [dstTraceNumSites]uint64
+	prefix   [dstTracePrefixK]uint64
+	ndec     [dstTraceNumSites]uint64
+	forced   [dstTraceNumSites]uint64 // decisions with candidate-set size <= 1 (no freedom)
+	multi    [dstTraceNumSites]uint64 // decisions with candidate-set size >= 2
+	count    [dstTraceNumSites][dstTraceMaxN + 1][dstTraceMaxN]uint64
+}
+
+var dstTrace dstTraceState
+
+// dstTraceRecord folds one seeded decision into the trace. ident is a stable
+// identity for the choice (the chosen goroutine's creation sequence at the
+// scheduler site; the raw draw elsewhere) hashed alongside (n, chosen). Pure
+// arithmetic on package globals: no allocation, no locks, no RNG draws —
+// serialized by the single-P DST regime like the counters above.
+//
+//go:nosplit
+func dstTraceRecord(site int, n, chosen uint32, ident uint64) {
+	const prime = 0x100000001b3
+	h := dstTrace.hash[site]
+	h = (h ^ uint64(n)) * prime
+	h = (h ^ uint64(chosen)) * prime
+	h = (h ^ ident) * prime
+	dstTrace.hash[site] = h
+	dstTrace.xorIdent[site] ^= ident
+	dstTrace.ndec[site]++
+	if n <= 1 {
+		dstTrace.forced[site]++
+	} else {
+		dstTrace.multi[site]++
+	}
+	nb := n
+	if nb > dstTraceMaxN {
+		nb = dstTraceMaxN
+	}
+	cb := chosen
+	if cb >= dstTraceMaxN {
+		cb = dstTraceMaxN - 1
+	}
+	dstTrace.count[site][nb][cb]++
+	if site == dstTraceSiteSched {
+		if d := dstTrace.ndec[site]; d&(d-1) == 0 {
+			k := 0
+			for uint64(1)<<k < d {
+				k++
+			}
+			if k < dstTracePrefixK {
+				dstTrace.prefix[k] = h
+			}
+		}
+	}
+}
+
+// dstSchedTraceSetFP enables or disables the seeded-decision trace. Set it
+// before simulation.Run; per-run state resets at bubble start. White-box
+// diagnostic surface (testing/simulation/determinism), via //go:linkname.
+//
+//go:linkname dstSchedTraceSetFP
+func dstSchedTraceSetFP(on bool) { dstSchedTraceOn = on }
+
+// dstSchedTraceSummaryFP reads a site's per-run totals. Via //go:linkname.
+//
+//go:linkname dstSchedTraceSummaryFP
+func dstSchedTraceSummaryFP(site int) (hash, xorIdent, ndec, forced, multi uint64) {
+	if site < 0 || site >= dstTraceNumSites {
+		return 0, 0, 0, 0, 0
+	}
+	return dstTrace.hash[site], dstTrace.xorIdent[site], dstTrace.ndec[site], dstTrace.forced[site], dstTrace.multi[site]
+}
+
+// dstSchedTracePrefixFP reads the scheduler-site fingerprint after 1<<k
+// decisions (0 if the run made fewer). Via //go:linkname.
+//
+//go:linkname dstSchedTracePrefixFP
+func dstSchedTracePrefixFP(k int) uint64 {
+	if k < 0 || k >= dstTracePrefixK {
+		return 0
+	}
+	return dstTrace.prefix[k]
+}
+
+// dstSchedTraceCountFP reads one histogram cell: decisions at site with
+// candidate-set-size bucket n choosing index bucket chosen. Via //go:linkname.
+//
+//go:linkname dstSchedTraceCountFP
+func dstSchedTraceCountFP(site, n, chosen int) uint64 {
+	if site < 0 || site >= dstTraceNumSites || n < 0 || n > dstTraceMaxN || chosen < 0 || chosen >= dstTraceMaxN {
+		return 0
+	}
+	return dstTrace.count[site][n][chosen]
 }
 
 //go:linkname dstSchedOvfPutsFP

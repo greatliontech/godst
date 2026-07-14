@@ -8081,11 +8081,41 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 func dstSchedSelect(c *dstCandidates, total uint32) uint32 {
 	switch dstSchedKind {
 	case dstSchedPCT:
-		return dstPCTSelect(c, total)
+		k := dstPCTSelect(c, total)
+		if dstSchedTraceOn {
+			// Observation only: dstPCTSelect already assigned every simulation
+			// candidate's creation sequence, so these reads mutate nothing.
+			dstTraceRecord(dstTraceSiteSched, c.simCount(total), c.simOrdinalOf(total, k), dstEnsureSeq(c.at(k)))
+		}
+		return k
 	case dstSchedScheduled:
 		return dstScheduledSelect(c, total)
 	}
-	return c.simSeqIdx(total, dstSchedRandn(c.simCount(total)))
+	n := c.simCount(total)
+	j := dstSchedRandn(n)
+	k := c.simSeqIdx(total, j)
+	if dstSchedTraceOn {
+		// Observation only: simSeqIdx already assigned every simulation
+		// candidate's creation sequence, so the dstEnsureSeq read mutates
+		// nothing.
+		dstTraceRecord(dstTraceSiteSched, n, j, dstEnsureSeq(c.at(k)))
+	}
+	return k
+}
+
+// simOrdinalOf returns the ordinal (0-based, in stable creation-sequence
+// order) of the simulation candidate at absolute index k among the set's
+// simulation candidates — the inverse of simSeqIdx. Trace-only observation
+// helper; caller guarantees c.at(k) is a simulation candidate.
+func (c *dstCandidates) simOrdinalOf(total, k uint32) uint32 {
+	seq := dstEnsureSeq(c.at(k))
+	var ord uint32
+	for i := uint32(0); i < total; i++ {
+		if gp := c.at(i); gp != nil && !dstIsInfraCandidate(gp) && dstEnsureSeq(gp) < seq {
+			ord++
+		}
+	}
+	return ord
 }
 
 // dstPCTSelect implements the PCT choice: advance the step counter, pick the

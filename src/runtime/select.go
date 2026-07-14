@@ -198,6 +198,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		var j uint32
 		if dstActive() && gp.dstrand != 0 {
 			j = dstrandn(gp, uint32(norder+1))
+			if dstSchedTraceOn {
+				dstTraceRecord(dstTraceSiteSelect, uint32(norder+1), j, uint64(j))
+			}
 		} else {
 			j = cheaprandn(uint32(norder + 1))
 		}
