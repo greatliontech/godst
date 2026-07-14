@@ -212,6 +212,9 @@ func dstSetNetSendBuffer(bytes int64)
 //go:linkname dstSetNetRetransmitTimeout runtime.dstSetNetRetransmitTimeout
 func dstSetNetRetransmitTimeout(ns int64)
 
+//go:linkname dstSetWedgeLimits runtime.dstSetWedgeLimits
+func dstSetWedgeLimits(decisions, wallNs int64)
+
 //go:linkname testingSimulationTest testing/simulation.testingSimulationTest
 func testingSimulationTest(t *testing.T, f func(*testing.T)) bool
 
@@ -343,6 +346,38 @@ type Options struct {
 	// for a byte a newer write covered, a state no page cache produces (see
 	// docs/dst/faults.md, the disk Crash axis).
 	CrashTear bool
+
+	// WedgeDecisionLimit bounds the wedge detector's quiescence arm: a run
+	// whose bubble makes this many scheduler decisions without ever reaching
+	// durable quiescence fails loudly (a runtime fatal error naming the
+	// runnable goroutines) instead of spinning until an external kill. A
+	// bubble that never durably quiesces can never advance virtual time —
+	// some goroutine stays perpetually runnable (a busy-poll, a Gosched or
+	// select spin, mutex ping-pong) — and the deadlock detector, which needs
+	// EVERY goroutine durably blocked, structurally cannot see it. The
+	// detector cannot distinguish such a wedge from a legitimately
+	// decision-heavy stretch, so the default (1<<26 decisions) is generous;
+	// raise it for workloads that genuinely exceed it. 0 selects the default;
+	// a negative value disables the arm. Observation-only until it fires:
+	// enabling or resizing it never changes a healthy run's schedule.
+	WedgeDecisionLimit int64
+
+	// WedgeWallLimit bounds the wedge detector's wall arm: a run in which one
+	// bubble goroutine runs for this much WALL-CLOCK time without a single
+	// scheduler decision fails loudly (a runtime fatal error naming the
+	// goroutine). That is the call-free spin loop (`for !flag.Load() {}`):
+	// with GOMAXPROCS pinned to 1 and preemption disabled it wedges the whole
+	// process — production Go completes such loops via async preemption — and
+	// since it never re-enters the scheduler, no in-schedule (seed-pure) bound
+	// can see it; the runtime's monitor thread carries this one arm on a wall
+	// bound instead. It fires only when the run made NO scheduler decision at
+	// all for the entire window, a state a healthy run leaves within
+	// microseconds, so no non-wedged run's schedule can observe it. The
+	// default (60s) is generous; raise it for legitimate long call-free
+	// computation. 0 selects the default; a negative value disables the arm.
+	// A goroutine blocked in a granted inherited-file capability syscall is
+	// exempt (that wall delay is the stdio stance's recorded legal behavior).
+	WedgeWallLimit time.Duration
 }
 
 // NetworkConfig configures the simulated network for a run.
@@ -563,11 +598,18 @@ func leaveSimulation() {
 // point the run's queued and later-discovered finalizers and cleanups are
 // deterministically discarded rather than run.
 //
-// A goroutine in f that never blocks and never makes a function call (e.g. a
-// bare for{}) will not be preempted and will stall the simulation; real code
-// rarely does this. A goroutine OUTSIDE the simulation that never blocks (a
-// Gosched loop started before Run) does not stall it: outside goroutines are
-// scheduled around the simulation and cannot starve it.
+// A goroutine in f that stays perpetually runnable wedges the simulation —
+// virtual time can only advance when every goroutine is durably blocked — and
+// the run fails LOUDLY instead of hanging until an external kill: a busy-poll
+// or non-durable park loop (Gosched/select spin, mutex ping-pong) fails after
+// WedgeDecisionLimit scheduler decisions without durable quiescence, and a
+// CALL-FREE spin (a bare for{}, `for !flag.Load() {}` — which never even
+// re-enters the scheduler) fails after WedgeWallLimit of wall time, each with
+// a runtime fatal error naming the guilty goroutine(s). See those Options
+// fields for the bounds and how to raise or disable them. A goroutine OUTSIDE
+// the simulation that never blocks (a Gosched loop started before Run) does
+// not stall it: outside goroutines are scheduled around the simulation and
+// cannot starve it.
 func Run(seed uint64, f func()) {
 	RunWith(seed, Options{}, f)
 }
@@ -597,7 +639,7 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
 	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("RunWith", opts.Network)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, nil, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds(), nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -616,6 +658,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
+	dstSetWedgeLimits(opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds())
 	var ok bool
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
@@ -711,7 +754,7 @@ func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwid
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, wedgeDecisions, wedgeWallNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	// Admitted: publish the run's crash-tear policy. Every admitted entry point
@@ -721,6 +764,10 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numc
 	// out. A REJECTED entry never reaches this line and leaves the active
 	// run's policy untouched.
 	setCrashTear(crashTear)
+	// The wedge-detector bounds follow the same discipline: every admitted
+	// entry point publishes them explicitly (the option-less entries publish
+	// the defaults), so no run inherits a previous run's bounds.
+	dstSetWedgeLimits(wedgeDecisions, wedgeWallNs)
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
 }
 

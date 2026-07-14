@@ -64,3 +64,14 @@ func DSTRawRename(oldname, newname string) error {
 	}
 	return err
 }
+
+// DSTSetRootCloseObserver installs (or clears, with nil) the teardown-order
+// observer for dstCloseRoots: fn receives each victim Root's captured name in
+// close order. White-box pin support for the registration-order teardown.
+func DSTSetRootCloseObserver(fn func(name string)) {
+	if fn == nil {
+		dstRootCloseHook = nil
+		return
+	}
+	dstRootCloseHook = func(r *root) { fn(r.name) }
+}

@@ -49,6 +49,26 @@ func (*dstNodeScopedError) Error() string {
 	return "inherited file capability is node-scoped to the root simulation body; relay cross-node I/O through the root"
 }
 
+// dstErrStaleRun is the node-scoped refusal's TEMPORAL sibling: an
+// inherited-file capability operated outside the run that granted it — after
+// the run, during a LATER run, or from a goroutine outside the run's bubble.
+// The grant is per run (the capability carries its run epoch), so there is no
+// production error to mimic, and the capability is NOT closed: its hidden
+// host duplicate stays open until Close, so a closed-file shape here
+// misdirects diagnosis toward close bugs exactly as the node-scoped rationale
+// records — an error-swallowing pipeline would silently drop every operation
+// while the real fix (re-grant inside the run that uses it, or Close the
+// leak) goes unnamed. The os layer wraps this into *PathError like any
+// backend error; it deliberately does not match ErrClosed. Close remains
+// available in every temporal state to release the duplicate.
+var dstErrStaleRun error = &dstStaleRunError{}
+
+type dstStaleRunError struct{}
+
+func (*dstStaleRunError) Error() string {
+	return "inherited file capability is scoped to the simulation run that granted it; the capability is not closed — grant it inside the run that uses it, or Close it to release the host duplicate"
+}
+
 //go:linkname dstInheritFile
 func dstInheritFile(src *File) (*File, error) {
 	if !dstFSActive() || !dstInSimBubble() {
@@ -98,8 +118,17 @@ func dstInheritFile(src *File) (*File, error) {
 }
 
 func (f *dstInheritedFile) begin() (bool, error) {
-	if f.closed.Load() || !dstFSActive() || !dstInSimBubble() || f.epoch != dstFSEpoch() {
+	if f.closed.Load() {
+		// Genuinely closed: the one state where the closed shape IS the
+		// diagnosis.
 		return false, poll.ErrFileClosing
+	}
+	if !dstFSActive() || !dstInSimBubble() || f.epoch != dstFSEpoch() {
+		// Outside the granting run's temporal scope — after the run, in a
+		// LATER run, or from a goroutine outside the run's bubble: the typed
+		// temporal refusal, never the closed shape (the capability is not
+		// closed; see dstErrStaleRun).
+		return false, dstErrStaleRun
 	}
 	if hostID, procID := dstFSCurrentNode(); f.hostID != hostID || f.procID != procID {
 		// A live capability reached from inside a Host or Process body: the
@@ -115,11 +144,16 @@ func (f *dstInheritedFile) closeCaller() error {
 	if !dstFSActive() {
 		return nil
 	}
+	if f.epoch != dstFSEpoch() {
+		// A capability from a DEAD run: its grant is gone and the only
+		// meaningful operation left is releasing the hidden host duplicate —
+		// Close always works (the pipe backend's temporal stance; refusing it
+		// here left the duplicate leaked for as long as later runs were
+		// active).
+		return nil
+	}
 	if !dstInSimBubble() {
 		return dstErrUnsupportedFS
-	}
-	if f.epoch != dstFSEpoch() {
-		return poll.ErrFileClosing
 	}
 	if hostID, procID := dstFSCurrentNode(); f.hostID != hostID || f.procID != procID {
 		// The node-scoped refusal, as in begin.

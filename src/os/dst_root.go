@@ -7,9 +7,11 @@
 package os
 
 import (
+	"cmp"
 	"errors"
 	"path"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -34,12 +36,20 @@ var dstOpenRoots struct {
 	mu    sync.Mutex
 	epoch uint64
 	roots map[*root]dstOpenFileEntry
+	// seq stamps each registration in open order, exactly as
+	// dstOpenFiles.seq does for files: close ORDER at teardown is
+	// observable in principle, and iterating the pointer-keyed map would
+	// order victims by run-varying heap addresses — a silent schedule fork
+	// the moment Root.Close gains any observable side effect. Reset with
+	// the per-run roll.
+	seq uint64
 }
 
 func dstOpenRootsRollLocked() {
 	if e := dstFSEpoch(); e != dstOpenRoots.epoch || dstOpenRoots.roots == nil {
 		dstOpenRoots.epoch = e
 		dstOpenRoots.roots = make(map[*root]dstOpenFileEntry)
+		dstOpenRoots.seq = 0
 	}
 }
 
@@ -47,7 +57,8 @@ func dstRegisterRoot(r *root) {
 	host, proc := dstFSCurrentNode()
 	dstOpenRoots.mu.Lock()
 	dstOpenRootsRollLocked()
-	dstOpenRoots.roots[r] = dstOpenFileEntry{host: host, proc: proc}
+	dstOpenRoots.seq++
+	dstOpenRoots.roots[r] = dstOpenFileEntry{host: host, proc: proc, seq: dstOpenRoots.seq}
 	dstOpenRoots.mu.Unlock()
 }
 
@@ -61,18 +72,35 @@ func dstUnregisterRoot(r *root) {
 func dstCloseRoots(match func(dstOpenFileEntry) bool) {
 	dstOpenRoots.mu.Lock()
 	dstOpenRootsRollLocked()
-	var roots []*root
+	type victim struct {
+		r   *root
+		seq uint64
+	}
+	var victims []victim
 	for r, entry := range dstOpenRoots.roots {
 		if match(entry) {
-			roots = append(roots, r)
+			victims = append(victims, victim{r: r, seq: entry.seq})
 			delete(dstOpenRoots.roots, r)
 		}
 	}
 	dstOpenRoots.mu.Unlock()
-	for _, r := range roots {
-		_ = r.Close()
+	// Close in registration order (the same rule as dstCloseOpenFiles): the
+	// map yields victims in pointer-hash order, which hashes run-varying
+	// heap addresses.
+	slices.SortFunc(victims, func(a, b victim) int { return cmp.Compare(a.seq, b.seq) })
+	for _, v := range victims {
+		if dstRootCloseHook != nil {
+			dstRootCloseHook(v.r)
+		}
+		_ = v.r.Close()
 	}
 }
+
+// dstRootCloseHook, when non-nil, observes each teardown Close in order — the
+// white-box pin for the registration-order teardown (Root.Close has no other
+// observable side effect today, which is exactly why the order needs a direct
+// observer). Set only by the os test export; nil in production.
+var dstRootCloseHook func(*root)
 
 func dstCloseProcRoots(proc uint32) {
 	dstCloseRoots(func(e dstOpenFileEntry) bool { return e.proc == proc })

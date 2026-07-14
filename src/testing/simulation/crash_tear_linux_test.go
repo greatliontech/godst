@@ -591,3 +591,102 @@ func TestDSTRejectedNestedRunKeepsCrashTearPolicy(t *testing.T) {
 		t.Fatalf("no durable bytes present after the torn crash — unexpected image %.16q...", recovered)
 	}
 }
+
+// multiAppendRun grows a file from a one-page durable image by several
+// unsynced appends, crashes the host with CrashTear on, and returns the
+// post-reboot content.
+func multiAppendRun(t *testing.T, seed uint64, appends int, appendLen int) (content []byte) {
+	t.Helper()
+	const page = 4096
+	durable := bytes.Repeat([]byte("D"), page)
+
+	RunWith(seed, Options{CrashTear: true}, func() {
+		Host("h", HostConfig{}, func() {
+			go Process("db", func() {
+				f, err := os.Create("/f")
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				if _, err := f.Write(durable); err != nil {
+					t.Errorf("write durable: %v", err)
+					return
+				}
+				if err := f.Sync(); err != nil {
+					t.Errorf("sync: %v", err)
+					return
+				}
+				syncDir(t, "/")
+				for i := 0; i < appends; i++ {
+					if _, err := f.Write(bytes.Repeat([]byte{'U'}, appendLen)); err != nil {
+						t.Errorf("append %d: %v", i, err)
+						return
+					}
+				}
+				f.Close()
+				select {}
+			})
+			for range 30 {
+				runtime.Gosched()
+			}
+		})
+
+		CrashHost("h")
+
+		Host("h", HostConfig{}, func() {
+			Process("recover", func() {
+				b, err := os.ReadFile("/f")
+				if err != nil {
+					t.Fatalf("read after reboot: %v", err)
+				}
+				content = b
+			})
+		})
+	})
+	return content
+}
+
+// TestDSTCrashTearIntermediateSizes: a file grown by several unsynced appends
+// can, on real Linux, crash at an INTERMEDIATE on-disk i_size — per-page
+// writeback advances the inode size progressively — so the crash-size draw
+// ranges over the page-advanced boundaries between the durable and current
+// lengths, not just the two endpoints. Over a seed sweep: every recovered
+// size is a member of the candidate set {durable, page boundaries between,
+// current}, the durable page survives byte-exactly, bytes below the recovered
+// size are 'U' (landed) or 0 (a hole delayed allocation left), and at least
+// one strictly-intermediate size is actually reached (completeness — the pin
+// that dies if the draw collapses back to binary). Mutation: reverting the
+// size draw to durable-or-current makes sawIntermediate false.
+func TestDSTCrashTearIntermediateSizes(t *testing.T) {
+	const page = 4096
+	const appends, appendLen = 5, 1800 // grows 4096 → 13096: boundaries 8192, 12288
+	durableSize := page
+	fullSize := page + appends*appendLen
+	candidates := map[int]bool{durableSize: true, fullSize: true}
+	for b := (durableSize/page + 1) * page; b < fullSize; b += page {
+		candidates[b] = true
+	}
+	sawIntermediate := false
+	for seed := uint64(1); seed <= 48; seed++ {
+		content := multiAppendRun(t, seed, appends, appendLen)
+		if !candidates[len(content)] {
+			t.Fatalf("seed %d: recovered i_size %d is not a per-page-advanced candidate %v", seed, len(content), candidates)
+		}
+		for i := 0; i < durableSize && i < len(content); i++ {
+			if content[i] != 'D' {
+				t.Fatalf("seed %d: durable byte %d = %q, want 'D'", seed, i, content[i])
+			}
+		}
+		for i := durableSize; i < len(content); i++ {
+			if content[i] != 'U' && content[i] != 0 {
+				t.Fatalf("seed %d: unsynced byte %d = %q, want 'U' or 0", seed, i, content[i])
+			}
+		}
+		if len(content) != durableSize && len(content) != fullSize {
+			sawIntermediate = true
+		}
+	}
+	if !sawIntermediate {
+		t.Fatal("seed sweep never recovered an intermediate i_size; the size draw has collapsed to durable-or-current")
+	}
+}

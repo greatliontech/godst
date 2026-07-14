@@ -2292,3 +2292,48 @@ func DstFreshGHeapBytesWant() uint64 {
 	}
 	return uint64(gc.SizeClassToSize[gc.SizeToSizeClass128[divRoundUp(s-gc.SmallSizeMax, gc.LargeSizeDiv)]])
 }
+
+// DSTDisabledVisibilityProbe drives the disabled-goroutine visibility rule
+// (dstCandidates.at and every selection scan built on it) deterministically,
+// without waiting for a live GC window to happen to reach the DST seam: it
+// builds a candidate view over two real goroutines — one marked a simulation
+// member — on a throwaway (never-installed) p, flips sched.disable.user under
+// sched.lock exactly as a GC schedEnableUser(false) window does, and reads
+// the filter's outputs. Holding sched.lock across the whole flip is what
+// makes the transient window invisible to concurrent scheduling: the
+// disable-consumers re-check schedEnabled under sched.lock, so no goroutine
+// can be parked onto sched.disable.runnable inside the window (which nothing
+// would ever release). gs supplies the two goroutines' gp pointers (from
+// getg() in each); the caller keeps them parked for the probe's duration.
+func DSTDisabledVisibilityProbe(g1p, g2p unsafe.Pointer) (inAt, inAnySim, inAnyVisible bool, inSimCount uint32, outAt, outAnySim bool) {
+	g1 := (*g)(g1p)
+	g2 := (*g)(g2p)
+	g1.dstSimG = true
+	defer func() { g1.dstSimG = false }()
+	pp := new(p)
+	pp.runq[0].set(g1)
+	pp.runq[1].set(g2)
+	c := dstCandidates{pp: pp, h: 0, ringN: 2}
+	const total = 2
+	lock(&sched.lock)
+	old := sched.disable.user
+	sched.disable.user = true
+	c.disableUser = true
+	inAt = c.at(0) != nil || c.at(1) != nil
+	inAnySim = c.hasSimG(total)
+	inAnyVisible = c.anyVisible(total)
+	inSimCount = c.simCount(total)
+	sched.disable.user = old
+	// The out-window reads use a view whose snapshot is explicitly not
+	// disabled (independent of a real GC window that may be open around this
+	// test), so at() never consults schedEnabled and no lock is needed.
+	c.disableUser = false
+	unlock(&sched.lock)
+	outAt = c.at(0) != nil && c.at(1) != nil
+	outAnySim = c.hasSimG(total)
+	return
+}
+
+// DSTProbeG returns the calling goroutine's g pointer for
+// DSTDisabledVisibilityProbe.
+func DSTProbeG() unsafe.Pointer { return unsafe.Pointer(getg()) }

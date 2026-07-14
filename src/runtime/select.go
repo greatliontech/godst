@@ -197,9 +197,13 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		// relies on is destroyed. See dstrandUint64.
 		var j uint32
 		if dstActive() && gp.dstrand != 0 {
-			j = dstrandn(gp, uint32(norder+1))
+			var raw uint64
+			j, raw = dstrandnRaw(gp, uint32(norder+1))
 			if dstSchedTraceOn {
-				dstTraceRecord(dstTraceSiteSelect, uint32(norder+1), j, uint64(j))
+				// The ident is the RAW draw, not the bounded index: with tiny
+				// candidate counts a bounded ident aliases in the xorIdent
+				// freeze-detection fold (see dstrandnRaw).
+				dstTraceRecord(dstTraceSiteSelect, uint32(norder+1), j, raw)
 			}
 		} else {
 			j = cheaprandn(uint32(norder + 1))

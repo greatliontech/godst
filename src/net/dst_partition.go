@@ -30,6 +30,16 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32))
 //go:linkname dstSetNetHostDeadHook runtime.dstSetNetHostDeadHook
 func dstSetNetHostDeadHook(fn func(host uint32) bool)
 
+// dstHostDeclaredQ reports whether host is a declared simulated host this run
+// (the runtime relay to testing/simulation's intern registry; true when no
+// simulation package is linked). A routable address of an UNDECLARED host is
+// owned by nothing: no kernel answers its SYNs, so a dial to it blackholes —
+// ETIMEDOUT at the retransmit horizon, a deadline, or a later declaration
+// booting the machine — never ECONNREFUSED (an RST needs a live kernel).
+//
+//go:linkname dstHostDeclaredQ runtime.dstHostDeclared
+func dstHostDeclaredQ(host uint32) bool
+
 // Net-fault op codes — net's contract with testing/simulation's targeting API,
 // which passes the same codes through runtime.dstNetPartitionOp. b is ignored for
 // the host/process-level ops.
@@ -277,6 +287,17 @@ func dstDialCut(dialer, target uint32) (cut, refuse bool) {
 		// exists to answer RST, so the dial can only blackhole — whatever any
 		// refuse-mode cut on the path would otherwise do. ECONNREFUSED requires
 		// a live kernel (design.md, Connect cost).
+		return true, false
+	}
+	if target != dialer && !dstHostDeclaredQ(target) {
+		// The target address is owned by NO declared host: nothing answers
+		// its SYNs, so the dial blackholes exactly like a powered-off
+		// machine — until the retransmit horizon, a deadline, or a Host (or
+		// implicit-host Process) declaration boots a machine at the address
+		// (the declaration relays host-up, waking parked dials). The
+		// dialer's own host is always declared; reachable only via a
+		// hand-constructed literal 10.x IP (HostIP panics on undeclared
+		// hosts).
 		return true, false
 	}
 	_, c1, bh1 := dstPartCutStartDir(dialer, target)

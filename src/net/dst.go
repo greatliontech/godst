@@ -651,8 +651,22 @@ func (c *dstConn) consumeSkErr(op string) error {
 	if e, ok := c.Conn.(*dstWireEnd); ok {
 		closeWait = e.rstCloseWait.Load()
 	}
-	if !closeWait && !c.skErrConsumed.Swap(true) {
-		return c.opError(op, syscall.ECONNRESET)
+	if closeWait {
+		return c.consumePendingErr(op, nil)
+	}
+	return c.consumePendingErr(op, syscall.ECONNRESET)
+}
+
+// consumePendingErr is the one-shot sk_err latch shared by every pending
+// socket error the kernel reports once — ECONNRESET (an RST) and ETIMEDOUT
+// (retransmission exhaustion, tcp_write_err's sk_err; host-probed: the first
+// failing op after a TCP_USER_TIMEOUT death reports ETIMEDOUT, later reads
+// return EOF and later writes EPIPE, identically to the ECONNRESET ladder). A
+// nil pending error means the identity was already spent or never pended (the
+// CLOSE_WAIT arm): the op reports the CLOSED-socket identity directly.
+func (c *dstConn) consumePendingErr(op string, pending error) error {
+	if pending != nil && !c.skErrConsumed.Swap(true) {
+		return c.opError(op, pending)
 	}
 	if op == "read" {
 		return io.EOF
@@ -669,9 +683,13 @@ func (c *dstConn) mapConnErr(op string, err error) error {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		return c.opError(op, os.ErrDeadlineExceeded)
 	case err == syscall.ETIMEDOUT:
-		// The retransmit horizon: a write/read into a permanently undeliverable conn
-		// (a cut outlasting the horizon). Production identity is OpError{ETIMEDOUT}.
-		return c.opError(op, syscall.ETIMEDOUT)
+		// The retransmit horizon: a write/read into a permanently undeliverable
+		// conn (a cut outlasting the horizon). Production pends ETIMEDOUT as the
+		// kernel's ONE-SHOT sk_err (tcp_write_err; host-probed, the same
+		// mechanics as the RST's ECONNRESET): the first failing op consumes it,
+		// later reads return io.EOF and later writes EPIPE — the CLOSED-socket
+		// identities.
+		return c.consumePendingErr(op, syscall.ETIMEDOUT)
 	case c.closed.Load():
 		return c.opError(op, errClosed)
 	case err == io.EOF:
@@ -1298,11 +1316,11 @@ redial:
 	dstNet.mu.Unlock()
 
 	if l == nil {
-		if dstHostDead(targetHost) {
-			// Powered off between the clear-path check and the lookup — a
-			// window no cooperative schedule reaches today (no yield between
-			// them); kept structural so a future preemption point cannot turn
-			// it into a refusal.
+		if dstHostDead(targetHost) || (targetHost != dialerHost && !dstHostDeclaredQ(targetHost)) {
+			// Powered off (or never declared) between the clear-path check
+			// and the lookup — a window no cooperative schedule reaches today
+			// (no yield between them); kept structural so a future preemption
+			// point cannot turn it into a refusal.
 			goto redial
 		}
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
@@ -1371,73 +1389,222 @@ redial:
 			backlogHorizonT.Stop()
 		}
 	}
-	select {
-	case <-ctx.Done():
-		stopBacklogHorizon()
-		cleanup()
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
-	case <-backlogHorizonC:
-		cleanup()
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
-	// Every abort of a still-parked dial carries ECONNREFUSED, never
-	// ECONNRESET: the dialer's socket is in SYN_SENT (connect(2) has not
-	// returned), and tcp_reset maps an RST received in SYN_SENT to
-	// ECONNREFUSED — the same identity the closed-listener path below
-	// surfaces (host-probed; see dstConnectSYNACK).
-	case <-p1.(*dstWireEnd).localDone:
-		stopBacklogHorizon()
-		cleanup()
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
-	case <-p1.(*dstWireEnd).remoteDone:
-		stopBacklogHorizon()
-		cleanup()
-		if dstHostDead(l.host) {
-			goto redial
-		}
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
-	case <-p1.(*dstWireEnd).rstKill:
-		// A fault-injected RST during the SYN retransmit window (backlog
-		// full, or a reset racing establishment) aborts the connect promptly
-		// — the drain-then-reset teardown of the queued/registered ends does
-		// not close the transports, so the done channels above stay silent.
-		// The dead-host check mirrors the remoteDone case: a crashed server
-		// host emits no RST, so that path redials into the blackhole and
-		// times out as production does.
-		stopBacklogHorizon()
-		cleanup()
-		if dstHostDead(l.host) {
-			goto redial
-		}
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
-	case l.accept <- ownedServer:
-		stopBacklogHorizon()
-		select {
-		case <-l.done:
-			// The listener closed while this connection sat in (or entered)
-			// the backlog; its teardown resets QUEUED connections, but this
-			// send may have landed after the drain — or the server may have
-			// already Accepted it before we resumed. Claim it: if it is still
-			// queued, refuse the dial; if Accept won, the connection stands.
-			if server.acceptState.CompareAndSwap(0, 2) {
+	// The backlog park models the SYN's undeliverability across a partition:
+	// while the handshake path is cut, the retransmitted SYN cannot reach the
+	// listener (nor could the child's handshake complete), so the parked send
+	// must not land — an Accept freeing a slot during a cut completes OTHER
+	// dials, never this one. The park re-checks the cut table on every
+	// partition change (the same clear-path wait the front-door blackhole
+	// loop performs), bounded by the already-armed retransmit horizon. The
+	// cut-wait deliberately does NOT wake on l.done: no RST can traverse a
+	// blackhole cut, so a listener closed during the cut is observed only
+	// after heal, when the re-offered SYN meets the closed port. A cut
+	// landing while the send is ALREADY parked commits the dial to the
+	// partition wake (the fault op runs on a scheduled goroutine, so its
+	// wake resolves the select before any Accept can run); an Accept that
+	// raced ahead of the cut is the SYN-arrived-at-the-cut-instant ordering,
+	// one of the two the real race produces.
+	for {
+		partWake := dstPartWakeCh()
+		if cut, refuse := dstDialCut(dialerHost, l.host); cut {
+			if refuse {
+				// A refuse-mode cut answers the retransmitted SYN with RST:
+				// ECONNREFUSED, the SYN_SENT identity (immediate, the same
+				// recorded timing simplification as the front-door refusal).
+				stopBacklogHorizon()
 				cleanup()
-				goto refused
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			}
-		default:
+			select {
+			case <-ctx.Done():
+				stopBacklogHorizon()
+				cleanup()
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
+			case <-backlogHorizonC:
+				cleanup()
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+			case <-partWake:
+				// Partition state changed: re-check the cut.
+			case <-p1.(*dstWireEnd).localDone:
+				stopBacklogHorizon()
+				cleanup()
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+			case <-p1.(*dstWireEnd).remoteDone:
+				stopBacklogHorizon()
+				cleanup()
+				if dstHostDead(l.host) {
+					goto redial
+				}
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+			case <-p1.(*dstWireEnd).rstKill:
+				stopBacklogHorizon()
+				cleanup()
+				if dstHostDead(l.host) {
+					goto redial
+				}
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+			}
+			continue
 		}
-		// SYN-ACK: the acknowledgment travels back; context expiry or endpoint
-		// teardown before its arrival aborts the connect and tears down both ends.
-		if err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset); err != nil {
+		select {
+		case <-ctx.Done():
+			stopBacklogHorizon()
+			cleanup()
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
+		case <-backlogHorizonC:
+			cleanup()
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+		case <-partWake:
+			// A partition landed while the send was parked: re-check the cut
+			// before offering the SYN again.
+			continue
+		// Every abort of a still-parked dial carries ECONNREFUSED, never
+		// ECONNRESET: the dialer's socket is in SYN_SENT (connect(2) has not
+		// returned), and tcp_reset maps an RST received in SYN_SENT to
+		// ECONNREFUSED — the same identity the closed-listener path below
+		// surfaces (host-probed; see dstConnectSYNACK).
+		case <-p1.(*dstWireEnd).localDone:
+			stopBacklogHorizon()
+			cleanup()
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+		case <-p1.(*dstWireEnd).remoteDone:
+			stopBacklogHorizon()
 			cleanup()
 			if dstHostDead(l.host) {
 				goto redial
 			}
-			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+		case <-p1.(*dstWireEnd).rstKill:
+			// A fault-injected RST during the SYN retransmit window (backlog
+			// full, or a reset racing establishment) aborts the connect promptly
+			// — the drain-then-reset teardown of the queued/registered ends does
+			// not close the transports, so the done channels above stay silent.
+			// The dead-host check mirrors the remoteDone case: a crashed server
+			// host emits no RST, so that path redials into the blackhole and
+			// times out as production does.
+			stopBacklogHorizon()
+			cleanup()
+			if dstHostDead(l.host) {
+				goto redial
+			}
+			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+		case l.accept <- ownedServer:
+			stopBacklogHorizon()
+			select {
+			case <-l.done:
+				// The listener closed while this connection sat in (or entered)
+				// the backlog; its teardown resets QUEUED connections, but this
+				// send may have landed after the drain — or the server may have
+				// already Accepted it before we resumed. Claim it: if it is still
+				// queued, refuse the dial; if Accept won, the connection stands.
+				if server.acceptState.CompareAndSwap(0, 2) {
+					cleanup()
+					goto refused
+				}
+			default:
+			}
+			// SYN-ACK: the acknowledgment travels back; context expiry or endpoint
+			// teardown before its arrival aborts the connect and tears down both ends.
+			if err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset); err != nil {
+				cleanup()
+				if dstHostDead(l.host) {
+					goto redial
+				}
+				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
+			}
+			// SYN-ACK across a cut: the acknowledgment travels the RETURNING
+			// direction (listener→dialer); a cut active there when it would
+			// complete holds it like any undeliverable segment — the server's
+			// SYN-ACK retransmits into the void — so connect(2) completes only
+			// on heal, or fails ETIMEDOUT at the retransmit horizon anchored
+			// at the first cut observation on this leg (never earlier than a
+			// kernel's own retransmit clock — the sound, errs-later anchor). A
+			// pure refuse-mode cut answers the handshake with RST instead:
+			// ECONNREFUSED, the SYN_SENT identity.
+			synackBlock := int64(-1)
+			for {
+				ackWake := dstPartWakeCh()
+				_, ackCut, ackBlackhole := dstPartCutStartDir(l.host, dialerHost)
+				if !ackCut {
+					// The deciding observer, as in dstConnectSYNACK's zero-latency
+					// arm: a reset or endpoint teardown that landed while the gate
+					// was parked (its wake can arrive via an unrelated partition
+					// op, committing the select before rstKill closes) must abort
+					// the still-in-SYN_SENT connect with ECONNREFUSED — returning
+					// an already-reset conn would surface the established-state
+					// ECONNRESET for a connect(2) that never established.
+					if reset.Load() || isClosedChan(p1.(*dstWireEnd).localDone) || isClosedChan(p1.(*dstWireEnd).remoteDone) {
+						cleanup()
+						if dstHostDead(l.host) {
+							goto redial
+						}
+						return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+					}
+					return dialer, nil
+				}
+				if !ackBlackhole {
+					cleanup()
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+				}
+				if synackBlock < 0 {
+					synackBlock = dstBaseNanos()
+				}
+				var ackHorizonC <-chan time.Time
+				var ackHorizonT *time.Timer
+				if retransNs > 0 {
+					remaining := retransNs - (dstBaseNanos() - synackBlock)
+					if remaining <= 0 {
+						cleanup()
+						return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+					}
+					ackHorizonT = time.NewTimer(time.Duration(remaining))
+					ackHorizonC = ackHorizonT.C
+				}
+				select {
+				case <-ctx.Done():
+					if ackHorizonT != nil {
+						ackHorizonT.Stop()
+					}
+					cleanup()
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
+				case <-ackWake:
+					if ackHorizonT != nil {
+						ackHorizonT.Stop()
+					}
+				case <-ackHorizonC:
+					cleanup()
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+				case <-p1.(*dstWireEnd).localDone:
+					if ackHorizonT != nil {
+						ackHorizonT.Stop()
+					}
+					cleanup()
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+				case <-p1.(*dstWireEnd).remoteDone:
+					if ackHorizonT != nil {
+						ackHorizonT.Stop()
+					}
+					cleanup()
+					if dstHostDead(l.host) {
+						goto redial
+					}
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+				case <-p1.(*dstWireEnd).rstKill:
+					if ackHorizonT != nil {
+						ackHorizonT.Stop()
+					}
+					cleanup()
+					if dstHostDead(l.host) {
+						goto redial
+					}
+					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+				}
+			}
+		case <-l.done:
+			stopBacklogHorizon()
+			cleanup()
+			goto refused
 		}
-		return dialer, nil
-	case <-l.done:
-		stopBacklogHorizon()
-		cleanup()
-		goto refused
 	}
 refused:
 	// The listener closed under this in-flight dial. One decision point for

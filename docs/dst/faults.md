@@ -520,7 +520,13 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   targeting uses the conn's host attribution
   (`dstConn.localHost`/`remoteHost`), so a cut touches exactly the targeted pair's cross-host conns in the
   cut direction (DST-FAULT-VICTIM). A dial checks BOTH handshake directions (SYN dialer→target, SYN-ACK
-  target→dialer), so a one-directional cut of either fails the connect. A refuse cut fails the dial
+  target→dialer), so a one-directional cut of either fails the connect — and the gate covers the
+  WHOLE handshake, not just its front door: a dial parked on a full accept backlog re-checks the
+  cut table on every partition change (a slot freed during a cut completes other dials, never the
+  parked one — the retransmitted SYN is dropped for the cut's whole duration), and the SYN-ACK
+  completion gates on its returning direction — each waiting for heal bounded by the retransmit
+  horizon (`ETIMEDOUT`; design.md's accept-backlog and connect-cost paragraphs,
+  `TestDSTNetBacklogParkPartitionTimesOut`/`…HealCompletes`, `TestDSTNetSYNACKPartition*`). A refuse cut fails the dial
   IMMEDIATELY (no ½-RTT SYN traversal), the same recorded timing simplification the direct
   declared-host `ECONNREFUSED` carries (design.md "Connect cost"). **Blackhole dominates refuse**: if a
   drop source (an isolated endpoint, or a blackhole-mode cut) is active on either handshake direction,
@@ -697,7 +703,14 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   and **tore at a byte boundary** (the physical torn-write shape: the bytes that went out before the cut
   landed, the rest did not — a strict subset of the arbitrary byte mixes the contract permits, which is
   the sound direction to be incomplete in); each unsynced directory-entry change (a create, a remove, a
-  rename-over) independently landed or did not; a file's unsynced size change landed or did not. Synced
+  rename-over) independently landed or did not; a file's unsynced **size** change draws over what
+  writeback can leave in the inode: a SHRINK (truncate-down) is one metadata update — it landed or it
+  did not — while a GROWTH additionally reaches every **intermediate page-boundary size** between the
+  durable and current lengths, because real writeback flushes the grown tail page by page and advances
+  the on-disk i_size as each lands (a file grown by several unsynced appends can crash at an i_size no
+  binary durable-or-current draw could produce; a page below the drawn size that did not land reads as
+  a hole, the sparse region delayed allocation leaves —
+  `TestDSTCrashTearIntermediateSizes`). Synced
   bytes and synced entries never move — no atomicity beyond `Sync`. A page past the live file's end (an
   unsynced truncate whose size change did not land) holds nothing to write back: the platter keeps the
   durable blocks the truncate never freed.

@@ -1298,9 +1298,206 @@ var dstSchedOvfPuts uint64
 
 func dstSchedStatsReset() {
 	dstSchedDecisions, dstSchedSysScheds, dstSchedRNGDraws, dstSchedOvfPuts = 0, 0, 0, 0
+	dstSchedSinceQuiesce = 0
 	if dstSchedTraceOn {
 		dstTrace = dstTraceState{}
 	}
+}
+
+// Wedge diagnosis: a run whose bubble can never reach durable quiescence is
+// permanently stuck in zero virtual time — the durably-blocked deadlock
+// detector cannot fire (some goroutine is always runnable), the run pins P=1
+// with async preemption and sysmon's retake disabled, and `go test -timeout`'s
+// watchdog goroutine is starved with everything else, so without a detector
+// the process wedges undiagnosed until an external kill (the hang modes
+// recorded in design.md's stdio/hang-modes paragraph). Two complementary arms
+// diagnose it loudly, both observation-only on healthy runs (no RNG draws, no
+// allocation, no new scheduler choices — enabling them cannot perturb a
+// schedule they observe):
+//
+//   - The QUIESCENCE arm (dstFindRunnable) counts scheduler decisions since
+//     the simulation bubble last reached durable quiescence
+//     (dstSchedSinceQuiesce, reset by maybeWakeLocked). A busy-poll or
+//     non-durable park loop (mutex ping-pong, Gosched spin) keeps making
+//     decisions but never lets the bubble quiesce, so the counter grows
+//     without bound; at the limit the run fails loud, naming the runnable
+//     simulation goroutines. Seed-pure: the failing decision index is a
+//     deterministic function of the seed.
+//   - The WALL arm (dstWedgeSysmonCheck, called from sysmon's loop) covers
+//     the decision-FREE wedge the quiescence arm structurally cannot see: a
+//     CALL-FREE spin loop (`for !flag.Load() {}`) never re-enters the
+//     scheduler, so no in-schedule counter can advance. sysmon still runs on
+//     its own M; when it observes the SAME simulation goroutine running with
+//     ZERO scheduler decisions for the whole wall window, the run is wedged
+//     and it throws, naming the goroutine. The wall bound is wall-clock by
+//     necessity (there is no seeded event to count), but it fires only on a
+//     run that made no scheduler decision at all for the entire window — a
+//     state a healthy run leaves within microseconds — so no non-wedged
+//     run's schedule can observe it. A goroutine inside a granted
+//     inherited-file capability syscall (g.dstHostIO) is exempt: a blocked
+//     capability write is a recorded LEGAL wall delay (design.md, the stdio
+//     stance), indistinguishable from the same-process-consumer wedge, so
+//     that sibling mode deliberately stays outside the detector.
+//
+// The detector cannot semantically distinguish "progress": a legitimate
+// program may make tens of millions of decisions between quiescences, or
+// compute call-free for a long stretch. The default bounds are therefore
+// generous, and the failure message says what was observed and names the
+// knob (testing/simulation Options.WedgeDecisionLimit / WedgeWallLimit).
+const (
+	dstWedgeDecisionsDefault = 1 << 26        // scheduler decisions since the last durable quiescence
+	dstWedgeWallDefaultNs    = 60_000_000_000 // 60s of wall time with zero scheduler decisions
+)
+
+// Per-run wedge bounds, set by testing/simulation at every admitted run entry
+// (the setCrashTear discipline): 0 selects the default, negative disables the
+// arm. Read by the single-P scheduler and (racily, observation-only) by sysmon.
+var dstWedgeDecisionLimit int64
+var dstWedgeWallLimitNs int64
+
+//go:linkname dstSetWedgeLimits
+func dstSetWedgeLimits(decisions, wallNs int64) {
+	dstWedgeDecisionLimit = decisions
+	dstWedgeWallLimitNs = wallNs
+}
+
+// dstSchedSinceQuiesce counts scheduler decisions since the simulation bubble
+// last reached durable quiescence. Incremented in dstFindRunnable (single-P,
+// serialized), reset by maybeWakeLocked when the sim bubble durably quiesces
+// and at bubble start (dstSchedStatsReset). Read racily by sysmon's wall arm,
+// which tolerates stale values (they only delay or reset its window).
+var dstSchedSinceQuiesce uint64
+
+// dstWedgeDecisionBound resolves the quiescence arm's limit: the configured
+// per-run value, the default when unset, 0 when disabled.
+func dstWedgeDecisionBound() uint64 {
+	switch lim := dstWedgeDecisionLimit; {
+	case lim < 0:
+		return 0
+	case lim == 0:
+		return dstWedgeDecisionsDefault
+	default:
+		return uint64(lim)
+	}
+}
+
+// dstWedgeResolvedBoundsFP reports the wedge detector's RESOLVED per-run
+// bounds — decisions and wall nanoseconds, 0 = that arm disabled — so a
+// white-box pin can assert the Options resolution (0 selects the default,
+// negative disables) without waiting out a disabled detector. Via //go:linkname.
+//
+//go:linkname dstWedgeResolvedBoundsFP
+func dstWedgeResolvedBoundsFP() (decisions uint64, wallNs int64) {
+	return dstWedgeDecisionBound(), dstWedgeWallBound()
+}
+
+// dstWedgeWallBound resolves the wall arm's limit: the configured per-run
+// value, the default when unset, 0 when disabled. The one resolution both
+// sysmon and the white-box FP read.
+func dstWedgeWallBound() int64 {
+	switch wall := dstWedgeWallLimitNs; {
+	case wall < 0:
+		return 0
+	case wall == 0:
+		return dstWedgeWallDefaultNs
+	default:
+		return wall
+	}
+}
+
+// dstWedgeMon is sysmon's wall-arm observation window: the simulation
+// goroutine it has watched running decision-free and since when. sysmon-only
+// state (one writer).
+var dstWedgeMon struct {
+	gp       guintptr // observed goroutine; guintptr, not *g: sysmon runs without a P, where write barriers are prohibited (gs are never freed, and allgs keeps the referent alive)
+	goid     uint64
+	dec      uint64
+	since    int64
+	lastTick int64
+}
+
+// dstWedgeSysmonCheck is sysmon's spin-wedge watchdog (the wall arm above).
+// Called on every sysmon cycle while DST is active; all reads are racy
+// observations (sysmon runs without the scheduler's locks), so any mismatch
+// or transient state just resets the window — the throw requires the same
+// simulation goroutine observed running, with the decision counter frozen,
+// across every tick of the whole window, plus a locked confirm of the
+// counter, so a torn racy read can only delay detection, never fire it.
+func dstWedgeSysmonCheck(now int64) {
+	limit := dstWedgeWallBound()
+	if limit == 0 || !dstActive() || dstSimBubble == nil {
+		dstWedgeMon.gp = 0
+		return
+	}
+	// The run pins GOMAXPROCS=1 (dstSimBubble is only set under simulation.Run),
+	// so the run's sole P is allp[0].
+	lock(&allpLock)
+	var pp *p
+	if len(allp) > 0 {
+		pp = allp[0]
+	}
+	unlock(&allpLock)
+	if pp == nil || atomic.Load(&pp.status) != _Prunning {
+		dstWedgeMon.gp = 0
+		return
+	}
+	mp := pp.m.ptr()
+	if mp == nil {
+		dstWedgeMon.gp = 0
+		return
+	}
+	gp := mp.curg
+	if gp == nil || !gp.dstSimG || gp.dstHostIO || readgstatus(gp)&^_Gscan != _Grunning {
+		dstWedgeMon.gp = 0
+		return
+	}
+	goid := gp.goid
+	dec := dstSchedSinceQuiesce + dstSchedDecisions // any movement in either resets the window
+	// A large gap between sysmon ticks means the whole PROCESS was stopped —
+	// SIGSTOP, a debugger attach, a hypervisor pause — not that the goroutine
+	// spun: CLOCK_MONOTONIC keeps advancing across such stops, so counting the
+	// gap would fire the detector on a healthy run someone paused. Restart the
+	// window instead; a real wedge keeps the P busy, sysmon awake (≤10ms
+	// ticks), and re-accumulates the whole window from live observations.
+	lastTick := dstWedgeMon.lastTick
+	dstWedgeMon.lastTick = now
+	if dstWedgeMon.gp.ptr() != gp || dstWedgeMon.goid != goid || dstWedgeMon.dec != dec ||
+		lastTick == 0 || now-lastTick > 1_000_000_000 {
+		dstWedgeMon.gp.set(gp)
+		dstWedgeMon.goid = goid
+		dstWedgeMon.dec = dec
+		dstWedgeMon.since = now
+		return
+	}
+	if now-dstWedgeMon.since < limit {
+		return
+	}
+	// Locked confirm: the racy per-tick reads agreed all window; re-read the
+	// counters under sched.lock so a torn read cannot have masked progress.
+	lock(&sched.lock)
+	confirmed := dstSchedSinceQuiesce+dstSchedDecisions == dec
+	unlock(&sched.lock)
+	if !confirmed || mp.curg != gp || !dstActive() {
+		dstWedgeMon.gp = 0
+		return
+	}
+	printlock()
+	print("DST-WEDGE: simulation goroutine ", goid, " has been running for ",
+		(now-dstWedgeMon.since)/1_000_000, " ms without a single scheduler decision.\n")
+	print("The run pins GOMAXPROCS=1 and disables preemption, so a bubble goroutine that neither blocks,\n")
+	print("yields, nor calls into the scheduler — a call-free spin loop such as `for !flag.Load() {}` —\n")
+	print("wedges the whole process: no other goroutine can ever run and virtual time cannot advance.\n")
+	print("Production Go completes such loops via async preemption; under the simulation they are a hang\n")
+	print("(design.md, hang modes). If this goroutine is legitimate long call-free computation, raise\n")
+	print("testing/simulation Options.WedgeWallLimit.\n\n")
+	goroutineheader(gp)
+	print("\tstack unavailable: the goroutine is running preemption-free on another thread\n")
+	if f := findfunc(gp.startpc); f.valid() {
+		print("\tstarted at: ", funcname(f), "\n")
+	}
+	printcreatedby(gp)
+	printunlock()
+	throw("DST-WEDGE: bubble goroutine perpetually runnable (call-free spin)")
 }
 
 // DST seeded-decision trace: a default-off, observation-only diagnostic that
@@ -2715,6 +2912,33 @@ func dstFenceActive() bool {
 	}
 	gp := getg()
 	return gp.bubble != nil && gp.bubble == dstSimBubble
+}
+
+// dstHostDeclaredHook reports whether a simulated host id has been declared
+// this run (a Host declaration or an implicit-host Process). Registered by
+// testing/simulation's init (which owns the name→id intern registry) and
+// queried by net through dstHostDeclared: a dial to a routable address NO
+// declared host owns must blackhole — nothing answers a SYN to an unowned
+// address — rather than refuse, and net cannot import testing/simulation
+// (the same always-linked-runtime relay pattern as the partition hook).
+var dstHostDeclaredHook func(host uint32) bool
+
+//go:linkname dstSetHostDeclaredHook
+func dstSetHostDeclaredHook(fn func(host uint32) bool) {
+	dstHostDeclaredHook = fn
+}
+
+// dstHostDeclared reports whether host is a declared simulated host. With no
+// hook registered (no testing/simulation in the binary — the white-box
+// activation path), every host reads declared, preserving the pre-hook
+// behavior. Reached from net via //go:linkname.
+//
+//go:linkname dstHostDeclared
+func dstHostDeclared(host uint32) bool {
+	if fn := dstHostDeclaredHook; fn != nil {
+		return fn(host)
+	}
+	return true
 }
 
 //go:linkname dstSetHostIO

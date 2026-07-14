@@ -271,11 +271,18 @@ func dstrandUint64(gp *g) uint64 {
 	return z ^ (z >> 31)
 }
 
-// dstrandn returns a deterministic value in [0,n) from g's DST RNG stream.
+// dstrandnRaw returns a deterministic value in [0,n) from g's DST RNG
+// stream, together with the raw 64-bit draw the bounded value was reduced
+// from. The seeded-decision trace records the raw draw as a choice site's
+// ident: a bounded index aliases in the order-independent xorIdent fold when
+// candidate counts are tiny (n=2 folds only 0/1), hiding a frozen stream
+// behind equal folds; the full-width draw keeps the fold's detection strength
+// uniform across sites (the timer site already records its raw key).
 //
 //go:nosplit
-func dstrandn(gp *g, n uint32) uint32 {
-	return uint32((uint64(uint32(dstrandUint64(gp))) * uint64(n)) >> 32)
+func dstrandnRaw(gp *g, n uint32) (j uint32, raw uint64) {
+	raw = dstrandUint64(gp)
+	return uint32((uint64(uint32(raw)) * uint64(n)) >> 32), raw
 }
 
 // dstReadRandom fills b from the active run's deterministic per-g RNG stream and

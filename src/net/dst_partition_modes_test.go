@@ -217,6 +217,11 @@ func TestDSTNetPartitionModeOneWayOverlapAndPartialHeal(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	simulation.RunWith(1, simulation.Options{}, func() {
+		// Declare the two hosts the raw ids below name: dstDialCut now treats
+		// an UNDECLARED target as an unowned address (blackhole), so a
+		// white-box probe of cut-mode composition must run over declared ids.
+		simulation.Host("h1", simulation.HostConfig{}, func() {}) // id 1
+		simulation.Host("h2", simulation.HostConfig{}, func() {}) // id 2
 		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
 		dstApplyPartitionOp(dstPartOpPartitionOneWay, 1, 2)
 		if _, cut, blackhole := dstPartCutStartDir(1, 2); !cut || !blackhole {
@@ -237,6 +242,8 @@ func TestDSTNetPartitionModeOneWayOverlapAndPartialHeal(t *testing.T) {
 		}
 	})
 	simulation.RunWith(1, simulation.Options{}, func() {
+		simulation.Host("h1", simulation.HostConfig{}, func() {}) // id 1 (see above)
+		simulation.Host("h2", simulation.HostConfig{}, func() {}) // id 2
 		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
 		dstApplyPartitionOp(dstPartOpIsolate, 1, 0)
 		dstApplyPartitionOp(dstPartOpHealHost, 1, 0)

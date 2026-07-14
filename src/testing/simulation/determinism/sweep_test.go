@@ -31,8 +31,13 @@ import (
 // computed and the order in which its goroutines emitted them, with virtual
 // timestamps — the full decision-relevant record one string can pin.
 func sweepProgram(seed uint64) string {
+	return sweepProgramWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}})
+}
+
+// sweepProgramWith is sweepProgram under caller-chosen run options (the
+// network config must match sweepProgram's for transcripts to be comparable).
+func sweepProgramWith(seed uint64, opts simulation.Options) string {
 	var b strings.Builder
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}
 	simulation.RunWith(seed, opts, func() {
 		start := time.Now()
 		var mu sync.Mutex
@@ -184,6 +189,24 @@ func TestSameSeedCrossRunTranscript(t *testing.T) {
 	}
 	if len(distinct) < 2 {
 		t.Errorf("transcript identical across %d seeds; the seed must vary the run", sweepSeeds)
+	}
+}
+
+// TestWedgeDetectorObservationNeutral: the wedge detector (the loud diagnosis
+// of a bubble that can never reach durable quiescence) is observation-only on
+// healthy runs — it rides the already-existing decision path with no RNG draw
+// and no new scheduler choice, so the composed program's transcript is
+// byte-identical with the detector armed at its defaults and with both arms
+// disabled. Mutation: any detector arm that draws from a seeded stream or
+// perturbs a decision diverges the transcripts.
+func TestWedgeDetectorObservationNeutral(t *testing.T) {
+	net := simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}
+	for seed := uint64(0); seed < 8; seed++ {
+		armed := sweepProgram(seed) // default options: both arms armed at their default bounds
+		off := sweepProgramWith(seed, simulation.Options{Network: net, WedgeDecisionLimit: -1, WedgeWallLimit: -1})
+		if armed != off {
+			t.Fatalf("wedge detector perturbed a healthy run at seed %d:\n--- armed ---\n%s\n--- disabled ---\n%s", seed, armed, off)
+		}
 	}
 }
 

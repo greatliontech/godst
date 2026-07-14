@@ -78,6 +78,9 @@ func dstProcessStateTeardown(proc uint32)
 //go:linkname dstSetMappingFaultTeardownHook runtime.dstSetMappingFaultTeardownHook
 func dstSetMappingFaultTeardownHook(fn func(proc uint32))
 
+//go:linkname dstSetHostDeclaredHook runtime.dstSetHostDeclaredHook
+func dstSetHostDeclaredHook(fn func(host uint32) bool)
+
 //go:linkname dstSelfCrashed runtime.dstSelfCrashed
 func dstSelfCrashed() bool
 
@@ -413,6 +416,19 @@ func activeProcClearAll(proc uint32) {
 }
 
 func internHost(name string) uint32 {
+	host, fresh := internHostLocked(name)
+	if fresh && runActive.Load() {
+		// A fresh implicit host is a machine booting mid-run, exactly like an
+		// explicit Host declaration: relay host-up so a dial blackholing on
+		// the (previously unowned, hence unanswering) address wakes and finds
+		// the new kernel. After the intern mutex is released — the relay
+		// takes net's partition-table lock.
+		dstNetPartitionOp(partOpHostUp, host, 0)
+	}
+	return host
+}
+
+func internHostLocked(name string) (host uint32, fresh bool) {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
 	if nodeReg.hosts == nil {
@@ -421,16 +437,29 @@ func internHost(name string) uint32 {
 		nodeReg.hosts = make(map[string]uint32)
 	}
 	if id, ok := nodeReg.hosts[name]; ok {
-		return id
+		return id, false
 	}
-	host := nodeReg.nextHost + 1
+	host = nodeReg.nextHost + 1
 	// An implicit host has the zero clock configuration. Establish it before
 	// publishing the name so table exhaustion leaves the registry untouched.
 	dstReestablishHostClock(host, 0, 0)
 	nodeReg.nextHost = host
 	nodeReg.hosts[name] = host
 	setHostIdent(host, name, 0)
-	return host
+	return host, true
+}
+
+func init() { dstSetHostDeclaredHook(hostDeclared) }
+
+// hostDeclared reports whether id names a declared host of the current run:
+// host 0 (the root) always exists, and declared ids are allocated
+// contiguously from 1 (Host declarations and implicit-host Processes share
+// nodeReg.nextHost), so the declared set is exactly [0, nextHost]. Queried by
+// net through the runtime relay for the unowned-address dial blackhole.
+func hostDeclared(id uint32) bool {
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	return id <= nodeReg.nextHost
 }
 
 func internProc(name string) uint32 {

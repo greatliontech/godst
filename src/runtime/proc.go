@@ -6765,6 +6765,14 @@ func sysmon() {
 		} else {
 			idle++
 		}
+		// Under an active simulation, watch for the decision-free wedge (a
+		// call-free in-bubble spin loop): with P=1, async preemption off, and
+		// the retakes above gated, sysmon is the only agent that still runs,
+		// so it carries the diagnosis. Observation-only on healthy runs; see
+		// dstWedgeSysmonCheck (runtime/dst.go).
+		if dstBuild && dstActive() {
+			dstWedgeSysmonCheck(now)
+		}
 		// check if we need to force a GC
 		//
 		// Under deterministic scheduling (DST active), skip the
@@ -7989,6 +7997,18 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 		break
 	}
 	dstSchedDecisions++
+	// The quiescence arm of the wedge detector (see runtime/dst.go): count
+	// decisions since the simulation bubble last durably quiesced, and fail
+	// loud at the bound — a bubble that can never quiesce is permanently stuck
+	// in zero virtual time (a busy-poll / non-durable park loop), invisible to
+	// the durably-blocked deadlock detector. Observation-only until it fires:
+	// one counter increment and a compare, no RNG draw, no allocation.
+	if dstSimBubble != nil {
+		dstSchedSinceQuiesce++
+		if bound := dstWedgeDecisionBound(); bound > 0 && dstSchedSinceQuiesce >= bound {
+			dstWedgeThrowScheduler(&c, total)
+		}
+	}
 	// Runtime-internal goroutines outside any bubble (g.bubble == nil — the
 	// runtime's own goroutines, e.g. the background mark worker or the main
 	// goroutine; the bubble's finalizer/cleanup drains have g.bubble set and are not
@@ -8070,6 +8090,45 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	gp, inheritTime = c.removeAt(sel)
 	unlock(&sched.lock)
 	return gp, inheritTime
+}
+
+// dstWedgeThrowScheduler fails a run whose bubble reached the wedge detector's
+// quiescence bound (see the wedge-diagnosis comment in runtime/dst.go): the
+// bubble made dstSchedSinceQuiesce scheduler decisions without ever becoming
+// durably quiescent, so virtual time can never advance and the run is stuck —
+// a busy-poll or non-durable park loop the durably-blocked deadlock detector
+// structurally cannot see. Prints every runnable simulation candidate (the
+// perpetually-runnable set the spin lives in) with its stack — the candidates
+// are runnable, not running, so their stacks are stable at P=1 — then throws.
+// Called from dstFindRunnable with sched.lock held (throw under sched.lock is
+// the checkdead precedent).
+func dstWedgeThrowScheduler(c *dstCandidates, total uint32) {
+	printlock()
+	print("DST-WEDGE: the simulation bubble made ", dstSchedSinceQuiesce,
+		" scheduler decisions without reaching durable quiescence.\n")
+	print("Some goroutine set stays perpetually runnable (a busy-poll: a Gosched/select spin, mutex\n")
+	print("ping-pong, or another non-durable park loop), so all-goroutines-durably-blocked never holds:\n")
+	print("virtual time cannot advance, timers never fire, and the run is permanently stuck in zero\n")
+	print("virtual time — invisible to the deadlock detector, which needs every goroutine durably\n")
+	print("blocked. If the workload legitimately makes this many decisions between quiescences, raise\n")
+	print("testing/simulation Options.WedgeDecisionLimit.\n")
+	print("\nrunnable simulation goroutines at the failing decision:\n")
+	for k := uint32(0); k < total; k++ {
+		gp := c.at(k)
+		if gp == nil || dstIsInfraCandidate(gp) {
+			continue
+		}
+		print("\n")
+		goroutineheader(gp)
+		if readgstatus(gp)&^_Gscan == _Grunning {
+			print("\tgoroutine running; stack unavailable\n")
+			printcreatedby(gp)
+		} else {
+			traceback(^uintptr(0), ^uintptr(0), 0, gp)
+		}
+	}
+	printunlock()
+	throw("DST-WEDGE: simulation bubble cannot reach durable quiescence (perpetually runnable goroutine)")
 }
 
 // dstSchedSelect returns the index in [0,total) of the candidate to run next

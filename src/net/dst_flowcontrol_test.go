@@ -464,7 +464,7 @@ func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
 	var firstN int
-	var firstErr, secondErr error
+	var firstErr, secondErr, thirdErr, writeErr error
 	var buf [8]byte
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
@@ -492,6 +492,8 @@ func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
 			time.Sleep(2 * time.Second) // horizon kills the end
 			firstN, firstErr = c.Read(buf[:])
 			_, secondErr = c.Read(make([]byte, 8))
+			_, thirdErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("after"))
 			close(done)
 			c.Close()
 		})
@@ -500,7 +502,13 @@ func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
 		t.Errorf("first read on the killed end = (%d, %q, %v), want (3, %q, nil): delivered data drains before the error", firstN, buf[:firstN], firstErr, "pre")
 	}
 	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
-		t.Errorf("second read on the killed end = %v, want ETIMEDOUT", secondErr)
+		t.Errorf("second read on the killed end = %v, want ETIMEDOUT (the first FAILING op consumes the one-shot sk_err)", secondErr)
+	}
+	if thirdErr != io.EOF {
+		t.Errorf("read after the consumed timeout = %v, want io.EOF (the CLOSED-socket read identity)", thirdErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed timeout = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
 	}
 }
 
@@ -796,4 +804,108 @@ func TestDSTNetSameHostWriteWriteDeadlocks(t *testing.T) {
 			<-done
 		})
 	})
+}
+
+// TestDSTNetHorizonOneShotReadFirst: retransmission exhaustion pends
+// ETIMEDOUT as the kernel's ONE-SHOT sk_err, exactly like an RST's
+// ECONNRESET (host-probed via TCP_USER_TIMEOUT zero-window death:
+// tcp_write_err sets sk_err=ETIMEDOUT, the first failing op consumes it,
+// later reads return EOF and later writes EPIPE). Read-first ladder: the
+// first read after the horizon death reports ETIMEDOUT, a second read plain
+// io.EOF, and writes the CLOSED-socket EPIPE. Mirrors
+// TestDSTNetResetDrainsDeliveredThenResets' ECONNRESET ladder.
+func TestDSTNetHorizonOneShotReadFirst(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstErr, secondErr, writeErr, secondWriteErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi"))       // buffers, arms the watchdog
+			time.Sleep(2 * time.Second) // the 1s horizon kills the end
+			_, firstErr = c.Read(make([]byte, 8))
+			_, secondErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("after"))
+			_, secondWriteErr = c.Write([]byte("after2"))
+			close(done)
+			c.Close()
+		})
+	})
+	var opErr *OpError
+	if !errors.Is(firstErr, syscall.ETIMEDOUT) || !errors.As(firstErr, &opErr) || opErr.Op != "read" || opErr.Net != "tcp" {
+		t.Errorf("first read after horizon death = %v, want a tcp read *OpError wrapping ETIMEDOUT (the one-shot sk_err)", firstErr)
+	}
+	if secondErr != io.EOF {
+		t.Errorf("second read after the consumed timeout = %v, want io.EOF (the CLOSED-socket read identity)", secondErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed timeout = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
+	}
+	if !errors.Is(secondWriteErr, syscall.EPIPE) {
+		t.Errorf("second write after the consumed timeout = %v, want EPIPE", secondWriteErr)
+	}
+}
+
+// TestDSTNetHorizonOneShotWriteFirst: the one-shot ETIMEDOUT is consumed by
+// whichever failing op comes FIRST — write-first here (host-probed ladder:
+// write ETIMEDOUT, then write EPIPE, then reads io.EOF). Complements the
+// read-first ladder above; mirrors TestDSTNetResetWriteFirstConsumesSkErr.
+func TestDSTNetHorizonOneShotWriteFirst(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var firstWriteErr, secondWriteErr, readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-done
+				c.Close()
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli")
+			c.Write([]byte("hi"))
+			time.Sleep(2 * time.Second)
+			_, firstWriteErr = c.Write([]byte("x"))
+			_, secondWriteErr = c.Write([]byte("y"))
+			_, readErr = c.Read(make([]byte, 8))
+			close(done)
+			c.Close()
+		})
+	})
+	var opErr *OpError
+	if !errors.Is(firstWriteErr, syscall.ETIMEDOUT) || !errors.As(firstWriteErr, &opErr) || opErr.Op != "write" || opErr.Net != "tcp" {
+		t.Errorf("first write after horizon death = %v, want a tcp write *OpError wrapping ETIMEDOUT (consumes the one-shot sk_err)", firstWriteErr)
+	}
+	if !errors.Is(secondWriteErr, syscall.EPIPE) {
+		t.Errorf("second write after the consumed timeout = %v, want EPIPE", secondWriteErr)
+	}
+	if readErr != io.EOF {
+		t.Errorf("read after the consumed timeout = %v, want io.EOF", readErr)
+	}
 }

@@ -163,6 +163,13 @@ func (bubble *synctestBubble) maybeWakeLocked() *g {
 	// Two wakes happening at the same time leads to very confusing failure modes,
 	// so we take steps to avoid it happening.
 	bubble.active++
+	if dstBuild && bubble == dstSimBubble {
+		// Durable quiescence: the bubble proved it can advance virtual time,
+		// so the wedge detector's quiescence window restarts (see the
+		// wedge-diagnosis comment in runtime/dst.go). Serialized with the
+		// scheduler's increments by the single-P DST regime.
+		dstSchedSinceQuiesce = 0
+	}
 	next := bubble.timers.wakeTime()
 	if next > 0 && next <= bubble.now {
 		// A timer is scheduled to fire. Wake the root goroutine to handle it.

@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -442,11 +443,73 @@ func TestDSTInheritFileRunOwnership(t *testing.T) {
 			}
 		})
 	})
-	if _, err := capability.Write(nil); !errors.Is(err, os.ErrClosed) {
-		t.Errorf("post-run capability write = %v, want os.ErrClosed", err)
+	if _, err := capability.Write(nil); err == nil || errors.Is(err, os.ErrClosed) ||
+		!strings.Contains(err.Error(), "scoped to the simulation run") {
+		// Temporal scope: the capability is NOT closed post-run (its hidden
+		// duplicate is still open), so the refusal is the typed stale-run
+		// error, never the misdirecting closed shape.
+		t.Errorf("post-run capability write = %v, want the stale-run refusal", err)
 	}
 	if err := capability.Close(); err != nil {
 		t.Errorf("post-run capability close: %v", err)
+	}
+}
+
+// TestDSTInheritFileStaleRunRefusal pins the TEMPORAL scope of an inherited
+// capability (the node-scoped refusal's sibling): a capability granted by one
+// run and used after it — or during a LATER run — refuses with the typed
+// stale-run identity, never os.ErrClosed (it is not closed; its hidden host
+// duplicate is open until Close), while Close keeps working in every temporal
+// state to release the duplicate, and a capability the program actually
+// Closed reports os.ErrClosed.
+func TestDSTInheritFileStaleRunRefusal(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	var capability *os.File
+	Run(1, func() {
+		capability, err = InheritFile(w)
+		if err != nil {
+			t.Fatalf("InheritFile: %v", err)
+		}
+	})
+
+	assertStale := func(op string, err error) {
+		t.Helper()
+		if err == nil || errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "scoped to the simulation run") {
+			t.Errorf("%s = %v, want the typed stale-run refusal (not os.ErrClosed)", op, err)
+		}
+		var pe *fs.PathError
+		if err != nil && !errors.As(err, &pe) {
+			t.Errorf("%s error = %T, want *fs.PathError", op, err)
+		}
+	}
+
+	// Post-run arm: the granting run is over.
+	_, err = capability.Write([]byte("x"))
+	assertStale("post-run Write", err)
+	_, err = capability.Read(make([]byte, 1))
+	assertStale("post-run Read", err)
+
+	// Second-run arm: a LATER run must refuse the stale grant identically —
+	// and Close inside that run must still release the duplicate.
+	Run(2, func() {
+		_, err := capability.Write([]byte("x"))
+		assertStale("second-run Write", err)
+		_, err = capability.Seek(0, 0)
+		assertStale("second-run Seek", err)
+		if err := capability.Close(); err != nil {
+			t.Errorf("second-run capability Close = %v, want success (Close always works)", err)
+		}
+	})
+
+	// Genuinely closed: the closed shape is now the correct diagnosis.
+	if _, err := capability.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("closed capability write = %v, want os.ErrClosed", err)
 	}
 }
 
@@ -475,4 +538,54 @@ func inheritFilePanic(f func()) (value any) {
 	defer func() { value = recover() }()
 	f()
 	return nil
+}
+
+// TestDSTInheritFileOutsideBubbleRefusal pins the CONCURRENT (same-run,
+// outside-bubble) arm of the capability scope: a goroutine started before the
+// run that operates the live capability mid-run gets the typed run-scope
+// refusal (never os.ErrClosed, never host I/O at an unseeded instant), and
+// its Close gets the unsupported-shape refusal — the run is live and its
+// schedule sovereign, so the always-works Close rule is temporal-only.
+func TestDSTInheritFileOutsideBubbleRefusal(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	var capability atomic.Pointer[os.File]
+	var opErrP, closeErrP atomic.Pointer[error]
+	var done atomic.Bool
+	go func() {
+		for capability.Load() == nil {
+			time.Sleep(time.Millisecond)
+		}
+		f := capability.Load()
+		_, opErr := f.Write([]byte("x"))
+		closeErr := f.Close()
+		opErrP.Store(&opErr)
+		closeErrP.Store(&closeErr)
+		done.Store(true)
+	}()
+
+	Run(1, func() {
+		f, err := InheritFile(w)
+		if err != nil {
+			t.Fatalf("InheritFile: %v", err)
+		}
+		capability.Store(f)
+		for !done.Load() {
+			time.Sleep(10 * time.Millisecond) // virtual; the foreign goroutine runs between quiescences
+		}
+	})
+
+	opErr := *opErrP.Load()
+	if opErr == nil || errors.Is(opErr, os.ErrClosed) || !strings.Contains(opErr.Error(), "scoped to the simulation run") {
+		t.Errorf("outside-bubble mid-run capability write = %v, want the typed run-scope refusal (not os.ErrClosed)", opErr)
+	}
+	closeErr := *closeErrP.Load()
+	if closeErr == nil || !strings.Contains(closeErr.Error(), "unsupported under deterministic simulation") {
+		t.Errorf("outside-bubble mid-run capability Close = %v, want the unsupported-shape refusal (the run is live)", closeErr)
+	}
 }

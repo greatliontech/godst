@@ -348,7 +348,14 @@ it never wraps a positive delay into an earlier delivery.
 - **Retransmission horizon.** Bytes that stay undeliverable because the link is **partitioned**
   error the connection with `ETIMEDOUT` after a fixed virtual horizon (`Options.Network.RetransmitTimeout`,
   default 2 minutes of bubble time — kernel-shaped: ~15 retries), on the blocked or subsequent
-  operation (`TestDSTNetWriteHorizonTimesOut`, `TestDSTNetDialPartitionHorizonTimesOut`). This holds
+  operation (`TestDSTNetWriteHorizonTimesOut`, `TestDSTNetDialPartitionHorizonTimesOut`). The
+  `ETIMEDOUT` is the kernel's **one-shot `sk_err`**, exactly like a reset's `ECONNRESET`
+  (host-probed via a TCP_USER_TIMEOUT zero-window death: tcp_write_err pends `sk_err = ETIMEDOUT`
+  and tcp_done closes the socket): the FIRST failing op — read or write, after any receive-queue
+  drain — consumes it, every later read returns `io.EOF` and every later write `EPIPE`, the
+  CLOSED-socket identities (`TestDSTNetHorizonOneShotReadFirst`,
+  `TestDSTNetHorizonOneShotWriteFirst`; a dial's `ETIMEDOUT` establishes no connection, so there is
+  nothing to latch). This holds
   for ANY undeliverable bytes, not only a blocked buffer-full write: a small write into a cut link
   returns immediately (TCP's async send — the bytes buffer), but the conn is dead at the horizon and
   the next operation fails (`TestDSTNetSmallWriteHorizonKillsConn`); a blocked read holding dying
@@ -403,12 +410,15 @@ it never wraps a positive delay into an earlier delivery.
   power fails — it re-enters the blackhole wait instead of surfacing the dead listener's teardown
   as a refusal (`TestDSTCrashHostMidHandshakeDialTimesOut`). The machine-off mark is distinct from a network cut: a
   `HealHost` cannot make a powered-off machine reachable, and a reboot does not heal an injected
-  isolation. **Pending (lands
-  with the FIN/RST follow-on):** a dial to an address **no declared host owns** should blackhole and
-  fail `ETIMEDOUT` (nothing answers SYNs) — the peer-down/unreachable split; today it also returns
-  `ECONNREFUSED`. This case is reachable only via a hand-constructed literal `10.x` IP (`HostIP`
-  panics on an undeclared host), so it needs net to learn the declared-host set (a query hook like
-  the partition hook) before it can distinguish refuse from blackhole.
+  isolation. A dial to an address **no declared host owns** blackholes the same way and fails
+  `ETIMEDOUT` (nothing answers a SYN to an unowned address; an RST needs a live kernel) — the
+  peer-down/unreachable split — until a `Host` (or implicit-host `Process`) declaration boots a
+  machine at the address, which relays host-up and wakes parked dials exactly as a reboot does
+  (`ECONNREFUSED` until a listener is up, then connect). net learns the declared-host set through a
+  runtime query hook to testing/simulation's intern registry (the partition-hook pattern); the case
+  is reachable only via a hand-constructed literal `10.x` IP, since `HostIP` panics on an undeclared
+  host (`TestDSTNetUnownedAddressDialTimesOut`, `TestDSTNetUnownedAddressDialDeadline`,
+  `TestDSTNetUnownedAddressLateDeclaration`).
 - **Peer close FIN read semantics — landed; post-FIN write/reset semantics pending.** Reads after a peer's
   graceful close drain buffered data, then `io.EOF` (landed). FIN is a delayed control event: its
   arrival pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
@@ -422,7 +432,10 @@ it never wraps a positive delay into an earlier delivery.
   one-shot `sk_err`** (host-probed ladder): the FIRST failing op on a reset connection — read or
   write, after any receive-queue drain — consumes the pending error and reports `ECONNRESET`;
   every later read returns `io.EOF` and every later write `EPIPE` (Go suppresses `SIGPIPE` on
-  sockets, so `EPIPE` is the returned errno), the CLOSED-socket identities. An RST that arrives
+  sockets, so `EPIPE` is the returned errno), the CLOSED-socket identities. Retransmit-exhaustion
+  death pends the SAME one-shot with `ETIMEDOUT` (the Retransmission-horizon bullet); `sk_err` is
+  one per-socket field, so whichever teardown pends first owns the single consumption (an RST
+  arriving after the horizon already killed the end does not flip the identity, and vice versa). An RST that arrives
   after the peer's FIN was already delivered (production `CLOSE_WAIT`) pends `EPIPE`, not
   `ECONNRESET` (`tcp_reset`'s `CLOSE_WAIT` arm) — and since an `EPIPE` consumption is
   indistinguishable from the post-consumption identities, that arm reads EOF and writes `EPIPE`
@@ -517,7 +530,25 @@ the bubble's virtual clock. A FULL accept backlog (128 pending connections) drop
 within the retransmit horizon, and otherwise fails `ETIMEDOUT` — a deadline-less dial into a
 saturated listener fails in bounded virtual time, never a permanent sim-only hang
 (`TestDSTNetBacklogFullDialTimesOut`; the horizon arms after the SYN traversal, so the bound is
-½RTT + horizon — never earlier than a kernel's connect()-anchored timer). Closing a listener
+½RTT + horizon — never earlier than a kernel's connect()-anchored timer). The backlog park is
+**partition-gated** like the front-door blackhole wait: while either handshake direction is cut,
+the retransmitted SYN cannot reach the listener, so an Accept freeing a slot during the cut
+completes OTHER dials, never this one — the parked dial waits for heal bounded by the same horizon
+(`ETIMEDOUT` under a permanent cut, completion on heal-before-horizon, both one-way orientations:
+`TestDSTNetBacklogParkPartitionTimesOut`, `TestDSTNetBacklogParkPartitionHealCompletes`), and a
+refuse-mode cut answers the retransmitted SYN with the SYN_SENT `ECONNREFUSED`. The **SYN-ACK leg**
+gates on its own (returning) direction at completion: a cut of listener→dialer active when the
+acknowledgment would arrive holds connect(2) — the server's SYN-ACK retransmits into the void —
+until heal or `ETIMEDOUT` at a horizon anchored at the first cut observation on that leg
+(`TestDSTNetSYNACKPartitionTimesOut`, `TestDSTNetSYNACKPartitionHealCompletes`), while a cut of
+only the FORWARD direction landing after the SYN traversed does not hold the dialer — connect(2)
+completes on receiving the SYN-ACK; the lost final ACK is the server child's failure surface
+(`TestDSTNetSYNACKForwardCutStillCompletes`). A gate that fails the dial (`ETIMEDOUT`, refuse, or
+a reset observed at heal — the heal path re-checks the same deciding observers as the zero-latency
+arm, `TestDSTNetSYNACKHealObservesReset`) resets both ends, including a server end the SUT may
+have ALREADY Accepted — the forced consequence of the recorded ½-RTT collapse (the server sees the
+conn before the handshake completes, where real TCP accepts only established children and its
+SYN_RECV child dies silently); the accepted survivor observes an ordinary reset. Closing a listener
 resets the connections still in its accept backlog (production's RST), so a dialer that already
 succeeded observes `ECONNRESET` (the one-shot, on its first failing op) instead of blocking durably
 forever, and `Accept` after `Close`
@@ -979,6 +1010,17 @@ record a cluster node emits. Two real machines cannot share an open file descrip
 use is the cross-node-channel escape the grant contract forbids, with no production error to mimic.
 Cross-node output (a cluster node's logging) is relayed in-model — over the simulated network or a
 shared channel — to the root body, which owns the capability (`TestDSTInheritFileRunOwnership`).
+The grant is also **run-scoped in time**: a capability operated after its run, during a LATER run,
+or from a goroutine outside the run's bubble refuses with a typed **stale-run** error — the
+node-scoped refusal's temporal sibling, never the closed shape, because the capability is NOT
+closed (its hidden duplicate stays open) and a closed-file identity would misdirect diagnosis
+toward close bugs — while `Close` works in every TEMPORAL state (post-run, later run) to release
+the duplicate (the pipe's temporal stance). The concurrent arm is spatial, not temporal: a
+goroutine outside the bubble of the LIVE granting run gets the same typed refusal for ops, but its
+`Close` keeps the unsupported-shape refusal — the run's schedule is sovereign, and an
+outside-schedule host close would race it (`TestDSTInheritFileOutsideBubbleRefusal`). A capability
+the program actually closed reports `os.ErrClosed`
+(`TestDSTInheritFileStaleRunRefusal`).
 The SUT fence does not apply to the **testing framework's own output stream**: the `-v` chatty
 printer (and the benchmark `b.Log` output branch) is framework-owned host plumbing, constructed
 from the pre-run host stdout before any run exists, and under `-v` its writes (t.Log routing,
@@ -1034,13 +1076,41 @@ deterministic. The dual failure mode is recorded plainly: a goroutine blocked **
 capability is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
 nor declare deadlock, so the run hangs until the read returns. Reading the real terminal under a
 run is therefore an explicit capability choice, not an accidental numeric-fd escape. A third hang
-mode shares the shape: a bubble goroutine executing a CALL-FREE spin loop (no preemption point —
-e.g. `for !flag.Load() {}`) wedges the whole process, because the run pins P=1, disables async
-preemption, and gates sysmon's retake — no other goroutine (bubble, foreign, or watchdog) can ever
-run, and the durably-blocked detector never fires over a running goroutine. Production Go completes
-such a program (async preemption keeps peers running); under DST it is an undiagnosed wall-clock
-hang — a recorded boundary of the cooperative single-P model (no in-process diagnosis exists
-today; only an external kill ends the run).
+mode shares the shape: a bubble that can never reach durable quiescence because some goroutine
+stays perpetually runnable — a CALL-FREE spin loop (no preemption point — e.g.
+`for !flag.Load() {}`), or a non-durable park loop (mutex ping-pong, a Gosched/select busy-poll)
+— wedges the run, because the run pins P=1, disables async preemption, and gates sysmon's retake,
+and the durably-blocked deadlock detector needs EVERY goroutine durably blocked. Production Go
+completes the call-free form (async preemption keeps peers running) and merely livelocks the
+busy-poll form; under DST both are permanent (virtual time can never advance). This mode is
+**diagnosed, not merely recorded**: the wedge detector fails the run with a loud typed fatal error
+(`DST-WEDGE`) naming the guilty goroutine(s), instead of wedging until an external kill. Two arms,
+both observation-only on healthy runs (they ride the existing decision path — no RNG draw, no new
+scheduler choice; same-seed transcripts are byte-identical with the detector armed or disabled,
+`TestWedgeDetectorObservationNeutral`): the **quiescence arm** counts scheduler decisions since the
+bubble's last durable quiescence and fails at a bound — seed-pure, since the failing decision index
+is a function of the seed — printing every runnable simulation goroutine's stack
+(`TestDSTWedgeParkLoop`); the **wall arm** covers the decision-free call-free spin, which
+structurally no in-schedule counter can see (the spinner never re-enters the scheduler): sysmon,
+still running on its own M, throws when the SAME simulation goroutine has run with ZERO scheduler
+decisions for a full wall window, naming the goroutine by id, entry function, and creation site
+(`TestDSTWedgeSpinCallFree`). The wall bound is wall-clock by necessity, but it fires only on a run
+that made no scheduler decision at all for the entire window — a state a healthy run leaves within
+microseconds — so no non-wedged run's schedule can observe it; and the window accumulates only from
+LIVE monitor observations (a gap between monitor ticks longer than a second — the whole process
+stopped by SIGSTOP, a debugger, or a hypervisor pause, across which CLOCK_MONOTONIC keeps advancing —
+restarts the window rather than counting the stop against the run). The detector cannot semantically
+distinguish a wedge from legitimate long computation, so both bounds are generous by default
+(2²⁶ decisions; 60 s) and configurable per run (`Options.WedgeDecisionLimit`,
+`Options.WedgeWallLimit`; negative disables an arm), and the failure text says what was observed
+and names the knob. One sibling wedge stays deliberately OUTSIDE the detector: a granted capability
+WRITE blocked in its raw syscall whose unblocking consumer is a goroutine in the same process
+(probe-verified: `anon_pipe_write` on the main thread, all peers futex-parked, SIGQUIT dead) is
+indistinguishable from the LEGAL blocked capability write above — the "delays the run in wall time
+but cannot reorder it" contract holds only when the unblocker is out-of-process, but a detector kill
+would be a false positive on every in-spec slow out-of-process consumer, so goroutines inside the
+scoped capability dispatch (`g.dstHostIO`) are exempt and that wedge remains program discipline
+(feed a capability's consumer from outside the process, or relay in-model).
 Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
 `ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
 `Getpid` are Options-pinned; env APIs operate on the per-process simulated environment (see the
@@ -1698,9 +1768,26 @@ later steps add, never rewrite.
 
 ### Pending features
 
-With the three I/O axes landed (network, disk, pipes), one feature remains: layering fault
-injection on top of the virtualized substrate. Most of its axes are landed (see the source table); the
-open work is the OOM and scheduling faults and the declarative orchestration layer.
+With the three I/O axes landed (network, disk, pipes), the remaining work is the fault-orchestration
+layer's open axes and a set of net-model increments. Most fault axes are landed (see the source
+table); the open work is the OOM and scheduling faults and the declarative orchestration layer.
+
+- **Net-model increments** (each recorded inline where it bites — never silent — and tracked here):
+  - **FIN/RST first-write shape.** The first write after a peer's FULL close today fails instantly
+    `ECONNRESET` (a recorded divergence, allowlisted in conformance); the production shape is
+    accept-into-the-send-buffer — the FIN closed only the peer's send direction — with the elicited
+    RST erroring a SUBSEQUENT op after its round trip (the `CLOSE_WAIT` arm: later writes `EPIPE`,
+    reads drain then `io.EOF`, no `ECONNRESET`). Wants delayed-RST delivery machinery on the wire
+    (the same fake-clock policy shape as FIN delivery). See the FIN/RST paragraph above for the
+    landed read side and the recorded divergence.
+  - **Sim-DNS.** Dial-by-hostname: a minimal `hostname → routable IP` lookup over the declared-host
+    assignment (faults.md, per-host address space) — a relay from net to testing/simulation's
+    intern registry, like the declared-host query hook. Until it lands, DNS-by-name stays fenced;
+    its error identities (NXDOMAIN shape, resolver API scope) are the increment's design work.
+  - **UDP / `PacketConn`.** The datagram transport, which is also what unlocks the packet-granular
+    fault axis (drop/reorder/duplicate — degrees of freedom a reliable in-order stream does not
+    have; see the network-faults collapse-check in faults.md). Reuses the Host/Process victim
+    contract and the fault table unchanged (DST-FAULT-NONFORECLOSE).
 
 - **Fault orchestration** — compose scheduling, network, disk, clock, OOM, and crash/restart faults under
   one seed, with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound);

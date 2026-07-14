@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // dstEnv is the white-box DST knob combination for the low-level mechanism
@@ -1543,6 +1544,52 @@ func TestDSTSchedForeignSpinner(t *testing.T) {
 	}
 }
 
+// TestDSTWedgeSpinCallFree: a bubble goroutine in a CALL-FREE spin loop (no
+// preemption point) wedges the whole process — no scheduler decision can ever
+// happen again, so only sysmon's wall arm can see it. The run must die with
+// the loud DST-WEDGE diagnostic naming the spinning goroutine, not hang until
+// the test timeout. Mutation: neutering dstWedgeSysmonCheck (or its sysmon
+// call) leaves the subprocess wedged until testenv's deadline kills it, and
+// the diagnostic never appears.
+func TestDSTWedgeSpinCallFree(t *testing.T) {
+	out := runTestProgDST(t, "DSTWedgeSpinCallFree")
+	if !strings.Contains(out, "DST-WEDGE") ||
+		!strings.Contains(out, "call-free spin") ||
+		!strings.Contains(out, "without a single scheduler decision") {
+		t.Fatalf("call-free spinner did not get the DST-WEDGE diagnostic:\n%s", out)
+	}
+	if !strings.Contains(out, "Options.WedgeWallLimit") {
+		t.Fatalf("diagnostic does not name the knob:\n%s", out)
+	}
+	if !strings.Contains(out, "goroutine ") {
+		t.Fatalf("diagnostic does not name the spinning goroutine:\n%s", out)
+	}
+	if strings.Contains(out, "unreachable") {
+		t.Fatalf("wedged run returned instead of failing loud:\n%s", out)
+	}
+}
+
+// TestDSTWedgeParkLoop: a bubble that keeps scheduling but never reaches
+// durable quiescence (mutex ping-pong with Gosched yields — a non-durable
+// park loop) is permanently stuck in zero virtual time, invisible to the
+// durably-blocked deadlock detector. The quiescence arm must fail the run
+// loudly at its decision bound, naming the runnable goroutines. Mutation:
+// dropping the dstSchedSinceQuiesce bound check in dstFindRunnable leaves the
+// subprocess spinning until testenv's deadline kills it.
+func TestDSTWedgeParkLoop(t *testing.T) {
+	out := runTestProgDST(t, "DSTWedgeParkLoop")
+	if !strings.Contains(out, "DST-WEDGE") ||
+		!strings.Contains(out, "durable quiescence") {
+		t.Fatalf("non-durable park loop did not get the DST-WEDGE diagnostic:\n%s", out)
+	}
+	if !strings.Contains(out, "Options.WedgeDecisionLimit") {
+		t.Fatalf("diagnostic does not name the knob:\n%s", out)
+	}
+	if !strings.Contains(out, "main.DSTWedgeParkLoop") {
+		t.Fatalf("diagnostic does not carry the spinning goroutines' stacks:\n%s", out)
+	}
+}
+
 // TestDSTCryptoPriorRunCaller is the INV-CRYPTO cross-run leg: the goroutine
 // that called a completed run survives with a seeded per-g root; deactivation
 // must clear it, so that during a LATER run (started by another goroutine) it
@@ -2508,5 +2555,47 @@ func main() {
 		if strings.Contains(string(out), "runtime.dst") {
 			t.Errorf("untagged %s references runtime.dst symbols:\n%s", probe.pattern, out)
 		}
+	}
+}
+
+// TestDSTDisabledVisibilityDirect is the DIRECT white-box pin for the
+// disabled-goroutine visibility rule: during a GC schedEnableUser(false)
+// window, user goroutines must be invisible to every candidate-selection
+// scan — at() reports them nil, hasSimG must not feed one into the
+// alternation hand-off, anyVisible must not see one, and simCount must not
+// count one. The composed regressions cross a real window only when the
+// wall-timed GC-worker quota happens to decline into the DST seam, so a
+// partial weakening (one scan bypassing the filter, or the hand-off probe
+// counting invisible candidates) was caught only probabilistically; this
+// probe flips the window deterministically over a fabricated candidate view
+// of real goroutines. Mutation: dropping the disableUser filter from at(), or
+// routing hasSimG/anyVisible/simCount through the unfiltered raw accessor,
+// flips an in-window assertion here.
+func TestDSTDisabledVisibilityDirect(t *testing.T) {
+	gs := make(chan unsafe.Pointer, 2)
+	release := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			gs <- runtime.DSTProbeG()
+			<-release
+		}()
+	}
+	g1, g2 := <-gs, <-gs
+	defer close(release)
+	inAt, inAnySim, inAnyVisible, inSimCount, outAt, outAnySim := runtime.DSTDisabledVisibilityProbe(g1, g2)
+	if inAt {
+		t.Error("a user goroutine is visible to at() inside a disabled-user window")
+	}
+	if inAnySim {
+		t.Error("hasSimG counts an invisible (disabled) simulation candidate; the alternation hand-off would burn a slot on a goroutine the window hides")
+	}
+	if inAnyVisible {
+		t.Error("anyVisible sees a candidate the window hides; the all-invisible nil-return leg would never fire")
+	}
+	if inSimCount != 0 {
+		t.Errorf("simCount = %d inside the window, want 0", inSimCount)
+	}
+	if !outAt || !outAnySim {
+		t.Error("candidates invisible outside the window; the probe view is wrong (the pin would be vacuous)")
 	}
 }

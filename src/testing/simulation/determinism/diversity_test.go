@@ -395,3 +395,68 @@ func TestElectionScheduleDiversity(t *testing.T) {
 		pct.report(t, fmt.Sprintf("election/pct-d%d", d))
 	}
 }
+
+// TestSelectTraceIdentFullWidth pins the select site's trace ident as the RAW
+// 64-bit draw, not the bounded chosen index: with tiny candidate counts a
+// bounded ident aliases in the order-independent xorIdent freeze-detection
+// fold (a two-case select folds only 0/1 — two seeds with equal chosen-index
+// multisets fold identically even when their draw streams differ), so a
+// frozen select stream could hide behind equal folds. The program records
+// only two-case selects at the select site; the raw-draw ident makes its fold
+// full-width, while a bounded ident caps it at 1. Mutation: recording the
+// chosen index as the ident drives the fold back into {0,1}.
+func TestSelectTraceIdentFullWidth(t *testing.T) {
+	dstSchedTraceSetFP(true)
+	defer dstSchedTraceSetFP(false)
+	simulation.Run(7, func() {
+		a, b := make(chan int, 1), make(chan int, 1)
+		for i := 0; i < 32; i++ {
+			a <- i
+			b <- i
+			select {
+			case <-a:
+				<-b
+			case <-b:
+				<-a
+			}
+		}
+	})
+	_, xor, ndec, _, _ := dstSchedTraceSummaryFP(siteSelect)
+	if ndec == 0 {
+		t.Fatal("no select decisions recorded; the pin is vacuous")
+	}
+	if xor <= 1 {
+		t.Fatalf("select-site xorIdent = %#x over %d two-case decisions: the fold is bounded-index-shaped; the ident must be the raw draw", xor, ndec)
+	}
+	if xor < 1<<32 {
+		t.Fatalf("select-site xorIdent = %#x over %d decisions; a full-width raw-draw ident is expected", xor, ndec)
+	}
+}
+
+//go:linkname dstWedgeResolvedBoundsFP runtime.dstWedgeResolvedBoundsFP
+func dstWedgeResolvedBoundsFP() (decisions uint64, wallNs int64)
+
+// TestWedgeBoundsResolution pins the wedge-detector knob resolution the
+// Options docs promise: 0 selects the defaults (1<<26 decisions, 60s), a
+// positive value is used exactly, and a NEGATIVE value disables the arm
+// (resolved bound 0) rather than silently selecting the default — the arm a
+// disabled-detector behavioral pin cannot cover without waiting out a wedge.
+// Mutation: folding the negative case into the default makes the disabled
+// legs read the default bounds.
+func TestWedgeBoundsResolution(t *testing.T) {
+	read := func(opts simulation.Options) (dec uint64, wall int64) {
+		simulation.RunWith(1, opts, func() {
+			dec, wall = dstWedgeResolvedBoundsFP()
+		})
+		return
+	}
+	if dec, wall := read(simulation.Options{}); dec != 1<<26 || wall != 60_000_000_000 {
+		t.Errorf("default bounds = (%d, %d), want (1<<26, 60s)", dec, wall)
+	}
+	if dec, wall := read(simulation.Options{WedgeDecisionLimit: -1, WedgeWallLimit: -1}); dec != 0 || wall != 0 {
+		t.Errorf("negative limits = (%d, %d), want both arms disabled (0, 0)", dec, wall)
+	}
+	if dec, wall := read(simulation.Options{WedgeDecisionLimit: 12345, WedgeWallLimit: 7 * time.Second}); dec != 12345 || wall != 7_000_000_000 {
+		t.Errorf("explicit limits = (%d, %d), want (12345, 7s)", dec, wall)
+	}
+}

@@ -78,12 +78,42 @@ const (
 // durable image is synced and whose page cache holds data. Caller holds dstFS.mu.
 func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}) []byte {
 	// The file's length is itself unsynced state when the file grew or was
-	// truncated: one draw decides whether the size change reached the inode.
-	// (A grown file whose tail pages are all lost still reads as zeros there —
-	// the sparse tail a real crash leaves.)
+	// truncated: one draw decides what on-disk i_size the crash left. For a
+	// SHRINK (unsynced truncate-down) the inode update is a single metadata
+	// write — it landed or it did not (two outcomes). For a GROWTH the
+	// candidates additionally include every INTERMEDIATE page-boundary size
+	// between the durable and current lengths: real writeback flushes the
+	// grown tail page by page and advances the on-disk i_size as each lands,
+	// so a crash mid-writeback leaves an inode covering only a prefix of the
+	// landed tail — sizes the binary durable-or-current draw could never
+	// reach (a completeness gap inside the contract's own MAY-be-lost
+	// language; sim ⊆ real is preserved in both directions, since a page
+	// below the drawn size that did not land reads as a hole, exactly the
+	// sparse region delayed allocation leaves). One draw either way, uniform
+	// over the candidate set, ordered smallest-first so the draw meaning is
+	// stable. (A grown file whose tail pages are all lost still reads as
+	// zeros there — the sparse tail a real crash leaves.)
 	size := len(synced)
-	if len(data) != len(synced) && dstFaultRandN(2) == 1 {
-		size = len(data)
+	if len(data) != len(synced) {
+		if len(data) > len(synced) {
+			// Candidates: len(synced), each page boundary strictly between,
+			// len(data).
+			first := (len(synced)/dstPageSize + 1) * dstPageSize // first page boundary past the durable size
+			boundaries := 0
+			if first < len(data) {
+				boundaries = (len(data)-1-first)/dstPageSize + 1
+			}
+			switch k := int(dstFaultRandN(int64(2 + boundaries))); {
+			case k == 0:
+				// durable size stands
+			case k == 1+boundaries:
+				size = len(data)
+			default:
+				size = first + (k-1)*dstPageSize
+			}
+		} else if dstFaultRandN(2) == 1 {
+			size = len(data)
+		}
 	}
 	out := make([]byte, size)
 	copy(out, synced) // durable bytes are stable, always

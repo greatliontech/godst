@@ -1157,7 +1157,7 @@ func (g *fsGen) step() {
 			}
 			return
 		}
-		switch g.rng.IntN(6) {
+		switch g.rng.IntN(7) {
 		case 0:
 			g.add(fsWrite(s, pat(1+g.rng.IntN(2048), byte(g.rng.IntN(256)))))
 		case 1:
@@ -1171,6 +1171,16 @@ func (g *fsGen) step() {
 			g.add(fsSeek(s, int64(g.rng.IntN(2048)), whences[g.rng.IntN(3)]))
 		case 5:
 			g.add(fsFstat(s, !sl.closed && sl.permCreate))
+		case 6:
+			// Multi-append burst: several consecutive sequential writes,
+			// sized to cross page boundaries — the growth shape the crash
+			// tear's per-page-advanced size draw ranges over (the crash leg
+			// itself is outside this harness; the burst keeps the
+			// differential grammar's input surface in step with it).
+			n := 3 + g.rng.IntN(4)
+			for i := 0; i < n; i++ {
+				g.add(fsWrite(s, pat(1024+g.rng.IntN(1536), byte(g.rng.IntN(256)))))
+			}
 		}
 	case r < 46: // close (sometimes double)
 		if len(g.slots) == 0 {

@@ -222,6 +222,7 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 	enterSimulation("Explore", "testing/simulation: Explore requires building with -tags dst")
 	defer leaveSimulation()
 	setCrashTear(opts.CrashTear)
+	dstSetWedgeLimits(0, 0) // exploration runs carry the default wedge bounds
 	cfg := exploreConfigFromOptions(opts)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	if opts.Mode == DPOR {
@@ -247,6 +248,7 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	// The crash policy is part of the execution the failure recorded: replaying a
 	// torn crash untorn would restore a different disk and not reproduce.
 	setCrashTear(failure.CrashTear)
+	dstSetWedgeLimits(0, 0) // replays carry the default wedge bounds
 	cfg := defaultExploreConfig()
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg, failure.ForeignSched)
@@ -432,6 +434,7 @@ func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, su
 	// as this internal entry carries no options — so it never inherits the
 	// previous run's setting.
 	setCrashTear(false)
+	dstSetWedgeLimits(0, 0)
 	return runOnceResultLocked(seed, prefix, forces, sut, cfg, false)
 }
 
