@@ -60,10 +60,29 @@ by slog (consumers need a relay they must discover by data loss);
   consumer-facing default for cluster suites. Deliverable may be
   measurement + a design recorded in design.md §Roadmap rather than
   code — no silent scope call either way.
-- [ ] **5 — Deferred arch verification.** The two parked items:
-  loong64 Fstat verification and MIPS fence verification — verify on
-  real or emulated targets per the Taskfile's cross legs, or
-  re-defer with self-contained conditions in issue docs.
+- [ ] **5 — loong64/MIPS disposition (user ruling: no investment).**
+  Assess the arch-specific dst arms: anything half-baked or
+  capable of hurting the dst on the primary target is removed
+  outright; anything inert and harmless may stay with its
+  verification deferred via an issue doc carrying a self-contained
+  condition. No emulated-target verification work.
+- [ ] **6 — Filed-issue burn (user ruling: fix all filed issues).**
+  Fix every open issue doc: dstRootRename aligned to the host
+  rooted-rename probed matrix; the fault layer's survivor-byte
+  destruction made kernel-faithful (drain-then-reset for
+  survivors) or its collapse re-justified against the fidelity
+  mandate under review; the mutex starvation-handoff false-positive
+  hang class eliminated (deterministic decision-count flip vs loud
+  diagnostic — decided in review by the fidelity mandate, recorded
+  either way). Close-out gate runs per issue: promote, retarget,
+  delete.
+- [ ] **7 — Full-surface re-audit.** Fresh adversarial audit of the
+  complete dst surface (scheduler, clock/timers, fs, pipes, net,
+  faults, capabilities, crypto/rand, map seeding), a spec-vs-code
+  coverage walk of design.md + faults.md + exploration.md, widened
+  conformance/determinism sweeps, and a protodb full-suite
+  integration pass on the final toolchain; every divergence found
+  is dispositioned like any review finding.
 
 Rulings inherited from the consumer session: work lands on `dst`
 directly; the adversarial review loop, gate lines, and commit
