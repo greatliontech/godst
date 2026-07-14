@@ -826,7 +826,22 @@ and ext alike, never an empty listing). Root-relative paths are walked component
 from that captured node; absolute paths and `..` walks above the opened root fail instead of resolving
 against the process cwd, the tree root, or the host filesystem. Rooted file, directory, metadata,
 removal, and rename operations preserve the same path, metadata, durability, and no-host-passthrough
-contracts as the named `os` surface.
+contracts as the named `os` surface. Rooted **rename** follows the host `os.Root.Rename` ladder —
+Go's own openat walk, NOT raw renameat(2) (host-probed through `os.Root.Rename`, ext4 and tmpfs
+agreeing on every row): the old walk asserts its terminal slash first (missing-old-final `ENOENT`,
+file `ENOTDIR`), then the new walk applies rename's creating-directory slash rule (a slashed
+missing new final is legal, a slashed file `ENOTDIR` — so a bad NEW walk precedes even a terminal
+`"."`'s `EBUSY`), then a slashed new final requires a directory source (`ENOENT`/`ENOTDIR` by the
+old's state), then the portable existing-directory-newname preamble refuses `EEXIST` whenever the
+old name resolves (missing old is `ENOENT`) — so dir-over-dir, dir-onto-nonempty-dir,
+dir-onto-self, and file-onto-dir are all `EEXIST` through a Root where raw rename(2) would say
+`ENOTEMPTY`, no-op, or `EISDIR` — with the preamble's one escape: equal final components naming
+the same node fall through to renameat, so the SAME directory reached with a literal-dot final on
+exactly one side (`Rename("de", "de/.")`) is `EBUSY`, not `EEXIST` (the finals are compared after
+the `..` restart rewrite, so `"sub/inside/.."` and `"sub"` agree and stay `EEXIST`) — and only
+then renameat(2)'s own ladder runs (terminal-`"."` `EBUSY`, missing-old `ENOENT`, same-file-node
+no-op, containment `EINVAL`, dir-over-file `ENOTDIR`). This differs from the UN-rooted ordering above (there `rename("missing",
+"existingfile/")` is `ENOENT`; through a Root the new walk's slash check answers `ENOTDIR` first).
 A simulated `Root` is an owned open capability: normal process exit, process crash, and host crash close
 every Root created by that process or kernel. Retained values then fail every rooted operation with
 `ErrClosed`, exactly like an explicitly closed Root; a reboot never revives the directory capability.
@@ -1209,10 +1224,13 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   layout), and under environmental perturbation in the children — TZ, LC_ALL/LANG, working
   directory, GOMAXPROCS. The map hash key needs no perturbation axis of its own: under `-tags dst`
   it is a fixed constant derived position-independently (see "Map hash key requires `-tags dst`").
-  The package also pins that in-bubble `sync.Mutex` starvation switching is measured on the virtual
-  clock (`TestMutexStarvationHandoffDeterministic`) — on the wall clock, whether a waiter's wait
-  crossed the 1ms starvation threshold decided lock handoff order, a machine-speed- and
-  load-dependent same-seed schedule fork. The leg also carries the schedule-diversity suite
+  The package also pins that in-bubble `sync.Mutex` starvation switching never reads the wall
+  clock (`TestMutexStarvationHandoffDeterministic`) — there, whether a waiter's wait crossed the
+  1ms starvation threshold decided lock handoff order, a machine-speed- and load-dependent
+  same-seed schedule fork; in-bubble the flip is the waiter's deterministic lost-wakeup count
+  (see the `sync.Mutex` row under "Nondeterminism sources"), pinned live by
+  `TestMutexStarvationHandoffLiveness` (a starvation-dependent SUT terminates in-sim) and stable by
+  `TestMutexStarvationHandoffCountDeterministic`. The leg also carries the schedule-diversity suite
   (determinism's complement: different seeds must explore genuinely different schedules), driving
   the runtime's default-off seeded-decision trace; it pins trace observation-neutrality and that
   seed entropy reaches every seeded choice site (measured record: exploration.md, "Measured
@@ -1371,7 +1389,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
 | `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
-| `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | the wait is measured on the bubble's fake clock (`runtime.internal_sync_nanotime`); mutex waits are non-durable so fake time never passes mid-wait — in-bubble handoff stays barging-mode, deterministically. The determinization is sound for every finite execution prefix (barging order is producible in production before the threshold) but NOT for liveness: a SUT whose progress depends on the starvation-mode handoff — a holder re-barging at every release while the parked waiter must acquire for the program to advance; production always terminates once the waiter's wall wait crosses 1ms and the flip forces the handoff — livelocks in-sim where production cannot, undetectably (the non-durable mutex wait means fake time never advances and the bubble-deadlock panic never fires): a known false-positive hang class. The alternative (letting the wall-valued flip through) was the demonstrated same-seed schedule escape, so determinism wins and the gap is recorded. | ✅ |
+| `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | in-bubble the flip is measured on the waiter's own LOST-WAKEUP count, a pure function of the seeded schedule: a bubbled waiter that returns from semacquire without acquiring more than 64 times within one Lock call flips its mutex to starvation mode (`internal/sync` `lockSlow` + `dst_mutex_on.go`; the wall clock stays out of the schedule — its value was a demonstrated same-seed escape — and the fake clock cannot serve: mutex waits are non-durable, so fake time never passes mid-wait and a fake-clock flip would deterministically never fire, livelocking a production-legal SUT whose progress depends on the starvation handoff, undetectably). Sound in both directions: production flips after ANY wait >1ms, and N lost handoffs take >1ms of wall in some real execution, so a flipped in-sim execution is production-producible and an unflipped one is production below the threshold — the flip POINT differs from any given production run (starvation mode engages by contention depth, not elapsed wall), never the reachable behavior set. Liveness restored: a starvation-handoff-dependent SUT terminates in-sim (`TestMutexStarvationHandoffLiveness`); the wall clock stays out (`TestMutexStarvationHandoffDeterministic`); the count is same-seed stable (`TestMutexStarvationHandoffCountDeterministic`); programs whose waiters never cross the threshold are byte-identical to the prior barging-only determinization (the branch reads only waiter-local state). | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |

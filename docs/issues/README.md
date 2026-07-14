@@ -7,23 +7,15 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- [root-rename-host-surface-divergences.md](./root-rename-host-surface-divergences.md) —
-  `dstRootRename` diverges from the host `os.Root.Rename` surface on
-  existing-directory targets (host `EEXIST`, sim replaces/no-ops) and on
-  new-final-assert-vs-old-missing ordering (host-probed matrix in the doc).
-  Lands: when dstRootRename is aligned with the host rooted-rename
-  surface's probed matrix.
-- [mutex-starvation-handoff-livelock-diagnostic.md](./mutex-starvation-handoff-livelock-diagnostic.md) —
-  the fake-clock mutex starvation measurement is sound for every finite
-  prefix but not for liveness: a SUT whose termination depends on the 1ms
-  starvation-handoff flip livelocks in-sim, undetectably (non-durable mutex
-  waits never advance fake time). Open question: detect the shape with a
-  loud diagnostic, model the flip on virtual decisions, or leave the gap
-  recorded. Lands: when the starvation-handoff diagnostic question is
-  ruled on.
-- [fault-reset-drop-vs-kernel-drain-soundness.md](./fault-reset-drop-vs-kernel-drain-soundness.md) —
-  the injected-reset/crash faults destroy a survivor's already-delivered
-  bytes, an execution a real kernel cannot produce (tcp_recvmsg drains
-  before reporting the socket error); whether the fault layer should model
-  drain-then-reset for survivors is an open Soundness call. Lands: when the
-  fault-layer drain semantics question is ruled on.
+- [reset-backlog-conn-accept-handout.md](./reset-backlog-conn-accept-handout.md) —
+  a fault-injected reset of a conn still queued in the accept backlog leaves
+  `acceptState == 0`, so a later Accept can hand the torn-down conn out
+  (first read `ECONNRESET`) — either kernel-legal (then the `acceptState`
+  comment's never-handed-out claim over-promises) or a missed `0→2` claim on
+  the fault path; pre-existing before the kernel-faithful reset rework.
+  Lands: 7
+- [untagged-net-test-compile.md](./untagged-net-test-compile.md) —
+  untagged `go test net` fails to compile: dst-only symbols referenced from
+  untagged test files (`dst_latency_test.go` at HEAD, and the white-box wire
+  tests following its convention); no leg gates on it. Convention call:
+  build-tag the files or stub the symbols. Lands: 7

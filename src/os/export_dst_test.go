@@ -50,3 +50,17 @@ func dstFSNodeStateFull(name string) (cur, synced string, curEntries, syncedEntr
 		node.mode, node.syncedMode,
 		node.modTime.UnixNano(), node.syncedModTime.UnixNano(), true
 }
+
+// DSTRawRename drives the internal renameat(2) ladder (dstRename) directly —
+// the kernel semantics beneath both portable preambles. The os.Rename and
+// os.Root.Rename surfaces refuse every existing-directory newname (EEXIST)
+// before reaching it, so the ladder's dir-over-empty-dir replacement arm is
+// surface-unreachable; tests use this hook to pin the internal arm (a
+// replaced directory node leaves the namespace like a Remove).
+func DSTRawRename(oldname, newname string) error {
+	handled, err := dstRename(oldname, newname)
+	if !handled {
+		return ErrInvalid
+	}
+	return err
+}

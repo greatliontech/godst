@@ -45,6 +45,16 @@ func runtime_doSpin()
 //go:linkname runtime_nanotime
 func runtime_nanotime() int64
 
+// runtime_dstMutexWaitVirtual reports whether the calling goroutine's mutex
+// wait is measured virtually — true exactly when it runs inside a DST
+// simulation bubble, where lockSlow replaces the wall-clock starvation
+// measure with the deterministic lost-wakeup count (see dst_mutex_on.go).
+// Always false in an untagged build (and unreferenced there: the guarding
+// const folds the call away).
+//
+//go:linkname runtime_dstMutexWaitVirtual
+func runtime_dstMutexWaitVirtual() bool
+
 //go:linkname throw
 func throw(string)
 

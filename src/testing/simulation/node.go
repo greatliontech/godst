@@ -309,7 +309,7 @@ func mappingFaultProcessTeardown(proc uint32) {
 		dstCrashProcessPid(pid)
 	}
 	dstProcessTeardown(proc)
-	dstNetPartitionOp(partOpResetProc, proc, 0)
+	dstNetPartitionOp(partOpCrashProcConns, proc, 0)
 	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 }
 
@@ -650,7 +650,7 @@ func crashProcess(name string) {
 		dstCrashProcessPid(pid)
 	}
 	dstProcessTeardown(proc)
-	dstNetPartitionOp(partOpResetProc, proc, 0)
+	dstNetPartitionOp(partOpCrashProcConns, proc, 0)
 	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 }
 
@@ -660,8 +660,10 @@ func crashProcess(name string) {
 // unwind), its pids read dead (Kill(pid, 0) answers ESRCH and the /proc
 // entries disappear), its open simulated files and virtual fds close, fd-owned
 // flocks release, shared mappings unregister (their bytes already are the
-// kernel page-cache pages), its connections RESET — the peer
-// observes ECONNRESET — and its listeners close. The host filesystem survives
+// kernel page-cache pages), its connections RESET — the surviving peer
+// drains the bytes already delivered to it, then observes ECONNRESET
+// (in-flight bytes die; a conn whose victim end was already app-closed is
+// spared, its peer drains to io.EOF) — and its listeners close. The host filesystem survives
 // untouched, unsynced writes included: a process crash does not tear the disk;
 // only the host-crash fault restores the durable image. If the calling
 // goroutine itself belongs to the victim (a self-crash — the OOM shape), Crash
@@ -756,9 +758,11 @@ func crashHost(name string) {
 // (docs/dst/faults.md "Crash / restart faults"). Every process on the host dies
 // as under Crash (goroutines descheduled permanently, no defers, pids dead),
 // every connection an end of which lives on the host is RESET at its peer —
-// the peer's next read fails ECONNRESET without draining, except a conn the
-// victim's application had already closed, whose peer still drains and reads
-// io.EOF (power loss emits no packet; bytes on the wire survive) — and
+// the peer drains the bytes already delivered to its receive queue, then its
+// reads fail ECONNRESET (an RST cannot destroy what the survivor's kernel
+// already holds; bytes still in flight died with the machine), except a conn
+// the victim's application had already closed, whose peer still drains and
+// reads io.EOF (power loss emits no packet; bytes on the wire survive) — and
 // every listener closes. Until the machine reboots, dialing it blackholes:
 // the connect times out (deadline or retransmit horizon, ETIMEDOUT), never
 // ECONNREFUSED — refusal needs a live kernel to answer RST. Then the machine's kernel state is gone: its

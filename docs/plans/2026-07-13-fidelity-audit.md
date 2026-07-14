@@ -66,7 +66,7 @@ by slog (consumers need a relay they must discover by data loss);
   outright; anything inert and harmless may stay with its
   verification deferred via an issue doc carrying a self-contained
   condition. No emulated-target verification work.
-- [ ] **6 — Filed-issue burn (user ruling: fix all filed issues).**
+- [x] **6 — Filed-issue burn (user ruling: fix all filed issues).**
   Fix every open issue doc: dstRootRename aligned to the host
   rooted-rename probed matrix; the fault layer's survivor-byte
   destruction made kernel-faithful (drain-then-reset for

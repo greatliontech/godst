@@ -56,6 +56,12 @@
 // depends on host somaxconn tuning and stays with the fork's unit
 // suite; host /dev/null is probed with non-mutating ops only (a
 // root-privileged harness must never chmod or unlink the real device).
+// The fs grammar drives the process-cwd os namespace surface only:
+// os.Root-scoped operations are not in the grammar (a recorded
+// coverage bound, not a silent cap) — the rooted surface, including
+// os.Root.Rename's preamble ordering, is pinned against a host-probed
+// matrix by the fork's own suite (TestDSTFSOpenRootRenameHostMatrix
+// and the TestDSTFSOpenRoot* tests) rather than differentially.
 //
 // The default sweep is bounded; set DST_CONFORMANCE_SEEDS=<n> for a
 // wider sweep (see Taskfile.yml).

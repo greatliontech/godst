@@ -791,33 +791,36 @@ func internal_sync_nanotime() int64 {
 	if dstBuild {
 		// A bubbled goroutine measures time on the bubble's fake clock, the
 		// same collapse time.runtimeNano applies. The only caller is
-		// sync.Mutex's starvation measurement, and on the real clock it is a
-		// wall-VALUE read inside a run: whether a waiter's wall wait crosses
-		// the 1ms starvation threshold decides the mutex's handoff mode —
-		// barging versus direct FIFO — so lock acquisition ORDER became a
-		// function of machine speed, host load, and GC pause wall time
-		// (demonstrated: a same-seed run with ~300us critical sections flips
-		// a waiter's acquisition slot run-to-run;
-		// TestMutexStarvationHandoffDeterministic). Mutex waits are not
-		// durably blocking, so virtual time cannot advance while a waiter is
-		// pending and in-bubble starvation mode is deterministically absent.
-		// That determinization is sound for every finite execution prefix —
-		// barging order is producible in production before the threshold —
-		// but NOT for liveness: a SUT whose progress depends on the
-		// starvation-mode handoff (a holder re-barging at every release
-		// while the parked waiter must acquire for the program to advance;
-		// production always terminates once the waiter's wall wait crosses
-		// 1ms and the flip forces the handoff) livelocks in-sim where
-		// production cannot, and undetectably so — the non-durable mutex
-		// wait means fake time never advances over it and the
-		// bubble-deadlock panic never fires. A known false-positive hang
-		// class, recorded in docs/dst/design.md ("Nondeterminism sources",
-		// the sync.Mutex row); the alternative — letting the wall-valued
-		// flip through — was the demonstrated same-seed schedule escape, so
-		// determinism wins and the gap is recorded.
+		// sync.Mutex's lockSlow, and on the real clock it is a wall-VALUE
+		// read inside a run: whether a waiter's wall wait crossed the 1ms
+		// starvation threshold decided the mutex's handoff mode — barging
+		// versus direct FIFO — so lock acquisition ORDER became a function
+		// of machine speed, host load, and GC pause wall time (demonstrated:
+		// a same-seed run with ~300us critical sections flips a waiter's
+		// acquisition slot run-to-run;
+		// TestMutexStarvationHandoffDeterministic). In-bubble the starvation
+		// flip is not time-measured at all: mutex waits are not durably
+		// blocking, so virtual time cannot advance while a waiter is pending
+		// (a fake-clock measure would deterministically never fire, and a
+		// SUT whose progress depends on the starvation handoff would
+		// livelock in-sim where production always terminates). lockSlow
+		// instead flips on the waiter's deterministic lost-wakeup count —
+		// seed-pure, liveness-restoring, and production-producible; see
+		// internal/sync's dst_mutex_on.go and
+		// internal_sync_dstMutexWaitVirtual below. The value returned here
+		// then only feeds lockSlow's waitStartTime queue-position sentinel
+		// (and the wall branch bubbled goroutines never take).
 		if bubble := getg().bubble; bubble != nil {
 			return bubble.now
 		}
 	}
 	return nanotime()
+}
+
+//go:linkname internal_sync_dstMutexWaitVirtual internal/sync.runtime_dstMutexWaitVirtual
+func internal_sync_dstMutexWaitVirtual() bool {
+	if dstBuild {
+		return getg().bubble != nil
+	}
+	return false
 }

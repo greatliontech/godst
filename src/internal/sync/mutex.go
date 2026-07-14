@@ -119,6 +119,14 @@ func (m *Mutex) lockSlow() {
 	starving := false
 	awoke := false
 	iter := 0
+	// In a DST bubble the starvation flip is measured on this waiter's
+	// wakeup count instead of wall time (dst_mutex_on.go): lostWakes counts
+	// returns from semacquire within this Lock call — evaluated at every
+	// wake, the handoff wake included, exactly where the wall measure is —
+	// so a waiter beyond the threshold has lost that many handoffs. The
+	// same per-waiter, sticky-until-acquired structure as the wall measure
+	// it replaces; the starvation-exit conditions below are shared.
+	lostWakes := 0
 	old := m.state
 	for {
 		// Don't spin in starvation mode, ownership is handed off to waiters
@@ -169,7 +177,12 @@ func (m *Mutex) lockSlow() {
 				waitStartTime = runtime_nanotime()
 			}
 			runtime_SemacquireMutex(&m.sema, queueLifo, 2)
-			starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
+			if dstMutexVirtualStarvation && runtime_dstMutexWaitVirtual() {
+				lostWakes++
+				starving = starving || lostWakes > dstStarvationWakeThreshold
+			} else {
+				starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
+			}
 			old = m.state
 			if old&mutexStarving != 0 {
 				// If this goroutine was woken and mutex is in starvation mode,

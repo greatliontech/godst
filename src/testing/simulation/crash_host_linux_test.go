@@ -1012,13 +1012,18 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 }
 
 // TestDSTCrashHostDropsInFlightBytes: a host crash RSTs each of its
-// connections AT THE SURVIVING PEER — queued and in-flight bytes are discarded
-// and the peer's next read fails ECONNRESET without draining. A real RST
-// destroys the receive queue; the simulation must not deliver bytes the
-// powered-off machine's teardown destroyed (DST-FAULT-SOUND).
+// connections AT THE SURVIVING PEER kernel-faithfully — bytes already
+// DELIVERED to the survivor's receive queue drain first (tcp_recvmsg reports
+// pending data before the socket error; an RST cannot destroy what the
+// survivor's kernel already holds), bytes still IN FLIGHT die with the
+// crashed sender's kernel, and only then do reads fail ECONNRESET
+// (DST-FAULT-SOUND). "abc" is delivered before the crash (its 100ms
+// traversal completes while the dial's SYN-ACK leg runs); "xyz" is written
+// with no virtual time left before the power loss and must never arrive.
 func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	var n int
-	var readErr error
+	var got [8]byte
+	var firstErr, secondErr error
 	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		written := make(chan struct{})
@@ -1041,7 +1046,14 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 					return
 				}
 				if _, err := c.Write([]byte("abc")); err != nil {
-					t.Errorf("victim write: %v", err)
+					t.Errorf("victim write abc: %v", err)
+					return
+				}
+				<-dialed
+				// Delivered in 100ms of virtual time — but the crash below
+				// runs with none passing, so these bytes die on the wire.
+				if _, err := c.Write([]byte("xyz")); err != nil {
+					t.Errorf("victim write xyz: %v", err)
 					return
 				}
 				close(written)
@@ -1064,24 +1076,24 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 					// any seed's schedule.
 					close(dialed)
 					<-crashed
-					// The writer's 3 bytes are still in flight (100ms link;
-					// no virtual time passed between the write and the crash).
-					// The first read must fail — never deliver them.
-					n, readErr = c.Read(make([]byte, 8))
+					n, firstErr = c.Read(got[:])
+					_, secondErr = c.Read(make([]byte, 8))
 					close(readDone)
 				})
 			}()
 		})
 
 		<-written
-		<-dialed
 		CrashHost("victim")
 		close(crashed)
 		<-readDone
 		<-exited
 	})
-	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
-		t.Fatalf("first read after the writer host crashed = (%d, %v), want (0, ECONNRESET): in-flight bytes must be dropped, not drained", n, readErr)
+	if n != 3 || string(got[:3]) != "abc" || firstErr != nil {
+		t.Fatalf("first read after the writer host crashed = (%d, %q, %v), want (3, %q, nil): delivered bytes drain before the reset", n, got[:n], firstErr, "abc")
+	}
+	if !errors.Is(secondErr, syscall.ECONNRESET) {
+		t.Fatalf("second read = %v, want ECONNRESET with no data: in-flight bytes died with the crashed kernel, never drained", secondErr)
 	}
 }
 
@@ -1226,14 +1238,16 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 	}
 }
 
-// TestDSTCrashHostDropsInFlightBytesVictimDialer: the no-drain RST holds with
-// the roles swapped — the victim host DIALED, so its conn end carries the
-// LOWER registration sequence and is torn down first within the crash. The
-// survivor's entry must still be matched against the pre-crash snapshot
-// (dstMatchedVictims collects before any teardown): an interleaved
-// match-and-reset loop would see the victim end's just-closed done channel,
-// mistake it for an app-close, skip the survivor's end, and reintroduce the
-// drain.
+// TestDSTCrashHostDropsInFlightBytesVictimDialer: the in-flight drop holds
+// with the roles swapped — the victim host DIALED, so its conn end carries
+// the LOWER registration sequence and is torn down first within the crash
+// ("abc" is written with no virtual time left before the power loss, so it
+// is still in flight and dies with the crashed kernel; nothing was delivered
+// to drain). The survivor's entry must still be matched against the
+// pre-crash snapshot (dstMatchedVictims collects before any teardown): an
+// interleaved match-and-teardown loop would see the victim end's just-closed
+// done channel, mistake it for an app-close, skip the survivor's end, and
+// deliver bytes the power loss destroyed.
 func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 	var n int
 	var readErr error

@@ -15,15 +15,15 @@ import (
 // (Reset / ResetProcess) drives this through runtime's passthrough into
 // dstApplyNetFaultOp, exactly like partition. A reset enumerates the active
 // connections matching the victim — a host-pair (all conns between hosts a and b)
-// or a process (all conns that process owns either end of) — and tears each down
-// via the connection's existing resetConn(). An injected reset hits BOTH ends,
-// closing each transport, so a subsequent read returns the close (ECONNRESET)
-// before draining any buffered bytes — the recorded fault-model collapse
-// (faults.md): the injected fault destroys the conn outright, where a real
-// RST's receiver would still drain its queued bytes (the close(2) conditional
-// models that kernel shape — see dstResetBothEnds).
-// Matching is by the connection's host/process attribution (dstConn.localHost/
-// remoteHost/localProc/remoteProc), so a reset touches exactly the victim's conns
+// or a process (all conns that process owns either end of) — and tears each
+// end down KERNEL-FAITHFULLY (faults.md "Connection reset"): a SURVIVING end
+// receives the RST as a real kernel would deliver it — bytes already in its
+// receive queue drain first, then reads fail ECONNRESET; writes fail at once;
+// bytes still in flight toward it die (dstInjectReset). A DEAD end (its
+// process or host crashed) is torn down outright via resetConn — its receive
+// queue died with it and nothing will read it again. Matching is by the
+// connection's host/process attribution (dstConn.localHost/remoteHost/
+// localProc/remoteProc), so a reset touches exactly the victim's conns
 // (DST-FAULT-VICTIM).
 
 // dstConns is the per-run set of active simulated connections, registered at Dial
@@ -32,17 +32,18 @@ import (
 // dstConn. resetConn tears down the END it is called on — that end's transport
 // closes; the shared reset flag only maps the peer's eventual EOF to ECONNRESET
 // identity, it does NOT close the peer's transport, so a peer whose own dstConn
-// is not reset still DRAINS queued bytes before seeing the error. That drain is
-// the kernel-real shape for an RST's RECEIVER (tcp_recvmsg reports pending data
-// before the socket error, host-probed), so the close(2) conditional's RST arm
-// (dstResetBothEnds) resets only the emitting end and merely deregisters the
-// peer. The FAULT matchers instead keep the no-drain both-ends teardown —
-// resetting each end's own dstConn — as their recorded fault-model collapse
-// (the host matcher spares a survivor's end whose victim end already closed —
-// see dstResetHost). The listener-backlog teardown of a never-accepted server
-// end, toward whose dialer nothing can yet be queued, is per-end. resetConn
-// is idempotent when both ends are reset: an atomic flag store, a sync.Once
-// close, a map delete.
+// is not torn down still DRAINS queued bytes before seeing the error. That
+// drain is the kernel-real shape for an RST's RECEIVER (tcp_recvmsg reports
+// pending data before the socket error, host-probed): the close(2)
+// conditional's RST arm (dstResetBothEnds) resets only the emitting end and
+// merely deregisters the peer, and the FAULT matchers deliver an injected RST
+// to each surviving end via dstInjectReset — delivered bytes drain, in-flight
+// bytes die, writes fail (the host and process crash matchers reset the DEAD
+// side's ends outright and spare a survivor's end whose victim end already
+// closed — see dstResetHost). The listener-backlog teardown of a
+// never-accepted server end, toward whose dialer nothing can yet be queued,
+// is per-end. resetConn is idempotent when both ends are reset: an atomic
+// flag store, a sync.Once close, a map delete.
 var dstConns struct {
 	mu    sync.Mutex
 	epoch uint64
@@ -190,17 +191,50 @@ func dstConnDeregister(c *dstConn) {
 	dstConns.mu.Unlock()
 }
 
-// dstResetMatching resets every registered conn for which match reports true. The
-// victims are collected under the lock and reset outside it, so resetConn's own
-// deregister does not re-enter the lock. They are reset in registration-SEQUENCE
-// order — never the registry map's iteration order, which hashes run-varying pointer
-// addresses (the fixed -tags dst hash key does not make addresses reproducible), so
-// with several victims the wake order of their blocked readers, and thus the whole
-// downstream schedule, would diverge across same-seed runs (DST-FAULT-REPLAY).
+// dstResetMatching delivers an injected RST to every registered conn end for
+// which match reports true — the ALL-SURVIVORS teardown (Reset host-pair,
+// ResetProcess): no process died, so every matched end is a live kernel
+// receiving an RST and drains its delivered bytes before failing
+// (dstInjectReset). The victims are collected under the lock and torn down
+// outside it, so the teardown's own deregister does not re-enter the lock.
+// They are processed in registration-SEQUENCE order — never the registry
+// map's iteration order, which hashes run-varying pointer addresses (the
+// fixed -tags dst hash key does not make addresses reproducible), so with
+// several victims the wake order of their blocked readers, and thus the
+// whole downstream schedule, would diverge across same-seed runs
+// (DST-FAULT-REPLAY).
 func dstResetMatching(match func(*dstConn) bool) {
 	for _, c := range dstMatchedVictims(match) {
-		c.resetConn()
+		dstInjectReset(c)
 	}
+}
+
+// dstInjectReset delivers a fault-injected RST to conn end c, the
+// kernel-faithful receiver teardown: already-delivered bytes drain to the
+// stable ECONNRESET identity (shared reset flag maps the post-drain failure),
+// in-flight bytes die, writes fail immediately (dstWireEnd.injectRST), and
+// the registration is released as production releases the tuple when the RST
+// moves the socket to CLOSED. Two collapses to the outright resetConn remain,
+// both kernel-faithful: a conn still in the accept BACKLOG is half-open — no
+// receive queue exists on either side (the dialer has not returned, the
+// server end was never handed out) and the blocked dial waits on the
+// transport done channels, so the hard teardown both matches the kernel (an
+// RST aborts the handshake) and wakes the dialer into ECONNRESET; and a
+// future non-wire Conn wrapper falls to the same uniform teardown rather
+// than a silent skip.
+func dstInjectReset(c *dstConn) {
+	if st := c.acceptState; st != nil && st.Load() == 0 {
+		c.resetConn()
+		return
+	}
+	e, ok := c.Conn.(*dstWireEnd)
+	if !ok {
+		c.resetConn()
+		return
+	}
+	c.reset.Store(true)
+	e.injectRST()
+	dstConnDeregister(c)
 }
 
 // dstMatchedVictims collects the registered conns satisfying match and returns them
@@ -278,28 +312,28 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 	return false
 }
 
-// dstResetHost resets every conn an end of which lives on host h — the machine
-// lost power, so each of its sockets emits an RST. Matching EITHER end (as the
-// pair and process matchers do) resets both registered dstConns of an affected
-// connection, so the surviving peer's own transport end closes too and its
-// next read fails ECONNRESET WITHOUT draining — queued and in-flight bytes are
-// dropped, as a real RST destroys the receive queue (DST-FAULT-SOUND).
-// Matching only the victim's local end would tear down just that end, which
-// presents at the peer as a graceful write-close: the peer would drain every
-// queued segment — bytes the powered-off machine's teardown destroyed — before
-// seeing the reset. A conn between two other hosts has neither end on h and is
-// untouched (DST-FAULT-VICTIM).
+// dstResetHost tears down every conn an end of which lives on host h — the
+// machine lost power. The VICTIM's own ends (localHost == h) reset outright:
+// their receive queues died with the kernel and nothing will read them
+// again. Each SURVIVING peer end receives the injected RST kernel-faithfully
+// (dstInjectReset): bytes already delivered to the survivor's receive queue
+// drain first — an incoming RST cannot destroy what the survivor's kernel
+// already holds — then reads fail ECONNRESET; bytes still in flight died
+// with the crashed sender. Tearing the survivor's end down outright instead
+// would destroy delivered bytes (an execution no real kernel produces), and
+// tearing down ONLY the victim's end would present at the peer as a graceful
+// write-close, draining even the in-flight bytes the power loss destroyed. A
+// conn between two other hosts has neither end on h and is untouched
+// (DST-FAULT-VICTIM).
 func dstResetHost(h uint32) {
 	// The machine lost power, so its kernel's TIME_WAIT table is gone too: a
 	// hold surviving the crash would refuse a bind the rebooted kernel
 	// allows. A process crash, by contrast, leaves the kernel (and its
 	// holds) alive — only this host-crash path purges.
 	dstTimeWaitDropHost(h)
-	dstResetMatching(func(c *dstConn) bool {
-		if c.localHost == h {
-			return true
-		}
-		if c.remoteHost != h {
+	victimEnd := func(c *dstConn) bool { return c.localHost == h }
+	survivorEnd := func(c *dstConn) bool {
+		if c.localHost == h || c.remoteHost != h {
 			return false
 		}
 		// The surviving peer's end of a victim conn. Skip it when the victim's
@@ -311,19 +345,41 @@ func dstResetHost(h uint32) {
 		// real RST exists for an app-closed end at power loss
 		// (DST-FAULT-SOUND). Every simulated connection is wire-backed (the
 		// transport contract); a future non-wire Conn wrapper falls to the
-		// reset arm — the uniform crash collapse — never to a silent skip.
+		// RST arm — the uniform crash teardown — never to a silent skip.
 		// The predicate is evaluated against the PRE-CRASH snapshot:
-		// dstMatchedVictims runs every match before any resetConn, so a
+		// dstMatchedVictims runs every match before any teardown, so a
 		// victim-side reset in the same crash (which closes exactly the
 		// channel tested here) cannot flip a survivor entry to a spurious
-		// skip. An interleaved match-and-reset loop would reintroduce the
-		// drain whenever the victim end carries the lower regSeq (victim
-		// dialed) — see TestDSTCrashHostDropsInFlightBytesVictimDialer.
+		// skip. An interleaved match-and-teardown loop would misclassify
+		// whenever the victim end carries the lower regSeq (victim dialed) —
+		// see TestDSTCrashHostDropsInFlightBytesVictimDialer.
 		if e, ok := c.Conn.(*dstWireEnd); ok && isClosedChan(e.remoteDone) {
 			return false
 		}
 		return true
-	})
+	}
+	dstCrashTeardown(victimEnd, survivorEnd)
+}
+
+// dstCrashTeardown is the shared crash-fault conn teardown: one snapshot of
+// the registry, victim (dead) ends reset outright, surviving peer ends given
+// the injected drain-then-reset RST — in registration-sequence order across
+// the union (DST-FAULT-REPLAY), with every predicate evaluated against the
+// pre-fault snapshot before any teardown runs.
+func dstCrashTeardown(victimEnd, survivorEnd func(*dstConn) bool) {
+	victims := dstMatchedVictims(func(c *dstConn) bool { return victimEnd(c) || survivorEnd(c) })
+	// Classify against the snapshot BEFORE any teardown mutates conn state.
+	dead := make(map[*dstConn]bool, len(victims))
+	for _, c := range victims {
+		dead[c] = victimEnd(c)
+	}
+	for _, c := range victims {
+		if dead[c] {
+			c.resetConn()
+		} else {
+			dstInjectReset(c)
+		}
+	}
 }
 
 // dstCloseHostListeners closes every listener on host h — the whole port space
@@ -341,12 +397,38 @@ func dstResetPair(a, b uint32) {
 	})
 }
 
-// dstResetProc resets every conn that process p owns an end of (as dialer or as
-// the listening/accepting process).
+// dstResetProc injects an RST on every conn that process p owns an end of (as
+// dialer or as the listening/accepting process) — the ResetProcess fault: p is
+// ALIVE (only its connections are reset), so every end, p's own included, is a
+// survivor and drains its delivered bytes before failing (dstResetMatching's
+// all-survivors teardown). The crash faults use dstCrashProcConns instead.
 func dstResetProc(p uint32) {
 	dstResetMatching(func(c *dstConn) bool {
 		return c.localProc == p || c.remoteProc == p
 	})
+}
+
+// dstCrashProcConns tears down every conn process p owns an end of for a
+// process CRASH (kill -9 / OOM): p is dead. Its own ends reset outright —
+// their receive queues died with the process. Each surviving peer end
+// receives the injected RST kernel-faithfully (drain delivered bytes, then
+// ECONNRESET), except a peer end whose victim-side end the application
+// already closed before the crash: its data and FIN are on the wire and the
+// kernel (which survives a process crash) has no socket left to answer RST
+// for — the peer drains and reads EOF exactly as the pre-crash teardown left
+// it, the same boundary the host-crash matcher applies (DST-FAULT-SOUND).
+func dstCrashProcConns(p uint32) {
+	victimEnd := func(c *dstConn) bool { return c.localProc == p }
+	survivorEnd := func(c *dstConn) bool {
+		if c.localProc == p || c.remoteProc != p {
+			return false
+		}
+		if e, ok := c.Conn.(*dstWireEnd); ok && isClosedChan(e.remoteDone) {
+			return false // app-closed victim end: FIN already on the wire
+		}
+		return true
+	}
+	dstCrashTeardown(victimEnd, survivorEnd)
 }
 
 // dstCloseProcConns closes the connection ENDS process p owns — the exit-time
@@ -399,10 +481,11 @@ func dstConnPeer(c *dstConn) *dstConn {
 // EOF, and the SHARED reset flag stored by resetConn maps that EOF — and its
 // failed writes — to the stable ECONNRESET identity); deregistering the peer
 // now mirrors production releasing the tuple when the RST moves the socket to
-// CLOSED, before any close(2). The fault-injection matchers (host/pair/
-// process reset) keep their recorded both-ends no-drain teardown — a fault-
-// model collapse, not this kernel conditional. A peer that already closed
-// needs nothing (dstConnPeer returns nil).
+// CLOSED, before any close(2). The fault-injection matchers follow the same
+// tcp_recvmsg rule through dstInjectReset — a survivor always drains its
+// delivered bytes — differing only in that an INJECTED RST also destroys the
+// in-flight bytes this conditional lets travel ahead of it. A peer that
+// already closed needs nothing (dstConnPeer returns nil).
 func dstResetBothEnds(c *dstConn) {
 	peer := dstConnPeer(c)
 	c.resetConn()

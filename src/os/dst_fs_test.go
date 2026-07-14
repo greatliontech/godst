@@ -1088,6 +1088,131 @@ func TestDSTFSOpenRoot(t *testing.T) {
 	})
 }
 
+// TestDSTFSOpenRootRenameHostMatrix pins the simulated rooted-rename surface
+// to the host os.Root.Rename matrix, row for row (host-probed on ext4 and
+// tmpfs, which agree; the host implementation is Go's own openat walk with
+// the portable existing-directory-newname EEXIST preamble, NOT raw
+// renameat(2) — see design.md, the os.OpenRoot paragraph). Population per
+// row: files f1,f2; empty dirs de,de2; nonempty dirs dn,dn2 (a child file
+// inside); nested sub/inside.
+func TestDSTFSOpenRootRenameHostMatrix(t *testing.T) {
+	type row struct {
+		old, new string
+		want     error // nil = success; errEscape = path-escape refusal
+	}
+	errEscape := errors.New("path escapes")
+	rows := []row{
+		// file sources
+		{"f1", "missing", nil}, {"f1", "missing/", syscall.ENOTDIR},
+		{"f1", "f2", nil}, {"f1", "f2/", syscall.ENOTDIR},
+		{"f1", "de", syscall.EEXIST}, {"f1", "de/", syscall.ENOTDIR},
+		{"f1", "dn", syscall.EEXIST}, {"f1", "dn/", syscall.ENOTDIR},
+		{"f1", "f1", nil}, {"f1", "f1/", syscall.ENOTDIR}, {"f1", "./f1", nil},
+		// dir sources (empty)
+		{"de", "missing", nil}, {"de", "missing/", nil},
+		{"de", "f2", syscall.ENOTDIR}, {"de", "f2/", syscall.ENOTDIR},
+		{"de", "de2", syscall.EEXIST}, {"de", "de2/", syscall.EEXIST},
+		{"de", "dn", syscall.EEXIST}, {"de", "dn/", syscall.EEXIST},
+		{"de", "de", syscall.EEXIST}, {"de", "de/", syscall.EEXIST},
+		{"de", "./de", syscall.EEXIST}, {"./de", "de", syscall.EEXIST},
+		{"de/", "missing", nil}, {"de/", "de2", syscall.EEXIST},
+		// dir sources (nonempty): the preamble's EEXIST, never raw
+		// rename(2)'s ENOTEMPTY, through a Root
+		{"dn", "missing", nil}, {"dn", "missing/", nil},
+		{"dn", "de", syscall.EEXIST}, {"dn", "de/", syscall.EEXIST},
+		{"dn", "dn2", syscall.EEXIST}, {"dn", "dn2/", syscall.EEXIST},
+		{"dn", "dn", syscall.EEXIST}, {"dn", "dn/", syscall.EEXIST},
+		// missing sources
+		{"missing", "missing2", syscall.ENOENT}, {"missing", "missing2/", syscall.ENOENT},
+		{"missing", "f2", syscall.ENOENT},
+		// the rooted ordering: the new walk's slash check on a file
+		// answers ENOTDIR before the old final's existence (the un-rooted
+		// surface answers ENOENT here)
+		{"missing", "f2/", syscall.ENOTDIR},
+		{"missing", "de", syscall.ENOENT}, {"missing", "de/", syscall.ENOENT},
+		{"missing", "dn", syscall.ENOENT}, {"missing", "dn/", syscall.ENOENT},
+		{"missing/", "missing2", syscall.ENOENT}, {"missing/", "f2", syscall.ENOENT},
+		{"missing/", "de", syscall.ENOENT},
+		// old trailing slash on a file: the old walk's slash assertion
+		{"f1/", "missing", syscall.ENOTDIR}, {"f1/", "de", syscall.ENOTDIR},
+		{"f1/", "f2", syscall.ENOTDIR},
+		// dot finals
+		{".", "de", syscall.EEXIST}, {".", "missing", syscall.EBUSY},
+		{"de", ".", syscall.EEXIST}, {"de", "./", syscall.EEXIST},
+		{"f1", ".", syscall.EEXIST},
+		{"de/.", "missing", syscall.EBUSY}, {"de", "de2/.", syscall.EEXIST},
+		// same node with a dot-final on exactly one side: the preamble's
+		// equal-names/SameFile escape falls through to renameat's EBUSY;
+		// dot on both sides keeps equal finals and stays EEXIST
+		{"de", "de/.", syscall.EBUSY}, {"de/.", "de", syscall.EBUSY},
+		{"de/.", "de/.", syscall.EEXIST}, {"de", "./de/.", syscall.EBUSY},
+		{"sub/inside/..", "sub", syscall.EEXIST},
+		{"sub/inside/..", "renamed-sub", nil},
+		{".", "f2/", syscall.ENOTDIR}, {".", "missing/", syscall.EBUSY},
+		{".", "f2", syscall.EBUSY}, {".", "missing/x", syscall.ENOENT},
+		{"de/.", "f2/", syscall.ENOTDIR}, {"de/.", "missing/", syscall.EBUSY},
+		{"de/.", "de2", syscall.EEXIST},
+		{"de/..", "missing", syscall.EBUSY}, {"de/..", "de2", syscall.EEXIST},
+		{"missing", "de/.", syscall.ENOENT}, {"missing", ".", syscall.ENOENT},
+		{"de", "de2/..", syscall.EEXIST}, {"f1", "de/../f2", nil},
+		{"f1", "de/..", syscall.EEXIST},
+		// containment: the preamble answers an existing-dir target first,
+		// EINVAL only for a missing target inside the source
+		{"sub", "sub/inside/x", syscall.EINVAL}, {"sub", "sub/x", syscall.EINVAL},
+		{"sub", "sub/inside", syscall.EEXIST}, {"sub", "sub/inside/", syscall.EEXIST},
+		{"sub/inside", "sub/inside/", syscall.EEXIST}, {"sub/inside", "sub", syscall.EEXIST},
+		// intermediates through files / missing components
+		{"f1", "f2/x", syscall.ENOTDIR}, {"f2/x", "f1", syscall.ENOTDIR},
+		{"f1", "missing/x", syscall.ENOENT}, {"missing/x", "f1", syscall.ENOENT},
+		// escapes, both sides, lexical and walked
+		{"f1", "../x", errEscape}, {"../x", "f1", errEscape},
+		{"f1", "/abs", errEscape}, {"/abs", "f1", errEscape},
+		{"sub/../../x", "f1", errEscape}, {"f1", "sub/../../x", errEscape},
+		{".", "../x", errEscape},
+	}
+	simulation.Run(1, func() {
+		for i, row := range rows {
+			dir := fmt.Sprintf("/matrix-%d", i)
+			if err := os.MkdirAll(dir+"/sub/inside", 0o755); err != nil {
+				t.Fatalf("row %d: population: %v", i, err)
+			}
+			for _, f := range []string{"f1", "f2", "dn/child", "dn2/child"} {
+				if err := os.MkdirAll(filepath.Dir(dir+"/"+f), 0o755); err != nil {
+					t.Fatalf("row %d: population: %v", i, err)
+				}
+				if err := os.WriteFile(dir+"/"+f, []byte(f), 0o644); err != nil {
+					t.Fatalf("row %d: population: %v", i, err)
+				}
+			}
+			for _, d := range []string{"de", "de2"} {
+				if err := os.Mkdir(dir+"/"+d, 0o755); err != nil {
+					t.Fatalf("row %d: population: %v", i, err)
+				}
+			}
+			r, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("row %d: OpenRoot: %v", i, err)
+			}
+			err = r.Rename(row.old, row.new)
+			switch want := row.want; {
+			case want == nil:
+				if err != nil {
+					t.Errorf("Root.Rename(%q, %q) = %v, want success (host-probed)", row.old, row.new, err)
+				}
+			case want == errEscape:
+				if err == nil || !strings.Contains(err.Error(), "path escapes") {
+					t.Errorf("Root.Rename(%q, %q) = %v, want path-escape refusal (host-probed)", row.old, row.new, err)
+				}
+			default:
+				if !errors.Is(err, want) {
+					t.Errorf("Root.Rename(%q, %q) = %v, want %v (host-probed)", row.old, row.new, err, want)
+				}
+			}
+			r.Close()
+		}
+	})
+}
+
 func TestDSTFSOpenRootAdditionalEdges(t *testing.T) {
 	simulation.Run(1, func() {
 		if err := os.Mkdir("/root", 0o755); err != nil {

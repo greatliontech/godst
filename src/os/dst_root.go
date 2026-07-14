@@ -558,6 +558,24 @@ func dstRootRemoveAll(root *Root, name string) error {
 	return nil
 }
 
+// dstRootRename mirrors the HOST os.Root.Rename surface (Go's own openat
+// walk in rootRename, not raw renameat(2)) — host-probed on ext4 and tmpfs,
+// which agree on every row. The ladder, in the host's order:
+//
+//  1. the OLD walk, including its terminal-slash assertion (a slash on a
+//     missing old final is ENOENT, on a file ENOTDIR);
+//  2. the NEW walk with rename's creating-directory slash rule (a slash on
+//     a missing new final is legal, on a file ENOTDIR) — so a bad new walk
+//     precedes even an old terminal "." EBUSY;
+//  3. a slashed NEW final requires a directory SOURCE (missing old ENOENT,
+//     file old ENOTDIR);
+//  4. the portable preamble: an EXISTING-DIRECTORY newname is refused
+//     EEXIST when the old name resolves (missing old reports ENOENT) —
+//     so dir-over-dir replacement, dir-onto-nonempty-dir (raw rename(2)'s
+//     ENOTEMPTY), dir-onto-self, and file-onto-dir (raw rename(2)'s
+//     EISDIR) are all EEXIST through a Root;
+//  5. renameat(2) itself: terminal "." EBUSY, missing old ENOENT,
+//     same-node no-op, containment EINVAL, dir-over-file ENOTDIR.
 func dstRootRename(root *Root, oldname, newname string) error {
 	r, err := dstRootEnter(root)
 	if err != nil {
@@ -570,44 +588,73 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
-	oldParent, oldBase, oldNode, _, errno := dstRootResolveLocked(r, oldname)
+	oldParent, oldBase, oldNode, oldTrailingSlash, errno := dstRootResolveLocked(r, oldname)
 	if errno != nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: errno}
 	}
-	if oldBase == "." {
-		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EBUSY}
-	}
-	if oldNode == nil {
+	if oldTrailingSlash && oldNode == nil {
+		// The old walk lstats a slashed final: a missing source surfaces
+		// there, before the new path is looked at.
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
 	}
 	newParent, newBase, newNode, newTrailingSlash, errno := dstRootResolveLocked(r, newname)
 	if errno != nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: errno}
 	}
-	if newBase == "." || newParent == nil {
+	if newTrailingSlash {
+		// A slashed new final admits a missing component (the creating-
+		// directory rule) but requires a directory SOURCE.
+		if oldNode == nil {
+			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
+		}
+		if !oldNode.isDir {
+			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
+		}
+	}
+	if newNode != nil && newNode.isDir {
+		// The preamble: an existing-directory newname is EEXIST whenever
+		// the old name resolves — with the host's one escape: equal names
+		// referring to the same file skip the preamble and renameat
+		// answers. The host compares the two FINAL components (after its
+		// ".." restart rewrite, before any "." collapse), so the same
+		// directory node reached with a literal-dot final on exactly one
+		// side has DIFFERING finals, escapes the preamble, and renameat
+		// refuses the dot EBUSY (host-probed: Rename("de","de/.") and
+		// Rename("de/.","de") are EBUSY while Rename("de","de") and
+		// Rename("de/.","de/.") are EEXIST). Distinct directory nodes
+		// never share a final-agnostic identity (no hardlinked dirs), so
+		// the escape fires only on same-node-differing-final shapes.
+		if oldNode == nil {
+			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
+		}
+		if newNode != oldNode || dstRootRenameFinal(oldname, oldBase) == dstRootRenameFinal(newname, newBase) {
+			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EEXIST}
+		}
+		// Same node, differing finals: fall through to renameat's ladder —
+		// the terminal-dot arm below answers EBUSY (one side must carry
+		// the dot for the finals to differ).
+	}
+	if oldBase == "." || dstRootFinalIsDot(oldname) || newBase == "." || dstRootFinalIsDot(newname) {
+		// renameat(2)'s terminal-"." refusal. A new-side "." always names
+		// an existing directory, so the preamble above answers it first;
+		// the arm is kept for both sides as renameat itself has it.
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EBUSY}
 	}
-	if newTrailingSlash && newNode == nil && !oldNode.isDir {
-		// A trailing slash on a missing newpath is legal when the SOURCE
-		// is a directory (renameat shares rename(2)'s source-type rule;
-		// host-probed through os.Root.Rename on ext4 and tmpfs).
-		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
+	if oldNode == nil {
+		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
 	}
 	if newNode == oldNode {
 		return nil
 	}
+	// newParent is never nil here: only a root-resolving newname yields a
+	// nil parent, and the root is a directory the preamble above always
+	// answers (EEXIST, ENOENT, or the same-node escape into the dot arm).
 	if oldNode.isDir && dstNodeContains(oldNode, newParent) {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EINVAL}
 	}
-	if newNode != nil {
-		switch {
-		case newNode.isDir && !oldNode.isDir:
-			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EISDIR}
-		case !newNode.isDir && oldNode.isDir:
-			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
-		case newNode.isDir && len(newNode.entries) > 0:
-			return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTEMPTY}
-		}
+	if newNode != nil && oldNode.isDir {
+		// newNode is a file here (directory targets were EEXIST above).
+		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
 	}
 	// (No unlinked check needed here: a rooted rename's SOURCE must resolve
 	// inside this root, and an unlinked root is empty — the source lookup
@@ -621,6 +668,32 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	oldParent.modTime = now
 	newParent.modTime = now
 	return nil
+}
+
+// dstRootRenameFinal is the final path component as the host's rename
+// preamble compares it: the resolver's base (which carries the host's ".."
+// restart-rewrite collapse) except that a literal terminal "." — which the
+// resolver collapses onto the named directory — stays ".".
+func dstRootRenameFinal(name, base string) string {
+	if dstRootFinalIsDot(name) {
+		return "."
+	}
+	return base
+}
+
+// dstRootFinalIsDot reports whether the path's final component is a literal
+// "." — renameat(2) refuses those EBUSY, and the resolver collapses them
+// onto the named directory, so it alone cannot distinguish "de/." from "de".
+// (A terminal ".." is NOT a dot final: the host's restart rewrite collapses
+// it onto the parent name, exactly as the resolver does, and the rename
+// legally targets that parent.) splitPathInRoot drops "." components except
+// at the end, so checking the last part is exact.
+func dstRootFinalIsDot(name string) bool {
+	parts, _, err := splitPathInRoot(name, nil, nil)
+	if err != nil || len(parts) == 0 {
+		return false
+	}
+	return parts[len(parts)-1] == "."
 }
 
 func dstNodeContains(root, node *dstFSNode) bool {

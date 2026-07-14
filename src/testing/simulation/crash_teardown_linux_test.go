@@ -9,6 +9,7 @@ package simulation
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -270,6 +271,12 @@ func TestDSTCrashProcessMmapPreservesSharedContents(t *testing.T) {
 	}
 }
 
+// TestDSTCrashProcessResetsConnections: a crashed process's connections RST
+// at the surviving peer — with nothing delivered, the survivor's first read
+// fails ECONNRESET immediately (the future deadline is a hang guard only; it
+// must not be what fires — production's poller reports an expired deadline
+// before the socket error, so an already-expired deadline would mask the
+// reset on host and simulation alike).
 func TestDSTCrashProcessResetsConnections(t *testing.T) {
 	var readErr error
 	Test(t, 1, func(t *testing.T) {
@@ -297,12 +304,154 @@ func TestDSTCrashProcessResetsConnections(t *testing.T) {
 			}
 			<-accepted
 			crashProcess("server")
-			_ = c.SetReadDeadline(time.Now())
+			_ = c.SetReadDeadline(time.Now().Add(time.Minute))
 			_, readErr = c.Read(make([]byte, 1))
 		})
 	})
 	if !errors.Is(readErr, syscall.ECONNRESET) {
 		t.Fatalf("client read after server crash = %v, want ECONNRESET", readErr)
+	}
+}
+
+// TestDSTCrashProcessSurvivorDrainsDeliveredBytes: bytes the crashed process
+// wrote that were already DELIVERED to the surviving peer's receive queue
+// drain before the reset error — kill -9 closes the victim's sockets, but an
+// RST cannot destroy what the survivor's kernel already holds (tcp_recvmsg
+// reports pending data before the socket error, host-probed). Bytes still in
+// flight at the crash die (the write with no virtual time left before the
+// crash never arrives).
+func TestDSTCrashProcessSurvivorDrainsDeliveredBytes(t *testing.T) {
+	var n int
+	var got [8]byte
+	var firstErr, secondErr error
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		delivered := make(chan struct{})
+		written := make(chan struct{})
+		exited := make(chan struct{})
+
+		Host("victimhost", HostConfig{}, func() {
+			go Process("writer", func() {
+				l, err := net.Listen("tcp", HostIP("victimhost")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				c, err := l.Accept()
+				if err != nil {
+					t.Errorf("victim accept: %v", err)
+					return
+				}
+				if _, err := c.Write([]byte("abc")); err != nil {
+					t.Errorf("victim write abc: %v", err)
+					return
+				}
+				<-delivered
+				if _, err := c.Write([]byte("xyz")); err != nil {
+					t.Errorf("victim write xyz: %v", err)
+					return
+				}
+				close(written)
+				select {} // dies with the process
+			})
+		})
+		addr := <-addrCh
+
+		Host("survivorhost", HostConfig{}, func() {
+			go func() {
+				defer close(exited)
+				Process("reader", func() {
+					c, err := net.Dial("tcp", addr)
+					if err != nil {
+						t.Errorf("survivor dial: %v", err)
+						return
+					}
+					time.Sleep(20 * time.Millisecond) // "abc" is delivered to this queue
+					close(delivered)
+					<-written
+					Crash("writer")
+					n, firstErr = c.Read(got[:])
+					_, secondErr = c.Read(make([]byte, 8))
+				})
+			}()
+		})
+		<-exited
+	})
+	if n != 3 || string(got[:3]) != "abc" || firstErr != nil {
+		t.Fatalf("first read after the writer crashed = (%d, %q, %v), want (3, %q, nil): delivered bytes drain before the reset", n, got[:n], firstErr, "abc")
+	}
+	if !errors.Is(secondErr, syscall.ECONNRESET) {
+		t.Fatalf("second read = %v, want ECONNRESET with no data: the in-flight write died with the process", secondErr)
+	}
+}
+
+// TestDSTCrashProcessSparesAppClosedConns: a conn whose victim end the
+// application already close()d before the process crash is NOT reset at the
+// surviving peer — the kernel survives a process crash and has no socket
+// left to answer RST for (the fd left the table at close; its data and FIN
+// are on the wire) — so the peer drains and reads EOF, exactly as the
+// pre-crash teardown left it: the same boundary the host-crash matcher
+// applies (DST-FAULT-SOUND).
+func TestDSTCrashProcessSparesAppClosedConns(t *testing.T) {
+	var n int
+	var got [8]byte
+	var firstErr, secondErr error
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func(t *testing.T) {
+		addrCh := make(chan string, 1)
+		dialed := make(chan struct{})
+		closed := make(chan struct{})
+		exited := make(chan struct{})
+
+		Host("victimhost", HostConfig{}, func() {
+			go Process("writer", func() {
+				l, err := net.Listen("tcp", HostIP("victimhost")+":0")
+				if err != nil {
+					t.Errorf("victim listen: %v", err)
+					return
+				}
+				addrCh <- l.Addr().String()
+				c, err := l.Accept()
+				if err != nil {
+					t.Errorf("victim accept: %v", err)
+					return
+				}
+				<-dialed // keep the accepted endpoint live through the complete handshake
+				if _, err := c.Write([]byte("abc")); err != nil {
+					t.Errorf("victim write: %v", err)
+					return
+				}
+				c.Close() // graceful FIN before the crash
+				close(closed)
+				select {} // dies with the process
+			})
+		})
+		addr := <-addrCh
+
+		Host("survivorhost", HostConfig{}, func() {
+			go func() {
+				defer close(exited)
+				Process("reader", func() {
+					c, err := net.Dial("tcp", addr)
+					if err != nil {
+						t.Errorf("survivor dial: %v", err)
+						return
+					}
+					close(dialed)
+					<-closed
+					Crash("writer")
+					n, firstErr = c.Read(got[:])
+					_, secondErr = c.Read(make([]byte, 8))
+				})
+			}()
+		})
+		<-exited
+	})
+	if n != 3 || string(got[:3]) != "abc" || firstErr != nil {
+		t.Fatalf("read of gracefully-closed conn after the peer process crashed = (%d, %q, %v), want (3, %q, nil): the crash cannot destroy bytes the network already carries", n, got[:n], firstErr, "abc")
+	}
+	if secondErr != io.EOF {
+		t.Fatalf("second read = %v, want io.EOF: the app-closed end FINned before the crash; no RST exists", secondErr)
 	}
 }
 

@@ -112,6 +112,7 @@ type dstStream struct {
 	space      chan struct{} // buffered(1) wakeup, pinged on pop (wakes a blocked WRITER)
 	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
 	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
+	frozen     bool          // an injected RST killed the receiving socket: later pushes are discarded (freezeAtHorizon)
 }
 
 func newDstStream(capacity int64) *dstStream {
@@ -138,25 +139,25 @@ func (s *dstStream) wakeWriter() {
 	}
 }
 
-// push appends a copy of b for delivery from now: a bandwidth-limited link
-// transmits the segment (it occupies the link len(b)/bandwidth before propagating,
-// serialized after earlier queued bytes via linkFreeAt), then the base latency and
-// a jitter draw in [0,jitterNs) apply. Non-blocking (a send buffer). FIFO order
-// needs no clamp: the reader consumes the head first, so a later segment (even one
-// with a smaller jitter draw) is never delivered before an earlier one —
-// head-of-line bunches it instead. bandwidthBps<=0 is unlimited; jitterNs<=0 draws
-// nothing (so an inactive jitter fault leaves the fault stream untouched).
-func (s *dstStream) push(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
-	s.mu.Lock()
-	s.pushLocked(b, latencyNs, jitterNs, bandwidthBps)
-	s.mu.Unlock()
-	s.wake()
-}
-
-// pushLocked is push's body with the caller holding s.mu (and not signaling the reader —
-// the caller does). The bounded-buffer write path uses it to check capacity and append
-// atomically under one lock hold.
+// pushLocked appends a copy of b for delivery from now, with the caller
+// holding s.mu (and signaling the reader itself): a bandwidth-limited link
+// transmits the segment (it occupies the link len(b)/bandwidth before
+// propagating, serialized after earlier queued bytes via linkFreeAt), then
+// the base latency and a jitter draw in [0,jitterNs) apply. Non-blocking (a
+// send buffer). FIFO order needs no clamp: the reader consumes the head
+// first, so a later segment (even one with a smaller jitter draw) is never
+// delivered before an earlier one — head-of-line bunches it instead. The
+// write path holds s.mu across its capacity check and this append, one
+// atomic unit. bandwidthBps<=0 is unlimited; jitterNs<=0 draws nothing (so
+// an inactive jitter fault leaves the fault stream untouched).
 func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64) {
+	if s.frozen {
+		// An injected RST killed the receiving socket: a late segment is
+		// answered with an RST, never queued (the sender's own end carries
+		// the failure once its injection lands — its local send still
+		// succeeds first, as a real send() into a doomed conn does).
+		return
+	}
 	data := append([]byte(nil), b...)
 	transmitEnd := dstBaseNanos()
 	if bandwidthBps > 0 {
@@ -325,6 +326,19 @@ type dstWireEnd struct {
 	horizonOnce   sync.Once
 	horizonKill   chan struct{}
 
+	// An injected RST (fault matcher or crash teardown) arrived at this
+	// end: reads drain the already-DELIVERED bytes first, then fail; writes
+	// fail immediately. rstKill closes when the RST lands, waking blocked
+	// operations to observe rstArrived (the horizonKill pattern). See
+	// injectRST for the kernel contract; the receive queue itself is FROZEN
+	// by the injection (dstStream.frozen), so a peer end whose own
+	// injection the teardown loop has not reached yet cannot slip bytes
+	// into this queue after the RST — a real CLOSED socket answers such a
+	// late segment with an RST of its own, never queues it.
+	rstArrived atomic.Bool
+	rstOnce    sync.Once
+	rstKill    chan struct{}
+
 	once       sync.Once
 	localDone  chan struct{}
 	remoteDone chan struct{} // the peer's localDone
@@ -342,13 +356,13 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 	a := &dstWireEnd{
 		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: dialerHost, peerHost: listenHost,
-		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}),
+		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
 		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
-		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}),
+		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	return a, b
@@ -397,7 +411,13 @@ func (e *dstWireEnd) armHorizon() {
 // delivered the bytes, or the end closed), extend if a heal-then-recut restarted
 // the window, otherwise kill this end — timedOut, wake every blocked operation.
 func (e *dstWireEnd) horizonCheck() {
-	if e.timedOut.Load() || isClosedChan(e.localDone) {
+	// rstArrived disarms too: an injected RST destroyed the socket, and its
+	// retransmit timer died with it — a later horizon expiry must not flip
+	// the conn's ECONNRESET identity to ETIMEDOUT. (The converse order —
+	// timeout first, RST later — keeps ETIMEDOUT: read and write consult
+	// timedOut first, matching a kernel that stopped accepting segments
+	// when retransmission exhausted.)
+	if e.timedOut.Load() || e.rstArrived.Load() || isClosedChan(e.localDone) {
 		e.horizonMu.Lock()
 		e.horizonArmed = false
 		e.horizonMu.Unlock()
@@ -437,6 +457,66 @@ func (e *dstWireEnd) horizonCheck() {
 	e.out.wake()
 	e.out.wakeWriter()
 	e.in.wake()
+}
+
+// injectRST delivers a fault-injected RST to this end — the kernel-faithful
+// RECEIVER shape (host-probed): an incoming RST sets the socket error, but
+// tcp_recvmsg reports pending data before the error, so bytes already
+// DELIVERED to this end's receive queue stay readable and drain first;
+// only then do reads fail (the dstConn wrapper maps the failure and the
+// drained-EOF to the stable ECONNRESET identity via the shared reset flag).
+// Writes fail immediately (the socket error is already pending). Bytes
+// still IN FLIGHT toward this end are destroyed: the RST reached the socket
+// before they did — one of the orderings a real injection race produces —
+// and a crashed sender's untransmitted send buffer never leaves its kernel.
+// "Delivered" is the same arrival horizon Read uses: under a partition cut
+// only bytes that arrived strictly before the cut are in the receive queue;
+// everything the cut holds dies with the connection.
+func (e *dstWireEnd) injectRST() {
+	// Once-guarded: a second injection (two fault ops racing to the same
+	// conn) must not re-freeze at a later horizon and resurrect bytes the
+	// first RST already killed.
+	e.rstOnce.Do(func() {
+		horizon := dstBaseNanos()
+		if cutStart, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cutStart-1 < horizon {
+			horizon = cutStart - 1
+		}
+		e.in.freezeAtHorizon(horizon)
+		e.rstArrived.Store(true)
+		close(e.rstKill)
+	})
+	e.in.wake()        // a reader parked on the ready channel re-evaluates
+	e.out.wakeWriter() // a writer parked on send-buffer space observes the RST
+}
+
+// freezeAtHorizon drops every segment not yet delivered at horizon and
+// FREEZES the stream — an injected RST destroys in-flight bytes, never the
+// receive queue, and the dead socket accepts nothing further: a push after
+// the freeze is discarded under the same lock (program order, not
+// timestamps — at zero latency a post-RST push carries deliverAt equal to
+// the horizon, so no timestamp comparison can separate it from a drainable
+// same-instant pre-RST byte). The receive queue kept is the longest FIFO
+// PREFIX whose every segment has arrived (head-of-line: a jitter draw can
+// give a later segment an earlier deliverAt, but it is readable only behind
+// its predecessors — exactly pop's delivery rule), so the scan stops at the
+// first undelivered segment and the whole remainder dies. The dropped
+// suffix is cleared so the backing array does not retain the dead buffers.
+func (s *dstStream) freezeAtHorizon(horizon int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen = true
+	live := 0
+	for live < len(s.segs) && s.segs[live].deliverAt <= horizon {
+		live++
+	}
+	for i := live; i < len(s.segs); i++ {
+		s.buffered -= int64(len(s.segs[i].data))
+		s.segs[i] = dstSeg{}
+	}
+	s.segs = s.segs[:live]
+	if len(s.segs) == 0 {
+		s.segs = nil
+	}
 }
 
 // unreadInbound reports whether this end's receive direction still holds bytes
@@ -514,6 +594,15 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		if e.timedOut.Load() {
 			return 0, syscall.ETIMEDOUT
 		}
+		// An injected RST follows the same tcp_recvmsg rule: the delivered
+		// bytes above drained first (injectRST truncated everything else), and
+		// only then does the socket error surface — before any FIN wait, since
+		// the RST supersedes a still-traveling graceful close. The dstConn
+		// wrapper maps ErrClosedPipe to ECONNRESET (the shared reset flag holds
+		// the identity for the drained-EOF path too).
+		if e.rstArrived.Load() {
+			return 0, io.ErrClosedPipe
+		}
 		// A blocked read observing dying OUTBOUND bytes arms the watchdog — the
 		// spec's "blocked operation" surfacing: write-then-read into a permanent
 		// cut must fail at the horizon, not hang forever. Checked before EITHER
@@ -534,6 +623,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			select {
 			case <-wake:
 			case <-e.horizonKill:
+			case <-e.rstKill:
 			case <-e.localDone:
 			case <-e.rdDead.wait():
 			}
@@ -563,6 +653,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			// reader past the horizon. The wake channel is remade per change —
 			// one wakeup per fault op, no spin.
 		case <-e.horizonKill:
+		case <-e.rstKill:
 		case <-e.localDone:
 		case <-e.rdDead.wait():
 		}
@@ -586,6 +677,11 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	switch {
 	case e.timedOut.Load():
 		return 0, syscall.ETIMEDOUT
+	case e.rstArrived.Load():
+		// An injected RST already landed: the socket error is pending and a
+		// send fails with it immediately (no drain applies to writes). The
+		// dstConn wrapper maps ErrClosedPipe to ECONNRESET.
+		return 0, io.ErrClosedPipe
 	case isClosedChan(e.localDone):
 		return 0, io.ErrClosedPipe
 	case isClosedChan(e.remoteDone):
@@ -611,6 +707,13 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	total := 0
 	cutStart := int64(-1) // base-time the current partition-block began; -1 = not counting
 	for len(b) > 0 {
+		// Re-check the injected-RST state on every chunk, not just at
+		// entry: under access-granularity (Level 2) scheduling the fault op
+		// can interleave between chunk pushes — a real kernel's destroyed
+		// connection can never carry the remaining bytes.
+		if e.rstArrived.Load() {
+			return total, io.ErrClosedPipe
+		}
 		e.out.mu.Lock()
 		for e.out.capacity > 0 && e.out.buffered >= e.out.capacity {
 			e.out.mu.Unlock()
@@ -640,6 +743,11 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			select {
 			case <-e.out.space:
 			case <-wake: // partition began or healed: re-evaluate the horizon
+			case <-e.rstKill:
+				if horizonT != nil {
+					horizonT.Stop()
+				}
+				return total, io.ErrClosedPipe
 			case <-e.horizonKill:
 				return total, syscall.ETIMEDOUT
 			case <-horizonC:
@@ -663,6 +771,19 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			}
 			if horizonT != nil {
 				horizonT.Stop()
+			}
+			// Re-check the injected-RST state after EVERY wake, before the
+			// buffer is touched again — including the freed-space wake that
+			// exits this loop. A parked writer can have COMMITTED to the
+			// freed-space arm before the RST landed (the peer drains, then
+			// the fault op runs, with the writer runnable but not yet
+			// resumed), so the select choice alone cannot carry the check:
+			// without it the resumed writer pushes post-RST bytes the peer
+			// could then read — a sim-only execution (a real kernel wakes a
+			// blocked sender with the pending socket error, and the
+			// destroyed connection never carries another byte).
+			if e.rstArrived.Load() {
+				return total, io.ErrClosedPipe
 			}
 			e.out.mu.Lock()
 		}

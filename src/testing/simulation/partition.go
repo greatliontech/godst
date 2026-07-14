@@ -48,6 +48,7 @@ const (
 	partOpCloseHostListeners
 	partOpHostDown
 	partOpHostUp
+	partOpCrashProcConns
 )
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections
@@ -100,8 +101,9 @@ func PartitionRefuse(a, b string) {
 
 // Reset injects ECONNRESET on every active connection between hosts a and b (in
 // either direction), modeling a transient that tears those flows down — a real RST
-// from a peer crash or a middlebox. Both ends of each connection observe
-// ECONNRESET on their next operation; any in-flight buffered bytes are dropped.
+// from a middlebox. Both ends survive and receive the RST as a real kernel would:
+// each drains the bytes already delivered to its receive queue, then reads fail
+// ECONNRESET and writes fail immediately; in-flight buffered bytes are dropped.
 func Reset(a, b string) {
 	withBubbleFaultCaller("Reset", func() { dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b)) })
 }
@@ -109,6 +111,8 @@ func Reset(a, b string) {
 // ResetProcess injects ECONNRESET on every active connection process p owns an end
 // of (as dialer or as the listening process) — modeling that process's sockets
 // being torn down (e.g. as a lighter-weight precursor to the process crash fault).
+// p itself stays alive, so every end — p's own included — drains its delivered
+// bytes before failing ECONNRESET; in-flight bytes are dropped.
 func ResetProcess(p string) {
 	withBubbleFaultCaller("ResetProcess", func() { dstNetPartitionOp(partOpResetProc, lookupProc(p), 0) })
 }

@@ -228,10 +228,12 @@ func TestDSTFSOpenRootRemovedDirectory(t *testing.T) {
 			t.Fatalf("Open of a removed subtree's child through the Root = %v, want not-exist (bottom-up unlink)", err)
 		}
 
-		// Rename-over unlinks the replaced (empty) directory. Go's os.Rename
-		// refuses directory targets at the Go level (EEXIST), so the
-		// dir-over-dir replace is exercised through the rooted surface, which
-		// keeps renameat(2)'s kernel semantics.
+		// Rename-over unlinks the replaced (empty) directory. BOTH portable
+		// surfaces refuse an existing-directory newname with EEXIST —
+		// os.Rename's preamble and os.Root.Rename's (host-probed; see
+		// design.md's os.OpenRoot paragraph) — so the dir-over-dir replace
+		// is pinned on the internal renameat(2) ladder via the raw hook,
+		// and the rooted surface's refusal is pinned alongside it.
 		if err := os.Mkdir("/old", 0o755); err != nil {
 			t.Fatalf("Mkdir /old: %v", err)
 		}
@@ -248,8 +250,11 @@ func TestDSTFSOpenRootRemovedDirectory(t *testing.T) {
 			t.Fatalf("OpenRoot /: %v", err)
 		}
 		defer rTree.Close()
-		if err := rTree.Rename("new", "old"); err != nil {
-			t.Fatalf("rooted Rename over: %v", err)
+		if err := rTree.Rename("new", "old"); !errors.Is(err, syscall.EEXIST) {
+			t.Fatalf("rooted Rename onto existing dir = %v, want EEXIST (host os.Root.Rename preamble)", err)
+		}
+		if err := os.DSTRawRename("/new", "/old"); err != nil {
+			t.Fatalf("raw rename over: %v", err)
 		}
 		if _, err := rOld.Create("f"); !errors.Is(err, syscall.ENOENT) {
 			t.Fatalf("Create in renamed-over root = %v, want ENOENT", err)

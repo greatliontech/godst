@@ -527,16 +527,23 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   not reproduce ACK-starvation (a real sender stalls and eventually `ETIMEDOUT`s when its ACKs travel the
   cut direction). This is a *completeness* limit (the sim MISSES a real fault — the safe, ⊆-real
   direction), never a false failure; ACK-level reverse death is a possible finer-grained follow-on.
-- **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns, reusing the conn's
-  existing `resetConn()` (already wired for backlog teardown: peer reads & writes then carry `ECONNRESET`).
+- **Connection reset** — inject `ECONNRESET` on a process's or a host-pair's conns.
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
   `ResetProcess(p)` (process), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
   host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). An injected reset hits **both
-  ends**, so each closes and a subsequent read returns `ECONNRESET` before draining — queued and in-flight
-  bytes alike: the fault destroys the conn outright, a recorded fault-model collapse (a real kernel's
-  tcp_recvmsg would still drain a receiver's already-queued bytes before reporting the error — the
-  drain-then-reset shape the non-fault close(2) conditional models). When a reset matches **several** conns, the victims are
+  ends**, and each end receives it as a real kernel delivers an RST (both ends are SURVIVORS — these
+  faults reset connections, not processes): bytes already **delivered** to that end's receive queue
+  drain first — tcp_recvmsg reports pending data before the socket error, host-probed — then reads
+  fail `ECONNRESET`; writes fail immediately with the pending error; bytes still **in flight** toward
+  either end are destroyed (the RST beat them to the socket — one of the orderings a real injection
+  race produces, so executions stay ⊆-real), and the receive queue is FROZEN at the RST instant —
+  a segment sent toward it afterward is never delivered (a CLOSED socket answers a late segment
+  with its own RST, it does not queue it). *Enforced:*
+  `TestDSTNetResetDrainsDeliveredThenResets`, `TestDSTNetResetProcessOwnEndDrains`,
+  `TestDSTNetResetDropsInFlight`, `TestDSTNetInjectRSTFreezesReceiveQueue`. A conn still in the accept backlog is half-open — no receive queue
+  exists on either side — so the RST aborts the handshake outright, as a kernel does.
+  When a reset matches **several** conns, the victims are
   reset in **connection-registration order** (a per-run sequence id recorded at establishment,
   `dstConn.regSeq`; the victims are collected from the registry and sorted by it —
   `TestDSTNetResetVictimOrderByRegSeq`) — never in
@@ -836,13 +843,19 @@ The crash-RST collapse has one boundary: a connection whose victim-side end the 
 wire, and a powered-off machine emits no packet — nothing can destroy bytes the network already
 carries, so the peer drains and reads `io.EOF` (or whatever error the pre-crash teardown recorded),
 exactly as if the crash never happened to that conn (DST-FAULT-SOUND: no real RST exists for an
-app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns`. The RST applies to
-the connections the victim still holds open, at the surviving peer's own end — its next read fails
-`ECONNRESET` **without draining**, queued and in-flight bytes alike: the fault destroys the conn
-outright, a recorded fault-model collapse (a real kernel's tcp_recvmsg would still drain the
-survivor's already-queued bytes before reporting the error — the shape the non-fault close(2)
-conditional models).
-*Enforced:* `TestDSTCrashHostDropsInFlightBytes`, `TestDSTCrashHostFreesVictimPorts`
+app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns` (host crash),
+`TestDSTCrashProcessSparesAppClosedConns` (process crash — the kernel survives a `kill -9` and has
+no socket left to answer RST for an fd that left the table at close). The RST applies to
+the connections the victim still holds open. The victim's own ends reset outright — their receive
+queues died with the process or kernel. The surviving peer's end receives the RST
+kernel-faithfully: bytes already **delivered** to the survivor's receive queue drain first (an
+incoming RST cannot destroy what the survivor's kernel already holds — tcp_recvmsg reports pending
+data before the socket error, host-probed), then its reads fail `ECONNRESET`; bytes still **in
+flight** die with the crashed sender (its kernel's send buffer and its emissions never complete —
+in the simulation's one-queue wire model every undelivered byte is destroyable in some real
+execution, so the collapse stays ⊆-real).
+*Enforced:* `TestDSTCrashHostDropsInFlightBytes` (delivered bytes drain, in-flight bytes die),
+`TestDSTCrashProcessSurvivorDrainsDeliveredBytes`, `TestDSTCrashHostFreesVictimPorts`
 (the victim's port space clears with the machine). And until a Host re-declaration reboots the
 machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so the connect times
 out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect cost; *enforced:*
@@ -862,8 +875,12 @@ whose receive queue holds unread data answers the peer with RST: the peer still 
 delivered to it, and bytes the dying process wrote before exiting (they travel ahead of the RST on the
 in-order link, and tcp_recvmsg reports pending data before the socket error — host-probed), and only
 then do its reads fail ECONNRESET (`TestDSTProcessExitResetDeliversPreExitBytesThenResets`); otherwise
-the close FINs and the peer drains buffered bytes then reads EOF — while crash RESETS them
-unconditionally with the fault layer's no-drain teardown, and both close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process
+the close FINs and the peer drains buffered bytes then reads EOF — while crash RESETS the still-open
+ends unconditionally (a recorded collapse: exit's per-end RST-vs-FIN conditional is not applied at a
+crash, every surviving peer of a still-open end gets `ECONNRESET`), with the survivor draining its
+delivered bytes first and in-flight bytes dying, per the crash-RST contract above; exit and crash
+also differ in the in-flight bytes themselves (exit's close lets pre-exit writes travel ahead of the
+RST; a crash destroys them) — and both close its listeners. The same conditional governs a USER-CALLED `Close()` on a live process
 (`TestDSTNetCloseWithUnreadDataResetsPeer`, `TestDSTNetCloseAfterDrainingFINs`) — close(2) is
 close(2), whoever calls it. The in-flight-counts-as-queued collapse is pinned by
 `TestDSTNetCloseBeforeDeliveryStillResets`. One recorded collapse of the conditional: bytes still in flight count as queued —

@@ -48,6 +48,7 @@ const (
 	dstFaultOpCloseHostListeners                   // close every listener on host a (host crash)
 	dstFaultOpHostDown                             // host a lost power: dials to it blackhole until it reboots
 	dstFaultOpHostUp                               // host a rebooted (Host re-declaration): dials reach its kernel again
+	dstFaultOpCrashProcConns                       // process a crashed: its conn ends reset outright, surviving peers drain then ECONNRESET
 )
 
 func init() {
@@ -67,6 +68,8 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstCloseProcListeners(a)
 	case dstFaultOpCloseProcConns:
 		dstCloseProcConns(a)
+	case dstFaultOpCrashProcConns:
+		dstCrashProcConns(a)
 	case dstFaultOpResetHost:
 		dstResetHost(a)
 	case dstFaultOpCloseHostListeners:

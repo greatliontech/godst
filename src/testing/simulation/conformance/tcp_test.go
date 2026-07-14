@@ -514,7 +514,7 @@ func tcpCoverageOps() []op {
 	add(tcpSettle(3, settleData))           // the 500 bytes must be QUEUED at 3 for its close to RST
 	add(tcpCloseConn(3))                    // unread data: RST, not FIN
 	add(tcpSettle(2, settleErr))
-	add(tcpRead("read-after-rst", 2, 16, guardReady)) // ECONNRESET without draining
+	add(tcpRead("read-after-rst", 2, 16, guardReady)) // ECONNRESET (2's receive queue is empty: nothing to drain before the error)
 	add(tcpWrite("post-reset-write", 2, pat(8, 60)))
 	add(tcpRead("post-reset-read", 2, 8, 0))
 	add(tcpCloseConn(2))
