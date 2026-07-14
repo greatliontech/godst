@@ -180,6 +180,40 @@ func TestDSTFSRemoveNonEmptyENOTEMPTY(t *testing.T) {
 	})
 }
 
+// TestDSTFSTrailingSlashCreateLegs pins the host-probed errno identities of
+// the trailing-slash CREATE legs, where the positive-dentry / slash-assertion
+// ordering differs per op and per surface:
+//   - mkdir(2) and mkdirat(2) report a positive final dentry EEXIST before
+//     the slash's directory assertion (filename_create looks the dentry up
+//     first) — never ENOTDIR;
+//   - the rooted create through a slash-asserted MISSING component is
+//     ENOENT (openat2's resolver), unlike the plain open(2)'s EISDIR
+//     (TestDSTFSCreateTrailingSlashEISDIR pins that arm).
+func TestDSTFSTrailingSlashCreateLegs(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/f", []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		if err := os.Mkdir("/f/", 0o755); !errors.Is(err, syscall.EEXIST) {
+			t.Fatalf(`Mkdir("/f/") = %v, want EEXIST (the positive dentry answers before the slash assertion)`, err)
+		}
+		root, err := os.OpenRoot("/")
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		defer root.Close()
+		if err := root.Mkdir("f/", 0o755); !errors.Is(err, syscall.EEXIST) {
+			t.Fatalf(`Root.Mkdir("f/") = %v, want EEXIST (mkdirat's positive dentry answers first)`, err)
+		}
+		if _, err := root.OpenFile("missing/", os.O_CREATE|os.O_WRONLY, 0o644); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf(`Root.OpenFile("missing/", O_CREATE|O_WRONLY) = %v, want ENOENT (openat2 rejects the slash-asserted missing component)`, err)
+		}
+		if _, statErr := os.Stat("/missing"); statErr == nil {
+			t.Fatalf("a file was created despite the trailing slash")
+		}
+	})
+}
+
 // TestDSTFSCreateTrailingSlashEISDIR: O_CREAT through a trailing slash cannot mint a
 // regular file — real Linux returns EISDIR (a trailing slash asserts a directory).
 func TestDSTFSCreateTrailingSlashEISDIR(t *testing.T) {

@@ -2385,6 +2385,12 @@ func TestDSTProcOverlayFDIdentity(t *testing.T) {
 		if st.Dev != 0 || st.Ino != 0 {
 			t.Fatalf("proc-overlay identity = (dev %d, ino %d), want (0, 0)", st.Dev, st.Ino)
 		}
+		// The timestamps stay zero too: the overlay's zero ModTime must not be
+		// stamped through UnixNano (whose overflow is a garbage NEGATIVE
+		// second count — a shape no kernel reports).
+		if st.Mtim != (syscall.Timespec{}) || st.Atim != (syscall.Timespec{}) || st.Ctim != (syscall.Timespec{}) {
+			t.Fatalf("proc-overlay timestamps = (atim %+v, mtim %+v, ctim %+v), want all zero", st.Atim, st.Mtim, st.Ctim)
+		}
 		buf := make([]byte, 8)
 		if n, err := syscall.Read(fd, buf); n <= 0 || err != nil {
 			t.Fatalf("read through the proc fd = %d, %v; want >0, nil", n, err)

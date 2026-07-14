@@ -76,7 +76,7 @@ by slog (consumers need a relay they must discover by data loss);
   diagnostic — decided in review by the fidelity mandate, recorded
   either way). Close-out gate runs per issue: promote, retarget,
   delete.
-- [ ] **7 — Full-surface re-audit.** Fresh adversarial audit of the
+- [x] **7 — Full-surface re-audit.** Fresh adversarial audit of the
   complete dst surface (scheduler, clock/timers, fs, pipes, net,
   faults, capabilities, crypto/rand, map seeding), a spec-vs-code
   coverage walk of design.md + faults.md + exploration.md, widened

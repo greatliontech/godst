@@ -931,8 +931,11 @@ func TestDSTFSOpenRoot(t *testing.T) {
 		}
 		_, err = r.OpenFile("sub/dir/file", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		mustErrIs("Root.OpenFile O_EXCL existing", err, syscall.EEXIST)
+		// ENOENT, not the plain open(2)'s EISDIR: openat2 (os.Root's
+		// resolver) rejects the slash-asserted missing final component
+		// first (host-probed; TestDSTFSTrailingSlashCreateLegs).
 		_, err = r.OpenFile("new/", os.O_WRONLY|os.O_CREATE, 0o600)
-		mustErrIs("Root.OpenFile create trailing slash", err, syscall.EISDIR)
+		mustErrIs("Root.OpenFile create trailing slash", err, syscall.ENOENT)
 		_, err = r.OpenFile("sub/dir", os.O_RDONLY|os.O_TRUNC, 0)
 		mustErrIs("Root.OpenFile truncate dir", err, syscall.EISDIR)
 		if err := r.Chown("sub/dir/file", 1, 1); !isDSTUnsupportedFS(err) {

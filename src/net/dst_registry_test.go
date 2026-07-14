@@ -139,8 +139,13 @@ func TestDSTNetAcceptedCloseBeforeDialReturnCleansOwnership(t *testing.T) {
 			}
 			dstConns.mu.Unlock()
 		})
-		if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
-			t.Fatalf("seed %d: accepted close returned (%v, %v), want nil ECONNRESET", seed, conn, dialErr)
+		// ECONNREFUSED: the dial is still mid-establishment (SYN-ACK in
+		// flight), and every abort of a not-yet-returned dial carries the
+		// SYN_SENT identity — production cannot produce this exact ordering
+		// (a real child is queued only after the handshake completes), so
+		// the model's uniform mid-establishment rule answers.
+		if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			t.Fatalf("seed %d: accepted close returned (%v, %v), want nil ECONNREFUSED", seed, conn, dialErr)
 		}
 		if leaked != 0 {
 			t.Fatalf("seed %d: accepted close left %d registered endpoint(s)", seed, leaked)

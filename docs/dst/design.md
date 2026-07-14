@@ -1004,7 +1004,14 @@ A capability's real syscall thus *serializes* the bubble for its duration: one l
 deterministic. The dual failure mode is recorded plainly: a goroutine blocked **reading** an inherited
 capability is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
 nor declare deadlock, so the run hangs until the read returns. Reading the real terminal under a
-run is therefore an explicit capability choice, not an accidental numeric-fd escape.
+run is therefore an explicit capability choice, not an accidental numeric-fd escape. A third hang
+mode shares the shape: a bubble goroutine executing a CALL-FREE spin loop (no preemption point —
+e.g. `for !flag.Load() {}`) wedges the whole process, because the run pins P=1, disables async
+preemption, and gates sysmon's retake — no other goroutine (bubble, foreign, or watchdog) can ever
+run, and the durably-blocked detector never fires over a running goroutine. Production Go completes
+such a program (async preemption keeps peers running); under DST it is an undiagnosed wall-clock
+hang — a recorded boundary of the cooperative single-P model (no in-process diagnosis exists
+today; only an external kill ends the run).
 Completing the audit of the remaining OS-backed I/O surface: `io.Pipe` is pure memory;
 `ReadFile`/`WriteFile`/`CreateTemp`/`MkdirTemp` ride the simulated `OpenFile`; `Hostname` and
 `Getpid` are Options-pinned; env APIs operate on the per-process simulated environment (see the
@@ -1161,7 +1168,7 @@ iteration (the reset registry iterates in registration order — see faults.md);
 
 One raw-syscall path is deliberately outside the fence: the `syscall` package's `rawSyscallNoError`
 (a fifth, asm-implemented raw entry that bypasses the four generic trampolines) backs
-`Getpid`/`Getuid`/`Getppid`/`Gettid`/`Getegid` and `Umask`. The identity reads are the same
+`Getpid`/`Getuid`/`Geteuid`/`Getgid`/`Getppid`/`Gettid`/`Getegid` and `Umask`. The identity reads are the same
 program-discipline stance as the ⛔ rows — `os.Getpid` and friends are intercepted to the simulated
 identity, but a *direct* `syscall.Getpid` reads the host value; that is a host-state read that mints
 nothing. `syscall.Umask` is the one *mutation* in this set: called directly from a bubble it changes
@@ -1169,7 +1176,12 @@ the process-global umask (nothing simulated observes it, but a later host file c
 left to program discipline for the same reason the reads are — the fence's choke point is the four
 generic trampolines (which catch `golang.org/x/sys/unix`, whose asm never routes through the
 unexported `rawSyscallNoError`) plus the resource-minting wrappers, not this asm path. A SUT that
-needs process identity or umask under a run uses the `os` API, which is modeled or fenced.
+needs process identity or umask under a run uses the `os` API, which is modeled or fenced. The one
+OTHER asm entry that bypasses the trampolines — linux/amd64's vDSO `gettimeofday`, backing
+`syscall.Gettimeofday`/`syscall.Time` — is NOT left to program discipline: unlike the identity
+reads it returns host WALL time, a nondeterministic value, so its named wrappers carry the fence
+(the same loud refusal an in-bubble `CLOCK_REALTIME` read gets; every other dst arch already
+routes these through the fenced `RawSyscall` wrapper). Enforced: `TestDSTGettimeofdayFence`.
 
 ### Enforcing test configurations
 

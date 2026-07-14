@@ -2,6 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// White-box: references dst-only symbols (dstConnectSYN, dstNewBaseTimer,
+// dstBaseNanos), so it is build-tagged like the package's other white-box
+// dst test files rather than stub-compilable untagged (the untagged test
+// build is gated by `vet net` in the Taskfile's untagged leg).
+
+//go:build dst
+
 package net
 
 import (
@@ -95,8 +102,8 @@ func TestDSTNetSYNACKObservesReset(t *testing.T) {
 			dialDuration = time.Since(start)
 		})
 	})
-	if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
-		t.Fatalf("reset during SYN-ACK returned (%v, %v), want nil ECONNRESET", conn, dialErr)
+	if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		t.Fatalf("reset during SYN-ACK returned (%v, %v), want nil ECONNREFUSED (an RST in SYN_SENT is the connection-refused mapping)", conn, dialErr)
 	}
 	if dialDuration != 100*time.Millisecond {
 		t.Fatalf("SYN-ACK reset returned after %v, want one-way 100ms", dialDuration)
@@ -126,8 +133,8 @@ func TestDSTNetSYNACKObservesServerProcessExit(t *testing.T) {
 			dialDuration = time.Since(start)
 		})
 	})
-	if conn != nil || !errors.Is(dialErr, syscall.ECONNRESET) {
-		t.Fatalf("server process exit during SYN-ACK returned (%v, %v), want nil ECONNRESET", conn, dialErr)
+	if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		t.Fatalf("server process exit during SYN-ACK returned (%v, %v), want nil ECONNREFUSED (an RST in SYN_SENT is the connection-refused mapping)", conn, dialErr)
 	}
 	if dialDuration != 100*time.Millisecond {
 		t.Fatalf("server exit during SYN-ACK returned after %v, want one-way 100ms", dialDuration)

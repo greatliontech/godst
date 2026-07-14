@@ -617,7 +617,18 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if name == "" {
 		return wrap(syscall.ENOENT)
 	}
-	parent, base, node, errno := dstFSResolve(name)
+	// mkdir(2) reports a positive final dentry EEXIST before the trailing
+	// slash's directory assertion (filename_create looks the dentry up first;
+	// host-probed: mkdir("file/") is EEXIST, not ENOTDIR), so mkdir resolves
+	// with trailing slashes stripped and lets the existing-node check answer.
+	trimmed := name
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	if trimmed == "" {
+		trimmed = name // "/" and all-slash names keep their root resolution
+	}
+	parent, base, node, errno := dstFSResolve(trimmed)
 	if errno != nil {
 		return wrap(errno)
 	}

@@ -272,7 +272,12 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		return wrap(syscall.EEXIST)
 	case node == nil:
 		if trailingSlash {
-			return wrap(syscall.EISDIR)
+			// The ROOTED create through a trailing slash is ENOENT, not the
+			// plain path's EISDIR: openat2(2) (os.Root's resolver) rejects
+			// the slash-asserted missing final component before open(2)'s
+			// EISDIR arm is reached (host-probed: Root.OpenFile("missing/",
+			// O_CREATE|O_WRONLY) is "no such file or directory").
+			return wrap(syscall.ENOENT)
 		}
 		if parent.unlinked {
 			// Creation in an rmdir'd directory (addressed through the captured
@@ -286,7 +291,12 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
-	if flag&O_TRUNC != 0 {
+	if flag&O_TRUNC != 0 && !node.isDevice() {
+		// Same rule as the plain-path open: Linux truncates even for
+		// O_RDONLY|O_TRUNC, but on a character device the kernel ignores
+		// O_TRUNC (handle_truncate runs for regular files only,
+		// host-verified error-free) — and the device node has no pagecache
+		// to truncate.
 		if err := node.truncateLocked(0); err != nil {
 			return wrap(err)
 		}
@@ -419,7 +429,19 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	if dstRootProcAbsLocked(r, name) != "" {
 		return &PathError{Op: "mkdirat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	parent, base, node, _, errno := dstRootResolveLocked(r, name)
+	// mkdirat(2) reports a positive final dentry EEXIST before the trailing
+	// slash's directory assertion (filename_create looks the dentry up first;
+	// host-probed: Root.Mkdir("file/") is EEXIST, not ENOTDIR), so mkdir
+	// resolves with trailing slashes stripped and lets the existing-node
+	// check answer.
+	trimmed := name
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	if trimmed == "" {
+		trimmed = name // all-slash names keep their original resolution
+	}
+	parent, base, node, _, errno := dstRootResolveLocked(r, trimmed)
 	if errno != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: errno}
 	}

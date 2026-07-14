@@ -39,20 +39,16 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	// owning host's id (+1 so no simulated device is 0), ino is the node's
 	// synthetic inode. Proc-overlay fds carry no tree node and keep (dev, ino)
 	// zero — no SUT keys identity on synthetic procfs stats.
-	if file, ok := entry.backend.(*dstFile); ok {
+	treeFile, isTree := entry.backend.(*dstFile)
+	if isTree {
 		stat.Dev = dstStatDev(stat.Dev, entry.host)
-		stat.Ino = file.node.ino
-	} else {
-		// Proc-overlay fds carry no tree node: (st_dev, st_ino) stays zero —
-		// synthetic procfs identity, per the spec's proc-fd contract — and so
-		// do the timestamps (the overlay's zero mtime would otherwise turn
-		// into UnixNano's garbage negative, a shape no kernel reports).
-		stat.Dev = 0
-		stat.Ino = 0
-		stat.Atim = syscall.Timespec{}
-		stat.Mtim = syscall.Timespec{}
-		stat.Ctim = syscall.Timespec{}
+		stat.Ino = treeFile.node.ino
 	}
+	// Proc-overlay fds carry no tree node: (st_dev, st_ino) stays zero —
+	// synthetic procfs identity, per the spec's proc-fd contract — and so
+	// do the timestamps (the overlay's zero mtime would otherwise turn
+	// into UnixNano's garbage negative, a shape no kernel reports), so the
+	// mtime stamping below is scoped to tree files.
 	stat.Mode = syscallMode(info.Mode())
 	switch {
 	case info.IsDir():
@@ -70,9 +66,11 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	default:
 		stat.Mode |= syscall.S_IFREG
 	}
-	mtime := info.ModTime()
-	stat.Mtim = syscall.NsecToTimespec(mtime.UnixNano())
-	stat.Atim = stat.Mtim
-	stat.Ctim = stat.Mtim
+	if isTree {
+		mtime := info.ModTime()
+		stat.Mtim = syscall.NsecToTimespec(mtime.UnixNano())
+		stat.Atim = stat.Mtim
+		stat.Ctim = stat.Mtim
+	}
 	return 0, true
 }

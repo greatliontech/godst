@@ -214,19 +214,22 @@ func dstResetMatching(match func(*dstConn) bool) {
 // stable ECONNRESET identity (shared reset flag maps the post-drain failure),
 // in-flight bytes die, writes fail immediately (dstWireEnd.injectRST), and
 // the registration is released as production releases the tuple when the RST
-// moves the socket to CLOSED. Two collapses to the outright resetConn remain,
-// both kernel-faithful: a conn still in the accept BACKLOG is half-open — no
-// receive queue exists on either side (the dialer has not returned, the
-// server end was never handed out) and the blocked dial waits on the
-// transport done channels, so the hard teardown both matches the kernel (an
-// RST aborts the handshake) and wakes the dialer into ECONNRESET; and a
-// future non-wire Conn wrapper falls to the same uniform teardown rather
-// than a silent skip.
+// moves the socket to CLOSED. A server end still QUEUED in the accept
+// backlog takes the same survivor shape: the accept queue holds only
+// ESTABLISHED children (the SYN queue is upstream of Dial's return), so the
+// dialer may already have written into its receive queue, and the kernel
+// does not unlink an RST-aborted child from the queue — accept(2) hands it
+// out and its reads drain the delivered bytes before failing ECONNRESET
+// (host-probed, with and without pre-accept data). acceptState deliberately
+// stays 0 so Accept's 0→1 claim succeeds — the handout IS the production
+// shape; only the listener-close teardown claims 0→2 (a closed listener can
+// hand nothing out). A dial still blocked mid-establishment is woken into a
+// prompt ECONNREFUSED by its own end's rstKill (the backlog-send select) or
+// the shared reset flag (dstConnectSYNACK) — the SYN_SENT abort, the
+// connection-refused mapping. One
+// collapse to the outright resetConn remains: a future non-wire Conn
+// wrapper falls to the uniform hard teardown rather than a silent skip.
 func dstInjectReset(c *dstConn) {
-	if st := c.acceptState; st != nil && st.Load() == 0 {
-		c.resetConn()
-		return
-	}
 	e, ok := c.Conn.(*dstWireEnd)
 	if !ok {
 		c.resetConn()

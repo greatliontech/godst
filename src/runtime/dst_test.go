@@ -1929,8 +1929,9 @@ func TestDSTExploreTimerHB(t *testing.T) {
 // goroutine acquires a mutex / rendezvous on a channel first is a real scheduling
 // choice that changes the outcome, but it occurs at a transition recording no
 // memory access, so DPOR drops one order unless each acquisition is recorded as a
-// conflicting transition (runtime.dstSyncAcquire). With that hook neutered the
-// sweep fails 23/290; with it, 0 — so it has teeth. See docs/dst/exploration.md
+// conflicting transition (runtime.dstSyncAcquire). With that hook neutered, 23 of
+// the original 290-program family fail (411 of the full 802 with dstAtomicYield
+// neutered); with the hooks live, 0 — so it has teeth. See docs/dst/exploration.md
 // (Level 2, DST-L2-3 + "Completeness boundary").
 //
 // It ALSO guards source-DPOR OPTIMALITY: the sweep reports maxDpor, the largest
@@ -1954,6 +1955,16 @@ func TestDSTExploreSweep(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "tp_dst")
 	buildTestProgExplicit(t, exe, "-tags=dst")
 	out := runBuiltTestProg(t, exe, "DSTExploreSweep", "DSTSEED=1")
+	// The family SIZE is asserted, not just mismatches=0: DPOR==Exhaustive
+	// over a silently-shrunk family is a hollow completeness proof (a
+	// generator regression — a collapsed loop bound, a dropped sub-family —
+	// keeps mismatches=0 green while the net thins). The spec's DST-L2-3
+	// claim stands on 802 SUTs; an intentional family change updates this
+	// constant together with exploration.md.
+	if got := exploreField(t, out, "programs"); got != "802" {
+		t.Fatalf("sweep family size = %s programs, want 802 (exploration.md DST-L2-3): "+
+			"a shrunk family silently caps the completeness net:\n%s", got, out)
+	}
 	if exploreField(t, out, "mismatches") != "0" {
 		t.Fatalf("DPOR completeness sweep found mismatches vs exhaustive enumeration "+
 			"(a dropped Mazurkiewicz class — DST-L2-3 violation):\n%s", out)

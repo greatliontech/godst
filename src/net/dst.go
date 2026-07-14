@@ -579,10 +579,15 @@ type dstConn struct {
 
 	// acceptState tracks a server-end connection through the accept backlog:
 	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
-	// 0→1; the backlog teardown and the dialer's post-send listener-closed
-	// check claim 0→2 — so a connection the server already Accepted can never
-	// be retroactively reset by teardown, and a torn-down connection is never
-	// handed out by Accept. Nil on the dialer end.
+	// 0→1; the LISTENER-CLOSE backlog teardown and the dialer's post-send
+	// listener-closed check claim 0→2 — so a connection the server already
+	// Accepted can never be retroactively reset by that teardown, and a conn
+	// the listener's close reset is never handed out by Accept (production
+	// cannot accept from a closed listener). A FAULT-injected RST
+	// deliberately leaves a queued conn at 0: the kernel does not unlink an
+	// RST-aborted established child from the accept queue — accept(2) hands
+	// it out and its reads drain delivered bytes, then fail ECONNRESET
+	// (host-probed; see dstInjectReset). Nil on the dialer end.
 	acceptState *atomic.Int32
 }
 
@@ -804,7 +809,9 @@ func (l *dstListener) Accept() (Conn, error) {
 		case owned := <-l.accept:
 			c := owned.conn
 			if c.acceptState != nil && !c.acceptState.CompareAndSwap(0, 1) {
-				// Torn down (reset/refused) while queued; never hand it out.
+				// Listener-close reset (or dial-side refusal) while queued;
+				// never hand it out. A FAULT-injected RST leaves the state 0
+				// on purpose — that conn IS handed out (see acceptState).
 				continue
 			}
 			// An Accept already parked in this select when Close ran can win
@@ -985,6 +992,10 @@ func dstAnyListenerConflict(scope, network string, ip IP, keys []string, port in
 // partition table is checked BEFORE this (the dial's blackhole loop); a cut that begins
 // mid-flight is not re-checked, so the connect still completes — the safe direction (the
 // sim succeeds where production might drop the SYN), a narrow race not worth the reload.
+// The same recorded collapse covers fault RESETS: the wire pair registers only after
+// this traversal returns, so a Reset/ResetProcess landing inside the half-RTT matches
+// no registered conn and the dial establishes untouched — the injection "missed", an
+// execution ⊆-real (a real RST event can miss a handshake too), never a false failure.
 func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 	d := dstLinkDelay(latencyNs, jitterNs)
 	if d <= 0 {
@@ -1001,15 +1012,33 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 }
 
 // dstConnectSYNACK waits for the second handshake traversal while the connect
-// context and both transport endpoints remain live.
+// context and both transport endpoints remain live. An abort surfaces as
+// ECONNREFUSED, never ECONNRESET: the dialer's socket is still in SYN_SENT
+// (connect(2) has not returned), and tcp_reset maps an RST received in
+// SYN_SENT to ECONNREFUSED — that mapping IS the connection-refused
+// mechanism (host-probed: a dial parked mid-establishment whose listener
+// closes fails "connection refused"). ECONNRESET is the established-state
+// identity only.
 func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWireEnd, reset *atomic.Bool) error {
 	d := dstLinkDelay(latencyNs, jitterNs)
 	if d <= 0 {
 		if err := ctx.Err(); err != nil {
 			return mapErr(err)
 		}
+		// LIVE arm at zero latency through the PARKED-send window: a dial
+		// parked on a full backlog has its send committed by the RECEIVER —
+		// Accept's dequeue moves the parked value into the buffer and
+		// commits the select's send arm while the dialer is descheduled —
+		// so a reset landing between that commit and the dialer's resume
+		// can no longer route through the select's rstKill case; this check
+		// is the deciding observer
+		// (TestDSTNetResetAfterParkedSendCommits pins the interleaving).
+		// For a NON-parked send no scheduling point separates the select
+		// from this check, so a pre-select reset routes through rstKill
+		// instead (TestDSTNetResetRacingZeroLatencyDial sweeps those
+		// orderings).
 		if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
-			return syscall.ECONNRESET
+			return syscall.ECONNREFUSED
 		}
 		return nil
 	}
@@ -1025,7 +1054,7 @@ func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWire
 		return mapErr(err)
 	}
 	if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
-		return syscall.ECONNRESET
+		return syscall.ECONNREFUSED
 	}
 	return nil
 }
@@ -1307,17 +1336,36 @@ redial:
 	case <-backlogHorizonC:
 		cleanup()
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
+	// Every abort of a still-parked dial carries ECONNREFUSED, never
+	// ECONNRESET: the dialer's socket is in SYN_SENT (connect(2) has not
+	// returned), and tcp_reset maps an RST received in SYN_SENT to
+	// ECONNREFUSED — the same identity the closed-listener path below
+	// surfaces (host-probed; see dstConnectSYNACK).
 	case <-p1.(*dstWireEnd).localDone:
 		stopBacklogHorizon()
 		cleanup()
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNRESET}
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	case <-p1.(*dstWireEnd).remoteDone:
 		stopBacklogHorizon()
 		cleanup()
 		if dstHostDead(l.host) {
 			goto redial
 		}
-		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNRESET}
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
+	case <-p1.(*dstWireEnd).rstKill:
+		// A fault-injected RST during the SYN retransmit window (backlog
+		// full, or a reset racing establishment) aborts the connect promptly
+		// — the drain-then-reset teardown of the queued/registered ends does
+		// not close the transports, so the done channels above stay silent.
+		// The dead-host check mirrors the remoteDone case: a crashed server
+		// host emits no RST, so that path redials into the blackhole and
+		// times out as production does.
+		stopBacklogHorizon()
+		cleanup()
+		if dstHostDead(l.host) {
+			goto redial
+		}
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	case l.accept <- ownedServer:
 		stopBacklogHorizon()
 		select {

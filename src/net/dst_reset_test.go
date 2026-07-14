@@ -2,6 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// White-box: references dst-only symbols (dstWirePair), so it is
+// build-tagged like the package's other white-box dst test files rather
+// than stub-compilable untagged (the untagged test build is gated by
+// `vet net` in the Taskfile's untagged leg).
+
+//go:build dst
+
 package net
 
 import (
@@ -308,13 +315,15 @@ func TestDSTNetResetProcessOwnEndDrains(t *testing.T) {
 	}
 }
 
-// TestDSTNetResetBacklogBlockedDialFailsPromptly: an injected reset reaches
-// a connection still in the accept backlog as the hard handshake abort a
-// real kernel performs — a dial blocked on a FULL backlog (its SYN dropped,
-// retransmitting) fails ECONNRESET at the reset, never stranding to the
-// retransmit horizon's ETIMEDOUT: no receive queue exists on either side of
-// a half-open connection, so there is nothing to drain and the blocked
-// connect must be woken by the teardown itself.
+// TestDSTNetResetBacklogBlockedDialFailsPromptly: a dial blocked on a FULL
+// backlog (its SYN dropped, retransmitting) fails promptly at an injected
+// reset, never stranding to the retransmit horizon's ETIMEDOUT — the
+// drain-then-reset teardown closes no transport, so the wake is the dial's
+// own rstKill arm. The identity is ECONNREFUSED, not ECONNRESET: the
+// dialer's socket is in SYN_SENT (connect(2) has not returned), and
+// tcp_reset maps an RST received in SYN_SENT to ECONNREFUSED — the
+// connection-refused mechanism itself (host-probed via the closed-listener
+// shape).
 func TestDSTNetResetBacklogBlockedDialFailsPromptly(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
@@ -359,8 +368,313 @@ func TestDSTNetResetBacklogBlockedDialFailsPromptly(t *testing.T) {
 			close(done)
 		})
 	})
-	if !errors.Is(dialErr, syscall.ECONNRESET) {
-		t.Errorf("dial blocked on a full backlog across a reset = %v, want ECONNRESET (prompt handshake abort, not a horizon ETIMEDOUT)", dialErr)
+	if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+		t.Errorf("dial blocked on a full backlog across a reset = %v, want ECONNREFUSED (prompt SYN_SENT abort, not ECONNRESET and not a horizon ETIMEDOUT)", dialErr)
+	}
+}
+
+// TestDSTNetResetRacingZeroLatencyDial: a reset racing a ZERO-LATENCY dial
+// can land in the window between the backlog send and the (instant) SYN-ACK
+// completion; the aborted dial carries the SYN_SENT ECONNREFUSED, never the
+// established-state ECONNRESET, whatever the seed's interleaving (nil means
+// the dial won the race — the reset then hits an established conn, which is
+// the drain-then-reset surface, not the dial's). Seed-swept so the seeded
+// scheduler explores the orderings around the send's scheduling point.
+func TestDSTNetResetRacingZeroLatencyDial(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for seed := uint64(1); seed <= 50; seed++ {
+		var dialErr error
+		simulation.RunWith(seed, simulation.Options{}, func() {
+			port := make(chan string, 1)
+			done := make(chan struct{})
+			simulation.Host("A", simulation.HostConfig{}, func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p
+				go func() {
+					<-done
+					ln.Close()
+				}()
+			})
+			simulation.Host("B", simulation.HostConfig{}, func() {
+				addr := simulation.HostIP("A") + ":" + <-port
+				dialDone := make(chan struct{})
+				go func() {
+					var c Conn
+					c, dialErr = Dial("tcp", addr)
+					if c != nil {
+						c.Close()
+					}
+					close(dialDone)
+				}()
+				simulation.Reset("A", "B")
+				<-dialDone
+				close(done)
+			})
+		})
+		if dialErr != nil && !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			t.Fatalf("seed %d: reset racing a zero-latency dial = %v, want nil or ECONNREFUSED (never the established-state ECONNRESET)", seed, dialErr)
+		}
+	}
+}
+
+// TestDSTNetResetAfterParkedSendCommits pins the parked-send-commit window:
+// a dial PARKED on a full backlog has its send committed by the RECEIVER —
+// Accept's dequeue moves the parked value into the buffer and commits the
+// select's send arm while the dialer is descheduled — so a reset landing
+// between that commit and the dialer's resume is observed by the
+// zero-latency SYN-ACK check, not the select's rstKill case, and the dial
+// fails ECONNREFUSED (the SYN_SENT identity). Seed-swept with a
+// non-vacuity floor: at least one seed must exercise the refusal window
+// (the other seeds' dials win the race and succeed).
+func TestDSTNetResetAfterParkedSendCommits(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	refused := 0
+	for seed := uint64(1); seed <= 50; seed++ {
+		var dialErr error
+		simulation.RunWith(seed, simulation.Options{}, func() {
+			port := make(chan string, 1)
+			parked := make(chan struct{})
+			accepted := make(chan struct{})
+			done := make(chan struct{})
+			simulation.Host("A", simulation.HostConfig{}, func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p
+				go func() {
+					<-parked
+					c, err := ln.Accept() // frees one slot: commits the parked send
+					if err == nil {
+						c.Close()
+					}
+					close(accepted)
+					<-done
+					ln.Close()
+				}()
+			})
+			simulation.Host("B", simulation.HostConfig{}, func() {
+				addr := simulation.HostIP("A") + ":" + <-port
+				conns := make([]Conn, 0, 128)
+				for i := 0; i < 128; i++ { // fill the accept backlog
+					c, err := Dial("tcp", addr)
+					if err != nil {
+						t.Errorf("seed %d: backlog-filling dial %d: %v", seed, i, err)
+						close(parked)
+						close(done)
+						return
+					}
+					conns = append(conns, c)
+				}
+				dialDone := make(chan struct{})
+				go func() {
+					var c Conn
+					c, dialErr = Dial("tcp", addr) // parks on the full backlog
+					if c != nil {
+						c.Close()
+					}
+					close(dialDone)
+				}()
+				go func() {
+					time.Sleep(10 * time.Millisecond) // let the dial park
+					close(parked)
+				}()
+				<-accepted // the parked send has been committed by the dequeue
+				simulation.Reset("A", "B")
+				<-dialDone
+				for _, c := range conns {
+					c.Close()
+				}
+				close(done)
+			})
+		})
+		if dialErr == nil {
+			continue // the dialer resumed before the reset: a legitimate win
+		}
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			t.Fatalf("seed %d: reset in the parked-send-commit window = %v, want ECONNREFUSED (the SYN_SENT identity, never ECONNRESET)", seed, dialErr)
+		}
+		refused++
+	}
+	if refused == 0 {
+		t.Fatalf("no seed exercised the parked-send-commit refusal window — the sweep is vacuous")
+	}
+}
+
+// TestDSTNetCrashHostBlockedDialTimesOut: a dial blocked on a FULL backlog
+// when the server HOST loses power fails ETIMEDOUT, never a reset identity —
+// a powered-off machine emits no RST, so the connect retransmits into
+// silence and dies at its horizon (contrast the injected-reset case above,
+// which aborts promptly with ECONNRESET). Swept across seeds: the crash
+// teardown closes several of the blocked dial's wake channels, the seeded
+// select picks among the ready ones, and every arm must classify the dead
+// host into the redial/blackhole path.
+func TestDSTNetCrashHostBlockedDialTimesOut(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for seed := uint64(1); seed <= 8; seed++ {
+		var dialErr error
+		simulation.RunWith(seed, simulation.Options{}, func() {
+			port := make(chan string, 1)
+			parked := make(chan struct{})
+			dialDone := make(chan struct{})
+			simulation.Host("A", simulation.HostConfig{}, func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p // never Accept; the listener dies with the host
+			})
+			simulation.Host("B", simulation.HostConfig{}, func() {
+				addr := simulation.HostIP("A") + ":" + <-port
+				for i := 0; i < 128; i++ { // fill the accept backlog
+					if _, err := Dial("tcp", addr); err != nil {
+						t.Errorf("seed %d: backlog-filling dial %d: %v", seed, i, err)
+						close(parked)
+						close(dialDone)
+						return
+					}
+				}
+				go func() {
+					_, dialErr = Dial("tcp", addr) // SYN dropped: blocks on the full backlog
+					close(dialDone)
+				}()
+				go func() {
+					time.Sleep(10 * time.Millisecond) // let the dial park
+					close(parked)
+				}()
+			})
+			<-parked
+			simulation.CrashHost("A")
+			<-dialDone
+		})
+		if !errors.Is(dialErr, syscall.ETIMEDOUT) {
+			t.Errorf("seed %d: dial blocked on a full backlog across a host crash = %v, want ETIMEDOUT (a dead machine emits no RST)", seed, dialErr)
+		}
+	}
+}
+
+// TestDSTNetResetBacklogAcceptHandsOutResetChild: a fault reset landing on a
+// conn still QUEUED in the accept backlog does not unlink it — a later Accept
+// hands it out and its first read fails ECONNRESET (host-probed: Linux keeps
+// an RST-aborted established child in the accept queue; accept(2) succeeds
+// and the first read reports the pending error). The write assertion pins
+// the sim's RECORDED stable-identity collapse (design.md: any operation on a
+// reset connection carries ECONNRESET) — the kernel's one-shot sk_err would
+// answer EPIPE once a read consumed the error; that divergence is recorded,
+// not host-probed here.
+func TestDSTNetResetBacklogAcceptHandsOutResetChild(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var acceptErr, readErr, writeErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		port := make(chan string, 1)
+		reset := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				<-reset // Accept only after the reset landed on the queued conn
+				c, err := ln.Accept()
+				acceptErr = err
+				if err == nil {
+					_, readErr = c.Read(make([]byte, 16))
+					_, writeErr = c.Write([]byte("after"))
+					c.Close()
+				}
+				ln.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				t.Errorf("dial: %v", err)
+				close(reset)
+				return
+			}
+			time.Sleep(10 * time.Millisecond) // conn sits queued, never accepted
+			simulation.Reset("A", "B")
+			close(reset)
+			<-done
+			c.Close()
+		})
+	})
+	if acceptErr != nil {
+		t.Errorf("Accept of an RST-torn backlog conn = %v, want success (the kernel hands the aborted child out)", acceptErr)
+	}
+	if !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Errorf("first read on the handed-out child = %v, want ECONNRESET", readErr)
+	}
+	if !errors.Is(writeErr, syscall.ECONNRESET) {
+		t.Errorf("write on the handed-out child = %v, want ECONNRESET", writeErr)
+	}
+}
+
+// TestDSTNetResetBacklogDrainsPreAcceptBytes: bytes the dialer wrote before
+// the conn was ever accepted survive a fault reset of the queued conn — the
+// handed-out child drains them first, then reads fail ECONNRESET (host-probed
+// tcp_recvmsg shape: the accept queue holds established children with live
+// receive queues, never "half-open" conns, so an injected RST cannot destroy
+// what the victim's kernel already delivered).
+func TestDSTNetResetBacklogDrainsPreAcceptBytes(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var n int
+	var buf [16]byte
+	var acceptErr, firstErr, secondErr error
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+		port := make(chan string, 1)
+		reset := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("A", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				<-reset // Accept only after the reset landed on the queued conn
+				c, err := ln.Accept()
+				acceptErr = err
+				if err == nil {
+					n, firstErr = c.Read(buf[:])
+					_, secondErr = c.Read(make([]byte, 16))
+					c.Close()
+				}
+				ln.Close()
+				close(done)
+			}()
+		})
+		simulation.Host("B", simulation.HostConfig{}, func() {
+			p := <-port
+			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				t.Errorf("dial: %v", err)
+				close(reset)
+				return
+			}
+			c.Write([]byte("msg"))
+			time.Sleep(20 * time.Millisecond) // past the link latency: delivered to the queued child's receive queue
+			simulation.Reset("A", "B")
+			close(reset)
+			<-done
+			c.Close()
+		})
+	})
+	if acceptErr != nil {
+		t.Errorf("Accept of an RST-torn backlog conn = %v, want success", acceptErr)
+	}
+	if n != 3 || string(buf[:3]) != "msg" || firstErr != nil {
+		t.Errorf("first read on the handed-out child = (%d, %q, %v), want (3, %q, nil): pre-accept bytes drain before the reset error", n, buf[:n], firstErr, "msg")
+	}
+	if !errors.Is(secondErr, syscall.ECONNRESET) {
+		t.Errorf("second read after drain = %v, want ECONNRESET", secondErr)
 	}
 }
 

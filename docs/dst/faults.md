@@ -52,7 +52,10 @@ scopes *declaration*, the goroutines it starts outlive it. Mid-run declarations 
 the simulation schedules — a foreign caller panics, like the fault APIs (see "Fault callers fail
 loud too"). An explicit or implicit host declaration validates its candidate ID before publishing
 the name or identity. `Host` also validates its complete clock configuration before publishing the
-caller stamp, timer remap, or reboot. Every rejected declaration is state-neutral.
+caller stamp, timer remap, or reboot. Every rejected declaration is state-neutral. A run is bounded
+to 4096 distinct hosts (`dstMaxSimHosts`, the same fixed-table stance as the `dstMaxSimProcs`
+process bound below): exceeding it panics loudly and state-neutrally, never silently drops a
+declaration (`TestDSTHostTableExhaustionIsStateNeutral`).
 
 ```go
 simulation.Host("h1", simulation.HostConfig{IP: "10.0.0.1", NumCPU: 4, Clock: simulation.Skew(50*ms)}, func() {
@@ -541,8 +544,17 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   a segment sent toward it afterward is never delivered (a CLOSED socket answers a late segment
   with its own RST, it does not queue it). *Enforced:*
   `TestDSTNetResetDrainsDeliveredThenResets`, `TestDSTNetResetProcessOwnEndDrains`,
-  `TestDSTNetResetDropsInFlight`, `TestDSTNetInjectRSTFreezesReceiveQueue`. A conn still in the accept backlog is half-open — no receive queue
-  exists on either side — so the RST aborts the handshake outright, as a kernel does.
+  `TestDSTNetResetDropsInFlight`, `TestDSTNetInjectRSTFreezesReceiveQueue`. A conn still QUEUED in the
+  accept backlog takes the same survivor shape — the accept queue holds only ESTABLISHED children
+  (a receive queue exists and may already hold the dialer's bytes), and the kernel does not unlink an
+  RST-aborted child from the queue: a later `accept(2)` hands it out, its reads drain the delivered
+  bytes, then fail `ECONNRESET` (host-probed, with and without pre-accept data). *Enforced:*
+  `TestDSTNetResetBacklogAcceptHandsOutResetChild`, `TestDSTNetResetBacklogDrainsPreAcceptBytes`.
+  A dial still blocked mid-establishment aborts promptly with `ECONNREFUSED` — the dialer's socket is
+  in SYN_SENT, and `tcp_reset` maps an RST received in SYN_SENT to `ECONNREFUSED` (the
+  connection-refused mechanism itself; host-probed via the closed-listener shape), never the
+  established-state `ECONNRESET` (`TestDSTNetResetBacklogBlockedDialFailsPromptly`,
+  `TestDSTNetSYNACKObservesReset`).
   When a reset matches **several** conns, the victims are
   reset in **connection-registration order** (a per-run sequence id recorded at establishment,
   `dstConn.regSeq`; the victims are collected from the registry and sorted by it —

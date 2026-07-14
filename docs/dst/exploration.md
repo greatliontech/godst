@@ -769,8 +769,10 @@ gate is itself load-bearing under `-race`, where an instrumented foreign access 
 reach the inline filtered commit with seq 0. Pinned by `TestDSTForeignSeqRefused` (the chokepoint) and
 `TestExploreForeignBubbleSyncChurn` (non-race: ready-edge door, trace invisibility); the race-build
 doors are netted by `TestExploreForeignBubbleSyncChurnRace`, whose rendezvous shape shields its
-own doors through the conservative flag — per-door reaching arms remain an open obligation,
-tracked outside this contract), the allocation-free recorder
+own doors through the conservative flag — both once-proposed per-door reaching arms were shown
+structurally unreachable (membership gating + pending-commit ownership; the reachability proofs
+live as code comments in `TestExploreForeignBubbleSyncChurnRace`), closing what was previously
+tracked as an open obligation (history: `git log --all -- docs/issues/dst-explore-race-door-reaching-arms.md`)), the allocation-free recorder
 (`dstScheduledSelect` runs on g0 under `sched.lock`), the transition-boundary hooks (`dstAccessYield` for
 memory accesses, `dstSyncAcquire` for synchronization object decisions — D1), and the Exhaustive + DPOR
 engines. Full landed DST suite stays green (`ok runtime`, normal and the scheduling subset). The remaining

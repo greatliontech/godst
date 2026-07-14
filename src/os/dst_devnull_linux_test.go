@@ -54,6 +54,39 @@ func TestDSTDevNullOpenModes(t *testing.T) {
 	})
 }
 
+// TestDSTDevNullRootedOpenModes: the rooted (openat) surface follows the same
+// device ladder — O_TRUNC is ignored on the character device (the kernel's
+// handle_truncate runs for regular files only, host-verified error-free), the
+// open succeeds, and writes discard with the full count.
+func TestDSTDevNullRootedOpenModes(t *testing.T) {
+	simulation.Run(1, func() {
+		root, err := os.OpenRoot("/dev")
+		if err != nil {
+			t.Fatalf("OpenRoot(/dev): %v", err)
+		}
+		defer root.Close()
+		for _, tc := range []struct {
+			name string
+			flag int
+		}{
+			{"O_WRONLY|O_TRUNC", os.O_WRONLY | os.O_TRUNC},
+			{"O_RDONLY|O_TRUNC", os.O_RDONLY | os.O_TRUNC},
+			{"O_RDWR", os.O_RDWR},
+		} {
+			f, err := root.OpenFile("null", tc.flag, 0o666)
+			if err != nil {
+				t.Fatalf("rooted open %s: %v", tc.name, err)
+			}
+			if tc.flag&os.O_WRONLY != 0 || tc.flag&os.O_RDWR != 0 {
+				if n, err := f.Write([]byte("discard")); n != 7 || err != nil {
+					t.Fatalf("rooted %s write = (%d, %v), want (7, nil)", tc.name, n, err)
+				}
+			}
+			f.Close()
+		}
+	})
+}
+
 // TestDSTDevNullReadWriteLadder: reads are EOF at every offset (behind the
 // wrong-direction EBADF), writes discard and report the full count at every
 // offset, and the file position is pinned at 0 whatever Seek asks — including
