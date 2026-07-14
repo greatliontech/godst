@@ -1104,6 +1104,260 @@ func TestDSTNetHorizonOneShotReadFirst(t *testing.T) {
 	}
 }
 
+// TestDSTNetBlockedWriterDeadPeerProbeResets: a writer ALREADY PARKED on a
+// full send buffer when its counterpart socket horizon-dies is re-probed at
+// every wake instead of re-parking forever. The writer fills the send buffer
+// toward the victim (all delivered, unread — the death's freeze drops
+// nothing), the victim dies at its own retransmit horizon via a one-way cut
+// of ITS outbound direction, and its application leaks the conn (neither
+// reads nor closes). The death's wake finds the return (dead→writer)
+// direction still cut, so the RST is swallowed and the writer re-parks (the
+// recorded ACK-starvation limit); the heal's wake finds the link live in
+// both directions: production's zero-window probes meet the CLOSED socket
+// and the answered RST fails the blocked send with the one-shot ECONNRESET —
+// at the heal's wake exactly (the zero-round-trip probe collapse). Later
+// reads and writes carry the CLOSED-socket identities (EOF / EPIPE).
+func TestDSTNetBlockedWriterDeadPeerProbeResets(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{
+		SendBuffer:        4 << 10,
+		RetransmitTimeout: time.Second,
+	}}
+	var blockedN int
+	var blockedErr, readErr, writeErr error
+	var blockedDur time.Duration
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		cutMade := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-cutMade
+				c.Write([]byte("v")) // held at srv's outbound cut: arms srv's watchdog; srv dies at 1s
+				// The application leaks the conn: neither reads nor closes.
+				<-done
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			c.Write(make([]byte, 4<<10))             // fills the send buffer: all delivered to srv, never read
+			simulation.PartitionOneWay("srv", "cli") // the victim's OWN outbound cut; cli→srv stays live
+			close(cutMade)
+			time.Sleep(100 * time.Millisecond) // srv's held write is in place, its watchdog armed
+			blockedDone := make(chan struct{})
+			t0 := time.Now()
+			go func() {
+				blockedN, blockedErr = c.Write([]byte("more")) // parks: buffer full, outbound link live
+				blockedDur = time.Since(t0)
+				close(blockedDone)
+			}()
+			time.Sleep(2 * time.Second)   // past srv's death at 1s: the death's wake re-parked the writer
+			simulation.Heal("srv", "cli") // now the link is live in both directions: the probe fires
+			<-blockedDone
+			_, readErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("after"))
+			close(done)
+			c.Close()
+		})
+	})
+	if blockedN != 0 || !errors.Is(blockedErr, syscall.ECONNRESET) {
+		t.Errorf("blocked write woken against the dead counterpart socket = (%d, %v), want (0, ECONNRESET): the zero-window probe meets the CLOSED socket over the live link", blockedN, blockedErr)
+	}
+	if blockedErr != nil && blockedDur != 2*time.Second {
+		t.Errorf("blocked write failed after %v, want 2s (the probe fires at the HEAL's wake — 2.1s minus the 0.1s park start — not at the death or later)", blockedDur)
+	}
+	if readErr != io.EOF {
+		t.Errorf("read after the consumed reset = %v, want io.EOF (the CLOSED-socket read identity)", readErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed reset = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
+	}
+}
+
+// TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets: a reader ALREADY
+// PARKED when its counterpart socket horizon-dies, with the heal landing
+// AFTER the death but BEFORE this end's own horizonCheck — which then sees
+// cut=false and disarms, so only the probe seam carries the failure. The
+// reader's bytes written during the symmetric cut were destroyed by the
+// victim's death-freeze (deadDropped): production keeps retransmitting those
+// never-to-be-ACKed bytes, and the post-heal retransmission meets the CLOSED
+// socket — the answered RST fails the blocked read with the one-shot
+// ECONNRESET at the heal's wake. Before the probe seam this read hung
+// forever unless the application wrote again.
+func TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var readN int
+	var readErr, secondReadErr, writeErr error
+	var readDur time.Duration
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		cutMade := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-cutMade
+				c.Write([]byte("v")) // held at the cut: arms srv's watchdog; srv dies at 1s
+				// The application leaks the conn: neither reads nor closes.
+				<-done
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			simulation.Partition("srv", "cli") // symmetric cut
+			close(cutMade)
+			time.Sleep(400 * time.Millisecond)
+			c.Write([]byte("hi")) // held at the cut, destroyed by srv's death-freeze at 1s: deadDropped
+			readDone := make(chan struct{})
+			t0 := time.Now()
+			go func() {
+				readN, readErr = c.Read(make([]byte, 8)) // parks under the cut
+				readDur = time.Since(t0)
+				close(readDone)
+			}()
+			time.Sleep(800 * time.Millisecond) // t=1.2s: after srv's death (1s), before cli's horizonCheck (1.4s)
+			simulation.Heal("srv", "cli")      // the check will see cut=false and DISARM: only the probe carries the failure
+			<-readDone
+			_, secondReadErr = c.Read(make([]byte, 8))
+			_, writeErr = c.Write([]byte("after"))
+			close(done)
+			c.Close()
+		})
+	})
+	if readN != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Errorf("blocked read woken by the heal inside the disarm window = (%d, %v), want (0, ECONNRESET): the retransmission of the destroyed bytes meets the CLOSED socket", readN, readErr)
+	}
+	if readErr != nil && readDur != 800*time.Millisecond {
+		t.Errorf("blocked read failed after %v, want 800ms (the probe fires at the HEAL's wake, before this end's own 1.4s horizonCheck)", readDur)
+	}
+	if secondReadErr != io.EOF {
+		t.Errorf("read after the consumed reset = %v, want io.EOF (the CLOSED-socket read identity)", secondReadErr)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Errorf("write after the consumed reset = %v, want EPIPE (the CLOSED-socket write identity)", writeErr)
+	}
+}
+
+// TestDSTNetBlockedWriterDeadPeerReturnOnlyCutNoRST: with the return
+// (dead→writer) direction cut for good, the RST the dead socket answers the
+// zero-window probe with is swallowed — the recorded flow-level
+// ACK-starvation limit, the safe ⊆-real direction — so the parked writer
+// must NOT surface ECONNRESET. Its own outbound direction is live and every
+// byte was delivered, so its horizon never arms either: the write parks
+// until its deadline, exactly as it did before the probe seam.
+func TestDSTNetBlockedWriterDeadPeerReturnOnlyCutNoRST(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{
+		SendBuffer:        4 << 10,
+		RetransmitTimeout: time.Second,
+	}}
+	var blockedErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		cutMade := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-cutMade
+				c.Write([]byte("v")) // held at srv's outbound cut: srv dies at 1s
+				<-done
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			c.Write(make([]byte, 4<<10))             // fills the send buffer: all delivered, never read
+			simulation.PartitionOneWay("srv", "cli") // permanent: the RST can never traverse dead→cli
+			close(cutMade)
+			c.SetWriteDeadline(time.Now().Add(3 * time.Second)) // well past srv's 1s death
+			_, blockedErr = c.Write([]byte("more"))             // parks; the death's wake must re-park it
+			close(done)
+			c.Close()
+		})
+	})
+	if errors.Is(blockedErr, syscall.ECONNRESET) {
+		t.Errorf("blocked write under a permanent return-only cut = %v; must NOT be ECONNRESET (the cut swallows the dead socket's RST — the recorded ACK-starvation limit)", blockedErr)
+	}
+	if !errors.Is(blockedErr, os.ErrDeadlineExceeded) {
+		t.Errorf("blocked write under a permanent return-only cut = %v, want os.ErrDeadlineExceeded (it parks: no RST arrives, and its own live outbound direction never arms the horizon)", blockedErr)
+	}
+}
+
+// TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked: the reader
+// probe requires destroyed, never-to-be-ACKed bytes (deadDropped) — a parked
+// reader that has NOTHING outstanding toward the dead socket has no segment
+// in flight to elicit an RST, and production hangs there too (no
+// retransmission, no zero-window probe). Surfacing ECONNRESET would be a
+// sim-only false failure, the class Soundness forbids: after the heal the
+// read must keep parking until its deadline.
+func TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: time.Second}}
+	var readErr error
+	simulation.RunWith(1, opts, func() {
+		port := make(chan string, 1)
+		cutMade := make(chan struct{})
+		done := make(chan struct{})
+		simulation.Host("srv", simulation.HostConfig{}, func() {
+			ln, _ := Listen("tcp", ":0")
+			_, p, _ := SplitHostPort(ln.Addr().String())
+			port <- p
+			go func() {
+				c, _ := ln.Accept()
+				<-cutMade
+				c.Write([]byte("v")) // held at srv's outbound cut: srv dies at 1s
+				<-done
+			}()
+		})
+		simulation.Host("cli", simulation.HostConfig{}, func() {
+			p := <-port
+			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
+			// cli writes NOTHING: no bytes of cli's are ever destroyed.
+			simulation.PartitionOneWay("srv", "cli") // srv's outbound cut only; cli→srv stays live
+			close(cutMade)
+			readDone := make(chan struct{})
+			c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			go func() {
+				_, readErr = c.Read(make([]byte, 8)) // parks; srv's held "v" dies with srv at 1s
+				close(readDone)
+			}()
+			time.Sleep(2 * time.Second)   // past srv's death
+			simulation.Heal("srv", "cli") // live in both directions — but cli has nothing to probe with
+			<-readDone
+			close(done)
+			c.Close()
+		})
+	})
+	if errors.Is(readErr, syscall.ECONNRESET) {
+		t.Errorf("blocked read with nothing outstanding toward the dead socket = %v; must NOT be ECONNRESET (no segment elicits an RST — production hangs here too)", readErr)
+	}
+	if !errors.Is(readErr, os.ErrDeadlineExceeded) {
+		t.Errorf("blocked read with nothing outstanding toward the dead socket = %v, want os.ErrDeadlineExceeded (it stays parked to its deadline)", readErr)
+	}
+}
+
 // TestDSTNetHorizonOneShotWriteFirst: the one-shot ETIMEDOUT is consumed by
 // whichever failing op comes FIRST — write-first here (host-probed ladder:
 // write ETIMEDOUT, then write EPIPE, then reads io.EOF). Complements the

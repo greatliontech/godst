@@ -518,10 +518,10 @@ func (e *dstWireEnd) horizonDie() {
 	}
 	e.out.freezeAtHorizon(outHorizon)
 	e.horizonOnce.Do(func() { close(e.horizonKill) })
-	e.out.wake()       // the peer's blocked reader re-evaluates (its held bytes died)
+	e.out.wake()       // the peer's blocked reader re-evaluates (its held bytes died; probeDeadPeer)
 	e.out.wakeWriter() // this end's blocked writer observes timedOut
 	e.in.wake()        // this end's blocked reader observes timedOut
-	e.in.wakeWriter()  // the peer's blocked writer re-evaluates (the freeze freed space)
+	e.in.wakeWriter()  // the peer's blocked writer re-evaluates (the buffer will never drain; probeDeadPeer)
 }
 
 // injectRST delivers a fault-injected RST to this end — the kernel-faithful
@@ -558,6 +558,41 @@ func (e *dstWireEnd) injectRST() {
 	})
 	e.in.wake()        // a reader parked on the ready channel re-evaluates
 	e.out.wakeWriter() // a writer parked on send-buffer space observes the RST
+}
+
+// probeDeadPeer is the probe seam for PARKED operations: a blocked read or
+// write woken while the counterpart socket is dead (this end's out stream
+// frozen — the receiver was destroyed by a retransmit-horizon death)
+// re-evaluates here instead of re-parking forever. Production never stops
+// probing a stalled connection: a blocked writer's zero-window probes, and a
+// blocked reader's retransmissions of its destroyed, never-to-be-ACKed bytes
+// (needDropped — a reader with nothing outstanding has no segment in flight
+// to elicit an RST and hangs on a real kernel too, so probing there would be
+// a sim-only false failure). When such a segment meets the CLOSED socket
+// over a link live in BOTH directions, the answered RST surfaces the
+// one-shot ECONNRESET exactly as a push into the frozen stream does
+// (dstDeadPushRST; the caller then observes rstArrived) — and with the same
+// zero-round-trip timing collapse: the RST lands at the wake, not after a
+// zero-window-probe interval. Under a cut the probe stays silent and the cut
+// arms govern instead: a forward (local→peer) cut is this end's own
+// retransmit horizon (heldBeyond/deadDropped → armHorizon → ETIMEDOUT), and
+// a return-only (peer→local) cut swallows the RST — the recorded flow-level
+// ACK-starvation limit (faults.md, Partition), the safe ⊆-real direction. An
+// end already dead (timedOut) or reset (rstArrived) keeps its earlier
+// identity: sk_err is one field, whichever teardown pends first owns it.
+func (e *dstWireEnd) probeDeadPeer(needDropped bool) bool {
+	e.out.mu.Lock()
+	frozen, dropped := e.out.frozen, e.out.deadDropped
+	e.out.mu.Unlock()
+	if !frozen || (needDropped && !dropped) {
+		return false
+	}
+	if e.timedOut.Load() || e.rstArrived.Load() ||
+		dstPartitionedDir(e.localHost, e.peerHost) || dstPartitionedDir(e.peerHost, e.localHost) {
+		return false
+	}
+	dstDeadPushRST(e)
+	return true
 }
 
 // freezeAtHorizon drops every segment not yet delivered at horizon and
@@ -692,6 +727,18 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		if e.rstArrived.Load() {
 			return 0, io.ErrClosedPipe
 		}
+		// A read parked against a DEAD counterpart socket re-probes at every
+		// wake (probeDeadPeer): its destroyed, never-to-be-ACKed outbound
+		// bytes are what production keeps retransmitting, and over a live
+		// link the retransmission meets the CLOSED socket and the answered
+		// RST surfaces the one-shot ECONNRESET — the next iteration drains
+		// any delivered bytes, then observes rstArrived. This is what rescues
+		// a heal landing between the counterpart's death and this end's own
+		// horizonCheck (which then sees cut=false and disarms): without the
+		// probe the read would re-park forever.
+		if e.probeDeadPeer(true) {
+			continue
+		}
 		// A blocked read observing dying OUTBOUND bytes arms the watchdog — the
 		// spec's "blocked operation" surfacing: write-then-read into a permanent
 		// cut must fail at the horizon, not hang forever. Checked before EITHER
@@ -811,7 +858,22 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			e.out.mu.Unlock()
 			// Fetch the partition wake channel before reading the cut state, so a cut
 			// that begins (or heals) while we block still re-evaluates the horizon.
+			// The probe below reads the cut state too, so it must also follow the
+			// fetch: a heal landing after a pre-fetch probe declined would close
+			// only the superseded channel — a lost wakeup, and the parked writer
+			// would strand exactly where the probe exists to fail it.
 			wake := dstPartWakeCh()
+			// A write parked on a full send buffer toward a DEAD counterpart
+			// socket re-probes at every wake (probeDeadPeer): the frozen
+			// buffer will never drain, and production's zero-window probes
+			// against the CLOSED socket are answered with an RST over a live
+			// link — the blocked send fails with the one-shot ECONNRESET
+			// instead of re-parking forever. Under a cut the arms are
+			// unchanged: forward-cut bytes die at this end's own horizon
+			// below, and a return-only cut swallows the RST.
+			if e.probeDeadPeer(false) {
+				return total, io.ErrClosedPipe
+			}
 			var horizonC <-chan time.Time
 			var horizonT *time.Timer
 			if e.retransNs > 0 && dstPartitionedDir(e.localHost, e.peerHost) { // outgoing local→peer is where a write's bytes are held
@@ -841,6 +903,9 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				}
 				return total, io.ErrClosedPipe
 			case <-e.horizonKill:
+				if horizonT != nil {
+					horizonT.Stop()
+				}
 				return total, syscall.ETIMEDOUT
 			case <-horizonC:
 				e.horizonDie()

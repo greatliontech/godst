@@ -244,12 +244,15 @@ func dstInjectReset(c *dstConn) {
 
 // dstDeadPushRST delivers the RST a dead (CLOSED) peer socket answers a live
 // segment with — the sender-side consequence of a push into a frozen stream
-// over a live link (dstWireEnd.write's dead-push handling): the pushing end
-// receives it as any injected RST, draining its delivered bytes to the
-// one-shot ECONNRESET identity. Routed through the end's registered dstConn
-// when one exists so the shared reset flag and registration release follow
-// (dstInjectReset); an end already deregistered (its teardown ran) still gets
-// the wire-level injection, whose identity its earlier teardown already owns.
+// over a live link (dstWireEnd.write's dead-push handling), and of a PARKED
+// operation's probe against the frozen counterpart (dstWireEnd.probeDeadPeer:
+// a blocked writer's zero-window probes, a blocked reader's retransmissions
+// of destroyed bytes): the pushing (probing) end receives it as any injected
+// RST, draining its delivered bytes to the one-shot ECONNRESET identity.
+// Routed through the end's registered dstConn when one exists so the shared
+// reset flag and registration release follow (dstInjectReset); an end already
+// deregistered (its teardown ran) still gets the wire-level injection, whose
+// identity its earlier teardown already owns.
 // At most one registered conn wraps a given end, so the scan is deterministic.
 func dstDeadPushRST(e Conn) {
 	dstConns.mu.Lock()

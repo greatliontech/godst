@@ -378,13 +378,23 @@ it never wraps a positive delay into an earlier delivery.
   timing simplification the refuse-mode connect records (detected at the push, not after a wire
   round trip). Under a cut of the peer→dead direction the segment never reaches the socket, and the
   peer's own retransmissions of the destroyed (never-to-be-ACKed) bytes exhaust at ITS horizon
-  (`TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut`). Two peer shapes carry no failure signal,
-  both erring ⊆-real (a missed real failure, never a false one): a cut of only the RETURN
-  (dead→peer) direction swallows the RST — the recorded flow-level ACK-starvation limit (faults.md,
-  Partition) — and a peer already PARKED in a blocked read or write when the death lands is not
-  re-probed (production's retransmissions/zero-window probes against the CLOSED socket would elicit
-  the RST; the sim surfaces it only at the peer's next push — a finer-grained probe seam is a
-  possible follow-on). A
+  (`TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut`). A peer already PARKED in a blocked read
+  or write when the death lands is **re-probed**: the death and every partition change wake the
+  parked operation, which re-evaluates against the counterpart stream's frozen state, and over a
+  link live in BOTH directions the segment production keeps sending — a blocked writer's
+  zero-window probes against the full send buffer, a blocked reader's retransmissions of its
+  destroyed, never-to-be-ACKed bytes — meets the CLOSED socket and the answered RST fails the
+  blocked operation with the same one-shot `ECONNRESET`, at the wake (the zero-round-trip collapse
+  above) (`TestDSTNetBlockedWriterDeadPeerProbeResets`;
+  `TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets` — the heal that lands after the death
+  but before the peer's own watchdog check, which then disarms, so only the probe carries the
+  failure). A parked reader with NOTHING outstanding toward the dead socket stays parked —
+  production has no segment in flight to elicit an RST there either
+  (`TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked`). One peer shape carries no
+  failure signal, erring ⊆-real (a missed real failure, never a false one): a cut of only the
+  RETURN (dead→peer) direction swallows the RST — the recorded flow-level ACK-starvation limit
+  (faults.md, Partition) — for parked operations exactly as at the push seam
+  (`TestDSTNetBlockedWriterDeadPeerReturnOnlyCutNoRST`). A
   deadline-less write or dial into a permanent partition therefore fails in bounded virtual time, as
   it does on a real kernel — it never succeeds-and-forgets. The horizon is **partition-gated**: a
   full send buffer behind a **live** peer that has merely stopped reading is TCP *zero-window
