@@ -1344,10 +1344,6 @@ func DSTMemfdFDIsolation() {
 			out.WriteString("named fstat of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
 			return
 		}
-		if err := dstPageCacheFstatRawFP(memfd); err != syscall.ENOSYS && err != syscall.EBADF {
-			out.WriteString("raw fstat of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
-			return
-		}
 		var one [1]byte
 		if _, err := syscall.Pread(memfd, one[:], 0); err != syscall.EBADF { // Syscall6 path
 			out.WriteString("pread of the page-cache fd: got " + errStr(err) + ", want EBADF\n")

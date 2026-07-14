@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dst && linux && (386 || arm || mips || mipsle)
+//go:build dst && linux && (386 || arm)
 
 package syscall_test
 
@@ -15,6 +15,8 @@ import (
 	"time"
 	"unsafe"
 )
+
+const sysClockGettime64 = 403
 
 // TestDSTClockGettime64Virtual: the time64 clock_gettime trap returns the DST
 // virtual base clock for CLOCK_MONOTONIC/CLOCK_BOOTTIME in __kernel_timespec

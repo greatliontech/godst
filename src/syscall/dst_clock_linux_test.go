@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"internal/testenv"
 	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -283,21 +281,7 @@ func runDSTClockInvalidPointerForms(t *testing.T, trap, size uintptr) {
 	for _, form := range []string{"Syscall", "Syscall6", "RawSyscall", "RawSyscall6"} {
 		t.Run(form, func(t *testing.T) {
 			exe := testenv.Executable(t)
-			var cmd *exec.Cmd
-			switch runtime.GOARCH {
-			case "mips", "mipsle":
-				emulatorName := "qemu-mips"
-				if runtime.GOARCH == "mipsle" {
-					emulatorName = "qemu-mipsel"
-				}
-				emulator, err := exec.LookPath(emulatorName)
-				if err != nil {
-					t.Skipf("%s unavailable: %v", emulatorName, err)
-				}
-				cmd = exec.Command(emulator, exe, "-test.run=^TestDSTClockGettimeInvalidPointerChild$")
-			default:
-				cmd = testenv.Command(t, exe, "-test.run=^TestDSTClockGettimeInvalidPointerChild$")
-			}
+			cmd := testenv.Command(t, exe, "-test.run=^TestDSTClockGettimeInvalidPointerChild$")
 			cmd = testenv.CleanCmdEnv(cmd)
 			cmd.Env = append(cmd.Env,
 				"GO_DST_CLOCK_FORM="+form,

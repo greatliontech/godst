@@ -11,9 +11,9 @@
 // System calls for mips, Linux
 //
 
-// func syscall9(trap trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2, err uintptr);
+// func Syscall9(trap trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2, err uintptr);
 // Actually Syscall8 but the rest of the code expects it to be named Syscall9.
-TEXT ·syscall9(SB),NOSPLIT,$28-52
+TEXT ·Syscall9(SB),NOSPLIT,$28-52
 	NO_LOCAL_POINTERS
 	JAL	runtime·entersyscall(SB)
 	MOVW	a1+4(FP), R4

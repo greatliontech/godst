@@ -1023,7 +1023,19 @@ modeled' never means 'reaches the host'" applies to the whole boundary, not just
 namespace. Without the fence, a dependency calling `syscall.Open` or `unix.Getrandom` mid-run does
 real host I/O and reads real entropy silently — same seed, different run, no error — which
 falsifies host isolation as an *enforced* invariant. Every fence below fires only for **bubble goroutines while a run is
-active** — non-bubble goroutines keep full host access, so the harness around the run is untouched:
+active** — non-bubble goroutines keep full host access, so the harness around the run is untouched.
+
+**Architecture scope** (GOARCH-quantified; operating-system scope is governed by the Linux-only
+feature clauses elsewhere in this document). Because host isolation is *enforced*, the dst runtime
+carries arch arms only for architectures whose raw-entry surface the fence table below covers:
+amd64 (the verified primary target) and the architectures sharing the generic trampoline surface —
+arm64, riscv64, ppc64/ppc64le, s390x, and the 32-bit 386/arm (fenced in full; the page cache
+additionally refuses 32-bit hosts at first use). loong64 and the MIPS family carry arch-private
+raw entries the fork does not claim (loong64's Fstat dispatches a direct `statx`; linux/mips
+exports an additional ninth-argument `Syscall9` trampoline) whose fences would be verifiable only
+on emulated targets, so a `-tags dst` build is **refused at compile time** on those architectures
+(`runtime/dst_arch_unsupported.go`; pinned by `test:cross`'s negative build probes across all five).
+Untagged builds remain valid upstream ports everywhere. The fences:
 
 - **Resource-minting `syscall` entry points** (`Open`/`Openat`/`Creat`, `Socket`/`Socketpair`,
   `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, host-backed `Mmap`, `ForkExec`/`Exec`) fail with the standard
@@ -1042,8 +1054,7 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   remain live and the caller stack cannot move before kernel dispatch, including through the entry
   symbols used by external assembly callers.
 - **The generic trampolines** `Syscall`/`Syscall6`/`RawSyscall`/`RawSyscall6` are fenced the same
-  way — as is linux/mips's additional `Syscall9` entry, before its assembly calls `entersyscall` —
-  and this is the choke point that catches `golang.org/x/sys/unix`. A numeric real fd is never a
+  way, and this is the choke point that catches `golang.org/x/sys/unix`. A numeric real fd is never a
   capability: read/write/close, lseek, pread64/pwrite64, fstat, fcntl, and every other operation are
   refused before host dispatch. Explicit inherited-file capabilities perform their host operations
   through a scoped trusted path and never expose their hidden descriptor. This is an API boundary,
@@ -1068,8 +1079,7 @@ active** — non-bubble goroutines keep full host access, so the harness around 
   in production — never host I/O, which would kill a live file's cache (fatal at the next resize or
   mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
   page cache admits (32-bit hosts are refused before any memfd exists), named fd wrappers bottom out
-  in the same trampolines except loong64 `Fstat`, which applies equivalent classification before its
-  direct `statx`; non-bubble callers
+  in the same trampolines; non-bubble callers
   are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). A bubble goroutine's close of **any** real
   (non-virtual) fd number is answered `EBADF` at the trampolines and **never dispatched to the
   kernel**. The invisibility check alone cannot protect a fd that does not exist yet — the fence
@@ -1228,7 +1238,12 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   `CGO_ENABLED=0 go build std`, untagged): ordinary standard-library builds remain valid for the
   two file layouts that do not carry DST backend storage. This leg makes no tagged DST support
   claim for Windows or Plan 9; the tagged filesystem requires a supported Unix, js/wasm, or wasip1
-  file layout. It runs separately from the `test` aggregate.
+  file layout. The leg also carries the architecture-scope refusal probes: a `-tags dst` build of
+  `runtime` for each excluded architecture (`linux/loong64` and the four MIPS ports) must fail
+  with the intended unsupported-architecture sentinel message (see "The interception boundary",
+  Architecture scope) —
+  a probe that fails either because the build succeeded or because the message is missing is a
+  scope regression. It runs separately from the `test` aggregate.
 
 Two operational rules for running these configurations honestly: never let a pipeline eat the exit
 code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures

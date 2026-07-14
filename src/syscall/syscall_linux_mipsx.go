@@ -15,34 +15,7 @@ const (
 	_SYS_fchmodat2  = 4452
 )
 
-func syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
-
-//go:uintptrkeepalive
-//go:nosplit
-//go:linkname Syscall9
-func Syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno) {
-	// Match Syscall and Syscall6: dispatch or refuse before entersyscall so
-	// helpers may grow the stack and no bubble operation reaches the kernel.
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
-			return r1, r2, err
-		}
-		if r1, err, handled := dstRawDispatch(trap, a1, a2, a3); handled {
-			if err != 0 {
-				return ^uintptr(0), 0, err
-			}
-			return r1, 0, err
-		}
-		if dstSyscallPageCacheFDTrap(trap, a1, a3) {
-			return ^uintptr(0), 0, EBADF
-		}
-		if dstSyscallHostClose(trap, a1) {
-			return ^uintptr(0), 0, EBADF
-		}
-		dstSyscallRefuse(trap)
-	}
-	return syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9)
-}
+func Syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
 
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error)

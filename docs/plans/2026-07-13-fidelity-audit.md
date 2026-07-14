@@ -60,7 +60,7 @@ by slog (consumers need a relay they must discover by data loss);
   consumer-facing default for cluster suites. Deliverable may be
   measurement + a design recorded in design.md §Roadmap rather than
   code — no silent scope call either way.
-- [ ] **5 — loong64/MIPS disposition (user ruling: no investment).**
+- [x] **5 — loong64/MIPS disposition (user ruling: no investment).**
   Assess the arch-specific dst arms: anything half-baked or
   capable of hurting the dst on the primary target is removed
   outright; anything inert and harmless may stay with its

@@ -141,7 +141,7 @@ func testDSTIoctlDescriptorMintRefused(t *testing.T) {
 
 func ioctlPeerRequest() uintptr {
 	switch runtime.GOARCH {
-	case "mips", "mipsle", "mips64", "mips64le", "ppc64", "ppc64le":
+	case "ppc64", "ppc64le":
 		return 0x20005441
 	default:
 		return 0x5441

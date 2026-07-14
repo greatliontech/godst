@@ -4,10 +4,7 @@
 
 package syscall
 
-import (
-	"internal/runtime/syscall/linux"
-	"unsafe"
-)
+import "unsafe"
 
 const (
 	_SYS_setgroups  = SYS_SETGROUPS
@@ -59,11 +56,7 @@ func fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) {
 	if err = statx(dirfd, path, _AT_NO_AUTOMOUNT|flags, _STATX_BASIC_STATS, &r); err != nil {
 		return err
 	}
-	statFromStatx(stat, &r)
-	return nil
-}
 
-func statFromStatx(stat *Stat_t, r *statx_t) {
 	stat.Dev = makedev(r.Dev_major, r.Dev_minor)
 	stat.Ino = r.Ino
 	stat.Mode = uint32(r.Mode)
@@ -79,6 +72,8 @@ func statFromStatx(stat *Stat_t, r *statx_t) {
 	stat.Atim = timespecFromStatxTimestamp(r.Atime)
 	stat.Mtim = timespecFromStatxTimestamp(r.Mtime)
 	stat.Ctim = timespecFromStatxTimestamp(r.Ctime)
+
+	return nil
 }
 
 func Fstatat(fd int, path string, stat *Stat_t, flags int) (err error) {
@@ -86,33 +81,7 @@ func Fstatat(fd int, path string, stat *Stat_t, flags int) (err error) {
 }
 
 func fstatFD(fd int, stat *Stat_t) (err error) {
-	if dstSimFenced && dstFenceActive() {
-		if !dstHostIOActive() {
-			if dstPageCacheFDReserved(uintptr(fd)) {
-				return errnoErr(EBADF)
-			}
-			dstSyscallRefuse(SYS_STATX)
-		}
-		return fstatFDDST(fd, stat)
-	}
 	return fstatat(fd, "", stat, _AT_EMPTY_PATH)
-}
-
-var emptyStatXPath [1]byte
-
-func fstatFDDST(fd int, stat *Stat_t) (err error) {
-	var r statx_t
-	// Granted capability I/O dispatches scheduler-invisibly — no
-	// entersyscall/exitsyscall window for wall-timed host events to race —
-	// matching the generic Syscall/Syscall6 trampolines' granted path (see
-	// the Syscall trampoline's comment in syscall_linux.go). Reached only
-	// under the per-goroutine host-I/O grant (fstatFD's dstHostIOActive arm).
-	_, _, errno := linux.Syscall6(SYS_STATX, uintptr(fd), uintptr(unsafe.Pointer(&emptyStatXPath[0])), uintptr(_AT_NO_AUTOMOUNT|_AT_EMPTY_PATH), uintptr(_STATX_BASIC_STATS), uintptr(unsafe.Pointer(&r)), 0)
-	if errno != 0 {
-		return errnoErr(Errno(errno))
-	}
-	statFromStatx(stat, &r)
-	return nil
 }
 
 func Stat(path string, stat *Stat_t) (err error) {

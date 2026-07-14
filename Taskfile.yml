@@ -89,12 +89,28 @@ tasks:
       - '{{.RUN}} test -count=1 -short std'
 
   test:cross:
-    desc: Untagged standard-library cross-builds for Windows and Plan 9 file layouts
+    desc: Untagged standard-library cross-builds for Windows and Plan 9 file layouts, plus the dst architecture-scope refusal probes
     dir: src
     deps: [tmpdir]
     cmds:
       - 'GOOS=windows GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
       - 'GOOS=plan9 GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
+      # Architecture-scope refusal: DST claims no support on loong64/MIPS
+      # (design.md, "The interception boundary" → Architecture scope), so a
+      # dst-tagged build there must fail AND fail with the intended sentinel
+      # message from runtime/dst_arch_unsupported.go — an accidental
+      # missing-symbol failure would pass a bare negation but not this probe.
+      # Pipeline-free by design: the case-match is the assertion.
+      - |
+        for a in loong64 mips mipsle mips64 mips64le; do
+          if out=$(GOOS=linux GOARCH=$a CGO_ENABLED=0 {{.RUN}} build -tags dst runtime 2>&1); then
+            echo "dst-tagged build unexpectedly succeeded on linux/$a"; exit 1
+          fi
+          case "$out" in
+            *"unsupported on this architecture"*) ;;
+            *) printf '%s\n' "$out"; echo "linux/$a dst refusal is missing the intended sentinel message"; exit 1;;
+          esac
+        done
 
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
