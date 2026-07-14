@@ -44,7 +44,7 @@ by slog (consumers need a relay they must discover by data loss);
   leg (`test:conformance`) so model drift is caught structurally,
   not by consumer debugging. Divergences found are per-item fidelity
   fixes inside the chunk.
-- [ ] **3 — Determinism-escape hunt.** Same-seed cross-RUN and
+- [x] **3 — Determinism-escape hunt.** Same-seed cross-RUN and
   cross-process transcript equality swept under `-race` and under
   environmental perturbation (TZ, locale, cwd, GOMAXPROCS, ASLR-ish
   address sensitivity via map iteration); close the deferred

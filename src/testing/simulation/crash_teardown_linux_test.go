@@ -8,10 +8,13 @@ package simulation
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -300,5 +303,158 @@ func TestDSTCrashProcessResetsConnections(t *testing.T) {
 	})
 	if !errors.Is(readErr, syscall.ECONNRESET) {
 		t.Fatalf("client read after server crash = %v, want ECONNRESET", readErr)
+	}
+}
+
+// TestDSTCrashProcessAbandonsCondWait: a crashed process's goroutine parked
+// in sync.Cond.Wait never runs again, and a survivor's Signal or Broadcast
+// is not lost to it — the runtime's notify-list dequeues skip crashed
+// waiters (dstPid < 0) exactly as the chan and sema dequeues do, passing a
+// Signal's consumed ticket on to the next live waiter.
+func TestDSTCrashProcessAbandonsCondWait(t *testing.T) {
+	var crashedRan atomic.Bool
+	var signalWoke, broadcastWoke bool
+	Test(t, 1, func(t *testing.T) {
+		var mu sync.Mutex
+		cond := sync.NewCond(&mu)
+		parked := make(chan struct{}, 1)
+
+		// Signal arm: the crashed waiter holds the oldest ticket; Signal
+		// must skip it and wake the live waiter queued behind it.
+		go Process("victim", func() {
+			mu.Lock()
+			parked <- struct{}{}
+			cond.Wait()
+			crashedRan.Store(true)
+			mu.Unlock()
+		})
+		<-parked
+		// Fake time advances only at quiescence: after the sleep the victim
+		// is durably parked inside Wait, holding the oldest ticket.
+		time.Sleep(time.Millisecond)
+		crashProcess("victim")
+
+		signalDone := make(chan struct{})
+		go Process("waiter", func() {
+			mu.Lock()
+			parked <- struct{}{}
+			cond.Wait()
+			signalWoke = true
+			mu.Unlock()
+			close(signalDone)
+		})
+		<-parked
+		time.Sleep(time.Millisecond)
+		Process("signaler", func() {
+			cond.Signal()
+		})
+		<-signalDone
+
+		// Broadcast arm: a second crashed waiter shares the list with a
+		// live one; Broadcast must wake only the live waiter.
+		go Process("victim2", func() {
+			mu.Lock()
+			parked <- struct{}{}
+			cond.Wait()
+			crashedRan.Store(true)
+			mu.Unlock()
+		})
+		<-parked
+		time.Sleep(time.Millisecond)
+		crashProcess("victim2")
+
+		broadcastDone := make(chan struct{})
+		go Process("waiter2", func() {
+			mu.Lock()
+			parked <- struct{}{}
+			cond.Wait()
+			broadcastWoke = true
+			mu.Unlock()
+			close(broadcastDone)
+		})
+		<-parked
+		time.Sleep(time.Millisecond)
+		Process("broadcaster", func() {
+			cond.Broadcast()
+		})
+		<-broadcastDone
+		// One more quiescence: a wrongly-woken crashed goroutine gets every
+		// chance to run (and trip the flag) before the run ends.
+		time.Sleep(time.Millisecond)
+	})
+	if crashedRan.Load() {
+		t.Fatal("a crashed process's Cond.Wait goroutine ran after Signal/Broadcast")
+	}
+	if !signalWoke {
+		t.Fatal("Signal was lost to the crashed waiter; the live waiter never woke")
+	}
+	if !broadcastWoke {
+		t.Fatal("Broadcast did not wake the live waiter")
+	}
+}
+
+// TestDSTCondAbandonedRunWaitersSkippedByLaterRun: an aborted run's parked
+// Cond waiters are retired at deactivation (negative pid, still pointing at
+// the dead bubble), and a LATER run signaling or broadcasting the shared
+// Cond must skip them — the notify-list dequeues key on dstPid < 0 before
+// the cross-bubble wake check, which would otherwise be a runtime fatal
+// against the dead bubble — and deliver the wakeup to its own live waiter.
+func TestDSTCondAbandonedRunWaitersSkippedByLaterRun(t *testing.T) {
+	var muOne, muAll sync.Mutex
+	condOne := sync.NewCond(&muOne)
+	condAll := sync.NewCond(&muAll)
+	var leftoverRan atomic.Bool
+
+	// Run 1: park one waiter on each cond and abandon them — returning with
+	// members durably parked aborts the run with the bubble-deadlock panic.
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("run abandoning parked Cond waiters completed; want the bubble-deadlock abort")
+			}
+			if !strings.Contains(fmt.Sprint(r), "deadlock") {
+				panic(r) // not the bubble-deadlock diagnostic: repanic
+			}
+		}()
+		Run(1, func() {
+			for _, c := range []*sync.Cond{condOne, condAll} {
+				go func(c *sync.Cond) {
+					c.L.Lock()
+					c.Wait()
+					leftoverRan.Store(true)
+					c.L.Unlock()
+				}(c)
+			}
+			time.Sleep(time.Millisecond) // both waiters durably parked in Wait
+		})
+	}()
+
+	// Run 2: a fresh bubble over the same Cond objects, one live waiter each.
+	Run(2, func() {
+		signalWoke := make(chan struct{})
+		go func() {
+			muOne.Lock()
+			condOne.Wait()
+			muOne.Unlock()
+			close(signalWoke)
+		}()
+		time.Sleep(time.Millisecond)
+		condOne.Signal() // the oldest ticket is the leftover's: skip it, wake the live waiter
+		<-signalWoke
+
+		bcastWoke := make(chan struct{})
+		go func() {
+			muAll.Lock()
+			condAll.Wait()
+			muAll.Unlock()
+			close(bcastWoke)
+		}()
+		time.Sleep(time.Millisecond)
+		condAll.Broadcast() // the leftover rides the pulled list: skip it
+		<-bcastWoke
+	})
+	if leftoverRan.Load() {
+		t.Fatal("an abandoned run's Cond waiter ran in a later run")
 	}
 }

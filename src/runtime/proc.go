@@ -7911,7 +7911,7 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 	var c dstCandidates
 	var total uint32
 	for {
-		c = dstCandidates{pp: pp, hasNext: pp.runnext != 0, h: pp.runqhead}
+		c = dstCandidates{pp: pp, hasNext: pp.runnext != 0, disableUser: sched.disable.user, h: pp.runqhead}
 		c.ringN = pp.runqtail - c.h
 		c.ovfN = uint32(pp.dstRunqOvf.size)
 		total = c.ringN + c.ovfN + uint32(sched.runq.size)
@@ -7922,9 +7922,69 @@ func dstFindRunnable(pp *p) (gp *g, inheritTime bool) {
 			unlock(&sched.lock)
 			return nil, false
 		}
+		// Crashed-goroutine reaping sees only visible candidates (at's
+		// disabled-user filter): a crashed goroutine hidden by a GC window is
+		// reaped at the first decision after the window closes.
 		if k, ok := c.firstCrashedG(total); ok {
 			c.removeAt(k)
 			continue
+		}
+		if c.disableUser && !c.anyVisible(total) {
+			// Every queued candidate is a user goroutine inside the GC's
+			// disabled-user window. There is nothing legal to pick; fall
+			// through to findRunnable's later stages (the GC's own workers are
+			// selected before this point). The goroutines stay queued, in
+			// order, for the first decision after the window closes.
+			//
+			// Liveness: this nil return leaves goroutines queued that
+			// findRunnable's bottom assumes are drained — if a pass carried
+			// on to the P-releasing bottom, the late global-runq batch pull
+			// would load disabled goroutines into the local ring, and a
+			// later pass reaching pidleput with them still ringed would hit
+			// its non-empty-run-queue throw. Under the DST regime (single
+			// P), that bottom is unreachable while the window is open:
+			//
+			//  1. The window is contained in the gcBlackenEnabled != 0 span:
+			//     gcStart sets sched.disable.user and then gcBlackenEnabled
+			//     inside its stop-the-world; gcMarkDone clears
+			//     gcBlackenEnabled and re-enables users inside the
+			//     mark-termination stop-the-world. An M inside a findRunnable
+			//     pass holds the sole P, so neither STW can complete
+			//     mid-pass: a pass that snapshots disableUser=true here ran
+			//     its GC-worker stages with blackening enabled (asserted
+			//     below).
+			//  2. Reaching the bottom requires both worker stages —
+			//     findRunnableGCWorker and the later idle-worker stage — to
+			//     decline, and at P=1 with the window open every decline
+			//     either cannot happen or resolves before the bottom:
+			//     (a) worker pool empty: the sole mark worker is not parked,
+			//         and it is not running (this M holds the only P), so it
+			//         is runnable in a run queue — where this selection
+			//         returns it (a system goroutine passes the visibility
+			//         filter).
+			//     (b) pool non-empty, no mark work: unreachable with the
+			//         window open. With one worker, gcEndWork reports last
+			//         exactly when no work remains, so the worker re-parks
+			//         into the pool mid-phase only when it stopped with work
+			//         still available; when it stops with none, it runs
+			//         gcMarkDone on its own goroutine — re-enabling users
+			//         under the mark-termination STW — before it next parks.
+			//     (c) pool non-empty, work available: the idle-worker stage
+			//         takes the worker even when the wall-timed fractional
+			//         quota made findRunnableGCWorker decline —
+			//         maxIdleMarkWorkers >= 1 whenever
+			//         dedicatedMarkWorkersNeeded == 0 (the P=1 shape), and
+			//         the idle-worker count returned to zero in same-M
+			//         program order when the worker last stopped.
+			//     So a disabled-window pass always schedules GC work or a
+			//     system goroutine before its bottom; disabled goroutines
+			//     are never batch-ringed, and pidleput's throw backstop
+			//     stays unreachable.
+			if gcBlackenEnabled == 0 {
+				throw("dst: user scheduling disabled outside the GC mark phase")
+			}
+			unlock(&sched.lock)
+			return nil, false
 		}
 		break
 	}
@@ -8108,11 +8168,20 @@ func (c *dstCandidates) simSeqIdx(total, n uint32) uint32 {
 // enumerating/removing a candidate allocates nothing (which would otherwise
 // perturb GC determinism).
 type dstCandidates struct {
-	pp      *p
-	hasNext bool
-	h       uint32 // runqhead snapshot
-	ringN   uint32
-	ovfN    uint32
+	pp          *p
+	hasNext     bool
+	disableUser bool   // sched.disable.user snapshot; disabled user goroutines are not candidates (see at)
+	h           uint32 // runqhead snapshot
+	ringN       uint32
+	ovfN        uint32
+	// Sequential-scan cursors for the linked-list segments (see atRaw),
+	// stack-local to one decision. guintptr, not *g: the enumeration runs
+	// under the scheduler's nowritebarrierrec paths, and the referents are
+	// kept live by the run queues themselves.
+	ovfCursorK uint32
+	ovfCursor  guintptr
+	glbCursorK uint32
+	glbCursor  guintptr
 }
 
 // firstSystemG returns the index of the first candidate that should be scheduled
@@ -8230,6 +8299,17 @@ func (c *dstCandidates) simIdx(total, j uint32) uint32 {
 	return 0
 }
 
+// anyVisible reports whether any candidate passes at's visibility filter.
+// Caller holds sched.lock.
+func (c *dstCandidates) anyVisible(total uint32) bool {
+	for k := uint32(0); k < total; k++ {
+		if c.at(k) != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *dstCandidates) firstCrashedG(total uint32) (uint32, bool) {
 	for k := uint32(0); k < total; k++ {
 		gp := c.at(k)
@@ -8244,16 +8324,56 @@ func (c *dstCandidates) firstCrashedG(total uint32) (uint32, bool) {
 // strategies (PCT) that must inspect candidates before choosing. The global-runq
 // branch walks the linked list (O(k)); the runnable set is short under the
 // single-P simulation. Caller holds sched.lock.
+//
+// While user scheduling is disabled (the deterministic in-bubble GC runs in
+// stop-the-world mode, and gcStart's schedEnableUser(false) window covers each
+// mark phase), a user goroutine is not a legal pick: at reports it nil, so
+// every selection scan sees only candidates schedule() can actually run. A
+// disabled goroutine stays where it is queued — selecting it would displace it
+// into sched.disable.runnable without progress and mutate the alternation
+// state (dstSchedPrevSys), which starved any foreign user goroutine whose
+// runnable moments phase-locked with the per-quiescence GC windows (it lost
+// every in-window decision to the reroute and every post-window decision to
+// the burned alternation slot). The window boundaries are deterministic (the
+// bubble GC is), so the visibility filter is too.
 func (c *dstCandidates) at(k uint32) *g {
+	gp := c.atRaw(k)
+	if gp != nil && c.disableUser && !schedEnabled(gp) {
+		return nil
+	}
+	return gp
+}
+
+// atRaw is at without the disabled-user visibility filter: the k-th physical
+// candidate. Removal (removeAt) indexes physical positions, so selection
+// indices returned by the scans — which only ever name visible candidates —
+// remain valid removal indices.
+//
+// The linked-list segments (the overflow queue and the global runq) memoize a
+// cursor: the selection scans access indices in ascending runs, so remembering
+// the last (index, node) pair makes a whole scan O(total) instead of O(total²)
+// — pure memoization, the enumeration is unchanged. Without it, a program
+// with thousands of simultaneously runnable goroutines (a spawn burst that
+// lands in the list segments) made every seeded selection walk the list from
+// its head per candidate, O(n·total²) per decision — a multi-minute stall at
+// 1500 goroutines (TestDSTGCSysstackAlloc's spawn phase). The cursors are
+// only valid against an unmutated list; removeAt invalidates them.
+func (c *dstCandidates) atRaw(k uint32) *g {
 	pp := c.pp
 	if k < c.ringN {
 		return pp.runq[(c.h+k)%uint32(len(pp.runq))].ptr()
 	}
 	if k < c.ringN+c.ovfN {
-		n := pp.dstRunqOvf.head.ptr()
-		for gi := k - c.ringN; gi > 0; gi-- {
+		gi := k - c.ringN
+		n, from := pp.dstRunqOvf.head.ptr(), uint32(0)
+		if c.ovfCursor != 0 && c.ovfCursorK <= gi {
+			n, from = c.ovfCursor.ptr(), c.ovfCursorK
+		}
+		for ; from < gi; from++ {
 			n = n.schedlink.ptr()
 		}
+		c.ovfCursor.set(n)
+		c.ovfCursorK = gi
 		return n
 	}
 	if c.hasNext && k == c.ringN+c.ovfN {
@@ -8263,16 +8383,26 @@ func (c *dstCandidates) at(k uint32) *g {
 	if c.hasNext {
 		gi--
 	}
-	n := sched.runq.head.ptr()
-	for ; gi > 0; gi-- {
+	n, from := sched.runq.head.ptr(), uint32(0)
+	if c.glbCursor != 0 && c.glbCursorK <= gi {
+		n, from = c.glbCursor.ptr(), c.glbCursorK
+	}
+	for ; from < gi; from++ {
 		n = n.schedlink.ptr()
 	}
+	c.glbCursor.set(n)
+	c.glbCursorK = gi
 	return n
 }
 
 // removeAt removes and returns the k-th candidate goroutine, plus inheritTime
 // (true only for runnext, matching runqget). Caller holds sched.lock.
 func (c *dstCandidates) removeAt(k uint32) (*g, bool) {
+	// The scan cursors memoize positions in the lists this mutates (see
+	// atRaw); a stale cursor after an unlink would resolve indices to the
+	// wrong node.
+	c.ovfCursor, c.ovfCursorK = 0, 0
+	c.glbCursor, c.glbCursorK = 0, 0
 	pp := c.pp
 	if k < c.ringN {
 		// Local-ring element: shift the elements ahead of it forward by one and

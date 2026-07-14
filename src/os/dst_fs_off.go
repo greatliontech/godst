@@ -6,7 +6,10 @@
 
 package os
 
-import "time"
+import (
+	"time"
+	_ "unsafe" // for go:linkname
+)
 
 // Stubs so the dst filesystem gates type-check in a non -tags dst build. The
 // gates are all guarded by the dstSimEnabled constant (false here), so every
@@ -17,6 +20,12 @@ import "time"
 func dstOpenFile(name string, flag int, perm FileMode) (*File, bool, error) {
 	return nil, false, nil
 }
+
+// dstFSRunTeardown is pulled by testing/simulation via linkname in every
+// build mode; a non-dst build has no simulated filesystem to release.
+//
+//go:linkname dstFSRunTeardown
+func dstFSRunTeardown() {}
 
 func dstFSFenced(op, name string) (error, bool) { return nil, false }
 

@@ -773,6 +773,11 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetNetCrossHostBandwidth(0)
 		dstSetNetSendBuffer(0)
 		dstSetNetRetransmitTimeout(0)
+		// The bubble has exited and the run is deactivated: release the run's
+		// filesystem host residue (page-cache memfds, the mapping region) now,
+		// so the run leaves the host descriptor table as it found it rather
+		// than parking the release on the next run's first filesystem op.
+		dstFSRunTeardown()
 		dstSetAsyncPreemptOff(oldPreempt)
 		if autoProcs {
 			runtime.SetDefaultGOMAXPROCS()

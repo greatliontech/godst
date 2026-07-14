@@ -38,11 +38,12 @@ tasks:
     cmds:
       - mkdir -p {{.ROOT_DIR}}/.tmp
   test:
-    desc: The fast enforcing legs (untagged, dst, dst-race, conformance), sequential and fail-fast; test:inert-std runs separately
+    desc: The fast enforcing legs (untagged, dst, dst-race, determinism, conformance), sequential and fail-fast; test:inert-std runs separately
     cmds:
       - task: test:untagged
       - task: test:dst
       - task: test:dst-race
+      - task: test:determinism
       - task: test:conformance
 
   test:untagged:
@@ -60,11 +61,18 @@ tasks:
       - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing/simulation crypto/rand net os syscall os/exec os/signal'
 
   test:dst-race:
-    desc: -tags dst -race testing/simulation — suite is race-clean; any TSan report here is a real finding
+    desc: -tags dst -race testing/simulation + determinism sweep — suite is race-clean; any TSan report here is a real finding
     dir: src
     deps: [tmpdir]
     cmds:
-      - '{{.RUN}} test -tags dst -race -count=1 testing/simulation'
+      - '{{.RUN}} test -tags dst -race -count=1 testing/simulation testing/simulation/determinism'
+
+  test:determinism:
+    desc: Same-seed determinism sweep — cross-run, cross-process, and environmental-perturbation transcript equality
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - '{{.RUN}} test -tags dst -count=1 -timeout 20m testing/simulation/determinism'
 
   test:conformance:
     desc: Host-vs-sim differential conformance harness (pipes/TCP/fs) — bounded seed sweep; DST_CONFORMANCE_SEEDS widens

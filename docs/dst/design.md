@@ -976,10 +976,15 @@ same-seed transcript-equality pins — `-v` solo, `-v` on-vs-off, and `-v` under
 shared program crosses the deterministic GC trigger repeatedly, so an alloc-coupling regression
 shifts them).
 The blocked case is covered too: a host write that blocks (a full pipe, a slow terminal) delays
-the run in *wall* time but cannot reorder it, because sysmon's **syscall-handoff retake is gated
-under an active run** exactly as its preemption retake is (`retake`, `proc.go`) — without that gate,
-whether a host write returns within sysmon's 10 ms
-window would decide whether the P is handed off mid-syscall, a wall-clock-dependent schedule fork.
+the run in *wall* time but cannot reorder it, because a granted capability syscall dispatches
+**raw and scheduler-invisible** (no `entersyscall`, so no `_Psyscall` window): the syscall holds
+the P for its duration, and no wall-timed host event — a host M's `exitsyscall` fast path
+reclaiming the shared P, a pending stop-the-world claiming `_Psyscall` Ps, or sysmon's 10 ms
+syscall-handoff window — can force the returning bubble goroutine through a wall-clock-dependent
+reschedule. Sysmon's **syscall-handoff retake stays gated under an active run** exactly as its
+preemption retake is (`retake`, `proc.go`), load-bearing for FOREIGN goroutines only: a host
+goroutine's real syscall under an active run would otherwise hand the P off iff the syscall
+outlasted sysmon's window, a wall-clock-dependent schedule fork.
 A capability's real syscall thus *serializes* the bubble for its duration: one legal execution,
 deterministic. The dual failure mode is recorded plainly: a goroutine blocked **reading** an inherited
 capability is syscall-blocked, not durably blocked — the bubble can neither advance fake time over it
@@ -1179,11 +1184,25 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
   fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
   `crypto/rand` enforces that the tagged outside-run entropy path remains allocation-free.
-- **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation`): the dst-race
-  sync-hook encodings. The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
+- **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation testing/simulation/determinism`): the dst-race
+  sync-hook encodings, plus the determinism sweep under instrumentation (race instrumentation must
+  not shift the seeded schedule). The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
   intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via
   `dstRaceEnabledFP` — so a TSan report in this leg is a real finding; the skip gates are
   load-bearing for this invariant.
+- **`test:determinism`** (`go test -tags dst -count=1 -timeout 20m testing/simulation/determinism`,
+  Linux): the same-seed determinism sweep — one representative composed program (hosts, processes,
+  network under latency, filesystem durability points, virtual timers, channel/select races,
+  value-keyed map iteration, math/rand and crypto/rand, a contended mutex) pinned byte-identical
+  across repeated in-process runs over a seed sweep, across child-process re-executions of the same
+  seed (which is also the address-layout perturbation probe: every child has a fresh heap and mmap
+  layout), and under environmental perturbation in the children — TZ, LC_ALL/LANG, working
+  directory, GOMAXPROCS. The map hash key needs no perturbation axis of its own: under `-tags dst`
+  it is a fixed constant derived position-independently (see "Map hash key requires `-tags dst`").
+  The package also pins that in-bubble `sync.Mutex` starvation switching is measured on the virtual
+  clock (`TestMutexStarvationHandoffDeterministic`) — on the wall clock, whether a waiter's wait
+  crossed the 1ms starvation threshold decided lock handoff order, a machine-speed- and
+  load-dependent same-seed schedule fork. Recorded coverage bounds live in the package's doc.go.
 - **`test:conformance`** (`go test -tags dst -count=1 -timeout 30m testing/simulation/conformance`,
   Linux): the differential host-vs-sim conformance harness — seeded op-grammar sequences over the
   modeled pipe, TCP, and filesystem surfaces, executed against real Linux primitives outside a run
@@ -1332,12 +1351,13 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | `math/rand`, `math/rand/v2` (top-level funcs) | `//go:linkname`'d to `runtime.rand` → per-g stream | ✅ |
 | `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
+| `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | the wait is measured on the bubble's fake clock (`runtime.internal_sync_nanotime`); mutex waits are non-durable so fake time never passes mid-wait — in-bubble handoff stays barging-mode, deterministically. The determinization is sound for every finite execution prefix (barging order is producible in production before the threshold) but NOT for liveness: a SUT whose progress depends on the starvation-mode handoff — a holder re-barging at every release while the parked waiter must acquire for the program to advance; production always terminates once the waiter's wall wait crosses 1ms and the flip forces the handoff — livelocks in-sim where production cannot, undetectably (the non-durable mutex wait means fake time never advances and the bubble-deadlock panic never fires): a known false-positive hang class. The alternative (letting the wall-valued flip through) was the demonstrated same-seed schedule escape, so determinism wins and the gap is recorded. | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
-| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for capture; syscall-retake gated so a blocked capability write serializes, never reorders; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
+| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for capture; granted capability syscalls dispatch raw (scheduler-invisible, the P held) so a blocked capability write serializes, never reorders — sysmon's syscall retake stays run-gated for foreign goroutines; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
@@ -1453,7 +1473,14 @@ later steps add, never rewrite.
   **bounded**: after an infrastructure pick, a runnable simulation candidate gets the next decision,
   selected over the sim-only subset in stable simulation creation-index order, so physical
   local/global/runnext placement and the hand-off change only when decisions happen,
-  never which goroutine one picks. **Exception: the simulation's own drain.** Under the scheduled
+  never which goroutine one picks. **Disabled-goroutine visibility:** during a deterministic-GC
+  `schedEnableUser(false)` window (the in-bubble STW GC's mark phase), user goroutines are invisible
+  to candidate selection — a scheduling decision selects only among goroutines the scheduler can
+  actually run, so an in-window decision neither selects a disabled goroutine (displacing it without
+  progress) nor burns an alternation slot on one (which starved any foreign user goroutine whose
+  runnable moments phase-locked with the per-quiescence GC windows). The window boundaries are
+  deterministic — the bubble GC is — so the visibility filter is too, and same-seed transcripts that
+  cross a GC stay seed-pure. **Exception: the simulation's own drain.** Under the scheduled
   strategies the bubble's finalizer/cleanup drain is infra-classified but has sim-visible effects
   (user callbacks), so it is exempt from the alternation in both directions: it outranks every other
   infrastructure candidate, and its pick neither owes the simulation the next slot nor can be

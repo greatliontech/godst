@@ -1743,8 +1743,12 @@ func dstSelfCrashed() bool {
 // crashed (or exited) simulated process invocation, whose threads never run
 // again — and never unwind (a killed process runs no defers; the caller
 // forfeits its own by parking here). The scheduler never selects a crashed
-// goroutine (dstFindRunnable drops them; the chan and sema dequeues skip
-// them), so the park is permanent by construction.
+// goroutine (dstFindRunnable drops them; the chan, sema, and sync.Cond
+// notify-list dequeues skip them), so the park is permanent by construction.
+// The same dequeue filters are what retire dstDeactivate's leftover parked
+// members: an abandoned run's members carry this identical mark (negative
+// pid), so every path that could resurrect a parked goroutine — scheduler
+// selection or a wait-queue wake — keys on dstPid < 0 and refuses.
 //
 // The caller may or may not already carry the crash mark: a self-crash was
 // marked by dstMarkProcessGoroutinesCrashed (which also settled its bubble
@@ -2404,6 +2408,46 @@ func dstDeactivate() {
 	getg().dstrand = 0
 	dstSimRootG = nil
 	dstSimBubble = nil
+	// Clear the simulation identity of every PARKED member goroutine the run
+	// leaves behind. A run that aborts — a recovered bubble-deadlock panic, or
+	// a panicking body unwound through synctest.Run — abandons durably parked
+	// members that can never wake (their bubble is dead), still carrying
+	// dstSimG plus this run's host/pid stamps. Host and process ids are
+	// interned per run (nodeRegReset), so a LATER run reuses the same numeric
+	// ids: its CrashHost/Crash fault mark would match the stale identity and
+	// subtract the previous run's goroutines from the CURRENT bubble's
+	// liveness ledger, driving total negative when the current run's own
+	// goroutines exit ("fatal error: total < 0", reproduced by
+	// TestDSTNetSameHostWriteWriteDeadlocks followed by
+	// TestDSTNetSYNACKObservesHostCrash in one process). Marking them exactly
+	// as a crash mark leaves its victims (negative pid, no host scope, not a
+	// sim member) retires the identity for every consumer at once: fault
+	// marks, scheduler classification, the wait-queue dequeue filters (chan,
+	// sema, and the sync.Cond notify list — a later run signaling a shared
+	// Cond must skip a leftover, not wake it into the dead bubble), and the
+	// bubble ledger's changegstatus
+	// guard. Only parked goroutines are touched: a member still runnable at a
+	// panic-path deactivation keeps today's behavior (it is handed to the
+	// normal scheduler below), and running goroutines — the caller — are the
+	// caller's own state.
+	forEachG(func(gp *g) {
+		if gp == getg() || !gp.dstSimG {
+			return
+		}
+		if status := readgstatus(gp) &^ _Gscan; status != _Gwaiting {
+			return
+		}
+		gp.dstSimG = false
+		gp.dstHostScope = nil
+		if gp.dstPid > 0 {
+			gp.dstPid = -gp.dstPid
+		} else if gp.dstPid == 0 {
+			// Never carried a pid: give it the sentinel no live pid takes,
+			// as the host-crash mark does, so pid-keyed filters all see a
+			// permanently descheduled goroutine.
+			gp.dstPid = -1
+		}
+	})
 	// Hand any goroutines still in the DST ring-overflow queue (foreign
 	// goroutines can legitimately be runnable at run end) back to the normal
 	// scheduler, which does not look at p.dstRunqOvf. The store above already

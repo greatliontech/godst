@@ -102,9 +102,12 @@ var emptyStatXPath [1]byte
 
 func fstatFDDST(fd int, stat *Stat_t) (err error) {
 	var r statx_t
-	runtime_entersyscall()
+	// Granted capability I/O dispatches scheduler-invisibly — no
+	// entersyscall/exitsyscall window for wall-timed host events to race —
+	// matching the generic Syscall/Syscall6 trampolines' granted path (see
+	// the Syscall trampoline's comment in syscall_linux.go). Reached only
+	// under the per-goroutine host-I/O grant (fstatFD's dstHostIOActive arm).
 	_, _, errno := linux.Syscall6(SYS_STATX, uintptr(fd), uintptr(unsafe.Pointer(&emptyStatXPath[0])), uintptr(_AT_NO_AUTOMOUNT|_AT_EMPTY_PATH), uintptr(_STATX_BASIC_STATS), uintptr(unsafe.Pointer(&r)), 0)
-	runtime_exitsyscall()
 	if errno != 0 {
 		return errnoErr(Errno(errno))
 	}

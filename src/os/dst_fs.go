@@ -51,7 +51,9 @@ func dstFSEpoch() uint64
 // (DST-NODE-ISOLATION). The working directory is per PROCESS: a path into the
 // process's host tree, so one process's Chdir does not move another's even on the
 // same host. Both maps are keyed by the run epoch (reset in dstFSRoll) so a new run
-// starts fresh with no teardown hook. The default host/process (id 0 — a program
+// starts fresh even without a teardown; the run's HOST residue (page-cache memfds
+// and the mapping region) is additionally released eagerly at run end
+// (dstFSRunTeardown). The default host/process (id 0 — a program
 // that declares neither) is one host, one process, identical to a plain run. All
 // node state is guarded by mu; per-handle state by the handle's own mutex, acquired
 // before mu where both are needed.
@@ -217,6 +219,34 @@ func dstFSRoll() {
 		// per-disk latency resets with the disks above).
 		dstDiskSlow.Store(false)
 	}
+}
+
+// dstFSRunTeardown releases a completed run's filesystem residue eagerly:
+// every page cache's host memfd closes and the mapping region is taken back
+// when the run ends, not at the next run's first filesystem operation. A run
+// must leave the host descriptor table as it found it — the lazy roll alone
+// left the last run's memfds open for the rest of the process (or until
+// another run's first filesystem op), a host-isolation leak the fd census in
+// TestDSTPipeBasic pins. Clearing the maps to nil (rather than to fresh maps)
+// makes dstFSRoll re-initialize on the next run's first operation exactly as
+// it does on an epoch advance.
+//
+// Called by testing/simulation at run teardown, after the bubble has exited
+// (no simulated operation is in flight; a leaked handle's later use is fenced
+// by the epoch checks, and a leaked mapping's later touch faults into the
+// reset region's named-abort path, both as the leak contract records).
+//
+//go:linkname dstFSRunTeardown
+func dstFSRunTeardown() {
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	if dstFS.disks == nil {
+		return // the run made no filesystem use, or was already torn down
+	}
+	dstNodeReleaseRunLocked()
+	dstFS.disks = nil
+	dstFS.cwds = nil
+	dstDiskSlow.Store(false)
 }
 
 // dstFSNewNode allocates a node with its inode number and its metadata durable

@@ -46,12 +46,18 @@ import (
 //     tracks only bubble writes and goes stale the moment a host line lands,
 //     leaving a bubble line attributed to the wrong test. A constant
 //     decision always attributes correctly; the cost is one redundant header
-//     line per bubble write. (Residual, not introduced here: fmt draws its
-//     printers from a process-shared pool, so an in-bubble fmt call's
-//     hit-or-miss allocation profile is host-coupled — a whole-of-fmt
-//     property affecting every in-bubble formatting call, SUT included, not
-//     schedule-visible in any current pin; owned by the determinism-escape
-//     sweep, see docs/issues/capability-write-entersyscall-gc-window.md.)
+//     line per bubble write. (Recorded bound, not introduced here: fmt draws
+//     its printers from a process-shared sync.Pool, so an in-bubble fmt
+//     call's hit-or-miss allocation profile is in principle host-coupled — a
+//     whole-of-fmt property affecting every in-bubble formatting call, SUT
+//     included. The coupling is schedule-neutral: sync.Pools are cleared at
+//     every gcStart, and in-bubble GCs are deterministic, so host-donated
+//     pool warmth is bounded by deterministic clear points rather than
+//     accumulating across a run. Enforced by same-seed transcript equality
+//     under a host-parallel goroutine hammering the shared printer
+//     (TestVerboseContendedSameSeedTranscript) and by the fmt-heavy,
+//     GC-trigger-crossing testing/simulation/determinism sweep — the
+//     standing pins if the coupling ever becomes schedule-reachable.)
 //
 // The grant is enacted only around these unexported writes, whose inputs the
 // framework formatted before the grant opens; SUT code cannot reach them, so

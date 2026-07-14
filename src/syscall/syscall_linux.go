@@ -95,7 +95,30 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall so the refusal panics in a clean scheduling
 	// state (see RawSyscall6). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+	if dstSimFenced && dstFenceActive() {
+		if dstHostIOActive() {
+			// A granted host operation (an explicit inherited-file
+			// capability's I/O) on a bubble goroutine dispatches
+			// scheduler-INVISIBLY: no entersyscall/exitsyscall. The
+			// entersyscall window exposes the single P's _Psyscall state to
+			// wall-timed host events — a host M's own exitsyscall fast path
+			// reclaiming the P through a stale oldp, or a pending
+			// stop-the-world claiming _Psyscall Ps — and losing that race
+			// sends the returning bubble goroutine through exitsyscall's slow
+			// path onto the run queue: a scheduling decision at a
+			// wall-clock-dependent instant, a same-seed schedule fork
+			// (demonstrated for the framework -v stream and closed with this
+			// same raw form; see testing's dstHostStreamWrite). The raw
+			// dispatch is the literal form of the spec's capability
+			// serialization contract: the syscall holds the P, delaying the
+			// bubble in wall time only, never reordering it — with the
+			// recorded dual that a wall-blocked granted syscall delays a
+			// pending host STW for its duration. The P is held throughout,
+			// so calling the Go RawSyscall6 here is instrumentation-safe
+			// (the N.B. below concerns the P-less window after
+			// entersyscall).
+			return RawSyscall6(trap, a1, a2, a3, 0, 0, 0)
+		}
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
@@ -141,7 +164,13 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:linkname Syscall6
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
 	// Fence before entersyscall (see Syscall). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
+	if dstSimFenced && dstFenceActive() {
+		if dstHostIOActive() {
+			// Granted capability I/O dispatches scheduler-invisibly, holding
+			// the P — no entersyscall window for wall-timed host events to
+			// race. See the Syscall trampoline's comment.
+			return RawSyscall6(trap, a1, a2, a3, a4, a5, a6)
+		}
 		if r1, r2, err, handled := dstTryClockGettime(trap, a1, a2); handled {
 			return r1, r2, err
 		}
