@@ -960,6 +960,13 @@ func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
 	if called {
 		t.Fatal("invalid mode invoked SUT")
 	}
+	if !dstBuilt() {
+		// The rejection half above is deliberately tag-independent (mode
+		// validation precedes activation); the valid-exploration follow-up —
+		// proving the rejection left the process-global state clean — needs a
+		// dst-built binary.
+		return
+	}
 	invocations := 0
 	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 20}, func() bool {
 		invocations++
