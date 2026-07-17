@@ -48,6 +48,9 @@ func dstSetFdatasyncHook(func(fd int) (err syscall.Errno, handled bool))
 //go:linkname dstSetFlockHook syscall.dstSetFlockHook
 func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetRenameat2Hook syscall.dstSetRenameat2Hook
+func dstSetRenameat2Hook(func(oldpath, newpath string, flags int) (err syscall.Errno, handled bool))
+
 func init() {
 	dstSetReadHook(dstFDRead)
 	dstSetWriteHook(dstFDWrite)
@@ -59,6 +62,7 @@ func init() {
 	dstSetFsyncHook(dstFDFsync)
 	dstSetFdatasyncHook(dstFDFdatasync)
 	dstSetFlockHook(dstFDFlock)
+	dstSetRenameat2Hook(dstRenameat2)
 }
 
 type dstFDEntry struct {
@@ -410,4 +414,39 @@ func dstFDClose(fd int) (syscall.Errno, bool) {
 	dstReleaseBackendFDs(entry.backend)
 	dstDropClosedNode(entry.backend)
 	return 0, true
+}
+
+// dstRenameat2 backs the raw SYS_RENAMEAT2 dispatch (the x/sys/unix
+// Renameat2 path databases use for an atomic no-clobber publish). Flags
+// allowlist per the partially-supported-syscall convention: 0 and
+// RENAME_NOREPLACE are modeled; RENAME_EXCHANGE / RENAME_WHITEOUT (and any
+// unknown bit) answer EINVAL — the kernel's own shape for a filesystem
+// without the capability, so a caller's degradation path sees the errno it
+// was written against. handled=false (inactive FS) sends the caller to the
+// fence, mirroring every other hook.
+func dstRenameat2(oldpath, newpath string, flags int) (syscall.Errno, bool) {
+	const dstRenameNoreplace = 0x1
+	if flags&^dstRenameNoreplace != 0 {
+		// Answered before path resolution; a kernel filesystem lacking the
+		// capability resolves paths first (missing source → ENOENT before
+		// the capability EINVAL). Degradation ladders probe with existing
+		// files, so the pre-lookup shape is indistinguishable there.
+		return syscall.EINVAL, true
+	}
+	handled, err := dstRenameFlags(oldpath, newpath, flags&dstRenameNoreplace != 0)
+	if !handled {
+		return 0, false
+	}
+	if err == nil {
+		return 0, true
+	}
+	if le, ok := err.(*LinkError); ok {
+		err = le.Err
+	}
+	if e, ok := err.(syscall.Errno); ok {
+		return e, true
+	}
+	// The one non-errno shape is the reserved-/proc refusal; the kernel
+	// answers EPERM for a procfs rename.
+	return syscall.EPERM, true
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"testing/simulation"
 	"time"
+	"unsafe"
 )
 
 func isDSTUnsupportedFS(err error) bool {
@@ -1964,6 +1966,118 @@ func TestDSTFSReaddirRemovedDirENOENT(t *testing.T) {
 		}
 		if _, err := dir.Stat(); err != nil {
 			t.Fatalf("Stat on removed dir handle = %v, want success", err)
+		}
+	})
+}
+
+// TestDSTFSRenameat2 pins the raw SYS_RENAMEAT2 dispatch — the
+// x/sys/unix Renameat2 path a database's atomic no-clobber publish
+// uses. NOREPLACE refuses an existing target with EEXIST (target
+// bytes intact) and the same-node case ahead of the same-file no-op;
+// flags=0 replaces like rename(2); EXCHANGE answers EINVAL (the
+// unsupported-filesystem shape a caller's degradation ladder expects).
+func TestDSTFSRenameat2(t *testing.T) {
+	renameat2Num := func() uintptr {
+		switch runtime.GOARCH {
+		case "amd64":
+			return 316
+		case "386":
+			return 353
+		case "arm":
+			return 382
+		case "arm64", "riscv64":
+			return 276
+		case "ppc64", "ppc64le":
+			return 357
+		case "s390x":
+			return 347
+		}
+		t.Fatalf("no renameat2 number for %s", runtime.GOARCH)
+		return 0
+	}
+	simulation.Run(1, func() {
+		atFdcwd := -0x64
+		r2 := func(old, new string, flags uintptr) syscall.Errno {
+			ob, err := syscall.BytePtrFromString(old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nb, err := syscall.BytePtrFromString(new)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, e := syscall.Syscall6(renameat2Num(), uintptr(atFdcwd),
+				uintptr(unsafe.Pointer(ob)), uintptr(atFdcwd),
+				uintptr(unsafe.Pointer(nb)), flags, 0)
+			return e
+		}
+		const noreplace, exchange = 0x1, 0x2
+		if err := os.WriteFile("/tmp/a", []byte("copy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile("/tmp/b", []byte("existing"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if e := r2("/tmp/a", "/tmp/b", noreplace); e != syscall.EEXIST {
+			t.Fatalf("NOREPLACE over existing = %v, want EEXIST", e)
+		}
+		if got, _ := os.ReadFile("/tmp/b"); string(got) != "existing" {
+			t.Fatalf("NOREPLACE clobbered the target: %q", got)
+		}
+		if e := r2("/tmp/a", "/tmp/a", noreplace); e != syscall.EEXIST {
+			t.Fatalf("NOREPLACE same node = %v, want EEXIST (ahead of the no-op)", e)
+		}
+		if e := r2("/tmp/a", "/tmp/c", noreplace); e != 0 {
+			t.Fatalf("NOREPLACE into absent = %v, want success", e)
+		}
+		if got, _ := os.ReadFile("/tmp/c"); string(got) != "copy" {
+			t.Fatalf("publish missing: %q", got)
+		}
+		if _, err := os.Lstat("/tmp/a"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("old name survived the rename: %v", err)
+		}
+		if e := r2("/tmp/c", "/tmp/b", 0); e != 0 {
+			t.Fatalf("flags=0 replace = %v, want success", e)
+		}
+		if got, _ := os.ReadFile("/tmp/b"); string(got) != "copy" {
+			t.Fatalf("flags=0 did not replace: %q", got)
+		}
+		if e := r2("/tmp/b", "/tmp/x", exchange); e != syscall.EINVAL {
+			t.Fatalf("EXCHANGE = %v, want EINVAL", e)
+		}
+		if e := r2("/tmp/missing", "/tmp/y", noreplace); e != syscall.ENOENT {
+			t.Fatalf("missing source = %v, want ENOENT", e)
+		}
+		// Host-probed kernel order: NOREPLACE's positive-target EEXIST
+		// precedes the trailing-slash source-type ENOTDIR, both shapes
+		// (both names must exist for the probe to be the ordering probe).
+		if err := os.WriteFile("/tmp/c", []byte("back"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if e := r2("/tmp/b/", "/tmp/c", noreplace); e != syscall.EEXIST {
+			t.Fatalf("NOREPLACE slashed source over existing = %v, want EEXIST", e)
+		}
+		if e := r2("/tmp/b", "/tmp/c/", noreplace); e != syscall.EEXIST {
+			t.Fatalf("NOREPLACE onto slashed existing = %v, want EEXIST", e)
+		}
+		// The dirfd-relative form is not the simulation's: it meets the
+		// raw fence (the clock tests' recover pattern).
+		d, err := os.Open("/tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		ob, _ := syscall.BytePtrFromString("/tmp/b")
+		nb, _ := syscall.BytePtrFromString("/tmp/z")
+		fencePanic := func() (p any) {
+			defer func() { p = recover() }()
+			syscall.Syscall6(renameat2Num(), d.Fd(),
+				uintptr(unsafe.Pointer(ob)), d.Fd(),
+				uintptr(unsafe.Pointer(nb)), noreplace, 0)
+			return nil
+		}()
+		if fencePanic == nil || !strings.Contains(fmt.Sprint(fencePanic), "unsupported under deterministic simulation") {
+			t.Fatalf("dirfd-relative renameat2 = %v, want the fence refusal", fencePanic)
 		}
 	})
 }

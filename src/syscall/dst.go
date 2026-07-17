@@ -63,6 +63,7 @@ type dstMunmapHook func(data []byte) (err Errno, handled bool)
 type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
 type dstMadviseHook func(data []byte, advice int) (err Errno, handled bool)
 type dstKillHook func(pid int, sig Signal) (err Errno, handled bool)
+type dstRenameat2Hook func(oldpath, newpath string, flags int) (err Errno, handled bool)
 
 var dstReadHookFn dstReadHook
 var dstWriteHookFn dstWriteHook
@@ -79,6 +80,7 @@ var dstMunmapHookFn dstMunmapHook
 var dstMprotectHookFn dstMprotectHook
 var dstMadviseHookFn dstMadviseHook
 var dstKillHookFn dstKillHook
+var dstRenameat2HookFn dstRenameat2Hook
 
 //go:linkname dstSetReadHook
 func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
@@ -124,6 +126,16 @@ func dstSetMadviseHook(fn dstMadviseHook) { dstMadviseHookFn = fn }
 
 //go:linkname dstSetKillHook
 func dstSetKillHook(fn dstKillHook) { dstKillHookFn = fn }
+
+//go:linkname dstSetRenameat2Hook
+func dstSetRenameat2Hook(fn dstRenameat2Hook) { dstRenameat2HookFn = fn }
+
+func dstTryRenameat2(oldpath, newpath string, flags int) (err Errno, handled bool) {
+	if !dstHookActive() || dstRenameat2HookFn == nil {
+		return 0, false
+	}
+	return dstRenameat2HookFn(oldpath, newpath, flags)
+}
 
 func dstHookActive() bool {
 	if !dstFenceActive() {

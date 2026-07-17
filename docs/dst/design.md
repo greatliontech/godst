@@ -785,8 +785,16 @@ host descriptor, and the raw-syscall fence still catches host-resource minting a
 syscalls before they can reach the host. The **raw boundary dispatches a settled subset**: a SUT that
 reaches the kernel through `golang.org/x/sys/unix` (whose asm enters `syscall.Syscall`/`Syscall6`
 directly, never the named wrappers) gets the same modeled behavior for the file barriers (`fsync`,
-`fdatasync`), advisory locking (`flock`), descriptor `close`, and the mapping operations (`madvise`,
-`mprotect`, `munmap`) — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one operation, not two.
+`fdatasync`), advisory locking (`flock`), descriptor `close`, the mapping operations (`madvise`,
+`mprotect`, `munmap`), and `renameat2` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one
+operation, not two. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
+fd exists — `os.Open(dir).Fd()` — but the model does not resolve renames relative to it, so a
+dirfd-relative form meets the fence) and routes to the modeled
+rename: flags `0` and `RENAME_NOREPLACE` are modeled — `RENAME_NOREPLACE` refuses ANY positive
+target with `EEXIST`, including the same-node case, ahead of the same-file no-op (the kernel's
+lookup order) — while `RENAME_EXCHANGE`/`RENAME_WHITEOUT` (and unknown bits) answer `EINVAL`, the
+kernel's own shape for a filesystem without the capability, so a caller's degradation ladder sees
+the errno it was written against.
 "Split-safe" is the constraint that fixes the set: the dispatch allocates and takes locks, so it can grow
 the stack, which is fatal once a trampoline has called `entersyscall` (no P) — `Syscall`/`Syscall6` fence
 BEFORE that and therefore dispatch, while `RawSyscall`/`RawSyscall6` (reached post-`entersyscall`, and

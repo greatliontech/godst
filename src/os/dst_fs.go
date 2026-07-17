@@ -749,6 +749,14 @@ func dstRemoveAll(name string) (handled bool, err error) {
 // neither), replacing a file target, requiring an empty directory target for
 // a directory source, and refusing ancestor moves.
 func dstRename(oldname, newname string) (handled bool, err error) {
+	return dstRenameFlags(oldname, newname, false)
+}
+
+// dstRenameFlags is dstRename with renameat2's RENAME_NOREPLACE arm: when
+// noreplace is set, an existing newname answers EEXIST — including the
+// same-node case, which the kernel refuses before its same-file no-op check
+// (the NOREPLACE lookup fails on any positive target dentry).
+func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
@@ -804,6 +812,15 @@ func dstRename(oldname, newname string) (handled bool, err error) {
 		// missing "/" oldname in the preamble stat — so this arm pins
 		// the internal ladder's order, not a surface behavior.
 		return wrap(syscall.EBUSY)
+	}
+	if noreplace && newNode != nil {
+		// RENAME_NOREPLACE: any positive target refuses EEXIST — ahead of
+		// the trailing-slash source-type ENOTDIR AND the same-node no-op
+		// (host-probed: rename("f/", "g", NOREPLACE) and
+		// rename("f", "g/", NOREPLACE) with both files present answer
+		// EEXIST on tmpfs; do_renameat2's positive-target check precedes
+		// the slash rule).
+		return wrap(syscall.EEXIST)
 	}
 	if !oldNode.isDir && (oldTrailingSlash || newTrailingSlash) {
 		return wrap(syscall.ENOTDIR)

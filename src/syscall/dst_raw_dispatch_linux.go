@@ -6,7 +6,10 @@
 
 package syscall
 
-import "unsafe"
+import (
+	"internal/goarch"
+	"unsafe"
+)
 
 // Split-safe raw-boundary dispatch.
 //
@@ -58,7 +61,19 @@ import "unsafe"
 //
 //go:nosplit
 //go:nocheckptr
-func dstRawDispatch(trap, a1, a2, a3 uintptr) (r1 uintptr, err Errno, handled bool) {
+func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno, handled bool) {
+	if trap == dstSysRenameat2 {
+		// renameat2(olddirfd, oldpath, newdirfd, newpath, flags): only the
+		// AT_FDCWD-relative form is the simulation's — a dirfd-relative form
+		// names a virtual directory fd the model does not resolve renames
+		// relative to; the fence decides those. The path
+		// pointers convert here, in nosplit code, so the splittable helper
+		// receives real pointers a stack copy adjusts.
+		if int(a1) != _AT_FDCWD || int(a3) != _AT_FDCWD || a2 == 0 || a4 == 0 {
+			return 0, 0, false
+		}
+		return dstRawRenameat2((*byte)(unsafe.Pointer(a2)), (*byte)(unsafe.Pointer(a4)), a5)
+	}
 	switch trap {
 	case SYS_MADVISE, SYS_MPROTECT, SYS_MUNMAP:
 		// A zero-length range names no mapping, so neither its address nor the
@@ -144,3 +159,66 @@ func dstRawFD(trap uintptr, fd int, a2 uintptr) (r1 uintptr, err Errno, handled 
 	dstSyscallRefuse(trap)
 	return 0, 0, true
 }
+
+// dstRawRenameat2 performs an AT_FDCWD renameat2 the simulation owns. Like
+// dstRawMapping it never falls through: the fence would refuse the operation
+// anyway, and refusing here preserves the no-splittable-call-before-fall-
+// through rule. The flags allowlist lives in the os backend (0 and
+// RENAME_NOREPLACE modeled; RENAME_EXCHANGE / RENAME_WHITEOUT answer EINVAL,
+// the kernel's own shape for a filesystem without the capability).
+//
+//go:noinline
+func dstRawRenameat2(old, new *byte, flags uintptr) (r1 uintptr, err Errno, handled bool) {
+	oldpath, ok := dstCString(old)
+	if !ok {
+		return 0, ENAMETOOLONG, true
+	}
+	newpath, ok := dstCString(new)
+	if !ok {
+		return 0, ENAMETOOLONG, true
+	}
+	if e, ok := dstTryRenameat2(oldpath, newpath, int(flags)); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(dstSysRenameat2)
+	return 0, 0, true
+}
+
+// dstCString reads a NUL-terminated C string into a Go string, bounded the
+// way the kernel's getname bounds a path copy: no NUL within PATH_MAX (4096)
+// answers ok=false (the caller's ENAMETOOLONG), never an unbounded walk into
+// unmapped memory a real kernel would refuse with a recoverable errno.
+// Splittable — callers hold real pointers, adjusted on stack growth.
+func dstCString(p *byte) (string, bool) {
+	const pathMax = 4096
+	n := 0
+	for ; n < pathMax; n++ {
+		if *(*byte)(unsafe.Add(unsafe.Pointer(p), n)) == 0 {
+			return string(unsafe.Slice(p, n)), true
+		}
+	}
+	return "", false
+}
+
+// dstSysRenameat2 is renameat2(2)'s number for the running architecture. The
+// frozen zsysnum tables predate the syscall (Linux 3.15) on several arches,
+// so the dst dispatch carries it for the dst-supported set. Arches outside
+// the set cannot build -tags dst at all (compile-time refusal), so the
+// switch is total.
+var dstSysRenameat2 = func() uintptr {
+	switch goarch.GOARCH {
+	case "amd64":
+		return 316
+	case "386":
+		return 353
+	case "arm":
+		return 382
+	case "arm64", "riscv64":
+		return 276
+	case "ppc64", "ppc64le":
+		return 357
+	case "s390x":
+		return 347
+	}
+	panic("dst: renameat2 number unknown for " + goarch.GOARCH)
+}()
