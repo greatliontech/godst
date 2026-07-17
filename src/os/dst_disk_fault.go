@@ -27,6 +27,8 @@ const (
 	diskOpUnlimit                       // remove the capacity
 	diskOpSlow                          // latency: arg nanoseconds per disk-touching op (0 = none)
 	diskOpCorruptFile                   // bit rot: flip one seeded bit of the file's durable image
+	diskOpFailWriteback                 // writeback EIO on: syncs fail and drop dirty pages; cache-served reads/writes succeed
+	diskOpHealWriteback                 // writeback EIO off
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook
@@ -53,6 +55,10 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		d.eio = true
 	case diskOpHealDisk:
 		d.eio = false
+	case diskOpFailWriteback:
+		d.wbFail = true
+	case diskOpHealWriteback:
+		d.wbFail = false
 	case diskOpFailFile:
 		node := dstFSNodeAt(d.root, name)
 		if node == nil || node.isDir {

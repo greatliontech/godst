@@ -21,7 +21,7 @@ import (
 // advance it; ENOSPC is a full disk, so it is injected only where writing more, or
 // creating a file, needs space the cap does not allow — a real disk fills what it can
 // first, and frees count, so deleting makes room (DST-FAULT-SOUND). The EIO,
-// ENOSPC, and latency faults are explicit toggles (no fault-RNG draw), and the
+// writeback, ENOSPC, and latency faults are explicit toggles (no fault-RNG draw), and the
 // corruption fault draws only at injection from the stream-isolated fault RNG, so
 // the same seed + same fault schedule replays identically (DST-FAULT-REPLAY), and
 // each affects exactly the named host's disk — or, for FailFile, exactly the named
@@ -42,6 +42,8 @@ const (
 	diskOpUnlimit
 	diskOpSlow
 	diskOpCorruptFile
+	diskOpFailWriteback
+	diskOpHealWriteback
 )
 
 // The victim-naming rule for every fault below: an undeclared host name panics
@@ -49,7 +51,12 @@ const (
 // calls outside a run are no-ops.
 //
 // FailDisk makes every read, write, and fsync on the named host's disk fail with
-// EIO, modeling a failing disk or controller, until HealDisk(host) restores it. It
+// EIO until HealDisk(host) restores it. All-syscall EIO is the filesystem-shutdown
+// shape — a filesystem that aborted after a fatal error (XFS forced shutdown) or a
+// device gone from the bus — where the kernel fails every call, INCLUDING reads the
+// page cache could serve. For a failing medium under a live page cache — buffered
+// reads and writes keep succeeding and only writeback fails, the fsyncgate shape a
+// commit-verification protocol must survive — use FailWriteback instead. FailDisk
 // targets exactly the host's disk: another host's I/O, and metadata-only operations
 // that do not touch the media, are unaffected. In-memory file content is not lost
 // and a heal resumes normal I/O — but a data sync that failed under the fault has
@@ -60,6 +67,32 @@ const (
 // the data on power loss; rewriting the data first is the recovery that works.
 func FailDisk(host string) {
 	withBubbleFaultCaller("FailDisk", func() { dstDiskFaultOp(diskOpFailDisk, lookupHost(host), 0, "") })
+}
+
+// FailWriteback makes writeback on the named host's disk fail: every fsync and
+// fdatasync fails with EIO — a failed data sync DROPPING the file's dirty pages
+// from the writeback set exactly as under FailDisk (the fsyncgate model) — and an
+// O_SYNC/O_DSYNC write applies its bytes to the page cache, then fails its
+// synchronous writeback and returns EIO with the count destroyed and the file
+// offset not advanced, as the kernel's generic_write_sync and ksys_write do.
+// Buffered reads and writes keep SUCCEEDING: the page
+// cache serves them without touching the failing medium (and this model never
+// evicts), which is what a real kernel does over a failing disk — this is the
+// medium-failure shape, where a program can still read back what it wrote and
+// only durability is gone, as distinct from FailDisk's all-syscall
+// filesystem-shutdown shape. HealWriteback(host) restores writeback; the
+// fsyncgate consequences of syncs that failed under the fault persist as under
+// FailDisk. The fault survives CrashHost — a failing medium is still failing
+// after a power cycle. It composes independently with FailDisk/FailFile:
+// healing one does not heal the other.
+func FailWriteback(host string) {
+	withBubbleFaultCaller("FailWriteback", func() { dstDiskFaultOp(diskOpFailWriteback, lookupHost(host), 0, "") })
+}
+
+// HealWriteback clears the writeback fault set by FailWriteback; the host's syncs
+// succeed again. Faults set by FailDisk or FailFile are unaffected.
+func HealWriteback(host string) {
+	withBubbleFaultCaller("HealWriteback", func() { dstDiskFaultOp(diskOpHealWriteback, lookupHost(host), 0, "") })
 }
 
 // HealDisk clears the host-wide EIO fault set by FailDisk; the host's reads, writes,

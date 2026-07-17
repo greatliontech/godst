@@ -1392,3 +1392,478 @@ func TestDSTDiskEIOFsyncgateShrinkRegrow(t *testing.T) {
 		})
 	})
 }
+
+// Writeback-fault tests (simulation.FailWriteback / HealWriteback) — the
+// medium-failure shape, as distinct from FailDisk's all-syscall
+// filesystem-shutdown shape: buffered reads and writes are served by the page
+// cache and keep succeeding, every sync fails EIO with the fsyncgate dirty-page
+// drop, and an O_SYNC/O_DSYNC write applies its bytes to the cache then fails
+// its synchronous writeback with the count destroyed (generic_write_sync).
+
+// TestDSTDiskWritebackCacheServedIO (DST-FAULT-SOUND): under FailWriteback the
+// cache serves buffered I/O — read/pread/write/pwrite succeed and read back the
+// written bytes — while fsync and fdatasync fail EIO; HealWriteback restores
+// them. An implementation that fails reads or writes here injects an error no
+// real kernel produces at a cache-served call.
+func TestDSTDiskWritebackCacheServedIO(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			_, err = f.WriteString("seed")
+			mustOK(t, "seed write", err)
+			mustOK(t, "seed sync", f.Sync())
+
+			simulation.FailWriteback("h")
+			if _, err := f.WriteString("more"); err != nil {
+				t.Fatalf("buffered write under FailWriteback: %v, want nil (cache-served)", err)
+			}
+			mustOK(t, "WriteAt", func() error { _, e := f.WriteAt([]byte("SEED"), 0); return e }())
+			buf := make([]byte, 8)
+			if n, err := f.ReadAt(buf, 0); err != nil || string(buf[:n]) != "SEEDmore" {
+				t.Fatalf("ReadAt under FailWriteback = %q, %v; want SEEDmore, nil (cache-served)", buf[:n], err)
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				t.Fatalf("Seek: %v", err)
+			}
+			if n, err := f.Read(buf); err != nil || string(buf[:n]) != "SEEDmore" {
+				t.Fatalf("Read under FailWriteback = %q, %v; want SEEDmore, nil (cache-served)", buf[:n], err)
+			}
+			eioErr(t, "Sync under FailWriteback", f.Sync())
+			if err := syscall.Fdatasync(int(f.Fd())); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("Fdatasync under FailWriteback: %v, want EIO", err)
+			}
+
+			simulation.HealWriteback("h")
+			// The failed syncs dropped the dirty pages; a rewrite redirties
+			// them, so this sync persists the content (the working recovery).
+			_, err = f.WriteAt([]byte("SEEDmore"), 0)
+			mustOK(t, "rewrite after heal", err)
+			mustOK(t, "Sync after heal", f.Sync())
+		})
+	})
+}
+
+// TestDSTDiskWritebackFsyncgate: the failed writeback drops the dirty pages
+// exactly as under FailDisk — the retried sync after HealWriteback succeeds
+// without the data reaching the durable image, and only a rewritten page is
+// written back. The trap FailWriteback exists to expose: the program could
+// READ BACK the data the whole time, yet it was never durable.
+func TestDSTDiskWritebackFsyncgate(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			const page = 4096
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			a := make([]byte, 2*page)
+			for i := range a {
+				a[i] = 'A'
+			}
+			_, err = f.Write(a)
+			mustOK(t, "write A", err)
+			mustOK(t, "sync A", f.Sync()) // durable: AA
+
+			b := make([]byte, 2*page)
+			for i := range b {
+				b[i] = 'B'
+			}
+			_, err = f.WriteAt(b, 0)
+			mustOK(t, "write B", err) // dirty: BB
+
+			simulation.FailWriteback("h")
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("faulted sync: %v, want EIO", err)
+			}
+			// The bytes are still readable — the cache serves them — which is
+			// exactly why a verification read must not be trusted as durability.
+			rb := make([]byte, 1)
+			if _, err := f.ReadAt(rb, 0); err != nil || rb[0] != 'B' {
+				t.Fatalf("ReadAt under fault = %c, %v; want B, nil", rb[0], err)
+			}
+			simulation.HealWriteback("h")
+
+			mustOK(t, "retried sync", f.Sync())
+			_, synced, _, _, _, _, ok := os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState not ok")
+			}
+			if synced[0] != 'A' || synced[page] != 'A' {
+				t.Fatalf("durable image after retried sync = %c%c, want AA (dropped pages must never reach the platter)", synced[0], synced[page])
+			}
+
+			c := make([]byte, page)
+			for i := range c {
+				c[i] = 'C'
+			}
+			_, err = f.WriteAt(c, 0) // redirty page 0 only
+			mustOK(t, "write C", err)
+			mustOK(t, "sync C", f.Sync())
+			_, synced, _, _, _, _, ok = os.DSTFSNodeState("/f")
+			if !ok {
+				t.Fatal("DSTFSNodeState not ok")
+			}
+			if synced[0] != 'C' {
+				t.Fatalf("redirtied page after sync = %c, want C", synced[0])
+			}
+			if synced[page] != 'A' {
+				t.Fatalf("unrewritten dropped page after sync = %c, want A (durably stale, never written back)", synced[page])
+			}
+		})
+	})
+}
+
+// TestDSTDiskWritebackOSyncWrite: an O_SYNC or O_DSYNC write under FailWriteback
+// applies its bytes to the page cache, then its synchronous writeback fails —
+// the call returns plain EIO with the count destroyed (generic_write_sync
+// replaces a positive count with the sync error), the cache holds the bytes,
+// the durable image does not, and the dirty pages are dropped (fsyncgate).
+func TestDSTDiskWritebackOSyncWrite(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		flag int
+	}{
+		{"O_SYNC", os.O_SYNC},
+		{"O_DSYNC", syscall.O_DSYNC},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			simulation.Run(1, func() {
+				onHost("h", func() {
+					// Two files, one per generic_write_sync arm (write(2) vs
+					// pwrite(2)): the drop is file-wide, so sharing a file
+					// would let one arm's drop mask the other's.
+					open := func(path string, extra int) *os.File {
+						f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|extra|mode.flag, 0o644)
+						mustOK(t, "OpenFile "+path, err)
+						_, err = f.Write([]byte("old!"))
+						mustOK(t, "seed write "+path, err)
+						return f
+					}
+					fp, fw, fa := open("/fp", 0), open("/fw", 0), open("/fa", os.O_APPEND)
+					defer fp.Close()
+					defer fw.Close()
+					defer fa.Close()
+					// Reposition the append handle away from EOF: a failed
+					// append must restore THIS position, not EOF.
+					if _, err := fa.Seek(0, io.SeekStart); err != nil {
+						t.Fatalf("seek /fa: %v", err)
+					}
+
+					simulation.FailWriteback("h")
+					n, err := fp.WriteAt([]byte("new!"), 0)
+					if n != 0 || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("O_SYNC WriteAt under FailWriteback = %d, %v; want 0, EIO (count destroyed by the failed sync)", n, err)
+					}
+					// The raw syscall surface: pwrite(2) returns -EIO in one
+					// register, which Go's wrapper reports as (-1, EIO) — no
+					// count survives alongside the error, whatever the write
+					// dirtied in the cache.
+					if n, err := syscall.Pwrite(int(fp.Fd()), []byte("raw!"), 0); n != -1 || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("raw O_SYNC pwrite under FailWriteback = %d, %v; want -1, EIO", n, err)
+					}
+					// The write(2) path's arm, on its own file.
+					n, err = fw.Write([]byte("new!"))
+					if n != 0 || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("O_SYNC Write under FailWriteback = %d, %v; want 0, EIO", n, err)
+					}
+					// The failed write must not advance the fd offset:
+					// ksys_write stores f_pos only for a non-negative return
+					// (the seed write left it at 4).
+					if off, err := fw.Seek(0, io.SeekCurrent); err != nil || off != 4 {
+						t.Fatalf("offset after failed O_SYNC Write = %d, %v; want 4 (a negative return discards the position update)", off, err)
+					}
+					// O_APPEND: the kernel repositions a COPY of f_pos to
+					// EOF; a failed synchronous append leaves the handle at
+					// its PRE-CALL position (0 after the seek above), never
+					// at EOF.
+					n, err = fa.Write([]byte("app!"))
+					if n != 0 || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("O_SYNC append under FailWriteback = %d, %v; want 0, EIO", n, err)
+					}
+					if off, err := fa.Seek(0, io.SeekCurrent); err != nil || off != 0 {
+						t.Fatalf("offset after failed O_SYNC append = %d, %v; want 0 (pre-call f_pos, not the EOF the append repositioned to)", off, err)
+					}
+					// The bytes reached the cache regardless.
+					buf := make([]byte, 4)
+					if _, err := fp.ReadAt(buf, 0); err != nil || string(buf) != "raw!" {
+						t.Fatalf("ReadAt /fp = %q, %v; want raw! (the buffered writes preceded the failed syncs)", buf, err)
+					}
+					if _, err := fw.ReadAt(buf, 0); err != nil || string(buf) != "old!" {
+						t.Fatalf("ReadAt /fw = %q, %v; want old! (Write appended at the seeded offset)", buf, err)
+					}
+					simulation.HealWriteback("h")
+					// Dropped pages: a plain sync after the heal must not
+					// resurrect them into any durable image.
+					mustOK(t, "retried sync /fp", fp.Sync())
+					mustOK(t, "retried sync /fw", fw.Sync())
+					mustOK(t, "retried sync /fa", fa.Sync())
+					// The pre-fault O_SYNC seeds committed "old!"; the faulted
+					// writes' pages were dropped and their BYTES must never
+					// reach the platter through the retried sync. /fp's
+					// overwrite left the size at 4, so its durable image is
+					// exactly the seed; /fw's append grew the file, and the
+					// retried sync commits the SIZE while the dropped page's
+					// data is absent — the durable tail reads as zeros, ext4's
+					// post-fsyncgate shape (size updated, data missing).
+					_, synced, _, _, _, _, ok := os.DSTFSNodeState("/fp")
+					if !ok {
+						t.Fatal("DSTFSNodeState /fp not ok")
+					}
+					if string(synced) != "old!" {
+						t.Fatalf("durable image /fp = %q, want old! (dropped O_SYNC pages reached the platter)", synced)
+					}
+					for _, path := range []string{"/fw", "/fa"} {
+						_, synced, _, _, _, _, ok = os.DSTFSNodeState(path)
+						if !ok {
+							t.Fatalf("DSTFSNodeState %s not ok", path)
+						}
+						if string(synced) != "old!\x00\x00\x00\x00" {
+							t.Fatalf("durable image %s = %q, want old! + a zero tail (dropped O_SYNC pages must read as absent, never as their bytes)", path, synced)
+						}
+					}
+				})
+			})
+		})
+	}
+}
+
+// TestDSTDiskWritebackOSyncPartialFill: an O_SYNC write that a capacity clips
+// to a partial fill, under FailWriteback, returns (0, EIO) — the failed
+// synchronous writeback replaces the partial count, so ENOSPC never surfaces
+// in that call — with the clipped bytes in the cache and the offset at its
+// pre-call value.
+func TestDSTDiskWritebackOSyncPartialFill(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.OpenFile("/f", os.O_RDWR|os.O_CREATE|os.O_SYNC, 0o644)
+			mustOK(t, "OpenFile", err)
+			defer f.Close()
+			_, err = f.Write([]byte("ab"))
+			mustOK(t, "seed write", err) // committed (O_SYNC), offset 2
+
+			simulation.LimitDisk("h", 4) // room for 2 more bytes
+			simulation.FailWriteback("h")
+			n, err := f.Write([]byte("cdef")) // clips to 2, then the sync fails
+			if n != 0 || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("clipped O_SYNC write under FailWriteback = %d, %v; want 0, EIO (the sync error replaces the partial count)", n, err)
+			}
+			if off, err := f.Seek(0, io.SeekCurrent); err != nil || off != 2 {
+				t.Fatalf("offset after failed clipped O_SYNC write = %d, %v; want 2 (pre-call)", off, err)
+			}
+			buf := make([]byte, 4)
+			if _, err := f.ReadAt(buf, 0); err != nil || string(buf) != "abcd" {
+				t.Fatalf("cache = %q, %v; want abcd (the clipped bytes reached the cache before the failed sync)", buf, err)
+			}
+			// The pwrite arm composes with the clip identically: a WriteAt
+			// past the cap clips, then the failed sync replaces the count.
+			simulation.LimitDisk("h", 6) // resident 4 → room for 2 more
+			n, err = f.WriteAt([]byte("ghij"), 4)
+			if n != 0 || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("clipped O_SYNC WriteAt under FailWriteback = %d, %v; want 0, EIO", n, err)
+			}
+			buf = make([]byte, 6)
+			if _, err := f.ReadAt(buf, 0); err != nil || string(buf) != "abcdgh" {
+				t.Fatalf("cache = %q, %v; want abcdgh", buf, err)
+			}
+			simulation.UnlimitDisk("h")
+			simulation.HealWriteback("h")
+		})
+	})
+}
+
+// TestDSTDiskWritebackVictimHost (DST-FAULT-VICTIM): FailWriteback on one host
+// fails exactly that host's syncs; a co-running host is untouched.
+func TestDSTDiskWritebackVictimHost(t *testing.T) {
+	simulation.Run(1, func() {
+		seed := func() {
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			_, err = f.WriteString("data")
+			mustOK(t, "write", err)
+			f.Close()
+		}
+		onHost("hA", seed)
+		onHost("hB", seed)
+
+		simulation.FailWriteback("hA")
+
+		onHost("hA", func() {
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "hA open", err)
+			defer f.Close()
+			_, err = f.WriteString("!")
+			mustOK(t, "hA write", err)
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("hA sync: %v, want EIO", err)
+			}
+		})
+		onHost("hB", func() {
+			f, err := os.OpenFile("/f", os.O_RDWR, 0)
+			mustOK(t, "hB open", err)
+			defer f.Close()
+			_, err = f.WriteString("!")
+			mustOK(t, "hB write", err)
+			mustOK(t, "hB sync (victim leaked onto hB)", f.Sync())
+		})
+	})
+}
+
+// TestDSTDiskWritebackDirSync: a directory fsync/fdatasync under FailWriteback
+// fails EIO — entry writeback goes through the same failing medium (the journal
+// commit fails) — while metadata-only mutations (create, rename) keep
+// succeeding, so the create-then-fsync-the-directory durability idiom observes
+// the failure at exactly the call that reports it on a real kernel.
+func TestDSTDiskWritebackDirSync(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			mustOK(t, "Mkdir", os.Mkdir("/d", 0o755))
+			dh, err := os.Open("/d")
+			mustOK(t, "Open dir", err)
+			defer dh.Close()
+
+			simulation.FailWriteback("h")
+			mustOK(t, "create under fault", os.WriteFile("/d/f", []byte("x"), 0o644))
+			mustOK(t, "rename under fault", os.Rename("/d/f", "/d/g"))
+			if err := dh.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("dir Sync under FailWriteback: %v, want EIO", err)
+			}
+			if err := syscall.Fdatasync(int(dh.Fd())); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("dir Fdatasync under FailWriteback: %v, want EIO (entry durability rides the same medium)", err)
+			}
+			simulation.HealWriteback("h")
+			mustOK(t, "dir Sync after heal", dh.Sync())
+		})
+	})
+}
+
+// TestDSTDiskWritebackIndependentOfFailDisk: the writeback fault and the
+// all-syscall EIO fault are independent policies — healing one never heals the
+// other (a compose-and-heal sequence that shares a flag fails here).
+func TestDSTDiskWritebackIndependentOfFailDisk(t *testing.T) {
+	simulation.Run(1, func() {
+		onHost("h", func() {
+			f, err := os.Create("/f")
+			mustOK(t, "Create", err)
+			defer f.Close()
+			_, err = f.WriteString("data")
+			mustOK(t, "write", err)
+
+			simulation.FailWriteback("h")
+			simulation.FailDisk("h")
+			eioErr(t, "read under both", func() error { _, e := f.ReadAt(make([]byte, 1), 0); return e }())
+
+			simulation.HealDisk("h")
+			if _, err := f.ReadAt(make([]byte, 1), 0); err != nil {
+				t.Fatalf("read after HealDisk: %v, want nil (only the all-syscall fault heals)", err)
+			}
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("sync after HealDisk: %v, want EIO (writeback fault must survive HealDisk)", err)
+			}
+			simulation.HealWriteback("h")
+			mustOK(t, "sync after HealWriteback", f.Sync())
+
+			// The FailFile half of the independence claim: HealWriteback
+			// must not heal a per-file fault either.
+			simulation.FailFile("h", "/f")
+			simulation.FailWriteback("h")
+			simulation.HealWriteback("h")
+			if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("sync after HealWriteback with FailFile active: %v, want EIO (per-file fault must survive HealWriteback)", err)
+			}
+			simulation.HealFile("h", "/f")
+			mustOK(t, "sync after HealFile", f.Sync())
+		})
+	})
+}
+
+// TestDSTDiskWritebackDeterminism (DST-FAULT-REPLAY): the writeback fault is an
+// explicit toggle, so the same seed + same fault schedule produces an identical
+// sequence of sync outcomes.
+func TestDSTDiskWritebackDeterminism(t *testing.T) {
+	run := func() string {
+		var trace string
+		simulation.Run(7, func() {
+			onHost("h", func() {
+				f, err := os.Create("/f")
+				mustOK(t, "Create", err)
+				defer f.Close()
+				step := func() string {
+					if _, err := f.WriteString("x"); err != nil {
+						return "W"
+					}
+					if errors.Is(f.Sync(), syscall.EIO) {
+						return "E"
+					}
+					return "."
+				}
+				trace += step() // ok
+				simulation.FailWriteback("h")
+				trace += step() // sync EIO, write fine
+				simulation.HealWriteback("h")
+				trace += step() // ok
+			})
+		})
+		return trace
+	}
+	a, b := run(), run()
+	if a != b {
+		t.Fatalf("non-deterministic writeback-fault trace: %q vs %q", a, b)
+	}
+	if a != ".E." {
+		t.Fatalf("trace = %q, want .E.", a)
+	}
+}
+
+// TestDSTDiskWritebackPowerLoss: data written and "verified" by readback under
+// FailWriteback is gone after a host crash — the end-to-end statement of the
+// medium-failure shape: readable the whole time, never durable.
+func TestDSTDiskWritebackPowerLoss(t *testing.T) {
+	simulation.Run(1, func() {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("db", func() {
+				mustOK(t, "seed", os.WriteFile("/f", []byte("olddata!"), 0o644))
+				f, err := os.OpenFile("/f", os.O_RDWR, 0)
+				mustOK(t, "open", err)
+				defer f.Close()
+				mustOK(t, "seed sync", f.Sync())
+				dir, err := os.Open("/")
+				mustOK(t, "open /", err)
+				mustOK(t, "sync /", dir.Sync()) // the NAME must be durable too
+				dir.Close()
+
+				simulation.FailWriteback("h")
+				_, err = f.WriteAt([]byte("newdata!"), 0)
+				mustOK(t, "write under fault", err)
+				if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("sync under fault: %v, want EIO", err)
+				}
+				buf := make([]byte, 8)
+				if _, err := f.ReadAt(buf, 0); err != nil || string(buf) != "newdata!" {
+					t.Fatalf("readback = %q, %v; want newdata! (cache serves it)", buf, err)
+				}
+			})
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("db2", func() {
+				got, err := os.ReadFile("/f")
+				mustOK(t, "read after reboot", err)
+				if string(got) != "olddata!" {
+					t.Fatalf("after power loss = %q, want olddata! (the dropped pages were never durable)", got)
+				}
+				// The fault SURVIVES the power cycle — a failing medium is
+				// still failing after a reboot — so recovery's first sync
+				// sees the same EIO until the harness heals it.
+				f, err := os.OpenFile("/f", os.O_RDWR, 0)
+				mustOK(t, "reopen", err)
+				defer f.Close()
+				if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("sync after reboot: %v, want EIO (the writeback fault survives a host crash)", err)
+				}
+				simulation.HealWriteback("h")
+				mustOK(t, "sync after heal", f.Sync())
+			})
+		})
+	})
+}

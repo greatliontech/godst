@@ -171,7 +171,10 @@ func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {
 // Disk faults are policy on the disk itself (one source of truth, reset with the
 // disk when the run epoch rolls — no separate teardown): eio fails the whole disk's
 // I/O with EIO, and eioFiles fails just the listed nodes (a bad sector on one
-// file). A node, not a path, is the per-file key, so a faulted file stays faulted
+// file); wbFail fails only writeback — every sync EIOs (data syncs dropping their
+// dirty pages, the fsyncgate model) while reads and writes keep succeeding, since
+// the page cache serves them without touching the failing medium (and this model
+// never evicts). A node, not a path, is the per-file key, so a faulted file stays faulted
 // across a rename and a removed-but-open handle keeps failing — the physical
 // bad-block semantics. capped/capacity model a full disk: writes that would grow the
 // disk past capacity, and creates on an already-full disk, fail with ENOSPC. The
@@ -189,6 +192,7 @@ type dstFSDisk struct {
 	root     *dstFSNode
 	eio      bool                // host-disk EIO: every read/write/sync on this disk fails EIO
 	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
+	wbFail   bool                // writeback EIO: syncs fail (data syncs drop dirty pages); cache-served reads/writes succeed
 	capped   bool                // whether a capacity (full-disk / ENOSPC) limit is set
 	capacity int64               // max total regular-file bytes when capped
 	latency  atomic.Int64        // slow-disk: per-op delay in nanoseconds (0 = none)
@@ -1432,6 +1436,20 @@ func (d *dstFile) diskEIO() error {
 	return nil
 }
 
+// syncEIO returns syscall.EIO if a sync of this handle must fail: any fault
+// diskEIO reports, or the host's writeback fault (wbFail). Writeback failure
+// fails ONLY here — a failing medium under a live page cache still serves
+// buffered reads and writes (the cache needs no device op, and this model
+// never evicts), so the read/write chokes consult diskEIO alone; injecting
+// EIO there under wbFail would surface an error no real kernel produces at a
+// cache-served call (DST-FAULT-SOUND). Caller holds dstFS.mu.
+func (d *dstFile) syncEIO() error {
+	if d.disk.wbFail {
+		return syscall.EIO
+	}
+	return d.diskEIO()
+}
+
 // residentLocked sums the live byte size of every regular file on the disk — the
 // space a capacity is measured against. Summed on demand (not tracked incrementally)
 // so a delete or truncate-down frees space for the next write with no accounting in
@@ -1589,10 +1607,18 @@ func (d *dstFile) write(b []byte) (int, error) {
 		// disk (all host-verified, including the unchanged mtime).
 		return len(b), nil
 	}
+	// The write position is a COPY of the handle offset, mirroring the
+	// kernel: ksys_write hands vfs_write a copy of f_pos and stores it back
+	// only for a non-negative return, so every error exit — EFBIG, EIO, a
+	// fully-refused ENOSPC, a failed O_SYNC writeback — leaves d.off at its
+	// exact pre-call value. For an O_APPEND handle that is wherever a prior
+	// seek/read left it, NOT the end-of-file the append repositions the copy
+	// to internally.
+	pos := d.off
 	if d.app {
-		d.off = int64(len(d.node.data))
+		pos = int64(len(d.node.data))
 	}
-	if d.off >= dstSMaxBytes && len(b) > 0 {
+	if pos >= dstSMaxBytes && len(b) > 0 {
 		// generic_write_checks precedes any device submission: at or past
 		// the bound the answer is EFBIG even on a disk whose injected fault
 		// would EIO a write that never gets submitted. The clip-binding
@@ -1602,15 +1628,14 @@ func (d *dstFile) write(b []byte) (int, error) {
 	if err := d.diskEIO(); err != nil {
 		return 0, err
 	}
-	allowed, refuse := d.writeAllowed(d.off, int64(len(b)))
+	allowed, refuse := d.writeAllowed(pos, int64(len(b)))
 	if allowed == 0 && len(b) > 0 {
 		return 0, refuse
 	}
-	n, werr := d.writeAtLocked(b[:allowed], d.off)
+	n, werr := d.writeAtLocked(b[:allowed], pos)
 	if werr != nil {
 		return n, werr
 	}
-	d.off += int64(n)
 	if (d.osync || d.odsync) && n > 0 {
 		// generic_write_sync fires only for ret > 0: a zero-length write, or
 		// one the ENOSPC cap fully refused, syncs nothing on real Linux. A
@@ -1618,12 +1643,33 @@ func (d *dstFile) write(b []byte) (int, error) {
 		// commits its n bytes, matching the kernel. Without the guard a crash
 		// after Write(nil) on an O_SYNC handle would durably preserve prior
 		// unsynced writes hardware could lose, narrowing the crash-tear surface.
+		if d.disk.wbFail {
+			// generic_write_sync fails under the writeback fault: the bytes
+			// reached the page cache (the buffered write above succeeded and
+			// its mutation stands) but the synchronous writeback got EIO,
+			// which REPLACES the count — write(2) returns plain EIO, so the
+			// caller's loop reports (0, EIO) with the data cached-but-not-
+			// durable, exactly the kernel's shape. The failed write does NOT
+			// advance the file offset either — d.off is stored only below,
+			// on the non-negative outcomes, exactly as ksys_write stores
+			// f_pos. The failed writeback drops the dirty pages (fsyncgate),
+			// as in sync — file-wide, which is pessimistic relative to the
+			// kernel's RANGED synchronous writeback but stays ⊆ real: the
+			// background flusher is free to have attempted (and dropped)
+			// every dirty page of the file during the fault window.
+			d.node.markWritebackDroppedLocked()
+			return 0, syscall.EIO
+		}
 		if d.osync {
 			d.node.commitLocked()
 		} else {
 			d.node.commitDataLocked()
 		}
 	}
+	// The non-negative outcomes — full success, and the partial fill whose
+	// short count a real write(2) returns before the retry's ENOSPC — store
+	// the advanced position back to the handle, as ksys_write does.
+	d.off = pos + int64(n)
 	if n < len(b) {
 		// The boundary bound mid-write: the remaining bytes fail with the
 		// binding boundary's errno (ENOSPC for a filled disk, EFBIG at
@@ -1687,6 +1733,14 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 		// before the backend (dstFDPwrite's len==0 short-circuit) and a
 		// fully-refused write already returned ENOSPC above — so the n > 0
 		// term is defensive parity with write, not a live branch.
+		if d.disk.wbFail {
+			// generic_write_sync fails under the writeback fault, replacing
+			// the count: pwrite(2) returns plain EIO with the bytes cached
+			// but not durable, and the failed writeback drops the dirty
+			// pages (fsyncgate) — as in write.
+			d.node.markWritebackDroppedLocked()
+			return 0, syscall.EIO
+		}
 		if d.osync {
 			d.node.commitLocked()
 		} else {
@@ -1980,7 +2034,7 @@ func (d *dstFile) sync() error {
 		// image.
 		return syscall.EINVAL
 	}
-	if err := d.diskEIO(); err != nil {
+	if err := d.syncEIO(); err != nil {
 		if !d.node.isDir {
 			// fsyncgate: the failed writeback marks the file's dirty pages
 			// clean without persisting them (see dstFSNode.wbDropped).
@@ -2006,7 +2060,7 @@ func (d *dstFile) datasync() error {
 		// directory fd — the create/rename-then-fdatasync-the-directory
 		// durability idiom is production-legal). Directory entry writeback
 		// keeps the full-commit model on EIO, as in sync.
-		if err := d.diskEIO(); err != nil {
+		if err := d.syncEIO(); err != nil {
 			return err
 		}
 		d.node.commitLocked()
@@ -2017,7 +2071,7 @@ func (d *dstFile) datasync() error {
 		// (host-verified).
 		return syscall.EINVAL
 	}
-	if err := d.diskEIO(); err != nil {
+	if err := d.syncEIO(); err != nil {
 		// fsyncgate, as in sync.
 		d.node.markWritebackDroppedLocked()
 		return err

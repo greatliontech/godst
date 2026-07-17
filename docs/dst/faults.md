@@ -635,7 +635,42 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   interleaving. Per-host / per-file victim isolation, durable-image preservation, infallible-call immunity,
   and replay are enforced by `TestDSTDiskEIO*` (`os/dst_disk_fault_test.go`), mutation-tested. Driven
   through the runtime relay `dstDiskFaultOp` (os registers the handler from init, mirroring the net
-  partition relay), so `testing/simulation` needs no `os` dependency.
+  partition relay), so `testing/simulation` needs no `os` dependency. *Anchor (soundness):* the
+  all-syscall shape — EIO at reads and writes the page cache could serve — is a FILESYSTEM SHUTDOWN
+  (XFS aborting after a fatal error fails every call, cached or not) or a device gone from the bus,
+  NOT a generic "failing disk": over a merely failing medium the kernel keeps serving buffered
+  reads/writes from the cache and only writeback fails. That medium-failure shape is the separate
+  writeback fault (next bullet); a suite reaching for "disk fault" chooses by which real failure it
+  models.
+- **Writeback EIO** — **landed**. The medium-failure counterpart of the all-syscall EIO fault:
+  `simulation.FailWriteback(host)` / `HealWriteback(host)`. Buffered reads and writes keep
+  SUCCEEDING — the page cache serves them without touching the failing medium, and the model never
+  evicts — while every `fsync`/`fdatasync` on the host fails EIO with the same fsyncgate dirty-page
+  drop as `FailDisk`'s sync arm (dropped pages never reach the platter; only rewritten pages are
+  written back after a heal; directory entry writeback keeps the full-commit model on EIO), and an
+  O_SYNC/O_DSYNC write applies its bytes to the page cache then fails its synchronous writeback,
+  returning plain EIO with the count destroyed and the file offset NOT advanced —
+  `generic_write_sync` replaces a positive count with the sync error and `ksys_write` stores the
+  position only for a non-negative return, so `os.File` callers see `(0, EIO)`, the raw syscall
+  surface sees `(-1, EIO)`, and the data is cached-but-not-durable: the kernel's exact shape. The
+  O_SYNC arms' drop is file-wide where the kernel's synchronous writeback is RANGED — pessimistic
+  (more loss), and still ⊆ real: the background flusher is free to have attempted, and dropped,
+  every dirty page of the file during the fault window. Directory `fsync`/`fdatasync` fail EIO too
+  (entry writeback rides the same medium — the journal commit fails). The fault SURVIVES
+  `CrashHost` — a failing medium is still failing after a power cycle — and is reset only by
+  `HealWriteback` or the run-epoch roll. This is the shape where a program can READ BACK everything it wrote
+  while none of it is durable — the surface a commit-outcome verification protocol (write, sync,
+  read back, classify) must be tested against, and which the all-syscall fault forecloses (its read
+  EIO kills the verification read a real kernel serves from cache). The two faults are independent
+  policies on the disk (`wbFail` beside `eio`): healing one never heals the other, and they compose.
+  DoF: a failing medium under a live page cache — ext4's default data handling, the fsyncgate
+  reality. Sound: no error is injected at a call the cache serves; a failed sync never advances the
+  durable image. Cache-served I/O, the fsyncgate drop, O_SYNC count destruction, per-host victim
+  isolation, directory-sync failure, heal independence, replay, and the power-loss end-to-end
+  (readable the whole time, gone after `CrashHost`) are enforced by `TestDSTDiskWriteback*`
+  (`os/dst_disk_fault_test.go`), mutation-tested. *Recorded bound:* host-level only — a per-file
+  writeback form (bad sectors under one file's blocks) extends along `eioFiles`' representation
+  unchanged if a consumer needs it, non-foreclosing.
 - **ENOSPC** — **landed**. Writes/creates on a host's disk fail `ENOSPC` past a budget, injected mid-run
   by `simulation.LimitDisk(host, bytes)` (and removed by `UnlimitDisk`). A capacity on the host's disk
   (`dstFSDisk.capped`/`capacity`) caps total regular-file content; a write that would grow the disk past

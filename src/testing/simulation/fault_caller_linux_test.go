@@ -54,6 +54,8 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		{"ResetProcess", func() { ResetProcess("p") }},
 		{"FailDisk", func() { FailDisk("h") }},
 		{"HealDisk", func() { HealDisk("h") }},
+		{"FailWriteback", func() { FailWriteback("h") }},
+		{"HealWriteback", func() { HealWriteback("h") }},
 		{"FailFile", func() { FailFile("h", "/f") }},
 		{"HealFile", func() { HealFile("h", "/f") }},
 		{"LimitDisk", func() { LimitDisk("h", 1<<20) }},
@@ -686,6 +688,8 @@ func TestDSTFaultOutsideRunIsNoop(t *testing.T) {
 	ResetProcess("p")
 	FailDisk("a")
 	HealDisk("a")
+	FailWriteback("a")
+	HealWriteback("a")
 	FailFile("a", "/f")
 	HealFile("a", "/f")
 	LimitDisk("a", 1)

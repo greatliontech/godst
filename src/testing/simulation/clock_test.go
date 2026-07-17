@@ -595,6 +595,8 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		{"ResetProcess", func() { ResetProcess("no-such-proc") }},
 		{"FailDisk", func() { FailDisk("no-such-host") }},
 		{"HealDisk", func() { HealDisk("no-such-host") }},
+		{"FailWriteback", func() { FailWriteback("no-such-host") }},
+		{"HealWriteback", func() { HealWriteback("no-such-host") }},
 		{"FailFile", func() { FailFile("no-such-host", "/f") }},
 		{"HealFile", func() { HealFile("no-such-host", "/f") }},
 		{"LimitDisk", func() { LimitDisk("no-such-host", 1) }},
