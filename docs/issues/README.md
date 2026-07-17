@@ -25,15 +25,21 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   quirk) exercised in-simulation. `os.Link` currently answers the
   unsupported-FS refusal; clients degrade to their rename fallback,
   which the modeled renameat2 serves.
-- **s_maxbytes model (huge-file refusal)** — Lands: when a SUT needs
-  max-file-size refusal semantics in-simulation. The FS models no
-  s_maxbytes: a huge size growth that reaches the page-cache mapping
-  reserve dies with a runtime fatal where a real kernel answers
-  EFBIG/ENOSPC. Reachable via `Truncate(1<<45)` on ANY disk (truncate
-  growth is not cap-checked — faults.md, ENOSPC item (c)) and via
-  `fallocate` on an uncapped disk (a capped disk's fallocate refuses
-  ENOSPC first). The honest fix is an s_maxbytes bound checked at every
-  size-growth site, answering EFBIG as vfs does.
+- **page-cache region reclamation (aggregate capacity)** — Lands: when a
+  SUT legitimately holds more near-limit files than the mapping region
+  carries (~8 at s_maxbytes; fewer under incremental doubling — the
+  region is carved, never reclaimed). Growth of an IN-BOUNDS sibling
+  then still dies with the mapping-reserve fatal s_maxbytes closed for
+  the single-file class. No sound errno exists (a real kernel evicts
+  page cache rather than failing), so the honest fix is reclamation or
+  an eviction model; until then the loud fatal is the recorded shape.
+- **densification-free durable images** — Lands: when a SUT syncs a
+  near-limit sparse file. commitDataLocked copies node.data into an
+  ordinary slice, so the sync densifies the sparse view and the harness
+  dies as an UNTYPED kernel OOM kill — the least loud failure shape,
+  same in-spec-input-kills-harness class s_maxbytes fixed for growth.
+  Needs a sparse (or COW page-referencing) durable-image
+  representation.
 - **per-boot host identity (`/proc/sys/kernel/random/boot_id` + boottime
   reset)** — Lands: when a client needs cross-reboot epoch invalidation
   testable in-sim. The procfs overlay models no `/proc/sys` surface; host

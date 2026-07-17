@@ -202,6 +202,23 @@ var dstDiskSlow atomic.Bool
 //go:linkname dstFSCurrentNode runtime.dstCurrentNode
 func dstFSCurrentNode() (host, proc uint32)
 
+//go:linkname dstSMaxBytesOS runtime.dstSMaxBytesOS
+func dstSMaxBytesOS() int64
+
+// dstSMaxBytes is the modeled s_maxbytes: no file's size may pass it, and
+// every size-growth site — truncate, fallocate, the write clip — answers
+// EFBIG at it, as the vfs does. Before it existed, huge growth ran into the
+// page-cache mapping reserve and died with a runtime fatal no real kernel
+// produces. On arches whose mapping region is off the runtime reports 0,
+// which means no modeled bound — 1<<62 keeps every check site unconditional
+// while refusing nothing a 32-bit address space could represent anyway.
+var dstSMaxBytes = func() int64 {
+	if v := dstSMaxBytesOS(); v > 0 {
+		return v
+	}
+	return 1 << 62
+}()
+
 // dstFSRoll resets the per-run filesystem state when the run epoch advances. Caller
 // holds dstFS.mu. Per-host trees are created lazily (dstFSDiskHere), so Roll only
 // clears the maps.
@@ -962,6 +979,11 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 // process dies, as under production SIGBUS) and the partial page's tail
 // zeroes — ftruncate semantics, which the page cache provides directly.
 func (node *dstFSNode) truncateLocked(size int64) error {
+	if size > dstSMaxBytes {
+		// inode_newsize_ok: growth past the filesystem's maximum file size
+		// is EFBIG, never a mapping-reserve fatal.
+		return syscall.EFBIG
+	}
 	if size < int64(len(node.data)) {
 		// A shrink zeroes the kept partial page's tail — a content change
 		// the kernel dirties, so it must leave the fsyncgate dropped set
@@ -1366,27 +1388,38 @@ func (disk *dstFSDisk) residentLocked() int64 {
 // the allowed prefix and returns ENOSPC only when nothing fit (DST-FAULT-SOUND: a
 // growth a real disk would partially satisfy is never failed outright). Caller holds
 // dstFS.mu.
-func (d *dstFile) enospcAllowed(off, n int64) int64 {
-	if !d.disk.capped {
-		return n
+func (d *dstFile) writeAllowed(off, n int64) (int64, syscall.Errno) {
+	// generic_write_checks first: a write starting at or past s_maxbytes is
+	// EFBIG outright; one crossing it is clipped, and the caller's retry at
+	// the boundary surfaces EFBIG — checked before the capacity clip, as
+	// the vfs does, so EFBIG wins when both boundaries bind at one offset.
+	if off >= dstSMaxBytes {
+		return 0, syscall.EFBIG
 	}
-	L := int64(len(d.node.data))
-	end := off + n
-	if end <= L {
-		return n // pure overwrite: no growth, no space consumed
+	refuse := syscall.EFBIG
+	if room := dstSMaxBytes - off; n > room {
+		n = room
 	}
-	room := d.disk.capacity - d.disk.residentLocked()
-	if room < 0 {
-		room = 0
+	if d.disk.capped {
+		L := int64(len(d.node.data))
+		end := off + n
+		if end > L {
+			room := d.disk.capacity - d.disk.residentLocked()
+			if room < 0 {
+				room = 0
+			}
+			writableEnd := L + room
+			switch {
+			case end <= writableEnd:
+				// the growth fits
+			case writableEnd <= off:
+				return 0, syscall.ENOSPC // not even the start offset is reachable
+			default:
+				n, refuse = writableEnd-off, syscall.ENOSPC
+			}
+		}
 	}
-	writableEnd := L + room
-	if end <= writableEnd {
-		return n // the growth fits
-	}
-	if writableEnd <= off {
-		return 0 // not even the write's start offset is reachable
-	}
-	return writableEnd - off
+	return n, refuse
 }
 
 // diskFullForCreate reports whether the disk has no room to allocate a new file or
@@ -1474,13 +1507,23 @@ func (d *dstFile) write(b []byte) (int, error) {
 		// disk (all host-verified, including the unchanged mtime).
 		return len(b), nil
 	}
-	if err := d.diskEIO(); err != nil {
-		return 0, err
-	}
 	if d.app {
 		d.off = int64(len(d.node.data))
 	}
-	allowed := d.enospcAllowed(d.off, int64(len(b)))
+	if d.off >= dstSMaxBytes && len(b) > 0 {
+		// generic_write_checks precedes any device submission: at or past
+		// the bound the answer is EFBIG even on a disk whose injected fault
+		// would EIO a write that never gets submitted. The clip-binding
+		// PARTIAL keeps EIO precedence — its bytes do submit.
+		return 0, syscall.EFBIG
+	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
+	}
+	allowed, refuse := d.writeAllowed(d.off, int64(len(b)))
+	if allowed == 0 && len(b) > 0 {
+		return 0, refuse
+	}
 	n, werr := d.writeAtLocked(b[:allowed], d.off)
 	if werr != nil {
 		return n, werr
@@ -1500,13 +1543,15 @@ func (d *dstFile) write(b []byte) (int, error) {
 		}
 	}
 	if n < len(b) {
-		// The disk filled: the remaining bytes fail ENOSPC, reported together with
-		// the partial count in ONE call — mirroring internal/poll.FD.Write's loop,
-		// which retries a short kernel write and surfaces (n, ENOSPC). Returning a
-		// bare short count instead would let os.File.Write report io.ErrShortWrite,
-		// an error identity a real regular-file write cannot produce, so the SUT's
-		// errors.Is(err, ENOSPC) recovery would miss exactly the faulted write.
-		return n, syscall.ENOSPC
+		// The boundary bound mid-write: the remaining bytes fail with the
+		// binding boundary's errno (ENOSPC for a filled disk, EFBIG at
+		// s_maxbytes), reported together with the partial count in ONE call —
+		// mirroring internal/poll.FD.Write's loop, which retries a short
+		// kernel write and surfaces (n, err). Returning a bare short count
+		// instead would let os.File.Write report io.ErrShortWrite, an error
+		// identity a real regular-file write cannot produce, so the SUT's
+		// errors.Is recovery would miss exactly the faulted write.
+		return n, refuse
 	}
 	return n, nil
 }
@@ -1525,9 +1570,6 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 		// write (host-verified via WriteAt).
 		return len(b), nil
 	}
-	if err := d.diskEIO(); err != nil {
-		return 0, err
-	}
 	if d.app {
 		// Linux pwrite(2), BUGS section: on a file opened O_APPEND, pwrite
 		// APPENDS to the end of the file regardless of the offset.
@@ -1536,14 +1578,22 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 		// reaches here with one — and it must get the kernel's shape.
 		off = int64(len(d.node.data))
 	}
+	if off >= dstSMaxBytes && len(b) > 0 {
+		// As in write: generic_write_checks' EFBIG precedes any submission,
+		// so it beats an injected device EIO for the outright case.
+		return 0, syscall.EFBIG
+	}
+	if err := d.diskEIO(); err != nil {
+		return 0, err
+	}
 	// pwrite models a SINGLE pwrite(2): os.File.WriteAt loops over it and adds the
 	// count only after the error check, so a partial fill must return (n, nil) here
 	// and let the loop surface ENOSPC on the next zero-byte call — returning a
 	// combined (n, ENOSPC) would make WriteAt discard the n. (The single-call Write
 	// path, by contrast, needs the combined return — see write.)
-	allowed := d.enospcAllowed(off, int64(len(b)))
+	allowed, refuse := d.writeAllowed(off, int64(len(b)))
 	if allowed == 0 && len(b) > 0 {
-		return 0, syscall.ENOSPC
+		return 0, refuse
 	}
 	n, werr := d.writeAtLocked(b[:allowed], off)
 	if werr != nil {
@@ -1802,6 +1852,11 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 	if newSize < 0 {
 		// off and length are both non-negative here, so a negative sum is
 		// int64 overflow: the span passes the filesystem's maximum file size.
+		return syscall.EFBIG
+	}
+	if newSize > dstSMaxBytes {
+		// vfs_fallocate checks offset+len against s_maxbytes before the
+		// filesystem op — so EFBIG wins over ENOSPC when both bind.
 		return syscall.EFBIG
 	}
 	if err := d.diskEIO(); err != nil {

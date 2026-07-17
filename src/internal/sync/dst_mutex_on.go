@@ -16,13 +16,15 @@ package sync
 // a function of machine speed, host load, and GC pause wall time — a
 // demonstrated same-seed schedule escape
 // (TestMutexStarvationHandoffDeterministic). And the bubble's fake clock
-// cannot decide it either: mutex waits are not durably blocking, so virtual
-// time never passes while a waiter is pending, the flip never fires, and a
-// production-legal SUT whose progress depends on the starvation handoff (a
-// holder re-barging at every release while the parked waiter must acquire
-// for the program to advance) livelocks in-sim where production always
-// terminates — a false-positive hang class, and an undetectable one (the
-// non-durable wait keeps the bubble-deadlock panic from firing).
+// was rejected too: when this landed, mutex waits were not durably
+// blocking, so virtual time never passed while a waiter was pending — the
+// flip could never fire, and a production-legal SUT whose progress depends
+// on the starvation handoff (a holder re-barging at every release while
+// the parked waiter must acquire for the program to advance) livelocked
+// in-sim where production always terminates, undetectably. In-bubble mutex
+// waits have since become DURABLE (runtime.dstDurableMutexWait), which
+// removes that impossibility — but not the choice: the lost-wakeup count
+// below stays the seed-pure trigger, independent of any clock.
 //
 // The in-bubble measure is therefore the waiter's own LOST-WAKEUP count — a
 // pure function of the seeded schedule: the waiter counts its returns from

@@ -794,7 +794,24 @@ the call's reason to exist), durable only after a sync like any growth; a span i
 size is a no-op (the recorded logical-bytes/sparse boundary); every other mode — `KEEP_SIZE`,
 `PUNCH_HOLE`, `ZERO_RANGE` — answers `EOPNOTSUPP`, the kernel's shape for a filesystem without the
 capability, so degradation ladders see the errno they were written against. The 32-bit trampoline
-shape (off/len as lo/hi register pairs) is decoded per-arch at the dispatch. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
+shape (off/len as lo/hi register pairs) is decoded per-arch at the dispatch.
+
+**s_maxbytes.** The modeled filesystem carries a maximum file size (an eighth of the page-cache
+mapping region — 128 GiB on the wide arches), and every size-growth site answers `EFBIG` at it as
+the vfs does: truncate growth (`inode_newsize_ok`), a fallocate span (checked before the
+filesystem op, so `EFBIG` wins over the capacity's `ENOSPC` when both bind), and the write path
+(`generic_write_checks`: a write starting at or past the bound is `EFBIG` outright; one crossing
+it is clipped and the retry surfaces the partial count with `EFBIG` in one call — the `ENOSPC`
+partial-fill shape with the boundary's errno). Before the bound, a single file's huge growth ran
+into the mapping reserve and died with a runtime fatal no real kernel produces; the bound closes
+that SINGLE-FILE class. Two capacity limits remain, both recorded in the issue register: the
+mapping region is carved, never reclaimed, so an AGGREGATE of near-limit in-bounds files (about
+eight at the bound, fewer under incremental doubling) still reaches the same loud fatal — a
+harness capacity, with no sound errno to answer (a real kernel evicts page cache instead of
+failing; the model has no eviction) — and the durable image is an ordinary copied slice, so
+SYNCING a near-limit sparse file densifies it and dies as an untyped kernel OOM kill, the least
+loud failure shape there is. Near-limit files are otherwise cheap: the page cache is a sparse
+memfd — size is address space, physical pages only where touched. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
 fd exists — `os.Open(dir).Fd()` — but the model does not resolve renames relative to it, so a
 dirfd-relative form meets the fence) and routes to the modeled
 rename: flags `0` and `RENAME_NOREPLACE` are modeled — `RENAME_NOREPLACE` refuses ANY positive

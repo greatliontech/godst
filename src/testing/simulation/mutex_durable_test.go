@@ -262,3 +262,47 @@ func foreignBubbleMutexHelper() {
 		mu.Unlock()
 	})
 }
+
+// TestDSTCrashWithMutexParkedVictims: the crash-mark paths classify parked
+// victims with the same durable predicate as the accounting sites — a
+// process (and then a host) dying while one of its goroutines HOLDS a
+// contended mutex and another is PARKED on it must leave the bubble's
+// running count coherent: the run continues, timers still fire, and the
+// run completes. A misclassified victim would double-decrement (a fatal)
+// or leak a running count (a wedge).
+func TestDSTCrashWithMutexParkedVictims(t *testing.T) {
+	Run(1, func() {
+		Host("h", HostConfig{}, func() {
+			var mu sync.Mutex
+			go Process("victim", func() {
+				mu.Lock()
+				go func() {
+					mu.Lock() // parks; dies parked when the process crashes
+					mu.Unlock()
+				}()
+				select {}
+			})
+			for range 50 {
+				runtime.Gosched()
+			}
+			Crash("victim")
+			time.Sleep(time.Millisecond) // timers must still fire post-crash
+		})
+		Host("h2", HostConfig{}, func() {
+			var mu sync.Mutex
+			go Process("victim2", func() {
+				mu.Lock()
+				go func() {
+					mu.Lock()
+					mu.Unlock()
+				}()
+				select {}
+			})
+			for range 50 {
+				runtime.Gosched()
+			}
+		})
+		CrashHost("h2")
+		time.Sleep(time.Millisecond)
+	})
+}

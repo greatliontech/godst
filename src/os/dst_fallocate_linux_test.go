@@ -156,11 +156,13 @@ func TestDSTFallocateENOSPC(t *testing.T) {
 			simulation.LimitDisk("h", (8<<10)+1)
 			mustOK(t, "fallocate under cap", falloc(f, 0, 0, 4<<10))
 			wantErrno(t, "fallocate past cap", falloc(f, 0, 0, 16<<10), syscall.ENOSPC)
-			// The near-MaxInt64 span: the capacity refusal must be the answer,
-			// never an overflowed accounting sum reaching the grow path (a
-			// wrapped sum once turned this into a runtime fatal —
-			// review-caught, this arm is the reproducer).
-			wantErrno(t, "huge span on capped disk", falloc(f, 0, 0, math.MaxInt64), syscall.ENOSPC)
+			// The near-MaxInt64 span: refused up front, never an overflowed
+			// accounting sum reaching the grow path (a wrapped sum once
+			// turned this into a runtime fatal — review-caught, this arm is
+			// the reproducer). Since s_maxbytes landed the refusal is EFBIG:
+			// the vfs checks the span against it before the filesystem op,
+			// so EFBIG wins over the capacity's ENOSPC.
+			wantErrno(t, "huge span on capped disk", falloc(f, 0, 0, math.MaxInt64), syscall.EFBIG)
 			st, err := f.Stat()
 			mustOK(t, "stat", err)
 			if st.Size() != 4<<10 {

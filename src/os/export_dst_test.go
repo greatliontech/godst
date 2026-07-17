@@ -75,3 +75,6 @@ func DSTSetRootCloseObserver(fn func(name string)) {
 	}
 	dstRootCloseHook = func(r *root) { fn(r.name) }
 }
+
+// DSTSMaxBytes exposes the modeled s_maxbytes for the white-box tests.
+func DSTSMaxBytes() int64 { return dstSMaxBytes }

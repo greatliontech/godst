@@ -519,3 +519,16 @@ func dstMappingSigpanic(gp *g) {
 		throw("dst: mapping tombstone carries an unknown state")
 	}
 }
+
+// dstSMaxBytesOS is the modeled filesystem's maximum file size — the
+// s_maxbytes the os layer's size-growth sites refuse EFBIG past, as the
+// vfs does. Derived from the mapping region so an in-bounds file can always
+// be viewed: an eighth of the region leaves headroom for the power-of-two
+// reserve doubling and for sibling files. Lives in this dst && linux file
+// because dstMapRegionSize exists only in that tag universe (the untagged
+// dst.go broke every cross-compile that first hosted this). Reached from os
+// via linkname; 0 on arches whose region is off — the os side treats that
+// as unbounded.
+//
+//go:linkname dstSMaxBytesOS
+func dstSMaxBytesOS() int64 { return int64(dstMapRegionSize / 8) }
