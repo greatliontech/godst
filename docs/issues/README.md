@@ -7,6 +7,13 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **bubble-scoped timezone cache** — Lands: when a client needs
+  non-UTC zone data in-simulation, or the determinism sweep gains a
+  TZ-perturbation leg. time's zone cache is process-wide: a zone
+  loaded by HOST code before a run stays visible inside later bubbles
+  without a file read, bypassing the ENOENT-under-fence answer in
+  time.open (src/time/dst_tz.go) — a residual host-dependence the
+  current fix narrows but does not close.
 - **`link(2)` model** — Lands: when a client needs the hard-link publish
   idiom (link-then-unlink atomic no-clobber, the NFS retransmission
   quirk) exercised in-simulation. `os.Link` currently answers the
