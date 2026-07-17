@@ -8,8 +8,8 @@ package syscall
 
 import _ "unsafe" // for go:linkname
 
-//go:linkname dstPidAlive runtime.dstPidAlive
-func dstPidAlive(pid int32) bool
+//go:linkname dstPidKillAlive runtime.dstPidKillAlive
+func dstPidKillAlive(pid int32) bool
 
 func init() {
 	dstSetKillHook(dstKill)
@@ -31,7 +31,10 @@ func dstKill(pid int, sig Signal) (Errno, bool) {
 	if int(pid32) != pid {
 		return ESRCH, true
 	}
-	if dstPidAlive(pid32) {
+	// Namespace-scoped liveness: a live pid in another pid namespace answers
+	// ESRCH too — the sibling-container visibility of design.md's namespace
+	// model.
+	if dstPidKillAlive(pid32) {
 		return 0, true
 	}
 	return ESRCH, true

@@ -183,7 +183,7 @@ func dstExplorePanicStepFP() int32
 func dstSyncEventOverflowFP() bool
 
 //go:linkname dstSetSimEnv runtime.dstSetSimEnv
-func dstSetSimEnv(hostname string, pid, numcpu int)
+func dstSetSimEnv(hostname string, pid, numcpu, pidmax int)
 
 //go:linkname dstClearSimEnv runtime.dstClearSimEnv
 func dstClearSimEnv()
@@ -284,8 +284,9 @@ type Options struct {
 	// Process gets a fresh, deterministic pid (a restart gets a new one), so distinct
 	// processes have distinct pids. A custom PID must fit in the OS pid_t-sized
 	// runtime identity field; values <= 0 select the default, and oversized values
-	// panic instead of wrapping. A run that exhausts that finite pid field while
-	// allocating Process pids also panics instead of reusing or wrapping pids.
+	// panic instead of wrapping. With PidMax unset, a run that exhausts that
+	// finite pid field while allocating Process pids also panics instead of
+	// reusing or wrapping pids.
 	//
 	// The rest of the process-identity surface is fixed to deterministic
 	// constants during a simulation (not configurable): os.Getppid is 1;
@@ -302,6 +303,19 @@ type Options struct {
 	// configuration.)
 	Hostname string
 	PID      int
+
+	// PidMax models the kernel's pid_max for Process pid allocation (default 0 =
+	// unbounded monotonic allocation). A positive PidMax makes allocation scan
+	// forward from the last allocated pid, WRAP into [2, PidMax] (pid 1 is the
+	// simulated init/ppid), and skip live pids — alloc_pid's behavior — so pid
+	// REUSE becomes constructible: a small PidMax plus process churn
+	// deterministically hands a dead process's pid to a new one, the
+	// same-pid-new-start-time hazard /proc start-time discrimination exists for.
+	// PidMax must exceed the root pid (a machine's own pid is inside its pid
+	// space); negative or pid_t-overflowing values panic. A run in which every
+	// pid in [2, PidMax] is simultaneously live panics loud — the kernel answers
+	// fork with EAGAIN there, and Process has no error return to carry it.
+	PidMax int
 
 	// NumCPU is the default simulated runtime.NumCPU() within a simulation (default
 	// 8; any value <= 0 selects the default), used by every host that does not set
@@ -637,9 +651,9 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //		})
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
-	kind, depth, steps, hostname, pid, numcpu := runOptions("RunWith", opts)
+	kind, depth, steps, hostname, pid, numcpu, pidmax := runOptions("RunWith", opts)
 	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("RunWith", opts.Network)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds(), nil, f)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds(), nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -647,7 +661,7 @@ func RunWith(seed uint64, opts Options, f func()) {
 // cleanup functions and t.Context run inside the bubble, and T.Run, T.Parallel,
 // and T.Deadline must not be called.
 func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
-	kind, depth, steps, hostname, pid, numcpu := runOptions("TestWith", opts)
+	kind, depth, steps, hostname, pid, numcpu, pidmax := runOptions("TestWith", opts)
 	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("TestWith", opts.Network)
 	if testingSimulationCleanupStarted(t) {
 		// Reject on the caller goroutine, before the bubble exists: the
@@ -660,7 +674,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
 	dstSetWedgeLimits(opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds())
 	var ok bool
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	if !ok {
@@ -675,7 +689,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 // crash-tear policy, runLocked for the runtime knobs); Explore and Replay
 // publish after their own guards the same way. Panics (invalid options) are
 // fine here — they mutate nothing.
-func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostname string, pid, numcpu int) {
+func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int) {
 	kind = kindRandom
 	switch opts.Strategy {
 	case Random:
@@ -717,7 +731,19 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 		// per-host value into the run. Both 0 and negative mean "use the default".
 		numcpu = defaultNumCPU
 	}
-	return kind, depth, steps, hostname, pid, numcpu
+	pidmax = opts.PidMax
+	switch {
+	case pidmax < 0:
+		// Unlike PID/NumCPU, a negative PidMax panics rather than selecting the
+		// default: 0 already means "unbounded", so a negative can only be a bug.
+		panic("testing/simulation: " + api + " Options.PidMax must be positive (0 = unbounded)")
+	case pidmax == 0:
+	case pidmax <= pid:
+		panic("testing/simulation: " + api + " Options.PidMax must exceed the root pid (a machine's own pid is inside its pid space)")
+	case pidmax > maxPID:
+		panic("testing/simulation: " + api + " Options.PidMax overflows OS pid field")
+	}
+	return kind, depth, steps, hostname, pid, numcpu, pidmax
 }
 
 // resolveNetConfig applies the SendBuffer/RetransmitTimeout defaults, returning the
@@ -754,7 +780,7 @@ func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwid
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, wedgeDecisions, wedgeWallNs int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, wedgeDecisions, wedgeWallNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	// Admitted: publish the run's crash-tear policy. Every admitted entry point
@@ -768,14 +794,14 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numc
 	// entry point publishes them explicitly (the option-less entries publish
 	// the defaults), so no run inherits a previous run's bounds.
 	dstSetWedgeLimits(wedgeDecisions, wedgeWallNs)
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
 }
 
 var dstEnvRunEdgeHook func(activating bool)
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
 	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
 	// keeps the sysmon container-aware auto-updater from resizing P count
 	// mid-run); remember whether the process was in auto mode so the restore
@@ -794,7 +820,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	func() {
 		dstEnvDispatchLock()
 		defer dstEnvDispatchUnlock()
-		dstSetSimEnv(hostname, pid, numcpu) // before dstActivate: published to the bubble by the activation store
+		dstSetSimEnv(hostname, pid, numcpu, pidmax) // before dstActivate: published to the bubble by the activation store
 		dstSetMemLimit(memLimit)
 		dstSetNetCrossHostLatency(netLatencyNs)
 		dstSetNetCrossHostJitter(netJitterNs)

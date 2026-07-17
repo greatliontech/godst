@@ -63,8 +63,11 @@ func dstCheckPidAvailable()
 //go:linkname dstSetProcessPid runtime.dstSetProcessPid
 func dstSetProcessPid(pid int32) (old int32)
 
-//go:linkname dstSetPidLive runtime.dstSetPidLive
-func dstSetPidLive(pid int32, live bool)
+//go:linkname dstRegisterPid runtime.dstRegisterPid
+func dstRegisterPid(pid int32, ns uint32)
+
+//go:linkname dstUnregisterPid runtime.dstUnregisterPid
+func dstUnregisterPid(pid int32)
 
 //go:linkname dstCrashProcessPid runtime.dstCrashProcessPid
 func dstCrashProcessPid(pid int32)
@@ -281,6 +284,11 @@ var nodeReg struct {
 	// uptime-clock origin) hold in binaries that never link net; the net
 	// partition table keeps its own down state for dial blackholing.
 	down map[uint32]bool
+	// pidns interns ProcessConfig.PIDNamespace names to namespace identities
+	// (the /proc/self/ns/pid inode): first-use order from 2 — identity 1 is
+	// the root namespace, never in the map.
+	pidns  map[string]uint32
+	nextNS uint32
 }
 
 var activeProcs struct {
@@ -333,6 +341,8 @@ func nodeRegReset() {
 	nodeReg.nextHost = 0
 	nodeReg.nextProc = 0
 	nodeReg.down = make(map[uint32]bool)
+	nodeReg.pidns = make(map[string]uint32)
+	nodeReg.nextNS = 0
 	activeProcs.mu.Lock()
 	activeProcs.pids = make(map[uint32][]int32)
 	activeProcs.host = make(map[uint32]uint32)
@@ -679,6 +689,29 @@ func lookupHost(name string) uint32 {
 	return 0
 }
 
+// internPIDNS interns a ProcessConfig.PIDNamespace name to its namespace
+// identity: "" is the root namespace (identity 1, every process's default);
+// named namespaces get deterministic identities in first-use order (2, 3, …),
+// reset per run with the other registries. Deterministic because first-use
+// order is schedule-deterministic.
+func internPIDNS(name string) uint32 {
+	if name == "" {
+		return 1
+	}
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	if nodeReg.pidns == nil {
+		nodeReg.pidns = make(map[string]uint32) // see internHost
+	}
+	if id, ok := nodeReg.pidns[name]; ok {
+		return id
+	}
+	nodeReg.nextNS++
+	id := 1 + nodeReg.nextNS
+	nodeReg.pidns[name] = id
+	return id
+}
+
 // lookupProc is lookupHost's process leg (ResetProcess and later process faults).
 func lookupProc(name string) uint32 {
 	nodeReg.mu.Lock()
@@ -879,14 +912,40 @@ func CrashHost(name string) {
 // (filesystem, page cache). During an active run Process must be called from a
 // goroutine the simulation schedules; a foreign caller panics, like the fault
 // APIs — it would start SUT goroutines outside the bubble, unscheduled by the
-// seed (see Host).
+// seed (see Host). Process runs in the root pid namespace; ProcessWith places
+// an invocation in a named one.
 func Process(name string, f func()) {
+	processWith("Process", name, ProcessConfig{}, f)
+}
+
+// ProcessConfig configures one Process invocation. The zero ProcessConfig is
+// Process's own behavior.
+type ProcessConfig struct {
+	// PIDNamespace places the invocation in the named pid namespace. Names
+	// intern per run to deterministic namespace identities (the same name is
+	// the same namespace — containers sharing a pod's pid namespace; a restart
+	// naming the same namespace keeps it); the empty name is the root
+	// namespace every process is in by default. Namespaces are SIBLINGS
+	// partitioning kill/procfs visibility over one global pid space:
+	// cross-namespace, kill(pid, 0) answers ESRCH and /proc/<pid>/stat does
+	// not exist — what peer containers see of each other. Namespace hierarchy
+	// and per-namespace pid numbering are not modeled (design.md, pid
+	// namespaces).
+	PIDNamespace string
+}
+
+// ProcessWith is Process with explicit per-invocation configuration.
+func ProcessWith(name string, config ProcessConfig, f func()) {
+	processWith("ProcessWith", name, config, f)
+}
+
+func processWith(api, name string, config ProcessConfig, f func()) {
 	var declaredActive bool
 	var declaredEpoch uint64
 	var host, proc uint32
 	var oldH, oldP uint32
 	var simPid, oldPid int32
-	withBubbleDeclCaller("Process", func() {
+	withBubbleDeclCaller(api, func() {
 		declaredActive = runActive.Load()
 		if declaredActive {
 			declaredEpoch = dstNetEpoch()
@@ -912,12 +971,16 @@ func Process(name string, f func()) {
 			// (nodeReg.down), so this refusal holds without net linked.
 			panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
 		}
+		ns := internPIDNS(config.PIDNamespace)
 		dstProcAllocEnsure(proc)
 		oldH, oldP = dstSetNode(host, proc)
 		simPid = dstAllocPid()
 		oldPid = dstSetProcessPid(simPid)
 		activeProcSet(proc, host, simPid)
-		dstSetPidLive(simPid, true)
+		// After dstSetNode: the registration stamps the incarnation's
+		// starttime from the TARGET host's uptime clock, read through the
+		// admitting goroutine's (just-set) host identity.
+		dstRegisterPid(simPid, ns)
 	})
 	// Registered FIRST so it runs LAST — after the exit-teardown defer below
 	// has completed and released procTeardownMu (parking while holding it
@@ -973,7 +1036,7 @@ func Process(name string, f func()) {
 			dstNetPartitionOp(partOpCloseProcConns, proc, 0)
 			dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
 		}
-		dstSetPidLive(simPid, false)
+		dstUnregisterPid(simPid)
 		activeProcClear(proc, simPid)
 	}()
 	f()

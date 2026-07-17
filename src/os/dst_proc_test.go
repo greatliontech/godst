@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/simulation"
+	"time"
 )
 
 func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
@@ -25,7 +26,9 @@ func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
 	var statErr error
 	var rootNS, procNS string
 	var rootNSErr, procNSErr error
-	var procPID int
+	var procPID, proc2PID int
+	var proc2Stat []byte
+	var proc2Err error
 	var signedErr, dotLeafErr, unsupportedProcWalkErr, deadErr, hostErr, dottedHostErr, unsupportedErr, unsupportedProcReadlinkWalkErr error
 	var mkdirProcErr, trailingMkdirErr, aliasWriteErr, unsupportedWriteErr error
 	var openRootProcErr error
@@ -46,6 +49,14 @@ func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
 			procPID = os.Getpid()
 			procStat, procErr = os.ReadFile("/proc/self/stat")
 			procNS, procNSErr = os.Readlink("/proc/self/ns/pid")
+		})
+		// The restart 150ms later starts on the ALREADY-booted implicit host:
+		// its starttime is 15 USER_HZ ticks of host uptime — the boot-relative
+		// contract, distinguishable from zero and from any pid-derived value.
+		time.Sleep(150 * time.Millisecond)
+		simulation.Process("p", func() {
+			proc2PID = os.Getpid()
+			proc2Stat, proc2Err = os.ReadFile("/proc/self/stat")
 		})
 		_, signedErr = os.ReadFile("/proc/+" + strconv.Itoa(simPID) + "/stat")
 		_, dotLeafErr = os.ReadFile("/proc/self/stat/.")
@@ -123,11 +134,25 @@ func TestDSTProcStatStarttimeAndNamespace(t *testing.T) {
 	if rootRootFields[0] != strconv.Itoa(simPID) {
 		t.Fatalf("Root proc pid field = %q, want %d", rootRootFields[0], simPID)
 	}
-	if rootFields[21] != strconv.Itoa(simPID) || selfFields[21] != rootFields[21] || dottedFields[21] != rootFields[21] || rootRootFields[21] != rootFields[21] {
-		t.Fatalf("root proc starttime fields = %q/%q/%q/%q, want deterministic %d", rootFields[21], selfFields[21], dottedFields[21], rootRootFields[21], simPID)
+	if proc2Err != nil {
+		t.Fatalf("restarted process stat: %v", proc2Err)
 	}
-	if procFields[0] != strconv.Itoa(procPID) || procFields[21] != strconv.Itoa(procPID) {
-		t.Fatalf("process proc fields pid/start = %q/%q, want %d", procFields[0], procFields[21], procPID)
+	proc2Fields := procStatFields(t, proc2Stat)
+	// Field-22 starttime is USER_HZ (100) ticks of the OWNING host's uptime at
+	// process start: the root process and the implicit host's first process
+	// both started at their machine's boot (0 — an implicit host boots at its
+	// first declaration), and the restart 150ms later reads 15 ticks.
+	if rootFields[21] != "0" || selfFields[21] != rootFields[21] || dottedFields[21] != rootFields[21] || rootRootFields[21] != rootFields[21] {
+		t.Fatalf("root proc starttime fields = %q/%q/%q/%q, want 0 (started at the machine's boot)", rootFields[21], selfFields[21], dottedFields[21], rootRootFields[21])
+	}
+	if procFields[0] != strconv.Itoa(procPID) || procFields[21] != "0" {
+		t.Fatalf("process proc fields pid/start = %q/%q, want %d/0 (the implicit host boots with its first process)", procFields[0], procFields[21], procPID)
+	}
+	if proc2PID == procPID {
+		t.Fatalf("restart pid = %d, want a fresh pid (got the predecessor's)", proc2PID)
+	}
+	if proc2Fields[0] != strconv.Itoa(proc2PID) || proc2Fields[21] != "15" {
+		t.Fatalf("restarted process fields pid/start = %q/%q, want %d/15 (15 USER_HZ ticks of host uptime at start)", proc2Fields[0], proc2Fields[21], proc2PID)
 	}
 	if rootNS != "pid:[1]" || procNS != rootNS {
 		t.Fatalf("pid namespace readlink = root %q process %q, want stable pid:[1]", rootNS, procNS)

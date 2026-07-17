@@ -184,6 +184,10 @@ func TestDSTGMDBCompat(t *testing.T) {
 			holdOpen := make(chan struct{})
 			writerReady := make(chan struct{})
 
+			// A real database writer never starts within its machine's first
+			// 10ms tick: stagger it so its /proc starttime — host uptime in
+			// USER_HZ ticks at process start — is a realistic nonzero value.
+			sleepMillis(20)
 			go Process("writer", func() {
 				writerPID = os.Getpid()
 				data, mapped, lockFile, slot := openDatabase(t, "/db")
@@ -314,8 +318,8 @@ func TestDSTGMDBCompat(t *testing.T) {
 	if slotSeenByContender != lockSlotAcquired {
 		t.Fatalf("lock slot seen across processes = %d, want %d (shared mmap coordination)", slotSeenByContender, lockSlotAcquired)
 	}
-	if writerStart == 0 {
-		t.Fatalf("holder start time was 0: /proc/<pid>/stat field 22 not usable")
+	if writerStart != 2 {
+		t.Fatalf("holder start time = %d, want 2 (20ms of host uptime in USER_HZ ticks at start)", writerStart)
 	}
 	if nsLink != "pid:[1]" {
 		t.Fatalf("pid namespace = %q, want pid:[1]", nsLink)
@@ -750,4 +754,116 @@ func TestDSTGMDBBootEpoch(t *testing.T) {
 	if heartbeat1 <= now2 {
 		t.Fatalf("pre-crash heartbeat %d <= post-reboot now %d, want the stamp in the new boot's future (heartbeat aging cannot recover cross-boot staleness)", heartbeat1, now2)
 	}
+}
+
+// TestDSTGMDBIdentityDivergence walks the database's two remaining
+// stale-writer classification legs end-to-end, with the exact probes the
+// database uses (kill(pid,0), /proc/<pid>/stat field 22, /proc/self/ns/pid).
+//
+// Reuse leg: a writer stamps (pid, starttime) and dies; churn under
+// Options.PidMax hands its pid to an UNRELATED process. The recovering peer's
+// probe finds the pid ALIVE — the trap pid-liveness alone falls into — and the
+// starttime mismatch is what classifies the stamped record stale.
+//
+// Cross-namespace leg: a LIVE writer in a sibling pid namespace is invisible
+// to the prober — kill answers ESRCH for a process that is alive and holding
+// state. Namespace-inode comparison is what tells the database the probe is
+// meaningless there, routing classification to the heartbeat instead.
+func TestDSTGMDBIdentityDivergence(t *testing.T) {
+	var stampedPid, reusedPid int
+	var stampedStart, reusedStart, probedStart uint64
+	var probeAlive bool
+	RunWith(41, Options{PidMax: 5}, func() {
+		// One shared machine: the reuse hazard is an intra-machine phenomenon
+		// (pids are compared through one host's shared lock file), and
+		// starttimes are host-uptime-relative — a dedicated implicit host per
+		// process would start every process at its own machine's boot.
+		Host("db-host", HostConfig{}, func() {
+			runIdentityReuseLeg(t, &stampedPid, &reusedPid, &stampedStart, &reusedStart, &probedStart, &probeAlive)
+		})
+	})
+	if stampedPid != 2 || reusedPid != stampedPid {
+		t.Fatalf("pids stamped/reused = %d/%d, want the same pid 2 (the reuse)", stampedPid, reusedPid)
+	}
+	if !probeAlive {
+		t.Fatalf("kill(stamped pid, 0) reported dead, want alive (the impostor holds it — liveness alone misclassifies)")
+	}
+	if probedStart != reusedStart || probedStart == stampedStart {
+		t.Fatalf("starttimes stamped/probed/impostor = %d/%d/%d: the probe must read the impostor's, differing from the stamp (the discriminator)", stampedStart, probedStart, reusedStart)
+	}
+
+	var writerPid int
+	var writerNS, proberNS string
+	var crossKill error
+	var writerStillLive bool
+	Run(42, func() {
+		hold := make(chan struct{})
+		ready := make(chan struct{})
+		go ProcessWith("ns-writer", ProcessConfig{PIDNamespace: "pod-a"}, func() {
+			writerPid = os.Getpid()
+			if l, err := os.Readlink("/proc/self/ns/pid"); err == nil {
+				writerNS = l
+			}
+			close(ready)
+			<-hold
+		})
+		<-ready
+		Process("prober", func() {
+			if l, err := os.Readlink("/proc/self/ns/pid"); err == nil {
+				proberNS = l
+			}
+			crossKill = syscall.Kill(writerPid, 0)
+		})
+		writerStillLive = dstPidAliveSim(int32(writerPid))
+		close(hold)
+	})
+	if writerNS == "" || proberNS == "" || writerNS == proberNS {
+		t.Fatalf("namespaces writer/prober = %q/%q, want distinct (the inode comparison that gates the probe)", writerNS, proberNS)
+	}
+	if !errors.Is(crossKill, syscall.ESRCH) || !writerStillLive {
+		t.Fatalf("cross-namespace kill = %v (writer live %v), want ESRCH against a LIVE holder — the hazard the heartbeat path exists for", crossKill, writerStillLive)
+	}
+}
+
+// runIdentityReuseLeg is TestDSTGMDBIdentityDivergence's reuse walk, on the
+// caller's (shared) host: writer stamps and dies, churn wraps the pid space,
+// the impostor lands on the writer's pid, the probe classifies.
+func runIdentityReuseLeg(t *testing.T, stampedPid, reusedPid *int, stampedStart, reusedStart, probedStart *uint64, probeAlive *bool) {
+	t.Helper()
+	sleepMillis(20)
+	Process("writer", func() {
+		*stampedPid = os.Getpid()
+		st, err := processStartTime(*stampedPid)
+		if err != nil {
+			t.Errorf("writer starttime: %v", err)
+		}
+		*stampedStart = st
+	})
+	// The writer is dead; its (pid, starttime) record is the stale stamp.
+	sleepMillis(30)
+	for _, n := range []string{"c1", "c2", "c3"} {
+		Process(n, func() {})
+	}
+	hold := make(chan struct{})
+	ready := make(chan struct{})
+	go Process("impostor", func() {
+		*reusedPid = os.Getpid()
+		st, err := processStartTime(*reusedPid)
+		if err != nil {
+			t.Errorf("impostor starttime: %v", err)
+		}
+		*reusedStart = st
+		close(ready)
+		<-hold
+	})
+	<-ready
+	// The database's same-namespace classification, verbatim: alive? then
+	// compare starttimes.
+	*probeAlive = processAlive(*stampedPid)
+	st, err := processStartTime(*stampedPid)
+	if err != nil {
+		t.Errorf("probe starttime: %v", err)
+	}
+	*probedStart = st
+	close(hold)
 }

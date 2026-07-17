@@ -1058,9 +1058,12 @@ the whole sim.
 
 **Restart** re-runs the victim's entry on a fresh goroutine subtree, over the live (process restart) or
 torn (host reboot) FS and a clean network — the canonical recovery fault, driven by a SUT supervisor or a
-fault policy (`Crash("p", RestartAfter: 3*s)`). A restarted process gets a **new pid** (a real restart
-always does; there is **no stable-pid option** — the stable identity is the logical name `"p"`, the
-footgun-free contract); `ppid` is `1`/reparented unless a supervision tree is modeled. A `Process`
+fault policy (`Crash("p", RestartAfter: 3*s)`). A restarted process gets a **freshly allocated pid**
+(a real restart always does; there is **no stable-pid option** — the stable identity is the logical
+name `"p"`, the footgun-free contract). Under `Options.PidMax` the allocation wraps and skips live
+pids like the kernel's `alloc_pid`, so a numeral can recur only through genuine pid REUSE — the
+kernel hazard start-time discrimination exists for, now constructible — never through a stability
+guarantee; `ppid` is `1`/reparented unless a supervision tree is modeled. A `Process`
 restart on a machine `CrashHost` powered off is **refused loudly** — a process cannot run on a dead
 kernel; model the reboot with a `Host` re-declaration first, then restart the processes inside it.
 

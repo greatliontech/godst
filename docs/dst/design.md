@@ -148,14 +148,25 @@ surface when DST is active: `os.Getpid`/`Getppid`/`Hostname`, `os.Getuid`/`Getgi
 values, set by `testing/simulation.run` *before* `dstActivate` so the activation's atomic store
 publishes them to the bubble, and cleared on return).
 
-Three values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), and `NumCPU` (default `8`,
+Four values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), `NumCPU` (default `8`,
 reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
-real concurrency for the schedule to explore). A positive `Options.NumCPU` or `HostConfig.NumCPU` is
+real concurrency for the schedule to explore), and `PidMax` (default unbounded). A positive
+`Options.NumCPU` or `HostConfig.NumCPU` is
 reported exactly; a non-positive value selects the applicable default. The positive range is the target
 architecture's `int` range. A custom positive `PID` must fit in the OS pid field
-(`int32`); non-positive values select the default, oversized values panic rather than wrapping, and a run
-that exhausts the finite pid field while allocating `Process` pids panics instead of reusing or wrapping
-pids. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
+(`int32`); non-positive values select the default, oversized values panic rather than wrapping. With
+`PidMax` unset (0), pid allocation stays monotonic and a run that exhausts the finite pid field while
+allocating `Process` pids panics instead of reusing or wrapping. A positive `PidMax` models the
+kernel's `pid_max`: allocation scans forward from the last allocated pid, WRAPS into `[2, PidMax]`
+(pid 1 is the simulated init/ppid), and skips live pids — `alloc_pid`'s behavior — so **pid reuse**
+becomes constructible in-simulation: a small `PidMax` plus process churn deterministically hands a
+dead process's pid to a new one (the same-pid-new-start-time hazard start-time discrimination exists
+for). `PidMax` must exceed the root pid (a real machine's own pid is inside its pid space); a run in
+which every pid in `[2, PidMax]` is simultaneously live refuses the `Process` loud and
+state-neutrally, BEFORE the admission stamps or interns anything — the kernel answers fork with
+`EAGAIN` and a failed fork leaves the parent unchanged; `Process` has no error return to carry it.
+Explore/Replay run with the identity defaults, `PidMax` unbounded included, like the other identity
+options — pid reuse is a `Run`/`Test`-tier input for now. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
 `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the simulated identity is
 observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
 `Run`, `RunWith`, `Test`, and `TestWith` fix the identity, so even plain `Run` or `Test` is reproducible here. This
@@ -165,7 +176,10 @@ The white-box `dstActivate` path leaves identity unset (real values), as it is n
 
 `syscall.Kill(pid, 0)` is the liveness probe over that simulated identity. During a run it consults only
 the simulated pid registry: the root pid is live for the whole run, each `simulation.Process` pid is live
-for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. `Kill(0, 0)` and
+for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. The probe is
+namespace-scoped: a live pid whose process is in a DIFFERENT pid namespace than the caller answers
+`ESRCH` too — sibling-container visibility (see the pid-namespace paragraph below); internal harness
+liveness (crash/exit teardown, callback ownership) is not namespace-filtered. `Kill(0, 0)` and
 `Kill(-1, 0)` succeed (the caller's own group and self always exist on Linux); other negative pids name
 process groups the simulation does not model — unknown, so `ESRCH`. It never probes a host
 process. The liveness READ gates process-globally like the other identity reads; non-zero signals remain
@@ -174,12 +188,33 @@ non-bubble harness goroutine's `Kill` reaches the host kernel mid-run, per the i
 Generic raw `SYS_KILL` remains fenced like other unsupported raw syscalls.
 
 The simulated filesystem also owns the procfs identity surface needed for pid-liveness recovery:
-`/proc/<pid>/stat` and `/proc/self/stat` are generated for live simulated pids and include a deterministic
-field-22 starttime derived from that pid identity; completed, unknown, host, or unrepresentable pids are
+`/proc/<pid>/stat` and `/proc/self/stat` are generated for live simulated pids with a real field-22
+**starttime**: the instant the process started, in USER_HZ (100) ticks since its host's boot,
+recorded at `Process` admission from the host's uptime clock — coherent with `CLOCK_BOOTTIME` reads,
+reset in meaning by a reboot (a post-reboot process has a small starttime again, the same cross-boot
+collision hazard a real machine has, which the boot-epoch discriminator exists to catch), and carried
+per-incarnation, so a REUSED pid (`Options.PidMax`) serves its new process's starttime — the
+pid-reuse discriminator clients parse `/proc` for. Two processes started within one 10 ms tick share
+a starttime, the host's own resolution caveat. Completed, unknown, cross-namespace, host, or
+unrepresentable pids are
 not visible, and a zero-padded pid is not a procfs name (Linux's `name_to_int` rejects leading zeros).
 `/proc/self/stat` and `/proc/<own-pid>/stat` are one file to `SameFile` (one inode on the host); a
 trailing slash on a proc leaf is `ENOTDIR` (the filesystem section's trailing-slash clause).
-`/proc/self/ns/pid` readlink returns the stable deterministic namespace identity `pid:[1]`.
+
+**Pid namespaces (sibling-container model, enforced).** `/proc/self/ns/pid` readlink returns the
+caller's namespace identity `pid:[<inode>]` — `pid:[1]` for the root namespace every process is in by
+default. `simulation.ProcessWith(name, ProcessConfig{PIDNamespace: "ns-name"}, f)` places that
+invocation in a NAMED pid namespace: names intern per run to deterministic inodes (2, 3, … in first-use
+order), the same name is the same namespace (containers sharing a pod's pid namespace; a restart
+naming the same namespace keeps it — the pause-container shape), and the empty name is the root
+namespace. Namespaces are modeled as SIBLINGS partitioning visibility over one global pid space:
+cross-namespace, `kill(pid, 0)` answers `ESRCH` and `/proc/<pid>/stat` does not exist — exactly what
+two peer containers see of each other. Deliberately NOT modeled (recorded limits, no client needs
+them): namespace hierarchy (an init-namespace parent observing children under translated pid
+numerals) and per-namespace pid numbering (two siblings each having their own pid 7) — pids remain
+one global space, so a numeral names at most one live process run-wide, and the
+same-numeral-unrelated-process shape is constructible only through pid REUSE (`PidMax`), not through
+namespace overlap.
 Unsupported `/proc` paths stay deterministic simulated results (unsupported or not-exist), never host
 passthrough.
 

@@ -1835,18 +1835,46 @@ var dstHostIdent atomic.Pointer[dstHostIdentTable]
 // to the root pid (dstSimPID) at dstSetSimEnv, so the first process is root pid + 1.
 var dstSimPidNext atomic.Int32
 
-// dstPidLive is the simulated pid liveness table consulted by syscall.Kill(pid, 0).
-// The root pid is live for the run; Process pids are live for the dynamic extent of
-// their body. Pids are allocated monotonically and never reused within a run, so a
-// completed process's old pid cannot become live again by accident. The map is
-// copy-on-write: readers get an immutable snapshot and writers publish a new table.
+// dstPidLive is the simulated pid registry: presence = live, consulted by
+// syscall.Kill(pid, 0) and the /proc surface. The root pid is live for the run;
+// Process pids are live for the dynamic extent of their body. Each entry
+// carries the INCARNATION's identity — its procfs starttime and its pid
+// namespace — so a reused pid (Options.PidMax) serves its new process's
+// identity, never its predecessor's. The map is copy-on-write: readers get an
+// immutable snapshot and writers publish a new table.
 type dstPidLiveTable struct {
-	live map[int32]bool
+	live map[int32]dstPidEntry
+}
+
+// dstPidEntry is one live incarnation's kernel-visible identity.
+type dstPidEntry struct {
+	start uint64 // procfs field-22 starttime: USER_HZ (100) ticks since the OWNING host's boot, at process start
+	ns    uint32 // pid-namespace id (dstRootPidNS = the root namespace)
 }
 
 var dstPidLive atomic.Pointer[dstPidLiveTable]
 
-const dstMaxSimPID = 1<<31 - 1
+const (
+	dstMaxSimPID = 1<<31 - 1
+	// dstRootPidNS is the root pid namespace's inode identity, the namespace
+	// every process is in unless ProcessWith names another. Namespaces are
+	// SIBLINGS partitioning kill/procfs visibility over one global pid space
+	// (design.md, pid namespaces).
+	dstRootPidNS = 1
+	// dstPidWrapFloor is where a bounded allocation wraps to: pid 1 is the
+	// simulated init/ppid, so the allocatable space is [2, PidMax] — the
+	// kernel's RESERVED_PIDS floor collapsed to the one reserved identity the
+	// simulation models.
+	dstPidWrapFloor = 2
+	// dstUserHZTickNS converts host uptime to procfs starttime ticks: USER_HZ
+	// is 100 on Linux, one tick per 10ms.
+	dstUserHZTickNS = 10_000_000
+)
+
+// dstSimPidMax is Options.PidMax: 0 = unbounded monotonic allocation (panic at
+// pid-field exhaustion), > 0 = kernel pid_max semantics (wrap into
+// [dstPidWrapFloor, PidMax], skip live pids). Set with the rest of the env.
+var dstSimPidMax atomic.Int32
 
 // Fixed simulated identity returned during a run for the parts testing/simulation
 // does not make configurable. Deterministic constants so a SUT that derives state
@@ -1871,7 +1899,7 @@ var dstEnvDispatchGate atomic.Uint32
 // testing/simulation.run before dstActivate; cleared by dstClearSimEnv on return.
 //
 //go:linkname dstSetSimEnv
-func dstSetSimEnv(hostname string, pid, numcpu int) {
+func dstSetSimEnv(hostname string, pid, numcpu, pidmax int) {
 	dstSimHostname = hostname
 	dstSimPID = pid
 	dstSimNumCPU = numcpu
@@ -1882,6 +1910,7 @@ func dstSetSimEnv(hostname string, pid, numcpu int) {
 	// was skipped.
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(int32(pid))
+	dstSimPidMax.Store(int32(pidmax))
 	dstPidLiveReset(int32(pid))
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
@@ -1898,6 +1927,7 @@ func dstClearSimEnv() {
 	dstSimNumCPU = 0
 	dstHostIdent.Store(nil)
 	dstSimPidNext.Store(0)
+	dstSimPidMax.Store(0)
 	dstPidLiveReset(0)
 	dstProcAlloc.Store(nil)
 	dstHostClock.Store(nil)
@@ -1923,7 +1953,10 @@ func dstPidLiveLoadRace() {
 func dstPidLiveReset(root int32) {
 	dstPidLivePublishRace()
 	if root > 0 {
-		dstPidLive.Store(&dstPidLiveTable{live: map[int32]bool{root: true}})
+		// The root process is in the root namespace and started at its
+		// machine's boot: starttime 0 — the run body's machine boots at the
+		// run epoch (the uptime clocks' origin).
+		dstPidLive.Store(&dstPidLiveTable{live: map[int32]dstPidEntry{root: {start: 0, ns: dstRootPidNS}}})
 	} else {
 		dstPidLive.Store(nil)
 	}
@@ -2040,47 +2073,136 @@ func dstSplitmix64(x uint64) uint64 {
 //
 //go:linkname dstAllocPid
 func dstAllocPid() int32 {
-	for {
-		old := dstSimPidNext.Load()
-		if old == dstMaxSimPID {
-			panic("testing/simulation: simulated pid allocation overflows OS pid field")
-		}
-		if dstSimPidNext.CompareAndSwap(old, old+1) {
-			return old + 1
+	max := dstSimPidMax.Load()
+	if max == 0 {
+		// Unbounded: monotonic, never reused, panic at pid-field exhaustion.
+		for {
+			old := dstSimPidNext.Load()
+			if old == dstMaxSimPID {
+				panic("testing/simulation: simulated pid allocation overflows OS pid field")
+			}
+			if dstSimPidNext.CompareAndSwap(old, old+1) {
+				return old + 1
+			}
 		}
 	}
+	// Bounded (Options.PidMax): alloc_pid semantics — scan forward from the
+	// last allocation, wrap into [dstPidWrapFloor, max], skip live pids (the
+	// root pid is in the registry, so it is skipped like any live pid). The
+	// one caller (Process admission) holds procTeardownMu, which also covers
+	// every registry mutation, so a single snapshot is a consistent view.
+	t := dstPidLive.Load()
+	if t != nil {
+		dstPidLiveLoadRace()
+	}
+	span := max - dstPidWrapFloor + 1
+	cand := dstSimPidNext.Load()
+	for i := int32(0); i < span; i++ {
+		cand++
+		if cand > max || cand < dstPidWrapFloor {
+			cand = dstPidWrapFloor
+		}
+		if t == nil {
+			break // no registry: identity-off white-box run, first candidate is free
+		}
+		if _, live := t.live[cand]; !live {
+			dstSimPidNext.Store(cand)
+			return cand
+		}
+	}
+	if t == nil {
+		dstSimPidNext.Store(cand)
+		return cand
+	}
+	// Every pid in [dstPidWrapFloor, max] is live: the kernel answers fork
+	// with EAGAIN here; Process has no error return, so fail loud.
+	panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
 }
 
 //go:linkname dstCheckPidAvailable
 func dstCheckPidAvailable() {
-	if dstSimPidNext.Load() == dstMaxSimPID {
-		panic("testing/simulation: simulated pid allocation overflows OS pid field")
+	max := dstSimPidMax.Load()
+	if max == 0 {
+		if dstSimPidNext.Load() == dstMaxSimPID {
+			panic("testing/simulation: simulated pid allocation overflows OS pid field")
+		}
+		return
+	}
+	// Bounded: refuse HERE, before the admission mutates anything — a failed
+	// fork leaves the parent unchanged, so the refusal must precede the node
+	// stamp and every intern (the same state-neutrality the unbounded
+	// pre-check gives). The caller holds procTeardownMu, which covers every
+	// registry mutation, so a free pid found here is still free when
+	// dstAllocPid scans (its own panic is an unreachable backstop).
+	t := dstPidLive.Load()
+	if t == nil {
+		return
+	}
+	dstPidLiveLoadRace()
+	inRange := int32(0)
+	for p := range t.live {
+		if p >= dstPidWrapFloor && p <= max {
+			inRange++
+		}
+	}
+	if inRange >= max-dstPidWrapFloor+1 {
+		// Every pid in [dstPidWrapFloor, max] is live: the kernel answers
+		// fork with EAGAIN here; Process has no error return, so fail loud.
+		panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
 	}
 }
 
-// dstSetPidLive marks a simulated pid live or dead for Kill(pid, 0). Reached from
-// testing/simulation.Process by //go:linkname.
+// dstRegisterPid marks a simulated pid live, recording its incarnation's
+// identity: its pid namespace and its procfs starttime — the calling
+// goroutine's host's current uptime in USER_HZ ticks (the caller is the
+// admitting Process goroutine, already stamped with the target host). Reached
+// from testing/simulation.Process by //go:linkname.
 //
-//go:linkname dstSetPidLive
-func dstSetPidLive(pid int32, live bool) {
+//go:linkname dstRegisterPid
+func dstRegisterPid(pid int32, ns uint32) {
 	if pid <= 0 {
 		return
 	}
+	if ns == 0 {
+		ns = dstRootPidNS
+	}
+	e := dstPidEntry{ns: ns}
+	if up, ok := dstVirtualMonotonicNow(); ok && up > 0 {
+		e.start = uint64(up) / dstUserHZTickNS
+	}
+	dstPidLiveMutate(pid, &e)
+}
+
+// dstUnregisterPid marks a simulated pid dead: its registry entry — starttime
+// and namespace included — vanishes with it, as a real /proc entry does.
+// Reached from testing/simulation's exit teardown by //go:linkname.
+//
+//go:linkname dstUnregisterPid
+func dstUnregisterPid(pid int32) {
+	if pid <= 0 {
+		return
+	}
+	dstPidLiveMutate(pid, nil)
+}
+
+// dstPidLiveMutate publishes a new registry table with pid set to *e (or
+// removed, e nil) via the copy-on-write CAS loop.
+func dstPidLiveMutate(pid int32, e *dstPidEntry) {
 	for {
 		old := dstPidLive.Load()
 		if old == nil {
 			return
 		}
 		dstPidLiveLoadRace()
-		if old.live[pid] == live {
+		if cur, ok := old.live[pid]; ok == (e != nil) && (e == nil || cur == *e) {
 			return
 		}
-		next := make(map[int32]bool, len(old.live)+1)
-		for p := range old.live {
-			next[p] = true
+		next := make(map[int32]dstPidEntry, len(old.live)+1)
+		for p, pe := range old.live {
+			next[p] = pe
 		}
-		if live {
-			next[pid] = true
+		if e != nil {
+			next[pid] = *e
 		} else {
 			delete(next, pid)
 		}
@@ -2091,20 +2213,68 @@ func dstSetPidLive(pid int32, live bool) {
 	}
 }
 
-// dstPidAlive reports whether pid is live in the current simulated pid registry.
-// Reached from syscall.Kill's DST hook by //go:linkname.
-//
-//go:linkname dstPidAlive
-func dstPidAlive(pid int32) bool {
+// dstPidLookup returns pid's live registry entry.
+func dstPidLookup(pid int32) (dstPidEntry, bool) {
 	if pid <= 0 || !dstSimEnvSet {
-		return false
+		return dstPidEntry{}, false
 	}
 	t := dstPidLive.Load()
 	if t == nil {
-		return false
+		return dstPidEntry{}, false
 	}
 	dstPidLiveLoadRace()
-	return t.live[pid]
+	e, ok := t.live[pid]
+	return e, ok
+}
+
+// dstPidAlive reports whether pid is live in the current simulated pid
+// registry — INTERNAL harness liveness (teardown, callback ownership, restart
+// admission), deliberately NOT namespace-filtered: a process dies for the
+// harness regardless of who could see it through kill. The ns-scoped probe is
+// dstPidKillAlive.
+//
+//go:linkname dstPidAlive
+func dstPidAlive(pid int32) bool {
+	_, ok := dstPidLookup(pid)
+	return ok
+}
+
+// dstCallerPidNS returns the calling goroutine's pid namespace: its process's
+// registry entry, or the root pid's for root goroutines; the root namespace
+// when neither resolves (identity-off white-box runs).
+func dstCallerPidNS() uint32 {
+	pid := getg().dstPid
+	if pid <= 0 {
+		pid = int32(dstSimPID)
+	}
+	if e, ok := dstPidLookup(pid); ok {
+		return e.ns
+	}
+	return dstRootPidNS
+}
+
+// dstPidKillAlive is the kill(pid, 0) probe: live AND visible from the
+// caller's pid namespace. Namespaces are siblings partitioning visibility
+// (design.md, pid namespaces), so a live pid in another namespace answers
+// dead — ESRCH — exactly what peer containers see of each other. Reached from
+// syscall.Kill's DST hook by //go:linkname.
+//
+//go:linkname dstPidKillAlive
+func dstPidKillAlive(pid int32) bool {
+	e, ok := dstPidLookup(pid)
+	return ok && e.ns == dstCallerPidNS()
+}
+
+// dstSelfPidNS reports the calling goroutine's pid-namespace identity for the
+// /proc/self/ns/pid readlink. ok mirrors the simulated-pid gate: no simulated
+// identity, no namespace to report. Reached from os by //go:linkname.
+//
+//go:linkname dstSelfPidNS
+func dstSelfPidNS() (ns uint32, ok bool) {
+	if !dstSimEnvSet {
+		return 0, false
+	}
+	return dstCallerPidNS(), true
 }
 
 func dstCallbackPid() int32 {
@@ -2124,17 +2294,19 @@ func dstCallbacksPendingFP() bool {
 	return finPending() || cleanupPending()
 }
 
-// dstPidStarttime reports the deterministic procfs starttime for a live simulated
-// pid. The value is derived from the pid itself because pids are monotonic and never
-// reused within a run; completed pids have no procfs entry. Reached from os's
-// synthetic /proc support by //go:linkname.
+// dstPidStarttime reports the procfs field-22 starttime for a live simulated
+// pid VISIBLE from the caller's pid namespace: the incarnation's recorded
+// start instant in USER_HZ ticks since its host's boot. Completed pids have no
+// procfs entry, and a cross-namespace pid is invisible (sibling-container
+// procfs). Reached from os's synthetic /proc support by //go:linkname.
 //
 //go:linkname dstPidStarttime
 func dstPidStarttime(pid int32) (start uint64, ok bool) {
-	if !dstPidAlive(pid) {
+	e, ok := dstPidLookup(pid)
+	if !ok || e.ns != dstCallerPidNS() {
 		return 0, false
 	}
-	return uint64(pid), true
+	return e.start, true
 }
 
 // dstCrashProcessPid marks one process invocation dead and removes its goroutine
@@ -2148,7 +2320,7 @@ func dstCrashProcessPid(pid int32) {
 	if pid <= 0 {
 		return
 	}
-	dstSetPidLive(pid, false)
+	dstUnregisterPid(pid)
 	dstMarkProcessGoroutinesCrashed(pid)
 }
 

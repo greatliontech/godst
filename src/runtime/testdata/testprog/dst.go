@@ -2974,7 +2974,7 @@ func DSTRunqOverflowOrder() {
 func dstDeactivate()
 
 //go:linkname dstSetSimEnv runtime.dstSetSimEnv
-func dstSetSimEnv(hostname string, pid, numcpu int)
+func dstSetSimEnv(hostname string, pid, numcpu, pidmax int)
 
 //go:linkname dstClearSimEnv runtime.dstClearSimEnv
 func dstClearSimEnv()
@@ -2993,7 +2993,7 @@ func dstGoroutineLeakPendingFP() bool
 // published, then activation, no bubble yet): runtime.GC() from the bare
 // goroutine must panic with the caller-position diagnostic. Prints "refused".
 func DSTForeignGCActivationStretch() {
-	dstSetSimEnv("h", 1, 1)
+	dstSetSimEnv("h", 1, 1, 0)
 	dstActivate(7)
 	msg := ""
 	func() {

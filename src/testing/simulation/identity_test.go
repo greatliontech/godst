@@ -241,7 +241,7 @@ func TestDSTIdentityOversizedPIDPanics(t *testing.T) {
 }
 
 func TestDSTIdentityPIDAllocatorOverflowPanics(t *testing.T) {
-	dstSetSimEnv(defaultHostname, maxPID, defaultNumCPU)
+	dstSetSimEnv(defaultHostname, maxPID, defaultNumCPU, 0)
 	defer dstClearSimEnv()
 	defer func() {
 		if recover() == nil {

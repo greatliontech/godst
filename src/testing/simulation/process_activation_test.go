@@ -24,13 +24,13 @@ func TestDSTProcessPIDLivenessPublishedWithinAdmission(t *testing.T) {
 	}
 	var process *ast.FuncDecl
 	for _, decl := range f.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "Process" {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "processWith" {
 			process = fn
 			break
 		}
 	}
 	if process == nil {
-		t.Fatal("Process declaration not found")
+		t.Fatal("processWith declaration not found")
 	}
 	countCalls := func(node ast.Node, name string) int {
 		count := 0
@@ -46,7 +46,7 @@ func TestDSTProcessPIDLivenessPublishedWithinAdmission(t *testing.T) {
 		})
 		return count
 	}
-	total := countCalls(process.Body, "dstSetPidLive")
+	total := countCalls(process.Body, "dstRegisterPid") + countCalls(process.Body, "dstUnregisterPid")
 	inside := 0
 	ast.Inspect(process.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -58,12 +58,14 @@ func TestDSTProcessPIDLivenessPublishedWithinAdmission(t *testing.T) {
 			return true
 		}
 		if callback, ok := call.Args[1].(*ast.FuncLit); ok {
-			inside += countCalls(callback.Body, "dstSetPidLive")
+			inside += countCalls(callback.Body, "dstRegisterPid")
+			// The unregister belongs to teardown, never to admission.
+			inside -= 10 * countCalls(callback.Body, "dstUnregisterPid")
 		}
 		return false
 	})
 	if total != 2 || inside != 1 {
-		t.Fatalf("Process dstSetPidLive calls = total %d, inside admission %d; want 2/1", total, inside)
+		t.Fatalf("processWith pid register/unregister calls = total %d, inside admission %d; want 2/1 (register inside, unregister in teardown only)", total, inside)
 	}
 }
 

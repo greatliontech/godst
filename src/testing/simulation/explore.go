@@ -475,7 +475,7 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 	// are 0, as everywhere here); take the send-buffer/retransmit DEFAULTS from the one
 	// source of truth (resolveNetConfig) so a default change can't silently desync them.
 	_, _, _, defSendBuf, defRetransNs := resolveNetConfig("Explore replay", NetworkConfig{})
-	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, 0, 0, 0, defSendBuf, defRetransNs, prefix, false, func() {
+	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, 0, 0, 0, 0, defSendBuf, defRetransNs, prefix, false, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
 				if pv, ok := dstExplorePanicFP(); ok {

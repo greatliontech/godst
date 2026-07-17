@@ -23,7 +23,8 @@ func dstPidStarttime(pid int32) (start uint64, ok bool)
 //go:linkname dstHostBootIdent runtime.dstHostBootIdent
 func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool)
 
-const dstProcPIDNamespace = "pid:[1]"
+//go:linkname dstSelfPidNS runtime.dstSelfPidNS
+func dstSelfPidNS() (ns uint32, ok bool)
 
 // dstProcBootIDPath is the per-boot host identity leaf: a UUID constant within
 // one boot of the calling goroutine's host, shared by its processes, and
@@ -89,7 +90,14 @@ func dstProcReadlinkAbs(abs string) (string, error) {
 		if _, ok := dstSimGetpid(); !ok {
 			return "", syscall.ENOENT
 		}
-		return dstProcPIDNamespace, nil
+		// The caller's pid-namespace identity: pid:[1] is the root namespace,
+		// named namespaces (ProcessWith) have their interned identities —
+		// the sibling-container model (design.md, pid namespaces).
+		ns, ok := dstSelfPidNS()
+		if !ok {
+			return "", syscall.ENOENT
+		}
+		return "pid:[" + strconv.Itoa(int(ns)) + "]", nil
 	}
 	trimmed := abs
 	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
