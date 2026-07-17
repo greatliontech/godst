@@ -25,6 +25,19 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   quirk) exercised in-simulation. `os.Link` currently answers the
   unsupported-FS refusal; clients degrade to their rename fallback,
   which the modeled renameat2 serves.
+- **durable in-bubble mutex waits (IO latency × lock-holding SUTs)** —
+  Lands: when a consumer needs disk/IO latency modeled while the SUT
+  performs IO under its own locks (first named consumer: tugboat's WAL
+  bubble leg — its flushers fdatasync under the store mutex, as real
+  databases do). Mutex waits follow synctest semantics (non-durable), so
+  a SUT goroutine sleeping a SlowDisk delay while holding a mutex a peer
+  contends freezes virtual time — the bound faults.md's SlowDisk bullet
+  records for the harness's own tree lock applies to every SUT lock.
+  Under whole-world DST every possible unlocker is in-bubble, so
+  treating in-bubble semacquire waits as durable is sound; it is also a
+  change to the quiescence definition (wedge/deadlock detector and
+  exploration-seam interplay), so it needs the full spec-first pass, not
+  a drive-by.
 - **s_maxbytes model (huge-file refusal)** — Lands: when a SUT needs
   max-file-size refusal semantics in-simulation. The FS models no
   s_maxbytes: a huge size growth that reaches the page-cache mapping
