@@ -117,6 +117,25 @@ type ExploreResult struct {
 	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
 	BudgetHit bool
+	// Uninstrumented is true iff a DPOR exploration in a build WITHOUT the
+	// dst-race auto-instrumentation (-tags dst -race) observed no Level-2
+	// dependency event at all: no compiler-emitted access hook, no runtime
+	// sync-primitive hook, and no manual dstAccessYield/dstSyncAcquire call
+	// fired during any explored run. Independence is then indistinguishable
+	// from INVISIBILITY — a SUT whose goroutines conflict only through
+	// channels the build cannot see (plain memory, mmap'd shared pages, the
+	// simulated filesystem) collapses into a single class — so Exhausted is
+	// downgraded to false rather than claiming a completeness the build
+	// cannot establish. A genuinely SEQUENTIAL SUT — no scheduling decision
+	// ever held more than one simulation candidate — is exempt: its
+	// single-schedule exhaustion is sound at the yield-granularity tree,
+	// and there was nothing for the missing instrumentation to miss. Build
+	// with -tags dst -race (or fire manual hooks: dstAccessYield,
+	// dstSyncAcquire, dstAtomicYield, dstSyncObserve)
+	// for meaningful DPOR coverage. Exhaustive mode is unaffected: it
+	// enumerates the runtime-yield-granularity schedule tree, whose
+	// exhaustion claim does not depend on dependency visibility.
+	Uninstrumented bool
 }
 
 // ExploreOptions configures ExploreWith. The zero value is exhaustive exploration
@@ -956,6 +975,26 @@ type dporFrame struct {
 // backtracking at each observed conflict anchor and disables sleep sets; the non-race
 // sweep keeps the full source-DPOR + sleep-set algorithm and its optimality guard.
 func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
+	// Level-2 event floor for the completeness claim: if this build has no
+	// dst-race auto-instrumentation, the whole exploration fires no manual
+	// hook, AND the schedule tree held at least one real concurrency choice
+	// (a multi-candidate decision), DPOR saw zero dependencies where
+	// goroutines were genuinely co-enabled — its single class proves
+	// invisibility, not independence (ExploreResult.Uninstrumented). A
+	// sequential SUT (no multi-candidate decision anywhere) keeps its
+	// claim: there was nothing to be invisible.
+	accessEventsAtStart := dstLevel2EventsFP()
+	choicesAtStart := dstMultiChoicePointsFP()
+	res := dporExploreRun(seed, sut, cfg)
+	if !dstRaceEnabledFP() && dstLevel2EventsFP() == accessEventsAtStart &&
+		dstMultiChoicePointsFP() != choicesAtStart {
+		res.Uninstrumented = true
+		res.Exhausted = false
+	}
+	return res
+}
+
+func dporExploreRun(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
 	totalSchedules := 0

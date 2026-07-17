@@ -170,6 +170,12 @@ func dstAccLogOverflowFP() bool
 //go:linkname dstRaceEnabledFP runtime.dstRaceEnabledFP
 func dstRaceEnabledFP() bool
 
+//go:linkname dstLevel2EventsFP runtime.dstLevel2EventsFP
+func dstLevel2EventsFP() uint64
+
+//go:linkname dstMultiChoicePointsFP runtime.dstMultiChoicePointsFP
+func dstMultiChoicePointsFP() uint64
+
 //go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool
 

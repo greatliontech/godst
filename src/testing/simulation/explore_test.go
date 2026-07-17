@@ -3314,3 +3314,102 @@ func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
 		t.Errorf("Exhausted = true, want false under overflow")
 	}
 }
+
+// TestDPORUninstrumentedDowngrade pins ExploreResult.Uninstrumented: in a
+// build without the dst-race auto-instrumentation, a DPOR exploration that
+// fires no Level-2 hook at all cannot distinguish independence from
+// invisibility, so it must NOT claim Exhausted — while a manual-hook SUT
+// (the sweep's shape) keeps its completeness claim, and the downgrade
+// never fires in a race-enabled build (auto-instrumentation guarantees
+// visibility).
+func TestDPORUninstrumentedDowngrade(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if dstRaceEnabledFP() {
+		// Race build: a hook-free RACE-FREE SUT (atomics) — the
+		// auto-instrumentation records its atomic events, so the
+		// downgrade must not fire.
+		var x atomic.Int64
+		free := func() bool {
+			done := make(chan struct{}, 2)
+			for i := 0; i < 2; i++ {
+				go func() {
+					x.Add(1)
+					done <- struct{}{}
+				}()
+			}
+			<-done
+			<-done
+			return false
+		}
+		res := ExploreWith(1, ExploreOptions{Mode: DPOR}, free)
+		if res.Uninstrumented {
+			t.Fatalf("race build: Uninstrumented = true, want false (auto-instrumentation was active): %+v", res)
+		}
+		return
+	}
+	// A hook-free racy SUT: the lost update is real, but without
+	// instrumentation DPOR sees no dependency.
+	bare := func() bool {
+		x := 0
+		done := make(chan struct{}, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				v := x
+				runtime.Gosched()
+				x = v + 1
+				done <- struct{}{}
+			}()
+		}
+		<-done
+		<-done
+		return x != 2
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR}, bare)
+	if !res.Uninstrumented || res.Exhausted {
+		t.Fatalf("hook-free racy SUT: Uninstrumented=%v Exhausted=%v, want true/false (invisible dependencies must not claim exhaustion)", res.Uninstrumented, res.Exhausted)
+	}
+
+	// A genuinely SEQUENTIAL hook-free SUT — no decision ever holds two
+	// simulation candidates — keeps its exhaustion claim: there was
+	// nothing for the missing instrumentation to miss.
+	seq := func() bool {
+		x := 0
+		for i := 0; i < 3; i++ {
+			runtime.Gosched()
+			x++
+		}
+		return x != 3
+	}
+	sres := ExploreWith(1, ExploreOptions{Mode: DPOR}, seq)
+	if sres.Uninstrumented || !sres.Exhausted {
+		t.Fatalf("sequential SUT: Uninstrumented=%v Exhausted=%v, want false/true (sequentiality is not invisibility)", sres.Uninstrumented, sres.Exhausted)
+	}
+
+	// A manual-hook SUT (the 802-sweep's shape): events fire, the
+	// completeness claim stands, Uninstrumented stays false.
+	hooked := func() bool {
+		x := 0
+		done := make(chan struct{}, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				dstAccessYield(unsafe.Pointer(&x), false)
+				v := x
+				dstAccessYield(unsafe.Pointer(&x), true)
+				x = v + 1
+				done <- struct{}{}
+			}()
+		}
+		<-done
+		<-done
+		return x != 2
+	}
+	hres := ExploreWith(1, ExploreOptions{Mode: DPOR}, hooked)
+	if hres.Uninstrumented {
+		t.Fatalf("manual-hook SUT: Uninstrumented = true, want false: %+v", hres)
+	}
+	if len(hres.Failures) == 0 {
+		t.Fatalf("manual-hook lost update not found: %+v", hres)
+	}
+}

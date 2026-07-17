@@ -31,6 +31,27 @@ import (
 // the per-run yield magnitude, read via dstAccessYieldFP.
 var dstAccessYieldPoints uint64
 
+// dstLevel2Events counts yield-context Level-2 dependency events —
+// accesses, sync decisions, atomic announces (size != 0) — never
+// dstYieldPoint's size-0 pure scheduling yields. (The restricted-context
+// commit path records without incrementing; every caller able to reach
+// it is race-build-gated today, where the counter is unused.) The DPOR
+// completeness downgrade (ExploreResult.Uninstrumented) keys on this:
+// zero events across an exploration in a non-race build means
+// dependencies were invisible, not absent. Monotone; never reset
+// (consumers take deltas).
+var dstLevel2Events uint64
+
+// dstMultiChoicePoints counts scheduled-strategy decisions whose
+// simulation candidate set held MORE THAN ONE goroutine — the exploration
+// actually had a concurrency choice to make. The Uninstrumented downgrade
+// requires a nonzero delta here too: a genuinely sequential SUT (never two
+// co-enabled simulation goroutines) fires no Level-2 events AND no
+// multi-choice decisions, and its single-schedule exhaustion claim is
+// sound at the yield-granularity tree — downgrading it would conflate
+// sequentiality with invisibility. Monotone; never reset.
+var dstMultiChoicePoints uint64
+
 const (
 	dstFilterMaxClockProcs  = 1024
 	dstFilterMaxSyncObjects = 1024
@@ -85,6 +106,9 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 		return
 	}
 	seq := dstEnsureSeq(gp)
+	if size != 0 {
+		dstLevel2Events++
+	}
 	gp.dstAccCount++
 	pc = dstAccessPCKey(pc)
 	auto := filter && raceenabled
@@ -239,6 +263,12 @@ func dstYieldPoint() {
 
 //go:linkname dstAccessYieldFP
 func dstAccessYieldFP() uint64 { return dstAccessYieldPoints }
+
+//go:linkname dstLevel2EventsFP
+func dstLevel2EventsFP() uint64 { return dstLevel2Events }
+
+//go:linkname dstMultiChoicePointsFP
+func dstMultiChoicePointsFP() uint64 { return dstMultiChoicePoints }
 
 //go:linkname dstAccessYieldReset
 func dstAccessYieldReset() { dstAccessYieldPoints = 0 }
@@ -1274,6 +1304,9 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 		}
 	}
 	simTotal := c.simCount(total)
+	if simTotal > 1 {
+		dstMultiChoicePoints++ // a real concurrency choice existed (see var doc)
+	}
 	if simTotal == 1 && dstLastDecisionSingleton {
 		for k := uint32(0); k < total; k++ {
 			gp := c.at(k)

@@ -358,6 +358,18 @@ mutex is sound and is exactly the interleaving Gap A needs.
   rendezvous-order SUTs), the DPOR explored *outcome set* equals brute-force `exhaustiveExplore` for
   every member (802 SUTs — the original 290 plus the atomic, atomic-plain-mixed, multi-way, and two-variable-mixed families — mutation-tested: 23 of the original family fail with `dstSyncAcquire` neutered; 411 fail with `dstAtomicYield` neutered). The committed
   micro-SUTs (`TestDSTExploreComplete` etc.) are the weak per-shape net this generalizes.
+  *Instrumentation floor (the claim's visibility precondition):* the invariant quantifies over
+  dependencies the build can SEE. In a build without the dst-race auto-instrumentation, a DPOR
+  exploration that fires no Level-2 event at all — no compiler access hook, no runtime sync hook,
+  no manual `dstAccessYield`/`dstSyncAcquire` — cannot distinguish independence from invisibility:
+  a SUT conflicting only through channels the build cannot observe (plain memory, mmap'd shared
+  pages, the simulated filesystem) collapses into one class. `ExploreResult.Uninstrumented` then
+  reports it and `Exhausted` is downgraded to false rather than claiming a completeness the build
+  cannot establish (keyed on the runtime's `dstLevel2Events` delta, which counts recorded accesses,
+  sync decisions, and atomic announces but never `dstYieldPoint`'s size-0 scheduling yields —
+  enforced by `TestDPORUninstrumentedDowngrade`, both builds). Manual-hook SUTs (the sweep's shape)
+  fire events and keep their claims; Exhaustive mode is unaffected — its exhaustion claim is over
+  the runtime-yield-granularity schedule tree and does not depend on dependency visibility.
 - **Hardening clauses.** Four consequences of the above, made explicit because each was violable in
   detail while the headline invariant read as satisfied (enforcement noted per clause):
   1. **Every capacity that can drop recorded information reports itself.** The sync-HB-event buffer is
