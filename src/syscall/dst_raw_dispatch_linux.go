@@ -112,6 +112,24 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 			return 0, 0, false // a host descriptor: the fence decides
 		}
 		return dstRawFD(trap, int(a1), a2)
+	case SYS_FALLOCATE:
+		// fallocate(fd, mode, offset, len) — the preallocation call WAL-shaped
+		// stores reach through unix.Fallocate. The trampoline shapes differ by
+		// word size: 64-bit arches pass (fd, mode, off, len); 32-bit split off
+		// and len into lo/hi register pairs (x/sys and the named wrapper agree).
+		// Register tests and arithmetic only — nosplit-safe — before the
+		// splittable helper.
+		if a1 < dstVirtualFDBase || a1 >= dstVirtualFDBase+dstVirtualFDCount {
+			return 0, 0, false // a host descriptor: the fence decides
+		}
+		var off, length int64
+		if goarch.PtrSize == 8 {
+			off, length = int64(a3), int64(a4)
+		} else {
+			off = int64(uint64(a3) | uint64(a4)<<32)
+			length = int64(uint64(a5) | uint64(a6)<<32)
+		}
+		return dstRawFallocate(int(a1), int(a2), off, length)
 	}
 	// Everything else on a virtual fd — read/write/pread/pwrite/lseek/fstat —
 	// stays fenced at the raw boundary. Their argument shapes are not uniform
@@ -173,6 +191,19 @@ func dstRawFD(trap uintptr, fd int, a2 uintptr) (r1 uintptr, err Errno, handled 
 		}
 	}
 	dstSyscallRefuse(trap)
+	return 0, 0, true
+}
+
+// dstRawFallocate performs a preallocation on a virtual descriptor. Like
+// dstRawFD it never falls through: the number lies in the reserved range, so
+// the operation is the simulation's whatever the hook answers.
+//
+//go:noinline
+func dstRawFallocate(fd int, mode int, off, length int64) (r1 uintptr, err Errno, handled bool) {
+	if e, ok := dstTryFallocate(fd, mode, off, length); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(SYS_FALLOCATE)
 	return 0, 0, true
 }
 

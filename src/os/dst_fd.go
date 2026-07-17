@@ -51,6 +51,9 @@ func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
 //go:linkname dstSetRenameat2Hook syscall.dstSetRenameat2Hook
 func dstSetRenameat2Hook(func(oldpath, newpath string, flags int) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetFallocateHook syscall.dstSetFallocateHook
+func dstSetFallocateHook(func(fd int, mode int, off, length int64) (err syscall.Errno, handled bool))
+
 //go:linkname dstSetFutexHook syscall.dstSetFutexHook
 func dstSetFutexHook(func(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err syscall.Errno, handled bool))
 
@@ -66,6 +69,7 @@ func init() {
 	dstSetFdatasyncHook(dstFDFdatasync)
 	dstSetFlockHook(dstFDFlock)
 	dstSetRenameat2Hook(dstRenameat2)
+	dstSetFallocateHook(dstFDFallocate)
 	dstSetFutexHook(dstFutexOp)
 }
 
@@ -418,6 +422,33 @@ func dstFDClose(fd int) (syscall.Errno, bool) {
 	dstReleaseBackendFDs(entry.backend)
 	dstDropClosedNode(entry.backend)
 	return 0, true
+}
+
+// dstFDFallocate backs the SYS_FALLOCATE dispatch (unix.Fallocate and
+// syscall.Fallocate — one operation through the trampolines). vfs_fallocate's
+// gate order: write access first (EBADF), then the file-type checks; a
+// procfs-overlay fd answers EOPNOTSUPP (a filesystem without an ->fallocate
+// op), and the mode allowlist lives with the tree backend.
+func dstFDFallocate(fd int, mode int, off, length int64) (syscall.Errno, bool) {
+	entry, handled, errno := dstFDLookup(fd)
+	if !handled || errno != 0 {
+		return errno, handled
+	}
+	f, ok := entry.backend.(*dstFile)
+	if !ok {
+		// The proc overlay is the only other fd-minting backend, and it is
+		// read-only: FMODE_WRITE loses before procfs's missing ->fallocate
+		// could answer, so every reachable proc fd is EBADF (argument gates
+		// still come first, as in the tree backend).
+		if off < 0 || length <= 0 {
+			return syscall.EINVAL, true
+		}
+		if mode&^dstFallocSupportedMask != 0 {
+			return syscall.EOPNOTSUPP, true
+		}
+		return syscall.EBADF, true
+	}
+	return dstFDErr(f.fallocate(mode, off, length)), true
 }
 
 // dstRenameat2 backs the raw SYS_RENAMEAT2 dispatch (the x/sys/unix

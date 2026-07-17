@@ -1752,6 +1752,77 @@ func (d *dstFile) truncate(size int64) error {
 	return d.node.truncateLocked(size)
 }
 
+// fallocate backs fallocate(2) mode 0 — preallocation, the WAL warmed-segment
+// idiom (allocate the file's full span up front, write into place, fdatasync).
+// In the logical-bytes model allocation IS size: mode 0 with offset+len past
+// EOF grows the file there (zeros — what a read of never-written preallocated
+// blocks returns), checked against the disk capacity all-or-nothing first (a
+// real fallocate's reason to exist is failing ENOSPC up front rather than
+// mid-write; it allocates nothing when it refuses). A span inside the current
+// size is a no-op — in-range blocks are always "allocated" here, the recorded
+// logical-bytes/sparse boundary the ENOSPC fault documents. The growth is a
+// mutation like truncate-grow: durable only after a sync, and the crash tear's
+// intermediate-size draws apply to it. Gate order is vfs_fallocate's
+// (fs/open.c, host-probed): arguments (EINVAL); then modes OUTSIDE
+// FALLOC_FL_SUPPORTED_MASK (EOPNOTSUPP — the vfs's own pre-access gate);
+// then write access (EBADF — which also covers directories, never
+// writable) and file type (a device answers ENODEV); then IN-mask modes
+// this filesystem does not implement (EOPNOTSUPP — the capability gate,
+// which on a real kernel sits with the fs op, AFTER access: a read-only fd
+// with KEEP_SIZE is EBADF, not EOPNOTSUPP); then the span check (EFBIG).
+// Only mode 0 is modeled.
+//
+// dstFallocSupportedMask is FALLOC_FL_SUPPORTED_MASK: KEEP_SIZE |
+// PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE.
+// Bits outside it are refused before the access checks, as the vfs does.
+const dstFallocSupportedMask = 0x7B
+
+func (d *dstFile) fallocate(mode int, off, length int64) error {
+	d.diskDelay()
+	if err := d.enter(); err != nil {
+		return err
+	}
+	defer d.leave()
+	if off < 0 || length <= 0 {
+		return syscall.EINVAL
+	}
+	if mode&^dstFallocSupportedMask != 0 {
+		return syscall.EOPNOTSUPP
+	}
+	if !d.wr {
+		return syscall.EBADF
+	}
+	if d.node.isDevice() {
+		return syscall.ENODEV
+	}
+	if mode != 0 {
+		return syscall.EOPNOTSUPP
+	}
+	newSize := off + length
+	if newSize < 0 {
+		// off and length are both non-negative here, so a negative sum is
+		// int64 overflow: the span passes the filesystem's maximum file size.
+		return syscall.EFBIG
+	}
+	if err := d.diskEIO(); err != nil {
+		return err
+	}
+	cur := int64(len(d.node.data))
+	if newSize <= cur {
+		return nil // in-range blocks are allocated by construction (logical bytes)
+	}
+	if d.disk.capped {
+		// Overflow-safe: capacity and resident are both non-negative, so the
+		// subtraction cannot wrap — summing resident with a near-MaxInt64
+		// growth CAN, and a wrapped sum once turned this refusal into a
+		// mapping-region fatal (review-caught, reproducer pinned).
+		if newSize-cur > d.disk.capacity-d.disk.residentLocked() {
+			return syscall.ENOSPC // refused whole: a failed fallocate allocates nothing
+		}
+	}
+	return d.node.truncateLocked(newSize)
+}
+
 // sync commits the durable image (the durability contract's commit points):
 // for a file, the current content and metadata; for a directory, the current
 // entry set (entry durability is the parent directory's property — POSIX's

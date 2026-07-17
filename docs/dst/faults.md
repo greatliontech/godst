@@ -671,7 +671,8 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   where a real disk at the same quota has all blocks free (a false-positive window); (b) a write
   INTO a hole is a no-growth overwrite and is never charged, so filling preallocated holes
   succeeds where a really-full disk would `ENOSPC` on block allocation (the paired false-negative
-  window); and (c) truncate GROWTH is charged to usage but not itself checked against the cap —
+  window); and (c) truncate GROWTH is charged to usage but not itself checked against the cap
+  (fallocate growth, by contrast, IS checked — failing ENOSPC up front is that call's purpose) —
   the disk silently enters the over-quota state, after which growth and creates fail until enough
   is freed. Closing the window needs allocation-granular (extent/hole-aware) accounting — charge
   on materialization, check truncate growth — a capacity-model rebuild, not an accounting-formula

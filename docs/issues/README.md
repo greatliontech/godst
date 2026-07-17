@@ -25,6 +25,15 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   quirk) exercised in-simulation. `os.Link` currently answers the
   unsupported-FS refusal; clients degrade to their rename fallback,
   which the modeled renameat2 serves.
+- **s_maxbytes model (huge-file refusal)** — Lands: when a SUT needs
+  max-file-size refusal semantics in-simulation. The FS models no
+  s_maxbytes: a huge size growth that reaches the page-cache mapping
+  reserve dies with a runtime fatal where a real kernel answers
+  EFBIG/ENOSPC. Reachable via `Truncate(1<<45)` on ANY disk (truncate
+  growth is not cap-checked — faults.md, ENOSPC item (c)) and via
+  `fallocate` on an uncapped disk (a capped disk's fallocate refuses
+  ENOSPC first). The honest fix is an s_maxbytes bound checked at every
+  size-growth site, answering EFBIG as vfs does.
 - **per-boot host identity (`/proc/sys/kernel/random/boot_id` + boottime
   reset)** — Lands: when a client needs cross-reboot epoch invalidation
   testable in-sim. The procfs overlay models no `/proc/sys` surface; host

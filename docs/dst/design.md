@@ -786,8 +786,15 @@ syscalls before they can reach the host. The **raw boundary dispatches a settled
 reaches the kernel through `golang.org/x/sys/unix` (whose asm enters `syscall.Syscall`/`Syscall6`
 directly, never the named wrappers) gets the same modeled behavior for the file barriers (`fsync`,
 `fdatasync`), advisory locking (`flock`), descriptor `close`, the mapping operations (`madvise`,
-`mprotect`, `munmap`), and `renameat2` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one
-operation, not two. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
+`mprotect`, `munmap`), `renameat2`, and `fallocate` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one
+operation, not two. `fallocate` dispatches mode 0 (preallocation, the WAL warmed-segment idiom):
+in the logical-bytes model allocation IS size, so a span past EOF grows the file with zeros,
+checked all-or-nothing against the disk capacity up front (failing `ENOSPC` before any write is
+the call's reason to exist), durable only after a sync like any growth; a span inside the current
+size is a no-op (the recorded logical-bytes/sparse boundary); every other mode — `KEEP_SIZE`,
+`PUNCH_HOLE`, `ZERO_RANGE` — answers `EOPNOTSUPP`, the kernel's shape for a filesystem without the
+capability, so degradation ladders see the errno they were written against. The 32-bit trampoline
+shape (off/len as lo/hi register pairs) is decoded per-arch at the dispatch. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
 fd exists — `os.Open(dir).Fd()` — but the model does not resolve renames relative to it, so a
 dirfd-relative form meets the fence) and routes to the modeled
 rename: flags `0` and `RENAME_NOREPLACE` are modeled — `RENAME_NOREPLACE` refuses ANY positive
