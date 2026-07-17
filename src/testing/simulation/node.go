@@ -51,6 +51,9 @@ func dstHostSeededDriftPPB(hostid uint32, maxPPB int64) int64
 //go:linkname dstSetHostIdent runtime.dstSetHostIdent
 func dstSetHostIdent(host uint32, hostname string, numcpu int)
 
+//go:linkname dstBootHost runtime.dstBootHost
+func dstBootHost(host uint32)
+
 //go:linkname dstAllocPid runtime.dstAllocPid
 func dstAllocPid() int32
 
@@ -272,6 +275,12 @@ var nodeReg struct {
 	procs    map[string]uint32
 	nextHost uint32
 	nextProc uint32
+	// down is the machines' powered-off state (CrashHost sets, a Host
+	// re-declaration clears). Owned HERE, not by the net layer, so the
+	// powered-off Process refusal and boot semantics (boot count, boot_id,
+	// uptime-clock origin) hold in binaries that never link net; the net
+	// partition table keeps its own down state for dial blackholing.
+	down map[uint32]bool
 }
 
 var activeProcs struct {
@@ -323,10 +332,29 @@ func nodeRegReset() {
 	nodeReg.procs = make(map[string]uint32)
 	nodeReg.nextHost = 0
 	nodeReg.nextProc = 0
+	nodeReg.down = make(map[uint32]bool)
 	activeProcs.mu.Lock()
 	activeProcs.pids = make(map[uint32][]int32)
 	activeProcs.host = make(map[uint32]uint32)
 	activeProcs.mu.Unlock()
+}
+
+// markHostDown and hostDown maintain the simulation-owned powered-off state
+// (see nodeReg.down). markHostDown tolerates a nil map (a crash fault driven
+// before the first run's nodeRegReset is a documented no-op path).
+func markHostDown(host uint32) {
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	if nodeReg.down == nil {
+		nodeReg.down = make(map[uint32]bool)
+	}
+	nodeReg.down[host] = true
+}
+
+func hostDown(host uint32) bool {
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	return nodeReg.down[host]
 }
 
 func activeProcSet(proc, host uint32, pid int32) {
@@ -446,6 +474,8 @@ func internHostLocked(name string) (host uint32, fresh bool) {
 	nodeReg.nextHost = host
 	nodeReg.hosts[name] = host
 	setHostIdent(host, name, 0)
+	// A fresh host's first declaration is the machine's first boot.
+	dstBootHost(host)
 	return host, true
 }
 
@@ -526,6 +556,17 @@ func Host(name string, config HostConfig, f func()) {
 			}
 			nodeReg.nextHost = hid
 			nodeReg.hosts[name] = hid
+		}
+		// The machine BOOTS on the powered-off→up edge only: its first
+		// declaration, or its first re-declaration after CrashHost. A
+		// re-declaration of a machine that is UP re-establishes the clock but
+		// does not boot — its processes survive, and boot identity (boot_id,
+		// uptime origin) changing under a live process is a state no kernel
+		// shows. After the clock commit, so a rejected declaration stays
+		// state-neutral.
+		if !exists || nodeReg.down[hid] {
+			delete(nodeReg.down, hid)
+			dstBootHost(hid)
 		}
 		setHostIdent(hid, hostname, config.NumCPU)
 		_, curProc := dstCurrentNode()
@@ -773,7 +814,10 @@ func crashHost(name string) {
 	// connect times out at the deadline or retransmit horizon, never
 	// ECONNREFUSED) until a Host re-declaration reboots it. Marked down BEFORE
 	// the listeners close so no teardown ordering can expose a
-	// listener-closed-but-still-alive refusal window.
+	// listener-closed-but-still-alive refusal window. The simulation-owned
+	// powered-off mark (Process refusal, boot-edge detection) is set alongside
+	// net's — one transition drives both.
+	markHostDown(host)
 	dstNetPartitionOp(partOpHostDown, host, 0)
 	dstNetPartitionOp(partOpResetHost, host, 0)
 	dstNetPartitionOp(partOpCloseHostListeners, host, 0)
@@ -861,10 +905,11 @@ func Process(name string, f func()) {
 		if runActive.Load() && activeProcLivesElsewhere(proc, host) {
 			panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
 		}
-		if runActive.Load() && dstNetHostDead(host) {
+		if runActive.Load() && hostDown(host) {
 			// A process cannot run on a powered-off machine. A process restart does
 			// not reboot the host (only a Host re-declaration does — it also
-			// re-establishes the clock).
+			// re-establishes the clock). The powered-off state is simulation-owned
+			// (nodeReg.down), so this refusal holds without net linked.
 			panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
 		}
 		dstProcAllocEnsure(proc)

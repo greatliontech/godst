@@ -310,7 +310,25 @@ func dstVirtualMonotonicNow() (int64, bool) {
 	if gp.bubble == nil {
 		return 0, false
 	}
-	return gp.bubble.now, true
+	// The raw MONOTONIC/BOOTTIME family is a per-host UPTIME clock: base time
+	// rebased to the calling goroutine's host's boot instant, so uptime is 0 at
+	// boot and RESETS at reboot (a pre-reboot stamp reads as the new boot's
+	// future — the real power-cycle relation). A host with no recorded boot
+	// (host 0, or a table not yet allocated) booted at the run epoch, which is
+	// the bubble base time — the same value a boot stamped at run start stores,
+	// so the fallback and a t=0 declaration are indistinguishable by design.
+	base := int64(synctestBaseTime)
+	// The h < dstMaxSimHosts bound is unreachable (interning bounds every
+	// stamped host id) but lets the compiler elide the bounds check: no
+	// panicIndex on this nosplit raw-syscall path.
+	if h := gp.dstHost; h != 0 && h < dstMaxSimHosts {
+		if t := dstHostClock.Load(); t != nil {
+			if b := t.ent[h].bootBase.Load(); b != 0 {
+				base = b
+			}
+		}
+	}
+	return gp.bubble.now - base, true
 }
 
 // dstClockCopyoutG identifies the one goroutine copying a virtual clock value
@@ -378,6 +396,13 @@ type dstHostClockEntry struct {
 	offset   atomic.Int64 // wall skew/step in ns (Skew/BoundedSkew set it, StepClock adds)
 	driftPPB atomic.Int64 // clock-rate departure in parts-per-billion (0 = rate 1); rate = 1 + driftPPB/1e9
 	driftT0  atomic.Int64 // base-time anchor (ns) from which the drift term accumulates
+
+	// Per-BOOT kernel state, alongside the clock because a boot is a clock
+	// event too: the uptime clocks' origin. Written only by dstBootHost (the
+	// powered-off→up edge testing/simulation detects); reset with the table
+	// each run.
+	bootBase  atomic.Int64  // base-time instant of the host's current boot (uptime origin); 0 = never booted → run epoch
+	bootCount atomic.Uint64 // boots this run; 0 = never booted → reads as boot 1
 }
 
 type dstHostClockTable struct {
@@ -1940,6 +1965,74 @@ func dstHostIdentFor(host uint32) (dstHostIdentity, bool) {
 		return t.ent[host], true
 	}
 	return dstHostIdentity{}, false
+}
+
+// dstBootHost records that host BOOTED now: its boot count bumps and its
+// uptime-clock origin (raw CLOCK_MONOTONIC/CLOCK_BOOTTIME) resets to the
+// current base instant. Called by testing/simulation on
+// the powered-off→up edge only — a host's first declaration in the run, or its
+// first Host re-declaration after CrashHost; a clock-only re-declaration of a
+// live machine must NOT reach here (boot identity changing under a live process
+// is a state no kernel shows). Host 0 (the driver's machine) boots implicitly
+// at the run epoch and never re-boots. A no-op outside a bubble, matching the
+// clock-establishment path. Reached via //go:linkname.
+//
+//go:linkname dstBootHost
+func dstBootHost(host uint32) {
+	gp := getg()
+	if host == 0 || gp.bubble == nil {
+		return
+	}
+	dstHostClockEnsure(host)
+	e := &dstHostClock.Load().ent[host]
+	e.bootCount.Add(1)
+	e.bootBase.Store(gp.bubble.now)
+}
+
+// dstHostBootIdent returns the raw material for the calling goroutine's host's
+// per-boot identity (/proc/sys/kernel/random/boot_id): 128 deterministic bits
+// derived from (run seed, host, boot count), plus the host and boot count for
+// per-(host, boot) file identity. Constant within a boot, different per host,
+// per boot, and per seed. A deterministic mix, not cryptographic randomness —
+// the entropy seam is crypto/rand's. ok=false outside an active DST run.
+// Reached from os's synthetic /proc support by //go:linkname.
+//
+//go:linkname dstHostBootIdent
+func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool) {
+	seed := dstSeed.Load()
+	if seed == 0 || getg().bubble == nil {
+		return 0, 0, 0, 0, false
+	}
+	host = getg().dstHost
+	boot = 1
+	if host != 0 {
+		if t := dstHostClock.Load(); t != nil {
+			if c := t.ent[host].bootCount.Load(); c != 0 {
+				boot = c
+			}
+		}
+	}
+	// Domain-separated splitmix64 chain: the constant keeps this derivation
+	// disjoint from the goroutine-randomness tree rooted at the same seed.
+	x := dstSplitmix64(seed ^ 0x626f6f745f696421) // "boot_id!"
+	x = dstSplitmix64(x ^ uint64(host))
+	x = dstSplitmix64(x ^ boot)
+	hi = dstSplitmix64(x)
+	lo = dstSplitmix64(x ^ 0x9e3779b97f4a7c15)
+	return hi, lo, host, boot, true
+}
+
+// dstSplitmix64 is the finalizer of Steele et al.'s splitmix64: a bijective
+// 64-bit mixer with full avalanche, used for deterministic identity derivation
+// (not for the scheduling/randomness streams, which have their own generator).
+func dstSplitmix64(x uint64) uint64 {
+	x += 0x9e3779b97f4a7c15
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // dstAllocPid returns the next per-process pid (deterministic: the Process call

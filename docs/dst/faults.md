@@ -1025,6 +1025,15 @@ victims by whichever home was recorded last and silently spare a pid on the mach
 Different-host validation and live registration are one admission transaction, so concurrent starts
 cannot both publish.
 
+What a reboot regenerates is what a booting *kernel* regenerates: the machine's next `Host`
+declaration after `CrashHost` bumps its boot count, serves a fresh
+`/proc/sys/kernel/random/boot_id`, and resets its uptime-clock origin (raw `CLOCK_MONOTONIC` /
+`CLOCK_BOOTTIME` restart at 0 — a pre-crash stamp reads as the new boot's future, the real
+power-cycle relation; design.md, per-boot host identity). A `Host` re-declaration of a machine that
+is UP re-establishes only its clock — no boot, no new boot_id: its processes survive. The
+powered-off state that gates this is owned by `testing/simulation` (not `net`), so the boot
+semantics and the powered-off `Process` refusal below hold in binaries that never link `net`.
+
 What a reboot keeps is what the *hardware* keeps. The durable image is the disk; the **disk faults** — a
 bad sector (`FailDisk`/`FailFile`), a full disk (`LimitDisk`), a slow device (`SlowDisk`) — are physical
 properties of the media, not of the dead kernel, so a bad disk stays bad across the crash. Metadata
@@ -1051,7 +1060,9 @@ the whole sim.
 torn (host reboot) FS and a clean network — the canonical recovery fault, driven by a SUT supervisor or a
 fault policy (`Crash("p", RestartAfter: 3*s)`). A restarted process gets a **new pid** (a real restart
 always does; there is **no stable-pid option** — the stable identity is the logical name `"p"`, the
-footgun-free contract); `ppid` is `1`/reparented unless a supervision tree is modeled.
+footgun-free contract); `ppid` is `1`/reparented unless a supervision tree is modeled. A `Process`
+restart on a machine `CrashHost` powered off is **refused loudly** — a process cannot run on a dead
+kernel; model the reboot with a `Host` re-declaration first, then restart the processes inside it.
 
 **Soundness boundary (recorded, contractual).** A crash is sound exactly when processes interact *only
 through the simulated network and host filesystem* — the distributed model the whole feature targets. If a

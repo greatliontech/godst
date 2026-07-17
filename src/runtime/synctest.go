@@ -194,6 +194,12 @@ func (bubble *synctestBubble) raceaddr() unsafe.Pointer {
 
 var bubbleGen atomic.Uint64 // bubble ID counter
 
+// synctestBaseTime is the fake clock's origin: the instant a bubble's clock
+// starts at. Package-level (not local to synctestRun) because DST's per-host
+// uptime clocks treat it as the run epoch — the boot instant of a host with no
+// recorded boot (dstVirtualMonotonicNow).
+const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
+
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
 	if debug.asynctimerchan.Load() != 0 {
@@ -210,7 +216,6 @@ func synctestRun(f func()) {
 		running: 1,
 		root:    gp,
 	}
-	const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 	bubble.now = synctestBaseTime
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)

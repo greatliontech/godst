@@ -20,13 +20,23 @@ import (
 //go:linkname dstPidStarttime runtime.dstPidStarttime
 func dstPidStarttime(pid int32) (start uint64, ok bool)
 
+//go:linkname dstHostBootIdent runtime.dstHostBootIdent
+func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool)
+
 const dstProcPIDNamespace = "pid:[1]"
+
+// dstProcBootIDPath is the per-boot host identity leaf: a UUID constant within
+// one boot of the calling goroutine's host, shared by its processes, and
+// regenerated when the machine boots (first declaration, or Host re-declaration
+// after CrashHost) — the cross-boot epoch discriminator. Derived
+// deterministically from (run seed, host, boot count) in the runtime.
+const dstProcBootIDPath = "/proc/sys/kernel/random/boot_id"
 
 // dstProcOpenFile returns a generated procfs file for the small synthetic /proc
 // surface DST supports. It is an overlay, not a disk node: procfs is kernel identity
 // state derived from the runtime pid registry, not mutable filesystem content.
 func dstProcOpenFile(name string, flag int) (*File, bool, error) {
-	data, ident, handled, errno := dstProcStatData(name)
+	data, ident, base, handled, errno := dstProcStatData(name)
 	if !handled {
 		return nil, false, nil
 	}
@@ -36,19 +46,19 @@ func dstProcOpenFile(name string, flag int) (*File, bool, error) {
 	if flag&(O_WRONLY|O_RDWR|O_CREATE|O_TRUNC) != 0 {
 		return nil, true, &PathError{Op: "open", Path: name, Err: syscall.EACCES}
 	}
-	return dstNewFile(&dstProcFile{data: data, name: name, ident: ident}, name), true, nil
+	return dstNewFile(&dstProcFile{data: data, name: name, base: base, ident: ident}, name), true, nil
 }
 
 func dstProcStatName(op, name string) (FileInfo, bool, error) {
-	data, ident, handled, errno := dstProcStatData(name)
+	data, ident, base, handled, errno := dstProcStatData(name)
 	if !handled {
 		return nil, false, nil
 	}
 	if errno != nil {
 		return nil, true, &PathError{Op: op, Path: name, Err: errno}
 	}
-	_ = data // proc stat files report size 0, like Linux procfs.
-	return &dstFileInfo{name: "stat", mode: 0o444, ident: ident}, true, nil
+	_ = data // proc leaves report size 0, like Linux procfs.
+	return &dstFileInfo{name: base, mode: 0o444, ident: ident}, true, nil
 }
 
 func dstProcReadlink(name string) (string, bool, error) {
@@ -59,57 +69,144 @@ func dstProcReadlink(name string) (string, bool, error) {
 	if abs == "" {
 		return "", false, nil
 	}
-	if abs != "/proc/self/ns/pid" {
-		return "", true, &PathError{Op: "readlink", Path: name, Err: dstErrUnsupportedFS}
+	target, errno := dstProcReadlinkAbs(abs)
+	if errno != nil {
+		return "", true, &PathError{Op: "readlink", Path: name, Err: errno}
 	}
-	if _, ok := dstSimGetpid(); !ok {
-		return "", true, &PathError{Op: "readlink", Path: name, Err: syscall.ENOENT}
+	return target, true, nil
+}
+
+// dstProcReadlinkAbs answers readlink for a canonical /proc path, shared by
+// the plain and Root resolvers so the two surfaces cannot diverge: the ns/pid
+// symlink's target; for a MODELED regular leaf (a stat file, boot_id) — not a
+// symlink — the host kernel's answer, EINVAL when the leaf exists and its
+// lookup errno (ENOENT dead pid, ENOTDIR trailing slash on an existing leaf)
+// when it does not; the deterministic unsupported-surface answer elsewhere.
+// A trailing slash on the ns/pid symlink itself takes the lookup-errno route
+// too — the slash forces the resolver past the link, exactly as on the host.
+func dstProcReadlinkAbs(abs string) (string, error) {
+	if abs == "/proc/self/ns/pid" {
+		if _, ok := dstSimGetpid(); !ok {
+			return "", syscall.ENOENT
+		}
+		return dstProcPIDNamespace, nil
 	}
-	return dstProcPIDNamespace, true, nil
+	trimmed := abs
+	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	_, isStat := dstProcStatPID(trimmed)
+	if isStat || trimmed == dstProcBootIDPath || trimmed == "/proc/self/ns/pid" {
+		_, _, _, _, errno := dstProcStatDataAbs(abs)
+		if errno == nil {
+			errno = syscall.EINVAL
+		}
+		return "", errno
+	}
+	return "", dstErrUnsupportedFS
+}
+
+// dstProcLeafExists reports whether the slash-trimmed proc path names a leaf
+// that currently exists: a live pid's stat file, the ns/pid symlink of a live
+// simulated pid, or the boot_id leaf of an active run.
+func dstProcLeafExists(trimmed string) bool {
+	if pidText, ok := dstProcStatPID(trimmed); ok {
+		pid, ok := dstProcResolvePID(pidText)
+		if !ok {
+			return false
+		}
+		_, ok = dstPidStarttime(int32(pid))
+		return ok
+	}
+	if trimmed == "/proc/self/ns/pid" {
+		_, ok := dstSimGetpid()
+		return ok
+	}
+	if trimmed == dstProcBootIDPath {
+		_, _, _, _, ok := dstHostBootIdent()
+		return ok
+	}
+	return false
 }
 
 func dstProcReserved(name string) bool {
 	return dstFSActive() && dstProcAbs(name) != ""
 }
 
-func dstProcStatData(name string) (data []byte, ident string, handled bool, errno error) {
+func dstProcStatData(name string) (data []byte, ident, base string, handled bool, errno error) {
 	abs := dstProcAbs(name)
 	if abs == "" {
-		return nil, "", false, nil
+		return nil, "", "", false, nil
 	}
 	return dstProcStatDataAbs(abs)
 }
 
-func dstProcStatDataAbs(abs string) (data []byte, ident string, handled bool, errno error) {
+func dstProcStatDataAbs(abs string) (data []byte, ident, base string, handled bool, errno error) {
 	if stringslite.HasSuffix(abs, "/") {
-		// A trailing slash asserts directory-ness; on a proc LEAF that exists the
-		// host answers ENOTDIR (the filesystem section's trailing-slash clause),
-		// and ENOENT elsewhere on the unsupported surface.
+		// A trailing slash asserts directory-ness; on a proc LEAF that EXISTS
+		// the host answers ENOTDIR (the filesystem section's trailing-slash
+		// clause), and ENOENT elsewhere — including a leaf-shaped name whose
+		// pid is dead: the kernel resolves the missing entry before the
+		// trailing slash matters.
 		trimmed := abs
 		for len(trimmed) > 0 && trimmed[len(trimmed)-1] == '/' {
 			trimmed = trimmed[:len(trimmed)-1]
 		}
-		if _, ok := dstProcStatPID(trimmed); ok || trimmed == "/proc/self/ns/pid" {
-			return nil, abs, true, syscall.ENOTDIR
+		if dstProcLeafExists(trimmed) {
+			return nil, abs, "", true, syscall.ENOTDIR
 		}
-		return nil, abs, true, syscall.ENOENT
+		return nil, abs, "", true, syscall.ENOENT
+	}
+	if abs == dstProcBootIDPath {
+		hi, lo, host, boot, ok := dstHostBootIdent()
+		if !ok {
+			return nil, abs, "", true, syscall.ENOENT
+		}
+		data, ident := dstProcBootIDContents(hi, lo, host, boot)
+		return data, ident, "boot_id", true, nil
 	}
 	pidText, ok := dstProcStatPID(abs)
 	if !ok {
-		return nil, abs, true, syscall.ENOENT
+		return nil, abs, "", true, syscall.ENOENT
 	}
 	pid, ok := dstProcResolvePID(pidText)
 	if !ok {
-		return nil, abs, true, syscall.ENOENT
+		return nil, abs, "", true, syscall.ENOENT
 	}
 	start, ok := dstPidStarttime(int32(pid))
 	if !ok {
-		return nil, abs, true, syscall.ENOENT
+		return nil, abs, "", true, syscall.ENOENT
 	}
 	// The identity is the CANONICAL pid form, so /proc/self/stat and
 	// /proc/<own-pid>/stat are one file to SameFile, as they are one inode on
 	// the host.
-	return []byte(dstProcStatContents(pid, start)), "/proc/" + strconv.Itoa(pid) + "/stat", true, nil
+	return []byte(dstProcStatContents(pid, start)), "/proc/" + strconv.Itoa(pid) + "/stat", "stat", true, nil
+}
+
+// dstProcBootIDContents renders the boot_id leaf: the canonical lowercase
+// 8-4-4-4-12 UUID text plus newline, exactly the host kernel's shape, with RFC
+// 4122 version-4 and variant bits set over the deterministic 128-bit material.
+// The SameFile identity is per (host, boot): each boot mounts a fresh procfs
+// instance, and two machines never share one.
+func dstProcBootIDContents(hi, lo uint64, host uint32, boot uint64) (data []byte, ident string) {
+	var b [16]byte
+	for i := 0; i < 8; i++ {
+		b[i] = byte(hi >> (56 - 8*i))
+		b[8+i] = byte(lo >> (56 - 8*i))
+	}
+	b[6] = 0x40 | b[6]&0x0f // version 4
+	b[8] = 0x80 | b[8]&0x3f // variant 10
+	const hexdig = "0123456789abcdef"
+	out := make([]byte, 0, 37)
+	for i, c := range b {
+		switch i {
+		case 4, 6, 8, 10:
+			out = append(out, '-')
+		}
+		out = append(out, hexdig[c>>4], hexdig[c&0xf])
+	}
+	out = append(out, '\n')
+	return out, dstProcBootIDPath + "#h" + strconv.Itoa(int(host)) + "#b" + strconv.FormatUint(boot, 10)
 }
 
 func dstProcStatPID(abs string) (string, bool) {
@@ -237,6 +334,9 @@ func dstProcStackIsLeaf(stack []string) bool {
 	if len(stack) == 3 && stack[0] == "proc" && stack[2] == "stat" {
 		return true
 	}
+	if len(stack) == 5 && stack[0] == "proc" && stack[1] == "sys" && stack[2] == "kernel" && stack[3] == "random" && stack[4] == "boot_id" {
+		return true
+	}
 	return len(stack) == 4 && stack[0] == "proc" && stack[1] == "self" && stack[2] == "ns" && stack[3] == "pid"
 }
 
@@ -244,6 +344,7 @@ type dstProcFile struct {
 	mu     sync.Mutex
 	data   []byte
 	name   string
+	base   string // leaf base name ("stat", "boot_id") — the FileInfo.Name
 	ident  string
 	off    int64
 	closed bool
@@ -369,7 +470,7 @@ func (f *dstProcFile) stat() (FileInfo, error) {
 	if f.closed {
 		return nil, poll.ErrFileClosing
 	}
-	return &dstFileInfo{name: "stat", mode: 0o444, ident: f.ident}, nil
+	return &dstFileInfo{name: f.base, mode: 0o444, ident: f.ident}, nil
 }
 
 func (f *dstProcFile) closeFile() error {

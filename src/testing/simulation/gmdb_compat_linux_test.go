@@ -697,3 +697,57 @@ func TestDSTGMDBNotifyFutex(t *testing.T) {
 		})
 	})
 }
+
+// TestDSTGMDBBootEpoch walks the database's cross-boot epoch-invalidation
+// pattern end-to-end: a writer stamps the boot epoch
+// (/proc/sys/kernel/random/boot_id) and a CLOCK_BOOTTIME heartbeat into shared
+// state; the host loses power and reboots; the successor reads a DIFFERENT
+// boot_id (its epoch reset fires) while the dead writer's heartbeat stamp
+// reads as the new boot's FUTURE — under the database's future-stamps-are-
+// fresh guard that heartbeat never ages out, which is exactly why the boot
+// epoch, not the heartbeat, must recover cross-boot staleness.
+func TestDSTGMDBBootEpoch(t *testing.T) {
+	var epoch1, epoch2 string
+	var heartbeat1, now2 int64
+
+	Run(11, func() {
+		Host("db", HostConfig{}, func() {
+			Process("writer", func() {
+				b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+				if err != nil {
+					t.Fatalf("boot_id: %v", err)
+				}
+				epoch1 = string(b)
+				sleepMillis(50)
+				hb, err := rawClockGettime(clockBoottime)
+				if err != nil {
+					t.Fatalf("CLOCK_BOOTTIME: %v", err)
+				}
+				heartbeat1 = hb
+			})
+		})
+		CrashHost("db")
+		sleepMillis(10)
+		Host("db", HostConfig{}, func() {
+			Process("writer", func() {
+				b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+				if err != nil {
+					t.Fatalf("boot_id after reboot: %v", err)
+				}
+				epoch2 = string(b)
+				n, err := rawClockGettime(clockBoottime)
+				if err != nil {
+					t.Fatalf("CLOCK_BOOTTIME after reboot: %v", err)
+				}
+				now2 = n
+			})
+		})
+	})
+
+	if epoch1 == "" || epoch2 == "" || epoch1 == epoch2 {
+		t.Fatalf("boot epochs %q / %q, want distinct non-empty (the cross-boot reset must fire)", epoch1, epoch2)
+	}
+	if heartbeat1 <= now2 {
+		t.Fatalf("pre-crash heartbeat %d <= post-reboot now %d, want the stamp in the new boot's future (heartbeat aging cannot recover cross-boot staleness)", heartbeat1, now2)
+	}
+}

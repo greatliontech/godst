@@ -114,6 +114,88 @@ func TestDSTClockGettimeVirtualMonotonic(t *testing.T) {
 	}
 }
 
+// TestDSTClockUptimePerHostBoot pins the raw clock family's uptime semantics:
+// CLOCK_MONOTONIC/CLOCK_BOOTTIME are per-host uptime clocks — 0 at boot (the
+// run epoch for the root machine, the declaration instant for a declared one),
+// advancing with virtual time, equal to each other, and RESET by a reboot, so
+// a pre-crash stamp reads as the new boot's future (the real power-cycle
+// relation cross-boot epoch invalidation exists to catch).
+func TestDSTClockUptimePerHostBoot(t *testing.T) {
+	var rootU0, rootU1, hostMono0, hostBoot0, preCrash, postBoot, postBoot2 int64
+	var skewU0, skewU1, driftU0, driftU1 int64
+	read := func(clockid uintptr) int64 {
+		ts, err := dstRawClockGettime(clockid)
+		if err != 0 {
+			t.Fatalf("clock_gettime(%d) errno = %v", clockid, err)
+		}
+		return dstTimespecNsec(ts)
+	}
+
+	simulation.Run(9, func() {
+		rootU0 = read(dstClockMonotonic)
+		time.Sleep(5 * time.Second)
+		rootU1 = read(dstClockMonotonic)
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			hostMono0 = read(dstClockMonotonic)
+			hostBoot0 = read(dstClockBoottime)
+			time.Sleep(2 * time.Second)
+			preCrash = read(dstClockBoottime)
+		})
+		simulation.CrashHost("h")
+		time.Sleep(3 * time.Second)
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			postBoot = read(dstClockBoottime)
+			time.Sleep(1 * time.Second)
+			postBoot2 = read(dstClockBoottime)
+		})
+		// Wall skew and drift never move the uptime clocks (neither raw clock
+		// is settable on Linux): a skewed host's uptime still starts at 0 and
+		// a drifting host's uptime advances in BASE time — its own Sleep(2s)
+		// (host-perceived) waits out ceil(2s/rate) of base time, the timer
+		// remap's documented rounding, not 2s.
+		simulation.Host("skewed", simulation.HostConfig{Clock: simulation.Skew(9 * time.Hour)}, func() {
+			skewU0 = read(dstClockMonotonic)
+			time.Sleep(1 * time.Second)
+			skewU1 = read(dstClockBoottime)
+		})
+		simulation.Host("drifty", simulation.HostConfig{Clock: simulation.Drift(500_000_000)}, func() { // rate 1.5
+			driftU0 = read(dstClockMonotonic)
+			time.Sleep(2 * time.Second)
+			driftU1 = read(dstClockMonotonic)
+		})
+	})
+
+	if rootU0 != 0 {
+		t.Fatalf("root uptime at run entry = %d, want 0 (the run body's machine boots at the run epoch)", rootU0)
+	}
+	if rootU1 != int64(5*time.Second) {
+		t.Fatalf("root uptime after 5s = %d, want %d", rootU1, int64(5*time.Second))
+	}
+	if hostMono0 != 0 || hostBoot0 != 0 {
+		t.Fatalf("declared host uptime at boot = mono %d boot %d, want 0/0", hostMono0, hostBoot0)
+	}
+	if preCrash != int64(2*time.Second) {
+		t.Fatalf("host uptime after 2s = %d, want %d", preCrash, int64(2*time.Second))
+	}
+	if postBoot != 0 {
+		t.Fatalf("host uptime after reboot = %d, want 0 (the reboot resets the uptime origin)", postBoot)
+	}
+	if postBoot2 != int64(1*time.Second) {
+		t.Fatalf("host uptime 1s after reboot = %d, want %d", postBoot2, int64(1*time.Second))
+	}
+	if preCrash <= postBoot2 {
+		t.Fatalf("pre-crash stamp %d <= post-reboot reading %d, want the stamp in the new boot's future", preCrash, postBoot2)
+	}
+	if skewU0 != 0 || skewU1 != int64(1*time.Second) {
+		t.Fatalf("skewed host uptime = %d then %d, want 0 then %d (wall skew never moves the uptime clocks)", skewU0, skewU1, int64(1*time.Second))
+	}
+	// ceil(2s · 1e9 / 1.5e9): the host-perceived 2s sleep in base time.
+	const driftBaseSpan = 1_333_333_334
+	if driftU0 != 0 || driftU1 != driftBaseSpan {
+		t.Fatalf("drifting host uptime = %d then %d, want 0 then %d (uptime advances in base time; drift never scales it)", driftU0, driftU1, int64(driftBaseSpan))
+	}
+}
+
 func TestDSTClockGettimeInvalidPointers(t *testing.T) {
 	runDSTClockInvalidPointerForms(t, syscall.SYS_CLOCK_GETTIME, unsafe.Sizeof(syscall.Timespec{}))
 }

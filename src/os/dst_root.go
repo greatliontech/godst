@@ -267,14 +267,14 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 	defer dstFS.mu.Unlock()
 	wrap := func(e error) (*File, error) { return nil, &PathError{Op: "openat", Path: name, Err: e} }
 	if abs := dstRootProcAbsLocked(r, name); abs != "" {
-		data, ident, _, errno := dstProcStatDataAbs(abs)
+		data, ident, base, _, errno := dstProcStatDataAbs(abs)
 		if errno != nil {
 			return wrap(errno)
 		}
 		if flag&(O_WRONLY|O_RDWR|O_CREATE|O_TRUNC) != 0 {
 			return wrap(syscall.EACCES)
 		}
-		f := dstNewFile(&dstProcFile{data: data, name: joinPath(root.Name(), name), ident: ident}, joinPath(root.Name(), name))
+		f := dstNewFile(&dstProcFile{data: data, name: joinPath(root.Name(), name), base: base, ident: ident}, joinPath(root.Name(), name))
 		f.inRoot = true
 		return f, nil
 	}
@@ -355,11 +355,11 @@ func dstRootStat(root *Root, name string, lstat bool) (FileInfo, error) {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if abs := dstRootProcAbsLocked(r, name); abs != "" {
-		_, ident, _, errno := dstProcStatDataAbs(abs)
+		_, ident, base, _, errno := dstProcStatDataAbs(abs)
 		if errno != nil {
 			return nil, &PathError{Op: "statat", Path: name, Err: errno}
 		}
-		return &dstFileInfo{name: "stat", mode: 0o444, ident: ident}, nil
+		return &dstFileInfo{name: base, mode: 0o444, ident: ident}, nil
 	}
 	_, base, node, _, errno := dstRootResolveLocked(r, name)
 	if errno != nil {
@@ -387,13 +387,11 @@ func dstRootReadlink(root *Root, name string) (string, error) {
 	if abs == "" {
 		return "", &PathError{Op: "readlinkat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	if abs != "/proc/self/ns/pid" {
-		return "", &PathError{Op: "readlinkat", Path: name, Err: dstErrUnsupportedFS}
+	target, errno := dstProcReadlinkAbs(abs)
+	if errno != nil {
+		return "", &PathError{Op: "readlinkat", Path: name, Err: errno}
 	}
-	if _, ok := dstSimGetpid(); !ok {
-		return "", &PathError{Op: "readlinkat", Path: name, Err: syscall.ENOENT}
-	}
-	return dstProcPIDNamespace, nil
+	return target, nil
 }
 
 func dstRootChmod(root *Root, name string, mode FileMode) error {
