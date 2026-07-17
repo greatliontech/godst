@@ -51,6 +51,9 @@ func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
 //go:linkname dstSetRenameat2Hook syscall.dstSetRenameat2Hook
 func dstSetRenameat2Hook(func(oldpath, newpath string, flags int) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetFutexHook syscall.dstSetFutexHook
+func dstSetFutexHook(func(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err syscall.Errno, handled bool))
+
 func init() {
 	dstSetReadHook(dstFDRead)
 	dstSetWriteHook(dstFDWrite)
@@ -63,6 +66,7 @@ func init() {
 	dstSetFdatasyncHook(dstFDFdatasync)
 	dstSetFlockHook(dstFDFlock)
 	dstSetRenameat2Hook(dstRenameat2)
+	dstSetFutexHook(dstFutexOp)
 }
 
 type dstFDEntry struct {

@@ -795,6 +795,28 @@ target with `EEXIST`, including the same-node case, ahead of the same-file no-op
 lookup order) — while `RENAME_EXCHANGE`/`RENAME_WHITEOUT` (and unknown bits) answer `EINVAL`, the
 kernel's own shape for a filesystem without the capability, so a caller's degradation ladder sees
 the errno it was written against.
+`SYS_FUTEX` dispatches the SHARED `FUTEX_WAIT`/`FUTEX_WAKE` pair on `MAP_SHARED` file pages — the
+cross-process wait primitive a database parks notification waiters on. The futex word is ordinary
+shared page-cache memory; the model supplies what the kernel supplies: a wait-queue keyed by the
+word's cross-mapping identity (file node, byte offset — the FUTEX_SHARED key), with the value
+check and the enqueue atomic against a wake's dequeue (the hash-bucket lock), so a peer's
+store-then-wake between a waiter's load and its park is never lost. Wakes are FIFO in park order —
+deterministic under the seed; a WAIT's relative timespec runs on the bubble's virtual clock
+(`ETIMEDOUT`, with a wake racing the timeout resolving to woken); a mismatched value answers
+`EAGAIN`; an unaligned word `EINVAL`; a crashed process's parked waiters leave the queue at
+teardown (kernel exit semantics — a later `FUTEX_WAKE(1)` never spends its wake on a dead waiter).
+A word on an
+unbacked page (a reservation window past EOF, a hole a truncate cut) answers `EFAULT` from WAIT and
+WAKE alike, host-probed — page-granular, like the kernel's
+reachability. The value check reads the word through the harness page-cache view under the tree
+lock — a SUT `mprotect(PROT_NONE)` on its own view does not affect the wait (a recorded divergence:
+the kernel would answer `EFAULT`), a racing truncate is serialized out, and no load under the queue
+lock can ever fault, so a fault can never wedge it. `FUTEX_WAKE`
+with `val <= 0` still wakes one waiter (the kernel wakes before it checks the count; host-probed
+for zero and negative). A HOST crash drops the dead machine's waiters outright — a reboot destroys
+the kernel's in-memory queues even though the durable file node, the queue key, survives the
+restore. `FUTEX_PRIVATE_FLAG` forms, every other futex op, and an address outside the calling
+process's simulated mappings meet the fence.
 "Split-safe" is the constraint that fixes the set: the dispatch allocates and takes locks, so it can grow
 the stack, which is fatal once a trampoline has called `entersyscall` (no P) — `Syscall`/`Syscall6` fence
 BEFORE that and therefore dispatch, while `RawSyscall`/`RawSyscall6` (reached post-`entersyscall`, and

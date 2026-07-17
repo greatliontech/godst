@@ -29,6 +29,7 @@ func dstApplyProcessTeardown(proc uint32) {
 	dstCloseProcFiles(proc)
 	dstReleaseProcFDs(proc)
 	dstMMapReleaseProc(proc)
+	dstFutexTeardownProc(proc)
 	dstApplyProcessStateTeardown(proc)
 }
 

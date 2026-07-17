@@ -74,6 +74,22 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 		}
 		return dstRawRenameat2((*byte)(unsafe.Pointer(a2)), (*byte)(unsafe.Pointer(a4)), a5)
 	}
+	if trap == SYS_FUTEX {
+		// futex(uaddr, op, val, timeout, uaddr2, val3): only the SHARED
+		// FUTEX_WAIT / FUTEX_WAKE forms are the simulation's — PRIVATE and
+		// every other op fall through to the fence. A nil address names no
+		// mapping (the fence decides); the timespec pointer converts here,
+		// in nosplit code, like every dispatched pointer.
+		op := int(a2)
+		if (op != 0 && op != 1) || a1 == 0 {
+			return 0, 0, false
+		}
+		var ts *Timespec
+		if a4 != 0 {
+			ts = (*Timespec)(unsafe.Pointer(a4))
+		}
+		return dstRawFutex((*uint32)(unsafe.Pointer(a1)), op, uint32(a3), ts)
+	}
 	switch trap {
 	case SYS_MADVISE, SYS_MPROTECT, SYS_MUNMAP:
 		// A zero-length range names no mapping, so neither its address nor the
@@ -222,3 +238,33 @@ var dstSysRenameat2 = func() uintptr {
 	}
 	panic("dst: renameat2 number unknown for " + goarch.GOARCH)
 }()
+
+// dstRawFutex performs a shared FUTEX_WAIT/FUTEX_WAKE the simulation owns.
+// Like the other noinline helpers it never falls through after the arm has
+// claimed the operation — an address outside the caller's simulated
+// mappings, or a hook miss, issues the fence's refusal here. A WAIT's
+// relative timespec converts to bubble-clock nanoseconds; malformed
+// timespecs answer EINVAL, as futex(2) does.
+//
+//go:noinline
+func dstRawFutex(addr *uint32, op int, val uint32, ts *Timespec) (r1 uintptr, err Errno, handled bool) {
+	var timeoutNs int64
+	hasTimeout := false
+	if op == 0 && ts != nil {
+		sec, nsec := int64(ts.Sec), int64(ts.Nsec)
+		if sec < 0 || nsec < 0 || nsec >= 1e9 {
+			return 0, EINVAL, true
+		}
+		const maxSec = int64(1) << 33 // caps well under int64 ns overflow
+		if sec > maxSec {
+			sec = maxSec
+		}
+		timeoutNs = sec*1e9 + nsec
+		hasTimeout = true
+	}
+	if n, e, ok := dstTryFutex(addr, op, val, timeoutNs, hasTimeout); ok {
+		return uintptr(n), e, true
+	}
+	dstSyscallRefuse(SYS_FUTEX)
+	return 0, 0, true
+}

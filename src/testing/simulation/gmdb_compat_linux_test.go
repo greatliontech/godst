@@ -632,3 +632,68 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 // pagerSink keeps the rogue's load from being optimized away: an elided load
 // is an elided fault.
 var pagerSink atomic.Uint32
+
+// TestDSTGMDBNotifyFutex — the notification-region idiom exactly as the
+// database issues it: a waiter parks in bounded shared-futex slices
+// (FUTEX_WAIT, 100ms relative timespec, no PRIVATE flag) on a version word
+// in the MAP_SHARED lock file, re-checking value > from after every wake;
+// the writer bumps the word through its own mapping and issues a wake-all.
+// Virtual-clock slices cost no wall time; the store+wake is never lost.
+func TestDSTGMDBNotifyFutex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("dst simulation test")
+	}
+	Run(11, func() {
+		Host("db", HostConfig{}, func() {
+			mkWord := func() *uint32 {
+				lf, err := os.OpenFile("/gmdb.lock", os.O_RDWR|os.O_CREATE, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer lf.Close()
+				if err := lf.Truncate(8); err != nil {
+					t.Fatal(err)
+				}
+				m, err := syscall.Mmap(int(lf.Fd()), 0, 8, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return (*uint32)(unsafe.Pointer(&m[0]))
+			}
+			futex := func(w *uint32, op int, val uint32, ts *syscall.Timespec) (uintptr, syscall.Errno) {
+				r1, _, e := syscall.Syscall6(syscall.SYS_FUTEX,
+					uintptr(unsafe.Pointer(w)), uintptr(op), uintptr(val),
+					uintptr(unsafe.Pointer(ts)), 0, 0)
+				return r1, e
+			}
+			observed := make(chan uint32, 1)
+			go Process("wait-version", func() {
+				w := mkWord()
+				from := atomic.LoadUint32(w)
+				for {
+					cur := atomic.LoadUint32(w)
+					if cur > from {
+						observed <- cur
+						return
+					}
+					ts := syscall.NsecToTimespec((100 * time.Millisecond).Nanoseconds())
+					if _, e := futex(w, 0, cur, &ts); e != 0 && e != syscall.EAGAIN && e != syscall.ETIMEDOUT {
+						t.Errorf("FUTEX_WAIT slice: %v", e)
+						return
+					}
+				}
+			})
+			Process("commit", func() {
+				w := mkWord()
+				time.Sleep(30 * time.Millisecond) // waiter parks mid-slice
+				atomic.AddUint32(w, 1)
+				if _, e := futex(w, 1, 1<<30, nil); e != 0 {
+					t.Errorf("FUTEX_WAKE: %v", e)
+				}
+			})
+			if got := <-observed; got != 1 {
+				t.Fatalf("waiter observed version %d, want 1", got)
+			}
+		})
+	})
+}

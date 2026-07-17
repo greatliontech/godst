@@ -64,6 +64,7 @@ type dstMprotectHook func(data []byte, prot int) (err Errno, handled bool)
 type dstMadviseHook func(data []byte, advice int) (err Errno, handled bool)
 type dstKillHook func(pid int, sig Signal) (err Errno, handled bool)
 type dstRenameat2Hook func(oldpath, newpath string, flags int) (err Errno, handled bool)
+type dstFutexHook func(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err Errno, handled bool)
 
 var dstReadHookFn dstReadHook
 var dstWriteHookFn dstWriteHook
@@ -81,6 +82,7 @@ var dstMprotectHookFn dstMprotectHook
 var dstMadviseHookFn dstMadviseHook
 var dstKillHookFn dstKillHook
 var dstRenameat2HookFn dstRenameat2Hook
+var dstFutexHookFn dstFutexHook
 
 //go:linkname dstSetReadHook
 func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
@@ -129,6 +131,16 @@ func dstSetKillHook(fn dstKillHook) { dstKillHookFn = fn }
 
 //go:linkname dstSetRenameat2Hook
 func dstSetRenameat2Hook(fn dstRenameat2Hook) { dstRenameat2HookFn = fn }
+
+//go:linkname dstSetFutexHook
+func dstSetFutexHook(fn dstFutexHook) { dstFutexHookFn = fn }
+
+func dstTryFutex(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err Errno, handled bool) {
+	if !dstHookActive() || dstFutexHookFn == nil {
+		return 0, 0, false
+	}
+	return dstFutexHookFn(addr, op, val, timeoutNs, hasTimeout)
+}
 
 func dstTryRenameat2(oldpath, newpath string, flags int) (err Errno, handled bool) {
 	if !dstHookActive() || dstRenameat2HookFn == nil {

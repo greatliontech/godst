@@ -150,6 +150,7 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 //
 //go:linkname dstCloseHostFilesFor
 func dstCloseHostFilesFor(host uint32) {
+	dstFutexTeardownHost(host)
 	if !dstFSActive() {
 		return
 	}
