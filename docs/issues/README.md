@@ -7,6 +7,12 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **process-identity divergence modeling** — Lands: when a client needs
+  pid REUSE (same pid, new start-time) or pid-namespace divergence
+  constructible in-simulation. Pids are allocated monotonically and
+  never reused; every process sees namespace pid:[1] — so a client's
+  reused-pid and cross-namespace staleness-classification legs cannot
+  be exercised end-to-end.
 - **bubble-scoped timezone cache** — Lands: when a client needs
   non-UTC zone data in-simulation, or the determinism sweep gains a
   TZ-perturbation leg. time's zone cache is process-wide: a zone
