@@ -565,6 +565,7 @@ func dstRootRemove(root *Root, name string) error {
 	if node.isDir && len(node.entries) > 0 {
 		return &PathError{Op: "removeat", Path: name, Err: syscall.ENOTEMPTY}
 	}
+	dstFSDropLink(node)
 	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
@@ -602,6 +603,7 @@ func dstRootRemoveAll(root *Root, name string) error {
 	if parent == nil {
 		return &PathError{Op: "RemoveAll", Path: name, Err: syscall.EBUSY}
 	}
+	dstFSDropLink(node)
 	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
@@ -710,6 +712,7 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	// inside this root, and an unlinked root is empty — the source lookup
 	// already answered ENOENT.)
 	if newNode != nil {
+		dstFSDropLink(newNode)
 		dstFSMarkUnlinked(newNode) // replaced target leaves the namespace (see dstRename)
 	}
 	delete(oldParent.entries, oldBase)
@@ -759,4 +762,56 @@ func dstNodeContains(root, node *dstFSNode) bool {
 		}
 	}
 	return false
+}
+
+// dstRootLink mirrors the HOST os.Root.Link surface (Go's openat walk
+// into linkat(2)) — host-probed on tmpfs: the shared rows match plain
+// link(2) — old walk-class errors first (missing old ENOENT even with
+// an existing new, slashed file old ENOTDIR), a positive new EEXIST
+// beating the dir-old EPERM, a slashed MISSING new ENOENT, EPERM last
+// — with ONE rooted divergence: a slashed EXISTING regular-file new
+// answers ENOTDIR (the rooted walk asserts the slash against the
+// final's type), where plain link(2) answers EEXIST.
+func dstRootLink(root *Root, oldname, newname string) error {
+	r, err := dstRootEnter(root)
+	if err != nil {
+		return &LinkError{Op: "linkat", Old: oldname, New: newname, Err: err}
+	}
+	defer root.root.decref()
+	dstRootDelay(r)
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {
+		return &LinkError{Op: "linkat", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
+	}
+	wrap := func(e error) error { return &LinkError{Op: "linkat", Old: oldname, New: newname, Err: e} }
+	_, _, oldNode, _, errno := dstRootResolveLocked(r, oldname)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if oldNode == nil {
+		return wrap(syscall.ENOENT)
+	}
+	// Slashed-final type errors (a slashed regular-file old, the rooted
+	// divergence where a slashed EXISTING file new answers ENOTDIR) are
+	// the RESOLVER's: dstRootResolveLocked rejects a slashed non-dir
+	// final before returning, so no arm here re-checks them — the ladder
+	// rows in the Root-surface test pin them through that path.
+	newParent, newBase, newNode, newTrailingSlash, errno := dstRootResolveLocked(r, newname)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if newNode != nil {
+		return wrap(syscall.EEXIST)
+	}
+	if newTrailingSlash {
+		return wrap(syscall.ENOENT)
+	}
+	if oldNode.isDir {
+		return wrap(syscall.EPERM)
+	}
+	newParent.entries[newBase] = oldNode
+	oldNode.nlink++
+	newParent.modTime = time.Now()
+	return nil
 }

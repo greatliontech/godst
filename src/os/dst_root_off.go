@@ -41,3 +41,4 @@ func dstRootRemove(r *Root, name string) error { panic("unreachable") }
 func dstRootRemoveAll(r *Root, name string) error { panic("unreachable") }
 
 func dstRootRename(r *Root, oldname, newname string) error { panic("unreachable") }
+func dstRootLink(r *Root, oldname, newname string) error   { panic("unreachable") }

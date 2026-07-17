@@ -281,6 +281,7 @@ func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
 	now := time.Now()
 	node := &dstFSNode{
 		isDir:         isDir,
+		nlink:         1,
 		ino:           dstFSAllocIno(),
 		mode:          mode,
 		modTime:       now,
@@ -407,6 +408,14 @@ type dstFSNode struct {
 	// SQLite/LMDB per-file lock-dedup pattern) require to distinguish files. It
 	// rides the node: stable across rename and while unlinked-but-open.
 	ino uint64
+
+	// nlink is a regular file's hard-link count: 1 at creation, +1 per
+	// link(2), -1 per dirent removal (Remove, RemoveAll subtree, a rename
+	// replacing the target). Rename itself moves a dirent and leaves it
+	// unchanged. Restored from the durable entry sets on a host crash (one
+	// per durable parent edge). Directories do not use it (their fixed
+	// Nlink synthesis is recorded in the spec).
+	nlink int
 
 	// unlinked marks a directory removed from the namespace (Remove/RemoveAll,
 	// or replaced by Rename). The kernel fails entry CREATION in an rmdir'd
@@ -691,9 +700,21 @@ func dstFSMarkUnlinked(node *dstFSNode) {
 	}
 	node.unlinked = true
 	for _, child := range node.entries {
+		dstFSDropLink(child)
 		dstFSMarkUnlinked(child)
 	}
 	clear(node.entries)
+}
+
+// dstFSDropLink accounts one dirent's removal against a regular file's
+// hard-link count. Every path that deletes a file's dirent (Remove, a
+// RemoveAll subtree clear, a rename replacing its target) routes one
+// call here; the node's content lives on while other links — or open
+// handles — remain, exactly the POSIX contract. Caller holds dstFS.mu.
+func dstFSDropLink(node *dstFSNode) {
+	if !node.isDir && node.nlink > 0 {
+		node.nlink--
+	}
 }
 
 // dstRemove implements Remove: files and empty directories. The node outlives
@@ -729,6 +750,7 @@ func dstRemove(name string) (handled bool, err error) {
 	if node.isDir && len(node.entries) > 0 {
 		return wrap(syscall.ENOTEMPTY)
 	}
+	dstFSDropLink(node)
 	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
@@ -770,9 +792,68 @@ func dstRemoveAll(name string) (handled bool, err error) {
 		// Match RemoveAll("/"): refuse to destroy the root.
 		return true, &PathError{Op: "removeall", Path: name, Err: syscall.EBUSY}
 	}
+	dstFSDropLink(node)
 	dstFSMarkUnlinked(node)
 	delete(parent.entries, base)
 	parent.modTime = time.Now()
+	return true, nil
+}
+
+// dstLink implements link(2) on the tree: a second dirent for the same
+// node — SameFile identity, shared bytes through every name and mapping,
+// content surviving until the last link AND handle goes. Error order is
+// the kernel's, host-probed on tmpfs: the old walk resolves first
+// (missing old answers ENOENT even with a slashed new), a slashed
+// regular-file old is ENOTDIR, ANY directory old — ".", "..", the root
+// included — is EPERM; then the new walk's errors, a positive new is
+// EEXIST (beating the slash rule), and a slashed MISSING new is ENOENT
+// (link cannot create a directory-asserted name). Cross-device EXDEV is
+// unconstructible: one tree per host. Raw SYS_LINK/SYS_LINKAT stay
+// fenced — the modeled entry is os.Link.
+func dstLink(oldname, newname string) (handled bool, err error) {
+	if !dstFSActive() {
+		return false, nil
+	}
+	if dstProcReserved(oldname) || dstProcReserved(newname) {
+		return true, &LinkError{Op: "link", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
+	}
+	dstDiskDelayHere()
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	wrap := func(e error) (bool, error) { return true, &LinkError{Op: "link", Old: oldname, New: newname, Err: e} }
+	if oldname == "" || newname == "" {
+		return wrap(syscall.ENOENT)
+	}
+	_, _, oldNode, errno := dstFSResolveWalk(oldname, false)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if oldNode == nil {
+		return wrap(syscall.ENOENT)
+	}
+	if _, oldSlash := dstFSComponents(oldname); oldSlash && !oldNode.isDir {
+		return wrap(syscall.ENOTDIR)
+	}
+	newParent, newBase, newNode, errno := dstFSResolveWalk(newname, false)
+	if errno != nil {
+		return wrap(errno)
+	}
+	if newNode != nil {
+		return wrap(syscall.EEXIST)
+	}
+	if _, newSlash := dstFSComponents(newname); newSlash {
+		return wrap(syscall.ENOENT)
+	}
+	// LAST, after every new-side answer — host-probed: a directory old
+	// with an existing new is EEXIST, with a slashed or unreachable new
+	// ENOENT; EPERM only when the new side would have succeeded.
+	if oldNode.isDir {
+		return wrap(syscall.EPERM)
+	}
+	newParent.entries[newBase] = oldNode
+	oldNode.nlink++
+	newParent.modTime = time.Now()
 	return true, nil
 }
 
@@ -877,6 +958,7 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 		// The replaced target leaves the namespace exactly as a Remove would
 		// (rename-over is atomic replace); an empty replaced directory becomes
 		// unlinked for any Root still holding it.
+		dstFSDropLink(newNode)
 		dstFSMarkUnlinked(newNode)
 	}
 	delete(oldParent.entries, oldBase)

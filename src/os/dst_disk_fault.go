@@ -19,14 +19,14 @@ import (
 // registers this handler from init so runtime carries no os dependency. The op codes
 // are this package's contract, mirrored by the caller in testing/simulation.
 const (
-	diskOpFailDisk uint32 = iota + 1 // host-disk EIO on
-	diskOpHealDisk                   // host-disk EIO off
-	diskOpFailFile                   // per-file EIO on (name is the host-absolute path)
-	diskOpHealFile                   // per-file EIO off
-	diskOpLimit                      // ENOSPC: cap the disk at arg total bytes
-	diskOpUnlimit                    // remove the capacity
-	diskOpSlow                       // latency: arg nanoseconds per disk-touching op (0 = none)
-	diskOpCorruptFile                // bit rot: flip one seeded bit of the file's durable image
+	diskOpFailDisk    uint32 = iota + 1 // host-disk EIO on
+	diskOpHealDisk                      // host-disk EIO off
+	diskOpFailFile                      // per-file EIO on (name is the host-absolute path)
+	diskOpHealFile                      // per-file EIO off
+	diskOpLimit                         // ENOSPC: cap the disk at arg total bytes
+	diskOpUnlimit                       // remove the capacity
+	diskOpSlow                          // latency: arg nanoseconds per disk-touching op (0 = none)
+	diskOpCorruptFile                   // bit rot: flip one seeded bit of the file's durable image
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook

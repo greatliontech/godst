@@ -452,7 +452,8 @@ func tempDir() string {
 // If there is an error, it will be of type *LinkError.
 func Link(oldname, newname string) error {
 	if dstSimEnabled {
-		if err, fenced := dstFSFencedLink("link", oldname, newname); fenced {
+		// dstLink handles every active-run case; no fence arm needed.
+		if handled, err := dstLink(oldname, newname); handled {
 			return err
 		}
 	}

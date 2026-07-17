@@ -11,6 +11,8 @@ import "syscall"
 // dstStatDev converts the simulated host id to the arch's st_dev field width
 // (uint64 on most Linux arches, uint32 on mips) without per-arch files: the
 // zero-valued field pins T. Host ids are small; +1 keeps device 0 unused.
+func dstStatNlink[T ~uint32 | ~uint64](_ T, n int) T { return T(n) }
+
 func dstStatDev[T ~uint32 | ~uint64](_ T, host uint32) T {
 	return T(host) + 1
 }
@@ -43,6 +45,11 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	if isTree {
 		stat.Dev = dstStatDev(stat.Dev, entry.host)
 		stat.Ino = treeFile.node.ino
+		if !treeFile.node.isDir {
+			// The live hard-link count; 0 for an unlinked-but-open file,
+			// as fstat(2) reports. Nlink's width is per-arch.
+			stat.Nlink = dstStatNlink(stat.Nlink, treeFile.node.nlink)
+		}
 	}
 	// Proc-overlay fds carry no tree node: (st_dev, st_ino) stays zero —
 	// synthetic procfs identity, per the spec's proc-fd contract — and so

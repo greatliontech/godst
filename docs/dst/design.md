@@ -972,6 +972,22 @@ A simulated `Root` is an owned open capability: normal process exit, process cra
 every Root created by that process or kernel. Retained values then fail every rooted operation with
 `ErrClosed`, exactly like an explicitly closed Root; a reboot never revives the directory capability.
 
+**Hard links** are modeled: `os.Link` creates a second dirent for the same node — `SameFile`
+identity (node identity, not number comparison), shared bytes through every name and mapping, a
+live `st_nlink` (1 at creation, per-dirent decrements from Remove/RemoveAll/rename-over, 0 visible
+through an unlinked-but-open fd), and content surviving until the last link and handle go. Error
+order is the kernel's, host-probed on tmpfs: the old walk first (a missing old answers ENOENT even
+with a slashed new), a slashed regular-file old ENOTDIR, ANY directory old — ".", "..", the root —
+EPERM; then the new walk's errors; a positive new EEXIST (beating the slash rule); a slashed
+MISSING new ENOENT. EXDEV is unconstructible (one tree per host). Durability is per-dirent like
+every namespace edge: each link lands durably at its parent's fsync, an unsynced link dies with the
+page cache, an unsynced removal resurrects, and the reboot's link count is exactly the number of
+durable dirents reaching the node — the restore walk already preserved multi-parent node identity
+(the rename-double-link invariant), so linked names share one inode across power loss. Raw
+`SYS_LINK`/`SYS_LINKAT` stay fenced; the modeled entries are `os.Link` and `os.Root.Link` (the
+rooted surface follows the host `os.Root.Link` ladder, host-probed, with its one divergence from
+plain link(2): a slashed EXISTING regular-file new answers ENOTDIR where link(2) answers EEXIST).
+
 Symlinks and unsupported file-locking surfaces are fenced until modeled — "not yet modeled" never means
 "reaches the host": within this feature's surface (the os file and namespace API; `os/exec`'s process
 surface is its own roadmap item), every handle-producing or namespace-touching entry point is either

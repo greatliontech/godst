@@ -74,9 +74,19 @@ func dstRestoreHostDiskFor(host uint32) {
 // an entry (the mark makes creation ENOENT) — a state no kernel produces.
 func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 	if restored[node] {
+		if !node.isDir {
+			// A second durable parent edge: one more surviving hard link.
+			node.nlink++
+		}
 		return // reachable from two parents: restore its image exactly once
 	}
 	restored[node] = true
+	if !node.isDir {
+		// The reboot's link count is the number of durable dirents that
+		// reach the node — exactly the edges this walk traverses. Unsynced
+		// links died with the page cache; unsynced removals resurrect.
+		node.nlink = 1
+	}
 	node.mode = node.syncedMode
 	node.modTime = node.syncedModTime
 	node.unlinked = false

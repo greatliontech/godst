@@ -2738,7 +2738,7 @@ func (m *M) before() {
 			fmt.Fprintf(os.Stderr, "testing: %s\n", err)
 			os.Exit(2)
 		}
-		m.deps.StartTestLog(f)
+		m.deps.StartTestLog(dstWrapTestlogWriter(f))
 		testlogFile = f
 	}
 	if *panicOnExit0 {

@@ -6,6 +6,11 @@
 
 package testing
 
+import (
+	"io"
+	"os"
+)
+
 // Stubs for the framework-stream bubble path (see dst_hostio.go): without
 // -tags dst there is no simulation fence to pass, and the false const guard
 // dead-code-eliminates the bubble legs from the printer. The bubble path is
@@ -19,3 +24,5 @@ func (p *chattyPrinter) dstBubbleUpdatef(testName, format string, args ...any) b
 func (p *chattyPrinter) dstBubblePrintf(testName, format string, args ...any) bool { return false }
 
 func (p *chattyPrinter) dstBubbleBenchWrite(indent string, b []byte) bool { return false }
+
+func dstWrapTestlogWriter(f *os.File) io.Writer { return f }

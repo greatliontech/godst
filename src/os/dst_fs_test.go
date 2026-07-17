@@ -194,7 +194,7 @@ func TestDSTFSFences(t *testing.T) {
 			name string
 			call func() error
 		}{
-			{"link", func() error { return os.Link("/a", "/b") }},
+			// link(2) is modeled (TestDSTFSHardLinks); symlinks stay fenced.
 			{"symlink", func() error { return os.Symlink("/a", "/b") }},
 		}
 		for _, op := range linkOps {
@@ -949,8 +949,22 @@ func TestDSTFSOpenRoot(t *testing.T) {
 		if _, err := r.Readlink("sub/dir/file"); !isDSTUnsupportedFS(err) {
 			t.Fatalf("Root.Readlink = %v, want unsupported-under-simulation", err)
 		}
-		if err := r.Link("sub/dir/file", "sub/dir/link"); !isDSTUnsupportedFS(err) {
-			t.Fatalf("Root.Link = %v, want unsupported-under-simulation", err)
+		if err := r.Link("sub/dir/file", "sub/dir/link"); err != nil {
+			t.Fatalf("Root.Link (modeled): %v", err)
+		}
+		lfi1, err := r.Stat("sub/dir/file")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lfi2, err := r.Stat("sub/dir/link")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(lfi1, lfi2) {
+			t.Fatal("Root.Link names are not SameFile")
+		}
+		if err := r.Remove("sub/dir/link"); err != nil {
+			t.Fatal(err)
 		}
 		if err := r.Symlink("sub/dir/file", "sub/dir/symlink"); !isDSTUnsupportedFS(err) {
 			t.Fatalf("Root.Symlink = %v, want unsupported-under-simulation", err)

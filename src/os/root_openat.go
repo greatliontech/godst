@@ -307,11 +307,7 @@ func rootRename(r *Root, oldname, newname string) error {
 
 func rootLink(r *Root, oldname, newname string) error {
 	if dstRootActive(r) {
-		if err := r.root.incref(); err != nil {
-			return &LinkError{"linkat", oldname, newname, err}
-		}
-		r.root.decref()
-		return &LinkError{"linkat", oldname, newname, dstErrUnsupportedFS}
+		return dstRootLink(r, oldname, newname)
 	}
 	_, err := doInRoot(r, oldname, 0, nil, func(oldparent sysfdType, oldname string, oldEndsInSlash bool) (struct{}, error) {
 		flags := uint(0)

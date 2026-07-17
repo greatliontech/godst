@@ -18,10 +18,18 @@ import _ "unsafe" // for go:linkname
 // missing-database fallback — Local resolves to UTC, LoadLocation
 // errors deterministically — identical on every host.
 //
-// Residual (fork issue index): the package caches zones process-wide,
-// so a zone loaded by HOST code before a run is visible inside later
-// bubbles without any file read — a recorded determinism caveat until
-// zones are bubble-scoped.
+// The cache side is closed at the LOOKUP: (*Location).get answers
+// &utcLoc for the Local sentinel — the &localLoc cache AND a
+// *Location the host ASSIGNED to the mutable time.Local var — while
+// the fence is active, so neither load order nor reassignment leaks a
+// host zone into a bubble. Host code keeps its zone untouched (the
+// cache is never mutated). Boundary: a host-loaded *Location VALUE
+// handed into the bubble (captured in the closure, not via
+// time.Local) is irreducible data flow no cache policing can catch —
+// program discipline, like pointer-carried host state generally —
+// as is reassigning time.Local from a HOST goroutine mid-run (the
+// sentinel reads the var per lookup; a mid-run swap is a data race
+// on a documented-mutable global in any Go program).
 
 //go:linkname dstTZFenceActive runtime.dstFenceActive
 func dstTZFenceActive() bool

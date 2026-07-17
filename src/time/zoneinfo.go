@@ -92,6 +92,20 @@ func (l *Location) get() *Location {
 	if l == nil {
 		return &utcLoc
 	}
+	if l == &localLoc || l == Local {
+		// Inside a deterministic-simulation bubble, Local IS UTC — at
+		// the lookup, not the load, so a zone the HOST cached (or a
+		// *Location the host ASSIGNED to time.Local) before the run
+		// can never leak into a bubble's schedule; the load-time
+		// ENOENT fence in sys_unix.go only covers the
+		// first-load-in-bubble order. A host-loaded *Location passed
+		// into the bubble by VALUE is irreducible data flow — program
+		// discipline, recorded in dst_tz.go. Folds to the sentinel
+		// compare in stock builds.
+		if dstTZFenceActive() {
+			return &utcLoc
+		}
+	}
 	if l == &localLoc {
 		localOnce.Do(initLocal)
 	}

@@ -7,24 +7,20 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **testlog buffer lock schedule coupling** — Lands: when the
+  determinism sweep gains a testlog-contention leg (host goroutines
+  hammering os.Open/Getenv while bubble goroutines run). The
+  -test.testlogfile flush now takes the granted host-I/O path from
+  bubble goroutines (no fence crash), but the shared bufio buffer's
+  mutex can still park a bubble flush behind a HOST goroutine's
+  wall-clock work — the same coupling the -v printer's lock-free
+  bubble path was built to avoid; the testlog needs that treatment.
 - **process-identity divergence modeling** — Lands: when a client needs
   pid REUSE (same pid, new start-time) or pid-namespace divergence
   constructible in-simulation. Pids are allocated monotonically and
   never reused; every process sees namespace pid:[1] — so a client's
   reused-pid and cross-namespace staleness-classification legs cannot
   be exercised end-to-end.
-- **bubble-scoped timezone cache** — Lands: when a client needs
-  non-UTC zone data in-simulation, or the determinism sweep gains a
-  TZ-perturbation leg. time's zone cache is process-wide: a zone
-  loaded by HOST code before a run stays visible inside later bubbles
-  without a file read, bypassing the ENOENT-under-fence answer in
-  time.open (src/time/dst_tz.go) — a residual host-dependence the
-  current fix narrows but does not close.
-- **`link(2)` model** — Lands: when a client needs the hard-link publish
-  idiom (link-then-unlink atomic no-clobber, the NFS retransmission
-  quirk) exercised in-simulation. `os.Link` currently answers the
-  unsupported-FS refusal; clients degrade to their rename fallback,
-  which the modeled renameat2 serves.
 - **page-cache region reclamation (aggregate capacity)** — Lands: when a
   SUT legitimately holds more near-limit files than the mapping region
   carries (~8 at s_maxbytes; fewer under incremental doubling — the

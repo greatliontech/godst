@@ -8,6 +8,8 @@ package testing
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -242,4 +244,34 @@ func dstHostStreamWrite(fd int, header, payload []byte) {
 			return
 		}
 	}
+}
+
+// dstTestlogWriter routes the cmd/go test-action log (the
+// -test.testlogfile writer, whose bufio buffer is fed by every
+// os.Open/Getenv the test performs and can FLUSH on any goroutine —
+// including a bubble goroutine, where the raw host write met the
+// fence and crashed any open-heavy dst binary under go test's caching
+// mode). The log is framework plumbing exactly like the -v stream: a
+// host-owned descriptor captured before any run starts, outbound
+// only, feeding no nondeterminism back. In-bubble flushes take the
+// same granted raw-write path as the framework stream; host
+// goroutines write normally. The residual log.mu schedule coupling (a
+// bubble flush parking on the buffer lock a host goroutine holds
+// across wall-clock work) is recorded in the issue index — it needs
+// the printer-style lock-free treatment, a design of its own.
+type dstTestlogWriter struct {
+	f  *os.File
+	fd int // captured pre-run; File.Fd from a bubble goroutine would fence
+}
+
+func dstWrapTestlogWriter(f *os.File) io.Writer {
+	return &dstTestlogWriter{f: f, fd: int(f.Fd())}
+}
+
+func (w *dstTestlogWriter) Write(p []byte) (int, error) {
+	if !dstInSimBubble() {
+		return w.f.Write(p)
+	}
+	dstHostStreamWrite(w.fd, nil, p)
+	return len(p), nil
 }
