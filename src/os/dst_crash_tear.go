@@ -75,8 +75,15 @@ const (
 )
 
 // dstTearFileLocked returns the content a power loss leaves for a file whose
-// durable image is synced and whose page cache holds data. Caller holds dstFS.mu.
-func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}) []byte {
+// durable image is synced and whose page cache holds data. rot is the file's
+// silent-corruption mask set (dstFSNode.rot): it modifies the PLATTER baseline,
+// so a page writeback landed (current or the torn prefix) overwrites its rot —
+// the sector was rewritten — while a clean page, a lost page, and the torn
+// suffix keep it. The landed/lost/torn draws themselves compare against the
+// UNROTTED durable bytes: rot never makes a clean page look dirty, because a
+// page nothing wrote is not in the writeback set and its fate is not a degree
+// of freedom (only its platter bytes rotted). Caller holds dstFS.mu.
+func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}, rot map[int64]byte) []byte {
 	// The file's length is itself unsynced state when the file grew or was
 	// truncated: one draw decides what on-disk i_size the crash left. For a
 	// SHRINK (unsynced truncate-down) the inode update is a single metadata
@@ -117,6 +124,13 @@ func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}) []byte
 	}
 	out := make([]byte, size)
 	copy(out, synced) // durable bytes are stable, always
+	// Iteration order is free: the masks are independent XORs at distinct
+	// offsets, and no draw depends on them.
+	for off, mask := range rot {
+		if off < int64(size) {
+			out[off] ^= mask
+		}
+	}
 	for start := 0; start < size; start += dstPageSize {
 		end := min(start+dstPageSize, size)
 		// Only bytes the page cache actually HOLDS can be written back. Where

@@ -26,6 +26,7 @@ const (
 	diskOpLimit                      // ENOSPC: cap the disk at arg total bytes
 	diskOpUnlimit                    // remove the capacity
 	diskOpSlow                       // latency: arg nanoseconds per disk-touching op (0 = none)
+	diskOpCorruptFile                // bit rot: flip one seeded bit of the file's durable image
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook
@@ -82,6 +83,29 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		d.latency.Store(arg)
 		if arg > 0 {
 			dstDiskSlow.Store(true) // arm the global gate; reset on the next run's roll
+		}
+	case diskOpCorruptFile:
+		node := dstFSNodeAt(d.root, name)
+		if node == nil || node.isDir || node.isDevice() || len(node.synced) == 0 {
+			// Bit rot corrupts durable media. A missing target or a directory is
+			// a no-op as for FailFile; a file whose durable image is empty has no
+			// platter blocks to rot (nothing was ever committed). No fault-RNG
+			// draw happens on the no-op paths, so a skipped target never shifts a
+			// later fault's stream position.
+			return
+		}
+		// One seeded byte, one seeded bit — the canonical silent-corruption
+		// quantum, and the sneakiest input a checksum must catch. The offset
+		// addresses the durable image (the platter), never the page cache:
+		// live reads keep serving the cached bytes (see dstFSNode.rot).
+		off := dstFaultRandN(int64(len(node.synced)))
+		bit := byte(1) << dstFaultRandN(8)
+		if node.rot == nil {
+			node.rot = make(map[int64]byte)
+		}
+		node.rot[off] ^= bit
+		if node.rot[off] == 0 {
+			delete(node.rot, off) // a re-flip un-rots: the platter holds the original byte again
 		}
 	}
 }

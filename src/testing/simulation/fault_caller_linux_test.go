@@ -59,6 +59,7 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		{"LimitDisk", func() { LimitDisk("h", 1<<20) }},
 		{"UnlimitDisk", func() { UnlimitDisk("h") }},
 		{"SlowDisk", func() { SlowDisk("h", time.Millisecond) }},
+		{"CorruptFile", func() { CorruptFile("h", "/f") }},
 	}
 
 	// The foreign goroutine exists BEFORE the run and calls each API mid-run —
@@ -690,4 +691,5 @@ func TestDSTFaultOutsideRunIsNoop(t *testing.T) {
 	LimitDisk("a", 1)
 	UnlimitDisk("a")
 	SlowDisk("a", time.Millisecond)
+	CorruptFile("a", "/f")
 }

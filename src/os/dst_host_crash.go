@@ -97,7 +97,18 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		// but the bytes' home does not move).
 		image := node.synced
 		if dstCrashTear {
-			image = dstTearFileLocked(node.synced, node.data, node.wbDropped)
+			image = dstTearFileLocked(node.synced, node.data, node.wbDropped, node.rot)
+		} else if node.rot != nil {
+			// The all-or-nothing restore reads the platter, and the platter
+			// carries the rot: no writeback landed (that is why the unsynced
+			// bytes are gone), so every mask applies. Copy first — synced must
+			// not be mutated before the commit below re-bases it.
+			image = append([]byte(nil), node.synced...)
+			for off, mask := range node.rot {
+				if off < int64(len(image)) {
+					image[off] ^= mask
+				}
+			}
 		}
 		dstNodeSetSizeLocked(node, int64(len(image)))
 		copy(node.data, image)
@@ -105,6 +116,11 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		// the platter, so nothing is clean-but-stale afterwards — and the
 		// commit below must be the full one.
 		node.wbDropped = nil
+		// The reboot folds rot into content: the corrupted bytes ARE what the
+		// platter holds now — what recovery reads, and what a checksum must
+		// catch. Cleared BEFORE the commit below, so the commit's own
+		// writeback-heal comparison cannot re-clear or double-apply a mask.
+		node.rot = nil
 		// The restored image IS what the platter now holds: commit it as the
 		// new durable image. Left uncommitted, a torn restore leaves synced
 		// at the PRE-crash durable image while disk and cache agree on the

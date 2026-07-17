@@ -429,6 +429,21 @@ type dstFSNode struct {
 	// a dropped page cannot land (dstTearFileLocked).
 	wbDropped map[int64]struct{}
 
+	// rot is the silent-corruption mark (the CorruptFile fault): XOR masks
+	// keyed by byte offset into the durable image — bit rot sitting on the
+	// platter. The page cache masks it (data is never touched; live reads
+	// keep returning the written bytes, and the model never evicts), so it
+	// surfaces where a real machine discovers latent corruption: when the
+	// platter is next read, at host-crash restore, where the masks fold into
+	// the restored content and clear. Writeback heals it sector by sector: a
+	// successful sync clears the masks of every page whose committed bytes
+	// CHANGED (content diff is the dirty proxy — a byte-identical rewrite
+	// does not clear, a recorded bound equivalent to the harness re-injecting
+	// after the write), while pages the sync did not rewrite — untouched
+	// pages, and fsyncgate-dropped pages — keep their rot, as a real disk
+	// keeps rot under blocks writeback never rewrites. Nil = no rot pending.
+	rot map[int64]byte
+
 	// Directory state.
 	entries       map[string]*dstFSNode
 	syncedEntries map[string]*dstFSNode
@@ -1819,15 +1834,16 @@ func (node *dstFSNode) commitLocked() {
 }
 
 func (node *dstFSNode) commitDataLocked() {
+	old := node.synced
 	if node.wbDropped == nil {
 		node.synced = append([]byte(nil), node.data...)
+		node.clearRotWrittenBackLocked(old)
 		return
 	}
 	// fsyncgate commit: everything reaches the platter except the pages the
 	// failed writeback dropped and nothing has rewritten since — those keep
 	// their old platter bytes (zero where the platter held nothing). See
 	// dstFSNode.wbDropped.
-	old := node.synced
 	synced := append([]byte(nil), node.data...)
 	for pg := range node.wbDropped {
 		off := pg * dstPageSize
@@ -1846,6 +1862,34 @@ func (node *dstFSNode) commitDataLocked() {
 	node.synced = synced
 	if len(node.wbDropped) == 0 {
 		node.wbDropped = nil // fully redirtied: back to the plain full-commit path
+	}
+	node.clearRotWrittenBackLocked(old)
+}
+
+// clearRotWrittenBackLocked drops the rot masks writeback just healed: a sync
+// that changed a page's committed bytes rewrote that page's sectors, so rot
+// under them is gone (dstFSNode.rot — the diff against the pre-commit image is
+// the dirty proxy; fsyncgate-dropped pages kept their old bytes above, so
+// their rot survives by the same comparison). Masks past the new image fall
+// off the platter's readable surface (a shrink freed the i_size range) and are
+// dropped with it. Caller holds dstFS.mu; old is the pre-commit durable image.
+func (node *dstFSNode) clearRotWrittenBackLocked(old []byte) {
+	if node.rot == nil {
+		return
+	}
+	for off := range node.rot {
+		if off >= int64(len(node.synced)) {
+			delete(node.rot, off)
+			continue
+		}
+		start := off / dstPageSize * dstPageSize
+		end := min(start+dstPageSize, int64(len(node.synced)))
+		if !slices.Equal(node.synced[start:end], dstPageSlice(old, int(start), int(end))) {
+			delete(node.rot, off)
+		}
+	}
+	if len(node.rot) == 0 {
+		node.rot = nil
 	}
 }
 

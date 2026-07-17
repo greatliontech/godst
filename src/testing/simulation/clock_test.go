@@ -598,6 +598,7 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		{"FailFile", func() { FailFile("no-such-host", "/f") }},
 		{"HealFile", func() { HealFile("no-such-host", "/f") }},
 		{"LimitDisk", func() { LimitDisk("no-such-host", 1) }},
+		{"CorruptFile", func() { CorruptFile("no-such-host", "/f") }},
 		{"UnlimitDisk", func() { UnlimitDisk("no-such-host") }},
 		{"SlowDisk", func() { SlowDisk("no-such-host", time.Millisecond) }},
 		{"HostFS", func() { HostFS("no-such-host") }},

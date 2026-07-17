@@ -693,7 +693,39 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   result is unchanged) and only on ops that truly touch the disk. The duration is explicit (no fault-RNG
   draw), so the virtual delays replay deterministically. Per-host victim isolation, host independence,
   in-memory/closed-fd exemption, and replay are enforced by `TestDSTDiskLatency*`
-  (`os/dst_disk_fault_test.go`), mutation-tested. This completes the disk axis.
+  (`os/dst_disk_fault_test.go`), mutation-tested.
+- **Read corruption (bit rot)** — **landed**. Silent media corruption — the fault a checksum exists
+  to catch, as distinct from EIO's unreadable sector — injected mid-run by
+  `simulation.CorruptFile(host, path)`: one fault-RNG-drawn bit of one drawn byte of the file's
+  DURABLE image flips (repeated calls accumulate; replays exactly — DST-FAULT-REPLAY — and, as
+  everywhere, the draws are stream-isolated from the schedule). The mask set (`dstFSNode.rot`) is
+  the policy's own state, XOR overlays on platter offsets — no new base representation. The page
+  cache masks the rot exactly as a real kernel's does: live reads keep returning the written bytes
+  (the model never evicts), and the corruption surfaces where a real machine discovers latent rot —
+  when the platter is next read, at host-crash restore, where the masks fold into the restored
+  content (and compose with the crash tear: a page whose writeback landed took fresh bytes to its
+  sectors, so its rot clears; clean, lost, torn-suffix, and fsyncgate-dropped bytes keep theirs —
+  the landed/lost/torn draws compare against the UNROTTED durable bytes, since rot never puts a
+  clean page in the writeback set). Writeback heals rot page by page (the model's writeback quantum): a successful sync clears
+  the masks of every page whose committed bytes CHANGED, so a full rewrite+sync heals while an
+  append's sync does not touch write-once pages' rot (the WAL shape). *Recorded bounds:* the dirty
+  proxy is a content diff, so a byte-identical rewrite does not clear its page's rot — equivalent
+  to the harness re-injecting after the write, the sound direction; and there is no in-cache
+  visibility without a reboot (a cache-miss read of a rotted sector on a LIVE host needs an
+  eviction model the FS deliberately does not have — a follow-on if a consumer needs it). No-op on
+  a missing path, a directory or device, or an empty durable image (no platter blocks to rot),
+  drawing nothing, so a skipped target never shifts a later fault's stream. DoF: real disks rot —
+  bits flip on the platter and pass the drive's ECC; the read returns wrong bytes with no error.
+  Sound: the flip lives only in durable content a crash legitimately reads back; nothing synced
+  moves while the machine is up, and no error is invented at a call that would not fail. Enforced
+  by `TestDSTDiskCorrupt*` (`testing/simulation/disk_corrupt_linux_test.go`) — surfacing at reboot
+  with exactly one flipped bit, cache masking, tear composition on clean AND dirty pages (landed
+  bytes carry no rot; only durable bytes may), fsyncgate-dropped pages keeping rot through the
+  retried sync's commit, rewrite-heal vs append-survival, accumulation across injections,
+  node-keyed rename-following, victim isolation, no-op targets drawing nothing, and same-seed
+  replay — mutation-tested (restore application both paths, tear-fold ordering, commit healing,
+  whole-file-heal over-clear, cache-masking violation, no-op draw shift). This completes the disk
+  axis.
 - **Crash (the durability tear)** is the **host (power-loss) crash** — see "Crash / restart faults". Its
   default policy restores a host's disk to **exactly its durable image** (synced survives byte-exact,
   everything unsynced is lost): one legal outcome, deterministic, and the simplest to reason about. With

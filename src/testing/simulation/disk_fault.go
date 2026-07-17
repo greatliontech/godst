@@ -20,8 +20,9 @@ import (
 // like seek), and it never touches the durable image — a failed fsync does not
 // advance it; ENOSPC is a full disk, so it is injected only where writing more, or
 // creating a file, needs space the cap does not allow — a real disk fills what it can
-// first, and frees count, so deleting makes room (DST-FAULT-SOUND). Faults are
-// explicit toggles (no fault-RNG draw), so
+// first, and frees count, so deleting makes room (DST-FAULT-SOUND). The EIO,
+// ENOSPC, and latency faults are explicit toggles (no fault-RNG draw), and the
+// corruption fault draws only at injection from the stream-isolated fault RNG, so
 // the same seed + same fault schedule replays identically (DST-FAULT-REPLAY), and
 // each affects exactly the named host's disk — or, for FailFile, exactly the named
 // file — leaving every other host and file untouched (DST-FAULT-VICTIM). Calls
@@ -40,6 +41,7 @@ const (
 	diskOpLimit
 	diskOpUnlimit
 	diskOpSlow
+	diskOpCorruptFile
 )
 
 // The victim-naming rule for every fault below: an undeclared host name panics
@@ -131,4 +133,34 @@ func SlowDisk(host string, perOp time.Duration) {
 		}
 		dstDiskFaultOp(diskOpSlow, lookupHost(host), int64(perOp), "")
 	})
+}
+
+// CorruptFile flips one bit of one byte of the named host file's DURABLE image —
+// silent media corruption (bit rot), the fault a checksum exists to catch, as
+// distinct from FailFile's unreadable sector (EIO). The byte offset and the bit
+// are drawn from the seeded fault RNG, so where the rot lands is a deterministic
+// function of the run seed and the fault schedule (DST-FAULT-REPLAY); repeated
+// calls accumulate independent flips (XOR semantics: a repeat that draws the
+// same offset and bit cancels it — the platter byte reverts). path is
+// host-absolute.
+//
+// The flip lands on the platter, not in the page cache: reads keep returning
+// the bytes the program wrote (a real kernel serves cached pages, and the model
+// never evicts), and the corruption surfaces where a real machine discovers
+// latent rot — when the platter is next read, at a host crash: after
+// CrashHost(host) and a Host re-declaration, the file's content carries the
+// flipped bit, which is exactly what a recovery-path integrity check must
+// detect rather than silently accept. Writeback heals rot page by page: a
+// successful sync clears the flips in every page whose committed bytes changed
+// (a byte-identical rewrite does not clear them — the content diff is the dirty
+// proxy, a recorded modeling bound equivalent to the rot recurring after the
+// write), while pages the sync never rewrote keep theirs, so corrupting a
+// write-once region survives later appends-and-syncs elsewhere in the file.
+//
+// Corrupting a path that does not exist, that names a directory or device, or a
+// file whose durable image is empty (nothing was ever committed to the platter)
+// is a no-op — and draws nothing from the fault RNG, so a
+// skipped target never shifts a later fault's stream. Call from within a Run.
+func CorruptFile(host, path string) {
+	withBubbleFaultCaller("CorruptFile", func() { dstDiskFaultOp(diskOpCorruptFile, lookupHost(host), 0, path) })
 }
