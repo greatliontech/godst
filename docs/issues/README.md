@@ -7,6 +7,11 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **`link(2)` model** — Lands: when a client needs the hard-link publish
+  idiom (link-then-unlink atomic no-clobber, the NFS retransmission
+  quirk) exercised in-simulation. `os.Link` currently answers the
+  unsupported-FS refusal; clients degrade to their rename fallback,
+  which the modeled renameat2 serves.
 - **per-boot host identity (`/proc/sys/kernel/random/boot_id` + boottime
   reset)** — Lands: when a client needs cross-reboot epoch invalidation
   testable in-sim. The procfs overlay models no `/proc/sys` surface; host
