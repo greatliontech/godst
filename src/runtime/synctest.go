@@ -76,7 +76,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 		wasRunning = false
 		totalDelta++
 	case _Gwaiting:
-		if gp.waitreason.isIdleInSynctest() {
+		if gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp) {
 			wasRunning = false
 		}
 	}
@@ -89,7 +89,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 			bubble.done = true
 		}
 	case _Gwaiting:
-		if gp.waitreason.isIdleInSynctest() {
+		if gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp) {
 			isRunning = false
 		}
 	}

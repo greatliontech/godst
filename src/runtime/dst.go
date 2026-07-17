@@ -2144,7 +2144,7 @@ func dstSynctestRunningStatus(gp *g, status uint32) bool {
 	if status == _Gdead || status == _Gdeadextra {
 		return false
 	}
-	if status == _Gwaiting && gp.waitreason.isIdleInSynctest() {
+	if status == _Gwaiting && (gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp)) {
 		return false
 	}
 	return true
@@ -2835,6 +2835,25 @@ var (
 	dstSimBubble *synctestBubble
 	dstSimRootG  *g
 )
+
+// dstDurableMutexWait reports whether gp's wait, though not durable under
+// plain synctest semantics, is durable under whole-world DST: a sync.Mutex /
+// sync.RWMutex wait inside the simulation bubble. Under DST every goroutine
+// that can unlock the mutex is inside the same bubble (cross-boundary mutex
+// sharing is out of model — the crash soundness boundary's discipline), so a
+// mutex waiter cannot be woken by anything the deterministic scheduler does
+// not control: the wait is durable, virtual time may advance across it, and
+// a SUT that sleeps (a SlowDisk delay, a batching window) while holding a
+// lock its peers contend progresses exactly as on real hardware — where the
+// non-durable classification instead froze virtual time and wedged the
+// bubble. Foreign (plain synctest) bubbles keep the upstream non-durable
+// semantics: their mutexes may legitimately be held by goroutines outside
+// the bubble.
+//
+//go:nosplit
+func dstDurableMutexWait(gp *g) bool {
+	return dstBuild && gp.bubble != nil && gp.bubble == dstSimBubble && gp.waitreason.isMutexWait()
+}
 
 // dstCallbackEpoch returns the ownership stamp recorded on a finalizer/cleanup
 // special at registration (SetFinalizer/AddCleanup): the current run epoch if

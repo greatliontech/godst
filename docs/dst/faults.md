@@ -688,8 +688,9 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   handle's `File.Stat`** — fstat reads the in-core inode, which a slow disk does not delay) are not
   delayed, as a real slow disk would not delay them. The sleep
   is read lock-free and taken *outside* the tree lock — so a slow disk on one host never stalls another's
-  filesystem (sleeping under the shared lock would in fact deadlock the bubble, since virtual time cannot
-  advance while a goroutine holds a mutex) — and a composite helper pays the latency once per backend op
+  filesystem through the shared lock (host isolation; and though in-bubble mutex waits are durable, a
+  sleep under the tree lock would still serialize every host's filesystem behind the slow one) — and a
+  composite helper pays the latency once per backend op
   (`os.Rename` = stat + rename = 2×). DoF: a slow disk; sound because the delay only postpones the op (its
   result is unchanged) and only on ops that truly touch the disk. The duration is explicit (no fault-RNG
   draw), so the virtual delays replay deterministically. Per-host victim isolation, host independence,

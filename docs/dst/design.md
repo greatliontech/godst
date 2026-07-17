@@ -1144,11 +1144,26 @@ nor declare deadlock, so the run hangs until the read returns. Reading the real 
 run is therefore an explicit capability choice, not an accidental numeric-fd escape. A third hang
 mode shares the shape: a bubble that can never reach durable quiescence because some goroutine
 stays perpetually runnable — a CALL-FREE spin loop (no preemption point — e.g.
-`for !flag.Load() {}`), or a non-durable park loop (mutex ping-pong, a Gosched/select busy-poll)
+`for !flag.Load() {}`), or a non-durable park loop (a Gosched/select busy-poll; mutex parks left
+this class when in-bubble mutex waits became durable, below)
 — wedges the run, because the run pins P=1, disables async preemption, and gates sysmon's retake,
 and the durably-blocked deadlock detector needs EVERY goroutine durably blocked. Production Go
 completes the call-free form (async preemption keeps peers running) and merely livelocks the
-busy-poll form; under DST both are permanent (virtual time can never advance). This mode is
+busy-poll form; under DST both are permanent (virtual time can never advance). **Durable in-bubble mutex waits.** Under whole-world DST a `sync.Mutex` / `sync.RWMutex` wait
+inside the simulation bubble is a DURABLE block (`dstDurableMutexWait`, consulted beside
+`isIdleInSynctest` at every accounting site): every goroutine that can unlock the mutex is inside
+the bubble (cross-boundary mutex sharing is out of model — the crash soundness boundary's
+discipline), so the deterministic scheduler controls every possible waker and virtual time may
+advance across the wait. This is what lets a SUT sleep — a SlowDisk delay, a batching window —
+while holding a lock its peers contend and still progress, exactly as on real hardware; under the
+upstream classification that shape froze virtual time and wedged. Two consequences: a genuine
+lock inversion is now a loud bubble-deadlock abort rather than an invisible wedge, and FOREIGN
+(plain synctest) bubbles keep the upstream non-durable semantics — their mutexes may legitimately
+be held by goroutines outside the bubble (`TestDSTForeignBubbleMutexStaysNonDurable` pins the
+boundary; the sleep-under-lock, RWMutex-family, SlowDisk-composition, deadlock-abort, and replay
+arms pin the rest — all mutation-tested).
+
+The remaining wedge mode is
 **diagnosed, not merely recorded**: the wedge detector fails the run with a loud typed fatal error
 (`DST-WEDGE`) naming the guilty goroutine(s), instead of wedging until an external kill. Two arms,
 both observation-only on healthy runs (they ride the existing decision path — no RNG draw, no new
@@ -1592,7 +1607,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | `crypto/rand` | `crypto/internal/sysrand.Read` seam → per-g stream | ✅ |
 | `hash/maphash` (`MakeSeed`, `Hash`'s lazy seed) | draws through `runtime.rand` → per-g stream when minted IN-run; an init-time `MakeSeed` captured for in-run use is pre-run entropy (host-random, recorded boundary — mint inside the run) | ✅ |
 | time, timers, tickers | `testing/synctest` fake clock | ✅ |
-| `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | in-bubble the flip is measured on the waiter's own LOST-WAKEUP count, a pure function of the seeded schedule: a bubbled waiter that returns from semacquire without acquiring more than 64 times within one Lock call flips its mutex to starvation mode (`internal/sync` `lockSlow` + `dst_mutex_on.go`; the wall clock stays out of the schedule — its value was a demonstrated same-seed escape — and the fake clock cannot serve: mutex waits are non-durable, so fake time never passes mid-wait and a fake-clock flip would deterministically never fire, livelocking a production-legal SUT whose progress depends on the starvation handoff, undetectably). Sound in both directions: production flips after ANY wait >1ms, and N lost handoffs take >1ms of wall in some real execution, so a flipped in-sim execution is production-producible and an unflipped one is production below the threshold — the flip POINT differs from any given production run (starvation mode engages by contention depth, not elapsed wall), never the reachable behavior set. Liveness restored: a starvation-handoff-dependent SUT terminates in-sim (`TestMutexStarvationHandoffLiveness`); the wall clock stays out (`TestMutexStarvationHandoffDeterministic`); the count is same-seed stable (`TestMutexStarvationHandoffCountDeterministic`); programs whose waiters never cross the threshold are byte-identical to the prior barging-only determinization (the branch reads only waiter-local state). | ✅ |
+| `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | in-bubble the flip is measured on the waiter's own LOST-WAKEUP count, a pure function of the seeded schedule: a bubbled waiter that returns from semacquire without acquiring more than 64 times within one Lock call flips its mutex to starvation mode (`internal/sync` `lockSlow` + `dst_mutex_on.go`; the wall clock stays out of the schedule — its value was a demonstrated same-seed escape — and the fake clock was rejected when this landed because mutex waits were then non-durable (fake time never passed mid-wait, so a fake-clock flip could deterministically never fire, livelocking a starvation-dependent SUT undetectably); mutex waits have since become durable, which removes that impossibility but not the choice: the lost-wakeup count stays the seed-pure trigger, independent of any clock). Sound in both directions: production flips after ANY wait >1ms, and N lost handoffs take >1ms of wall in some real execution, so a flipped in-sim execution is production-producible and an unflipped one is production below the threshold — the flip POINT differs from any given production run (starvation mode engages by contention depth, not elapsed wall), never the reachable behavior set. Liveness restored: a starvation-handoff-dependent SUT terminates in-sim (`TestMutexStarvationHandoffLiveness`); the wall clock stays out (`TestMutexStarvationHandoffDeterministic`); the count is same-seed stable (`TestMutexStarvationHandoffCountDeterministic`); programs whose waiters never cross the threshold are byte-identical to the prior barging-only determinization (the branch reads only waiter-local state). | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
