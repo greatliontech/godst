@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	_ "unsafe" // for go:linkname
+	"unsafe" // go:linkname + coarse-dependency node identities
 )
 
 // Under deterministic simulation testing (testing/simulation), the filesystem
@@ -655,6 +655,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 		return true, &PathError{Op: "mkdir", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -731,6 +732,7 @@ func dstRemove(name string) (handled bool, err error) {
 		return true, &PathError{Op: "remove", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -773,6 +775,7 @@ func dstRemoveAll(name string) (handled bool, err error) {
 		return true, &PathError{Op: "removeall", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -822,6 +825,7 @@ func dstLink(oldname, newname string) (handled bool, err error) {
 		return true, &LinkError{Op: "link", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -881,6 +885,7 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 		return true, &LinkError{Op: "rename", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -983,6 +988,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 		return fi, true, err
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1029,6 +1035,7 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 		return true, &PathError{Op: "truncate", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1106,6 +1113,7 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 		return true, &PathError{Op: "chmod", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1127,6 +1135,7 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 // chmodHandle implements File.Chmod on a simulated handle.
 func (d *dstFile) chmodHandle(mode FileMode) error {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -1146,6 +1155,7 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 		return true, &PathError{Op: "chtimes", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1186,6 +1196,7 @@ func dstChdir(dir string) (handled bool, err error) {
 		return true, &PathError{Op: "chdir", Path: dir, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1249,6 +1260,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	}
 
 	dstDiskDelayHere()
+	// A create-mode open can mutate the namespace; a plain open only
+	// resolves it.
+	dstCoarseNamespaceDep(flag&(O_CREATE|O_TRUNC) != 0)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1332,6 +1346,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: e}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1383,6 +1398,44 @@ func (d *dstFile) enter() error {
 func (d *dstFile) leave() {
 	dstFS.mu.Unlock()
 	d.mu.Unlock()
+}
+
+//go:linkname dstCoarseDep runtime.dstCoarseDep
+func dstCoarseDep(id uintptr, write bool, hb uintptr)
+
+//go:linkname dstCoarseHB runtime.dstCoarseHB
+func dstCoarseHB(id uintptr, hb uintptr)
+
+// coarseDep announces this handle's file node as a coarse DPOR
+// dependency identity (runtime.dstCoarseDep): a data-plane op on a
+// shared file is how co-located simulated processes conflict, and the
+// announce is what lets a non-race DPOR exploration reorder two
+// processes' ops on one file. write per the op's effect; devices and
+// closed handles announce nothing (no shared object). Called BEFORE
+// enter()/the tree lock — the announce yields, and a yield under a held
+// lock would serialize every host's filesystem behind the scheduler.
+func (d *dstFile) coarseDep(write bool) {
+	d.mu.Lock()
+	node := d.node
+	closed := d.closed
+	d.mu.Unlock()
+	if closed || node == nil || node.isDevice() {
+		return
+	}
+	dstCoarseDep(uintptr(unsafe.Pointer(node)), write, 0)
+}
+
+// dstCoarseNamespaceDep announces the calling host's NAMESPACE as a
+// coarse dependency identity for a named (path) op: path creation,
+// removal, renaming and lookup all contend on the host's directory
+// tree, and one per-host identity is the deliberately COARSE collapse —
+// over-approximating (any two namespace ops with a write conflict) but
+// sound, and cheap where it matters (data-plane ops announce per-node
+// above). The identity is the small integer host id + 1, collision-free
+// against real pointers by construction.
+func dstCoarseNamespaceDep(write bool) {
+	host, _ := dstFSCurrentNode()
+	dstCoarseDep(uintptr(host)+1, write, 0)
 }
 
 // diskDelay sleeps this handle's disk's per-op latency before a disk-touching op (a
@@ -1532,6 +1585,7 @@ func (disk *dstFSDisk) diskFullForCreate() bool {
 
 func (d *dstFile) read(b []byte) (int, error) {
 	d.diskDelay()
+	d.coarseDep(false)
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -1566,6 +1620,7 @@ func (d *dstFile) read(b []byte) (int, error) {
 
 func (d *dstFile) pread(b []byte, off int64) (int, error) {
 	d.diskDelay()
+	d.coarseDep(false)
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -1593,6 +1648,7 @@ func (d *dstFile) pread(b []byte, off int64) (int, error) {
 
 func (d *dstFile) write(b []byte) (int, error) {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -1686,6 +1742,7 @@ func (d *dstFile) write(b []byte) (int, error) {
 
 func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -1784,6 +1841,11 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 }
 
 func (d *dstFile) seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekEnd {
+		// SEEK_END reads the shared file size — the one seek form whose
+		// result a peer's concurrent append/truncate determines.
+		d.coarseDep(false)
+	}
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
@@ -1859,6 +1921,7 @@ func (d *dstFile) sortedEntryNamesLocked() []string {
 // (n > 0) reads; io.EOF at exhaustion for chunked mode, as the host funnel.
 func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
 	d.diskDelay()
+	d.coarseDep(false)
 	if e := d.enter(); e != nil {
 		return nil, nil, e
 	}
@@ -1921,6 +1984,7 @@ func (d *dstFile) chdirHandle() error {
 
 func (d *dstFile) truncate(size int64) error {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -1965,6 +2029,7 @@ const dstFallocSupportedMask = 0x7B
 
 func (d *dstFile) fallocate(mode int, off, length int64) error {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2024,6 +2089,7 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 // to the platter's post-crash state (dstRestoreNodeLocked).
 func (d *dstFile) sync() error {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2050,6 +2116,7 @@ func (d *dstFile) sync() error {
 
 func (d *dstFile) datasync() error {
 	d.diskDelay()
+	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2179,6 +2246,10 @@ func (node *dstFSNode) dstMarkRedirtiedLocked(off, n int64) {
 }
 
 func (d *dstFile) stat() (FileInfo, error) {
+	// fstat reads shared node state (size, mtime) a peer's write moves —
+	// a coarse read-conflict on the node (no disk delay: fstat stays an
+	// in-core read; the announce is a dependency record, not a device op).
+	d.coarseDep(false)
 	if err := d.enter(); err != nil {
 		return nil, err
 	}

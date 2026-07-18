@@ -253,6 +253,54 @@ func dstSyncObserve(id unsafe.Pointer) {
 	dstYieldAccess(uintptr(id), 1, false, false, sys.GetCallerPC())
 }
 
+// dstSyncCoarseAux keys the coarse cross-process dependency model's
+// happens-before events apart from the channel/atomic auxes on the same
+// id space (close=0, buffered slots=slot+1, rendezvous=^0, atomic=^1).
+const dstSyncCoarseAux = ^uintptr(2)
+
+// dstCoarseDep is the Level-2 transition boundary of the COARSE
+// cross-process dependency model (exploration.md, "Coarse cross-process
+// dependencies"): the simulated OS surfaces the objects real processes
+// conflict through — a filesystem node, a host namespace, a flock'd
+// file, a shared futex word — as announced dependency identities, so a
+// non-race dst build explores multi-process interleavings that plain
+// memory instrumentation (dst-race only) would otherwise carry. write
+// follows the op's effect on the object (a pwrite/unlink/wake is a
+// write-conflict; a pread/stat/wait a read-conflict — read pairs
+// commute); hb optionally records the op's happens-before contribution
+// (1 = acquire, 2 = release) for pruning, exactly as dstAtomicYield
+// records its own. Announced like dstSyncAcquire — always-yield, never
+// the shared-address filter. Self-gated through dstYieldAccess /
+// dstRecordSyncEventID: outside a scheduled-strategy simulation it is
+// a cheap early return.
+//
+//go:linkname dstCoarseDep
+func dstCoarseDep(id uintptr, write bool, hb uintptr) {
+	dstYieldAccess(id, 1, write, false, sys.GetCallerPC())
+	switch hb {
+	case 1:
+		dstRecordSyncAcquireID(id, dstSyncCoarseAux)
+	case 2:
+		dstRecordSyncReleaseID(id, dstSyncCoarseAux)
+	}
+}
+
+// dstCoarseHB records only the happens-before half of a coarse
+// dependency op whose announce already happened — the post-decision
+// acquire of a granted flock or a woken futex waiter (the announce
+// yielded pre-decision; the acquire is known only after). hb as in
+// dstCoarseDep. No yield.
+//
+//go:linkname dstCoarseHB
+func dstCoarseHB(id uintptr, hb uintptr) {
+	switch hb {
+	case 1:
+		dstRecordSyncAcquireID(id, dstSyncCoarseAux)
+	case 2:
+		dstRecordSyncReleaseID(id, dstSyncCoarseAux)
+	}
+}
+
 // dstYieldPoint is a cooperative yield with no specific memory access recorded — a
 // pure scheduling point (used by soundness probes). See dstAccessYield.
 //

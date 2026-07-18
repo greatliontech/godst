@@ -114,11 +114,23 @@ func dstFutexOp(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bo
 	return 0, 0, false
 }
 
+// dstFutexID is the coarse-dependency identity of a futex word: the
+// backing node plus the word's file offset — exactly the queue key, so
+// waits and wakes through DIFFERENT mappings announce one identity.
+func dstFutexID(key dstFutexKey) uintptr {
+	return uintptr(unsafe.Pointer(key.node)) + uintptr(key.off)
+}
+
 func dstFutexWait(addr *uint32, val uint32, timeoutNs int64, hasTimeout bool) (syscall.Errno, bool) {
 	key, errno, handled := dstFutexResolve(addr)
 	if !handled || errno != 0 {
 		return errno, handled
 	}
+	// Coarse DPOR dependency: wait-vs-wake order on one word is the
+	// lost-wake surface itself — announced pre-decision as a READ of the
+	// word's identity (the wake is the write; read pairs commute). A
+	// woken return ACQUIRES the waker's released history below.
+	dstCoarseDep(dstFutexID(key), false, 0)
 	host, proc := dstFSCurrentNode()
 	w := &dstFutexWaiter{ch: make(chan struct{}), host: host, proc: proc}
 	// The value check reads the word through the HARNESS page-cache view
@@ -152,22 +164,26 @@ func dstFutexWait(addr *uint32, val uint32, timeoutNs int64, hasTimeout bool) (s
 	dstFS.mu.Unlock()
 	if !hasTimeout {
 		<-w.ch
+		dstCoarseHB(dstFutexID(key), 1) // woken: acquire the waker's history
 		return 0, true
 	}
 	timer := time.NewTimer(time.Duration(timeoutNs)) // bubble virtual clock
 	defer timer.Stop()
 	select {
 	case <-w.ch:
+		dstCoarseHB(dstFutexID(key), 1) // woken: acquire the waker's history
 		return 0, true
 	case <-timer.C:
 	}
 	// Timed out. If a wake dequeued this waiter first, the wake wins (it
 	// spent a slot on us): report woken, not ETIMEDOUT.
 	dstFutex.mu.Lock()
-	defer dstFutex.mu.Unlock()
-	if dstFutexRemoveLocked(key, w) {
+	removed := dstFutexRemoveLocked(key, w)
+	dstFutex.mu.Unlock()
+	if removed {
 		return syscall.ETIMEDOUT, true
 	}
+	dstCoarseHB(dstFutexID(key), 1) // wake won the race: acquire its history
 	return 0, true
 }
 
@@ -176,6 +192,9 @@ func dstFutexWake(addr *uint32, n uint32) (int, syscall.Errno, bool) {
 	if !handled || errno != 0 {
 		return 0, errno, handled
 	}
+	// Coarse DPOR dependency: the wake writes the word's identity and
+	// RELEASES this goroutine's history to whichever waiter it wakes.
+	dstCoarseDep(dstFutexID(key), true, 2)
 	dstFutex.mu.Lock()
 	defer dstFutex.mu.Unlock()
 	dstFutexRollLocked()

@@ -129,6 +129,7 @@ func dstOpenRoot(name string) (*Root, bool, error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: dstErrUnsupportedFS}
 	}
 	dstDiskDelayHere()
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -238,6 +239,7 @@ func dstRootOpenRoot(root *Root, name string) (*Root, error) {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -263,6 +265,7 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(flag&(O_CREATE|O_TRUNC) != 0)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	wrap := func(e error) (*File, error) { return nil, &PathError{Op: "openat", Path: name, Err: e} }
@@ -352,6 +355,7 @@ func dstRootStat(root *Root, name string, lstat bool) (FileInfo, error) {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if abs := dstRootProcAbsLocked(r, name); abs != "" {
@@ -381,6 +385,7 @@ func dstRootReadlink(root *Root, name string) (string, error) {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	abs := dstRootProcAbsLocked(r, name)
@@ -401,6 +406,7 @@ func dstRootChmod(root *Root, name string, mode FileMode) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -424,6 +430,7 @@ func dstRootChtimes(root *Root, name string, atime, mtime time.Time) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -450,6 +457,7 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -492,6 +500,7 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" || dstRootMkdirAllProcReservedLocked(r, name) {
@@ -545,6 +554,7 @@ func dstRootRemove(root *Root, name string) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -583,6 +593,7 @@ func dstRootRemoveAll(root *Root, name string) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, name) != "" {
@@ -633,6 +644,7 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {
@@ -777,6 +789,7 @@ func dstRootLink(root *Root, oldname, newname string) error {
 	}
 	defer root.root.decref()
 	dstRootDelay(r)
+	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {

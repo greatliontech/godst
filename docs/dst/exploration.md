@@ -362,14 +362,46 @@ mutex is sound and is exactly the interleaving Gap A needs.
   dependencies the build can SEE. In a build without the dst-race auto-instrumentation, a DPOR
   exploration that fires no Level-2 event at all — no compiler access hook, no runtime sync hook,
   no manual `dstAccessYield`/`dstSyncAcquire` — cannot distinguish independence from invisibility:
-  a SUT conflicting only through channels the build cannot observe (plain memory, mmap'd shared
-  pages, the simulated filesystem) collapses into one class. `ExploreResult.Uninstrumented` then
+  a SUT conflicting only through channels the build cannot observe (plain memory, or atomics on
+  mmap'd shared pages — the simulated filesystem, flock, and futex announce build-independently
+  through the coarse model below) collapses into one class. `ExploreResult.Uninstrumented` then
   reports it and `Exhausted` is downgraded to false rather than claiming a completeness the build
   cannot establish (keyed on the runtime's `dstLevel2Events` delta, which counts recorded accesses,
   sync decisions, and atomic announces but never `dstYieldPoint`'s size-0 scheduling yields —
   enforced by `TestDPORUninstrumentedDowngrade`, both builds). Manual-hook SUTs (the sweep's shape)
   fire events and keep their claims; Exhaustive mode is unaffected — its exhaustion claim is over
   the runtime-yield-granularity schedule tree and does not depend on dependency visibility.
+  *Coarse cross-process dependencies (build-independent):* the simulated OS announces the objects
+  real PROCESSES conflict through as dependency identities via `runtime.dstCoarseDep` — active in
+  every dst build, race or not, self-gated outside scheduled-strategy runs: (a) a HANDLE (fd) op
+  announces its FILE NODE (read/pread/readdir/fstat/SEEK_END read-conflict — fstat and SEEK_END
+  read the shared size a peer's write moves; write/pwrite/truncate/fallocate/sync/datasync/chmod
+  write-conflict — a sync is a write on the durable image); (b) a NAMED (path) op — the plain
+  form AND the whole `os.Root` family, each wired per-op — announces its HOST NAMESPACE, one
+  deliberately coarse per-host identity (creation/removal/rename/truncate-by-name/chmod/chtimes/
+  link and create-or-O_TRUNC opens write; stat/readlink/readdir-open/chdir/openroot/plain opens
+  read); (c) a flock decision announces its file node as a write-conflict, with the grant
+  ACQUIRING and the unlock — explicit LOCK_UN or the close/exit release path — RELEASING
+  happens-before through the coarse aux (`dstSyncCoarseAux`); (d) a futex wait announces the word
+  identity (node pointer + byte offset — the queue key, so different mappings meet) as a read, a
+  wake as a write that RELEASES, and a woken waiter ACQUIRES. Coarseness is one-directional for
+  the ANNOUNCE half: extra announced dependencies only ADD explored orderings. The HB half rides
+  the same masking floor as the atomic CAS over-claim above: a coarse release that released
+  nothing real (an unheld LOCK_UN, a wake that woke nobody, an aliased identity — the futex id
+  arithmetic can in principle alias another node's pointer) is never load-bearing for pruning,
+  because every coarse HB event rides a same-id WRITE announce, so the reorder is always seeded
+  and the per-trace re-analysis drops an edge the reordered trace does not exhibit. *Recorded
+  incompleteness (the honest bounds):* (i) plain shared Go memory between goroutines of ONE
+  process, and atomics on mmap'd pages — the race build's domain; (ii) HANDLE-vs-NAMED
+  cross-identity: a named op's node-state effect (truncate-by-name, chmod-by-name, O_TRUNC's
+  data clear, named-stat's size read) announces at namespace granularity only, so it orders
+  against other NAMED ops but not against a peer's HANDLE ops on the same node — closable by
+  post-resolution node announces if a consumer needs it. `Exhausted` remains, as everywhere, a
+  claim over the visible dependency relation. Enforced by `TestDSTExploreCoarse{FSOrder,
+  FlockWinner,FutexLostWakeWindow,NamespaceOrder,FlockCloseRelease}`
+  (`testing/simulation/explore_coarse_linux_test.go`) — each pins the OUTCOME SET: both orders of
+  the conflicting pair genuinely ran under non-race DPOR, where each collapsed to one
+  falsely-exhausted class before the model; the namespace leg routes through `os.Root`.
 - **Hardening clauses.** Four consequences of the above, made explicit because each was violable in
   detail while the headline invariant read as satisfied (enforcement noted per clause):
   1. **Every capacity that can drop recorded information reports itself.** The sync-HB-event buffer is

@@ -123,8 +123,10 @@ type ExploreResult struct {
 	// sync-primitive hook, and no manual dstAccessYield/dstSyncAcquire call
 	// fired during any explored run. Independence is then indistinguishable
 	// from INVISIBILITY — a SUT whose goroutines conflict only through
-	// channels the build cannot see (plain memory, mmap'd shared pages, the
-	// simulated filesystem) collapses into a single class — so Exhausted is
+	// channels the build cannot see (plain memory, or atomics on mmap'd
+	// shared pages; the simulated filesystem, flock, and futex announce
+	// build-independently through the coarse model, exploration.md)
+	// collapses into a single class — so Exhausted is
 	// downgraded to false rather than claiming a completeness the build
 	// cannot establish. A genuinely SEQUENTIAL SUT — no scheduling decision
 	// ever held more than one simulation candidate — is exempt: its

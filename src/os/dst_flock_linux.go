@@ -6,7 +6,10 @@
 
 package os
 
-import "syscall"
+import (
+	"syscall"
+	"unsafe"
+)
 
 func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 	entry, handled, errno := dstFDLookup(fd)
@@ -34,6 +37,18 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 	}
 	node := file.node
 	file.leave()
+	// Coarse DPOR dependency (runtime.dstCoarseDep): flock is THE
+	// cross-process mutual-exclusion decision — which contender wins a
+	// LOCK_EX is outcome-determining, so both orders must be explorable.
+	// Announced pre-decision as a write-conflict on the file node; an
+	// unlock also RELEASES its happens-before history (the next grantee
+	// acquires it below), mirroring the runtime mutex hooks' shape.
+	flockID := uintptr(unsafe.Pointer(node))
+	if op == syscall.LOCK_UN {
+		dstCoarseDep(flockID, true, 2)
+	} else {
+		dstCoarseDep(flockID, true, 0)
+	}
 	for {
 		if err := file.enter(); err != nil {
 			if !file.flockClosedInRun() {
@@ -48,6 +63,9 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			dstFS.mu.Lock()
 			if op == syscall.LOCK_UN || node.flock.canLock(owner, exclusive) {
 				dstFS.mu.Unlock()
+				if op != syscall.LOCK_UN {
+					dstCoarseHB(flockID, 1) // granted: acquire the released history
+				}
 				return 0, true
 			}
 			if nonblock {
@@ -74,6 +92,7 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 		if node.flock.canLock(owner, exclusive) {
 			node.flock.lock(owner, exclusive)
 			file.leave()
+			dstCoarseHB(flockID, 1) // granted: acquire the released history
 			return 0, true
 		}
 		if nonblock {
@@ -100,9 +119,36 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 	if !ok {
 		return
 	}
+	// Coarse DPOR dependency: a close (or exit) RELEASING a held flock is
+	// as outcome-determining as an explicit LOCK_UN — a contender's
+	// nonblocking attempt lands on either side of it. Announced with the
+	// same write-conflict + release edge, before this function's own
+	// mutation (the announce yields, so it precedes the locks it is
+	// re-taken under). NARROWED to closes whose owner actually holds a
+	// lock: announcing every close would put a write-conflict on every
+	// file teardown and combinatorially inflate exhaustive explorations
+	// that never flock at all (measured: an unbudgeted explore test went
+	// from seconds to minutes).
+	file.mu.Lock()
+	node := file.node
+	file.mu.Unlock()
+	if node != nil {
+		dstFS.mu.Lock()
+		_, held := node.flock.holders[dstFlockOwner{host: entry.host, proc: entry.proc, fd: fd}]
+		dstFS.mu.Unlock()
+		if held {
+			dstCoarseDep(uintptr(unsafe.Pointer(node)), true, 2)
+		}
+	}
+	if node == nil {
+		// The node was already dropped (a close raced the registry sweep,
+		// or nilled during the announce's yield): the earlier drop's own
+		// release path covered the flock state — nothing left to unlock.
+		return
+	}
 	file.mu.Lock()
 	dstFS.mu.Lock()
-	file.node.flock.unlock(dstFlockOwner{host: entry.host, proc: entry.proc, fd: fd})
+	node.flock.unlock(dstFlockOwner{host: entry.host, proc: entry.proc, fd: fd})
 	dstFS.mu.Unlock()
 	file.mu.Unlock()
 }
