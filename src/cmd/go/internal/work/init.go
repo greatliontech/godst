@@ -129,6 +129,31 @@ func fuzzInstrumentFlags() []string {
 	return []string{"-d=libfuzzer"}
 }
 
+// dstRaceInstrumentFlags returns the compiler flags that enable dst-race
+// instrumentation: a dstAccessYield access-granularity yield emitted before
+// each -race hook, so every instrumented memory access becomes a deterministic
+// scheduling decision point (GOROOT/docs/dst/exploration.md, Level 2).
+//
+// The mode is active only under -race with the dst build tag; in every other
+// configuration it returns nil and the compiler stays hook-inert (DST-L2-4).
+//
+// The flag changes the compiler's output for otherwise-identical hashed
+// inputs (build tags alone do not enter the action ID — they normally only
+// select files, which are hashed individually), so any use here must be
+// mirrored in buildActionID. gc and buildActionID both call this function so
+// the flag and its cache key cannot diverge.
+func dstRaceInstrumentFlags() []string {
+	if !cfg.BuildRace {
+		return nil
+	}
+	for _, tag := range cfg.BuildContext.BuildTags {
+		if tag == "dst" {
+			return []string{"-d=dstrace=1"}
+		}
+	}
+	return nil
+}
+
 func instrumentInit() {
 	if !cfg.BuildRace && !cfg.BuildMSan && !cfg.BuildASan {
 		return
