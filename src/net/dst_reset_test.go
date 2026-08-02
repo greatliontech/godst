@@ -919,11 +919,13 @@ func TestDSTNetResetFailsBlockedWrite(t *testing.T) {
 // destroys the socket AND its retransmit timer — a partition-armed
 // retransmit watchdog expiring after the RST must not flip the conn's error
 // identity to ETIMEDOUT on later operations: the ladder stays the reset
-// one (first op ECONNRESET, then the CLOSED-socket EOF/EPIPE). The reachable
-// shape is a HOST-CRASH survivor: its outbound bytes written into the cut
-// stay held (only its inbound direction is truncated by the RST), so the
-// watchdog still sees them at its horizon; a pair reset truncates both
-// directions and the watchdog self-disarms.
+// one (first op ECONNRESET, then the CLOSED-socket EOF/EPIPE). The
+// reachable shape is a PROCESS-CRASH survivor under a ONE-WAY cut of its
+// own outbound direction: its bytes into the cut stay held (arming the
+// watchdog), while the victim kernel's crash RST traverses the clear
+// return direction and truncates only the inbound side — a real network's
+// asymmetric-route shape. (A HOST crash emits nothing and a pair reset
+// truncates both directions; neither reaches this interleaving.)
 func TestDSTNetResetKeepsIdentityPastRetransmitHorizon(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
@@ -936,26 +938,26 @@ func TestDSTNetResetKeepsIdentityPastRetransmitHorizon(t *testing.T) {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
 		simulation.Host("victim", simulation.HostConfig{}, func() {
-			ln, _ := Listen("tcp", ":0")
-			_, p, _ := SplitHostPort(ln.Addr().String())
-			port <- p
-			go func() {
+			go simulation.Process("srv", func() {
+				ln, _ := Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln.Addr().String())
+				port <- p
 				ln.Accept()
 				close(accepted)
-				select {} // dies with the machine
-			}()
+				select {} // dies with the process
+			})
 		})
 		simulation.Host("survivor", simulation.HostConfig{}, func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("victim")+":"+p)
 			<-accepted
-			simulation.Partition("survivor", "victim")
-			c.Write([]byte("held")) // undeliverable: arms the survivor's retransmit watchdog
-			simulation.CrashHost("victim")
+			simulation.PartitionOneWay("survivor", "victim") // outbound cut only: the return direction stays clear
+			c.Write([]byte("held"))                          // undeliverable: arms the survivor's retransmit watchdog
+			simulation.Crash("srv")                          // the LIVE kernel's RST rides the clear return direction
 			_, firstErr = c.Read(make([]byte, 8))
 			time.Sleep(3 * time.Second) // well past the watchdog's horizon
 			_, lateReadErr = c.Read(make([]byte, 8))
-			_, lateWriteErr = c.Write([]byte("x"))
+			_, lateWriteErr = c.Write(make([]byte, 1))
 			c.Close()
 		})
 	})

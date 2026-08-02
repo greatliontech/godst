@@ -576,7 +576,10 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 					}
 					close(ready)
 					<-crashed
-					// The peer's machine lost power: its sockets RST.
+					// The peer's machine lost power: SILENCE (no kernel
+					// exists to emit a packet). The survivor's default
+					// keepalive — Go enables it on every dialed conn —
+					// exhausts against the dead machine: ETIMEDOUT.
 					_, victimPeerReadErr = c.Read(make([]byte, 1))
 					close(readDone)
 					<-done // hold the lock while the checker probes it
@@ -622,8 +625,8 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 	if !errors.Is(siblingLockErr, syscall.EWOULDBLOCK) {
 		t.Fatalf("sibling flock = %v, want EWOULDBLOCK (its lock table survived)", siblingLockErr)
 	}
-	if !errors.Is(victimPeerReadErr, syscall.ECONNRESET) {
-		t.Fatalf("peer of the crashed host = %v, want ECONNRESET", victimPeerReadErr)
+	if !errors.Is(victimPeerReadErr, syscall.ETIMEDOUT) {
+		t.Fatalf("peer of the crashed host = %v, want ETIMEDOUT (silence, then keepalive exhaustion — power loss emits no RST)", victimPeerReadErr)
 	}
 	if !errors.Is(victimDialErr, syscall.ETIMEDOUT) {
 		t.Fatalf("dial to the crashed host = %v, want ETIMEDOUT (the machine is off — nothing answers the SYN)", victimDialErr)
@@ -1088,15 +1091,17 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 	}
 }
 
-// TestDSTCrashHostDropsInFlightBytes: a host crash RSTs each of its
-// connections AT THE SURVIVING PEER kernel-faithfully — bytes already
-// DELIVERED to the survivor's receive queue drain first (tcp_recvmsg reports
-// pending data before the socket error; an RST cannot destroy what the
-// survivor's kernel already holds), bytes still IN FLIGHT die with the
-// crashed sender's kernel, and only then do reads fail ECONNRESET
-// (DST-FAULT-SOUND). "abc" is delivered before the crash (its 100ms
-// traversal completes while the dial's SYN-ACK leg runs); "xyz" is written
-// with no virtual time left before the power loss and must never arrive.
+// TestDSTCrashHostDropsInFlightBytes: a host crash freezes each of its
+// connections at the surviving peer kernel-faithfully — bytes already
+// DELIVERED to the survivor's receive queue drain first (nothing can
+// destroy what the survivor's kernel already holds), bytes still IN FLIGHT
+// die with the crashed sender's kernel, and then SILENCE: no packet exists
+// for a powered-off machine to send, so the survivor's default keepalive
+// (Go enables it on every dialed conn) is what finally surfaces the death,
+// ETIMEDOUT (DST-FAULT-SOUND). "abc" is delivered before the crash (its
+// 100ms traversal completes while the dial's SYN-ACK leg runs); "xyz" is
+// written with no virtual time left before the power loss and must never
+// arrive.
 func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	var n int
 	var got [8]byte
@@ -1169,8 +1174,8 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	if n != 3 || string(got[:3]) != "abc" || firstErr != nil {
 		t.Fatalf("first read after the writer host crashed = (%d, %q, %v), want (3, %q, nil): delivered bytes drain before the reset", n, got[:n], firstErr, "abc")
 	}
-	if !errors.Is(secondErr, syscall.ECONNRESET) {
-		t.Fatalf("second read = %v, want ECONNRESET with no data: in-flight bytes died with the crashed kernel, never drained", secondErr)
+	if !errors.Is(secondErr, syscall.ETIMEDOUT) {
+		t.Fatalf("second read = %v, want ETIMEDOUT with no data: in-flight bytes died with the crashed kernel, never drained, and the silence ends at keepalive exhaustion", secondErr)
 	}
 }
 
@@ -1320,11 +1325,9 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 // the LOWER registration sequence and is torn down first within the crash
 // ("abc" is written with no virtual time left before the power loss, so it
 // is still in flight and dies with the crashed kernel; nothing was delivered
-// to drain). The survivor's entry must still be matched against the
-// pre-crash snapshot (dstMatchedVictims collects before any teardown): an
-// interleaved match-and-teardown loop would see the victim end's just-closed
-// done channel, mistake it for an app-close, skip the survivor's end, and
-// deliver bytes the power loss destroyed.
+// to drain — the victim-end freeze truncates it). The surviving listener's
+// read then sees silence until its default keepalive exhausts, ETIMEDOUT —
+// never the destroyed bytes.
 func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 	var n int
 	var readErr error
@@ -1380,8 +1383,8 @@ func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 		<-readDone
 		<-exited
 	})
-	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
-		t.Fatalf("first read after the dialing writer's host crashed = (%d, %v), want (0, ECONNRESET): in-flight bytes must be dropped, not drained", n, readErr)
+	if n != 0 || !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Fatalf("first read after the dialing writer's host crashed = (%d, %v), want (0, ETIMEDOUT): in-flight bytes must be dropped, not drained, and the silence ends at keepalive exhaustion", n, readErr)
 	}
 }
 

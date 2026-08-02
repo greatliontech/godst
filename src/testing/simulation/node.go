@@ -763,10 +763,13 @@ func crashProcess(name string) {
 // unwind), its pids read dead (Kill(pid, 0) answers ESRCH and the /proc
 // entries disappear), its open simulated files and virtual fds close, fd-owned
 // flocks release, shared mappings unregister (their bytes already are the
-// kernel page-cache pages), its connections RESET — the surviving peer
-// drains the bytes already delivered to it, then observes ECONNRESET
-// (in-flight bytes die; a conn whose victim end was already app-closed is
-// spared, its peer drains to io.EOF) — and its listeners close. The host filesystem survives
+// kernel page-cache pages), its connections RESET — the kernel survives a
+// process crash and answers for the dead sockets: the surviving peer drains
+// the bytes already delivered to it, then observes ECONNRESET (in-flight
+// bytes die; a conn whose victim end was already app-closed is spared, its
+// peer drains to io.EOF; a blackhole cut of the victim→peer direction
+// swallows the RST — the peer sees silence until a heal lets its probes meet
+// the CLOSED socket's RST) — and its listeners close. The host filesystem survives
 // untouched, unsynced writes included: a process crash does not tear the disk;
 // only the host-crash fault restores the durable image. If the calling
 // goroutine itself belongs to the victim (a self-crash — the OOM shape), Crash
@@ -863,14 +866,19 @@ func crashHost(name string) {
 // CrashHost kills the named host — the power-loss / kernel-panic fault
 // (docs/dst/faults.md "Crash / restart faults"). Every process on the host dies
 // as under Crash (goroutines descheduled permanently, no defers, pids dead),
-// every connection an end of which lives on the host is RESET at its peer —
-// the peer drains the bytes already delivered to its receive queue, then its
-// reads fail ECONNRESET (an RST cannot destroy what the survivor's kernel
-// already holds; bytes still in flight died with the machine), except a conn
-// the victim's application had already closed, whose peer still drains and
-// reads io.EOF (power loss emits no packet; bytes on the wire survive) — and
-// every listener closes. Until the machine reboots, dialing it blackholes:
-// the connect times out (deadline or retransmit horizon, ETIMEDOUT), never
+// and every connection an end of which lives on the host goes SILENT at its
+// surviving peer — a powered-off machine emits no packet. The peer drains the
+// bytes already delivered to its receive queue (nothing can destroy what its
+// kernel holds; bytes still in flight died with the machine), then the modeled
+// laws surface the death: retransmission exhaustion for outstanding bytes
+// (host death arms the horizon as a cut does, ETIMEDOUT), keepalive exhaustion
+// for idle connections (Go's default keepalive detects the dead machine at
+// ~150s), and — once a Host re-declaration reboots the machine — the RST its
+// fresh kernel answers the survivor's next traffic with (ECONNRESET). A conn
+// the victim's application had already closed is untouched: its peer drains
+// and reads io.EOF (bytes on the wire survive). Every listener closes. Until
+// the machine reboots, dialing it blackholes: the connect times out (deadline
+// or retransmit horizon, ETIMEDOUT), never
 // ECONNREFUSED — refusal needs a live kernel to answer RST. Then the machine's kernel state is gone: its
 // filesystem TEARS BACK TO ITS DURABLE IMAGE — data a file's Fsync committed
 // survives byte-exactly, a name its parent directory's Fsync committed survives,
@@ -903,7 +911,9 @@ func CrashHost(name string) {
 // files and virtual fds close (releasing flocks; shared mappings unregister while
 // their page-cache contents survive the exit), its listeners close, and
 // its connections close with the kernel's conditional — an end holding unread
-// received data answers the peer with RST (ECONNRESET), otherwise the peer drains
+// received data answers the peer with RST (ECONNRESET; a blackhole cut of the
+// RST's direction swallows it, and the peer's probes meet the CLOSED socket's
+// RST after heal instead), otherwise the peer drains
 // buffered bytes then reads io.EOF — so a
 // process that needs its work observed synchronizes before returning, exactly as a
 // real main must. A process is restarted by calling Process again with the same

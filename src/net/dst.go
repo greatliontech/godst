@@ -905,7 +905,20 @@ func (l *dstListener) Accept() (Conn, error) {
 	}
 }
 
-func (l *dstListener) Close() error {
+func (l *dstListener) Close() error { return l.closeTearing(nil) }
+
+// closeTearing closes the listener; each queued backlog connection whose
+// claim succeeds (acceptState 0→2) is torn down by tear. nil tear is the
+// kernel's own backlog teardown: production TCP resets connections still
+// sitting in the accept backlog when the listener closes — so a dialer that
+// already got a successful Dial observes ECONNRESET on its next op instead
+// of blocking durably forever on a connection no one will ever accept —
+// but the RST is a kernel-emitted segment: a blackhole cut of the
+// listener→dialer direction swallows it, and that dialer sees the silent
+// freeze instead (its probes meet the CLOSED socket's RST after heal). The
+// crash paths pass their own tear (a powered-off machine emits nothing for
+// ANY backlog conn — dstCloseHostListeners).
+func (l *dstListener) closeTearing(tear func(*dstConn)) error {
 	if !dstInSimBubble() && dstActive() && l.epoch == dstNetEpoch() {
 		return l.opError("close", errClosed)
 	}
@@ -914,6 +927,15 @@ func (l *dstListener) Close() error {
 	}
 	if l.stale() {
 		return nil
+	}
+	if tear == nil {
+		tear = func(c *dstConn) {
+			if dstPartitionedDir(c.localHost, c.remoteHost) {
+				dstCrashVictimConn(c)
+			} else {
+				c.resetConn()
+			}
+		}
 	}
 	close(l.done)
 	dstNet.mu.Lock()
@@ -924,16 +946,12 @@ func (l *dstListener) Close() error {
 	}
 	dstNet.mu.Unlock()
 	dstSockFDFree(l.sockFD, l.opts)
-	// Production TCP resets connections still sitting in the accept backlog
-	// when the listener closes; mirror it, so a dialer that already got a
-	// successful Dial observes ECONNRESET on its next op instead of blocking
-	// durably forever on a connection no one will ever accept.
 	for {
 		select {
 		case owned := <-l.accept:
 			c := owned.conn
 			if c.acceptState == nil || c.acceptState.CompareAndSwap(0, 2) {
-				c.resetConn()
+				tear(c)
 			}
 		default:
 			return nil

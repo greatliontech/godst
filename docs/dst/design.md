@@ -526,11 +526,13 @@ it never wraps a positive delay into an earlier delivery.
   episode-bounded** (armed by a blocked operation observing the unanswerable state; at most
   count+1 fires per episode, then death or disarm), never a free-running timer: a standing
   per-conn probe chain would advance the bubble's clock forever and destroy quiescence-based
-  deadlock detection. Two recorded ⊆-real limits follow (missed real faults, never false
-  failures): a connection NO operation observes during a cut-then-heal window misses the death a
-  free-running prober would have delivered, and a probe meeting a REBOOTED peer host is treated as
-  answered rather than RST'd. Conformance: `net/dst_keepalive_test.go` (invocation contract,
-  observability, inheritance, resolution, the death laws and their ladders, replay-exactness).
+  deadlock detection. One recorded ⊆-real limit follows (a missed real fault, never a false
+  failure): a connection NO operation observes during a cut-then-heal window misses the death a
+  free-running prober would have delivered. A probe meeting a REBOOTED peer host meets its fresh
+  kernel's RST (the one-shot `ECONNRESET`), and a DEAD host answers nothing — the crash-as-silence
+  contract (faults.md, Crash / restart faults). Conformance: `net/dst_keepalive_test.go`
+  (invocation contract, observability, inheritance, resolution, the death laws and their ladders,
+  replay-exactness) and `net/dst_crash_silence_test.go` (the dead-host and reboot arms).
 - **Connect cost.** Establishing a cross-host connection completes after one round trip of the
   link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + a jitter draw;
   throttle exempts the zero-payload control segments) — the SYN half is paid before the server's

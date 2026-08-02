@@ -776,7 +776,31 @@ func (e *dstWireEnd) horizonCheck() {
 		return
 	}
 	cutStart, cut, _ := dstPartCutStartDir(e.localHost, e.peerHost)
-	if !cut || !e.out.heldBeyond(cutStart) {
+	hostDead := dstHostDead(e.peerHost)
+	if cut {
+		// The cut's own heldBeyond boundary governs, as before.
+		if !e.out.heldBeyond(cutStart) {
+			e.horizonMu.Lock()
+			e.horizonArmed = false
+			e.horizonMu.Unlock()
+			return
+		}
+	} else if hostDead {
+		// A dead peer host: only destroyed-unacknowledged bytes
+		// (deadDropped) keep the watchdog armed — the delivered prefix
+		// still queued in the frozen stream was ACKed before the machine
+		// died and is not outstanding.
+		if !e.out.deadDroppedNow() {
+			e.horizonMu.Lock()
+			e.horizonArmed = false
+			e.horizonMu.Unlock()
+			return
+		}
+	} else {
+		// Neither cut nor dead: a heal delivered the bytes, or the machine
+		// REBOOTED — a fresh kernel answers the retransmissions with RST
+		// (probeDeadPeer at the parked ops' wake), never a timeout. Disarm
+		// either way.
 		e.horizonMu.Lock()
 		e.horizonArmed = false
 		e.horizonMu.Unlock()
@@ -905,7 +929,12 @@ func (e *dstWireEnd) probeDeadPeer(needDropped bool) bool {
 		return false
 	}
 	if e.timedOut.Load() || e.rstArrived.Load() ||
-		dstPartitionedDir(e.localHost, e.peerHost) || dstPartitionedDir(e.peerHost, e.localHost) {
+		dstPartitionedDir(e.localHost, e.peerHost) || dstPartitionedDir(e.peerHost, e.localHost) ||
+		dstHostDead(e.peerHost) {
+		// A DEAD peer host answers nothing (power loss has no kernel to RST
+		// with) — silence, until the machine reboots and its fresh kernel
+		// meets the probe. The cut arms and the host-dead arm alike leave
+		// the death to the retransmit/keepalive laws.
 		return false
 	}
 	dstDeadPushRST(e)
@@ -958,6 +987,17 @@ func (s *dstStream) freezeAtHorizon(horizon int64) (finArrived bool) {
 		s.segs = nil
 	}
 	return finArrived
+}
+
+// deadDroppedNow reports whether this stream carries destroyed-unacknowledged
+// bytes (deadDropped) — the ONLY outstanding-data witness after a crash
+// freeze: the delivered prefix still queued in a frozen stream was ACKed by
+// the peer's kernel before it died, and production retransmits nothing for
+// ACKed bytes (arming a horizon on them would be a sim-only ETIMEDOUT).
+func (s *dstStream) deadDroppedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deadDropped
 }
 
 // unreadInbound reports whether this end's receive direction still holds bytes
@@ -1067,6 +1107,15 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			if outCutStart, outCut, _ := dstPartCutStartDir(e.localHost, e.peerHost); outCut && e.out.heldBeyond(outCutStart) {
 				e.armHorizon()
 			}
+		}
+		if dstHostDead(e.peerHost) && e.out.deadDroppedNow() {
+			// A dead peer HOST destroyed this end's unacknowledged bytes
+			// (the crash freeze marks them deadDropped; anything pushed
+			// later joins them): the retransmissions into the silent
+			// machine exhaust at the horizon. Bytes merely QUEUED in the
+			// frozen stream are the delivered-and-ACKed prefix — production
+			// retransmits nothing for them, so they never arm.
+			e.armHorizon()
 		}
 		// A blocked read is the keepalive law's observer: an idle connection
 		// (nothing outstanding — otherwise the horizon above governs) whose
@@ -1203,7 +1252,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			}
 			var horizonC <-chan time.Time
 			var horizonT *time.Timer
-			if horizon := e.effRetransNs(); horizon > 0 && dstPartitionedDir(e.localHost, e.peerHost) { // outgoing local→peer is where a write's bytes are held
+			if horizon := e.effRetransNs(); horizon > 0 && (dstPartitionedDir(e.localHost, e.peerHost) || dstHostDead(e.peerHost)) { // outgoing local→peer is where a write's bytes are held; a DEAD peer host is as undeliverable as a cut
 				if cutStart < 0 {
 					cutStart = dstBaseNanos() // the cut-block began; a heal resets it, restarting the timer on ACK progress
 				}
@@ -1309,7 +1358,8 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 		e.out.mu.Unlock()
 		e.out.wake()
 		if dead && !e.timedOut.Load() && !e.rstArrived.Load() &&
-			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) {
+			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) &&
+			!dstHostDead(e.peerHost) {
 			// The segment met a dead (CLOSED) peer socket over a live link: the
 			// dead kernel answers it with an RST that reaches this end. The
 			// local send's success stands — a real send() into a doomed conn
@@ -1335,7 +1385,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 		total += int(room)
 		b = b[room:]
 		cutStart = -1 // progress: reset the cut window
-		if dstPartAnyCut() && dstPartitionedDir(e.localHost, e.peerHost) {
+		if (dstPartAnyCut() && dstPartitionedDir(e.localHost, e.peerHost)) || dstHostDead(e.peerHost) {
 			// The bytes just buffered are undeliverable: a real sender's
 			// retransmissions into the void exhaust at the horizon even though
 			// this write returned (TCP's async send). Arm the watchdog so the

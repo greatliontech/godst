@@ -559,9 +559,11 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   accepted TCP conn (15s idle/15s interval/9 probes → death ~150s into a permanent cut), so a SUT's
   idle connections across a partition die under simulation exactly as deployed ones do, with the
   same one-shot `ETIMEDOUT` ladder as retransmission exhaustion. The law is op-armed (a blocked
-  operation is its observer) and episode-bounded; recorded ⊆-real limits: an unobserved conn misses
-  its death across a cut-then-heal window, and a probe meeting a rebooted host is answered rather
-  than RST'd (design.md, Socket options & keepalive). Conformance: `net/dst_keepalive_test.go`.
+  operation is its observer) and episode-bounded; recorded ⊆-real limit: an unobserved conn misses
+  its death across a cut-then-heal window (design.md, Socket options & keepalive). A probe meeting
+  a REBOOTED host meets its fresh kernel's RST (`ECONNRESET`), and a DEAD host answers nothing —
+  the crash-as-silence contract (Crash / restart faults). Conformance:
+  `net/dst_keepalive_test.go`, `net/dst_crash_silence_test.go`.
 - **Connection reset** — inject a connection reset (an RST, surfacing as the one-shot `ECONNRESET`)
   on a process's or a host-pair's conns.
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
@@ -966,34 +968,39 @@ process** — so a process dying and the host losing power tear the disk differe
 
 | Fault | Kills | Host FS | Conns | Models |
 |---|---|---|---|---|
-| **Process crash** (`Crash("p")`) | that process's goroutines + memory + fds | **intact** — kernel survives, so un-fsync'd writes persist for host-siblings and the restart | its conns RST | a process dying / `kill -9` / OOM |
-| **Host crash** (`CrashHost("h")`, power loss) | **all** processes on the host | **tears to the fsync'd durable image** (the disk "Crash" above) | all their conns RST | power loss / kernel panic |
+| **Process crash** (`Crash("p")`) | that process's goroutines + memory + fds | **intact** — kernel survives, so un-fsync'd writes persist for host-siblings and the restart | its conns RST at the peer (the live kernel answers) — unless a cut swallows the RST | a process dying / `kill -9` / OOM |
+| **Host crash** (`CrashHost("h")`, power loss) | **all** processes on the host | **tears to the fsync'd durable image** (the disk "Crash" above) | all their conns go SILENT at the peer (no kernel exists to emit a packet) | power loss / kernel panic |
 
 Both, at the victim's next cooperative point: the targeted goroutines (process membership or current /
 inherited entered-Host membership names the victim) are
 **descheduled permanently** (the `dstSchedSelect` seam never selects them again; their in-flight blocking
 ops are abandoned — a crash does not, cannot in Go, force-unwind a goroutine mid-instruction; the sound
-model is *they never run again*, what a killed process's threads do), conns RST, fds drop, memory is gone.
+model is *they never run again*, what a killed process's threads do), conns tear down per the paragraph
+below (silence for a host crash, the kernel's RST for a process crash), fds drop, memory is gone.
 The host crash additionally tears the host disk; the process crash leaves it intact.
 
-The crash-RST collapse has one boundary: a connection whose victim-side end the application had
-**already closed** before the crash is NOT reset at the surviving peer. Its data and FIN are on the
-wire, and a powered-off machine emits no packet — nothing can destroy bytes the network already
-carries, so the peer drains and reads `io.EOF` (or whatever error the pre-crash teardown recorded),
-exactly as if the crash never happened to that conn (DST-FAULT-SOUND: no real RST exists for an
-app-closed end at power loss). *Enforced:* `TestDSTCrashHostSparesAppClosedConns` (host crash),
-`TestDSTCrashProcessSparesAppClosedConns` (process crash — the kernel survives a `kill -9` and has
-no socket left to answer RST for an fd that left the table at close). The RST applies to
-the connections the victim still holds open. The victim's own ends reset outright — their receive
-queues died with the process or kernel. The surviving peer's end receives the RST
-kernel-faithfully: bytes already **delivered** to the survivor's receive queue drain first (an
-incoming RST cannot destroy what the survivor's kernel already holds — tcp_recvmsg reports pending
-data before the socket error, host-probed), then its first failing op reports `ECONNRESET` (the
-one-shot `sk_err`; later reads `io.EOF`, later writes `EPIPE`); bytes still **in
-flight** die with the crashed sender (its kernel's send buffer and its emissions never complete —
-in the simulation's one-queue wire model every undelivered byte is destroyable in some real
-execution, so the collapse stays ⊆-real).
-*Enforced:* `TestDSTCrashHostDropsInFlightBytes` (delivered bytes drain, in-flight bytes die),
+The two crashes part at the surviving peer, because only one leaves a kernel to speak. A **host
+crash emits nothing** — power loss has no kernel to send with — so every surviving peer sees
+SILENCE: bytes already **delivered** to its receive queue drain (nothing can destroy what its
+kernel already holds), bytes still **in flight** die with the crashed machine (its kernel's send
+buffer and its emissions never complete — every undelivered byte is destroyable in some real
+execution, ⊆-real), and then the modeled laws surface the death — retransmission exhaustion for
+outstanding bytes (host death arms the horizon exactly as a cut does), keepalive exhaustion for
+idle connections (production Go enables keepalive on every dialed/accepted conn, so a default
+survivor detects the dead machine at ~150s), and the RST a REBOOTED machine's fresh kernel answers
+the survivor's next traffic with (`ECONNRESET` — it knows nothing of the old connection). A
+**process crash** leaves the kernel alive to answer for the dead sockets: the surviving peer
+receives the RST kernel-faithfully (delivered bytes drain first, then the one-shot `ECONNRESET`;
+later reads `io.EOF`, later writes `EPIPE`) — unless a blackhole cut of the victim→survivor
+direction swallows it (no kernel-emitted segment traverses a blackhole): the survivor then sees
+silence until a heal lets its probes meet the CLOSED socket's RST. A connection whose victim-side
+end the application had **already closed** before either crash is untouched at the peer: its data
+and FIN are on the wire, and the peer drains and reads `io.EOF` (or whatever the pre-crash
+teardown recorded) exactly as if the crash never happened to that conn (DST-FAULT-SOUND).
+*Enforced:* `net/dst_crash_silence_test.go` (host-crash silence, keepalive and horizon deaths,
+reboot-RST, cut+crash silence, the app-closed drain, the cut-held process-crash RST),
+`TestDSTCrashHostSparesAppClosedConns`, `TestDSTCrashProcessSparesAppClosedConns`,
+`TestDSTCrashHostDropsInFlightBytes` (delivered bytes drain, in-flight bytes die),
 `TestDSTCrashProcessSurvivorDrainsDeliveredBytes`, `TestDSTCrashHostFreesVictimPorts`
 (the victim's port space clears with the machine). And until a Host re-declaration reboots the
 machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so the connect times
