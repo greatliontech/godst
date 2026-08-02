@@ -3315,6 +3315,57 @@ func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
 	}
 }
 
+// TestDPORMutexBlindDowngrade pins the PARTIAL-invisibility arm of the
+// Uninstrumented downgrade: in a build without the dst-race sync hooks,
+// a simulation goroutine parking on a sync.Mutex proves the SUT orders
+// through a primitive whose dependencies this build cannot see — other
+// Level-2 events firing alongside (channels here) must not let the
+// exploration claim exhaustion. In a race build the same SUT keeps its
+// claim (the sync hooks see the mutex).
+func TestDPORMutexBlindDowngrade(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	sut := func() bool {
+		var mu sync.Mutex
+		x := 0
+		// Guarantee a mutex PARK in every run: the holder takes the
+		// lock, releases the contender, and unlocks only after the
+		// contender is queued behind it (Gosched gives the contender
+		// its blocking turn deterministically under the sim).
+		held := make(chan struct{})
+		done := make(chan struct{}, 2)
+		mu.Lock()
+		go func() {
+			close(held)
+			mu.Lock()
+			x++
+			mu.Unlock()
+			done <- struct{}{}
+		}()
+		go func() {
+			<-held
+			done <- struct{}{}
+		}()
+		runtime.Gosched()
+		runtime.Gosched()
+		mu.Unlock()
+		<-done
+		<-done
+		return x != 1
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR}, sut)
+	if dstRaceEnabledFP() {
+		if res.Uninstrumented {
+			t.Fatalf("race build: Uninstrumented = true, want false (sync hooks see the mutex): %+v", res)
+		}
+		return
+	}
+	if !res.Uninstrumented || res.Exhausted {
+		t.Fatalf("norace mutex-parking SUT: Uninstrumented=%v Exhausted=%v, want true/false (mutex orderings were invisible)", res.Uninstrumented, res.Exhausted)
+	}
+}
+
 // TestDPORUninstrumentedDowngrade pins ExploreResult.Uninstrumented: in a
 // build without the dst-race auto-instrumentation, a DPOR exploration that
 // fires no Level-2 hook at all cannot distinguish independence from

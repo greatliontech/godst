@@ -118,17 +118,19 @@ type ExploreResult struct {
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
 	BudgetHit bool
 	// Uninstrumented is true iff a DPOR exploration in a build WITHOUT the
-	// dst-race auto-instrumentation (-tags dst -race) observed no Level-2
-	// dependency event at all: no compiler-emitted access hook, no runtime
-	// sync-primitive hook, and no manual dstAccessYield/dstSyncAcquire call
-	// fired during any explored run. Independence is then indistinguishable
-	// from INVISIBILITY — a SUT whose goroutines conflict only through
-	// channels the build cannot see (plain memory, or atomics on mmap'd
-	// shared pages; the simulated filesystem, flock, and futex announce
-	// build-independently through the coarse model, exploration.md)
-	// collapses into a single class — so Exhausted is
-	// downgraded to false rather than claiming a completeness the build
-	// cannot establish. A genuinely SEQUENTIAL SUT — no scheduling decision
+	// dst-race auto-instrumentation (-tags dst -race) could not vouch for
+	// its own dependency view: either no Level-2 dependency event fired at
+	// all across a tree that held a real concurrency choice (no
+	// compiler-emitted access hook, no runtime sync-primitive hook, no
+	// manual dstAccessYield/dstSyncAcquire call — total invisibility), or
+	// a simulation goroutine PARKED on a sync.Mutex/RWMutex during the
+	// exploration (partial invisibility: mutex orderings ride HB events
+	// only the dst-race build emits, so events firing elsewhere cannot
+	// vouch for them; the uncontended fast path is an uninstrumented
+	// atomic and remains a documented residual). Independence is then
+	// indistinguishable from INVISIBILITY, so Exhausted is downgraded to
+	// false rather than claiming a completeness the build cannot
+	// establish. A genuinely SEQUENTIAL SUT — no scheduling decision
 	// ever held more than one simulation candidate — is exempt: its
 	// single-schedule exhaustion is sound at the yield-granularity tree,
 	// and there was nothing for the missing instrumentation to miss. Build
@@ -985,13 +987,37 @@ func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult 
 	// invisibility, not independence (ExploreResult.Uninstrumented). A
 	// sequential SUT (no multi-candidate decision anywhere) keeps its
 	// claim: there was nothing to be invisible.
+	//
+	// The second downgrade arm is PARTIAL invisibility: a simulation
+	// goroutine parking on a sync.Mutex/RWMutex during the exploration
+	// proves the SUT orders through a primitive whose dependencies only
+	// the dst-race sync hooks emit — other events (channels, the coarse
+	// FS model) firing alongside cannot vouch for the mutex orderings
+	// this build never saw, so the exhaustion claim downgrades even
+	// though the event floor was met — UNLESS the run announced sync
+	// decisions manually (dstSyncAcquire): announced-sync SUTs carry
+	// their own visibility and keep their claims. Coarse-model-only and
+	// channel-only SUTs are untouched: their dependencies are recorded
+	// build-independently and no mutex park fires.
 	accessEventsAtStart := dstLevel2EventsFP()
 	choicesAtStart := dstMultiChoicePointsFP()
+	blindAtStart := dstSyncBlindBlocksFP()
+	announcesAtStart := dstSyncAnnouncesFP()
 	res := dporExploreRun(seed, sut, cfg)
-	if !dstRaceEnabledFP() && dstLevel2EventsFP() == accessEventsAtStart &&
-		dstMultiChoicePointsFP() != choicesAtStart {
-		res.Uninstrumented = true
-		res.Exhausted = false
+	if !dstRaceEnabledFP() {
+		zeroEvents := dstLevel2EventsFP() == accessEventsAtStart &&
+			dstMultiChoicePointsFP() != choicesAtStart
+		// Blind only when nothing announced: a SUT wiring its sync
+		// decisions through dstSyncAcquire (the sweep's generated
+		// programs, any manually instrumented SUT) carries its own
+		// ordering visibility, and per-object correlation is not
+		// attempted (documented residual at dstSyncBlindBlocks).
+		mutexBlind := dstSyncBlindBlocksFP() != blindAtStart &&
+			dstSyncAnnouncesFP() == announcesAtStart
+		if zeroEvents || mutexBlind {
+			res.Uninstrumented = true
+			res.Exhausted = false
+		}
 	}
 	return res
 }

@@ -176,6 +176,12 @@ func dstLevel2EventsFP() uint64
 //go:linkname dstMultiChoicePointsFP runtime.dstMultiChoicePointsFP
 func dstMultiChoicePointsFP() uint64
 
+//go:linkname dstSyncBlindBlocksFP runtime.dstSyncBlindBlocksFP
+func dstSyncBlindBlocksFP() uint64
+
+//go:linkname dstSyncAnnouncesFP runtime.dstSyncAnnouncesFP
+func dstSyncAnnouncesFP() uint64
+
 //go:linkname dstScheduleAbortedFP runtime.dstScheduleAbortedFP
 func dstScheduleAbortedFP() bool
 

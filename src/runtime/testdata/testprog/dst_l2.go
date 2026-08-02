@@ -126,7 +126,10 @@ func DSTYieldSound() {
 	res := simulation.Explore(dstSeedEnv(), simulation.DPOR, yieldLockedSUT)
 	os.Stdout.WriteString("yieldsound schedules=" + strconv.Itoa(res.Schedules) +
 		" failures=" + strconv.Itoa(len(res.Failures)) +
-		" exhausted=" + strconv.FormatBool(res.Exhausted) + "\n")
+		" exhausted=" + strconv.FormatBool(res.Exhausted) +
+		" budgethit=" + strconv.FormatBool(res.BudgetHit) +
+		" overflow=" + strconv.FormatBool(res.Overflow) +
+		" uninstrumented=" + strconv.FormatBool(res.Uninstrumented) + "\n")
 }
 
 // atomicityViolSUT is an Explore SUT: two withdrawals of 100 from a balance of

@@ -42,6 +42,45 @@ var dstAccessYieldPoints uint64
 // (consumers take deltas).
 var dstLevel2Events uint64
 
+// dstSyncBlindBlocks counts mutex-class semaphore parks of simulation
+// goroutines during scheduled-strategy (Explore) runs in builds WITHOUT
+// the dst-race sync hooks. A sync.Mutex/RWMutex ordering rides HB events
+// only the dst-race build emits; a park here proves the SUT orders
+// through a primitive whose dependencies this build cannot see, so any
+// exhaustion claim over such a run is invisibility, not independence.
+// (WaitGroup and Cond parks are exempt: their wakeups are addr==0
+// transitions the explorer records build-independently, and they carry
+// no outcome-determining order beyond the completion edge.) Two
+// documented residuals: the uncontended fast path is an uninstrumented
+// atomic and stays invisible (contention is the detectable signal),
+// and a run whose manual announces cover SOME sync objects vouches for
+// the rest too (the downgrade consults dstSyncAnnounces as an
+// all-or-nothing signal — per-object correlation is not attempted).
+// Monotone; never reset (consumers take deltas).
+var dstSyncBlindBlocks uint64
+
+// dstNoteSyncBlindBlock feeds dstSyncBlindBlocks from the semaphore
+// park site. Cheap and branch-first: inert unless a scheduled-mode
+// simulation goroutine is parking in a norace build.
+//
+//go:nosplit
+func dstNoteSyncBlindBlock(reason waitReason) {
+	if raceenabled || !dstActive() || dstSchedKind != dstSchedScheduled {
+		return
+	}
+	gp := getg()
+	if gp == nil || !gp.dstSimG {
+		return
+	}
+	switch reason {
+	case waitReasonSyncMutexLock, waitReasonSyncRWMutexLock, waitReasonSyncRWMutexRLock:
+		dstSyncBlindBlocks++
+	}
+}
+
+//go:linkname dstSyncAnnouncesFP
+func dstSyncAnnouncesFP() uint64 { return dstSyncAnnounces }
+
 // dstMultiChoicePoints counts scheduled-strategy decisions whose
 // simulation candidate set held MORE THAN ONE goroutine — the exploration
 // actually had a concurrency choice to make. The Uninstrumented downgrade
@@ -161,8 +200,17 @@ func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
 //
 //go:linkname dstSyncAcquire
 func dstSyncAcquire(id unsafe.Pointer) {
+	dstSyncAnnounces++
 	dstYieldAccess(uintptr(id), 1, true, false, sys.GetCallerPC())
 }
+
+// dstSyncAnnounces counts dstSyncAcquire calls — manual (or dst-race
+// compiler-emitted) synchronization-object announces. The mutex-blind
+// downgrade consults its delta: a SUT that announces its sync decisions
+// carries its own ordering visibility, so its mutex parks are covered,
+// not blind (the DPOR completeness sweep's generated programs are this
+// shape). Monotone; never reset (consumers take deltas).
+var dstSyncAnnounces uint64
 
 // Atomic-operation kinds for dstAtomicYield. MIRRORED by the compiler's
 // dst-race emission (cmd/compile/internal/ssagen, dstAtomicCallInfo) — the
@@ -317,6 +365,9 @@ func dstLevel2EventsFP() uint64 { return dstLevel2Events }
 
 //go:linkname dstMultiChoicePointsFP
 func dstMultiChoicePointsFP() uint64 { return dstMultiChoicePoints }
+
+//go:linkname dstSyncBlindBlocksFP
+func dstSyncBlindBlocksFP() uint64 { return dstSyncBlindBlocks }
 
 //go:linkname dstAccessYieldReset
 func dstAccessYieldReset() { dstAccessYieldPoints = 0 }

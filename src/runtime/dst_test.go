@@ -1822,8 +1822,16 @@ func TestDSTAccessYieldSound(t *testing.T) {
 		t.Fatalf("yield-while-locked test is vacuous: only %d schedule(s) — the access-yield "+
 			"did not drive interleavings: %q", n, out1)
 	}
-	if !strings.Contains(out1, "exhausted=true") {
-		t.Fatalf("yield-while-locked interleaving space not exhausted: %q", out1)
+	// The SUT announces every lock acquisition through dstSyncAcquire,
+	// so even in this norace build the exploration carries its own
+	// ordering visibility and KEEPS its exhaustion claim — the
+	// mutex-blind downgrade (TestDPORMutexBlindDowngrade in
+	// testing/simulation) fires only for parks with no announces.
+	if !strings.Contains(out1, "budgethit=false") || !strings.Contains(out1, "overflow=false") {
+		t.Fatalf("yield-while-locked enumeration truncated: %q", out1)
+	}
+	if !strings.Contains(out1, "exhausted=true") || !strings.Contains(out1, "uninstrumented=false") {
+		t.Fatalf("announced-sync exploration must keep its exhaustion claim: %q", out1)
 	}
 	if out2 := runTestProgDSTNoRace(t, "DSTYieldSound", "DSTSEED=1"); out1 != out2 {
 		t.Fatalf("access-granularity yield not deterministic across same-seed runs:\n run1=%q\n run2=%q", out1, out2)

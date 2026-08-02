@@ -188,6 +188,7 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		}
 		// Any semrelease after the cansemacquire knows we're waiting
 		// (we set nwait above), so go to sleep.
+		dstNoteSyncBlindBlock(reason)
 		root.queue(addr, s, lifo)
 		goparkunlock(&root.lock, reason, traceBlockSync, 4+skipframes)
 		if s.ticket != 0 || cansemacquire(addr) {

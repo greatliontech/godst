@@ -368,7 +368,16 @@ mutex is sound and is exactly the interleaving Gap A needs.
   reports it and `Exhausted` is downgraded to false rather than claiming a completeness the build
   cannot establish (keyed on the runtime's `dstLevel2Events` delta, which counts recorded accesses,
   sync decisions, and atomic announces but never `dstYieldPoint`'s size-0 scheduling yields —
-  enforced by `TestDPORUninstrumentedDowngrade`, both builds). Manual-hook SUTs (the sweep's shape)
+  enforced by `TestDPORUninstrumentedDowngrade`, both builds). The floor has a second, PARTIAL
+  arm: `sync.Mutex`/`RWMutex` orderings ride HB events only the dst-race sync hooks emit, so a
+  simulation goroutine PARKING on one during a norace exploration proves the SUT orders through a
+  primitive the build cannot see — events firing elsewhere (channels, the coarse model) cannot
+  vouch for those orderings, and the same downgrade applies (keyed on the runtime's
+  `dstSyncBlindBlocks` delta from the semaphore park site; enforced by
+  `TestDPORMutexBlindDowngrade`, both builds). The uncontended mutex fast path is an
+  uninstrumented atomic and stays invisible — the documented residual: norace DPOR exhaustion
+  over mutex-using SUTs is sound only when contention parks at least once or the dst-race build
+  is used. Manual-hook SUTs (the sweep's shape)
   fire events and keep their claims; Exhaustive mode is unaffected — its exhaustion claim is over
   the runtime-yield-granularity schedule tree and does not depend on dependency visibility.
   *Coarse cross-process dependencies (build-independent):* the simulated OS announces the objects
