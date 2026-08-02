@@ -131,6 +131,15 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 //go:nosplit
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() {
+		// A sockopt on a virtual socket descriptor is the simulation's
+		// (dstSocketcallSockopt); every other in-bubble socketcall meets the
+		// fence. rawsocketcall dispatches nothing, like the raw trampolines.
+		if e, handled := dstSocketcallSockopt(call, a0, a1, a2, a3, a4); handled {
+			if e != 0 {
+				return -1, e
+			}
+			return 0, 0
+		}
 		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)

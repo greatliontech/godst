@@ -11,6 +11,16 @@ import _ "unsafe" // for go:linkname
 const dstVirtualFDBase = 1 << 30
 const dstVirtualFDCount = 1 << 20
 
+// The virtual SOCKET descriptor range, disjoint from (and adjacent to) the
+// virtual file range: the numbers net issues for simulated sockets so a
+// Dialer.Control / ListenConfig.Control callback's raw setsockopt/getsockopt
+// (the golang.org/x/sys/unix path) can be routed to the simulated option
+// layer. net declares the same constants (net/dst_sockopt.go); the two
+// packages share the range by construction, like os and syscall share the
+// file range.
+const dstVirtualSockFDBase = dstVirtualFDBase + dstVirtualFDCount
+const dstVirtualSockFDCount = 1 << 20
+
 // dstSyscallVirtualFDTrap reports whether an fd-carrying trap names
 // a number in the reserved virtual-fd range [dstVirtualFDBase,
 // dstVirtualFDBase+dstVirtualFDCount). The WHOLE range is refused at the raw

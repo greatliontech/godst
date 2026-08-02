@@ -785,92 +785,28 @@ func TestDSTNetRejectsUnsupportedOptions(t *testing.T) {
 	dialAddr := "127.0.0.1:1"
 	listenAddr := "127.0.0.1:0"
 
-	dialCases := []struct {
-		name   string
-		dialer Dialer
-		option string
-	}{
-		{
-			name: "ControlContext",
-			dialer: Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
-				t.Fatal("Dialer.ControlContext called under DST")
-				return nil
-			}},
-			option: "Dialer.ControlContext",
-		},
-		{
-			name: "Control",
-			dialer: Dialer{Control: func(string, string, syscall.RawConn) error {
-				t.Fatal("Dialer.Control called under DST")
-				return nil
-			}},
-			option: "Dialer.Control",
-		},
-		{
-			name:   "MPTCP",
-			option: "Dialer.MultipathTCP",
-		},
-		{
-			name:   "KeepAlive",
-			dialer: Dialer{KeepAlive: time.Second},
-			option: "Dialer.KeepAlive",
-		},
-		{
-			name:   "KeepAliveConfig",
-			dialer: Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true}},
-			option: "Dialer.KeepAlive",
-		},
-	}
-	dialCases[2].dialer.SetMultipathTCP(true)
-
-	listenCases := []struct {
-		name   string
-		config ListenConfig
-		option string
-	}{
-		{
-			name: "Control",
-			config: ListenConfig{Control: func(string, string, syscall.RawConn) error {
-				t.Fatal("ListenConfig.Control called under DST")
-				return nil
-			}},
-			option: "ListenConfig.Control",
-		},
-		{
-			name:   "MPTCP",
-			option: "ListenConfig.MultipathTCP",
-		},
-		{
-			name:   "KeepAlive",
-			config: ListenConfig{KeepAlive: time.Second},
-			option: "ListenConfig.KeepAlive",
-		},
-		{
-			name:   "KeepAliveConfig",
-			config: ListenConfig{KeepAliveConfig: KeepAliveConfig{Enable: true}},
-			option: "ListenConfig.KeepAlive",
-		},
-	}
-	listenCases[1].config.SetMultipathTCP(true)
+	// Control/ControlContext and the keepalive configuration are MODELED
+	// (the socket-option layer; see dst_keepalive_test.go for the modeled
+	// behavior). Only an explicit MPTCP enable remains refused.
+	var mptcpDialer Dialer
+	mptcpDialer.SetMultipathTCP(true)
+	var mptcpConfig ListenConfig
+	mptcpConfig.SetMultipathTCP(true)
 
 	simulation.Run(1, func() {
-		for _, tt := range dialCases {
-			c, err := tt.dialer.DialContext(ctx, "tcp", dialAddr)
-			if c != nil {
-				c.Close()
-			}
-			if !isDSTUnsupportedNetOption(err, tt.option) {
-				t.Fatalf("Dialer %s option error = %v, want unsupported %s", tt.name, err, tt.option)
-			}
+		c, err := mptcpDialer.DialContext(ctx, "tcp", dialAddr)
+		if c != nil {
+			c.Close()
 		}
-		for _, tt := range listenCases {
-			l, err := tt.config.Listen(ctx, "tcp", listenAddr)
-			if l != nil {
-				l.Close()
-			}
-			if !isDSTUnsupportedNetOption(err, tt.option) {
-				t.Fatalf("ListenConfig %s option error = %v, want unsupported %s", tt.name, err, tt.option)
-			}
+		if !isDSTUnsupportedNetOption(err, "Dialer.MultipathTCP") {
+			t.Fatalf("Dialer MPTCP option error = %v, want unsupported Dialer.MultipathTCP", err)
+		}
+		l, err := mptcpConfig.Listen(ctx, "tcp", listenAddr)
+		if l != nil {
+			l.Close()
+		}
+		if !isDSTUnsupportedNetOption(err, "ListenConfig.MultipathTCP") {
+			t.Fatalf("ListenConfig MPTCP option error = %v, want unsupported ListenConfig.MultipathTCP", err)
 		}
 	})
 }

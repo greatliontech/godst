@@ -544,6 +544,24 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   not reproduce ACK-starvation (a real sender stalls and eventually `ETIMEDOUT`s when its ACKs travel the
   cut direction). This is a *completeness* limit (the sim MISSES a real fault — the safe, ⊆-real
   direction), never a false failure; ACK-level reverse death is a possible finer-grained follow-on.
+- **Keepalive & TCP_USER_TIMEOUT (per-socket death laws)** — not injected faults but per-socket
+  POLICIES that change when the faults above kill a connection, configured exactly as production
+  configures them (Go-level `KeepAlive`/`KeepAliveConfig`, or raw sockopts through
+  `Dialer.Control`/`ControlContext`/`ListenConfig.Control`/`SyscallConn` on the socket's virtual
+  descriptor — design.md "Socket options & keepalive"). `TCP_USER_TIMEOUT` overrides the
+  retransmission horizon per socket (data held at a cut, the connect path's SYN, and a zero-window
+  stall against a live peer; fixed-instant, the horizon model's recorded collapse). **Keepalive**
+  kills an IDLE connection — nothing outstanding, so the horizon above never arms — whose probes
+  are unanswerable (a cut in either direction, or the peer's host dead), on `tcp_keepalive_timer`'s
+  own grid: first probe at idle-from-activity, one per interval after, death when the probes out
+  reach the count (or, with `TCP_USER_TIMEOUT` set, at the first fire past it with a probe out —
+  the user timeout replaces the count check). Production Go enables keepalive on EVERY dialed and
+  accepted TCP conn (15s idle/15s interval/9 probes → death ~150s into a permanent cut), so a SUT's
+  idle connections across a partition die under simulation exactly as deployed ones do, with the
+  same one-shot `ETIMEDOUT` ladder as retransmission exhaustion. The law is op-armed (a blocked
+  operation is its observer) and episode-bounded; recorded ⊆-real limits: an unobserved conn misses
+  its death across a cut-then-heal window, and a probe meeting a rebooted host is answered rather
+  than RST'd (design.md, Socket options & keepalive). Conformance: `net/dst_keepalive_test.go`.
 - **Connection reset** — inject a connection reset (an RST, surfacing as the one-shot `ECONNRESET`)
   on a process's or a host-pair's conns.
   DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and

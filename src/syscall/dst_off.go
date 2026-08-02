@@ -62,3 +62,9 @@ func dstTryKill(pid int, sig Signal) (err Errno, handled bool) { return 0, false
 func dstTryClockGettime(trap, clockid, ts uintptr) (r1, r2 uintptr, err Errno, handled bool) {
 	return 0, 0, 0, false
 }
+
+func dstTrySetsockopt(fd, level, opt int, val []byte) (err Errno, handled bool) { return 0, false }
+
+func dstTryGetsockopt(fd, level, opt int, val []byte) (retlen int, err Errno, handled bool) {
+	return 0, 0, false
+}

@@ -680,14 +680,14 @@ func fsAllowlist() []allowEntry {
 		},
 		{
 			key:  "fs-dir-nlink",
-			cite: `design.md §In-memory deterministic filesystem: "directories report Nlink 2 (per-subdirectory increments are not modeled)"`,
+			cite: `design.md §In-memory deterministic filesystem: "directories report Nlink 2 (per-subdirectory increments are not modeled)" — host conventions differ (ext4-style 2+subdirs, btrfs-style flat 1); the sim's constant diverges from any host count other than 2`,
 			match: func(o op, host, sim outcome) bool {
 				if !strings.HasPrefix(o.name, "fstat-nlink(") || host.Err != "" || sim.Err != "" {
 					return false
 				}
 				hn, hRest, hok := parseStateInt(host.State, "nlink")
 				sn, sRest, sok := parseStateInt(sim.State, "nlink")
-				return hok && sok && hRest == sRest && sn == 2 && hn > 2
+				return hok && sok && hRest == sRest && sn == 2 && hn >= 1 && hn != 2
 			},
 		},
 		{

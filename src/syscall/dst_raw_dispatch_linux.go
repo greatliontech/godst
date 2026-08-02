@@ -90,6 +90,17 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 		}
 		return dstRawFutex((*uint32)(unsafe.Pointer(a1)), op, uint32(a3), ts)
 	}
+	if trap == dstSysSetsockopt || trap == dstSysGetsockopt {
+		// setsockopt(fd, level, optname, optval, optlen) /
+		// getsockopt(fd, level, optname, optval, *optlen): only a virtual
+		// SOCKET descriptor is the simulation's — a host fd falls through to
+		// the fence. The pointer conversions happen here, in nosplit code, so
+		// the splittable helpers receive real pointers a stack copy adjusts.
+		if a1 < dstVirtualSockFDBase || a1 >= dstVirtualSockFDBase+dstVirtualSockFDCount {
+			return 0, 0, false
+		}
+		return dstRawSockopt(trap == dstSysSetsockopt, a1, a2, a3, a4, a5)
+	}
 	switch trap {
 	case SYS_MADVISE, SYS_MPROTECT, SYS_MUNMAP:
 		// A zero-length range names no mapping, so neither its address nor the
@@ -138,6 +149,99 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 	// named wrappers already dispatch.
 	return 0, 0, false
 }
+
+// dstRawSockopt performs a sockopt on a virtual socket descriptor. Like
+// dstRawFD it never falls through: the number lies in the reserved range, so
+// the operation is the simulation's whatever the hook answers (no registered
+// hook — net not linked — meets the fence). Argument shapes follow the
+// kernel: optlen is a value for setsockopt and a pointer for getsockopt
+// (socklen_t, uint32 on linux); a NULL optval with a nonzero length is
+// EFAULT, a negative or absurd length EINVAL (the kernel caps sockopt
+// copies), before any pointer is dereferenced. The uintptr→pointer
+// conversions ride the trampoline's uintptrkeepalive exactly as
+// dstRawMapping's do.
+//
+//go:nosplit
+//go:nocheckptr
+func dstRawSockopt(set bool, a1, a2, a3, a4, a5 uintptr) (r1 uintptr, err Errno, handled bool) {
+	const maxOptLen = 1 << 20 // far above any real option; a larger len is not a sockopt
+	fd, level, opt := int(a1), int(a2), int(a3)
+	if set {
+		n := int(a5)
+		if n < 0 || n > maxOptLen {
+			return 0, EINVAL, true
+		}
+		if a4 == 0 && n > 0 {
+			return 0, EFAULT, true
+		}
+		var val []byte
+		if n > 0 {
+			val = unsafe.Slice((*byte)(unsafe.Pointer(a4)), n)
+		}
+		return dstRawSetsockopt(fd, level, opt, val)
+	}
+	if a5 == 0 {
+		return 0, EFAULT, true
+	}
+	lenp := (*uint32)(unsafe.Pointer(a5))
+	n := int(int32(*lenp))
+	if n < 0 || n > maxOptLen {
+		return 0, EINVAL, true
+	}
+	if a4 == 0 && n > 0 {
+		return 0, EFAULT, true
+	}
+	var val []byte
+	if n > 0 {
+		val = unsafe.Slice((*byte)(unsafe.Pointer(a4)), n)
+	}
+	return dstRawGetsockopt(fd, level, opt, val, lenp)
+}
+
+//go:noinline
+func dstRawSetsockopt(fd, level, opt int, val []byte) (r1 uintptr, err Errno, handled bool) {
+	if e, ok := dstTrySetsockopt(fd, level, opt, val); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(dstSysSetsockopt)
+	return 0, 0, true
+}
+
+//go:noinline
+func dstRawGetsockopt(fd, level, opt int, val []byte, lenp *uint32) (r1 uintptr, err Errno, handled bool) {
+	n, e, ok := dstTryGetsockopt(fd, level, opt, val)
+	if !ok {
+		dstSyscallRefuse(dstSysGetsockopt)
+		return 0, 0, true
+	}
+	if e == 0 {
+		*lenp = uint32(n)
+	}
+	return 0, e, true
+}
+
+// dstSysSetsockopt / dstSysGetsockopt are setsockopt(2)/getsockopt(2)'s
+// numbers for the running architecture, the dstSysRenameat2 pattern. 386
+// has no direct numbers (the socketcall era); its multiplexed path is
+// dispatched at the fenced socketcall wrapper instead, and the sentinel
+// here matches no trap.
+var dstSysSetsockopt, dstSysGetsockopt = func() (uintptr, uintptr) {
+	switch goarch.GOARCH {
+	case "amd64":
+		return 54, 55
+	case "386":
+		return ^uintptr(0), ^uintptr(0)
+	case "arm":
+		return 294, 295
+	case "arm64", "riscv64":
+		return 208, 209
+	case "ppc64", "ppc64le":
+		return 339, 340
+	case "s390x":
+		return 366, 365
+	}
+	panic("dst: sockopt numbers unknown for " + goarch.GOARCH)
+}()
 
 // dstRawMapping performs a mapping operation the simulation owns. It never
 // reports handled=false: a bubble goroutine's madvise/mprotect/munmap on a range

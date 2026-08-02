@@ -113,6 +113,7 @@ type dstStream struct {
 	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
 	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
 	frozen     bool          // the receiving socket died (injected RST or retransmit-horizon death): later pushes are discarded (freezeAtHorizon)
+	lastArrive int64         // latest deliverAt ever queued — the last instant this direction carried a segment (keepalive's activity signal)
 
 	// deadDropped records that bytes (or a FIN) committed to this stream were
 	// destroyed by the receiver's death — dropped by freezeAtHorizon or
@@ -188,7 +189,36 @@ func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64
 	at := dstDelayAdd(dstDelayAdd(transmitEnd, latencyNs), dstFaultRandN(jitterNs))
 	s.segs = append(s.segs, dstSeg{data: data, deliverAt: at})
 	s.buffered += int64(len(data))
+	if at > s.lastArrive {
+		s.lastArrive = at
+	}
 	return false
+}
+
+// arrivedThrough reports the latest segment-arrival instant no later than
+// horizon (the caller's cut-capped arrival horizon), and whether any queued
+// segment (or destroyed bytes, deadDropped) is still undelivered at that
+// horizon — the keepalive prober's two inputs: activity and
+// data-outstanding. lastArrive is a running max, so under a cut the capped
+// value can sit at the horizon rather than the true last pre-cut arrival —
+// at or after it, never before — which only defers a probe (the errs-later,
+// sound direction).
+func (s *dstStream) arrivedThrough(horizon int64) (lastArrive int64, outstanding bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last := s.lastArrive
+	if last > horizon {
+		last = horizon
+	}
+	if s.deadDropped {
+		return last, true
+	}
+	for i := range s.segs {
+		if s.segs[i].deliverAt > horizon {
+			return last, true
+		}
+	}
+	return last, false
 }
 
 // dstTransmitNanos returns ceil(nbytes * 1e9 / bps) — the base-time a bandwidth-limited
@@ -327,8 +357,28 @@ type dstWireEnd struct {
 	bandwidthBps        int64  // link transmit rate in bytes/sec; 0 = unlimited
 	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
 
-	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none)
+	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none; TCP_USER_TIMEOUT overrides per socket — effRetransNs)
 	timedOut  atomic.Bool // the retransmit horizon fired: this end is dead (ETIMEDOUT)
+
+	// opts is this end's socket-option state (the dialing socket's for the
+	// dialer end, the accept-inherited clone for the server end); bornAt the
+	// establishment instant. The keepalive prober (kaCheck) reads opts live
+	// at every decision, so a post-establishment option write takes effect on
+	// the next probe, as the kernel's timer reads its socket fields.
+	opts   *dstSockOpts
+	bornAt int64
+
+	// The keepalive prober's chain state — the armHorizon/horizonCheck
+	// AfterFunc-chain pattern: kaArmed guards a single pending timer;
+	// kaEpisode is the base-time anchor of the current unanswered-probe
+	// episode (-1 = none: the socket is idle-waiting or its probes are being
+	// answered); kaAckAt the last answered-probe instant (an activity
+	// signal, as the probe's ACK resets the kernel's idle clock).
+	kaMu        sync.Mutex
+	kaArmed     bool
+	kaEpisode   int64
+	kaAckAt     int64
+	kaProbesOut int64 // probes sent unanswered this episode — the kernel's icsk_probes_out
 
 	// The retransmit-exhaustion watchdog for this end's OUTGOING direction: armed
 	// whenever undeliverable bytes are observed under a cut (any write into the
@@ -378,22 +428,288 @@ type dstWireEnd struct {
 // dstWirePair builds the two ends of a connection between dialerHost
 // (the a/dialer end) and listenHost (the b/server end). Each direction gets a send
 // buffer of capacity bytes (0 = unbounded) and the retransmit horizon retransNs.
-func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32) (Conn, Conn) {
+// dialerOpts/serverOpts are the per-end socket-option states; registering each
+// end's keepalive kick (and arming the prober when keepalive is already
+// enabled) happens here, at establishment — the kernel's keepalive timer arms
+// when the connection does.
+func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32, dialerOpts, serverOpts *dstSockOpts) (Conn, Conn) {
 	ab, ba := newDstStream(capacity), newDstStream(capacity)
 	doneA, doneB := make(chan struct{}), make(chan struct{})
+	born := dstBaseNanos()
 	a := &dstWireEnd{
 		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: dialerHost, peerHost: listenHost,
+		opts: dialerOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
 	b := &dstWireEnd{
 		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
+		opts: serverOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
 		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
 	}
+	if dialerOpts != nil {
+		dialerOpts.setKick(a.kaPoke)
+	}
+	if serverOpts != nil {
+		serverOpts.setKick(b.kaPoke)
+	}
 	return a, b
+}
+
+// userTimeoutNs is this end's TCP_USER_TIMEOUT (0 = unset; nil opts — a
+// bare test-constructed wire — has none).
+func (e *dstWireEnd) userTimeoutNs() int64 {
+	if e.opts == nil {
+		return 0
+	}
+	return e.opts.userTimeoutNs()
+}
+
+// effRetransNs is this end's effective retransmission horizon: the socket's
+// TCP_USER_TIMEOUT when set (tcp(7): the maximum time transmitted data may
+// remain unacknowledged before the connection is forcibly closed — it
+// applies even when the run's horizon is disabled), else the run's
+// RetransmitTimeout.
+func (e *dstWireEnd) effRetransNs() int64 {
+	if e.opts != nil {
+		if uto := e.opts.userTimeoutNs(); uto > 0 {
+			return uto
+		}
+	}
+	return e.retransNs
+}
+
+// The keepalive law — tcp_keepalive_timer's death, modeled as an
+// OP-ARMED, EPISODE-BOUNDED watchdog (the armHorizon pattern), never a
+// standing timer: a free-running per-conn probe chain would keep the
+// bubble's virtual clock advancing forever and destroy quiescence-based
+// deadlock detection (a sim-only liveness break). The watchdog arms when a
+// BLOCKED operation observes the unanswerable-probe state — the link cut in
+// either direction (the probe cannot reach, or its ACK cannot return), or
+// the peer's host DEAD (a crashed machine answers nothing) — while no
+// outbound data is outstanding (with data in flight the RETRANSMIT
+// machinery governs, as production's keepalive timer is not armed while the
+// retransmit timer is). The connection dies ETIMEDOUT — tcp_write_err's
+// sk_err, the same one-shot identity ladder as retransmission exhaustion
+// (horizonDie) — when the episode has lasted the full probe schedule:
+// remaining idle time plus keepIntvl×keepCnt (TCP_USER_TIMEOUT, when set,
+// overrides the probing budget, tcp(7)). A heal before the deadline
+// disarms; the episode anchor is the blocked op's first observation — an
+// observation time, never the cut's start — so the sim errs toward later
+// deaths (the armHorizon precedent's sound direction).
+//
+// Recorded completeness limit (⊆-real, the safe direction): a connection NO
+// operation observes during a cut-then-heal window misses the death a real
+// kernel's free-running prober would have delivered — the same class as the
+// recorded flow-level ACK-starvation limit. And a probe meeting a REBOOTED
+// peer host (its sockets gone) is treated as answered rather than RST'd
+// (production's ECONNRESET): the conn survives where production kills it —
+// missed-fault direction again, never a false failure.
+//
+// Determinism: fake-clock AfterFuncs reading partition/host state at fire
+// time; no randomness, no scheduling choices beyond the timers themselves.
+
+// kaActivity is the last-activity instant keepalive idles from: the latest
+// of establishment, the last segment arrival either direction carried
+// (arrival ≈ its ACK), and the last answered probe — each arrival capped at
+// its direction's cut-start (a capped value can sit at the cap rather than
+// the true pre-cut arrival: at or after it, never before, which only defers
+// the probe — errs later). Also reports whether outbound data is
+// outstanding at the same horizon.
+func (e *dstWireEnd) kaActivity(now int64) (act int64, outstanding bool) {
+	inHorizon := now
+	if cs, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cs-1 < inHorizon {
+		inHorizon = cs - 1
+	}
+	outHorizon := now
+	if cs, cut, _ := dstPartCutStartDir(e.localHost, e.peerHost); cut && cs-1 < outHorizon {
+		outHorizon = cs - 1
+	}
+	inLast, _ := e.in.arrivedThrough(inHorizon)
+	outLast, out := e.out.arrivedThrough(outHorizon)
+	act = e.bornAt
+	if inLast > act {
+		act = inLast
+	}
+	if outLast > act {
+		act = outLast
+	}
+	return act, out
+}
+
+// kaUnanswerable reports whether a keepalive probe sent now could not be
+// answered: a cut in either direction, or the peer's host dead.
+func (e *dstWireEnd) kaUnanswerable() bool {
+	return dstPartitionedDir(e.localHost, e.peerHost) ||
+		dstPartitionedDir(e.peerHost, e.localHost) ||
+		dstHostDead(e.peerHost)
+}
+
+// armKeepalive starts the keepalive prober if a blocked operation should:
+// keepalive enabled, probes unanswerable now, no outbound data outstanding.
+// Idempotent while armed; cheap early-outs keep the block paths' loops
+// unburdened. The first fire lands at the first probe instant — the idle
+// time from the last activity, or the arming observation itself if idle had
+// already expired (the errs-later anchor: an unobserved conn's probes
+// before the arm are not presumed to have failed).
+func (e *dstWireEnd) armKeepalive() {
+	if e.opts == nil || e.timedOut.Load() || e.rstArrived.Load() {
+		return
+	}
+	enabled, idleNs, _, _, _ := e.opts.kaParams()
+	if !enabled || !e.kaUnanswerable() {
+		return
+	}
+	now := dstBaseNanos()
+	act, outstanding := e.kaActivity(now)
+	if outstanding {
+		return // the retransmit horizon owns the death
+	}
+	e.kaMu.Lock()
+	if e.kaArmed {
+		e.kaMu.Unlock()
+		return
+	}
+	e.kaArmed = true
+	if e.kaEpisode < 0 {
+		e.kaEpisode = now
+	}
+	if e.kaAckAt > act {
+		act = e.kaAckAt
+	}
+	due := dstDelayAdd(act, idleNs)
+	if e.kaEpisode > due {
+		due = e.kaEpisode
+	}
+	e.kaMu.Unlock()
+	remaining := due - now
+	if remaining < 1 {
+		remaining = 1
+	}
+	time.AfterFunc(time.Duration(remaining), e.kaCheck)
+}
+
+// kaCheck is one keepalive-timer fire — tcp_keepalive_timer's own per-fire
+// algorithm, run on the probe grid (the first fire at idle-from-activity,
+// then every interval), so the death instant is grid-exact, never earlier
+// than a real kernel's:
+//
+//   - The link answerable (no cut, host up): the pending probe is ACKed —
+//     the failure state resets and the prober DISARMS (op-armed design: no
+//     standing chain on a live link; a blocked op re-arms when it next
+//     observes an unanswerable state). A probe meeting the peer's dead
+//     SOCKET over the live link is answered with RST instead
+//     (probeDeadPeer).
+//   - Unanswerable: the kill check runs BEFORE this fire's probe would be
+//     sent, exactly as the kernel's — with TCP_USER_TIMEOUT set, kill when
+//     the time since last activity has reached it AND at least one probe is
+//     already out (the user timeout replaces the count check, tcp(7));
+//     without it, kill when the probes already out have reached the count.
+//     Otherwise send the probe (count it) and re-fire in an interval.
+//
+// Each fire OBSERVES partition/host state, so a heal between fires is seen
+// within one interval and resets the counter as the answered probe would —
+// no cut-history inference is needed for episode continuity — and ACTIVITY
+// between fires resets it too (the due-recompute branch: an arrival's ACK
+// zeroes the kernel's probe counter). The chain is bounded relative to
+// quiet: at most count+1 fires (or the user-timeout's grid equivalent) per
+// QUIET episode, then death or disarm; inbound activity under a persistent
+// one-way cut defers fires by trailing the arrivals, which keeps the bubble
+// non-quiescent only while the peer itself is active — quiescence-based
+// deadlock detection is preserved.
+func (e *dstWireEnd) kaCheck() {
+	disarm := func() {
+		e.kaMu.Lock()
+		e.kaArmed = false
+		e.kaEpisode = -1
+		e.kaProbesOut = 0
+		e.kaMu.Unlock()
+	}
+	if e.opts == nil || e.timedOut.Load() || e.rstArrived.Load() || isClosedChan(e.localDone) {
+		disarm()
+		return
+	}
+	enabled, idleNs, intvlNs, cnt, utoNs := e.opts.kaParams()
+	if !enabled {
+		disarm()
+		return
+	}
+	now := dstBaseNanos()
+	if !e.kaUnanswerable() {
+		if e.probeDeadPeer(false) {
+			// The probe met the peer's CLOSED socket over a live link: RST,
+			// the one-shot ECONNRESET (rstArrived set; blocked ops woken).
+			disarm()
+			return
+		}
+		// Answered: the ACK resets the idle clock and the failure state.
+		e.kaMu.Lock()
+		e.kaArmed = false
+		e.kaEpisode = -1
+		e.kaProbesOut = 0
+		e.kaAckAt = now
+		e.kaMu.Unlock()
+		return
+	}
+	act, outstanding := e.kaActivity(now)
+	if outstanding {
+		disarm() // the retransmit horizon owns the death now
+		return
+	}
+	e.kaMu.Lock()
+	if e.kaEpisode < 0 {
+		e.kaEpisode = now
+	}
+	if e.kaAckAt > act {
+		act = e.kaAckAt
+	}
+	due := dstDelayAdd(act, idleNs)
+	if e.kaEpisode > due {
+		due = e.kaEpisode
+	}
+	if now < due {
+		// Activity moved the first probe instant past this fire: an arrival
+		// post-dated the last fire's scheduling (nothing else moves due
+		// mid-episode), and that arrival's ACK zeroes the kernel's
+		// icsk_probes_out (tcp_ack) — so probes sent before the activity
+		// burst never count toward a later kill. Reset here, the ACK-reset
+		// point, then re-fire at the due instant.
+		e.kaProbesOut = 0
+		e.kaMu.Unlock()
+		time.AfterFunc(time.Duration(due-now), e.kaCheck)
+		return
+	}
+	kill := false
+	if utoNs > 0 {
+		kill = now-act >= utoNs && e.kaProbesOut > 0
+	} else {
+		kill = e.kaProbesOut >= cnt
+	}
+	if kill {
+		e.kaArmed = false
+		e.kaEpisode = -1
+		e.kaProbesOut = 0
+		e.kaMu.Unlock()
+		e.horizonDie()
+		return
+	}
+	e.kaProbesOut++
+	e.kaMu.Unlock()
+	time.AfterFunc(time.Duration(intvlNs), e.kaCheck)
+}
+
+// kaPoke wakes this end's blocked reads so they re-evaluate arming — the
+// option layer's kick after a keepalive-affecting write (enabling
+// SO_KEEPALIVE through a stashed RawConn must reach an already-parked
+// read). Deliberately NOT a writer wake: a fabricated send-buffer space
+// token would read as window progress to a parked zero-window write and
+// reset its user-timeout stall clock; a write parked when an option lands
+// picks the change up at its next genuine wake (errs later).
+func (e *dstWireEnd) kaPoke() {
+	e.in.wake()
 }
 
 func (*dstWireEnd) LocalAddr() Addr  { return pipeAddr{} }
@@ -428,7 +744,8 @@ func (s *dstStream) heldBeyond(cutStart int64) bool {
 // the real first retransmission, so the sim errs toward later timeouts (the
 // sound direction).
 func (e *dstWireEnd) armHorizon() {
-	if e.retransNs <= 0 || e.timedOut.Load() {
+	horizon := e.effRetransNs()
+	if horizon <= 0 || e.timedOut.Load() {
 		return
 	}
 	e.horizonMu.Lock()
@@ -439,7 +756,7 @@ func (e *dstWireEnd) armHorizon() {
 	e.horizonArmed = true
 	e.horizonAnchor = dstBaseNanos()
 	e.horizonMu.Unlock()
-	time.AfterFunc(time.Duration(e.retransNs), e.horizonCheck)
+	time.AfterFunc(time.Duration(horizon), e.horizonCheck)
 }
 
 // horizonCheck runs at the watchdog's deadline: disarm if the episode ended (heal
@@ -480,7 +797,7 @@ func (e *dstWireEnd) horizonCheck() {
 		e.horizonAnchor = anchor
 	}
 	e.horizonMu.Unlock()
-	if remaining := e.retransNs - (dstBaseNanos() - anchor); remaining > 0 {
+	if remaining := e.effRetransNs() - (dstBaseNanos() - anchor); remaining > 0 {
 		time.AfterFunc(time.Duration(remaining), e.horizonCheck)
 		return
 	}
@@ -751,12 +1068,22 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 				e.armHorizon()
 			}
 		}
+		// A blocked read is the keepalive law's observer: an idle connection
+		// (nothing outstanding — otherwise the horizon above governs) whose
+		// probes are unanswerable dies at the probe schedule's exhaustion,
+		// the death this parked read surfaces (horizonKill wake → timedOut).
+		e.armKeepalive()
 		if cut {
 			// Arrived-before-cut bytes exhausted; anything else (in flight, written
 			// after the cut, or a not-yet-arrived FIN) is held. Block until heal, a
 			// deadline, a local close, or the outbound retransmit horizon killing
-			// this end.
+			// this end. The ready channel is a wake source here too: it carries
+			// no deliverable bytes under a cut (pop's horizon holds them), but
+			// the option layer's poke rides it (kaPoke) — a keepalive enabled
+			// through a stashed RawConn must reach this parked read to arm the
+			// watchdog, and a spurious wake just re-evaluates and re-parks.
 			select {
+			case <-e.in.ready:
 			case <-wake:
 			case <-e.horizonKill:
 			case <-e.rstKill:
@@ -876,7 +1203,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			}
 			var horizonC <-chan time.Time
 			var horizonT *time.Timer
-			if e.retransNs > 0 && dstPartitionedDir(e.localHost, e.peerHost) { // outgoing local→peer is where a write's bytes are held
+			if horizon := e.effRetransNs(); horizon > 0 && dstPartitionedDir(e.localHost, e.peerHost) { // outgoing local→peer is where a write's bytes are held
 				if cutStart < 0 {
 					cutStart = dstBaseNanos() // the cut-block began; a heal resets it, restarting the timer on ACK progress
 				}
@@ -884,7 +1211,25 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				// the writer's host clock, so under a DriftClock rate change "retransNs
 				// of base time" shifts slightly — deterministic, and faithful to a real
 				// retransmit timer running on the sender's own clock.
-				remaining := e.retransNs - (dstBaseNanos() - cutStart)
+				remaining := horizon - (dstBaseNanos() - cutStart)
+				if remaining <= 0 {
+					e.horizonDie()
+					return total, syscall.ETIMEDOUT
+				}
+				horizonT = time.NewTimer(time.Duration(remaining))
+				horizonC = horizonT.C
+			} else if uto := e.userTimeoutNs(); uto > 0 {
+				// TCP_USER_TIMEOUT bounds a ZERO-WINDOW stall too (tcp(7),
+				// tcp_probe_timer checks icsk_user_timeout): a write parked on
+				// a full send buffer with no window progress for the timeout
+				// dies ETIMEDOUT even against a LIVE peer — the one exception
+				// to the persist-forever model, opted into per socket. The
+				// anchor is the block's start, reset on any freed space
+				// (window progress), the errs-later direction.
+				if cutStart < 0 {
+					cutStart = dstBaseNanos()
+				}
+				remaining := uto - (dstBaseNanos() - cutStart)
 				if remaining <= 0 {
 					e.horizonDie()
 					return total, syscall.ETIMEDOUT
@@ -896,6 +1241,13 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			}
 			select {
 			case <-e.out.space:
+				// Freed space is window progress (the peer's receiver
+				// drained): re-anchor the stall window — production's
+				// user-timeout clock resets on ACK progress. Errs later
+				// under a cut (pre-cut drains defer the death, never
+				// hasten it); the async watchdog (armHorizon) still bounds
+				// held bytes independently.
+				cutStart = -1
 			case <-wake: // partition began or healed: re-evaluate the horizon
 			case <-e.rstKill:
 				if horizonT != nil {

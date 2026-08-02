@@ -316,9 +316,18 @@ func tcpSettle(slot int, cond string) op {
 				time.Sleep(20 * time.Millisecond)
 				return outcome{N: -1}
 			}
+			if w.sim {
+				// The simulated leg: virtual, deterministic — and never
+				// probed through the fd. Simulated conns DO implement
+				// syscall.Conn (the socket-option layer), but their virtual
+				// descriptors admit only the modeled sockopts; a raw ppoll
+				// meets the interception fence, so the leg flag — not a
+				// type assertion — discriminates.
+				time.Sleep(20 * time.Millisecond)
+				return outcome{N: -1}
+			}
 			sc, ok := c.(syscall.Conn)
 			if !ok {
-				// The simulated conn: virtual, deterministic.
 				time.Sleep(20 * time.Millisecond)
 				return outcome{N: -1}
 			}

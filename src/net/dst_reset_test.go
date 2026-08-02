@@ -990,7 +990,7 @@ func TestDSTNetInjectRSTFreezesReceiveQueue(t *testing.T) {
 		var lateN, preN int
 		var lateErr, preErr error
 		simulation.Run(1, func() {
-			a, b := dstWirePair(int64(latency), 0, 0, 0, 0, 1, 2)
+			a, b := dstWirePair(int64(latency), 0, 0, 0, 0, 1, 2, nil, nil)
 			ea, eb := a.(*dstWireEnd), b.(*dstWireEnd)
 			if _, err := ea.Write([]byte("pre")); err != nil { // toward b, before ANY injection
 				t.Errorf("latency %v: pre-RST write = %v, want success", latency, err)

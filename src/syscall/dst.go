@@ -66,6 +66,8 @@ type dstKillHook func(pid int, sig Signal) (err Errno, handled bool)
 type dstRenameat2Hook func(oldpath, newpath string, flags int) (err Errno, handled bool)
 type dstFallocateHook func(fd int, mode int, off, length int64) (err Errno, handled bool)
 type dstFutexHook func(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err Errno, handled bool)
+type dstSetsockoptHook func(fd, level, opt int, val []byte) (err Errno, handled bool)
+type dstGetsockoptHook func(fd, level, opt int, val []byte) (retlen int, err Errno, handled bool)
 
 var dstReadHookFn dstReadHook
 var dstWriteHookFn dstWriteHook
@@ -85,6 +87,8 @@ var dstKillHookFn dstKillHook
 var dstRenameat2HookFn dstRenameat2Hook
 var dstFallocateHookFn dstFallocateHook
 var dstFutexHookFn dstFutexHook
+var dstSetsockoptHookFn dstSetsockoptHook
+var dstGetsockoptHookFn dstGetsockoptHook
 
 //go:linkname dstSetReadHook
 func dstSetReadHook(fn dstReadHook) { dstReadHookFn = fn }
@@ -139,6 +143,30 @@ func dstSetFallocateHook(fn dstFallocateHook) { dstFallocateHookFn = fn }
 
 //go:linkname dstSetFutexHook
 func dstSetFutexHook(fn dstFutexHook) { dstFutexHookFn = fn }
+
+//go:linkname dstSetSetsockoptHook
+func dstSetSetsockoptHook(fn dstSetsockoptHook) { dstSetsockoptHookFn = fn }
+
+//go:linkname dstSetGetsockoptHook
+func dstSetGetsockoptHook(fn dstGetsockoptHook) { dstGetsockoptHookFn = fn }
+
+// dstTrySetsockopt / dstTryGetsockopt route a sockopt on a virtual SOCKET
+// descriptor to the simulated network's option layer (registered by net).
+// The value travels as raw native-endian bytes, exactly the kernel's view;
+// the net side owns option-level validation and errno shapes.
+func dstTrySetsockopt(fd, level, opt int, val []byte) (err Errno, handled bool) {
+	if !dstHookActive() || dstSetsockoptHookFn == nil {
+		return 0, false
+	}
+	return dstSetsockoptHookFn(fd, level, opt, val)
+}
+
+func dstTryGetsockopt(fd, level, opt int, val []byte) (retlen int, err Errno, handled bool) {
+	if !dstHookActive() || dstGetsockoptHookFn == nil {
+		return 0, 0, false
+	}
+	return dstGetsockoptHookFn(fd, level, opt, val)
+}
 
 func dstTryFutex(addr *uint32, op int, val uint32, timeoutNs int64, hasTimeout bool) (ret int, err Errno, handled bool) {
 	if !dstHookActive() || dstFutexHookFn == nil {

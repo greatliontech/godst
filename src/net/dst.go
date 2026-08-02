@@ -337,31 +337,21 @@ func dstPendingBindInUse(key dstBindKey) bool {
 	return false
 }
 
+// dstDialOptionsError rejects the dial options the model does not provide.
+// Control/ControlContext and the keepalive configuration are MODELED (the
+// socket-option layer, dst_sockopt.go, and the wire's keepalive prober,
+// dst_wire.go); only an explicit MPTCP enable remains refused — multipath
+// requires path semantics the single-link wire does not have.
 func dstDialOptionsError(d *Dialer, network string, source, addr Addr) error {
-	if d.ControlContext != nil {
-		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.ControlContext")
-	}
-	if d.Control != nil {
-		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.Control")
-	}
 	if d.mptcpStatus == mptcpEnabledDial {
 		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.MultipathTCP")
-	}
-	if d.KeepAlive != 0 || d.KeepAliveConfig != (KeepAliveConfig{}) {
-		return dstUnsupportedNetOption("dial", network, source, addr, "Dialer.KeepAlive")
 	}
 	return nil
 }
 
 func dstListenOptionsError(lc *ListenConfig, network string, addr Addr) error {
-	if lc.Control != nil {
-		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.Control")
-	}
 	if lc.mptcpStatus == mptcpEnabledListen {
 		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.MultipathTCP")
-	}
-	if lc.KeepAlive != 0 || lc.KeepAliveConfig != (KeepAliveConfig{}) {
-		return dstUnsupportedNetOption("listen", network, nil, addr, "ListenConfig.KeepAlive")
 	}
 	return nil
 }
@@ -587,6 +577,14 @@ type dstConn struct {
 	// Dial order, schedule-determined) rather than by pointer-map iteration order.
 	regSeq uint64
 
+	// sockFD is this end's virtual socket descriptor (dst_sockopt.go): the
+	// number SyscallConn hands out, retiring with the connection (Close or a
+	// reset teardown). The dialer end keeps the dialing socket's descriptor
+	// — production's fd continuity from socket() through Control to the
+	// established conn.
+	sockFD   int
+	sockOpts *dstSockOpts
+
 	// acceptState tracks a server-end connection through the accept backlog:
 	// 0 queued, 1 accepted, 2 reset/refused. The listener's Accept claims
 	// 0→1; the LISTENER-CLOSE backlog teardown and the dialer's post-send
@@ -635,6 +633,7 @@ func (c *dstConn) resetConn() {
 	c.reset.Store(true)
 	c.Conn.Close()
 	dstConnDeregister(c)
+	dstSockFDFree(c.sockFD, c.sockOpts)
 }
 
 // consumeSkErr shapes the error for an op that found this end's connection
@@ -766,6 +765,7 @@ func (c *dstConn) Close() error {
 	c.timeWaitHold()
 	c.Conn.Close()
 	dstConnDeregister(c)
+	dstSockFDFree(c.sockFD, c.sockOpts)
 	return nil
 }
 
@@ -846,6 +846,16 @@ type dstListener struct {
 	closed  atomic.Bool
 	host    uint32 // the host that owns this listener (its network identity)
 	proc    uint32 // the process that created this listener (owns its accepted conns)
+
+	// sockFD/opts are the listening socket's virtual descriptor and option
+	// state (a ListenConfig.Control callback's writes land here); accepted
+	// connections inherit a clone of opts (accept(2) inheritance) and then
+	// take the Go-level keepalive resolution kaIdle/kaCfg (production's
+	// newTCPConn at accept).
+	sockFD int
+	opts   *dstSockOpts
+	kaIdle time.Duration
+	kaCfg  KeepAliveConfig
 }
 
 func (l *dstListener) opError(op string, err error) error {
@@ -913,6 +923,7 @@ func (l *dstListener) Close() error {
 		}
 	}
 	dstNet.mu.Unlock()
+	dstSockFDFree(l.sockFD, l.opts)
 	// Production TCP resets connections still sitting in the accept backlog
 	// when the listener closes; mirror it, so a dialer that already got a
 	// successful Dial observes ECONNRESET on its next op instead of blocking
@@ -933,7 +944,7 @@ func (l *dstListener) Close() error {
 func (l *dstListener) Addr() Addr { return dstCloneAddr(l.addr) }
 
 // dstListen is net.Listen under DST: register a simulated listener.
-func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
+func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr error) {
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("listen", network)
 	}
@@ -984,6 +995,30 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		return nil, err
 	}
 
+	// The listening socket: production creates the fd and runs
+	// ListenConfig.Control on it BEFORE bind, so a Control error preempts
+	// any bind conflict, and the callback's address is the REQUESTED form
+	// (":0" before an ephemeral port is assigned).
+	lOpts := newDstSockOpts()
+	lfd, ok := dstSockFDAlloc(lOpts)
+	if !ok {
+		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: reportIP, Port: portnum}, Err: os.NewSyscallError("socket", syscall.EMFILE)}
+	}
+	defer func() {
+		if retErr != nil {
+			dstSockFDFree(lfd, lOpts)
+		}
+	}()
+	if lc.Control != nil {
+		// The callback's network string is the SOCKET's family form — for a
+		// dual-stack wildcard listen production opens AF_INET6 and reports
+		// "tcp6" — so it derives from reportIP, not the loopback the
+		// simulation maps the wildcard to internally.
+		if err := dstRunControl(context.Background(), nil, lc.Control, dstAddrFamily(network, reportIP), (&TCPAddr{IP: reportIP, Port: portnum}).String(), lfd); err != nil {
+			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: reportIP, Port: portnum}, Err: err}
+		}
+	}
+
 	dstNet.mu.Lock()
 	defer dstNet.mu.Unlock()
 	dstNetRoll()
@@ -1021,6 +1056,10 @@ func dstListen(lc *ListenConfig, network, address string) (Listener, error) {
 		done:    make(chan struct{}),
 		host:    listeningHost,
 		proc:    listeningProc,
+		sockFD:  lfd,
+		opts:    lOpts,
+		kaIdle:  lc.KeepAlive,
+		kaCfg:   lc.KeepAliveConfig,
 	}
 	for _, k := range scoped {
 		dstNet.listeners[k] = l
@@ -1149,6 +1188,28 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	if err := dstDialOptionsError(d, network, localTCPAddr.opAddr(), serverAddr); err != nil {
 		return nil, err
 	}
+	// The dialing socket: production creates the fd and runs
+	// Dialer.ControlContext/Control on it after resolution and before
+	// connect (sock_posix.go's socket()); the callback's raw sockopts land
+	// on the socket's option state, carried into the established connection.
+	// A callback error aborts the dial exactly as production's ctrlFn
+	// failure does. The descriptor is freed on any dial failure (the socket
+	// dies with it) and otherwise lives as the conn's identity.
+	dialOpts := newDstSockOpts()
+	dialFD, okFD := dstSockFDAlloc(dialOpts)
+	if !okFD {
+		return nil, &OpError{Op: "dial", Net: network, Source: localTCPAddr.opAddr(), Addr: serverAddr, Err: os.NewSyscallError("socket", syscall.EMFILE)}
+	}
+	defer func() {
+		if retErr != nil {
+			dstSockFDFree(dialFD, dialOpts)
+		}
+	}()
+	if d.ControlContext != nil || d.Control != nil {
+		if err := dstRunControl(ctx, d.ControlContext, d.Control, dstAddrFamily(network, ip), serverAddr.String(), dialFD); err != nil {
+			return nil, &OpError{Op: "dial", Net: network, Source: localTCPAddr.opAddr(), Addr: serverAddr, Err: err}
+		}
+	}
 	dialerHost, dialerProc := dstNetCurrentNode()
 	targetHost := dialerHost
 	if h, ok := dstHostForRoutableIP(ip); ok {
@@ -1223,6 +1284,12 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	// so a one-directional partition of either also fails the connect. The target host
 	// is the routable IP's owner; a loopback/own-host target is never partitioned.
 	retransNs := dstNetRetransmitTimeoutNs()
+	if uto := dialOpts.userTimeoutNs(); uto > 0 {
+		// TCP_USER_TIMEOUT set on the dialing socket (a Control callback)
+		// bounds the connect's retransmissions too (tcp(7): the option
+		// applies in SYN_SENT), overriding the run's horizon for this dial.
+		retransNs = uto
+	}
 	// redial re-enters the blackhole wait and the listener lookup after a
 	// refusal point discovers the target host is powered off: a crash landing
 	// while this dial was mid-handshake (sleeping in the SYN traversal, or
@@ -1358,11 +1425,26 @@ redial:
 	if err := dstConnectSYN(ctx, latency, jitter); err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
 	}
-	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host)
+	// The established connection's socket-option states: the dialer end
+	// carries the dialing socket's (Control's writes), with the Go-level
+	// keepalive resolution applied now — production's newTCPConn order,
+	// after Control, so an explicit Dialer.KeepAlive/KeepAliveConfig wins
+	// over the callback and a negative KeepAlive leaves the callback's
+	// enablement standing (the grpc-go recipe). The server end inherits a
+	// clone of the listener's options (accept(2) inheritance) and takes the
+	// ListenConfig resolution the same way.
+	dialOpts.applyGoKeepAlive(d.KeepAlive, d.KeepAliveConfig)
+	serverOpts := l.opts.cloneForChild()
+	serverOpts.applyGoKeepAlive(l.kaIdle, l.kaCfg)
+	serverFD, okServerFD := dstSockFDAlloc(serverOpts)
+	if !okServerFD {
+		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: os.NewSyscallError("socket", syscall.EMFILE)}
+	}
+	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
 	reset := new(atomic.Bool)
 	epoch := dstNetEpoch()
-	dialer := &dstConn{Conn: p1, epoch: epoch, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP)}
-	server := &dstConn{Conn: p2, epoch: epoch, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP)}
+	dialer := &dstConn{Conn: p1, epoch: epoch, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP), sockFD: dialFD, sockOpts: dialOpts}
+	server := &dstConn{Conn: p2, epoch: epoch, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP), sockFD: serverFD, sockOpts: serverOpts}
 	// Publish lifecycle ownership before the server endpoint can enter the
 	// backlog or become visible to Accept. Failed establishment removes both
 	// registrations through the idempotent cleanup below.

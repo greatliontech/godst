@@ -488,6 +488,49 @@ it never wraps a positive delay into an earlier delivery.
   delta, skew-invariant, but the timer fires on the sender's host clock, so under a `DriftClock` rate
   change "2 minutes of base time" shifts slightly — faithful to a real retransmit timer, which runs
   on the sender's own clock.)
+- **Socket options & keepalive.** Every simulated socket — dialing, listening, and each end of an
+  established connection — carries per-socket option state reachable exactly as in production: the
+  Go-level configuration (`Dialer.KeepAlive`/`KeepAliveConfig`, the `ListenConfig` twins, with
+  production's own resolution — plain `Dial` enables keepalive at Go's 15s/15s/9 defaults;
+  `KeepAlive: -1` disables the Go layer without clearing what a callback enabled), and raw
+  `setsockopt`/`getsockopt` on the socket's **virtual descriptor** — the fd a `Dialer.Control` /
+  `ControlContext` / `ListenConfig.Control` callback receives (production's invocation contract:
+  resolved family network, target address, before connect/bind; a callback error aborts the
+  dial/listen) and the one `SyscallConn` hands out after establishment (`dstConn` implements
+  `syscall.Conn`; raw Read/Write are refused). The raw syscalls ride the interception boundary's
+  virtual-fd dispatch — including the `golang.org/x/sys/unix` path, whose trampolines jump to
+  `syscall.Syscall6`, and the socketcall multiplex on 386/s390x — so a callback's writes are fully
+  observed, deterministic, with kernel errno shapes. The modeled set is `SO_KEEPALIVE`,
+  `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT` (defaults are the
+  simulated kernel's deterministic constants: 7200s/75s/9, the Linux sysctl defaults); an option
+  outside it fails `ENOPROTOOPT` — the fence philosophy at option granularity, nothing silently
+  stored whose behavior the model does not provide. Accepted connections inherit the listener's
+  option state (accept(2) inheritance, tcp(7)). The semantics wire into the death machinery:
+  `TCP_USER_TIMEOUT` overrides the retransmission horizon per socket (including the connect path's
+  SYN retransmissions, and bounding a ZERO-WINDOW stall against a live peer — the one per-socket
+  exception to persist-forever, `tcp_probe_timer`'s user-timeout arm); these data-path deaths keep
+  the horizon model's fixed-instant collapse — the conn dies at exactly the configured bound rather
+  than at the next retransmit/probe-grid fire, the same recorded abstraction as the base horizon's
+  fixed window. **Keepalive** gives an IDLE connection (nothing outstanding — with data in flight
+  the retransmit horizon governs, as production's keepalive timer is not armed while the retransmit
+  timer is) the production death the pre-model base missed, and here the probe grid IS modeled, so
+  the law is `tcp_keepalive_timer`'s own per-fire algorithm, grid-exact: the first probe fires when
+  the idle time expires from the last activity (or at the episode's first observation, if later —
+  the errs-later anchor), probes repeat every interval, each fire observes whether a probe is
+  answerable (a cut in either direction, or the peer's host dead, starves it — and a heal between
+  fires is seen within one interval, resetting the counter as the answered probe would), and the
+  kill check runs BEFORE a fire's probe would be sent: with `TCP_USER_TIMEOUT` set, kill when the
+  time since last activity has reached it and at least one probe is out (the user timeout replaces
+  the count check, tcp(7)); without it, kill when the probes out have reached the count — the same
+  one-shot `ETIMEDOUT` sk_err ladder as retransmission exhaustion. The prober is **op-armed and
+  episode-bounded** (armed by a blocked operation observing the unanswerable state; at most
+  count+1 fires per episode, then death or disarm), never a free-running timer: a standing
+  per-conn probe chain would advance the bubble's clock forever and destroy quiescence-based
+  deadlock detection. Two recorded ⊆-real limits follow (missed real faults, never false
+  failures): a connection NO operation observes during a cut-then-heal window misses the death a
+  free-running prober would have delivered, and a probe meeting a REBOOTED peer host is treated as
+  answered rather than RST'd. Conformance: `net/dst_keepalive_test.go` (invocation contract,
+  observability, inheritance, resolution, the death laws and their ladders, replay-exactness).
 - **Connect cost.** Establishing a cross-host connection completes after one round trip of the
   link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + a jitter draw;
   throttle exempts the zero-payload control segments) — the SYN half is paid before the server's
@@ -680,11 +723,15 @@ freedom TCP has, so packet-granular drop/reorder/duplicate land with the UDP/`Pa
 not this base. See [faults.md](./faults.md).
 
 **Caveat (fidelity).** `Dial` returns the `net.Conn` *interface*; code that type-asserts the concrete
-`*net.TCPConn` (raw fds, `SetNoDelay`, `syscall.Conn`) will not get one. `Dialer.Control`,
-`Dialer.ControlContext`, `ListenConfig.Control`, explicit MPTCP enable/use, and explicit keepalive
-configuration fail under DST rather than being silently ignored, because they require raw socket semantics
-the base model does not provide. Explicitly disabling MPTCP is accepted because the base model is ordinary
-TCP. DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed
+`*net.TCPConn` (raw fds, `SetNoDelay`) will not get one — but the conns and listeners implement
+`syscall.Conn`, and `Dialer.Control`, `Dialer.ControlContext`, `ListenConfig.Control`, and explicit
+keepalive configuration are MODELED (the socket-option layer and keepalive death law — see "Socket
+options & keepalive" in the transport model): callbacks run against a virtual socket descriptor whose
+sockopts land in per-socket option state, the modeled set carries full death-machinery semantics, and
+an option outside the modeled set fails `ENOPROTOOPT` rather than being silently ignored — the same
+fail-loud contract at option granularity. Explicit MPTCP enable/use still fails (multipath needs path
+semantics the single-link wire does not have); explicitly disabling MPTCP is accepted because the base
+model is ordinary TCP. DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed
 synthetic set consistent with this addressing) are follow-on increments. Public DNS resolver APIs and
 service-name port lookups fail under DST rather than touching the host resolver, while literal-IP,
 numeric-port, and pre-I/O validation fast paths keep their normal no-I/O behavior. Unsupported networks

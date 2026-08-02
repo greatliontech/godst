@@ -179,6 +179,7 @@ type op struct {
 // slot tables can drift).
 type world struct {
 	root  string
+	sim   bool // the simulated leg (fd-free settle; the host leg polls real fds)
 	files []*os.File
 	lns   []net.Listener
 	conns []net.Conn
@@ -244,7 +245,7 @@ func runOpsSim(t *testing.T, seed uint64, ops []op) []outcome {
 		if err := os.MkdirAll(simRoot, 0o777); err != nil {
 			panic("conformance: sim root: " + err.Error())
 		}
-		w := &world{root: simRoot}
+		w := &world{root: simRoot, sim: true}
 		defer w.close()
 		outs = runOps(w, ops)
 	})
