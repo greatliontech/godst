@@ -7,6 +7,27 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **killed-goroutine kill-trace diagnostics** — Lands: pending
+  feature. A process body's return or panic kills its still-running
+  goroutines by design (`src/testing/simulation/node.go` process
+  model) — but silently, so a workload that spawns long-lived
+  machinery from a transient process sees only a downstream stall
+  with no error anywhere (field case: an apply pump spawned on a
+  driver process cost a two-layer root-cause hunt before the kill
+  was even suspected). Record kill events — process id, the killed
+  goroutine's spawn site — into the deterministic trace and surface
+  them in failure output (and/or an opt-in live log), so "goroutine
+  spawned at S was killed with process P" is one line, not a hunt.
+- **modeled stdout/stderr in bubbles** — Lands: pending feature.
+  Raw write syscalls to fd 1/2 from bubble goroutines panic ("raw
+  syscall 1 unsupported") — the refusal of unmodeled I/O is
+  correct, but every workload reimplements the same idiom
+  (in-memory trace, dumped via t.Log at failure), and the panic
+  message costs each new consumer a debugging round. Model fd 1/2
+  writes as a deterministic per-process buffer surfaced through the
+  test log on failure; at minimum, the panic message should name
+  the discipline ("stdout is unmodeled in bubbles; collect
+  diagnostics in memory and dump via t.Log").
 - **testlog buffer lock schedule coupling** — Lands: when the
   determinism sweep gains a testlog-contention leg (host goroutines
   hammering os.Open/Getenv while bubble goroutines run). The
