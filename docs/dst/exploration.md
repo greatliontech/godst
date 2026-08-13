@@ -582,12 +582,19 @@ DST already **re-executes** `simulation.Run(seed, f)` from the start per run, so
 exactly: each schedule is one re-execution guided by a thread-choice prefix + backtrack/sleep sets, no
 stored global states.
 
-- **Schedule representation.** A prefix `[]goid` of thread choices, plus per-decision backtrack and sleep
-  sets. Goids are deterministic given a fixed prefix (per-g tree + deterministic creation order), so a
-  prefix replays exactly; the suffix runs the strategy default (lowest-goid, deterministic).
+- **Schedule representation.** A prefix `[]dstSeq` of thread choices (stable per-bubble creation
+  indices — goids are process-global and episode-varying), plus per-decision backtrack and sleep
+  sets. Indices are deterministic given a fixed prefix (deterministic creation order), so a prefix
+  replays exactly; the suffix runs the strategy default: RUN-TO-BLOCK — the previous decision's
+  goroutine while it remains a candidate, else the lowest-index candidate (`dstStickyDefaultIdx`).
+  Run-to-block is the canonical DPOR execution model, and for BUDGETED exploration it is
+  load-bearing: under a preempt-every-decision default, one flipped decision advances the flipped
+  goroutine a single slot, so outcome classes in which it runs a long region first sit
+  region-length stacked flips away — no budget reaches them under any exploration order
+  (`TestDPORBudgetedRaceCrossesLongRegions`).
 - **At the seam.** `dstSchedSelect` gains a `dstSchedDPOR` branch: if the decision index is within the
-  prefix, return the candidate index whose goid matches the prescribed choice; else pick the default and
-  let the post-run analysis add backtracks. Installed per bubble at the synctest re-root point (the
+  prefix, return the candidate index whose stable per-bubble index (dstSeq) matches the prescribed
+  choice; else pick the default and let the post-run analysis add backtracks. Installed per bubble at the synctest re-root point (the
   `dstSchedRootPCT()` slot, `synctest.go`), like every other per-bubble scheduling state.
 - **Post-run analysis (the DPOR core — source-DPOR).** After each Run, walk the recorded transition
   trace; for every reversible race — a *concurrent* (sync-HB) dependent pair `(t_i, t_j)`, `i<j` — add a
@@ -675,7 +682,7 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
 
 1. **Access-yield + transition-record substrate.** Runtime `dstYieldPoint`/`dstAccessYield` + the
    safe-point guard + a per-bubble **transition recorder** (an ordered event log: scheduling decisions
-   with the enabled goid set, accesses with goid/addr/size/isWrite/step, and sync events for offline HB —
+   with the enabled stable-index set, accesses with seq/addr/size/isWrite/step, and sync events for offline HB —
    D2). **Manual-hook half: VALIDATED [V]** — mutex-counter soundness probe reaches exactly `G·K` at
    access granularity incl. yields while holding a user lock (DST-L2-1; 200/200 over 50 seeds, normal and
    `-race`, 0 spurious races), replay deterministic (DST-L2-2; 30/30 per seed), Gap A closed (110/200),
@@ -936,7 +943,7 @@ relation.
       more): `dstSyncAcquire` (D1) records sync-object decisions as conflicting transitions — zero brain change —
       and the sweep (`TestDSTExploreSweep`) is now the enforcing artifact (23/290 → 0). Optimality (sleep
       sets) is therefore built on a foundation the sweep proves complete.
-   2. **Source-DPOR (sleep sets + weak-initial backtracks) — VALIDATED [V].** Each `dporFrame` gains a
+   2. **Source-DPOR (sleep sets + weak-initial backtracks; the NON-RACE walk) — VALIDATED [V].** Each `dporFrame` gains a
       `sleep` set: a frame inherits the parent's asleep + already-explored goroutines, FILTERED by
       independence with the transition the parent chose (a commuting goroutine stays asleep, a dependent
       one is woken), threaded through the `for d := len(stack); d < n` extension loop; an asleep backtrack
@@ -985,8 +992,12 @@ relation.
    HB-ordered accesses do not yield. The live filter uses bounded preallocated clocks/tables and falls back
    to yield-every-access on overflow, so overflow can only under-prune. The brain promotes any observed
    conflicting inline access that needs a missing boundary to a forced yield on replay; race-enabled DPOR
-   uses conservative conflict-anchor backtracking while disabling sleep sets, and the non-race sweep keeps
-   full source-DPOR sleep-set pruning. Non-race manual hooks remain explicit transitions, so `TestDSTExploreSweep` continues to
+   uses conservative conflict-anchor backtracking while disabling sleep sets — explored as a prefix
+   QUEUE ordered shallowest-anchor-first (children bucketed by flip-anchor depth, prefix-deduped), so
+   a bounded schedule budget spreads across few-reversal classes instead of draining into one
+   corner's deepest reversal tail (`TestDPORBudgetedRaceReachesShallowReversals`; truncated parents'
+   recorded regions harvested, `TestDPORRaceTruncatedTraceHarvestsAnchors`) — and the non-race sweep keeps
+   full source-DPOR sleep-set DFS pruning. Non-race manual hooks remain explicit transitions, so `TestDSTExploreSweep` continues to
    validate the hand-controlled DPOR brain (`mismatches=0`). Validation:
    `TestDSTExploreAutoInstrument` validates filtered auto-instrumented RMWs by checking DPOR==Exhaustive,
    preserving the known `{1,2}` outcome set, and keeping Exhaustive tractable (plain RMW: 19,448 before
@@ -1017,16 +1028,24 @@ relation.
   (`TestExploreFanOutOverflowIsNotBudgetHit`). Trace truncation
   is STICKY and CHECKED (recording never resumes past a truncation — the runtime throws on a would-be
   gap — so the recorded trace is always a contiguous prefix); a `Failure.Schedule` is gap-free by
-  construction (spawning prefixes derive only from untruncated parents) and replays
+  construction (every spawning prefix derives from its parent trace's contiguous RECORDED region —
+  the non-race walks spawn from untruncated parents only, and the race-enabled queued walk's
+  harvested children stay inside the recorded prefix) and replays
   (`TestExploreTruncatedFailureReplays`). A truncated trace is never EXTENDED into new child
-  schedules or DPOR frames — its children typically re-truncate, and coverage is already reported
-  incomplete — but the walk continues: work seeded by earlier untruncated runs (queued prefixes in
-  the exhaustive walk, pending backtracks in DPOR) is still explored, and force promotion is gated
-  on untruncated traces in both modes. The DPOR continuation is pinned discriminatingly by
-  `TestExploreDPORTruncatedChildContinuesWalk`: two independent conflicts with the fan-out gated on
+  schedules or DPOR frames beyond its recorded region — its children typically re-truncate, and
+  coverage is already reported incomplete — but the walk continues: work seeded by earlier
+  untruncated runs (queued prefixes in the exhaustive walk, pending backtracks in the non-race
+  DPOR's DFS) is still explored, the RACE-ENABLED queued walk additionally harvests a truncated
+  trace's own recorded-region anchors (sticky truncation makes that region a contiguous prefix, so
+  every anchor in it derives a replayable child; on an always-truncating SUT this enumerates the
+  bounded-horizon prefix space, so the caller's schedule budget is the practical cap — coverage
+  reads incomplete throughout), and force promotion is gated on untruncated
+  traces in every mode. The NON-RACE DFS's continuation is pinned discriminatingly by
+  `TestExploreDPORTruncatedChildContinuesWalk` (race builds run the queued walk, whose truncation
+  behavior is the harvesting above, pinned by `TestDPORRaceTruncatedTraceHarvestsAnchors`): two independent conflicts with the fan-out gated on
   the deeper one's reversal, so deepest-first backtracking reaches the truncating run while the
   shallow conflict's backtrack is still pending and its failure lives only there — ending the walk
   at the truncation loses that failure (9 schedules/3 failures continuing, 3/0 broken). The
-  EXTENSION-SKIP leg — a truncated trace spawns no new frames — is pinned separately by
+  EXTENSION-SKIP leg — a truncated trace spawns no new NON-RACE DFS frames — is pinned separately by
   `TestExploreDPORTruncatedChildNoExtensionExplosion`: k recorded conflicts before an unconditional
   truncating fan-out stay bounded with the skip and grow ~3^k without it (k=6 → 729).

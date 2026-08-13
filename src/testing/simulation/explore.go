@@ -1061,10 +1061,28 @@ func dporExploreRun(seed uint64, sut func() bool, cfg exploreConfig) ExploreResu
 }
 
 func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
+	if dstRaceEnabledFP() {
+		// The race-enabled path runs conservative all-enabled backtracking
+		// with sleep sets disabled (see dporExplore's doc), so exploration
+		// order is free — and a BUDGETED run's usefulness hangs on it: the
+		// DFS walk below backtracks deepest-first, which spends a bounded
+		// budget entirely inside one outcome corner's deep reversal tail
+		// (observed in the field: two racers under auto-instrumentation,
+		// 1000 schedules, one outcome class — the outcome-deciding shallow
+		// reversal never reached). The queued walk explores
+		// shallowest-anchor-first instead, reaching every few-reversal
+		// class before descending — covering the DFS's explored space
+		// unbudgeted (conflict-anchored all-enabled expansion, closed
+		// under recursion, prefix-deduped), a usable spread under a
+		// budget.
+		return dporExploreQueuedPass(seed, sut, forces, cfg)
+	}
+	// Non-race from here: the sleep-set source-DPOR DFS, optimality-guarded
+	// by the sweep's DPOR==Exhaustive equivalence.
+	const raceEnabled = false
+	const useSleep = true
 	var res ExploreResult
 	var stack []*dporFrame
-	raceEnabled := dstRaceEnabledFP()
-	useSleep := !raceEnabled
 	for {
 		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
 			res.BudgetHit = true
@@ -1228,6 +1246,110 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 func dporSelectBacktrack(frame *dporFrame, proc uint64, originForeign bool) {
 	frame.proc = proc
 	frame.originForeign = originForeign
+}
+
+// dporExploreQueuedPass is the race-enabled DPOR walk: at every concurrent
+// conflicting pair's anchor decision, every not-chosen enabled goroutine
+// becomes a child prefix (the same conservative all-enabled backtracking the
+// DFS race path applied), but pending children are explored
+// SHALLOWEST-ANCHOR-FIRST from an explicit queue instead of deepest-first
+// from the DFS stack. Unbudgeted, the explored space covers the DFS's (the
+// expansion is closed under recursion and prefix-deduped — dedup by explored
+// set here, by per-frame done sets in the DFS; truncated traces harvest
+// their whole recorded region, a superset of the DFS's existing-frame
+// seeding); budgeted, the order is the point: single- and few-reversal
+// classes anchor shallow, and a gate's budget must reach them before
+// drowning in one corner's deep outcome-equivalent tail. Sleep sets are not
+// consulted — the race path never used them (filtered intervals and replay
+// promotion make the minimal source-set calculation too narrow; see
+// dporExplore).
+func dporExploreQueuedPass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
+	var res ExploreResult
+	type queued struct {
+		prefix        []uint64
+		parentEnabled [][]uint64
+		originForeign bool
+	}
+	// seen marks prefixes ever pushed, so a re-seeded child (all-enabled
+	// backtracking re-derives anchors freely) neither queues nor runs twice.
+	seen := map[string]bool{}
+	var buckets [][]queued // buckets[d]: pending children whose flip anchors at decision d
+	push := func(d int, q queued) {
+		k := encodePrefix(q.prefix)
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		for len(buckets) <= d {
+			buckets = append(buckets, nil)
+		}
+		buckets[d] = append(buckets[d], q)
+	}
+	push(0, queued{})
+	for {
+		var q queued
+		found := false
+		for d := 0; d < len(buckets); d++ {
+			if len(buckets[d]) > 0 {
+				q = buckets[d][0]
+				buckets[d] = buckets[d][1:]
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+		if cfg.maxSchedules > 0 && res.Schedules >= cfg.maxSchedules {
+			res.BudgetHit = true
+			break
+		}
+		r := runOnceResultLocked(seed, q.prefix, forces, sut, cfg, q.originForeign)
+		tr := r.tr
+		// The enabled-set cross-check against the parent's recorded sets
+		// (hardening clause 4), exactly as the exhaustive pass carries it.
+		checkReplayEnabled(q.prefix, q.parentEnabled, tr)
+		res.Schedules++
+		if tr.budgetHit {
+			res.BudgetHit = true
+		}
+		if tr.overflow {
+			res.Overflow = true
+		}
+		if tr.foreignSched {
+			res.ForeignSched = true
+		}
+		appendRunFailures(&res, q.prefix, forces, r)
+		if promoteAccessForces(tr, forces) {
+			return res, true
+		}
+		// A truncated trace still harvests its RECORDED region's anchors —
+		// the DFS seeded backtracks on existing frames from truncated
+		// traces, and a class reachable only through such an anchor must
+		// not silently vanish here (the truncation itself is already
+		// reported: traceTruncated ⇒ budgetHit ∨ overflow, so Exhausted
+		// cannot read true). Sticky truncation makes the recorded region a
+		// contiguous prefix, so every anchor d < len(tr.procs) is sound.
+		clk, pidx := dporClocks(tr)
+		n := len(tr.procs)
+		forEachConcurrentConflictingPair(tr, clk, pidx, func(i, j int) {
+			d := tr.accStep[i] - 1
+			if d < 0 || d >= n {
+				return
+			}
+			for _, g := range tr.enabled[d] {
+				if g == tr.procs[d] {
+					continue
+				}
+				child := make([]uint64, d+1)
+				copy(child, tr.procs[:d])
+				child[d] = g
+				push(d, queued{child, tr.enabled[:d+1], tr.foreignSched})
+			}
+		})
+	}
+	res.Exhausted = !res.Overflow && !res.BudgetHit && !res.ForeignSched
+	return res, false
 }
 
 // dporHB reports whether access a happens-before access b (a → b) per the vector

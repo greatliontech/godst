@@ -986,6 +986,160 @@ func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
 	}
 }
 
+// TestDPORBudgetedRaceReachesShallowReversals pins the race path's
+// queued shallowest-anchor-first exploration order: two workers race a
+// mutex-guarded order-deciding write and then hammer a deep tail of
+// further mutex-serialized work — the outcome (final x) is decided by
+// the SHALLOW lock-order reversal alone, while the tail supplies a
+// deep space of outcome-equivalent reversal classes. A deepest-first
+// budgeted walk burns the whole budget in that tail and observes one
+// outcome (the field shape: 1000 schedules, one class); the queued
+// walk must reach both orders well inside a small budget.
+func TestDPORBudgetedRaceReachesShallowReversals(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the race path's queued walk)")
+	}
+	outcomes := map[int]bool{}
+	sut := func() bool {
+		var mu sync.Mutex
+		var x, tail int
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		worker := func(id int) {
+			<-start
+			mu.Lock()
+			x = id
+			mu.Unlock()
+			for k := 0; k < 25; k++ {
+				mu.Lock()
+				tail++
+				mu.Unlock()
+			}
+			done <- struct{}{}
+		}
+		go worker(1)
+		go worker(2)
+		close(start)
+		<-done
+		<-done
+		outcomes[x] = true
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 60}, sut)
+	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
+	if len(res.Failures) != 0 {
+		t.Fatalf("mutex-serialized SUT reported %d failures", len(res.Failures))
+	}
+	if !outcomes[1] || !outcomes[2] {
+		t.Fatalf("budgeted exploration observed outcomes %v — the shallow order-deciding reversal was not reached (budget spent in the deep tail)", outcomes)
+	}
+}
+
+// TestDPORBudgetedRaceCrossesLongRegions pins the run-to-block
+// beyond-prefix default: here the order-deciding write comes AFTER each
+// worker's long mutex-serialized region, so reversing the outcome
+// requires one worker to traverse its whole region first. Under a
+// preempt-every-decision default a single flip advances the flipped
+// worker one slot — the reversed outcome sits ~region-length stacked
+// flips away and no small budget reaches it, under any exploration
+// order. Run-to-block makes it a one-switch class.
+func TestDPORBudgetedRaceCrossesLongRegions(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the race path)")
+	}
+	outcomes := map[int]bool{}
+	sut := func() bool {
+		var mu sync.Mutex
+		var x, tail int
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		worker := func(id int) {
+			<-start
+			for k := 0; k < 25; k++ {
+				mu.Lock()
+				tail++
+				mu.Unlock()
+			}
+			mu.Lock()
+			x = id
+			mu.Unlock()
+			done <- struct{}{}
+		}
+		go worker(1)
+		go worker(2)
+		close(start)
+		<-done
+		<-done
+		outcomes[x] = true
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 60}, sut)
+	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
+	if len(res.Failures) != 0 {
+		t.Fatalf("mutex-serialized SUT reported %d failures", len(res.Failures))
+	}
+	if !outcomes[1] || !outcomes[2] {
+		t.Fatalf("budgeted exploration observed outcomes %v — the long-region reversal was not reached (preemptive default gulf)", outcomes)
+	}
+}
+
+// TestDPORRaceTruncatedTraceHarvestsAnchors pins the queued race walk's
+// truncation clause: every run here truncates (the caller step budget is
+// far below the workers' tail), so the order-deciding shallow conflict's
+// anchors exist ONLY inside truncated traces' recorded regions. Dropping
+// truncated traces wholesale (instead of harvesting their recorded
+// regions) explores exactly one schedule and observes one outcome;
+// harvesting reaches both orders. Coverage stays loudly incomplete
+// either way (truncation ⇒ BudgetHit/Overflow ⇒ Exhausted false).
+func TestDPORRaceTruncatedTraceHarvestsAnchors(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the queued race walk's truncation clause)")
+	}
+	outcomes := map[int]bool{}
+	sut := func() bool {
+		var mu sync.Mutex
+		var x, tail int
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		worker := func(id int) {
+			<-start
+			mu.Lock()
+			x = id
+			mu.Unlock()
+			for k := 0; k < 2000; k++ {
+				mu.Lock()
+				tail++
+				mu.Unlock()
+			}
+			done <- struct{}{}
+		}
+		go worker(1)
+		go worker(2)
+		close(start)
+		<-done
+		<-done
+		outcomes[x] = true
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 40, MaxSteps: 200}, sut)
+	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
+	if res.Exhausted {
+		t.Fatal("truncated exploration claimed exhaustion")
+	}
+	if !outcomes[1] || !outcomes[2] {
+		t.Fatalf("outcomes %v — truncated traces' recorded-region anchors were not harvested", outcomes)
+	}
+}
+
 func TestDPORBacktrackCarriesTraceProvenance(t *testing.T) {
 	frame := &dporFrame{proc: 1}
 	dporSelectBacktrack(frame, 2, true)
@@ -3186,9 +3340,11 @@ func TestExploreDPORTruncatedChildContinuesWalk(t *testing.T) {
 	}
 	if dstRaceEnabledFP() {
 		// The conflicts are intentional data races (the point of the manual
-		// access hooks); -race fails tRunner on them. DPOR's walk structure —
-		// the contract under test — is identical in both build modes.
-		t.Skip("intentionally racy sut; the continuation contract is build-mode-independent")
+		// access hooks); -race fails tRunner on them. This pins the NON-RACE
+		// DFS's continuation contract; the race build runs the queued walk,
+		// whose truncation behavior (recorded-region anchor harvesting) is
+		// documented in exploration.md's truncation clause.
+		t.Skip("intentionally racy sut; pins the non-race DFS continuation")
 	}
 	sut := func() bool {
 		var b, a int
@@ -3244,7 +3400,10 @@ func TestExploreDPORTruncatedChildNoExtensionExplosion(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	if dstRaceEnabledFP() {
-		t.Skip("intentionally racy sut; the extension-skip is build-mode-independent")
+		// Pins the NON-RACE DFS's extension-skip; the race build's queued
+		// walk deliberately harvests a truncated trace's recorded-region
+		// anchors instead (exploration.md's truncation clause).
+		t.Skip("intentionally racy sut; pins the non-race DFS extension-skip")
 	}
 	const k = 6
 	sut := func() bool {

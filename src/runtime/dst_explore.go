@@ -373,8 +373,9 @@ func dstSyncBlindBlocksFP() uint64 { return dstSyncBlindBlocks }
 func dstAccessYieldReset() { dstAccessYieldPoints = 0 }
 
 // dstSchedulePrefix[s] is the stable per-bubble index (dstSeq, not goid) to run at
-// scheduled-strategy decision s. Beyond its end the strategy runs the
-// lowest-dstSeq enabled candidate (a deterministic default), and every decision is
+// scheduled-strategy decision s. Beyond its end the strategy runs the previous
+// decision's goroutine while it remains a candidate, else the lowest-dstSeq
+// enabled candidate (run-to-block; see dstStickyDefaultIdx), and every decision is
 // recorded so the brain can extend the prefix. Set by dstSetSchedule before a Run.
 var dstSchedulePrefix []uint64
 
@@ -1447,7 +1448,7 @@ func dstScheduledSelect(c *dstCandidates, total uint32) uint32 {
 			sel = dstLowestSeqIdx(c, total)
 		}
 	} else {
-		sel = dstLowestSeqIdx(c, total)
+		sel = dstStickyDefaultIdx(c, total)
 	}
 	// Record the decision (enabled set in candidate order + chosen id), bounded.
 	// The enabled set is the simulation's candidates only (see the doc above);
@@ -1566,6 +1567,33 @@ func dstLowestSeqIdx(c *dstCandidates, total uint32) uint32 {
 		throw("dst: no simulation candidate in scheduled selection")
 	}
 	return best
+}
+
+// dstStickyDefaultIdx is the beyond-prefix default: keep running the previous
+// decision's goroutine while it remains a candidate (run-to-block), falling
+// back to the lowest-seq candidate at its blocking/exit points. Run-to-block
+// is the canonical DPOR execution model, and for BUDGETED exploration it is
+// load-bearing: under a preempt-every-decision default (lowest-seq
+// unconditionally), a schedule prefix that flips one decision toward a
+// goroutine advances it by exactly one slot before the default switches away
+// again, so reaching an outcome class in which that goroutine runs a long
+// region first needs as many stacked flips as the region has decisions — no
+// budget crosses that gulf (field shape: two racers, 1000 schedules, one
+// outcome class). Sticky, one flip means "switch here and let it run", and
+// few-switch classes — the ones budgets must cover — sit few flips from the
+// base schedule. Equally deterministic (DST-L2-2: dstLastDecisionSeq is a
+// pure function of the decision sequence, reset per episode), and coverage
+// is unchanged where exploration is complete — the default only picks the
+// base path through the same recorded tree.
+func dstStickyDefaultIdx(c *dstCandidates, total uint32) uint32 {
+	if dstLastDecisionSeq != 0 {
+		for k := uint32(0); k < total; k++ {
+			if gp := c.at(k); gp != nil && !dstIsInfraCandidate(gp) && gp.dstSeq == dstLastDecisionSeq {
+				return k
+			}
+		}
+	}
+	return dstLowestSeqIdx(c, total)
 }
 
 // --- brain-facing API (linkname'd; called on normal goroutines, off-lock) ------
