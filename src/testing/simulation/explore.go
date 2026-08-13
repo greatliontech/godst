@@ -861,14 +861,10 @@ func promoteAccessForces(tr exploreTrace, forces map[accessForce]bool) bool {
 	}
 	clk, pidx := dporClocks(tr)
 	conflicting := make([]bool, len(tr.accSeq))
-	for j := 0; j < len(tr.accSeq); j++ {
-		for i := j - 1; i >= 0; i-- {
-			if accessConflict(tr, i, j) && dporConcurrent(clk, pidx, tr, i, j) {
-				conflicting[i] = true
-				conflicting[j] = true
-			}
-		}
-	}
+	forEachConcurrentConflictingPair(tr, clk, pidx, func(i, j int) {
+		conflicting[i] = true
+		conflicting[j] = true
+	})
 	grew := false
 	for k := range tr.accSeq {
 		if tr.accCount[k] == 0 || !conflicting[k] || !accessNeedsReplayBoundary(tr, conflicting, k) {
@@ -1168,33 +1164,26 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		// are over log entries.
 		clk, pidx := dporClocks(tr)
 		traceClk, tracePidx := dporTraceClocks(tr)
-		nLog := len(tr.accSeq)
-		for j := 0; j < nLog; j++ {
-			for i := j - 1; i >= 0; i-- {
-				if accessConflict(tr, i, j) {
-					if dporConcurrent(clk, pidx, tr, i, j) {
-						// d < len(stack): with a truncated trace the stack was
-						// not extended, and a backtrack can only seed a frame
-						// that exists.
-						if d := tr.accStep[i] - 1; d >= 0 && d < n && d < len(stack) {
-							if raceEnabled || tr.syncEventOverflow {
-								// All-enabled over-approximation. For a sync-event overflow
-								// trace the weak-initial computation is under-ordered (a
-								// spurious weak-initial can seed the WRONG backtrack and drop
-								// a class), so precision degrades to soundness: backtrack
-								// everything enabled. The overflow is still reported
-								// (Exhausted=false).
-								for _, g := range tr.enabled[d] {
-									stack[d].backtrack[g] = true
-								}
-							} else {
-								addSourceBacktrack(stack[d], tr.enabled[d], tr, traceClk, tracePidx, i, j)
-							}
-						}
+		forEachConcurrentConflictingPair(tr, clk, pidx, func(i, j int) {
+			// d < len(stack): with a truncated trace the stack was
+			// not extended, and a backtrack can only seed a frame
+			// that exists.
+			if d := tr.accStep[i] - 1; d >= 0 && d < n && d < len(stack) {
+				if raceEnabled || tr.syncEventOverflow {
+					// All-enabled over-approximation. For a sync-event overflow
+					// trace the weak-initial computation is under-ordered (a
+					// spurious weak-initial can seed the WRONG backtrack and drop
+					// a class), so precision degrades to soundness: backtrack
+					// everything enabled. The overflow is still reported
+					// (Exhausted=false).
+					for _, g := range tr.enabled[d] {
+						stack[d].backtrack[g] = true
 					}
+				} else {
+					addSourceBacktrack(stack[d], tr.enabled[d], tr, traceClk, tracePidx, i, j)
 				}
 			}
-		}
+		})
 		// Backtrack to the deepest decision with an unexplored, NON-ASLEEP backtrack
 		// choice (deterministic enabled order); discard fully-explored frames. As each
 		// chosen goroutine's subtree completes, record its interval access-set
@@ -1567,6 +1556,8 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 	maxStep := maxHBStep(tr)
 	nLog := len(tr.accSeq)
 	clk = make([][]uint32, nLog)
+	ix := &accLastIndex{pages: map[uintptr][]accLastGroup{}}
+	var doms []int
 	li := 0
 	for s := 0; s <= maxStep; s++ {
 		applyEvents(s, li)
@@ -1575,14 +1566,16 @@ func dporTraceClocks(tr exploreTrace) (clk [][]uint32, pidx map[uint64]int) {
 			pi := pidx[tr.accSeq[li]]
 			// Conflict edges: a later access to an overlapping interval with >=1 write causally
 			// depends on every earlier conflicting access — merge their clocks in, so e_i
-			// trace-happens-before every later conflicting access.
-			for m := 0; m < li; m++ {
-				if accessConflict(tr, m, li) {
-					mergeInto(cur[pi], clk[m])
-				}
+			// trace-happens-before every later conflicting access. The index yields a
+			// dominating subset (per-goroutine last conflicting access), which is
+			// merge-identical: same-goroutine snapshots are monotone.
+			doms = ix.appendConflictDominators(doms[:0], tr, li)
+			for _, m := range doms {
+				mergeInto(cur[pi], clk[m])
 			}
 			cur[pi][pi]++
 			clk[li] = append([]uint32(nil), cur[pi]...)
+			ix.add(tr, li)
 			li++
 			applyEvents(s, li)
 		}
