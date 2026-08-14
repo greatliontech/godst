@@ -25,6 +25,9 @@ import (
 //go:linkname dstAccessYield runtime.dstAccessYield
 func dstAccessYield(addr unsafe.Pointer, write bool)
 
+//go:linkname dstFilterForceConservativeFP runtime.dstFilterForceConservativeFP
+func dstFilterForceConservativeFP(on bool)
+
 //go:linkname dstAccessYieldRange runtime.dstAccessYieldRange
 func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool)
 
@@ -3621,5 +3624,227 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 	}
 	if len(hres.Failures) == 0 {
 		t.Fatalf("manual-hook lost update not found: %+v", hres)
+	}
+}
+
+// pointerful is the regression shape for the mid-construction hazard: an
+// address-taken composite of pointer fields, built by straight-line field
+// stores between which the dst-race compiler emits access hooks — the one
+// window where a yield would park a frame whose stack object still holds
+// junk in pointer slots.
+type pointerful struct {
+	a, b, c, d *int
+	s1, s2     string
+	xs         []int
+}
+
+//go:noinline
+func consumePointerful(p *pointerful) int { return len(p.xs) + len(p.s1) }
+
+// TestExploreConservativeOwnStackNeverYields pins the single-owner yield
+// exemption's UNCONDITIONAL half: own-stack accesses record-only in EVERY
+// filter state — force-conservative included, where the overflow fallback
+// used to yield every auto-instrumented access. Load-bearing beyond
+// pruning: the compiler emits access hooks BETWEEN the field stores of
+// address-taken stack composites (the only calls in those windows — real
+// calls are hoisted out by evaluation order), so an own-stack yield can
+// park a frame whose stack object still holds junk in pointer slots, and
+// the GC scan or stack shrink of the parked frame faults ("invalid
+// pointer found on stack" — observed from grpc's resolver.State literal
+// via the sibling morestack exposure). The witness is the yield counter:
+// a straight-line run of stack-composite builds must contribute ZERO
+// access yields under force-conservative; the pre-fix behavior yields at
+// every field store.
+func TestExploreConservativeOwnStackNeverYields(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the auto-instrumented access hooks)")
+	}
+	dstFilterForceConservativeFP(true)
+	defer dstFilterForceConservativeFP(false)
+	var yields, events uint64
+	sut := func() bool {
+		done := make(chan struct{}, 1)
+		go func() {
+			v := 7
+			xs := []int{0} // preallocated: an in-loop literal escapes and its
+			// heap write would be a LEGITIMATE shared yield, polluting the
+			// own-stack bracket.
+			c0 := dstAccessYieldFP()
+			e0 := dstLevel2EventsFP()
+			total := 0
+			for i := 0; i < 4; i++ {
+				// Built through a pointer: pointer-mediated stores ARE
+				// instrumented (direct own-frame stores are compiler-skipped
+				// as sanitizer-safe), and they classify own-stack.
+				var m pointerful
+				p := &m
+				p.a, p.b, p.c, p.d = &v, &v, &v, &v
+				p.s1, p.s2 = "own", "stack"
+				p.xs = xs
+				total += consumePointerful(p)
+			}
+			yields = dstAccessYieldFP() - c0
+			events = dstLevel2EventsFP() - e0
+			_ = total
+			done <- struct{}{}
+		}()
+		<-done
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 8}, sut)
+	if len(res.Failures) != 0 {
+		t.Fatalf("explored SUT reported %d failures", len(res.Failures))
+	}
+	if events == 0 {
+		t.Fatal("no Level-2 events in the composite-build window — the witness is not exercising instrumented accesses (vacuity guard)")
+	}
+	if yields != 0 {
+		t.Fatalf("own-stack composite builds took %d access yields under the conservative filter — a mid-construction park is reachable", yields)
+	}
+	t.Logf("schedules=%d yields=%d events=%d", res.Schedules, yields, events)
+}
+
+// heapSrc is the H-shape's shared field source: a heap cell whose read
+// sits BETWEEN an address-taken stack composite's field stores.
+var heapSrc = &struct{ f *int }{}
+
+//go:noinline
+func consumePointerfulLen(p *pointerful) int { return len(p.s1) }
+
+// TestExploreSharedMidWindowParkIsScannable is the smoke for the
+// remaining mid-window shape: a SHARED-classified load (heap read)
+// between the stores of an address-taken stack composite must yield in
+// conservative mode — it is a real transition — and the park is safe
+// only because dst-race entry-zeroes address-taken pointerful autos
+// (the liveness Needzero rule): the parked frame scans clean under the
+// sibling's GC instead of faulting on construction junk.
+func TestExploreSharedMidWindowParkIsScannable(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race (the auto-instrumented access hooks)")
+	}
+	dstFilterForceConservativeFP(true)
+	defer dstFilterForceConservativeFP(false)
+	sut := func() bool {
+		done := make(chan struct{}, 2)
+		v := 7
+		heapSrc.f = &v
+		go func() {
+			total := 0
+			for i := 0; i < 3; i++ {
+				var m pointerful
+				p := &m
+				p.a = &v
+				p.b = heapSrc.f // shared load mid-window: yields, parks
+				p.s1 = "w"
+				total += consumePointerfulLen(p)
+			}
+			_ = total
+			done <- struct{}{}
+		}()
+		go func() {
+			runtime.GC()
+			done <- struct{}{}
+		}()
+		<-done
+		<-done
+		return false
+	}
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 40}, sut)
+	if len(res.Failures) != 0 {
+		t.Fatalf("explored SUT reported %d failures", len(res.Failures))
+	}
+	t.Logf("schedules=%d exhausted=%v", res.Schedules, res.Exhausted)
+}
+
+// TestDSTHookChainNosplitStructural pins the hook-safety contract's
+// nosplit half structurally (exploration.md D1): every function on the
+// hook ENTRY chain must carry no stack-growth prologue — a splittable
+// hook's morestack at an instrumented site inside a composite-
+// construction window was a field fatal ("invalid pointer found on
+// stack"), and a dropped pragma resurrects it silently (the linker
+// checks budgets, not reachability). The witness disassembles this
+// very test binary and rejects any morestack call inside the named
+// functions. Bound: the marked functions' own prologues — a splittable
+// callee newly added to a chain body is caught only when it appears in
+// these bodies via inlining; the suites' grpc-importing dst-race runs
+// remain the end-to-end net.
+func TestDSTHookChainNosplitStructural(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	// The test binary itself is built without a symbol section; build a
+	// minimal dst-tagged binary to disassemble (the chain lives in the
+	// runtime, present in any binary).
+	dir := t.TempDir()
+	// The probe's body references every hook kind so deadcode keeps the
+	// chain: plain + range writes (access hooks), channel ops and len
+	// (sync acquire/observe), an atomic (atomic hook), file I/O (coarse
+	// deps).
+	probe := `package main
+
+import (
+	"os"
+	"sync/atomic"
+)
+
+var g struct {
+	p *int
+	a [4]int
+}
+var n atomic.Int64
+var ch = make(chan int, 1)
+
+func main() {
+	v := int(n.Add(1))
+	g.p = &v
+	g.a = [4]int{v, v, v, v}
+	ch <- v
+	_ = len(ch)
+	<-ch
+	f, _ := os.CreateTemp("", "probe")
+	if f != nil {
+		f.Write([]byte("x"))
+		f.Close()
+		os.Remove(f.Name())
+	}
+}
+`
+	if err := os.WriteFile(dir+"/main.go", []byte(probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/go.mod", []byte("module nosplitprobe\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exe := dir + "/probe.bin"
+	bcmd := exec.Command(testenv.GoToolPath(t), "build", "-tags", "dst", "-race", "-o", exe, ".")
+	bcmd.Dir = dir
+	if out, err := bcmd.CombinedOutput(); err != nil {
+		t.Fatalf("build probe: %v\n%s", err, out)
+	}
+	chain := `^runtime\.(dstAccessYield|dstAccessYieldRange|dstSyncAcquire|dstAtomicYield|dstSyncObserve|dstCoarseDep|dstCoarseHB|dstYieldPoint|dstYieldAccess|dstEnsureSeq|dstAccessMaybeShared|dstCommitAccess|dstRecordAccess|dstRecordSyncEvent|dstRecordSyncEventID|dstRecordSyncAcquireID|dstRecordSyncReleaseID|goyield)$`
+	cmd := exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", chain, exe)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump: %v\n%s", err, out)
+	}
+	var fn string
+	seen := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "TEXT ") {
+			fn = strings.Fields(line)[1]
+			seen++
+			continue
+		}
+		if strings.Contains(line, "CALL") && strings.Contains(line, "morestack") {
+			t.Errorf("%s grows the stack (%s) — the nosplit hook-chain contract is broken", fn, strings.TrimSpace(line))
+		}
+	}
+	if seen < 10 {
+		t.Fatalf("objdump matched only %d chain functions — the structural witness is not seeing the chain", seen)
 	}
 }

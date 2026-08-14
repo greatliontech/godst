@@ -512,8 +512,9 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   exactly as upstream (DST-L2-4). Two correctness properties this buys over rerouting the race symbol
   (the rejected Option 2): **(i)** the TSan oracle is never modified — perfect attribution, identical
   detection; **(ii)** `raceread` stays `NOSPLIT`, so instrumented `//go:nosplit` functions still link —
-  the *new* splittable `dstAccessYield` is simply **not emitted in nosplit functions** (the compiler
-  checks `fn.Pragma&Nosplit`; skipping a yield point is always sound). `dstAccessYield` is DST's own
+  `dstAccessYield` is **not emitted in nosplit functions** (the compiler checks `fn.Pragma&Nosplit`;
+  skipping a yield point is always sound — and the hook chain's own nosplit frames, below, would join
+  the caller's nosplit budget). `dstAccessYield` is DST's own
   transition hook — it is *not* TSan's — so the DPOR access stream rides it, not a hijacked detector
   hook. (Rejected Option 2 — replace `raceread` with a Go shim that yields then forwards to `racereadpc`
   — would make `raceread` splittable, breaking nosplit instrumented callers, and reroute every access
@@ -546,8 +547,23 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
    restarts the pass until no new promotion is needed. Auto-instrumented accesses to the
   current goroutine's stack log as `addr=0` (private; no conflict identity), while explicit manual/sync
   identities keep their addresses. If the bounded live filter state overflows, the runtime conservatively
-  yields every later access (less pruning, never a dropped class). Non-race manual hooks remain explicit
+  yields every later SHARED access (less pruning, never a dropped class) — own-stack accesses are
+  exempt in EVERY filter state, restating the primary rule above (a single-owner access records but
+  never yields): single-owner needs no clock state, and those hooks sit inside composite-construction
+  windows where a park must not occur (the hook-safety contract below). Non-race manual hooks remain explicit
   transition boundaries for the hand-controlled DPOR brain-validation corpus.
+
+  **Hook-safety contract (load-bearing).** The emission inherits TSan's site set, including hooks
+  BETWEEN the field stores of address-taken stack composites, where a not-yet-written pointer slot
+  holds junk; those sites are safe under stock -race only because TSan's hooks are nosplit — nothing
+  can observe the half-initialized frame. The dst hooks therefore hold three properties, each with a
+  witness: the ENTRY chain is `//go:nosplit` (a splittable hook's `morestack` at such a site was a
+  field fatal — "invalid pointer found on stack"; pinned structurally by the objdump nosplit test);
+  own-stack accesses NEVER yield, in every filter state including the conservative fallback
+  (`TestExploreConservativeOwnStackNeverYields`, the zero-yield bracket with an instrumentation-
+  presence guard); and the compiler entry-zeroes address-taken pointerful autos under dst-race (the
+  liveness `Needzero` rule), so a SHARED-classified hook that parks mid-window leaves a frame whose
+  stack objects scan clean under GC or stack movement (`TestExploreSharedMidWindowParkIsScannable`).
 
 #### D2 — Happens-before tracking (the dependency relation)
 
@@ -692,7 +708,8 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    `runtime.dstAccessYieldRange(addr, size, isWrite)` before composite `race{read,write}range` hooks, gated
    by the `-d=dstrace=1` debug flag that `cmd/go` sets exactly when `-tags dst` **and** `-race` are both
    present; the race hook itself is untouched (oracle byte-identical), the yield is skipped in
-   `//go:nosplit` functions (`goyield` is splittable; skipping is sound), and with the flag off the pass
+   `//go:nosplit` functions (skipping is sound; the hook chain is itself nosplit — the hook-safety
+   contract in D1), and with the flag off the pass
    emits plain `race*` with no DST access-yield call (DST-L2-4 — verified absent in non-dst and
    dst-without-race builds). An UNMODIFIED SUT (no manual hooks) built `-tags dst -race` is then explored end-to-end
    (`TestDSTExploreAutoInstrument`: the lost update is found, DPOR outcome set == Exhaustive). Foreclosure:

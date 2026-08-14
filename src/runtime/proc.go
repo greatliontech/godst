@@ -4498,6 +4498,7 @@ func preemptPark(gp *g) {
 // See go.dev/issue/67401.
 //
 //go:linkname goyield
+//go:nosplit
 func goyield() {
 	checkTimeouts()
 	mcall(goyield_m)

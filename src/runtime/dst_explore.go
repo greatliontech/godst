@@ -102,6 +102,24 @@ const (
 	dstSyncRendezvousAux = ^uintptr(0)
 )
 
+// The whole hook ENTRY chain (the linkname'd hooks, this core, and the
+// fast-path recorders below) is //go:nosplit — load-bearing, not an
+// optimization: the dst-race compiler emits these calls at the same
+// sites as the TSan hooks, including BETWEEN the field stores of
+// address-taken composite literals, where a not-yet-written pointer
+// slot holds junk. Those sites are safe in a stock -race build only
+// because TSan's hooks are nosplit — no stack check, so neither
+// morestack/copystack nor a preemption-point GC scan can ever observe
+// the half-initialized frame. A splittable hook reintroduced exactly
+// that window (field observation: fatal "invalid pointer found on
+// stack" growing the stack at hook entry inside grpc's resolver.State
+// literal). Non-simulation runs execute only the few-field fast path
+// under nosplit. Simulation mode closes the rest by construction:
+// own-stack accesses NEVER yield, in every filter state (below), and
+// the dst-race compiler entry-zeroes address-taken pointerful autos
+// (the liveness Needzero rule), so a SHARED-classified hook that does
+// park mid-window leaves a frame whose stack objects scan clean.
+//
 // dstYieldAccess is the shared core of every Level-2 transition-boundary hook: it
 // records the transition (addr, size, write) for DPOR's dependency relation and yields,
 // subject to the safe-point guard and the dst-race shared-address filter. The guard
@@ -111,6 +129,7 @@ const (
 // only forgoes an interleaving). goyield requeues the current G and reschedules
 // through dstFindRunnable, so the seam never runs a blocked G; soundness is
 // inherited from Seq 5 unchanged.
+//go:nosplit
 func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	gp := getg()
 	// Access-granularity yielding is a Level-2 (scheduled-strategy) mechanism. Under
@@ -141,7 +160,12 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 		// promoteAccessForces cannot loop on it (it grows only on a NEW force).
 		seq := dstEnsureSeq(gp)
 		gp.dstAccCount++
-		dstCommitAccess(gp, seq, addr, size, write, dstAccessPCKey(pc), gp.dstAccCount, filter && raceenabled, dstScheduleStep)
+		auto := filter && raceenabled
+		key := uintptr(0)
+		if !auto || dstAccessMaybeShared(gp, addr, size) {
+			key = dstAccessPCKey(pc)
+		}
+		dstCommitAccess(gp, seq, addr, size, write, key, gp.dstAccCount, auto, dstScheduleStep)
 		return
 	}
 	seq := dstEnsureSeq(gp)
@@ -149,8 +173,23 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 		dstLevel2Events++
 	}
 	gp.dstAccCount++
-	pc = dstAccessPCKey(pc)
 	auto := filter && raceenabled
+	if auto && !dstAccessMaybeShared(gp, addr, size) {
+		// Single-owner (own-stack) access: record-only, in EVERY filter
+		// state — conservative mode included. Load-bearing twice over:
+		// single-owner accesses are independent (yielding explores
+		// nothing), and these are the only hooks the compiler emits
+		// INSIDE address-taken composite-construction windows, where a
+		// park would expose the half-initialized frame to a GC scan or
+		// stack shrink (the same class the nosplit entry chain closes
+		// for morestack). The pc key is skipped: it exists for replay
+		// forces, and an own-stack row (logged addr=0) can never be
+		// promoted; keying would also call splittable runtime lookups
+		// mid-window. Commit's own single-owner test nils the addr.
+		dstCommitAccess(gp, seq, addr, size, write, 0, gp.dstAccCount, auto, dstScheduleStep)
+		return
+	}
+	pc = dstAccessPCKey(pc)
 	forced := dstAccessForced(seq, gp.dstAccCount, pc)
 	if auto && !forced && !dstAccessShouldYield(gp, seq, addr, size, write) {
 		dstCommitAccess(gp, seq, addr, size, write, pc, gp.dstAccCount, auto, dstScheduleStep)
@@ -174,6 +213,7 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 // independent.
 //
 //go:linkname dstAccessYield
+//go:nosplit
 func dstAccessYield(addr unsafe.Pointer, write bool) {
 	dstYieldAccess(uintptr(addr), 1, write, true, sys.GetCallerPC())
 }
@@ -183,6 +223,7 @@ func dstAccessYield(addr unsafe.Pointer, write bool) {
 // same byte interval the unchanged TSan oracle observes.
 //
 //go:linkname dstAccessYieldRange
+//go:nosplit
 func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
 	dstYieldAccess(uintptr(addr), size, write, true, sys.GetCallerPC())
 }
@@ -199,6 +240,7 @@ func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
 // goroutine changes the sync object's state.
 //
 //go:linkname dstSyncAcquire
+//go:nosplit
 func dstSyncAcquire(id unsafe.Pointer) {
 	dstSyncAnnounces++
 	dstYieldAccess(uintptr(id), 1, true, false, sys.GetCallerPC())
@@ -271,6 +313,7 @@ const dstSyncAtomicAux = ^uintptr(1)
 // class.
 //
 //go:linkname dstAtomicYield
+//go:nosplit
 func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr) {
 	dstYieldAccess(uintptr(addr), size, kind != dstAtomicLoad, false, sys.GetCallerPC())
 	switch kind {
@@ -297,6 +340,7 @@ func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr) {
 // carries no ordering decision at all.
 //
 //go:linkname dstSyncObserve
+//go:nosplit
 func dstSyncObserve(id unsafe.Pointer) {
 	dstYieldAccess(uintptr(id), 1, false, false, sys.GetCallerPC())
 }
@@ -323,6 +367,7 @@ const dstSyncCoarseAux = ^uintptr(2)
 // a cheap early return.
 //
 //go:linkname dstCoarseDep
+//go:nosplit
 func dstCoarseDep(id uintptr, write bool, hb uintptr) {
 	dstYieldAccess(id, 1, write, false, sys.GetCallerPC())
 	switch hb {
@@ -340,6 +385,7 @@ func dstCoarseDep(id uintptr, write bool, hb uintptr) {
 // dstCoarseDep. No yield.
 //
 //go:linkname dstCoarseHB
+//go:nosplit
 func dstCoarseHB(id uintptr, hb uintptr) {
 	switch hb {
 	case 1:
@@ -353,6 +399,7 @@ func dstCoarseHB(id uintptr, hb uintptr) {
 // pure scheduling point (used by soundness probes). See dstAccessYield.
 //
 //go:linkname dstYieldPoint
+//go:nosplit
 func dstYieldPoint() {
 	dstYieldAccess(0, 0, false, false, sys.GetCallerPC())
 }
@@ -529,8 +576,10 @@ var (
 // after this one exits; raw stack-address equality is not a shared-memory identity.
 //
 // Clocks are bounded and preallocated. If the run exceeds the precise clock/table
-// budget, filtering falls back to yielding every later access; that loses pruning but
-// cannot lose a class.
+// budget, filtering falls back to yielding every later SHARED access; that loses
+// pruning but cannot lose a class. Own-stack accesses are exempt in every filter
+// state — single-owner needs no clock state, and those hooks sit inside
+// composite-construction windows where a park must not occur (dstYieldAccess).
 var (
 	dstClockProcs int
 	dstClock      []uint32 // flat [dstClockProcs][dstClockProcs]
@@ -610,6 +659,7 @@ const (
 // and assignment makes a sim-candidate-without-an-index unrepresentable.
 // The sim bubble's own drain and root ARE members and keep their
 // access/edge-path seqs.
+//go:nosplit
 func dstEnsureSeq(gp *g) uint64 {
 	if !gp.dstSimG {
 		return 0
@@ -650,6 +700,7 @@ func dstClearSchedState(gp *g) {
 	gp.dstAccAuto = false
 }
 
+//go:nosplit
 func dstClockIdx(seq uint64) int {
 	if seq == 0 || seq > uint64(dstClockProcs) {
 		return -1
@@ -657,14 +708,17 @@ func dstClockIdx(seq uint64) int {
 	return int(seq - 1)
 }
 
+//go:nosplit
 func dstClockAt(proc, component int) uint32 {
 	return dstClock[proc*dstClockProcs+component]
 }
 
+//go:nosplit
 func dstClockSet(proc, component int, v uint32) {
 	dstClock[proc*dstClockProcs+component] = v
 }
 
+//go:nosplit
 func dstClockTick(proc int) uint32 {
 	e := dstClockAt(proc, proc) + 1
 	dstClockSet(proc, proc, e)
@@ -879,6 +933,7 @@ func dstAccessHBBefore(curProc, priorProc int, priorEpoch uint32) bool {
 	return priorEpoch == 0 || dstClockAt(curProc, priorProc) >= priorEpoch
 }
 
+//go:nosplit
 func dstAccessRangeEnd(addr, size uintptr) uintptr {
 	if size == 0 {
 		size = 1
@@ -899,6 +954,7 @@ func dstAccessOverlap(addr, size, otherAddr, otherSize uintptr) bool {
 	return addr < otherEnd && otherAddr < end
 }
 
+//go:nosplit
 func dstAccessMaybeShared(gp *g, addr, size uintptr) bool {
 	if addr == 0 {
 		return false
@@ -1017,6 +1073,7 @@ func dstAccessEntryConflicts(e, proc int, addr, size uintptr, write bool) bool {
 	return false
 }
 
+//go:nosplit
 func dstCommitAccess(gp *g, seq uint64, addr, size uintptr, write bool, pc uintptr, count uint64, auto bool, step int) {
 	if auto && !dstAccessMaybeShared(gp, addr, size) {
 		addr = 0
@@ -1054,6 +1111,7 @@ func dstCommitAccess(gp *g, seq uint64, addr, size uintptr, write bool, pc uintp
 // filtered) access commits inline with no reschedule, so announce order == commit
 // order and it is logged at dstAccessYield (step = dstScheduleStep). Allocation-free;
 // the dstScheduledSelect caller runs under sched.lock, so this must not allocate.
+//go:nosplit
 func dstRecordAccess(seq uint64, addr, size uintptr, write bool, pc uintptr, count uint64, step int) {
 	if dstAccLogN < len(dstAccLogSeq) {
 		dstAccLogSeq[dstAccLogN] = seq
@@ -1113,6 +1171,7 @@ func dstRecordReadyEdge(readier, readied *g) {
 	}
 }
 
+//go:nosplit
 func dstRecordSyncEvent(kind uint8, id unsafe.Pointer) {
 	if id == nil {
 		return
@@ -1120,6 +1179,7 @@ func dstRecordSyncEvent(kind uint8, id unsafe.Pointer) {
 	dstRecordSyncEventID(kind, uintptr(id), 0)
 }
 
+//go:nosplit
 func dstRecordSyncEventID(kind uint8, id, aux uintptr) {
 	if !dstActive() || dstSchedKind != dstSchedScheduled || id == 0 {
 		return
@@ -1248,14 +1308,17 @@ func dstRecordSyncRelease(id unsafe.Pointer) {
 }
 
 //go:linkname dstRecordSyncAcquire
+//go:nosplit
 func dstRecordSyncAcquire(id unsafe.Pointer) {
 	dstRecordSyncEvent(dstSyncEventAcquire, id)
 }
 
+//go:nosplit
 func dstRecordSyncReleaseID(id, aux uintptr) {
 	dstRecordSyncEventID(dstSyncEventRelease, id, aux)
 }
 
+//go:nosplit
 func dstRecordSyncAcquireID(id, aux uintptr) {
 	dstRecordSyncEventID(dstSyncEventAcquire, id, aux)
 }

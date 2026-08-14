@@ -750,6 +750,28 @@ func (lv *Liveness) epilogue() {
 	liveout := bitvec.New(nvars)
 	livedefer := bitvec.New(nvars) // always-live variables
 
+	// dst-race (DST Level-2): the compiler emits access-yield hooks at
+	// TSan's sites, including BETWEEN the field stores of address-taken
+	// stack composites — the one window where a pointer slot of a live
+	// stack object can hold junk. Unlike TSan's nosplit hooks, a dst
+	// hook may grow the stack or park the goroutine (Explore mode), so
+	// every hook site must present a scannable frame: zero every
+	// address-taken pointerful auto at entry, foreclosing the junk.
+	// Stock -race needs no such rule — its hooks never let the stack
+	// machinery observe those sites. Address-taken vars are not in
+	// lv.vars (liveness does not track them), so this walks fn.Dcl.
+	// Skips mirror the hook-emission gate: nosplit functions get no
+	// hooks; norace functions are not instrumented.
+	if base.Flag.Race && base.Debug.DstRace != 0 &&
+		lv.fn.Pragma&ir.Norace == 0 && lv.fn.Pragma&ir.Nosplit == 0 {
+		for _, n := range lv.fn.Dcl {
+			if n.Class == ir.PAUTO && n.Addrtaken() && n.Type().HasPointers() &&
+				n.Type().Size() > 0 && n.Type().Size()%int64(types.PtrSize) == 0 {
+				n.SetNeedzero(true)
+			}
+		}
+	}
+
 	// If there is a defer (that could recover), then all output
 	// parameters are live all the time.  In addition, any locals
 	// that are pointers to heap-allocated output parameters are

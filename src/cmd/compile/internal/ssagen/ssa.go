@@ -1588,9 +1588,10 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 	// unchanged, so TSan detection/PC-attribution stay byte-identical to a stock -race
 	// build (the oracle is never modified). Gated to -race with -d=dstrace (cmd/go sets
 	// it only for -tags dst + -race); off → this is dead and instrument2 emits exactly
-	// upstream (DST-L2-4). Skipped in //go:nosplit functions because dstAccessYield →
-	// goyield is splittable (skipping a yield only forgoes an interleaving — always
-	// sound). Not emitted for the MSan-only move kind (race uses read/write only). The
+	// upstream (DST-L2-4). Skipped in //go:nosplit functions: the hook chain's own
+	// nosplit frames would join every instrumented nosplit caller's budget, and the
+	// simulation-mode deep path is splittable (skipping a yield only forgoes an
+	// interleaving — always sound). Not emitted for the MSan-only move kind (race uses read/write only). The
 	// runtime's own safe-point guard (bubble G, no runtime lock) handles the rest.
 	if base.Debug.DstRace != 0 && base.Flag.Race && kind != instrumentMove && s.curfn.Pragma&ir.Nosplit == 0 {
 		if needWidth {
