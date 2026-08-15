@@ -923,15 +923,24 @@ func TestExploreRaceAttributionRequiresForeignFreeRun(t *testing.T) {
 func TestExploreUnattributedRacesAccumulateAcrossPasses(t *testing.T) {
 	total, unattributed := 0, 0
 	foreign := false
-	first := ExploreResult{Schedules: 2, ForeignSched: true, UnattributedRaces: 3}
-	mergeExplorePass(&first, &total, &foreign, &unattributed)
-	second := ExploreResult{Schedules: 4, UnattributedRaces: 2}
-	mergeExplorePass(&second, &total, &foreign, &unattributed)
+	var peaks ExploreFootprint
+	first := ExploreResult{Schedules: 2, ForeignSched: true, UnattributedRaces: 3,
+		Footprint: ExploreFootprint{PeakDecisions: 10, PeakAccesses: 900}}
+	mergeExplorePass(&first, &total, &foreign, &unattributed, &peaks)
+	second := ExploreResult{Schedules: 4, UnattributedRaces: 2,
+		Footprint: ExploreFootprint{PeakDecisions: 7, PeakAccesses: 1200, PeakEdges: 3}}
+	mergeExplorePass(&second, &total, &foreign, &unattributed, &peaks)
 	if second.Schedules != 6 || !second.ForeignSched || second.UnattributedRaces != 5 {
 		t.Fatalf("merged pass = schedules %d, foreign %v, unattributed %d", second.Schedules, second.ForeignSched, second.UnattributedRaces)
 	}
-	budget := exploreBudgetResult(total, nil, foreign, unattributed)
-	if !budget.BudgetHit || budget.UnattributedRaces != 5 {
+	// The footprint is per-axis maxima ACROSS passes — a later pass's
+	// smaller axis never shrinks it, and the budget-hit return carries it.
+	want := ExploreFootprint{PeakDecisions: 10, PeakAccesses: 1200, PeakEdges: 3}
+	if second.Footprint != want {
+		t.Fatalf("merged footprint = %+v, want %+v", second.Footprint, want)
+	}
+	budget := exploreBudgetResult(total, nil, foreign, unattributed, peaks)
+	if !budget.BudgetHit || budget.UnattributedRaces != 5 || budget.Footprint != want {
 		t.Fatalf("budget result = %+v", budget)
 	}
 }
@@ -3027,8 +3036,14 @@ func TestExploreOptionsBudgetKnobs(t *testing.T) {
 		t.Fatalf("the knobs did not land: %+v", cfg)
 	}
 	cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: 1 << 40, MaxEdges: 1 << 40})
-	if cfg.maxAccesses != 1<<31-1 || cfg.maxEdges != 1<<31-1 {
-		t.Fatalf("the int32 soundness clamp did not hold: %+v", cfg)
+	if cfg.maxAccesses != exploreBudgetClamp || cfg.maxEdges != exploreBudgetClamp {
+		t.Fatalf("the soundness clamp did not hold: %+v", cfg)
+	}
+	// The MaxSteps-derived budgets clamp on the same bound (their step
+	// and offset fields are int32 runtime-side too).
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: 1 << 40})
+	if cfg.maxDecisions != exploreBudgetClamp || cfg.maxEnabledTotal != exploreBudgetClamp {
+		t.Fatalf("the derived-budget clamp did not hold: %+v", cfg)
 	}
 	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: 1 << 20})
 	if cfg.maxAccesses != def.maxAccesses || cfg.maxEdges != def.maxEdges {

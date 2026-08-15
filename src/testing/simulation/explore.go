@@ -202,6 +202,25 @@ func (f *ExploreFootprint) fold(tr *exploreTrace) {
 	f.PeakAccesses = max(f.PeakAccesses, len(tr.accSeq))
 }
 
+// foldPeaks folds another footprint's peaks in, axis by axis — the
+// cross-pass accumulator's merge.
+func (f *ExploreFootprint) foldPeaks(o ExploreFootprint) {
+	f.PeakDecisions = max(f.PeakDecisions, o.PeakDecisions)
+	f.PeakEnabledTotal = max(f.PeakEnabledTotal, o.PeakEnabledTotal)
+	f.PeakEdges = max(f.PeakEdges, o.PeakEdges)
+	f.PeakAccesses = max(f.PeakAccesses, o.PeakAccesses)
+}
+
+// exploreBudgetClamp bounds every caller-raised budget. MaxInt32 is NOT
+// the sound bound: the runtime's shared-address page-node pool allocates
+// TWICE maxAccesses entries chained by 1-based int32 indices
+// (dst_explore.go dstAccPageNode*), and the HB ordinal (int32
+// dstHBEventN) advances at both edge and sync-event records — up to
+// twice maxEdges per bubble. Half MaxInt32 keeps every derived index in
+// int32 range; it still sits four orders of magnitude above any
+// measured arc-scale footprint.
+const exploreBudgetClamp = 1<<30 - 1
+
 type exploreConfig struct {
 	maxDecisions    int
 	maxEnabledTotal int
@@ -242,22 +261,17 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 		if cfg.maxEnabledTotal < opts.MaxSteps {
 			cfg.maxEnabledTotal = opts.MaxSteps
 		}
+		// The decision trace's step and enabled-offset fields are
+		// int32 runtime-side; the derived budgets clamp with the same
+		// bound as the explicit knobs.
+		cfg.maxDecisions = min(cfg.maxDecisions, exploreBudgetClamp)
+		cfg.maxEnabledTotal = min(cfg.maxEnabledTotal, exploreBudgetClamp)
 	}
 	if opts.MaxAccesses > 0 {
-		cfg.maxAccesses = opts.MaxAccesses
-		// The access index stores int32 log positions (accPairEntry);
-		// a budget past MaxInt32 would silently corrupt indexing, so
-		// it clamps — still five orders of magnitude past any real
-		// arc-scale footprint.
-		if cfg.maxAccesses > 1<<31-1 {
-			cfg.maxAccesses = 1<<31 - 1
-		}
+		cfg.maxAccesses = min(opts.MaxAccesses, exploreBudgetClamp)
 	}
 	if opts.MaxEdges > 0 {
-		cfg.maxEdges = opts.MaxEdges
-		if cfg.maxEdges > 1<<31-1 {
-			cfg.maxEdges = 1<<31 - 1
-		}
+		cfg.maxEdges = min(opts.MaxEdges, exploreBudgetClamp)
 	}
 	return cfg
 }
@@ -655,13 +669,14 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 	totalSchedules := 0
 	foreignSeen := false
 	unattributedRaces := 0
+	var passPeaks ExploreFootprint
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces)
+			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces, passPeaks)
 		}
 		res, grew := exhaustiveExplorePass(seed, sut, forces, passCfg)
-		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces)
+		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces, &passPeaks)
 		// Churn is cross-pass state: coverage in the FINAL pass is built on
 		// forces promoted (and race failures carried) from earlier passes, so
 		// churn during any pass taints the whole result even if the foreign
@@ -694,17 +709,19 @@ func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreR
 	}
 }
 
-func mergeExplorePass(res *ExploreResult, totalSchedules *int, foreignSeen *bool, unattributedRaces *int) {
+func mergeExplorePass(res *ExploreResult, totalSchedules *int, foreignSeen *bool, unattributedRaces *int, fp *ExploreFootprint) {
 	*totalSchedules += res.Schedules
 	res.Schedules = *totalSchedules
 	*foreignSeen = *foreignSeen || res.ForeignSched
 	res.ForeignSched = *foreignSeen
 	*unattributedRaces += res.UnattributedRaces
 	res.UnattributedRaces = *unattributedRaces
+	fp.foldPeaks(res.Footprint)
+	res.Footprint = *fp
 }
 
-func exploreBudgetResult(schedules int, failures []Failure, foreign bool, unattributedRaces int) ExploreResult {
-	return ExploreResult{Schedules: schedules, Failures: failures, BudgetHit: true, ForeignSched: foreign, UnattributedRaces: unattributedRaces}
+func exploreBudgetResult(schedules int, failures []Failure, foreign bool, unattributedRaces int, fp ExploreFootprint) ExploreResult {
+	return ExploreResult{Schedules: schedules, Failures: failures, BudgetHit: true, ForeignSched: foreign, UnattributedRaces: unattributedRaces, Footprint: fp}
 }
 
 // checkReplayPrefix verifies DST-L2-2 over a replayed schedule prefix: each frame's
@@ -1081,13 +1098,14 @@ func dporExploreRun(seed uint64, sut func() bool, cfg exploreConfig) ExploreResu
 	totalSchedules := 0
 	foreignSeen := false
 	unattributedRaces := 0
+	var passPeaks ExploreFootprint
 	for {
 		passCfg, ok := explorePassConfig(cfg, totalSchedules)
 		if !ok {
-			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces)
+			return exploreBudgetResult(totalSchedules, carriedRace, foreignSeen, unattributedRaces, passPeaks)
 		}
 		res, grew := dporExplorePass(seed, sut, forces, passCfg)
-		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces)
+		mergeExplorePass(&res, &totalSchedules, &foreignSeen, &unattributedRaces, &passPeaks)
 		// See exhaustiveExplore: churn in any pass taints the whole result.
 		if foreignSeen {
 			res.Exhausted = false
