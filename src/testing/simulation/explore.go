@@ -114,6 +114,13 @@ type ExploreResult struct {
 	// UnattributedRaces counts process-global race reports observed during runs
 	// in which foreign work was scheduled. They are not replayable SUT failures.
 	UnattributedRaces int
+	// Footprint reports the largest per-run trace demands observed across the
+	// exploration — the budget-fit measurement for arc-scale SUTs: compare the
+	// peaks against the effective budgets (the defaults, or the Max* overrides)
+	// to size MaxSteps/MaxAccesses/MaxEdges with verified headroom. Peaks from
+	// truncated runs still count; when Overflow or BudgetHit is set they are
+	// lower bounds, not the SUT's true demand.
+	Footprint ExploreFootprint
 	// BudgetHit is true iff exploration stopped at a caller-supplied MaxSchedules or
 	// MaxSteps budget. Coverage is then incomplete and Exhausted is false.
 	BudgetHit bool
@@ -169,6 +176,30 @@ type ExploreOptions struct {
 	// MaxEdges, if > 0, replaces the per-bubble race/sync edge capacity (default
 	// 1<<16), on the same terms as MaxAccesses.
 	MaxEdges int
+}
+
+// ExploreFootprint is the largest per-run trace demand observed across an
+// exploration, axis by axis (each budget's consumption peak, not one run's).
+type ExploreFootprint struct {
+	// PeakDecisions is the longest recorded decision trace (MaxSteps sizes it).
+	PeakDecisions int
+	// PeakEnabledTotal is the largest per-run total of enabled-set entries.
+	PeakEnabledTotal int
+	// PeakEdges is the largest per-run happens-before edge count (MaxEdges).
+	PeakEdges int
+	// PeakAccesses is the largest per-run access-log length (MaxAccesses).
+	PeakAccesses int
+}
+
+func (f *ExploreFootprint) fold(tr *exploreTrace) {
+	enabled := 0
+	for _, e := range tr.enabled {
+		enabled += len(e)
+	}
+	f.PeakDecisions = max(f.PeakDecisions, len(tr.procs))
+	f.PeakEnabledTotal = max(f.PeakEnabledTotal, enabled)
+	f.PeakEdges = max(f.PeakEdges, len(tr.edgeFrom))
+	f.PeakAccesses = max(f.PeakAccesses, len(tr.accSeq))
 }
 
 type exploreConfig struct {
@@ -765,6 +796,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 		tr := r.tr
 		checkReplayEnabled(prefix, q.parentEnabled, tr)
 		res.Schedules++
+		res.Footprint.fold(&tr)
 		if tr.budgetHit {
 			res.BudgetHit = true
 		}
@@ -1124,6 +1156,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		r := runOnceResultLocked(seed, prefix, forces, sut, cfg, originForeign)
 		tr := r.tr
 		res.Schedules++
+		res.Footprint.fold(&tr)
 		if tr.budgetHit {
 			res.BudgetHit = true
 		}
@@ -1335,6 +1368,7 @@ func dporExploreQueuedPass(seed uint64, sut func() bool, forces map[accessForce]
 		// (hardening clause 4), exactly as the exhaustive pass carries it.
 		checkReplayEnabled(q.prefix, q.parentEnabled, tr)
 		res.Schedules++
+		res.Footprint.fold(&tr)
 		if tr.budgetHit {
 			res.BudgetHit = true
 		}

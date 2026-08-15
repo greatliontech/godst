@@ -3069,6 +3069,16 @@ func TestExploreAccessBudgetKnobLiftsOverflow(t *testing.T) {
 	if big.Overflow {
 		t.Fatalf("the raised access budget still overflowed: %+v", big)
 	}
+	// The footprint is the budget-fit measurement: the clean run's peak
+	// demand must exceed the budget the small run overflowed, and every
+	// axis must have registered.
+	fp := big.Footprint
+	if fp.PeakAccesses <= 64 {
+		t.Fatalf("PeakAccesses = %d, want > the 64-entry budget the small run overflowed", fp.PeakAccesses)
+	}
+	if fp.PeakDecisions == 0 || fp.PeakEnabledTotal == 0 {
+		t.Fatalf("footprint axes unregistered: %+v", fp)
+	}
 }
 
 // TestExploreFilterPageIndexFindsConflicts pins the shared-address filter's
