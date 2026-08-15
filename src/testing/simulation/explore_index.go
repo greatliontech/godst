@@ -55,9 +55,10 @@ func accIdxPages(addr, size uintptr) (start, end uintptr) {
 
 // accPairEntry is one indexed access: its log index and its goroutine's
 // per-goroutine ordinal (own vector-clock component), ascending in both within
-// a history. int32 log indices are sound because the access log is capped at
-// exploreMaxAccesses (1<<16) — ExploreOptions.MaxSteps raises only the
-// decision budget, never the access-log capacity.
+// a history. int32 log indices are sound because the access-log capacity never
+// exceeds MaxInt32: the default is exploreMaxAccesses (1<<16), and
+// ExploreOptions.MaxAccesses — the arc-scale override — clamps there
+// (exploreConfigFromOptions). MaxSteps raises only the decision budget.
 type accPairEntry struct {
 	log int32
 	ord uint32

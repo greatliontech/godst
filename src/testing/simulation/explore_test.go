@@ -3011,6 +3011,66 @@ func TestExploreWithStepBudgetReportsIncomplete(t *testing.T) {
 	}
 }
 
+// TestExploreOptionsBudgetKnobs pins the arc-scale budget surface:
+// MaxAccesses/MaxEdges replace their per-bubble capacities, zero keeps the
+// defaults, MaxSteps still never raises the access budget, and both knobs
+// clamp at MaxInt32 (the access index stores int32 log positions —
+// accPairEntry — so a larger budget would corrupt indexing, not extend it).
+func TestExploreOptionsBudgetKnobs(t *testing.T) {
+	def := defaultExploreConfig()
+	cfg := exploreConfigFromOptions(ExploreOptions{})
+	if cfg.maxAccesses != def.maxAccesses || cfg.maxEdges != def.maxEdges {
+		t.Fatalf("zero options moved the budgets: %+v vs %+v", cfg, def)
+	}
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: 1 << 20, MaxEdges: 1 << 19})
+	if cfg.maxAccesses != 1<<20 || cfg.maxEdges != 1<<19 {
+		t.Fatalf("the knobs did not land: %+v", cfg)
+	}
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: 1 << 40, MaxEdges: 1 << 40})
+	if cfg.maxAccesses != 1<<31-1 || cfg.maxEdges != 1<<31-1 {
+		t.Fatalf("the int32 soundness clamp did not hold: %+v", cfg)
+	}
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: 1 << 20})
+	if cfg.maxAccesses != def.maxAccesses || cfg.maxEdges != def.maxEdges {
+		t.Fatalf("MaxSteps raised a non-decision budget: %+v", cfg)
+	}
+}
+
+// TestExploreAccessBudgetKnobLiftsOverflow: the end-to-end flip — a
+// memory-churning SUT overflows a tiny access budget loudly, and the raised
+// knob clears the SAME exploration clean.
+func TestExploreAccessBudgetKnobLiftsOverflow(t *testing.T) {
+	if !dstBuilt() {
+		t.Skip("requires -tags dst")
+	}
+	if !dstRaceEnabledFP() {
+		t.Skip("requires -race so accesses are recorded")
+	}
+	sut := func() bool {
+		buf := make([]byte, 4096)
+		var wg sync.WaitGroup
+		for g := 0; g < 2; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for i := 0; i < 300; i++ {
+					buf[(i%32)*8+g*2048]++
+				}
+			}(g)
+		}
+		wg.Wait()
+		return false
+	}
+	small := ExploreWith(11, ExploreOptions{Mode: DPOR, MaxSchedules: 4, MaxAccesses: 64}, sut)
+	if !small.Overflow {
+		t.Fatalf("a 64-entry access budget did not overflow: %+v", small)
+	}
+	big := ExploreWith(11, ExploreOptions{Mode: DPOR, MaxSchedules: 4, MaxAccesses: 1 << 20}, sut)
+	if big.Overflow {
+		t.Fatalf("the raised access budget still overflowed: %+v", big)
+	}
+}
+
 // TestExploreFilterPageIndexFindsConflicts pins the shared-address filter's
 // overlap detection through every lookup path of its page index: the
 // second of two unordered conflicting accesses must YIELD (the filter sees the

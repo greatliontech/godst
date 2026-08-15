@@ -160,6 +160,15 @@ type ExploreOptions struct {
 	// Hitting it reports BudgetHit rather than silently treating the truncated trace
 	// as exhausted.
 	MaxSteps int
+	// MaxAccesses, if > 0, replaces the per-bubble access-log capacity (default
+	// 1<<16). MaxSteps never raises this budget: the access log scales with the
+	// SUT's memory traffic, not its decision count, and arc-scale SUTs (full
+	// consensus arcs under exploration) overflow the default long before the
+	// decision budget. Exceeding it still reports Overflow loudly.
+	MaxAccesses int
+	// MaxEdges, if > 0, replaces the per-bubble race/sync edge capacity (default
+	// 1<<16), on the same terms as MaxAccesses.
+	MaxEdges int
 }
 
 type exploreConfig struct {
@@ -201,6 +210,22 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 		cfg.maxEnabledTotal = opts.MaxSteps * 64
 		if cfg.maxEnabledTotal < opts.MaxSteps {
 			cfg.maxEnabledTotal = opts.MaxSteps
+		}
+	}
+	if opts.MaxAccesses > 0 {
+		cfg.maxAccesses = opts.MaxAccesses
+		// The access index stores int32 log positions (accPairEntry);
+		// a budget past MaxInt32 would silently corrupt indexing, so
+		// it clamps — still five orders of magnitude past any real
+		// arc-scale footprint.
+		if cfg.maxAccesses > 1<<31-1 {
+			cfg.maxAccesses = 1<<31 - 1
+		}
+	}
+	if opts.MaxEdges > 0 {
+		cfg.maxEdges = opts.MaxEdges
+		if cfg.maxEdges > 1<<31-1 {
+			cfg.maxEdges = 1<<31 - 1
 		}
 	}
 	return cfg
