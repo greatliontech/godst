@@ -202,10 +202,6 @@ const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
-	if debug.asynctimerchan.Load() != 0 {
-		panic("synctest.Run not supported with asynctimerchan!=0")
-	}
-
 	gp := getg()
 	if gp.bubble != nil {
 		panic("synctest.Run called from within a synctest bubble")
@@ -411,6 +407,8 @@ type synctestDeadlockError struct {
 	reason string
 	bubble *synctestBubble
 }
+
+var _ error = synctestDeadlockError{}
 
 func (e synctestDeadlockError) Error() string {
 	return e.reason

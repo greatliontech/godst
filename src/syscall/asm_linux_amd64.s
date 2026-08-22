@@ -45,8 +45,9 @@ TEXT ·rawSyscallNoError(SB),NOSPLIT,$0-48
 	MOVQ	DX, r2+40(FP)
 	RET
 
-// func gettimeofday(tv *Timeval) (err uintptr)
-TEXT ·gettimeofday(SB),NOSPLIT,$0-16
+// func rawGettimeofday(tv *Timeval) (err uintptr)
+// The fenced Go wrapper gettimeofday (syscall_linux_amd64.go) is the named entry.
+TEXT ·rawGettimeofday(SB),NOSPLIT,$0-16
 	// Usually, we'd check if we're running
 	// secret code here, but because we execute
 	// gettimeofday on the G stack, it's fine to leave

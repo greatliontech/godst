@@ -136,7 +136,7 @@ func rootMkdir(r *Root, name string, perm FileMode) error {
 	}
 	flags := uint(doInRootCreatingDirectory)
 	switch runtime.GOOS {
-	case "linux", "windows":
+	case "linux", "windows", "openbsd":
 		// These platforms do not follow "symlink" on "mkdir symlink/".
 		// (POSIX.1-2024 4.16 says that the trailing slash should cause
 		// resolution to follow the symlink, but we're trying to match
@@ -215,7 +215,7 @@ func rootMkdirAll(r *Root, fullname string, perm FileMode) error {
 	}
 	flags := uint(doInRootCreatingDirectory)
 	switch runtime.GOOS {
-	case "linux", "windows":
+	case "linux", "windows", "openbsd":
 		flags |= doInRootNoHandleTerminalSlash // see rootMkdir
 	}
 	_, err := doInRoot(r, fullname, flags, openDirFunc, openLastComponentFunc)

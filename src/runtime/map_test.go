@@ -1086,7 +1086,7 @@ func TestMemHashGlobalSeed(t *testing.T) {
 		t.Skip("global hash seed is intentionally fixed under -tags dst")
 	}
 
-	// aeshash and memhashFallback use separate per-process seeds, so test
+	// aeshash and memHashFallback use separate per-process seeds, so test
 	// both.
 	t.Run("aes", func(t *testing.T) {
 		if !*runtime.UseAeshash {

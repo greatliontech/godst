@@ -127,8 +127,13 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 // uintptrkeepalive keeps pointer-derived arguments live, and nosplit prevents
 // stack copying from leaving their integer addresses stale before dispatch.
 //
+// The push linknames keep golang.org/x/net linking: its s390x assembly enters
+// these by name, and routed through the FENCED wrappers its socket calls are
+// refused in-bubble exactly like syscall.Socket.
+//
 //go:uintptrkeepalive
 //go:nosplit
+//go:linkname socketcall
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() {
 		// A sockopt on a virtual socket descriptor is the simulation's
@@ -147,6 +152,7 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 
 //go:uintptrkeepalive
 //go:nosplit
+//go:linkname rawsocketcall
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 	if dstSimFenced && dstFenceActive() {
 		dstSyscallRefuse(SYS_SOCKETCALL)

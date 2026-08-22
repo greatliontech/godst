@@ -135,11 +135,14 @@ func (p *chattyPrinter) dstBubblePrintf(testName, format string, args ...any) bo
 // dstBubbleBenchWrite is the benchmark output branch's bubble-domain leg
 // (writeLine's bench arm prints straight to stdout, with no name-header
 // machinery — mirrored here). Reports false outside a bubble, as above.
-func (p *chattyPrinter) dstBubbleBenchWrite(indent string, b []byte) bool {
+func (p *chattyPrinter) dstBubbleBenchWrite(strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
 	if !p.dstBubbleFramework() {
 		return false
 	}
-	dstHostStreamWrite(p.hostFD, nil, fmt.Appendf(nil, "%s%s", indent, b))
+	// The same five-part line writeLine prints on the host path: the -json
+	// error framing (^O … ^N) around the indented text, then the trailing
+	// newline split off for the marker.
+	dstHostStreamWrite(p.hostFD, nil, fmt.Appendf(nil, "%s%s%s%s%s", strErrBegin, indent, b, strErrEnd, c))
 	return true
 }
 

@@ -4,6 +4,8 @@
 
 package syscall
 
+import _ "unsafe" // for linkname
+
 const (
 	_SYS_setgroups  = SYS_SETGROUPS
 	_SYS_clone3     = 435
@@ -71,20 +73,32 @@ func Lstat(path string, stat *Stat_t) (err error) {
 
 //sys	futimesat(dirfd int, path string, times *[2]Timeval) (err error)
 
+// rawGettimeofday is the assembly entry (vDSO with a raw-syscall fallback);
+// it enters the kernel through none of the fenced trampolines.
+//
 //go:noescape
-func gettimeofday(tv *Timeval) (err Errno)
+func rawGettimeofday(tv *Timeval) (err Errno)
 
-func Gettimeofday(tv *Timeval) (err error) {
-	// amd64's gettimeofday is assembly (vDSO with a raw-syscall fallback)
-	// and enters the kernel through none of the fenced trampolines, so the
-	// fence runs here in the named wrapper — as it does on every other dst
-	// arch, where Gettimeofday is a generated wrapper over the fenced
-	// RawSyscall. Without it, in-bubble host WALL time flows silently into
-	// the seeded schedule (same stance as the refused CLOCK_REALTIME leg;
-	// the virtual clock serves only the monotonic/boottime ids).
+// gettimeofday is the fenced wrapper over the assembly entry, and the symbol
+// golang.org/x/sys/unix enters by name (its amd64 assembly jumps to
+// syscall·gettimeofday): exporting the raw entry instead would hand a
+// bubble goroutine an unfenced host WALL-clock read. Without the fence,
+// in-bubble wall time flows silently into the seeded schedule (same stance
+// as the refused CLOCK_REALTIME leg; the virtual clock serves only the
+// monotonic/boottime ids). Gettimeofday and Time below, and every other dst
+// arch's generated Gettimeofday over the fenced RawSyscall, meet the same
+// fence.
+//
+//go:nosplit
+//go:linkname gettimeofday
+func gettimeofday(tv *Timeval) (err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
 		dstSyscallRefuse(SYS_GETTIMEOFDAY)
 	}
+	return rawGettimeofday(tv)
+}
+
+func Gettimeofday(tv *Timeval) (err error) {
 	errno := gettimeofday(tv)
 	if errno != 0 {
 		return errno
@@ -93,10 +107,6 @@ func Gettimeofday(tv *Timeval) (err error) {
 }
 
 func Time(t *Time_t) (tt Time_t, err error) {
-	// Same fence as Gettimeofday: this wrapper shares the asm vDSO entry.
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		dstSyscallRefuse(SYS_GETTIMEOFDAY)
-	}
 	var tv Timeval
 	errno := gettimeofday(&tv)
 	if errno != 0 {

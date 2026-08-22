@@ -145,7 +145,10 @@ the new base excludes them by construction.
    skipping the check; (b) for every dst-patched path upstream did **not** change
    between the bases, the re-applied content is byte-identical to the old
    tip (old and new base agree there, so any difference is a dropped or
-   altered hook); the dst-patched paths upstream did change are listed —
+   altered hook) — a deliberate re-derivation of a dst-only file, whose hook
+   follows a change upstream made in another file, is acknowledged by name
+   (`ALTERED='path …'`, echoed, stale entries refused) and explained in the
+   port commit message; the dst-patched paths upstream did change are listed —
    those are the hooks hand-reviewed against the new base, and the only
    place a silent drop can still hide; and (c) **both modes build** — `go
    build std` and `go build -tags dst std`: make.bash and the untagged build
