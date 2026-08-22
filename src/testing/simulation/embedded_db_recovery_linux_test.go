@@ -21,14 +21,15 @@ import (
 )
 
 // End-to-end compatibility harness for an embedded database's real recovery
-// surface (github.com/thegrumpylion/gmdb). It is a harness rather than a vendored
+// surface — the mmap-backed, flock-coordinated, fdatasync-barriered shape a
+// single-file embedded store performs. It is a harness rather than a vendored
 // dependency — std cannot import a module — and it is faithful where fidelity
-// matters: every syscall below is issued exactly as the database issues it,
+// matters: every syscall below is issued exactly as such a database issues it,
 // including the ones that arrive through golang.org/x/sys/unix rather than the
 // named syscall wrappers. x/sys's assembly enters the generic trampolines
 // directly, so `unix.Fdatasync(fd)` is `syscall.Syscall(SYS_FDATASYNC, fd, 0, 0)`
 // — a different code path through the interception boundary than
-// `syscall.Fdatasync(fd)`, and the one that used to meet the fence.
+// `syscall.Fdatasync(fd)`, so the interception must cover both entries.
 //
 // Covered, in the order the database performs them: open/create with the
 // directory barrier, single-writer flock, read-only data mmap with page-cache
@@ -70,7 +71,7 @@ const (
 	clockBoottime      = 7
 	madvPopulateRead   = 22
 	lockSlotAcquired   = 1
-	dbHeader           = "GMDB"
+	dbHeader           = "EMDB"
 	unsyncedTailMarker = "TAIL"
 )
 
@@ -154,11 +155,11 @@ func openDatabase(t *testing.T, dir string) (data *os.File, mapped []byte, lockF
 	return f, b, lf, s
 }
 
-// TestDSTGMDBCompat walks the database's whole surface under one simulation:
-// open, lock, map, barrier, cross-process lock-slot coordination, liveness
-// recovery, virtual clocks — then a process crash and a host crash, each
-// recovered the way the database recovers.
-func TestDSTGMDBCompat(t *testing.T) {
+// TestDSTEmbeddedDBRecovery walks the database's whole surface under one
+// simulation: open, lock, map, barrier, cross-process lock-slot coordination,
+// liveness recovery, virtual clocks — then a process crash and a host crash,
+// each recovered the way the database recovers.
+func TestDSTEmbeddedDBRecovery(t *testing.T) {
 	var (
 		writerPID              int
 		writerStart            uint64
@@ -341,21 +342,21 @@ func TestDSTGMDBCompat(t *testing.T) {
 	}
 }
 
-// TestDSTGMDBPagerLifecycle is the pager's mmap strategy end to end, the
-// shape gmdb's internal/pager performs: a read-only reservation of MaxSize
-// over a short file, growth in GrowStep extents under the live reservation
-// (readable with no remap), per-commit fdatasync then maybeShrink's truncate
-// toward the high-water mark, a reader that respects the HWM published
+// TestDSTEmbeddedDBPagerLifecycle is the pager's mmap strategy end to end, the
+// shape the database's pager performs: a read-only reservation of the
+// maximum size over a short file, growth in fixed extents under the live
+// reservation (readable with no remap), per-commit fdatasync then a shrink
+// truncate toward the high-water mark, a reader that respects the HWM published
 // through the coordination slot — and the negative, a reader that does not,
 // whose process dies alone. Then a TORN host crash with the reservation live:
 // the durable prefix survives byte-for-byte, the unsynced tail is at the
 // tear's mercy, and the rebooted process's fresh mapping reads the restored
 // page cache (the same pages read(2) sees, which is what rules out a restore
 // that moved the bytes out of the page cache).
-func TestDSTGMDBPagerLifecycle(t *testing.T) {
+func TestDSTEmbeddedDBPagerLifecycle(t *testing.T) {
 	const (
 		page        = 4096
-		maxSize     = 64 * page // the reservation: MaxSize
+		maxSize     = 64 * page // the reservation
 		growStep    = 4 * page
 		commits     = 6
 		durablePage = 0 // the header page: fdatasync'd, so the torn crash must preserve it
@@ -374,7 +375,7 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create data file: %v", err)
 			}
-			// MinSize: two pages, header durable.
+			// The minimum size: two pages, header durable.
 			f.Write(make([]byte, 2*page))
 			f.WriteAt([]byte("HDRv1"), 0)
 			rawFdatasync(f.Fd())
@@ -382,7 +383,7 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 			// NAMES durable — omit it and the torn reboot rightly finds no file.
 			syncDir(t, "/")
 
-			// The coordination slot (gmdb's lock-file header): HWM in pages.
+			// The coordination slot (the lock-file header): HWM in pages.
 			lf, err := os.OpenFile("/lock", os.O_CREATE|os.O_RDWR, 0o644)
 			if err != nil {
 				t.Fatalf("create lock file: %v", err)
@@ -395,7 +396,7 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 			hwm := (*uint32)(unsafe.Pointer(&slot[0]))
 			atomic.StoreUint32(hwm, 2)
 
-			// mmapRO: the MaxSize reservation over the two-page file.
+			// The read-only reservation over the two-page file.
 			ro, err := syscall.Mmap(int(f.Fd()), 0, maxSize, syscall.PROT_READ, syscall.MAP_SHARED)
 			if err != nil {
 				t.Fatalf("reservation mmap: %v", err)
@@ -439,8 +440,8 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 				extent := int64(2 * page) // file-backed pages, ahead of the HWM
 				for c := 0; c < commits; c++ {
 					pageNo := int64(2 + c)
-					// AllocPage: grow only when the claimed page is PAST the
-					// extent, GrowStep-aligned — one truncate per GrowStep.
+					// Page allocation: grow only when the claimed page is PAST the
+					// extent, aligned to the growth extent — one truncate per extent.
 					if need := (pageNo + 1) * page; need > extent {
 						target := (need + growStep - 1) / growStep * growStep
 						if err := g.Truncate(target); err != nil {
@@ -462,12 +463,12 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 						rawFdatasync(g.Fd())
 						atomic.StoreUint32(whwm, uint32(pageNo+1))
 					}
-					// maybeShrink: truncate toward HWM under the live reservation.
+					// Shrink: truncate toward HWM under the live reservation.
 					hw := int64(atomic.LoadUint32(whwm)) * page
 					target := (hw + growStep - 1) / growStep * growStep
 					if target < extent {
 						if err := g.Truncate(target); err != nil {
-							t.Errorf("maybeShrink to %d: %v", target, err)
+							t.Errorf("shrink to %d: %v", target, err)
 							return
 						}
 						extent = target
@@ -475,15 +476,15 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 				}
 				close(commitsDone)
 				// Frees: after the harness has read the grown pages, the
-				// workload drops to 3 live pages and maybeShrink reclaims the
+				// workload drops to 3 live pages and the shrink reclaims the
 				// slack — the shape that makes the shrink observable (tight
-				// growth alone also ends GrowStep-aligned, at a larger size).
+				// growth alone also ends extent-aligned, at a larger size).
 				<-freesGo
 				atomic.StoreUint32(whwm, 3)
 				target := (int64(3)*page + growStep - 1) / growStep * growStep
 				if target < extent {
 					if err := g.Truncate(target); err != nil {
-						t.Errorf("maybeShrink after frees: %v", err)
+						t.Errorf("shrink after frees: %v", err)
 						return
 					}
 					extent = target
@@ -623,10 +624,10 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 	if !grownVisible {
 		t.Errorf("committed pages were not visible through the pre-growth reservation")
 	}
-	// Exact, not merely GrowStep-aligned: without maybeShrink the file ends at
-	// 6 GrowSteps of growth; with it, alignUp(final HWM of 7 pages) = 8 pages.
+	// Exact, not merely extent-aligned: without the shrink the file ends at
+	// 6 extents of growth; with it, alignUp(final HWM of 7 pages) = 8 pages.
 	if shrunkTo != 4*page {
-		t.Errorf("maybeShrink left size %d, want %d (alignUp of the post-frees HWM)", shrunkTo, 4*page)
+		t.Errorf("shrink left size %d, want %d (alignUp of the post-frees HWM)", shrunkTo, 4*page)
 	}
 	if string(rebootMappedDurable) != "HDRv1\x00\x00\x00" {
 		t.Errorf("durable page after torn reboot = %q, want the fdatasync'd header", rebootMappedDurable)
@@ -637,20 +638,20 @@ func TestDSTGMDBPagerLifecycle(t *testing.T) {
 // is an elided fault.
 var pagerSink atomic.Uint32
 
-// TestDSTGMDBNotifyFutex — the notification-region idiom exactly as the
+// TestDSTEmbeddedDBNotifyFutex — the notification-region idiom exactly as the
 // database issues it: a waiter parks in bounded shared-futex slices
 // (FUTEX_WAIT, 100ms relative timespec, no PRIVATE flag) on a version word
 // in the MAP_SHARED lock file, re-checking value > from after every wake;
 // the writer bumps the word through its own mapping and issues a wake-all.
 // Virtual-clock slices cost no wall time; the store+wake is never lost.
-func TestDSTGMDBNotifyFutex(t *testing.T) {
+func TestDSTEmbeddedDBNotifyFutex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("dst simulation test")
 	}
 	Run(11, func() {
 		Host("db", HostConfig{}, func() {
 			mkWord := func() *uint32 {
-				lf, err := os.OpenFile("/gmdb.lock", os.O_RDWR|os.O_CREATE, 0o600)
+				lf, err := os.OpenFile("/db.lock", os.O_RDWR|os.O_CREATE, 0o600)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -702,7 +703,7 @@ func TestDSTGMDBNotifyFutex(t *testing.T) {
 	})
 }
 
-// TestDSTGMDBBootEpoch walks the database's cross-boot epoch-invalidation
+// TestDSTEmbeddedDBBootEpoch walks the database's cross-boot epoch-invalidation
 // pattern end-to-end: a writer stamps the boot epoch
 // (/proc/sys/kernel/random/boot_id) and a CLOCK_BOOTTIME heartbeat into shared
 // state; the host loses power and reboots; the successor reads a DIFFERENT
@@ -710,7 +711,7 @@ func TestDSTGMDBNotifyFutex(t *testing.T) {
 // reads as the new boot's FUTURE — under the database's future-stamps-are-
 // fresh guard that heartbeat never ages out, which is exactly why the boot
 // epoch, not the heartbeat, must recover cross-boot staleness.
-func TestDSTGMDBBootEpoch(t *testing.T) {
+func TestDSTEmbeddedDBBootEpoch(t *testing.T) {
 	var epoch1, epoch2 string
 	var heartbeat1, now2 int64
 
@@ -756,7 +757,7 @@ func TestDSTGMDBBootEpoch(t *testing.T) {
 	}
 }
 
-// TestDSTGMDBIdentityDivergence walks the database's two remaining
+// TestDSTEmbeddedDBIdentityDivergence walks the database's two remaining
 // stale-writer classification legs end-to-end, with the exact probes the
 // database uses (kill(pid,0), /proc/<pid>/stat field 22, /proc/self/ns/pid).
 //
@@ -769,7 +770,7 @@ func TestDSTGMDBBootEpoch(t *testing.T) {
 // to the prober — kill answers ESRCH for a process that is alive and holding
 // state. Namespace-inode comparison is what tells the database the probe is
 // meaningless there, routing classification to the heartbeat instead.
-func TestDSTGMDBIdentityDivergence(t *testing.T) {
+func TestDSTEmbeddedDBIdentityDivergence(t *testing.T) {
 	var stampedPid, reusedPid int
 	var stampedStart, reusedStart, probedStart uint64
 	var probeAlive bool
@@ -825,8 +826,8 @@ func TestDSTGMDBIdentityDivergence(t *testing.T) {
 	}
 }
 
-// runIdentityReuseLeg is TestDSTGMDBIdentityDivergence's reuse walk, on the
-// caller's (shared) host: writer stamps and dies, churn wraps the pid space,
+// runIdentityReuseLeg is TestDSTEmbeddedDBIdentityDivergence's reuse walk, on
+// the caller's (shared) host: writer stamps and dies, churn wraps the pid space,
 // the impostor lands on the writer's pid, the probe classifies.
 func runIdentityReuseLeg(t *testing.T, stampedPid, reusedPid *int, stampedStart, reusedStart, probedStart *uint64, probeAlive *bool) {
 	t.Helper()

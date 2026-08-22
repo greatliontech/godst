@@ -260,7 +260,8 @@ func dstProcStatContents(pid int, start uint64) string {
 		ppid = strconv.Itoa(p)
 	}
 	// Field 22 is starttime. The preceding fields are deterministic placeholders
-	// for the Linux proc_pid_stat shape gmdb parses for liveness recovery.
+	// for the Linux proc_pid_stat shape a liveness-recovery reader parses
+	// (pid-reuse detection compares this starttime).
 	return pidText + " (dst) R " + ppid + " 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 " + startText + "\n"
 }
 

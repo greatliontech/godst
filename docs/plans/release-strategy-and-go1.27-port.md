@@ -15,7 +15,7 @@ test configurations" (the matrix).
       branches (`dst-127base`, `dst-audit-fixes`, `dst-disk-corrupt`,
       `dst-fallocate`, `dst-mmu-mappings`, `master`); `provenance` stays
       pending the user's call.
-- [ ] 3. Consumer-neutral tree: godst carries no reference to any particular
+- [x] 3. Consumer-neutral tree: godst carries no reference to any particular
       consumer — rename `src/testing/simulation/gmdb_compat_linux_test.go` and
       reword its doc comment, the two comment mentions in
       `src/os/dst_proc.go` / `src/os/dst_fd_linux_test.go`, and

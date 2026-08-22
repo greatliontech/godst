@@ -827,7 +827,8 @@ handle until close — content lives on the node, names are references.
 cannot foreclose it).** Every mutation — file write, truncate, create, remove, rename, metadata
 change — enters the tree as **unsynced**. `File.Sync` and Linux virtual-fd `syscall.Fsync` commit a
 regular file's content and size durably; Linux virtual-fd `syscall.Fdatasync` is a distinct modeled
-regular-file barrier, and currently commits the same gmdb-relevant durable image. A file's *name*
+regular-file barrier, and currently commits the same content-and-size durable image (a file's mode and
+mtime stay unsynced — those are `Fsync`'s). A file's *name*
 becoming durable is a property of its **parent directory** (POSIX: data durability and entry durability
 are separate — fsync the file, fsync the directory), committed by syncing an open handle on the
 directory (`File.Sync`, Linux virtual-fd `syscall.Fsync`, or Linux virtual-fd `syscall.Fdatasync` —

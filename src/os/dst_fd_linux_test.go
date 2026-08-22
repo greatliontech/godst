@@ -2070,13 +2070,13 @@ func faultShapeInProcess(t *testing.T, setup func(t *testing.T) func(), check fu
 	check(!past && killErr == syscall.ESRCH, recovered, peer, killErr)
 }
 
-// TestDSTFSMappingFaultShapes: the two shapes gmdb's pager performs on its hot
-// path, now behaving as the kernel behaves. A RESERVATION maps more than the
-// file holds — reads inside the file and inside its last partial page are
-// ordinary, a read from a page wholly past EOF is the process's death, and
-// growing the file makes the page readable with no remap. A SHRINK under the
-// live mapping cuts pages out from under it — the truncate succeeds, and it
-// is the later ACCESS that dies.
+// TestDSTFSMappingFaultShapes: the two shapes an embedded database's pager
+// performs on its hot path, now behaving as the kernel behaves. A RESERVATION
+// maps more than the file holds — reads inside the file and inside its last
+// partial page are ordinary, a read from a page wholly past EOF is the
+// process's death, and growing the file makes the page readable with no
+// remap. A SHRINK under the live mapping cuts pages out from under it — the
+// truncate succeeds, and it is the later ACCESS that dies.
 func TestDSTFSMappingFaultShapes(t *testing.T) {
 	const page = 4096 // the SIMULATED page size; a coarser host is refused before any boundary matters
 	t.Run("reservation past EOF", func(t *testing.T) {
