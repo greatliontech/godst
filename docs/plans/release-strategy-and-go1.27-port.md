@@ -21,14 +21,13 @@ test configurations" (the matrix).
       `src/os/dst_proc.go` / `src/os/dst_fd_linux_test.go`, and
       `docs/dst/design.md` "durable image" line to describe the modeled
       recovery surface on its own terms.
-- [ ] 4. Repository cut-over: create `greatliontech/godst` (standalone, public);
+- [x] 4. Repository cut-over: create `greatliontech/godst` (standalone, public);
       re-create the lightweight release tags (`go1.26.5-dst.3`,
       `go1.26.5-dst.6`) as annotated on the same commits; push the cleaned
       branch as `main` plus all tags (dst releases and the upstream tags
       reachable from it); set `main` as default; move the local clone to
       `~/repos/github.com/greatliontech/godst` with `origin` → godst,
-      `upstream` → golang/go; archive `thegrumpylion/go` with a pointer (user
-      action).
+      `upstream` → golang/go; delete `thegrumpylion/go`.
 - [ ] 5. CI workflows: `.github/workflows/ci.yml` (toolchain build, both-mode
       `std` builds, `test:untagged`, `test:cross`, committed-artifact tree
       check on PRs and pushes), `matrix.yml` (full matrix; nightly on `main`
