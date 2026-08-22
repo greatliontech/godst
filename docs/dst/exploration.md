@@ -519,8 +519,8 @@ any goroutine changes the sync state) and sound (a pre-decision yield never runs
   hook. (Rejected Option 2 — replace `raceread` with a Go shim that yields then forwards to `racereadpc`
   — would make `raceread` splittable, breaking nosplit instrumented callers, and reroute every access
   through a different TSan entry with hand-derived PC bookkeeping across six arch asm files: more
-  fragile under rebase and modifies the oracle. We do not optimize for upstreamability — this fork
-  rebases continuously — but Option 1 is chosen on *correctness*, not upstreamability: untouched oracle +
+  fragile under upstream ports and modifies the oracle. We do not optimize for upstreamability — this fork
+  merges every upstream release — but Option 1 is chosen on *correctness*, not upstreamability: untouched oracle +
   nosplit-safe.)
 - **The yield primitive.** `goyield`-shaped: requeue the current G on the local runq and `schedule()` →
   `findRunnable` → `dstFindRunnable` (the existing seam). The current G stays runnable, so the seam never

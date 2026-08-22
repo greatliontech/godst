@@ -15,11 +15,20 @@ and [dst/exploration.md](dst/exploration.md) (schedule exploration).
 ## Building and running
 
 Simulation support compiles in only under the `dst` build tag, using this
-fork as the toolchain:
+fork as the toolchain — a release tarball extracted to `go/`, or a checkout
+built with `src/make.bash`:
 
 ```sh
-GOROOT=<godst checkout> <godst>/bin/go test -tags dst ./...
+GOROOT=<godst> GOTOOLCHAIN=local <godst>/bin/go test -tags dst ./...
 ```
+
+Both variables are load-bearing. An exported `GOROOT` naming another
+toolchain would redirect this `go` to that toolchain's runtime. Under the
+default `GOTOOLCHAIN=auto`, a module whose `go` directive is newer than this
+toolchain's version makes the go command fetch and switch to a stock
+toolchain, silently bypassing the simulation; `local` forbids the switch.
+Releases, the version scheme, and the download assets are specified in
+[dst/releases.md](dst/releases.md).
 
 Without `-tags dst` every hook is inert and the toolchain behaves as
 upstream Go. Inside a run, the simulation owns time (`time` reads the fake

@@ -126,18 +126,108 @@ tasks:
       - '{{.RUN}} install cmd/compile'
       - '{{.RUN}} clean -cache'
 
-  # Porting: docs/dst/releases.md is the contract (branches, tags, VERSION
-  # scheme); this task is the executable rebase step. CUR names the base the
-  # stack currently sits on, NEW the base to move to — passing both explicitly
-  # keeps the replayed range exactly the dst stack, never upstream's own
-  # backports. rerere is enabled repo-locally, so conflict resolutions replay.
-  # After a port: resolve VERSION to the new base + -dst.1, run `task compiler`
-  # (upstream may have touched cmd/compile), then the full test matrix, then tag.
+  # Porting: docs/dst/releases.md "Porting procedure" is the contract; `port`
+  # is its executable step 1 and `port:check` its step 3. The port commit is
+  # a merge commit whose TREE is the new base plus the dst delta, not git's
+  # three-way merge (which would keep the old release branch's backports the
+  # new base lacks): record the parent with `-s ours`, replace the tree with
+  # the new base, re-apply the delta from the old base with a three-way
+  # fallback. One shell block, deliberately: the old base is read off VERSION
+  # BEFORE read-tree replaces it (a per-command shell would read the new
+  # base's VERSION and re-apply a delta that reverts upstream) and is
+  # recorded with the merge parent under .git/ for `port:check`. Guards: only
+  # an upstream release TAG can be a base; an already-ported base leaves no
+  # MERGE_HEAD and is refused (a port is never a single-parent commit).
   port:
-    desc: 'Rebase the dst stack onto a new upstream base: task port CUR=upstream/release-branch.go1.26 NEW=upstream/release-branch.go1.27'
+    desc: 'Port the current line to an upstream release tag: task port BASE=go1.27.0'
     preconditions:
-      - sh: test -n "{{.CUR}}" && test -n "{{.NEW}}"
-        msg: 'usage: task port CUR=<current-base-ref> NEW=<new-base-ref>'
+      - sh: test -n "{{.BASE}}"
+        msg: 'usage: task port BASE=<upstream release tag, e.g. go1.27.0>'
     cmds:
-      - git fetch upstream
-      - git rebase --onto {{.NEW}} $(git merge-base HEAD {{.CUR}})
+      - |
+        set -e
+        git fetch upstream tag {{.BASE}}
+        git rev-parse -q --verify 'refs/tags/{{.BASE}}^{commit}' >/dev/null || { echo '{{.BASE}} is not a tag'; exit 1; }
+        old=$(head -1 VERSION | sed 's/-dst\..*//')
+        # The path lists below are newline-delimited and word-split, and
+        # pathspecs are fnmatch patterns: a dst-delta path carrying
+        # whitespace, quotes (git quotes non-ASCII names), backslashes or
+        # glob metacharacters would be mis-handled silently, so such a path
+        # is refused loudly instead. The doubled backslash is deliberate: a
+        # POSIX grep reads a backslash inside a bracket expression literally,
+        # ugrep reads it as an escape — `\\` means "backslash" to both.
+        if git diff --name-only "$old" HEAD | grep -q '[][:space:]"'"'"'\\*?[]'; then
+          echo 'a dst-patched path contains whitespace, quotes (git quotes non-ASCII names), backslashes or glob characters; the port tooling does not quote — rename it first'; exit 1
+        fi
+        git merge -s ours --no-ff --no-commit {{.BASE}}
+        new=$(git rev-parse -q --verify MERGE_HEAD) || { echo '{{.BASE}} is already an ancestor: nothing to port'; exit 1; }
+        printf '%s %s\n' "$old" "$new" > "$(git rev-parse --git-dir)/DST_PORT"
+        git read-tree -u --reset {{.BASE}}
+        # A dst-patched path upstream deleted between the bases would make
+        # `git apply` reject the WHOLE patch (it is atomic); those paths are
+        # left out of the re-application and named here — their hooks are
+        # re-homed by hand and acknowledged to port:check via ALLOW.
+        excl=''
+        for p in $(git diff --no-renames --diff-filter=D --name-only "$old" {{.BASE}}); do
+          if git diff --quiet "$old" HEAD -- "$p"; then :; else echo "upstream deleted dst-patched path $p: its hooks are NOT re-applied; re-home them by hand"; excl="$excl :!$p"; fi
+        done
+        git diff --binary "$old" HEAD -- . $excl | git apply --3way --index
+
+  # The delta survived + both modes build. The three-way application can
+  # resolve a hunk toward the new base without a conflict, so: (a) the path
+  # set of the new delta must equal the old delta's — differences are
+  # upstream deletions/renames or absorbed hooks, acknowledged by name via
+  # ALLOW='path ...' (echoed, so the acknowledgement rides the port commit
+  # message; an ALLOW entry that is not a difference is an error, so the
+  # record cannot name a fiction), never by skipping the task; (b) for every
+  # dst-patched path upstream did not touch between the bases — computed
+  # with --no-renames, so a renamed file's old path counts as touched — the
+  # re-applied content must be byte-identical to the old tip (old and new
+  # base agree there, so any difference is a dropped or altered hook); the
+  # upstream-touched dst paths are listed for hand review. The record
+  # written by `port` must match MERGE_HEAD, so a hand-made merge cannot
+  # reuse a stale old base. Path handling is word-split by design; `port`
+  # refused any path that would break it. The builds run the repo's own
+  # bin/go (RUN); the tagged build is what catches upstream signature
+  # changes in dst-only files.
+  port:check:
+    desc: 'After resolving a port: verify the dst delta survived (path set; byte-exact where upstream is untouched) and both build modes compile'
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - |
+        set -e
+        cd {{.ROOT_DIR}}   # git's --name-only paths are root-relative; the pathspecs fed back must resolve against the same root
+        gitdir=$(git rev-parse --git-dir); tmp={{.ROOT_DIR}}/.tmp
+        new=$(git rev-parse -q --verify MERGE_HEAD) || { echo 'no port in progress (MERGE_HEAD absent)'; exit 1; }
+        [ -f "$gitdir/DST_PORT" ] || { echo 'no port record: the merge was not made by task port'; exit 1; }
+        read -r old rec < "$gitdir/DST_PORT"
+        [ "$rec" = "$new" ] || { echo "port record is for $rec but MERGE_HEAD is $new: the merge was not made by task port"; exit 1; }
+        git diff --name-only "$old" HEAD | sort > "$tmp/port-old-paths"
+        git diff --cached --name-only "$new" | sort > "$tmp/port-new-paths"
+        printf '%s\n' {{.ALLOW}} | sed '/^$/d' | sort > "$tmp/port-allow"
+        diff "$tmp/port-old-paths" "$tmp/port-new-paths" | sed -n 's/^[<>] //p' | sort > "$tmp/port-pathdiff"
+        # Same refusal as `port`, over paths introduced during conflict resolution.
+        if grep -q '[][:space:]"'"'"'\\*?[]' "$tmp/port-pathdiff"; then
+          echo 'a path introduced by the port contains whitespace, quotes, backslashes or glob characters; the port tooling does not quote — rename it first'; exit 1
+        fi
+        if comm -23 "$tmp/port-pathdiff" "$tmp/port-allow" | grep .; then
+          echo 'dst delta path set changed across the port (paths above); acknowledge each by name with ALLOW="path ..." and explain it in the port commit message'
+          exit 1
+        fi
+        if comm -13 "$tmp/port-pathdiff" "$tmp/port-allow" | grep .; then
+          echo 'ALLOW names paths (above) that are not path-set differences; remove them'
+          exit 1
+        fi
+        [ -s "$tmp/port-allow" ] && { echo 'acknowledged path-set differences (ALLOW):'; cat "$tmp/port-allow"; }
+        git diff --no-renames --name-only "$old" "$new" | sort > "$tmp/port-upstream-touched"
+        comm -23 "$tmp/port-old-paths" "$tmp/port-upstream-touched" > "$tmp/port-untouched"
+        if [ -s "$tmp/port-untouched" ] && changed=$(xargs git diff --cached --name-only HEAD -- < "$tmp/port-untouched") && [ -n "$changed" ]; then
+          printf '%s\n' "$changed"
+          echo 'dst content changed in files upstream did not touch between the bases (paths above): a hook was dropped or altered'
+          exit 1
+        fi
+        echo 'dst-patched paths upstream also changed — hand-review each hook against the new base:'
+        comm -12 "$tmp/port-old-paths" "$tmp/port-upstream-touched"
+      - '{{.RUN}} build std'
+      - '{{.RUN}} build -tags dst std'
