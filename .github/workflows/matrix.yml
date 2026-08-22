@@ -1,0 +1,52 @@
+# The full enforcing matrix — docs/dst/design.md "Enforcing test
+# configurations" defines the legs, Taskfile.yml encodes them, this workflow
+# runs them: nightly on main and, via the fan-out below, on the live
+# release-go1.* line; dispatchable on any ref (a dispatch runs on the ref's
+# tip, which is what a release candidate is). The `release` workflow requires
+# a successful run of this workflow on the release commit's parent
+# (docs/dst/releases.md "Cutting a release").
+name: matrix
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # A scheduled run executes only on the default branch; the live maintenance
+  # line — the release-go1.* branch with the greatest minor (releases.md
+  # "Branches") — gets its own run, with its own head_sha for the release
+  # gate, by dispatching this workflow on that ref. Frozen lines are not run.
+  fan-out:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          set -eu
+          live=$(git ls-remote --heads origin 'release-go1.*' | awk '{print $2}' | sed 's#^refs/heads/release-go1\.##' | sort -n | tail -1)
+          if [ -z "$live" ]; then echo "no maintenance line"; exit 0; fi
+          echo "dispatching matrix on release-go1.$live"
+          gh workflow run matrix.yml --ref "release-go1.$live"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  leg:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [test:untagged, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:cross]
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/build-toolchain
+      - name: ${{ matrix.leg }}
+        run: GOTOOLCHAIN=local task ${{ matrix.leg }}

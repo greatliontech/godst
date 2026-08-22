@@ -1,0 +1,36 @@
+# Builds this checkout's toolchain from source on a fresh runner and puts
+# `task` on PATH — the shared prelude of every workflow (docs/dst/releases.md
+# "Continuous integration"). The bootstrap toolchain is stock Go (cmd/dist's
+# minBootstrap is go1.24.6 on every supported base). No Go build cache is
+# restored: tool IDs are version-derived in this fork, so a cached object from
+# another compiler at the same version string would be served silently.
+name: build-toolchain
+description: Build the godst toolchain from source and install task
+inputs:
+  distpack:
+    description: Also write distribution archives to pkg/distpack (make.bash -distpack)
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.26.x'
+        cache: false
+    - name: Install task
+      shell: bash
+      run: |
+        go install github.com/go-task/task/v3/cmd/task@v3.53.1
+        echo "$HOME/go/bin" >> "$GITHUB_PATH"
+    - name: Build the toolchain
+      shell: bash
+      env:
+        DISTPACK: ${{ inputs.distpack }}
+      run: |
+        cd src
+        if [ "$DISTPACK" = "true" ]; then
+          GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash -distpack
+        else
+          GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+        fi

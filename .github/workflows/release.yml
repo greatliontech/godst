@@ -1,0 +1,113 @@
+# Release on a goX.Y.Z-dst.N tag — docs/dst/releases.md "Cutting a release",
+# "Continuous integration", "Distribution". Enforces the gate (annotated tag,
+# VERSION equals the tag, the counter is unused elsewhere, the release commit
+# changes only VERSION, the release commit's parent has a green `matrix`
+# run), builds each published platform natively with upstream's own
+# packaging (make.bash -distpack), smoke-tests the built toolchain under
+# -tags dst, and publishes the assets.
+name: release
+
+on:
+  push:
+    tags: ['go*-dst.*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Release gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=${GITHUB_REF_NAME}
+          [ "$(git cat-file -t "$tag")" = tag ] || { echo "$tag is not an annotated tag"; exit 1; }
+          ver=$(head -1 VERSION)
+          [ "$ver" = "$tag" ] || { echo "VERSION is '$ver', tag is '$tag'"; exit 1; }
+          n=${tag##*-dst.}
+          case "$n" in ''|*[!0-9]*) echo "tag '$tag' has no numeric -dst.N counter"; exit 1;; esac
+          for t in $(git tag -l '*-dst.*'); do
+            [ "$t" = "$tag" ] && continue
+            [ "${t##*-dst.}" = "$n" ] && { echo "counter dst.$n is already used by tag $t"; exit 1; }
+          done
+          changed=$(git diff --name-only "${tag}^1" "${tag}^{commit}")
+          [ "$changed" = VERSION ] || { printf 'release commit must change only VERSION; it changes:\n%s\n' "$changed"; exit 1; }
+          parent=$(git rev-parse "${tag}^1")
+          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/matrix.yml/runs?head_sha=${parent}&status=success&per_page=1" --jq '.total_count')
+          [ "${runs:-0}" -ge 1 ] || { echo "no successful matrix run for the release commit's parent ${parent}"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goarch: arm64
+    name: linux-${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/build-toolchain
+        with:
+          distpack: 'true'
+      - name: Built toolchain reports the tag
+        run: |
+          set -eu
+          got=$(GOTOOLCHAIN=local GOROOT=$GITHUB_WORKSPACE bin/go version | awk '{print $3}')
+          [ "$got" = "${{ needs.verify.outputs.tag }}" ] || { echo "built toolchain reports $got"; exit 1; }
+          ls -l pkg/distpack
+      - name: Tagged smoke
+        run: GOTOOLCHAIN=local task smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distpack-linux-${{ matrix.goarch }}
+          path: pkg/distpack/*
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Assemble assets
+        run: |
+          set -eu
+          mkdir -p assets
+          # Every platform's distpack emits the source tarball; they must agree, and one is published.
+          for f in dist/distpack-linux-amd64/*.src.tar.gz; do cmp "$f" "dist/distpack-linux-arm64/$(basename "$f")"; done
+          cp dist/distpack-linux-amd64/* assets/
+          for f in dist/distpack-linux-arm64/*; do case "$f" in *.src.tar.gz) ;; *) cp "$f" assets/;; esac; done
+          cd assets && sha256sum * > SHA256SUMS && ls -l
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=${{ needs.verify.outputs.tag }}
+          gh release create "$tag" --verify-tag --title "$tag" \
+            --notes "godst toolchain $tag. Extract a binary tarball to go/ and run go/bin/go with GOTOOLCHAIN=local and -tags dst; see docs/dst/releases.md." \
+            assets/*

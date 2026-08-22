@@ -1,0 +1,29 @@
+# Pull-request smoke gate — docs/dst/releases.md "Continuous integration".
+# Not the release gate: that is the `matrix` workflow.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'release-go1.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tree carries no build artifact
+        run: .github/scripts/no-artifacts.sh
+      - uses: ./.github/actions/build-toolchain
+      - name: Both build modes
+        run: GOTOOLCHAIN=local task build:both
+      - name: Fast legs
+        run: GOTOOLCHAIN=local task test:untagged test:cross

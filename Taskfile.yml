@@ -71,7 +71,7 @@ tasks:
     dir: src
     deps: [tmpdir]
     cmds:
-      - '{{.RUN}} test -tags dst -race -count=1 testing/simulation testing/simulation/determinism'
+      - '{{.RUN}} test -tags dst -race -count=1 -timeout 60m testing/simulation testing/simulation/determinism'
 
   test:determinism:
     desc: Same-seed determinism sweep — cross-run, cross-process, and environmental-perturbation transcript equality
@@ -117,6 +117,28 @@ tasks:
             *) printf '%s\n' "$out"; echo "linux/$a dst refusal is missing the intended sentinel message"; exit 1;;
           esac
         done
+
+  # Both build modes. make.bash and the untagged build never compile the
+  # dst_* files, so an upstream signature change breaking only a tagged file
+  # is invisible until the tagged build runs; every gate that builds, builds
+  # both (releases.md "Porting procedure", "Continuous integration").
+  build:both:
+    desc: Untagged and -tags dst std builds
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - '{{.RUN}} build std'
+      - '{{.RUN}} build -tags dst std'
+
+  # The release workflow's smoke of a freshly built toolchain — tagged,
+  # -short (the sweeps skip), enough to prove the simulation starts and the
+  # dst_* files compiled into the packaged toolchain. Not a gate leg.
+  smoke:
+    desc: Tagged -short testing/simulation against the built toolchain
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - '{{.RUN}} test -tags dst -short -count=1 -timeout 20m testing/simulation'
 
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
@@ -229,5 +251,4 @@ tasks:
         fi
         echo 'dst-patched paths upstream also changed — hand-review each hook against the new base:'
         comm -12 "$tmp/port-old-paths" "$tmp/port-upstream-touched"
-      - '{{.RUN}} build std'
-      - '{{.RUN}} build -tags dst std'
+      - task: build:both

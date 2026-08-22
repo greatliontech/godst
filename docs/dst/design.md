@@ -1559,7 +1559,7 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
   fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
   `crypto/rand` enforces that the tagged outside-run entropy path remains allocation-free.
-- **`test:dst-race`** (`go test -tags dst -race -count=1 testing/simulation testing/simulation/determinism`): the dst-race
+- **`test:dst-race`** (`go test -tags dst -race -count=1 -timeout 60m testing/simulation testing/simulation/determinism`): the dst-race
   sync-hook encodings, plus the determinism sweep under instrumentation (race instrumentation must
   not shift the seeded schedule). The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
   intentionally racy SUTs are either subprocess testprogs or skip-gated to the non-race leg via

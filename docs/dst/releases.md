@@ -31,7 +31,10 @@ go1.N.M main` — the complete dst delta — needs no second remote.
   `main` — correctness of the simulation contract (soundness, determinism,
   fences, crash and durability fidelity) and build breakage. Features and
   API additions land on `main` only. When upstream stops supporting `1.N`,
-  the line is frozen: no further tags; the branch is kept.
+  the line is frozen: no further tags; the branch is kept. Operationally,
+  the **live** maintenance line is the `release-go1.*` branch with the
+  greatest minor (the support window holds exactly one besides `main`);
+  every other `release-go1.*` branch is frozen.
 
 On either branch, `git log --first-parent <base tag>..<branch>` is the
 dst-only history since the base, and `git diff <base tag> <branch>` is the
@@ -213,19 +216,33 @@ Workflows under `.github/workflows`:
   linked, and its executable fixtures live under `testdata`. It is a smoke
   gate, not the release gate.
 - **`matrix`** — the full enforcing matrix: scheduled nightly on `main` and
-  every live `release-go1.*`, and dispatchable on any ref (a dispatch runs
-  on the ref's tip; the release candidate is the line's tip, so dispatching
-  on the line covers it). A red nightly on a line blocks the line's next
-  release until green.
-- **`release`** — on a `go*-dst.*` tag: verifies that `VERSION` equals the
-  tag, that no other tag carries the same `N`, and that a successful
-  `matrix` run exists for the release commit's parent; then, on a native
-  runner per published platform, builds that platform's distribution with
-  upstream's own packaging (`make.bash -distpack` — identical layout and
-  naming to upstream's downloads), runs a tagged `-short` smoke of
-  `testing/simulation` with the built toolchain, and publishes a GitHub
-  Release with the assets below. The release workflow enforces the gate; it
-  is not itself the gate.
+  on the live `release-go1.*` line (the scheduled run on `main` dispatches
+  the workflow on that line, so the line gets a run on its own tip), and
+  dispatchable on any ref (a dispatch runs on the ref's tip; the release
+  candidate is the line's tip, so dispatching on the line covers it). A red
+  nightly on a line blocks the line's next release until green.
+- **`release`** — on a `go*-dst.*` tag: verifies that the tag is annotated,
+  that `VERSION` equals the tag, that no other tag carries the same `N`,
+  that the release commit changes only `VERSION` (the premise that lets the
+  gate bind to the parent), and that a successful `matrix` run exists for
+  the release commit's parent; then, on a native runner per published
+  platform, builds that platform's distribution with upstream's own
+  packaging (`make.bash -distpack` — identical layout and naming to
+  upstream's downloads), runs the Taskfile `smoke` task (tagged `-short`
+  `testing/simulation`) with the built toolchain, and publishes a GitHub
+  Release with the assets below — the source tarball once (the platforms'
+  copies must be identical), each platform's binary tarball and module
+  files, `SHA256SUMS`. The release workflow enforces the gate; it is not
+  itself the gate.
+
+Every workflow builds the toolchain from source on a fresh runner and never
+restores a Go build cache across commits: this fork's release-form version
+string makes tool IDs version-derived (design.md "Enforcing test
+configurations"), so a cached object built by a different compiler at the
+same version string would be served silently. The Taskfile is the single
+source of how the built toolchain is built against and tested; workflows
+build and test through its tasks (`build:both`, the legs, `smoke`) rather
+than open-coding `go build`/`go test` commands.
 
 ## Distribution
 
