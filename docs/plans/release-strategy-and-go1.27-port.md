@@ -9,7 +9,7 @@ test configurations" (the matrix).
       `greatliontech/godst` identity, CI and distribution contract; Taskfile
       `port`/`port:check` tasks become the executable port steps; README gains the
       `GOTOOLCHAIN=local` consumer rule and the releases pointer.
-- [ ] 2. History cleanup: drop the committed `compile` binary from the commits
+- [x] 2. History cleanup: drop the committed `compile` binary from the commits
       that carry it (no tag contains it; one last force-push under the old
       contract's allowance); delete the merged/superseded local and remote
       branches (`dst-127base`, `dst-audit-fixes`, `dst-disk-corrupt`,
