@@ -12,6 +12,7 @@ import (
 	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -510,9 +511,27 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 	if err != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: err}
 	}
+	// Host Root.MkdirAll walks component-wise — openat(O_DIRECTORY) for
+	// every component before the last, mkdirat for the last — and reports
+	// a failure as that component's own PathError: Op openat or mkdirat,
+	// Path the CLEANED root-relative path of that component (`.` dropped,
+	// `..` resolved, repeated and trailing slashes gone), never the name as
+	// given; only an escape names the whole path. An existing
+	// non-directory is therefore EEXIST as the target (mkdirat finds the
+	// dentry before any trailing-slash assertion) and ENOTDIR as an
+	// ancestor. cur is always a directory here: the root node, a verified
+	// child, or a `..` pop to one; names is cur's cleaned path from the root.
 	cur := r.node
 	stack := []*dstFSNode{cur}
-	for _, part := range parts {
+	var names []string
+	at := func(part string) string {
+		if len(names) == 0 {
+			return part
+		}
+		return strings.Join(names, "/") + "/" + part
+	}
+	for i, part := range parts {
+		last := i == len(parts)-1
 		switch part {
 		case ".":
 			continue
@@ -521,28 +540,30 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 				return &PathError{Op: "mkdirat", Path: name, Err: errPathEscapes}
 			}
 			stack = stack[:len(stack)-1]
+			names = names[:len(names)-1]
 			cur = stack[len(stack)-1]
 			continue
-		}
-		if !cur.isDir {
-			return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOTDIR}
 		}
 		child := cur.entries[part]
 		if child == nil {
 			if cur.unlinked {
-				return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOENT}
+				return &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOENT}
 			}
 			if r.disk.diskFullForCreate() {
-				return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
+				return &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOSPC}
 			}
 			child = dstFSNewNode(true, ModeDir|perm&dstFSModeMask)
 			cur.entries[part] = child
 			cur.modTime = time.Now()
 		} else if !child.isDir {
-			return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOTDIR}
+			if last {
+				return &PathError{Op: "mkdirat", Path: at(part), Err: syscall.EEXIST}
+			}
+			return &PathError{Op: "openat", Path: at(part), Err: syscall.ENOTDIR}
 		}
 		cur = child
 		stack = append(stack, cur)
+		names = append(names, part)
 	}
 	return nil
 }

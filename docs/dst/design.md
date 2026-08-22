@@ -1092,6 +1092,16 @@ the `..` restart rewrite, so `"sub/inside/.."` and `"sub"` agree and stay `EEXIS
 then renameat(2)'s own ladder runs (terminal-`"."` `EBUSY`, missing-old `ENOENT`, same-file-node
 no-op, containment `EINVAL`, dir-over-file `ENOTDIR`). This differs from the UN-rooted ordering above (there `rename("missing",
 "existingfile/")` is `ENOENT`; through a Root the new walk's slash check answers `ENOTDIR` first).
+Rooted **`MkdirAll`** follows the host's component walk — openat(O_DIRECTORY) for every
+component before the last, mkdirat for the last — so an existing non-directory is `EEXIST` as the
+TARGET (mkdirat finds the dentry before any trailing-slash assertion: `MkdirAll("file")` and
+`MkdirAll("file/")` alike) and `ENOTDIR` as an ANCESTOR (`MkdirAll("file/a")`), and the error names
+the failing component (`Op` `openat`/`mkdirat`; `Path` that component's CLEANED root-relative path —
+`.` dropped, `..` resolved, repeated and trailing slashes gone, so `MkdirAll("a/x/../b/f")` names
+`a/b/f` — while an escape names the whole path as given) — where un-rooted `os.MkdirAll` stats its
+target first and answers `ENOTDIR` for an existing file named without a trailing slash (with one,
+the stat fails and mkdir's `EEXIST` answers) (host-probed both ways; enforced by
+`TestDSTRootMkdirConformsToHost`, which runs one table on the host and in the simulation).
 A simulated `Root` is an owned open capability: normal process exit, process crash, and host crash close
 every Root created by that process or kernel. Retained values then fail every rooted operation with
 `ErrClosed`, exactly like an explicitly closed Root; a reboot never revives the directory capability.

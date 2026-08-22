@@ -1,12 +1,23 @@
 # Issue docs
 
 Tracked follow-ups and **pending features**. Each entry carries a `Lands:` trigger
-(a chunk number when an active plan exists, a self-contained condition, or
-"pending feature" for planned roadmap work). At close-out, lasting rationale is
+(a chunk number when an active plan exists, a self-contained condition,
+"pending feature" for planned roadmap work, or "user decision" when neither a
+chunk nor a checkable condition exists and scheduling is the user's call). At close-out, lasting rationale is
 promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **rooted MkdirAll walk shares the Root resolver** — Lands: user decision.
+  `dstRootMkdirAll` re-implements `dstRootResolveLocked`'s component walk
+  (`.`/`..`/escape/ENOTDIR handling) with its own last-component rule; two
+  copies of one walk are where the EEXIST/ENOTDIR divergence lived. See
+  [root-mkdirall-shares-resolver.md](root-mkdirall-shares-resolver.md).
+- **conformance harness: an `os.Root` domain** — Lands: user decision.
+  `os.Root` is modeled separately (`src/os/dst_root.go`) but has no
+  differential domain; divergences surface only by hand probe (the 1.26.7
+  port audit found one). See
+  [conformance-os-root-domain.md](conformance-os-root-domain.md).
 - **killed-goroutine kill-trace diagnostics** — Lands: pending
   feature. A process body's return or panic kills its still-running
   goroutines by design (`src/testing/simulation/node.go` process

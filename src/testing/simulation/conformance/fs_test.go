@@ -826,6 +826,8 @@ func fsCoverageOps() []op {
 	// Namespace error arms.
 	add(fsMkdir("d1", 0o755))            // EEXIST
 	add(fsMkdirAll("f1/x", 0o755))       // ENOTDIR
+	add(fsMkdirAll("f1", 0o755))         // ENOTDIR: os.MkdirAll stats the target first (path.go), both legs
+	add(fsMkdirAll("f1/", 0o755))        // EEXIST: mkdir finds the dentry before the trailing-slash assertion
 	add(fsRemoveAll("f1/x"))             // ENOTDIR: host Op unlinkat, sim Op removeall (recorded)
 	add(fsRemove("d1"))                  // ENOTEMPTY
 	add(fsRemove("absent"))              // ENOENT
