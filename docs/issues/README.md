@@ -8,6 +8,10 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **enterSimulation's build-mode refusals share one shape** — Lands: user
+  decision. The FIPS latch and the arenas-experiment check are one concept
+  in two shapes. See
+  [enter-simulation-refusal-shapes.md](enter-simulation-refusal-shapes.md).
 - **rooted MkdirAll walk shares the Root resolver** — Lands: user decision.
   `dstRootMkdirAll` re-implements `dstRootResolveLocked`'s component walk
   (`.`/`..`/escape/ENOTDIR handling) with its own last-component rule; two
