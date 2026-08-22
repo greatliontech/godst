@@ -233,7 +233,12 @@ Workflows under `.github/workflows`:
   Release with the assets below — the source tarball once (the platforms'
   copies must be identical), each platform's binary tarball and module
   files, `SHA256SUMS`. The release workflow enforces the gate; it is not
-  itself the gate.
+  itself the gate. It can be **rehearsed**: dispatched on an existing
+  `go*-dst.*` tag it runs the gate and the builds and publishes nothing, so
+  a change to the release workflow itself is proven on a tag that already
+  exists before a counter is spent on it (the checked-out tree — composite
+  action, Taskfile, scripts — is the tag's, so only `release.yml` is
+  exercised at the dispatched ref).
 
 Every workflow builds the toolchain from source on a fresh runner and never
 restores a Go build cache across commits: this fork's release-form version
