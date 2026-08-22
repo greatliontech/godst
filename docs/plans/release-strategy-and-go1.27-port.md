@@ -28,7 +28,7 @@ test configurations" (the matrix).
       reachable from it); set `main` as default; move the local clone to
       `~/repos/github.com/greatliontech/godst` with `origin` → godst,
       `upstream` → golang/go; delete `thegrumpylion/go`.
-- [ ] 5. CI workflows: `.github/workflows/ci.yml` (toolchain build, both-mode
+- [x] 5. CI workflows: `.github/workflows/ci.yml` (toolchain build, both-mode
       `std` builds, `test:untagged`, `test:cross`, committed-artifact tree
       check on PRs and pushes), `matrix.yml` (full matrix; nightly on `main`
       and `release-go1.*`, `workflow_dispatch` on any ref), `release.yml`
