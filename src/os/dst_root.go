@@ -12,7 +12,6 @@ import (
 	"path"
 	"runtime"
 	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -524,11 +523,12 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 	cur := r.node
 	stack := []*dstFSNode{cur}
 	var names []string
-	at := func(part string) string {
-		if len(names) == 0 {
-			return part
+	at := func(part string) string { // os may not import strings (go/build deps policy)
+		p := ""
+		for _, n := range names {
+			p += n + "/"
 		}
-		return strings.Join(names, "/") + "/" + part
+		return p + part
 	}
 	for i, part := range parts {
 		last := i == len(parts)-1

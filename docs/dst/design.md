@@ -1556,10 +1556,14 @@ The DST contract tests are dead in a stock `-short`/untagged run. The enforcing 
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the
 authoritative statement of its leg, and the `go test` command in the Taskfile is its definition:
 
-- **`test:untagged`** (`go test -count=1 -short runtime`, untagged): DST hooks are inert; also
+- **`test:untagged`** (`go test -count=1 -short runtime` and `go test -count=1 -short go/build`,
+  untagged): DST hooks are inert; also
   enforces that `runtime/testdata/testprog` stays cgo-free — a cgo-pulling import there (net,
   os/user — DST fixtures needing those live in `testprognet`) disables the runtime's deadlock
-  detection and hangs the crash tests loudly.
+  detection and hangs the crash tests loudly. `go/build`'s `TestDependencies` is the standard
+  library's import-policy gate (which package may import which, over every build-tagged file):
+  the fork adds imports to std packages, and a violation otherwise surfaces only in the heavy
+  `inert-std` leg.
 - **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation crypto/rand net os syscall os/exec os/signal`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own

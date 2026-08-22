@@ -47,11 +47,15 @@ tasks:
       - task: test:conformance
 
   test:untagged:
-    desc: Untagged -short runtime — DST hooks inert; testprog stays cgo-free (deadlock crash tests live); vet net compile-gates the untagged net test build
+    desc: Untagged -short runtime — DST hooks inert; testprog stays cgo-free (deadlock crash tests live); vet net compile-gates the untagged net test build; go/build pins the std dependency policy the dst imports must respect
     dir: src
     deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -count=1 -short runtime'
+      # go/build's TestDependencies is the std import-policy gate (which
+      # package may import which); dst adds imports to std packages, and a
+      # violation surfaces nowhere else before the heavy inert-std leg.
+      - '{{.RUN}} test -count=1 -short go/build'
       # Untagged `go test net` must COMPILE: dst test files are either
       # build-tagged (white-box, dst-only symbols) or stub-compilable via
       # dst_off.go. vet type-checks the test files without running them, so
