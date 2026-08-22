@@ -89,7 +89,6 @@ func rawGettimeofday(tv *Timeval) (err Errno)
 // arch's generated Gettimeofday over the fenced RawSyscall, meet the same
 // fence.
 //
-//go:nosplit
 //go:linkname gettimeofday
 func gettimeofday(tv *Timeval) (err Errno) {
 	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {

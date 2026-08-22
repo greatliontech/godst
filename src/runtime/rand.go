@@ -45,11 +45,13 @@ func randinit() {
 	switch {
 	case dstBuild:
 		// In a DST build (-tags dst), seed the global generator from a fixed
-		// constant so the process-global map hash key (derived in alginit via
-		// bootstrapRand) is identical every run. Map iteration order is still
-		// seed-varied via the per-g m.seed; only this global key must be fixed,
-		// and it cannot be re-seeded at runtime without corrupting maps created
-		// before DST activation. See docs/dst/design.md.
+		// constant so every startup draw from it (heap-base randomization,
+		// per-m generators, anything else taken before activation) is
+		// identical every run. The process-global map hash key no longer
+		// depends on it — internal/runtime/maps derives it from a fixed
+		// constant directly under dst — but the stream cannot be re-seeded at
+		// runtime without corrupting state created before DST activation.
+		// See docs/dst/design.md.
 		dstFixedSeed(seed)
 	case len(startupRand) >= 16 &&
 		// Check that at least the first two words of startupRand weren't

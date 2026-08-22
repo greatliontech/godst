@@ -812,21 +812,21 @@ the channel-light workloads that first validated it (both **landed**):
   TRIGGERS a collection (the physical `heapLive` trigger is unreachable under `dstActive` and forcegc
   is neutralized) — foreign garbage is reclaimed only by bubble-armed (or user-forced) cycles, so a
   run whose bubble never crosses leaves foreign growth unbounded, a modeled consequence of
-  bubble-keyed pacing. `GOEXPERIMENT=sizespecializedmalloc` would bypass the dispatcher with
-  compiler-emitted direct calls in user packages, so `enterSimulation` refuses it, like FIPS mode —
-  except in instrumented builds (`-race`/`-msan`/`-asan`), where the compiler suppresses specialized
-  emission for every package it instruments, runtime-group packages never receive it, and the
-  NoInstrument non-runtime packages (`runtime/race`, `runtime/msan`, `runtime/asan`) receive it but
-  contain no allocating Go code — so every heap allocation still funnels through the dispatcher and
-  the run is admitted. The build-level exemption assumes build-uniform instrumentation; what it
-  cannot see (a per-package `-gcflags` instrumentation opt-out, or one of those stub packages
-  growing allocating code) a generated-site backstop catches: every size-specialized malloc
-  function throws on entry during an active run (under `-tags dst` the runtime never dispatches to
-  them, so any arrival is a compiler-emitted bypass call). Pinned by real builds under the
-  experiment: `TestDSTSizeSpecializedMallocRefused` (plain build refuses; with the refusal dropped
-  the same probe observes the bypass — zero same-seed GC deltas),
-  `TestDSTSizeSpecializedMallocRaceExempt` (race build admits and keeps same-seed NumGC deltas
-  equal and nonzero), and `TestDSTSizeSpecializedMallocPerPackageOptOutFailsLoud` (the opt-out
+  bubble-keyed pacing. `GOEXPERIMENT=sizespecializedmalloc` (on by default since Go 1.27) would
+  bypass the dispatcher with compiler-emitted direct calls in user packages, so the compiler
+  suppresses specialized emission in every package of a `-tags dst` build — `cmd/go` passes
+  `-d=dstbuild=1` for every dst-tagged build and `ssagen` keys its one emission gate on it, as it
+  already does on instrumentation (`-race`/`-msan`/`-asan`) — so every heap allocation funnels
+  through the dispatcher whatever the experiment says, and `enterSimulation` admits it. What the
+  flag cannot see — an explicit per-package `-gcflags` override of it, which `cmd/go` lets the
+  user's later `-d` assignment win — a generated-site backstop catches: every size-specialized
+  malloc function throws on entry during an active run (under `-tags dst` the runtime never
+  dispatches to them, so any arrival is a compiler-emitted bypass call; the throw lives in
+  `mallocStub`, the template `_mkmalloc` generates every specialized function from). Pinned by real
+  builds under the experiment: `TestDSTSizeSpecializedMallocAdmitted` (plain and `-race` dst builds
+  admit the run and keep same-seed NumGC deltas equal and nonzero; with the compiler gate dropped
+  the same probe dies on the backstop's throw, and with both dropped it observes the bypass — zero
+  same-seed GC deltas) and `TestDSTSizeSpecializedMallocPerPackageOptOutFailsLoud` (the opt-out
   configuration dies on the backstop's throw; with the backstop neutered it runs to completion with
   zero deltas). The gate also requires the allocation to be on the bubble
   goroutine's own stack: runtime bookkeeping allocated on systemstack on its behalf (e.g. `allgs`

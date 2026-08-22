@@ -38,11 +38,11 @@ import (
 
 type node struct {
 	next *node
-	buf  [88]byte
+	buf  [56]byte
 }
 
 var (
-	ring  [64]*[96]byte
+	ring  [64]*[64]byte
 	nodes [64]*node
 	tiny  [64]*int64
 )
@@ -59,9 +59,11 @@ func main() {
 			runtime.ReadMemStats(&ms)
 			start := ms.NumGC
 			for i := 0; i < 1<<16; i++ {
-				// All three specialized families: small noscan, small
-				// pointerful, and tiny (< 16 bytes, noscan).
-				ring[i%len(ring)] = new([96]byte)
+				// All three specialized families — small noscan, small
+				// pointerful, and tiny (< 16 bytes, noscan) — at sizes
+				// below ssagen's specializedMallocMax (80 bytes), above
+				// which the compiler emits the generic call regardless.
+				ring[i%len(ring)] = new([64]byte)
 				nodes[i%len(nodes)] = &node{next: nodes[i%len(nodes)]}
 				tiny[i%len(tiny)] = new(int64)
 			}
@@ -166,72 +168,70 @@ func TestDSTArenasRefused(t *testing.T) {
 	}
 }
 
-// TestDSTSizeSpecializedMallocRefused: a plain (uninstrumented) -tags dst
-// build under GOEXPERIMENT=sizespecializedmalloc refuses Run loudly — the
-// compiler emits direct size-specialized malloc calls in user packages there,
-// bypassing the mallocgc dispatcher that is the DST heap trigger's single
-// evaluation point. This builds real std under the experiment, so the refusal
-// branch is exercised for the build mode that actually has the bypass.
-func TestDSTSizeSpecializedMallocRefused(t *testing.T) {
+// TestDSTSizeSpecializedMallocAdmitted: under GOEXPERIMENT=sizespecializedmalloc
+// (the default since Go 1.27) a -tags dst build is admitted in every build mode
+// and GC discovery stays deterministic — two same-seed runs agree on a nonzero
+// NumGC delta. Plain: cmd/go passes -d=dstbuild=1 and the compiler suppresses
+// the direct size-specialized malloc calls it would otherwise emit in user
+// packages, so every allocation still reaches the mallocgc dispatcher, the DST
+// heap trigger's single evaluation point. Race: the compiler suppresses
+// emission for every package it instruments (runtime-group packages never
+// receive it); -msan/-asan share the same gate but need sanitizer toolchains,
+// so only the race arm is exercised. Both arms build real std under the
+// experiment, so the suppression is exercised for the build modes that would
+// otherwise have the bypass. Mutation: with the compiler gate dropped the probe
+// dies on the runtime's generated-site backstop; with both dropped it observes
+// the bypass — zero same-seed GC deltas.
+func TestDSTSizeSpecializedMallocAdmitted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips GOEXPERIMENT std rebuild")
 	}
-	out, err := buildAndRunSizeSpecializedProbe(t)
-	if err != nil {
-		t.Fatalf("probe run: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "unsupported with GOEXPERIMENT=sizespecializedmalloc") {
-		t.Fatalf("experiment build did not refuse Run (got %q)", out)
-	}
-}
-
-// TestDSTSizeSpecializedMallocRaceExempt: under -race the compiler suppresses
-// specialized emission for every package it instruments (and runtime-group
-// packages never receive it), so there is no dispatcher bypass and the
-// refusal must NOT fire — and GC discovery must still be deterministic: two
-// same-seed runs agree on a nonzero NumGC delta. -msan/-asan share the same
-// compiler gate (ssagen sizeSpecializedMallocEnabled keys on Instrumenting)
-// but need sanitizer toolchains, so only the race arm is exercised.
-func TestDSTSizeSpecializedMallocRaceExempt(t *testing.T) {
-	if testing.Short() {
-		t.Skip("-short: skips GOEXPERIMENT std rebuild")
-	}
-	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
-		t.Skipf("no race detector on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	testenv.MustHaveCGO(t) // -race needs cgo
-	out, err := buildAndRunSizeSpecializedProbe(t, "-race")
-	if err != nil {
-		t.Fatalf("probe run: %v\n%s", err, out)
-	}
-	if strings.Contains(out, "panic:") {
-		t.Fatalf("instrumented experiment build refused Run (got %q); the exemption regressed", out)
-	}
-	f := strings.Fields(strings.TrimSpace(out))
-	if len(f) != 4 || f[0] != "gcs" || f[3] != "true" {
-		t.Fatalf("instrumented experiment build lost GC determinism (got %q, want equal nonzero same-seed NumGC deltas)", out)
+	for _, arm := range []struct {
+		name  string
+		flags []string
+		race  bool
+	}{
+		{"plain", nil, false},
+		{"race", []string{"-race"}, true},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			if arm.race {
+				if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+					t.Skipf("no race detector on %s/%s", runtime.GOOS, runtime.GOARCH)
+				}
+				testenv.MustHaveCGO(t) // -race needs cgo
+			}
+			out, err := buildAndRunSizeSpecializedProbe(t, arm.flags...)
+			if err != nil {
+				t.Fatalf("probe run: %v\n%s", err, out)
+			}
+			if strings.Contains(out, "panic:") {
+				t.Fatalf("experiment build refused Run (got %q); the compiler-side suppression regressed", out)
+			}
+			f := strings.Fields(strings.TrimSpace(out))
+			if len(f) != 4 || f[0] != "gcs" || f[3] != "true" {
+				t.Fatalf("experiment build lost GC determinism (got %q, want equal nonzero same-seed NumGC deltas)", out)
+			}
+		})
 	}
 }
 
 // TestDSTSizeSpecializedMallocPerPackageOptOutFailsLoud: the build-level
-// exemption assumes build-uniform instrumentation, and a per-package
-// instrumentation opt-out voids that assumption — the opted-out package
-// compiles uninstrumented, gets specialized emission, and its allocations
-// bypass the dispatcher while race.Enabled still reads true, so Run is
-// admitted. The runtime's generated-site backstop is what catches this
-// configuration: the first specialized allocation during the active run
-// throws instead of silently skewing the trigger stream.
+// mechanism assumes -d=dstbuild=1 reached every package, and an explicit
+// per-package -gcflags override voids that assumption — cmd/go places the
+// dst flags first, so the user's later -d=dstbuild=0 wins for that package,
+// which then compiles with specialized emission and its allocations bypass
+// the dispatcher while Run is admitted. The runtime's generated-site
+// backstop is what catches this configuration: the first specialized
+// allocation during the active run throws instead of silently skewing the
+// trigger stream.
 func TestDSTSizeSpecializedMallocPerPackageOptOutFailsLoud(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips GOEXPERIMENT std rebuild")
 	}
-	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
-		t.Skipf("no race detector on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	testenv.MustHaveCGO(t) // -race needs cgo
-	out, err := buildAndRunSizeSpecializedProbe(t, "-race", "-gcflags=command-line-arguments=-race=false")
+	out, err := buildAndRunSizeSpecializedProbe(t, "-gcflags=command-line-arguments=-d=dstbuild=0")
 	if err == nil {
-		t.Fatalf("per-package instrumentation opt-out ran to completion (got %q); the generated-site backstop is gone", out)
+		t.Fatalf("per-package dst-flag opt-out ran to completion (got %q); the generated-site backstop is gone", out)
 	}
 	if !strings.Contains(out, "size-specialized malloc during a simulation") {
 		t.Fatalf("per-package opt-out died without the backstop diagnostic (err %v, output %q)", err, out)

@@ -835,7 +835,12 @@ func (s *state) sizeSpecializedMallocEnabled() bool {
 		return false
 	}
 
-	return buildcfg.Experiment.SizeSpecializedMalloc && !base.Flag.Cfg.Instrumenting
+	// A dst build (cmd/go passes -d=dstbuild=1 for every -tags dst build)
+	// routes every heap allocation through the mallocgc dispatcher, the
+	// deterministic-simulation heap trigger's single evaluation point, so
+	// specialized emission is suppressed there exactly as under
+	// instrumentation (GOROOT/docs/dst/gc.md).
+	return buildcfg.Experiment.SizeSpecializedMalloc && !base.Flag.Cfg.Instrumenting && base.Debug.DstBuild == 0
 }
 
 // setHeapaddr allocates a new PAUTO variable to store ptr (which must be non-nil)
@@ -5045,11 +5050,11 @@ func dstAtomicCallInfo(name string) (kind int64, ok bool) {
 
 func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExtra ir.Expr) *ssa.Value {
 	s.prevCall = nil
-	var calleeLSym *obj.LSym // target function (if static)
-	var closure *ssa.Value   // ptr to closure to run (if dynamic)
-	var codeptr *ssa.Value   // ptr to target code (if dynamic)
-	var dextra *ssa.Value    // defer extra arg
-	var rcvr *ssa.Value      // receiver to set
+	var calleeLSym *obj.LSym                // target function (if static)
+	var closure *ssa.Value                  // ptr to closure to run (if dynamic)
+	var codeptr *ssa.Value                  // ptr to target code (if dynamic)
+	var dextra *ssa.Value                   // defer extra arg
+	var rcvr *ssa.Value                     // receiver to set
 	var dstAtomicWidth, dstAtomicKind int64 // dst-race mode: hooked sync/atomic call (see below)
 	dstAtomicOK := false
 	fn := n.Fun

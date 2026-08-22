@@ -253,7 +253,10 @@ tasks:
         comm -23 "$tmp/port-old-paths" "$tmp/port-upstream-touched" > "$tmp/port-untouched"
         printf '%s\n' {{.ALTERED}} | sed '/^$/d' | sort > "$tmp/port-altered"
         : > "$tmp/port-changed"
-        if [ -s "$tmp/port-untouched" ]; then xargs git diff --cached --name-only HEAD -- < "$tmp/port-untouched" | sort > "$tmp/port-changed"; fi
+        if [ -s "$tmp/port-untouched" ]; then
+          changed=$(xargs git diff --cached --name-only HEAD -- < "$tmp/port-untouched") || { echo 'git diff over the upstream-untouched dst paths failed'; exit 1; }
+          printf '%s\n' "$changed" | sed '/^$/d' | sort > "$tmp/port-changed"
+        fi
         if comm -23 "$tmp/port-changed" "$tmp/port-altered" | grep .; then
           echo 'dst content changed in files upstream did not touch between the bases (paths above): a hook was dropped or altered; a deliberate re-derivation is acknowledged by name with ALTERED="path ..." and explained in the port commit message'
           exit 1
@@ -265,4 +268,10 @@ tasks:
         [ -s "$tmp/port-altered" ] && { echo 'acknowledged re-derivations in upstream-untouched files (ALTERED):'; cat "$tmp/port-altered"; }
         echo 'dst-patched paths upstream also changed — hand-review each hook against the new base:'
         comm -12 "$tmp/port-old-paths" "$tmp/port-upstream-touched"
+        # Port-audit input (releases.md step 4): a push linkname upstream adds
+        # on an unfenced entry is how a bubble acquires a host read the fenced
+        # trampolines never see (the go1.27 port's gettimeofday); list them.
+        echo 'new //go:linkname directives upstream added over the intercepted surface (moves filtered) — audit each for an unfenced entry:'
+        git diff "$old" "$new" -- src/runtime src/internal/runtime src/sync src/internal/sync src/internal/synctest src/net src/os src/syscall src/time src/crypto/rand src/crypto/internal src/testing src/internal/poll | grep -E '^[-+]//go:linkname' | sed 's#^\([-+]\)//go:linkname #\1 #' | sort -u > "$tmp/port-linknames"
+        comm -23 <(grep '^+ ' "$tmp/port-linknames" | cut -c3- | sort -u) <(grep '^- ' "$tmp/port-linknames" | cut -c3- | sort -u) || true
       - task: build:both

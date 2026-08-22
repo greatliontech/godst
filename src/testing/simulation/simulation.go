@@ -68,11 +68,8 @@
 package simulation
 
 import (
-	"internal/asan"
 	"internal/godebug"
 	"internal/goexperiment"
-	"internal/msan"
-	"internal/race"
 	"internal/synctest"
 	"math"
 	"runtime"
@@ -498,8 +495,9 @@ var runActive atomic.Bool
 var callerGate sync.RWMutex
 
 // fips140Mode is latched at startup, mirroring crypto/internal/fips140's own
-// init-time read of the GODEBUG, so a mid-process Setenv cannot desynchronize
-// the two.
+// init-time read of the GODEBUG, so a Setenv after package initialization
+// cannot desynchronize the two (a Setenv from an init that runs between the
+// two packages' initializers could; no std package does that).
 var fips140Mode = func() bool {
 	switch godebug.New("#fips140").Value() {
 	case "on", "only", "debug":
@@ -526,26 +524,16 @@ func enterSimulation(api, buildPanic string) {
 		// deterministic accounting path.
 		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)")
 	}
-	if goexperiment.SizeSpecializedMalloc && !race.Enabled && !msan.Enabled && !asan.Enabled {
-		// The experiment makes the compiler emit direct size-specialized
-		// malloc calls in USER packages, bypassing the mallocgc dispatcher
-		// that is the DST heap trigger's single evaluation point: SUT
-		// allocations would neither count toward the per-bubble counter nor
-		// gate the trigger, silently breaking GC determinism. Fail loud, as
-		// with FIPS mode. Instrumented builds are exempt: the compiler
-		// suppresses specialized emission whenever it instruments a package
-		// (ssagen's sizeSpecializedMallocEnabled; runtime-group packages
-		// never get it at all, and the NoInstrument non-runtime packages —
-		// runtime/race, runtime/msan, runtime/asan — do get emission but
-		// contain no allocating Go code), so under -race/-msan/-asan every
-		// heap allocation still funnels through the dispatcher and there is
-		// no bypass to refuse. This exemption assumes build-uniform
-		// instrumentation; configurations it cannot see (a per-package
-		// -gcflags instrumentation opt-out) are caught by the runtime's
-		// generated-site backstop, which throws on the first specialized
-		// allocation during an active run (see runtime's mallocStub).
-		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=sizespecializedmalloc (allocations would bypass the deterministic GC trigger)")
-	}
+	// GOEXPERIMENT=sizespecializedmalloc (the 1.27 default) is admitted: in a
+	// -tags dst build the compiler suppresses specialized emission for every
+	// package (cmd/go passes -d=dstbuild=1; ssagen honors it as it honors
+	// instrumentation), so every heap allocation funnels through the mallocgc
+	// dispatcher — the DST heap trigger's single evaluation point — and there
+	// is no bypass to refuse. The configurations the build-level mechanism
+	// cannot see (an explicit per-package -gcflags override of the flag) are
+	// caught by the runtime's generated-site backstop, which throws on the
+	// first specialized allocation during an active run (see runtime's
+	// mallocStub).
 	if synctest.IsInBubble() {
 		panic("testing/simulation: " + api + " called from within a synctest bubble")
 	}

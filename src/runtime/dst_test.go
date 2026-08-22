@@ -203,13 +203,13 @@ func buildTestProgExplicit(t *testing.T, exe string, flags ...string) {
 // from bootstrapRand drew from the global RNG at a startup *stream position* that
 // -race shifts by one draw (composition/instrumentation varies the preceding
 // draw count), so it was only fixed *per build*: a >=16-element map iterated in a
-// different order under -race. alg.go now derives the key from a fixed constant
-// (dstFixedHashKey), position-independently. Per-map m.seed still varies order by
-// seed (TestDSTDeterministicMap); only this one global key is fixed, now
-// identically across builds.
+// different order under -race. internal/runtime/maps now derives the key from a
+// fixed constant (dstFixedHashKey), position-independently. Per-map m.seed still
+// varies order by seed (TestDSTDeterministicMap); only this one global key is
+// fixed, now identically across builds.
 //
-// Mutation check: reverting alg.go to fill the key from bootstrapRand makes the
-// -race build's order differ from the normal build's, failing here.
+// Mutation check: reverting maps.AlgInit to fill the key from bootstrapRand makes
+// the -race build's order differ from the normal build's, failing here.
 func TestDSTMapHashKeyBuildInvariant(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips the extra -race build")

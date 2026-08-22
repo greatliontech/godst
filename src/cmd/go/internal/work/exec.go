@@ -355,13 +355,13 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 			fmt.Fprintf(h, "fuzz %q\n", fuzzFlags)
 		}
 	}
-	if dstFlags := dstRaceInstrumentFlags(); dstFlags != nil {
-		// dst-race instrumentation (gc appends these to gcflags) changes the
-		// compiler's output for inputs the rest of this hash cannot tell apart:
-		// build tags are not hashed on their own, so a -race build with and
+	if dstFlags := dstGcflags(); dstFlags != nil {
+		// The dst build's compiler flags (gc prepends them to gcflags) change
+		// the compiler's output for inputs the rest of this hash cannot tell
+		// apart: build tags are not hashed on their own, so a build with and
 		// without the dst tag would otherwise share an action ID while gc
 		// compiles them differently.
-		fmt.Fprintf(h, "dstrace %q\n", dstFlags)
+		fmt.Fprintf(h, "dst %q\n", dstFlags)
 	}
 	if p.Internal.BuildInfo != nil {
 		fmt.Fprintf(h, "modinfo %q\n", p.Internal.BuildInfo.String())

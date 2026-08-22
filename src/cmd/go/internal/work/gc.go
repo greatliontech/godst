@@ -122,13 +122,15 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 		defaultGcFlags = append(defaultGcFlags, "-symabis", symabis)
 	}
 
-	gcflags := str.StringList(forcedGcflags, p.Internal.Gcflags)
+	// DST: -d=dstbuild=1 goes first so an explicit per-package -gcflags can
+	// override it (the generated-site backstop catches that); -d=dstrace=1
+	// goes last so the Level-2 yields cannot be opted out of per package. Both
+	// are hashed into the action ID by buildActionID (see dstGcflags).
+	gcflags := append(dstBuildGcflags(), str.StringList(forcedGcflags, p.Internal.Gcflags)...)
 	if p.Internal.FuzzInstrument {
 		gcflags = append(gcflags, fuzzInstrumentFlags()...)
 	}
-	// DST Level-2: under -tags dst AND -race, turn on the compiler's dst-race mode
-	// (see dstRaceInstrumentFlags; hashed into the action ID by buildActionID).
-	gcflags = append(gcflags, dstRaceInstrumentFlags()...)
+	gcflags = append(gcflags, dstRaceGcflags()...)
 	// Add -c=N to use concurrent backend compilation, if possible.
 	c, release := compilerConcurrency()
 	defer release()

@@ -27,6 +27,7 @@ type DebugFlags struct {
 	Converthash           string `help:"hash value for use in debugging changes to platform-dependent float-to-[u]int conversion" concurrent:"ok"`
 	Defer                 int    `help:"print information about defer compilation"`
 	DisableNil            int    `help:"disable nil checks" concurrent:"ok"`
+	DstBuild              int    `help:"DST: the build carries the dst tag (set by cmd/go for every -tags dst build); suppresses size-specialized malloc emission so every heap allocation reaches the mallocgc dispatcher" concurrent:"ok"`
 	DstRace               int    `help:"DST Level-2: emit dstAccessYield access-granularity yields before -race hooks (set by cmd/go for -tags dst + -race)" concurrent:"ok"`
 	DumpInlFuncProps      string `help:"dump function properties from inl heuristics to specified file"`
 	DumpInlCallSiteScores int    `help:"dump scored callsites during inlining"`

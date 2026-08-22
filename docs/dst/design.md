@@ -1654,12 +1654,13 @@ re-run with `-skip` for the affected lookup tests, before reading a net FAIL as 
 ### Map hash key requires `-tags dst` (a startup constraint the API cannot cover)
 
 Map *iteration order* depends on the process-global hash key (`aeshash`/`memhash`), set at **startup**
-in `alginit` from OS entropy for hash-flooding protection. It cannot be re-seeded at runtime without
-corrupting maps created before activation (including runtime/stdlib-internal ones the bubble then
-touches). So a deterministic map order needs a **build-time** signal: **`-tags dst`** makes `randinit`
-seed the global generator from a fixed constant (`dstFixedSeed`), fixing the hash key — but the *seed*
-alone is not sufficient; the key is also derived position-independently (see next paragraph). Map order
-is still *seed-varied* via the per-g `m.seed`; only this one global key is fixed. `simulation.Run` **panics if
+in `internal/runtime/maps.AlgInit` from OS entropy for hash-flooding protection. It cannot be re-seeded
+at runtime without corrupting maps created before activation (including runtime/stdlib-internal ones
+the bubble then touches). So a deterministic map order needs a **build-time** signal: under **`-tags
+dst`** `AlgInit` derives the key from a fixed constant, position-independently (next paragraph), and
+`randinit` seeds the global generator from a fixed constant (`dstFixedSeed`) so every other startup
+draw — heap-base randomization, the per-m generators — is fixed too. Map order is still
+*seed-varied* via the per-g `m.seed`; only this one global key is fixed. `simulation.Run` **panics if
 the binary was not built with `-tags dst`**, so the constraint can't be silently violated. A
 `-tags dst` binary has a fixed hash key for all maps (hash-flooding exposure) — acceptable for a test
 build, and absent from normal builds. Upstream's `TestMemHashGlobalSeed` asserts the opposite
@@ -1667,10 +1668,10 @@ build, and absent from normal builds. Upstream's `TestMemHashGlobalSeed` asserts
 enforce it for normal builds.
 
 **The hash key is derived position-independently, so map order is *build*-invariant too.** Fixing the
-global RNG *seed* (`dstFixedSeed`) is necessary but not sufficient: `alginit` fills the hash key
-(`aeskeysched`, and the non-AES `hashkey` fallback) from `bootstrapRand`, which draws from that
-fixed-seeded stream at whatever *position* `alginit` has reached — and the number of startup draws
-preceding `alginit` varies with **binary composition** and **`-race`/`-msan` instrumentation**. So a
+global RNG *seed* (`dstFixedSeed`) would not be sufficient: upstream's `AlgInit` fills the hash key
+(`hashkey`, and `aeskeysched` on an AES machine) from `bootstrapRand`, which draws from that
+fixed-seeded stream at whatever *position* `AlgInit` has reached — and the number of startup draws
+preceding it varies with **binary composition** and **`-race`/`-msan` instrumentation**. So a
 `bootstrapRand`-derived key is only fixed *per build*: a different build shifts the key (measured: a
 `-race` build's `aeskeysched` is the normal build's shifted by exactly one word — `race[i]==normal[i-1]`
 across the first 6 key words), and a `≥16`-element
@@ -1678,7 +1679,8 @@ across the first 6 key words), and a `≥16`-element
 `hash & mask` (single-group maps `≤8` place keys in insertion order, so they are invariant regardless).
 This is the same defect class as the system-goroutine scheduling leak — a composition/instrumentation-
 varying draw count shifting a seeded stream. So under `-tags dst` the key is instead derived from a
-**fixed constant** (`alg.go` `dstFixedHashKey`, a salted splitmix64 mirroring `dstFixedSeed`),
+**fixed constant** (`internal/runtime/maps` `dstFixedHashKey`, a salted splitmix64 mirroring
+`dstFixedSeed`; both the AES key schedule and the fallback key, since `AlgInit` fills both),
 position-independently, so the key — and thus map iteration order — is identical across builds and
 import sets, not merely fixed per build. Per-map seed variation (`m.seed`) is untouched; only this one
 process-global key is fixed. The per-g streams (`g.dstrand`, `dstSchedRand`) are immune already: they
@@ -1687,10 +1689,13 @@ by `TestDSTMapHashKeyBuildInvariant` (a normal-`dst` and a `-race`-`dst` build i
 identically; reverting the key to `bootstrapRand` makes them diverge).
 
 **Recorded replay boundary — the hash FUNCTION, not just the key.** The key is build-invariant, but
-which hash function consumes it is CPU-feature-selected at startup (`aeshash` behind AES-NI, the
-generic `memhash` fallback otherwise), and the two produce different — each stable — multi-group
+which hash function consumes it is CPU-feature-selected at startup (`aeshash` behind AES-NI — and
+since Go 1.27 the VAES intrinsics variant behind AVX as well — the generic `memhash` fallback
+otherwise), and the variants produce different — each stable — multi-group
 (>8-element) map orders for the same key (probe-verified: `GODEBUG=cpu.aes=off` vs default diverge;
-cross-architecture replay diverges likewise). Same-machine, same-`GODEBUG` replay is unaffected;
+cross-architecture replay diverges likewise), and the derivation itself belongs to the toolchain
+release (the go1.27 port changed which arrays are fixed-salt derived). Same-machine,
+same-`GODEBUG`, same-toolchain replay is unaffected;
 replaying a seed across machines with different CPU features (or across `GODEBUG=cpu.*` settings)
 does not reproduce multi-group map iteration order — a recorded boundary of the replay contract,
 not a same-seed escape.

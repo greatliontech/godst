@@ -129,29 +129,55 @@ func fuzzInstrumentFlags() []string {
 	return []string{"-d=libfuzzer"}
 }
 
-// dstRaceInstrumentFlags returns the compiler flags that enable dst-race
-// instrumentation: a dstAccessYield access-granularity yield emitted before
-// each -race hook, so every instrumented memory access becomes a deterministic
-// scheduling decision point (GOROOT/docs/dst/exploration.md, Level 2).
-//
-// The mode is active only under -race with the dst build tag; in every other
-// configuration it returns nil and the compiler stays hook-inert (DST-L2-4).
-//
-// The flag changes the compiler's output for otherwise-identical hashed
-// inputs (build tags alone do not enter the action ID — they normally only
-// select files, which are hashed individually), so any use here must be
-// mirrored in buildActionID. gc and buildActionID both call this function so
-// the flag and its cache key cannot diverge.
-func dstRaceInstrumentFlags() []string {
-	if !cfg.BuildRace {
+// dstBuildGcflags returns -d=dstbuild=1 for every build that carries the dst
+// build tag, nil otherwise. ssagen suppresses size-specialized malloc
+// emission under it, exactly as it does under instrumentation, so every heap
+// allocation in every package funnels through the mallocgc dispatcher — the
+// DST heap trigger's single evaluation point (GOROOT/docs/dst/gc.md) —
+// whatever GOEXPERIMENT says. gc places it BEFORE the user's -gcflags, so an
+// explicit per-package override (a later -d assignment wins) is the user's
+// to make; the runtime's generated-site backstop is what catches an
+// overridden package's specialized allocations during a simulation.
+func dstBuildGcflags() []string {
+	if !dstBuildTag() {
 		return nil
 	}
+	return []string{"-d=dstbuild=1"}
+}
+
+// dstRaceGcflags returns -d=dstrace=1 under -race with the dst build tag,
+// nil otherwise: dst-race instrumentation, a dstAccessYield access-
+// granularity yield emitted before each -race hook, so every instrumented
+// memory access becomes a deterministic scheduling decision point
+// (GOROOT/docs/dst/exploration.md, Level 2); in every other configuration
+// the compiler stays hook-inert (DST-L2-4). gc places it AFTER the user's
+// -gcflags: unlike dstbuild, nothing backstops a package that opted out of
+// the yields (the exploration would silently lose decision points), so it is
+// not overridable per package.
+func dstRaceGcflags() []string {
+	if !cfg.BuildRace || !dstBuildTag() {
+		return nil
+	}
+	return []string{"-d=dstrace=1"}
+}
+
+// dstGcflags is the complete set gc applies (build flag first, race flag
+// last), for buildActionID: the flags change the compiler's output for
+// otherwise-identical hashed inputs (build tags alone do not enter the action
+// ID — they normally only select files, which are hashed individually), so
+// gc and buildActionID both derive from the same two functions and the flags
+// and their cache key cannot diverge.
+func dstGcflags() []string {
+	return append(dstBuildGcflags(), dstRaceGcflags()...)
+}
+
+func dstBuildTag() bool {
 	for _, tag := range cfg.BuildContext.BuildTags {
 		if tag == "dst" {
-			return []string{"-d=dstrace=1"}
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func instrumentInit() {

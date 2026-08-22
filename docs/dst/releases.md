@@ -163,7 +163,17 @@ the new base excludes them by construction.
    `synctest`; `net`, `os`, `syscall`, `time`, `crypto/rand`, `testing`;
    design.md "Nondeterminism sources and who owns them" and "The
    interception boundary" enumerate the owned surface) and upstream's
-   release notes, and disposition every relevant change as one of:
+   release notes — the mechanical half of the walk is fixed: `task
+   port:check` prints upstream's new `//go:linkname` directives over the
+   intercepted surface (a push-linkname export of an unfenced entry is how a
+   bubble acquires a host read the trampolines never see), the diff of the
+   generated syscall tables (`zsyscall_*`, `zsysnum_*`, `ztypes_*`) and of
+   the `GOEXPERIMENT`/`GODEBUG` defaults is read, and every changed file over
+   that surface is searched for the source classes (`time.Now`, `nanotime`,
+   `cputicks`, `runtime_rand`, `getrandom`, `urandom`, `rdrand`, `Getenv`,
+   `Environ`, goroutine ids, addresses as ordering keys) and for moves of the
+   functions and fields the hooks live in — and disposition every relevant
+   change as one of:
    *no dst impact* (stated, with the reason); *hook re-derived* — the hook
    is rewritten from upstream's new mechanism (a replaced bubble
    implementation means the drain hooks are redesigned against the new
