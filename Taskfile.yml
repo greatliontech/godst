@@ -18,7 +18,7 @@
 # invocation of an extracted distribution is itself the thing under test.
 # The space-free-path assumption below extends to their $G prefix and to
 # dist:extract's TARBALL/DEST values.) Every command except
-# the cmd legs also pins `TMPDIR={{.ROOT_DIR}}/.tmp` (via the RUN var) to
+# the cmd and dist legs also pins `TMPDIR={{.ROOT_DIR}}/.tmp` (via the RUN var) to
 # keep the heavy build/test temp trees on the gitignored on-disk .tmp/ at
 # the repo root, because the std leg's parallel build trees plus accumulated
 # per-test temp dirs can fill a tmpfs /tmp mid-leg ("disk quota exceeded" /
@@ -42,6 +42,11 @@ vars:
   # bin/go to ANOTHER toolchain — green exit codes, vacuous run, the same
   # class the GOROOT pin closes.
   RUN: 'GOROOT={{.ROOT_DIR}} GOTOOLCHAIN=local TMPDIR={{.ROOT_DIR}}/.tmp {{.ROOT_DIR}}/bin/go'
+  # The intercepted/owned surface the port tooling walks (releases.md
+  # "Porting procedure" step 4) — one spelling, used by port:check's
+  # linkname report and port:audit; a divergent copy would be a silent
+  # audit gap.
+  PORT_SURFACE: 'src/runtime src/internal/runtime src/sync src/internal/sync src/internal/synctest src/net src/os src/syscall src/internal/syscall src/time src/crypto/rand src/crypto/internal src/testing src/internal/poll src/cmd/compile src/cmd/go'
 
 tasks:
   tmpdir:
@@ -355,6 +360,114 @@ tasks:
         done
         git diff --binary "$old" HEAD -- . $excl | git apply --3way --index
 
+  # Post-commit re-verification of a port merge, from git objects alone —
+  # no MERGE_HEAD, no worktree state, so it runs long after the port
+  # landed. Everything is recovered from the commit:
+  # the old tip is the merge's first parent, the new base its second, the
+  # old base is the first parent's VERSION minus the -dst suffix, and the
+  # commit's own VERSION must name the second parent (binding the recorded
+  # base to the actual merge parent — a hand-made merge whose VERSION lies
+  # is refused), and the old base must be an ancestor of the first parent.
+  # The checks are port:check's delta-survival pair: (a) the
+  # path set of the new delta equals the old delta's, differences
+  # acknowledged by name via ALLOW (stale entries refused); (b) for every
+  # dst-patched path upstream did not touch between the bases, the ported
+  # content is byte-identical to the old tip, differences acknowledged via
+  # ALTERED (both recorded in the port commit message). Builds are
+  # deliberately absent: post-commit they belong to the branch's ci/matrix
+  # runs, not to this graph-only check.
+  port:verify:
+    desc: 'Re-verify a COMMITTED port merge from git objects alone: task port:verify REF=<merge> [ALLOW="path ..."] [ALTERED="path ..."]'
+    preconditions:
+      - sh: test -n "{{.REF}}"
+        msg: 'usage: task port:verify REF=<port merge commit> [ALLOW="path ..."] [ALTERED="path ..."]'
+    cmds:
+      - |
+        set -e
+        cd {{.ROOT_DIR}}
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        ref=$(git rev-parse -q --verify '{{.REF}}^{commit}') || { echo '{{.REF}} is not a commit'; exit 1; }
+        tip=$(git rev-parse -q --verify "$ref^1") || { echo '{{.REF}} has no parent'; exit 1; }
+        new=$(git rev-parse -q --verify "$ref^2") || { echo '{{.REF}} is not a merge commit'; exit 1; }
+        old=$(git show "$tip:VERSION" | head -1); old=${old%-dst.*}
+        git rev-parse -q --verify "$old^{commit}" >/dev/null || { echo "old base tag $old (from the first parent's VERSION) is not present"; exit 1; }
+        newver=$(git show "$ref:VERSION" | head -1); newbase=${newver%-dst.*}
+        newc=$(git rev-parse -q --verify "$newbase^{commit}") || { echo "new base tag $newbase (from the port's VERSION) is not present locally — fetch it before verifying"; exit 1; }
+        [ "$newc" = "$new" ] || { echo "the port's VERSION names $newbase but the merge parent is $new — the recorded base and the actual base disagree"; exit 1; }
+        echo "port $ref: $old -> $newbase"
+        git merge-base --is-ancestor "$old" "$tip" || { echo "old base $old is not an ancestor of the first parent — the recorded lineage is wrong"; exit 1; }
+        git diff --name-only "$old" "$tip" | sort > "$tmp/old-paths"
+        # Same refusal as `task port`: the path lists below are word-split
+        # and fed to xargs — a metacharacter-bearing path would silently
+        # drop check (b)'s coverage for itself.
+        if grep -q '[][:space:]"'"'"'\\*?[]' "$tmp/old-paths"; then
+          echo 'a dst-patched path contains whitespace, quotes, backslashes or glob characters; the port tooling does not quote — rename it first'; exit 1
+        fi
+        git diff --name-only "$new" "$ref" | sort > "$tmp/new-paths"
+        printf '%s\n' {{.ALLOW}} | sed '/^$/d' | sort > "$tmp/allow"
+        diff "$tmp/old-paths" "$tmp/new-paths" | sed -n 's/^[<>] //p' | sort > "$tmp/pathdiff"
+        if comm -23 "$tmp/pathdiff" "$tmp/allow" | grep .; then
+          echo 'dst delta path set changed across the port (paths above); acknowledge each by name with ALLOW="path ..." — the port commit message should already explain them'
+          exit 1
+        fi
+        if comm -13 "$tmp/pathdiff" "$tmp/allow" | grep .; then
+          echo 'ALLOW names paths (above) that are not path-set differences; remove them'
+          exit 1
+        fi
+        [ -s "$tmp/allow" ] && { echo 'acknowledged path-set differences (ALLOW):'; cat "$tmp/allow"; }
+        git diff --no-renames --name-only "$old" "$new" | sort > "$tmp/upstream-touched"
+        comm -23 "$tmp/old-paths" "$tmp/upstream-touched" > "$tmp/untouched"
+        printf '%s\n' {{.ALTERED}} | sed '/^$/d' | sort > "$tmp/altered"
+        : > "$tmp/changed"
+        if [ -s "$tmp/untouched" ]; then
+          changed=$(xargs git diff --name-only "$tip" "$ref" -- < "$tmp/untouched") || { echo 'git diff over the upstream-untouched dst paths failed'; exit 1; }
+          printf '%s\n' "$changed" | sed '/^$/d' | sort > "$tmp/changed"
+        fi
+        if comm -23 "$tmp/changed" "$tmp/altered" | grep .; then
+          echo 'dst content changed in files upstream did not touch between the bases (paths above): a hook was dropped or altered unless acknowledged with ALTERED="path ..."'
+          exit 1
+        fi
+        if comm -13 "$tmp/changed" "$tmp/altered" | grep .; then
+          echo 'ALTERED names paths (above) whose content did not change; remove them'
+          exit 1
+        fi
+        [ -s "$tmp/altered" ] && { echo 'acknowledged re-derivations in upstream-untouched files (ALTERED):'; cat "$tmp/altered"; }
+        echo 'delta survived: path set and upstream-untouched content verified'
+        echo 'dst-patched paths upstream also changed — the hooks hand-reviewed at the port:'
+        comm -12 "$tmp/old-paths" "$tmp/upstream-touched"
+
+  # The mechanical half of the port audit (releases.md "Porting procedure"
+  # step 4), re-runnable post-commit: prints, for a port merge, every fixed
+  # input the audit walk reads. The dispositions themselves are the
+  # reviewer's work and ride the port commit message; this task only
+  # guarantees the walk's inputs are complete and reproducible.
+  port:audit:
+    desc: 'Print the mechanical port-audit inputs for a committed port merge: task port:audit REF=<merge>'
+    preconditions:
+      - sh: test -n "{{.REF}}"
+        msg: 'usage: task port:audit REF=<port merge commit>'
+    cmds:
+      - |
+        set -e
+        cd {{.ROOT_DIR}}
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        ref=$(git rev-parse -q --verify '{{.REF}}^{commit}') || { echo '{{.REF}} is not a commit'; exit 1; }
+        tip=$(git rev-parse -q --verify "$ref^1") && new=$(git rev-parse -q --verify "$ref^2") || { echo '{{.REF}} is not a merge commit'; exit 1; }
+        old=$(git show "$tip:VERSION" | head -1); old=${old%-dst.*}
+        git rev-parse -q --verify "$old^{commit}" >/dev/null || { echo "old base tag $old is not present"; exit 1; }
+        surface='{{.PORT_SURFACE}}'
+        echo "== port audit inputs: $old -> $(git show "$ref:VERSION" | head -1 | sed 's/-dst\..*//') =="
+        echo '== new //go:linkname directives over the intercepted surface (moves filtered) =='
+        git diff "$old" "$new" -- $surface | grep -E '^[-+]//go:linkname' | sed 's#^\([-+]\)//go:linkname #\1 #' | sort -u > "$tmp/ln"
+        comm -23 <(grep '^+ ' "$tmp/ln" | cut -c3- | sort -u) <(grep '^- ' "$tmp/ln" | cut -c3- | sort -u) || true
+        echo '== generated syscall table changes (read the diff) =='
+        git diff --stat "$old" "$new" -- 'src/syscall/zsyscall_*' 'src/syscall/zsysnum_*' 'src/syscall/ztypes_*' src/internal/syscall | cat
+        echo '== GOEXPERIMENT / GODEBUG defaults =='
+        git diff "$old" "$new" -- src/internal/goexperiment src/internal/godebugs | grep -E '^[-+][^-+]' | cat
+        echo '== changed files over the owned surface =='
+        git diff --name-only "$old" "$new" -- $surface | cat
+        echo '== nondeterminism source-class hits in those files (new side) =='
+        git diff "$old" "$new" -- $surface | grep -nE '^\+.*(time\.Now|nanotime|cputicks|runtime_rand|getrandom|urandom|rdrand|Getenv|Environ)' | cat
   # The delta survived + both modes build. The three-way application can
   # resolve a hunk toward the new base without a conflict, so: (a) the path
   # set of the new delta must equal the old delta's — differences are
@@ -428,6 +541,6 @@ tasks:
         # on an unfenced entry is how a bubble acquires a host read the fenced
         # trampolines never see (the go1.27 port's gettimeofday); list them.
         echo 'new //go:linkname directives upstream added over the intercepted surface (moves filtered) — audit each for an unfenced entry:'
-        git diff "$old" "$new" -- src/runtime src/internal/runtime src/sync src/internal/sync src/internal/synctest src/net src/os src/syscall src/time src/crypto/rand src/crypto/internal src/testing src/internal/poll | grep -E '^[-+]//go:linkname' | sed 's#^\([-+]\)//go:linkname #\1 #' | sort -u > "$tmp/port-linknames"
+        git diff "$old" "$new" -- {{.PORT_SURFACE}} | grep -E '^[-+]//go:linkname' | sed 's#^\([-+]\)//go:linkname #\1 #' | sort -u > "$tmp/port-linknames"
         comm -23 <(grep '^+ ' "$tmp/port-linknames" | cut -c3- | sort -u) <(grep '^- ' "$tmp/port-linknames" | cut -c3- | sort -u) || true
       - task: build:both

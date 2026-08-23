@@ -1,0 +1,44 @@
+# The upstream tag watch — docs/dst/releases.md "Support window", Patch
+# cadence: the stale-base refusal makes stale releases impossible but not
+# lag OBSERVABLE (a line that cuts nothing is never refused), so this
+# scheduled run goes red the moment any supported line's base trails an
+# upstream point release on its minor. Red here means: the port is the
+# line's highest-priority work.
+name: tagwatch
+
+on:
+  schedule:
+    - cron: '43 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare each supported line's base against upstream's point releases
+        run: |
+          set -eu
+          stale=0
+          # Supported lines: main plus the live release-go1.* (greatest
+          # minor) — the same discovery the matrix fan-out uses. The check
+          # itself is the shared fail-closed script (also the release
+          # gate's refusal).
+          live=$(git ls-remote --heads origin 'release-go1.*' | awk '{print $2}' | sed 's#^refs/heads/release-go1\.##' | sort -n | tail -1)
+          lines=main; [ -n "$live" ] && lines="main release-go1.$live"
+          for br in $lines; do
+            git fetch --depth=1 origin "$br"
+            base=$(git show FETCH_HEAD:VERSION | head -1); base=${base%-dst.*}
+            [ -n "$base" ] || { echo "::error::$br has an empty or unreadable VERSION"; stale=1; continue; }
+            if out=$(.github/scripts/stale-base.sh "$base"); then
+              echo "$br: $out"
+            else
+              echo "::error::$br: $out"
+              stale=1
+            fi
+          done
+          exit $stale

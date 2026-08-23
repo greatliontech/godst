@@ -68,9 +68,16 @@ minor" steps (which themselves require the old minor's last point release to
 be ported and released first), not through this refusal. The refusal makes
 stale releases impossible but does not by itself make lag *observable* — a
 line that cuts nothing is never refused — so its enforcement pairs with an
-upstream tag watch that surfaces new point releases as they appear. Lands:
-when the release workflow's gate compares the line's base against upstream's
-tags and a scheduled watch reports upstream tags newer than any line's base.
+upstream tag watch that surfaces new point releases as they appear.
+Enforced: the release workflow's gate refuses a tag whose base trails
+upstream's newest final point release on the same minor, and the scheduled
+`tagwatch` workflow goes red when any supported line's base trails one.
+Both run the shared check in `.github/scripts/stale-base.sh` (runnable
+locally with a base as its argument), which consults upstream's tags
+directly, matches final releases only (rc/beta never), and **fails
+closed**: an unanswerable question — a failed upstream query, an empty
+match — refuses rather than passes, because a pass is what lets a release
+ship without upstream's security patches.
 
 ## Versions and tags
 
@@ -178,6 +185,15 @@ the new base excludes them by construction.
    never compile the `dst_*` files, so an upstream signature change that
    breaks only a tagged file (a `dst && unix` file no untagged build
    touches) is invisible until the tagged build runs.
+   The same delta-survival pair is re-verifiable long after the port
+   landed: `task port:verify REF=<merge>` recovers everything from the
+   commit graph — the old tip is the merge's first parent, the old base
+   that parent's `VERSION` minus its suffix, and the commit's own `VERSION`
+   must name the second parent, so a hand-made merge whose recorded base
+   and actual base disagree is refused — and re-runs checks (a) and (b)
+   with the acknowledgements re-supplied as `ALLOW`/`ALTERED` (the port
+   commit message records them). Builds are deliberately absent from the
+   post-commit form: they belong to the branch's ci/matrix runs.
 4. **Port audit** — a port re-derives the model against the new base; it
    is not "the old code compiles against the new tree". Walk upstream's
    change set between the bases (`git log`/`git diff <old base>..<new
@@ -186,17 +202,20 @@ the new base excludes them by construction.
    `synctest`; `net`, `os`, `syscall`, `time`, `crypto/rand`, `testing`;
    design.md "Nondeterminism sources and who owns them" and "The
    interception boundary" enumerate the owned surface) and upstream's
-   release notes — the mechanical half of the walk is fixed: `task
-   port:check` prints upstream's new `//go:linkname` directives over the
-   intercepted surface (a push-linkname export of an unfenced entry is how a
-   bubble acquires a host read the trampolines never see), the diff of the
-   generated syscall tables (`zsyscall_*`, `zsysnum_*`, `ztypes_*`) and of
-   the `GOEXPERIMENT`/`GODEBUG` defaults is read, and every changed file over
-   that surface is searched for the source classes (`time.Now`, `nanotime`,
+   release notes — the mechanical half of the walk is fixed and scripted:
+   `task port:audit REF=<merge>` prints, post-commit and reproducibly,
+   upstream's new `//go:linkname` directives over the intercepted surface
+   (a push-linkname export of an unfenced entry is how a bubble acquires a
+   host read the trampolines never see; `task port:check` prints the same
+   list at port time), the diff STAT of the generated syscall tables
+   (`zsyscall_*`, `zsysnum_*`, `ztypes_*` — pointing at the diffs to read)
+   and the changed lines of the `GOEXPERIMENT`/`GODEBUG` defaults, the
+   changed files over the owned surface, and the source-class hits in
+   upstream's ADDED lines over those files (`time.Now`, `nanotime`,
    `cputicks`, `runtime_rand`, `getrandom`, `urandom`, `rdrand`, `Getenv`,
-   `Environ`, goroutine ids, addresses as ordering keys) and for moves of the
-   functions and fields the hooks live in — and disposition every relevant
-   change as one of:
+   `Environ`); the walk additionally covers what no grep can — goroutine
+   ids, addresses as ordering keys, and moves of the functions and fields
+   the hooks live in — and dispositions every relevant change as one of:
    *no dst impact* (stated, with the reason); *hook re-derived* — the hook
    is rewritten from upstream's new mechanism (a replaced bubble
    implementation means the drain hooks are redesigned against the new
@@ -258,10 +277,24 @@ Workflows under `.github/workflows`:
   gate, not the release gate.
 - **`matrix`** — the full enforcing matrix: scheduled nightly on `main` and
   on the live `release-go1.*` line (the scheduled run on `main` dispatches
-  the workflow on that line, so the line gets a run on its own tip), and
+  the workflow on that line, so the line gets a run on its own tip),
   dispatchable on any ref (a dispatch runs on the ref's tip; the release
-  candidate is the line's tip, so dispatching on the line covers it). A red
+  candidate is the line's tip, so dispatching on the line covers it), and
+  triggered by pushes to `port-*` branches — a convenience convention for
+  preparing a port on a branch; the procedure does not mandate one, and
+  step 6 also runs by dispatching on any ref. A red
   nightly on a line blocks the line's next release until green.
+- **`tagwatch`** — scheduled daily: goes red when any supported line's base
+  trails an upstream final point release on its minor (the observability
+  half of the Patch cadence's stale-base refusal; the refusal itself lives
+  in the release gate). Red here means the port is that line's
+  highest-priority work.
+- **`port-rehearsal`** — dispatched with an upstream release tag: runs
+  `task port BASE=<tag>` on a throwaway workspace and reports what the real
+  port will face — the conflict inventory when the re-application
+  conflicts, or the built-toolchain `port:check` acknowledgement inventory
+  when it is clean (reported, not gating). Nothing is pushed; the rehearsal
+  prices a port before anyone starts it.
 - **`release`** — on a `go*-dst.*` tag: verifies that the tag is annotated,
   that `VERSION` equals the tag, that no other tag carries the same `N`,
   that the release commit changes only `VERSION` (the premise that lets the

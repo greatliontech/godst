@@ -60,6 +60,10 @@ jobs:
           parent=$(git rev-parse "${tag}^1")
           runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/matrix.yml/runs?head_sha=${parent}&status=success&per_page=1" --jq '.total_count')
           [ "${runs:-0}" -ge 1 ] || { echo "no successful matrix run for the release commit's parent ${parent}"; exit 1; }
+          # Stale-base refusal (releases.md, Patch cadence): a line never
+          # cuts a release on a base whose upstream minor has a newer point
+          # release. Fails CLOSED — see the script.
+          .github/scripts/stale-base.sh "${tag%-dst.*}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:

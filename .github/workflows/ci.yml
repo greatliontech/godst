@@ -37,7 +37,10 @@ jobs:
         id: base
         run: |
           echo "version=$(head -1 VERSION | sed 's/-dst\..*//' | sed 's/^go//')" >> "$GITHUB_OUTPUT"
-          git fetch --depth=1 origin tag "$(head -1 VERSION | sed 's/-dst\..*//')"
+          # A freshly ported tree's VERSION names a base whose tag reaches
+          # origin only at the port's final push — fall back to upstream.
+          base=$(head -1 VERSION | sed 's/-dst\..*//')
+          git fetch --depth=1 origin tag "$base" || git fetch --depth=1 https://github.com/golang/go tag "$base"
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.base.outputs.version }}

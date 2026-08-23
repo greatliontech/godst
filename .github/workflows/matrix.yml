@@ -11,6 +11,19 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+  # A pushed port-* branch gets the full enforcing matrix without a manual
+  # dispatch — a convenience convention for preparing a port on a branch
+  # (the procedure's step 6 also runs by dispatching on any ref; the
+  # procedure itself does not mandate a port branch).
+  push:
+    branches: ['port-*']
+
+concurrency:
+  # Rapid pushes to a port branch supersede each other; scheduled and
+  # dispatched runs never cancel (a nightly's green run is the release
+  # gate's evidence).
+  group: matrix-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 permissions:
   contents: read
@@ -69,7 +82,11 @@ jobs:
         id: base
         run: |
           echo "version=$(head -1 VERSION | sed 's/-dst\..*//' | sed 's/^go//')" >> "$GITHUB_OUTPUT"
-          git fetch --depth=1 origin tag "$(head -1 VERSION | sed 's/-dst\..*//')"
+          # On a port branch the VERSION names the NEW base, whose tag
+          # reaches origin only at the port's final push — fall back to
+          # upstream for it.
+          base=$(head -1 VERSION | sed 's/-dst\..*//')
+          git fetch --depth=1 origin tag "$base" || git fetch --depth=1 https://github.com/golang/go tag "$base"
       - uses: actions/setup-go@v5
         if: matrix.leg == 'test:inert-diff'
         with:

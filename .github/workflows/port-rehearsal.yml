@@ -1,0 +1,71 @@
+# Port rehearsal — docs/dst/releases.md "Porting procedure". Dispatched
+# with an upstream release tag, it runs `task port BASE=<tag>` on a
+# throwaway workspace and reports what the real port will face: a clean
+# re-application runs the toolchain build and `task port:check` (whose
+# ALLOW/ALTERED refusals are the expected inventory of acknowledgements the
+# port will need — reported, not gating); a conflicted one reports the
+# conflict inventory. Nothing is pushed; the workspace is discarded. This
+# rehearses the tooling path and prices the port before anyone starts it.
+name: port-rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Upstream release tag to rehearse porting to (e.g. go1.27.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Install task
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@v3.53.1
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      - name: Run the port
+        id: port
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          set -eu
+          git config user.name port-rehearsal
+          git config user.email port-rehearsal@invalid
+          git remote add upstream https://github.com/golang/go
+          if task port BASE="$BASE"; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            echo "the dst delta re-applied without conflicts"
+          else
+            # A conflicted re-application is a SUCCESSFUL rehearsal — the
+            # inventory is the product. A failure with ZERO conflicts is
+            # not: the port never ran (bad tag, already-ported base, fetch
+            # failure) and must not report an empty inventory as green.
+            n=$(git status --short | grep -cE '^(UU|AA|DU|UD|AU|UA|DD) ' || true)
+            [ "${n:-0}" -gt 0 ] || { echo "task port failed without conflicts — see the log above"; exit 1; }
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "## Conflict inventory (resolve these in the real port)" >> "$GITHUB_STEP_SUMMARY"
+            git status --short | sed -n 's/^\(UU\|AA\|DU\|UD\|AU\|UA\|DD\) /- /p' >> "$GITHUB_STEP_SUMMARY"
+            echo "$n conflicted paths — see the step summary"
+          fi
+      - name: Build the ported toolchain
+        if: steps.port.outputs.clean == 'true'
+        run: |
+          cd src
+          GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+      - name: port:check inventory (expected acknowledgements; reported, not gating)
+        if: steps.port.outputs.clean == 'true'
+        continue-on-error: true
+        run: task port:check
