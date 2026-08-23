@@ -1298,7 +1298,7 @@ func TestDSTDiskEIOFsyncgateTornCrash(t *testing.T) {
 	}
 }
 
-func TestDSTFSCreatePreservesSpecialModeBitsAcrossCrash(t *testing.T) {
+func TestDSTFSSpecialModeBitsDurableAcrossCrash(t *testing.T) {
 	const special = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 	wantFile := special | 0o640
 	wantDir := os.ModeDir | special | 0o750
@@ -1325,11 +1325,18 @@ func TestDSTFSCreatePreservesSpecialModeBitsAcrossCrash(t *testing.T) {
 				mustOK(t, "create named dir", os.Mkdir("/named-dir", createDirMode))
 				root, err := os.OpenRoot("/")
 				mustOK(t, "open root", err)
-				f, err = root.OpenFile("rooted-file", os.O_CREATE|os.O_RDWR, wantFile)
+				// Root's create operations accept 0o777 only (upstream's
+				// contract; the special bits arrive via Root.Chmod), so the
+				// rooted entries take the special bits post-create.
+				f, err = root.OpenFile("rooted-file", os.O_CREATE|os.O_RDWR, 0o640)
 				mustOK(t, "create rooted file", err)
 				f.Close()
-				mustOK(t, "create rooted dir", root.Mkdir("rooted-dir", createDirMode))
-				mustOK(t, "create rooted tree", root.MkdirAll("rooted-tree/leaf", createDirMode))
+				mustOK(t, "create rooted dir", root.Mkdir("rooted-dir", 0o750))
+				mustOK(t, "create rooted tree", root.MkdirAll("rooted-tree/leaf", 0o750))
+				mustOK(t, "chmod rooted file", root.Chmod("rooted-file", special|0o640))
+				mustOK(t, "chmod rooted dir", root.Chmod("rooted-dir", createDirMode))
+				mustOK(t, "chmod rooted tree", root.Chmod("rooted-tree", createDirMode))
+				mustOK(t, "chmod rooted leaf", root.Chmod("rooted-tree/leaf", createDirMode))
 				root.Close()
 				check()
 				for _, p := range paths {

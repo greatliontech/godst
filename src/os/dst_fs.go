@@ -69,7 +69,13 @@ var dstFS struct {
 	backed []*dstFSNode
 }
 
-const dstFSModeMask = rootCreateModeMask
+// dstFSModeMask is the modeled metadata mode-bit set: the permission bits
+// plus the bits Chmod can set (setuid/setgid/sticky). Which bits a given
+// CREATE surface accepts is upstream's contract, enforced at the public API
+// before any backend dispatch (Root's create operations accept 0o777 only);
+// this mask is what the tree stores and Chmod changes; dstFSNewNode
+// applies it, so no creation path can differ.
+const dstFSModeMask = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
 
 var dstOpenFiles struct {
 	mu    sync.Mutex
@@ -280,11 +286,16 @@ func dstFSRunTeardown() {
 // images stay empty: no bytes and no children were ever committed.
 //
 // Every node-creation site goes through here, so the rule cannot be forgotten
-// at one of them. Caller holds dstFS.mu.
-func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
+// at one of them. typ carries the type bits a call site chooses (ModeDir,
+// device bits; only ModeType bits survive), perm the caller-supplied mode,
+// of which only dstFSModeMask survives — the split means a user perm cannot
+// type a node, a call site cannot smuggle metadata through typ, and no
+// creation path can skip the mask. Caller holds dstFS.mu.
+func dstFSNewNode(typ, perm FileMode) *dstFSNode {
 	now := time.Now()
+	mode := typ&ModeType | perm&dstFSModeMask
 	node := &dstFSNode{
-		isDir:         isDir,
+		isDir:         typ&ModeDir != 0,
 		nlink:         1,
 		ino:           dstFSAllocIno(),
 		mode:          mode,
@@ -293,7 +304,7 @@ func dstFSNewNode(isDir bool, mode FileMode) *dstFSNode {
 		syncedModTime: now,
 	}
 	switch {
-	case isDir:
+	case node.isDir:
 		node.entries = make(map[string]*dstFSNode)
 	case node.isDevice():
 		// A character device has no page cache: it stores nothing (writes
@@ -333,10 +344,10 @@ func dstFSDiskHere() *dstFSDisk {
 // its own /tmp and /dev/null; os.TempDir reports the fixed path "/tmp" during
 // a run.
 func newDstFSDisk() *dstFSDisk {
-	root := dstFSNewNode(true, ModeDir|0o755)
-	root.entries["tmp"] = dstFSNewNode(true, ModeDir|ModeSticky|0o777)
-	dev := dstFSNewNode(true, ModeDir|0o755)
-	dev.entries["null"] = dstFSNewNode(false, ModeDevice|ModeCharDevice|0o666)
+	root := dstFSNewNode(ModeDir, 0o755)
+	root.entries["tmp"] = dstFSNewNode(ModeDir, ModeSticky|0o777)
+	dev := dstFSNewNode(ModeDir, 0o755)
+	dev.entries["null"] = dstFSNewNode(ModeDevice|ModeCharDevice, 0o666)
 	root.entries["dev"] = dev
 	// The mkfs image is part of the durable image: a filesystem is born with
 	// its initial tree ON THE PLATTER, so a host crash preserves root, /tmp,
@@ -684,7 +695,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if dstFSDiskHere().diskFullForCreate() {
 		return wrap(syscall.ENOSPC)
 	}
-	parent.entries[base] = dstFSNewNode(true, ModeDir|perm&dstFSModeMask)
+	parent.entries[base] = dstFSNewNode(ModeDir, perm)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -1304,7 +1315,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		if dstFSDiskHere().diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = dstFSNewNode(false, perm&dstFSModeMask)
+		node = dstFSNewNode(0, perm)
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}

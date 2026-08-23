@@ -341,8 +341,7 @@ func (e *dstPipeEnd) chmodHandle(mode FileMode) error {
 	if e.ownClosed() {
 		return poll.ErrFileClosing
 	}
-	const changeable = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
-	e.p.mode = e.p.mode&^changeable | mode&changeable
+	e.p.mode = e.p.mode&^dstFSModeMask | mode&dstFSModeMask
 	return nil
 }
 

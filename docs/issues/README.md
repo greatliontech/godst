@@ -16,6 +16,10 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   when the linux zsyscall files are next regenerated. The dst fd-wrapper
   split renames symbols inside generated `zsyscall_linux_*.go`. See
   [zsyscall-regeneration-conflict.md](zsyscall-regeneration-conflict.md).
+- **gomutant cannot load the fork's std tree** — Lands: when `gomutant
+  discover` reports non-zero targets for the fork's std tree. Until then
+  probes and campaigns fall back to hand edits, and reviewer hand-probes
+  are unavailable. See [gomutant-std-tree.md](gomutant-std-tree.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept
   in two shapes. See

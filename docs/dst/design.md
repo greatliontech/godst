@@ -805,11 +805,22 @@ consistent with `os.ReadDir`'s documented sorting. Mod times come from the bubbl
 Permission bits are stored and reported but not enforced in the base model (no simulated
 credential checks), and ownership is not represented at all — `Chown`/`Lchown` and `File.Chown`
 stay fenced. **umask is not modeled** (recorded stance): created files and directories store the
-requested mode verbatim — `os.Create` yields `0666` where a default-umask Linux yields `0644` —
+requested mode verbatim within the modeled metadata set (permissions plus
+setuid/setgid/sticky) — `os.Create` yields `0666` where a default-umask Linux yields `0644` —
 because a simulated umask would be one more machine-state input for no determinism gain; a SUT
-asserting host-masked modes is asserting machine state. Mode bits beyond the permission bits that
-`Chmod` can set (`setuid`/`setgid`/`sticky`) are preserved on create exactly as `Chmod` preserves
-them — create and `Chmod` never disagree about which bits are representable. Error identity is
+asserting host-masked modes is asserting machine state. Any other bit in a create perm (type
+bits, `ModeAppend`, …) is ignored exactly as the host's mode conversion ignores it. Enforced:
+`TestDSTFSCreateIgnoresUnmodeledModeBits`. Mode bits beyond the permission bits that
+`Chmod` can set (`setuid`/`setgid`/`sticky`) are preserved wherever creation accepts them — the
+named creators (`os.OpenFile`, `os.Mkdir`, `os.MkdirAll`) store them verbatim, exactly as `Chmod`
+preserves them. Which bits a create surface *accepts* is upstream's contract, including upstream's
+create-narrower-than-`Chmod` asymmetry on `os.Root`: every rooted create surface
+(`Root.OpenFile`, and `Root.Create`/`Root.WriteFile` through it, `Root.Mkdir`, `Root.MkdirAll`)
+refuses bits beyond `0o777` with upstream's `"unsupported file mode"` refusal, in-sim and on the
+host alike, while `Root.Chmod` sets the special bits afterward — a bit accepted at create and a
+bit set by `Chmod` are indistinguishable in current and durable metadata. Enforced:
+`TestRootCreateRejectsSpecialModeBits` (host), `TestDSTRootCreateRejectsSpecialModeBits`
+(in-sim), `TestDSTFSSpecialModeBitsDurableAcrossCrash` (durability). Error identity is
 production-shaped throughout `errors.Is`: `*PathError`/
 `*LinkError` wrapping `syscall.ENOENT`/`EEXIST`/`ENOTDIR`/`EISDIR`/`ENOTEMPTY`/`EBADF`/`EINVAL`,
 `os.ErrClosed` on use-after-close, exactly as the host would shape them — including `EISDIR` for

@@ -38,7 +38,7 @@ func init() { dstSetDiskFaultHook(dstApplyDiskFaultOp) }
 
 // dstApplyDiskFaultOp applies one disk-fault op to the named host's disk. Reached
 // from testing/simulation through the runtime relay. arg is op-specific (unused by
-// the EIO ops; the capacity / latency the later chunks add); name is the per-file
+// the EIO ops; reserved for capacity and latency faults); name is the per-file
 // target. A call outside a run is a no-op (no disk to fault). Per-file faults key on
 // the resolved node, not the path, so the fault follows the file across a rename and
 // a target that does not (yet) exist is a no-op.

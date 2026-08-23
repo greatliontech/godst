@@ -28,7 +28,7 @@ func isDSTUnsupportedFS(err error) bool {
 		"filesystem operation unsupported under deterministic simulation")
 }
 
-// TestDSTFSBasic exercises the chunk-1 file surface end to end on the
+// TestDSTFSBasic exercises the core file surface end to end on the
 // simulated tree: create, write, seek, read, pread/pwrite, truncate, stat,
 // sync, close.
 func TestDSTFSBasic(t *testing.T) {
@@ -90,8 +90,8 @@ func TestDSTFSBasic(t *testing.T) {
 	})
 }
 
-// TestDSTFSErrorIdentity asserts production-shaped errors across the chunk-1
-// surface: *PathError wrapping the exact errno, errors.Is identities.
+// TestDSTFSErrorIdentity asserts production-shaped errors across the core
+// file surface: *PathError wrapping the exact errno, errors.Is identities.
 func TestDSTFSErrorIdentity(t *testing.T) {
 	simulation.Run(1, func() {
 		check := func(what string, err error, want error) {
@@ -307,14 +307,13 @@ func TestDSTFSCopyAndIdentity(t *testing.T) {
 			t.Fatalf("SyscallConn = %v, want unsupported", err)
 		}
 
-		// Readdir on a regular file: the production ENOTDIR shape (the
-		// funnel is implemented as of the namespace chunk); the remaining
-		// unmodeled handle methods carry the fence shape.
+		// Readdir on a regular file: the production ENOTDIR shape; the
+		// remaining unmodeled handle methods carry the fence shape.
 		if _, err := mf.Readdirnames(0); !errors.Is(err, syscall.ENOTDIR) {
 			t.Fatalf("Readdirnames on file = %v, want ENOTDIR", err)
 		}
 		if err := mf.Chmod(0o600); err != nil {
-			t.Fatalf("File.Chmod = %v (implemented as of the metadata chunk)", err)
+			t.Fatalf("File.Chmod = %v", err)
 		}
 		if fi2, _ := mf.Stat(); fi2.Mode() != 0o600 {
 			t.Fatalf("File.Chmod mode = %v, want 0600", fi2.Mode())
@@ -607,7 +606,7 @@ func TestDSTFSVirtualFDProcessIsolation(t *testing.T) {
 	})
 }
 
-// TestDSTFSNamespace covers the chunk-2 named operations end to end:
+// TestDSTFSNamespace covers the named namespace operations end to end:
 // Mkdir/MkdirAll/Remove/RemoveAll/Rename/Stat/Lstat with production error
 // identity, rename atomicity rules, and unlinked-but-open semantics.
 func TestDSTFSNamespace(t *testing.T) {
@@ -1418,7 +1417,7 @@ func TestDSTFSOpenRootDurability(t *testing.T) {
 }
 
 // TestDSTFSDurabilityMonotonicity is the enforcement of the spec's
-// durability-monotonicity invariant, promoted from spec tier at this chunk:
+// durability-monotonicity invariant:
 // every mutation enters the tree as unsynced (the durable image is
 // untouched), and sync alone advances the durable boundary — for file
 // content, file metadata, and directory entry sets. A future simulated crash
@@ -1556,7 +1555,7 @@ func TestDSTFSDurabilityMonotonicity(t *testing.T) {
 	})
 }
 
-// TestDSTFSMetadata covers the chunk-4 named metadata ops: Truncate(name)
+// TestDSTFSMetadata covers the named metadata operations: Truncate(name)
 // with truncate(2) shapes, Chmod (named and handle) changing exactly the
 // changeable bits, Chtimes with the zero-time leave-unchanged contract, and
 // the monotonicity extension — metadata mutations never advance the durable
@@ -2092,6 +2091,64 @@ func TestDSTFSRenameat2(t *testing.T) {
 		}()
 		if fencePanic == nil || !strings.Contains(fmt.Sprint(fencePanic), "unsupported under deterministic simulation") {
 			t.Fatalf("dirfd-relative renameat2 = %v, want the fence refusal", fencePanic)
+		}
+	})
+}
+
+// Root's create operations refuse mode bits beyond 0o777 in the simulation
+// exactly as on the host — upstream's accepted domain is the contract in
+// both worlds, so a SUT cannot pass in-sim on a mode the host would refuse.
+// The closing legal create binds the probe to the simulated tree: the
+// refusals fire pre-dispatch, so without it the body would pass against a
+// host root too.
+func TestDSTRootCreateRejectsSpecialModeBits(t *testing.T) {
+	simulation.Run(1, func() {
+		root, err := os.OpenRoot("/")
+		if err != nil {
+			t.Fatalf("OpenRoot: %v", err)
+		}
+		defer root.Close()
+		for _, bit := range []os.FileMode{os.ModeSetuid, os.ModeSetgid, os.ModeSticky} {
+			f, err := root.OpenFile("f", os.O_CREATE|os.O_RDWR, 0o600|bit)
+			if err == nil {
+				f.Close()
+			}
+			rootRefusal(t, "in-sim OpenFile with "+bit.String(), err, "openat", "f")
+			rootRefusal(t, "in-sim WriteFile with "+bit.String(), root.WriteFile("w", []byte("x"), 0o600|bit), "openat", "w")
+			rootRefusal(t, "in-sim Mkdir with "+bit.String(), root.Mkdir("d", 0o700|bit), "mkdirat", "d")
+			rootRefusal(t, "in-sim MkdirAll with "+bit.String(), root.MkdirAll("d/e", 0o700|bit), "mkdirat", "d/e")
+		}
+		f, err := root.OpenFile("ok", os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatalf("legal rooted create in-sim: %v", err)
+		}
+		f.Close()
+		if _, err := os.Stat("/ok"); err != nil {
+			t.Fatalf("created entry not on the simulated tree: %v", err)
+		}
+	})
+}
+
+// Named creation stores only the modeled metadata bits — permissions plus
+// setuid/setgid/sticky. Any other FileMode bit in a create perm (type bits,
+// ModeAppend, ...) is ignored exactly as the host's syscallMode conversion
+// ignores it: the node is typed by the operation, never by the caller's
+// perm.
+func TestDSTFSCreateIgnoresUnmodeledModeBits(t *testing.T) {
+	simulation.Run(1, func() {
+		f, err := os.OpenFile("/u", os.O_CREATE|os.O_RDWR, 0o640|os.ModeAppend|os.ModeDevice)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		f.Close()
+		if fi, err := os.Stat("/u"); err != nil || fi.Mode() != 0o640 {
+			t.Fatalf("created file mode = %v, %v; want 0o640", fi.Mode(), err)
+		}
+		if err := os.Mkdir("/ud", 0o750|os.ModeAppend|os.ModeSymlink); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		if fi, err := os.Stat("/ud"); err != nil || fi.Mode() != os.ModeDir|0o750 {
+			t.Fatalf("created dir mode = %v, %v; want dir|0o750", fi.Mode(), err)
 		}
 	})
 }
