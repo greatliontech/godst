@@ -42,7 +42,7 @@ plan conforms code and CI to.
   `TestDSTUntaggedCodeFootprint` is subsumed or kept as the fast leg.
 - [x] 8. Exported-API baseline: `api/godst.txt` for `testing/simulation`,
   `cmd/api` green, an api leg in per-PR CI.
-- [ ] 9. cmd and breadth legs: `cmd/internal/testdir` plus short
+- [x] 9. cmd and breadth legs: `cmd/internal/testdir` plus short
   `cmd/go`/`cmd/compile`/`cmd/link` legs (own TMPDIR outside GOROOT),
   `test:inert-std` into the per-PR gate, arm64 axis in matrix, untagged
   `go build std` sweep over the supported platform list, and the
