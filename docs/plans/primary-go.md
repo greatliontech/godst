@@ -13,7 +13,7 @@ plan conforms code and CI to.
   `0o777` validation in both build modes; mode-bit preservation through
   creation/Chmod/durability stays; the design.md filesystem-metadata clause is
   rescoped to stock's accepted domains.
-- [ ] 3. Runtime residue gating: `gdestroy`'s ungated stores and bubble-drain
+- [x] 3. Runtime residue gating: `gdestroy`'s ungated stores and bubble-drain
   guard, `gcStart`/`gcAssistAlloc` save-restores, and `isSystemGoroutine`'s
   package-var guard become constant-guarded and fold away untagged.
 - [ ] 4. Finalizer/cleanup callback residue (`addfinalizer`, `addCleanup`,
