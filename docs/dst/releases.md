@@ -245,7 +245,9 @@ Workflows under `.github/workflows`:
 
 - **`ci`** — on pull requests and pushes to `main` and `release-go1.*`:
   build the toolchain, both-mode `std` builds, the legs cheap enough for a
-  pull-request gate (`test:untagged`, `test:cross`), and a tree check that
+  pull-request gate (`test:untagged`, `test:cross`, and `test:inert-diff` —
+  the INV-VANILLA differential gate against the upstream base toolchain,
+  which the workflow installs), and a tree check that
   no build artifact is committed: no tracked linked executable (ELF
   `ET_EXEC`/`ET_DYN`, Mach-O executable, PE image) outside a `testdata`
   directory — upstream's tracked `.syso` objects are relocatable, not

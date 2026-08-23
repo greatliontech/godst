@@ -47,7 +47,8 @@ plan conforms code and CI to.
   `test:inert-std` into the per-PR gate, arm64 axis in matrix, untagged
   `go build std` sweep over the supported platform list, and the
   tagged-context dependency-policy evaluation (dispositions the
-  tagged-import-policy-gate issue).
+  tagged-import-policy-gate issue); arm64 enablement of the vanilla text
+  gate (its drift heuristics are amd64-tuned).
 - [ ] 10. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
   untagged; environment-red tests skipped by explicit name with citation.
 - [ ] 11. Release workflow validates the extracted distpack binary tarball:

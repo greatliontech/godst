@@ -41,12 +41,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [test:untagged, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:cross]
+        leg: [test:untagged, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:inert-diff, test:cross]
     name: ${{ matrix.leg }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/build-toolchain
+      - name: Upstream base toolchain (inert-diff only)
+        if: matrix.leg == 'test:inert-diff'
+        id: base
+        run: |
+          echo "version=$(head -1 VERSION | sed 's/-dst\..*//' | sed 's/^go//')" >> "$GITHUB_OUTPUT"
+          git fetch --depth=1 origin tag "$(head -1 VERSION | sed 's/-dst\..*//')"
+      - uses: actions/setup-go@v5
+        if: matrix.leg == 'test:inert-diff'
+        with:
+          go-version: ${{ steps.base.outputs.version }}
+          cache: false
       - name: ${{ matrix.leg }}
         run: GOTOOLCHAIN=local task ${{ matrix.leg }}
+        env:
+          DST_REQUIRE_LIVE_DELTA: ${{ matrix.leg == 'test:inert-diff' && '1' || '' }}

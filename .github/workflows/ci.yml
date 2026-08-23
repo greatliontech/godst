@@ -27,3 +27,16 @@ jobs:
         run: GOTOOLCHAIN=local task build:both
       - name: Fast legs
         run: GOTOOLCHAIN=local task test:untagged test:cross
+      - name: Upstream base toolchain for the differential gate
+        id: base
+        run: |
+          echo "version=$(head -1 VERSION | sed 's/-dst\..*//' | sed 's/^go//')" >> "$GITHUB_OUTPUT"
+          git fetch --depth=1 origin tag "$(head -1 VERSION | sed 's/-dst\..*//')"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.base.outputs.version }}
+          cache: false
+      - name: Differential untagged text-identity gate
+        run: GOTOOLCHAIN=local task test:inert-diff
+        env:
+          DST_REQUIRE_LIVE_DELTA: "1"

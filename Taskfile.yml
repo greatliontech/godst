@@ -91,6 +91,23 @@ tasks:
     cmds:
       - '{{.RUN}} test -tags dst -count=1 -timeout 30m testing/simulation/conformance'
 
+  test:inert-diff:
+    desc: INV-VANILLA differential gate — untagged probe-corpus text vs the upstream base toolchain (design.md, "Untagged footprint")
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - |
+        set -e
+        if [ -z "$DST_STOCK_GOROOT" ]; then
+          base=$(head -1 {{.ROOT_DIR}}/VERSION | sed 's/-dst\..*//')
+          command -v go >/dev/null 2>&1 || { echo "DST_STOCK_GOROOT is unset and no host go is available to provide $base"; exit 1; }
+          got=$(GOTOOLCHAIN=$base go version | awk '{print $3}')
+          [ "$got" = "$base" ] || { echo "host go provided $got, want $base"; exit 1; }
+          DST_STOCK_GOROOT=$(GOTOOLCHAIN=$base go env GOROOT)
+          export DST_STOCK_GOROOT
+        fi
+        DST_STOCK_GOROOT="$DST_STOCK_GOROOT" GOTOOLCHAIN=local {{.RUN}} test -tags dst -count=1 -timeout 20m -v -run 'TestUntaggedTextIdenticalToStock' testing/simulation
+
   test:inert-std:
     desc: Untagged -short std — build-mode inertness across all of std (heavy; not in `task test`)
     dir: src

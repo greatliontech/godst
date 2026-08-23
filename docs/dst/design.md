@@ -1578,8 +1578,38 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   packages (the `testing/simulation` tree) are a recorded deviation class outside the corpus
   property: they enter a consumer's binary only if imported, and untagged they are inert by the
   build-constraint panic (`TestDSTRunRequiresBuildTag`), so the comparison never sees them
-  unless a corpus program imports one — which the corpus therefore must not. Lands: when the differential untagged-inertness gate — an
-  enforcing leg running this comparison — runs green. The named-anchor subset is enforced by
+  unless a corpus program imports one — which the corpus therefore must not. Enforced:
+  `TestUntaggedTextIdenticalToStock` over the probe corpus
+  (`testing/simulation/testdata/vanillacorpus`), the `test:inert-diff` Taskfile leg, per-PR in
+  ci.yml (the upstream base toolchain arrives via `DST_STOCK_GOROOT` or through the host go).
+  The comparison also admits, as a layout consequence, bounded codegen drift — register
+  allocation, scheduling, block order, and size-class selection shift under the recorded
+  layouts. The universal bound: callee sets equal modulo the write-barrier and
+  size-class-specialized malloc families, no dst-symbol reference (checked on raw text, before
+  operand canonicalization, method receivers included), at most three instructions and six
+  mnemonics of drift, and — after fork-extra lines pair against register-renamed stock twins —
+  no fork-side unmatched line may touch memory at all (register-base or canonicalized-global
+  operand; LEA is address arithmetic and exempt). Admitted-class symbols (the extraction pairs
+  at 48 instructions / 64 mnemonics, the layout set at the same, the availability
+  substitutions at 12 / 16) get that wider numeric latitude with class rules on their
+  fork-side unmatched lines: a plain-displacement immediate store — the only shape the
+  compiler emits for a hand-written field clear — fails everywhere, a canonicalized-global
+  access fails everywhere, register-source stores may not outnumber the unmatched loads
+  feeding them (the copy-word latitude; a surplus is the save-restore residue shape), and
+  indexed immediate stores are admitted as the extracted loops' array-element clears.
+  Extraction helpers are checked pairwise against the stock symbol (caller minus the
+  extraction call plus helper, callee sets over the pair), the non-generic admitted runtime
+  symbols additionally pin their exact instruction-count delta (deterministic per base;
+  re-measured under review at a port — a mimicking store still adds a line and trips the pin),
+  and every fence-wrapper split body must be linked by the corpus and instruction-identical to
+  its stock counterpart (the morestack self-jump comparing under the stock name). Split
+  wrappers may touch only registers and their own stack frame; equality-function bodies admit
+  no store and no dst reference. The remaining recorded blind spot: within GENERIC admitted
+  instantiations and the availability class, a residue store that mimics an existing store
+  shape inside the numeric bound is beyond this gate; those hooks stay covered by the
+  footprint anchors and review. The gate is amd64-only until the arm64
+  matrix work tunes those heuristics.
+  The named-anchor subset is enforced by
   `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
   goroutine-exit, finalizer/cleanup registration, queueing, and execution, and fence-wrapper
   (`syscall.Close`) anchors; a dst-named symbol reference in any form — data reference, call,
@@ -1598,7 +1628,9 @@ tool IDs derive from the fork's version string (see the build-cache discipline b
 difference is what keeps godst's cache entries from colliding with a stock toolchain's on the
 same machine. The identical-output claim is bound by INV-VANILLA itself — the corpus is compiled
 by godst's `cmd/go` and `cmd/compile`, so any untagged output the toolchain's DST support
-changed would surface as a text diff — and shares INV-VANILLA's Lands: line.
+changed would surface as a text diff — and is enforced by INV-VANILLA's gate
+(`TestUntaggedTextIdenticalToStock` compiles the corpus with godst's `cmd/go` and
+`cmd/compile`).
 
 Further recorded CODE deviation classes, each admitted by name and difference class:
 
@@ -1713,6 +1745,10 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   outside the harness — a differential leg requires a host counterpart for every op, and host
   power-loss cannot be injected — so the sim-side tear model remains pinned by its unit suites,
   not by this leg.
+- **`test:inert-diff`** (`TestUntaggedTextIdenticalToStock`, `-tags dst`, non-short): the
+  INV-VANILLA differential gate — the probe corpus built untagged by this toolchain and by the
+  upstream base toolchain (from `DST_STOCK_GOROOT` or the host go), whole-binary text compared
+  under the recorded deviation classes. Per-PR in ci.yml and in the nightly matrix; amd64-only.
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the five fast legs
   sequentially and fail-fast.
