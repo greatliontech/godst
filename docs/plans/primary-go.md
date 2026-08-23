@@ -23,7 +23,7 @@ plan conforms code and CI to.
 - [x] 5. Inline-neutrality: `goready`, `syscall.Read`/`Write` regain stock
   inlining; sweep for other guard-cost inlining losses; the hook shape that
   survives the inliner's pre-fold cost model is designed here.
-- [ ] 6. Small-residue sweep: `crypto/internal/sysrand` untagged read path
+- [x] 6. Small-residue sweep: `crypto/internal/sysrand` untagged read path
   returns to stock shape; `os.root` dst nil-check residue;
   `testing.chattyPrinter` untagged initialization; the syscall fd-wrapper
   split (`Close`/`Fstat`/`Seek` → `closeFD`/`fstatFD`/`seekFD`) folds back
