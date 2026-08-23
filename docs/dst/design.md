@@ -4,8 +4,10 @@ Status: **working**. This is the design contract for a fork of the Go toolchain 
 **deterministic simulation testing** to the runtime. Built with `-tags dst` and driven through the
 `testing/simulation` public API, a program's goroutine scheduling, runtime randomness, time, garbage
 collection, and process identity become a reproducible function of a seed. It is a general-purpose
-facility — any Go program can use it; it is not tied to any particular application. Code conforms to
-this doc, not the reverse.
+facility — any Go program can use it; it is not tied to any particular application. godst is
+**upstream Go plus DST patches**, not a divergent fork: an untagged (non-`-tags dst`) build is the
+upstream toolchain and serves as a consumer's primary `go` (the contract is "Untagged footprint
+(contract)" below). Code conforms to this doc, not the reverse.
 
 ## The problem
 
@@ -1533,24 +1535,69 @@ routes these through the fenced `RawSyscall` wrapper). Enforced: `TestDSTGettime
 
 ### Enforcing test configurations
 
-**Untagged footprint (contract).** A non-`-tags dst` build carries zero CODE footprint: `dstBuild`
-is a build constant, so every `if dstActive()`/`if dstBuild` guard — hot paths included: `NumCPU`'s
-simulated-count branch, `gopanic`'s explore hook, the finalizer-execution loop's drain legs, and
-`synctest`'s drain/teardown calls — is dead-code-eliminated. `TestDSTUntaggedCodeFootprint` pins the fold by objdump at the panic,
-finalizer, NumCPU, and generic-AddCleanup anchors; the synctest legs share the same constant-guard
-pattern and were objdump-verified at the change, as does `testing`'s framework-stream grant
-(`dstFrameworkStreamEnabled`, nm-verified at the change). The DATA layout is NOT zero-footprint, deliberately, in every build: `g` carries
-fourteen per-goroutine DST words (the six identity/RNG stamps, the seven race-access staging
-fields, and the sticky simulation-membership bit the scheduler classification keys on), `p` carries the run-queue overflow flag, `timer` carries fake-timer state (arming
-host, full-width registration epoch, list link, and the overdue-conversion delivery shift), `synctestBubble` carries the GC-drain
-bookkeeping, `specialfinalizer` carries epoch+sequence+PID, `specialCleanup` carries epoch while its
-embedded cleanup carries sequence+PID, and `finalizer`/`cleanupFn` each carry registration sequence
-plus run-epoch/process-invocation ownership (so untagged builds fit slightly
-fewer entries per block). Restoring the untagged layouts would fork per-tag variants of the runtime's central `g`
-struct and of hand-maintained GC bitmap construction (`finptrmask` and
-`cleanupBlockPtrMask`, whose repeating patterns are load-bearing on queued callback layouts) — an
-unsafe-critical duplication for a few words per object; recorded here as the deliberate limit, with
-the rationale at the claim in `runtime/dst.go`.
+**Untagged footprint (contract).** An untagged (non-`-tags dst`) build is the upstream toolchain,
+and untagged use — including as a consumer's primary `go` — is first-class. The CODE contract is
+**instruction identity of built programs**: what an untagged consumer observes is the text the
+toolchain emits, so the invariant is stated over programs godst builds, not over the toolchain's
+own binaries. Instruction identity is deliberately stronger than "guards are dead-code-eliminated":
+constant guards are DCE-correct but not inline-neutral — the inliner's cost model runs *before*
+constant folding — so a hook can leave zero guard bytes behind yet still de-inline its host
+function at every call site. Symbol-level identity over whole linked programs catches both failure
+shapes (live residue inside a symbol; inlining loss in every caller) mechanically.
+
+- **INV-VANILLA**: for a probe corpus of programs built untagged — same GOOS/GOARCH,
+  GOEXPERIMENT, and build flags — once by godst and once by the upstream base release toolchain
+  (its published distribution, or an equivalent local build of the base tag: upstream toolchain
+  builds are reproducible), every text symbol of each linked binary is instruction-identical
+  across the two builds, modulo a machine-checked allowlist of recorded deviations; a symbol
+  present in only one build is a deviation like any other. The allowlist admits only deviations
+  this document records as deliberate, each entry citing its clause; an applicable entry that
+  never fires is itself a failure (the stale-entry discipline of the conformance harness). A
+  recorded DATA deviation admits exactly the symbols whose text differs as a pure consequence of
+  the recorded layout (block entry-count constants, GC mask construction) — the allowlist names
+  those symbols explicitly against the recording clause, and each entry records the expected
+  difference class for its symbol, so a diff of any other kind in an admitted symbol still
+  fails; unrecorded CODE deviations are inadmissible. The corpus is pinned by a coverage
+  property, not by enumeration: the transitive import closure of the corpus programs covers
+  every upstream-present std package the dst delta modifies — packages that exist in the base
+  tag; the delta path set against the base tag is the checkable source — so every patched call
+  site is reachable by the comparison; the concrete programs live with the gate. godst-only std
+  packages (the `testing/simulation` tree) are a recorded deviation class outside the corpus
+  property: they enter a consumer's binary only if imported, and untagged they are inert by the
+  build-constraint panic (`TestDSTRunRequiresBuildTag`), so the comparison never sees them
+  unless a corpus program imports one — which the corpus therefore must not. Lands: when the differential untagged-inertness gate — an
+  enforcing leg running this comparison — runs green. The named-anchor subset is enforced by
+  `TestDSTUntaggedCodeFootprint` (objdump at the panic, finalizer, NumCPU, and generic-AddCleanup
+  anchors); the synctest legs and `testing`'s framework-stream grant (`dstFrameworkStreamEnabled`)
+  share the same constant-guard pattern.
+
+The toolchain's own binaries are a recorded deviation class, outside INV-VANILLA's subject:
+`cmd/compile` and `cmd/go` carry the DST support code unconditionally (the `-tags dst` of the
+*target* build, not of the toolchain build, selects it), gated so that untagged compilations
+produce identical emitted text to stock — the non-text surfaces (rodata, pclntab, DWARF) are
+not separately enforced. Build action IDs deliberately differ from stock's:
+tool IDs derive from the fork's version string (see the build-cache discipline below), and that
+difference is what keeps godst's cache entries from colliding with a stock toolchain's on the
+same machine. The identical-output claim is bound by INV-VANILLA itself — the corpus is compiled
+by godst's `cmd/go` and `cmd/compile`, so any untagged output the toolchain's DST support
+changed would surface as a text diff — and shares INV-VANILLA's Lands: line.
+
+The DATA layout is the recorded deviation set — NOT zero-footprint, deliberately, in every build:
+`g` carries the per-goroutine DST words (the identity/RNG stamps, the race-access staging
+fields, the sticky simulation-membership bit the scheduler classification keys on, the
+GC-internal simulation-membership save slot, and the scoped host-I/O grant flag), `p` carries the
+run-queue overflow flag, `timer` carries fake-timer state (arming host, full-width registration
+epoch, list link, the overdue-conversion delivery shift, and the universe-base-time mark that
+excludes a timer from host-rate re-mapping), `synctestBubble` carries the GC-drain bookkeeping,
+`specialfinalizer` carries epoch+sequence+PID, `specialCleanup` carries epoch while its embedded
+cleanup carries sequence+PID, and `finalizer`/`cleanupFn` each carry registration sequence plus
+run-epoch/process-invocation ownership (so untagged builds fit slightly fewer entries per block).
+Outside the runtime, `os.file` carries the DST backend words and fd map slot, `os`'s unexported
+`root` the DST root pointer, and `testing`'s chatty printer the host-stream fd slot. Restoring the untagged
+layouts would fork per-tag variants of the runtime's central `g` struct and of hand-maintained GC
+bitmap construction (`finptrmask` and `cleanupBlockPtrMask`, whose repeating patterns are
+load-bearing on queued callback layouts) — an unsafe-critical duplication for a few words per
+object; recorded here as the deliberate limit, with the rationale at the claim in `runtime/dst.go`.
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the

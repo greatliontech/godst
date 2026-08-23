@@ -8,6 +8,14 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **import-policy gate does not cover dst-tagged build contexts** — Lands: 9
+  (primary-go plan). `deps_test` evaluates untagged contexts only, so a
+  dst-tagged std import bypasses the policy gate. See
+  [tagged-import-policy-gate.md](tagged-import-policy-gate.md).
+- **hand edits to generated zsyscall files will fight regeneration** — Lands:
+  when the linux zsyscall files are next regenerated. The dst fd-wrapper
+  split renames symbols inside generated `zsyscall_linux_*.go`. See
+  [zsyscall-regeneration-conflict.md](zsyscall-regeneration-conflict.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept
   in two shapes. See

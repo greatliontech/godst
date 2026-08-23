@@ -5,6 +5,12 @@ and how a release is cut and distributed. Kept current; the Taskfile's `port`
 task and the `.github/workflows` files are the executable forms of the
 procedures below.
 
+godst is **upstream Go plus DST patches**: an untagged build is the upstream
+toolchain (design.md, "Untagged footprint (contract)"), so godst serves as a
+consumer's primary `go` as well as the DST toolchain. That positioning drives
+the patch cadence below — for a primary toolchain, an unported upstream
+release is user-visible lag, security fixes included.
+
 ## Repository identity
 
 godst lives at `github.com/greatliontech/godst` as a standalone repository —
@@ -48,6 +54,23 @@ godst supports exactly the upstream minors upstream supports: the two most
 recent majors. At any time that is `main` (newest) plus one `release-go1.N`
 line. A consumer pinned to an older minor builds from the frozen branch's
 tags; no further releases are cut for it.
+
+**Patch cadence.** Every upstream release tag on a supported line is ported
+(the porting procedure below) and released. The checkable form is a
+stale-base refusal: **a line never cuts a release on a base whose upstream
+minor has a newer point release** — the port lands before, or as, the line's
+next release. Primary-toolchain consumers receive upstream fixes — security
+patches included — only through a godst release, so the port of an upstream
+point release is the line's highest-priority work from the moment the
+upstream tag exists. The refusal is point-release-scoped by design: a new
+upstream *minor* is adopted through the porting procedure's "new upstream
+minor" steps (which themselves require the old minor's last point release to
+be ported and released first), not through this refusal. The refusal makes
+stale releases impossible but does not by itself make lag *observable* — a
+line that cuts nothing is never refused — so its enforcement pairs with an
+upstream tag watch that surfaces new point releases as they appear. Lands:
+when the release workflow's gate compares the line's base against upstream's
+tags and a scheduled watch reports upstream tags newer than any line's base.
 
 ## Versions and tags
 

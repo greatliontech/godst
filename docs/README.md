@@ -31,7 +31,9 @@ Releases, the version scheme, and the download assets are specified in
 [dst/releases.md](dst/releases.md).
 
 Without `-tags dst` every hook is inert and the toolchain behaves as
-upstream Go. Inside a run, the simulation owns time (`time` reads the fake
+upstream Go — godst is upstream Go plus DST patches, and an untagged build
+serves as a primary `go` (the contract is design.md's "Untagged footprint
+(contract)"). Inside a run, the simulation owns time (`time` reads the fake
 clock), the network (`net` TCP is fully in-memory, per-host addressing via
 `simulation.HostIP`), and the filesystem (`os` operates on a per-host
 in-memory tree with a crash-faithful page cache; the host filesystem is
