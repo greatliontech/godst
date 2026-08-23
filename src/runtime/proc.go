@@ -4588,48 +4588,15 @@ func gdestroy(gp *g) {
 	gp.param = nil
 	gp.labels = nil
 	gp.timer = nil
-	if bubble := gp.bubble; bubble != nil && bubble.gcDrain == gp {
-		// The DST GC-callback drain is dying. On the clean path the driver set
-		// gcDrainExit and waits for this death. Any other death (a callback
-		// panic recorded by Explore, or a callback calling runtime.Goexit) must
-		// clear the driver's reference — a later wake would goready a dead g —
-		// and mark the death so teardown discards queued callbacks instead of
-		// leaking them to bubble-less async workers (DST-FIN-1/DST-CLEANUP-1).
-		lock(&bubble.mu)
-		if bubble.gcDrain == gp {
-			bubble.gcDrain = nil
-			if !bubble.gcDrainExit {
-				bubble.gcDrainDied = true
-			}
-		}
-		unlock(&bubble.mu)
+	// dstBuild-gated so untagged builds keep a store-free, stock exit path
+	// here (the constant folds the call away). Must run before gp.bubble is
+	// cleared below: the drain unhook reads it.
+	if dstBuild {
+		dstGdestroy(gp)
 	}
-	gp.dstSimG = false
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0
-	// Clear the DST per-g state so a recycled g cannot carry a prior run's identity
-	// or RNG root into a goroutine created BETWEEN runs (newproc1 only re-stamps
-	// these while a run is active). Otherwise a g recycled from run N's Host-5
-	// subtree, reused between runs, would report host 5 / that stream — and the
-	// unseeded-crypto gate keys on dstrand == 0, which a stale nonzero would defeat.
-	gp.dstrand = 0
-	gp.dstHost = 0
-	gp.dstHostScope = nil
-	gp.dstProc = 0
-	gp.dstPid = 0
-	gp.dstPrio = 0
-	// Scheduled-strategy identity (dstSeq) and pending-access state are the
-	// same leak class: newproc1's dstClearSchedState re-stamps them only for
-	// creations while a run is active, so a g recycled BETWEEN runs would
-	// otherwise carry a dead episode's stable index into its next life — a
-	// foreign goroutine with a stale nonzero dstSeq silently no-ops the
-	// stable-index assignment paths that key on dstSeq == 0. dstBuild-gated
-	// so untagged builds keep a store-free exit path here (the constant
-	// folds the call away).
-	if dstBuild {
-		dstClearSchedState(gp)
-	}
 
 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
 		// Flush assist credit to the global pool. This gives

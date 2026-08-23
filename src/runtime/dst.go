@@ -12,6 +12,14 @@
 // (GOMAXPROCS=1) and no asynchronous or time-based preemption, this makes
 // goroutine scheduling and randomness a reproducible function of the seed.
 //
+// Untagged builds must fold every hook to stock text (design.md, "Untagged
+// footprint (contract)"). Two gating shapes, chosen by the hook's placement:
+// a contiguous dst-only block collapses to one dstBuild-gated call into this
+// file (anchorable by TestDSTUntaggedCodeFootprint — a dropped guard shows
+// as a dst-named call); dst lines interleaved with stock statements use
+// `if dstBuild { … } else { <stock text> }` so the untagged fold is the
+// stock text verbatim. Never a bare store or a runtime-variable guard.
+//
 // The public entry point is package testing/simulation. dstActivate is also linkname'd
 // by the runtime's own white-box tests, which exercise the per-g mechanism under
 // GOMAXPROCS>1 M-migration that testing/simulation.Run (single-P) cannot reproduce.
@@ -3333,4 +3341,45 @@ func dstSetAsyncPreemptOff(off bool) (old bool) {
 		debug.asyncpreemptoff = 0
 	}
 	return old
+}
+
+// dstGdestroy clears the DST per-g state on goroutine exit and unhooks a
+// dying GC-callback drain. Called from gdestroy under dstBuild only, before
+// gdestroy clears gp.bubble (the drain unhook reads it).
+func dstGdestroy(gp *g) {
+	if bubble := gp.bubble; bubble != nil && bubble.gcDrain == gp {
+		// The DST GC-callback drain is dying. On the clean path the driver set
+		// gcDrainExit and waits for this death. Any other death (a callback
+		// panic recorded by Explore, or a callback calling runtime.Goexit) must
+		// clear the driver's reference — a later wake would goready a dead g —
+		// and mark the death so teardown discards queued callbacks instead of
+		// leaking them to bubble-less async workers (DST-FIN-1/DST-CLEANUP-1).
+		lock(&bubble.mu)
+		if bubble.gcDrain == gp {
+			bubble.gcDrain = nil
+			if !bubble.gcDrainExit {
+				bubble.gcDrainDied = true
+			}
+		}
+		unlock(&bubble.mu)
+	}
+	gp.dstSimG = false
+	// Clear the DST per-g state so a recycled g cannot carry a prior run's identity
+	// or RNG root into a goroutine created BETWEEN runs (newproc1 only re-stamps
+	// these while a run is active). Otherwise a g recycled from run N's Host-5
+	// subtree, reused between runs, would report host 5 / that stream — and the
+	// unseeded-crypto gate keys on dstrand == 0, which a stale nonzero would defeat.
+	gp.dstrand = 0
+	gp.dstHost = 0
+	gp.dstHostScope = nil
+	gp.dstProc = 0
+	gp.dstPid = 0
+	gp.dstPrio = 0
+	// Scheduled-strategy identity (dstSeq) and pending-access state are the
+	// same leak class: newproc1's dstClearSchedState re-stamps them only for
+	// creations while a run is active, so a g recycled BETWEEN runs would
+	// otherwise carry a dead episode's stable index into its next life — a
+	// foreign goroutine with a stale nonzero dstSeq silently no-ops the
+	// stable-index assignment paths that key on dstSeq == 0.
+	dstClearSchedState(gp)
 }

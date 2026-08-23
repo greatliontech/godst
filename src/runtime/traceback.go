@@ -1496,7 +1496,9 @@ func isSystemGoroutine(gp *g, fixed bool) bool {
 	if f.funcID == abi.FuncID_runtime_main || f.funcID == abi.FuncID_corostart || f.funcID == abi.FuncID_handleAsyncEvent {
 		return false
 	}
-	if synctestGCDrainPC != 0 && gp.startpc == synctestGCDrainPC {
+	// dstBuild-gated: synctestGCDrainPC is only ever set by the dst drain
+	// spawn, so untagged builds fold this comparison away entirely.
+	if dstBuild && synctestGCDrainPC != 0 && gp.startpc == synctestGCDrainPC {
 		// The DST per-bubble finalizer-drain goroutine runs user finalizer
 		// callbacks inside a synctest bubble. Like runFinalizers it is a runtime
 		// goroutine that executes user code, but unlike the process-global fing it

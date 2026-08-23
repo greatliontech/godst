@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 )
@@ -2502,8 +2504,9 @@ func TestDSTForeignGCActivationStretch(t *testing.T) {
 
 // TestDSTUntaggedCodeFootprint pins the zero-code-footprint contract
 // (design.md, "Untagged footprint"): in a non-`-tags dst` build, the
-// dstBuild-guarded legs on the panic, finalizer, and NumCPU paths fold out —
-// the compiled symbols reference no runtime.dst* symbol. (The synctest legs
+// dstBuild-guarded legs on the anchored paths below (panic, finalizer
+// execution, NumCPU, generic AddCleanup, GC, gcForce, goroutine exit) fold
+// out — the compiled symbols reference no runtime.dst* symbol. (The synctest legs
 // are covered by the same constant-guard pattern but are not reachable from a
 // plain main; they were verified by objdump at the change.)
 func TestDSTUntaggedCodeFootprint(t *testing.T) {
@@ -2548,6 +2551,7 @@ func main() {
 		{"runtime.AddCleanup", true}, // the user-package generic instantiation (prefix match)
 		{"runtime.GC$", false},       // the foreign-caller refusal folds; GC may inline into callers
 		{"runtime.gcForce$", true},   // the forced-cycle protocol behind GC
+		{"runtime.gdestroy$", true},  // the per-g DST clear + drain unhook fold into one gated call
 	} {
 		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
 		out, err := cmd.CombinedOutput()
@@ -2605,5 +2609,61 @@ func TestDSTDisabledVisibilityDirect(t *testing.T) {
 	}
 	if !outAt || !outAnySim {
 		t.Error("candidates invisible outside the window; the probe view is wrong (the pin would be vacuous)")
+	}
+}
+
+// Goroutine exit clears every per-g DST field, so a recycled g cannot carry
+// a dead goroutine's identity or RNG root into its next life — the
+// unseeded-crypto gate keys on dstrand == 0 and the stable-index paths on
+// dstSeq == 0, and a stale nonzero defeats both silently. Waves of stamped
+// goroutines exit and waves of checkers reuse their gs. Reachability is
+// asserted, not assumed: at least one checker must land on a stamped g, or
+// the test reports itself vacuous instead of passing.
+func TestDSTGoroutineExitClearsPerGState(t *testing.T) {
+	if !runtime.DSTBuild {
+		t.Skip("untagged build: goroutine exit does not clear DST fields (nothing stamps them)")
+	}
+	const n = 100
+	stamped := map[uintptr]bool{}
+	var mu sync.Mutex
+	recycled := false
+	for wave := 0; wave < 3; wave++ {
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				addr := runtime.DSTTestStampSelfG()
+				mu.Lock()
+				stamped[addr] = true
+				mu.Unlock()
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+		runtime.Gosched()
+		var checkers sync.WaitGroup
+		var residue atomic.Bool
+		checkers.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				addr, r := runtime.DSTTestSelfGResidue()
+				if r {
+					residue.Store(true)
+				}
+				mu.Lock()
+				if stamped[addr] {
+					recycled = true
+				}
+				mu.Unlock()
+				checkers.Done()
+			}()
+		}
+		checkers.Wait()
+		if residue.Load() {
+			t.Fatal("a recycled g carries per-g DST state after goroutine exit")
+		}
+	}
+	if !recycled {
+		t.Fatal("no checker landed on a stamped g: the test is vacuous, re-shape the churn")
 	}
 }

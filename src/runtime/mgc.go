@@ -907,13 +907,23 @@ func gcStart(trigger gcTrigger) {
 		// This is less elegant than incrementing the group's active count,
 		// but avoids any contamination between GC and synctest.
 		bubble := gp.bubble
-		gcInternal := gp.dstGCInternal
-		gp.bubble = nil
-		gp.dstGCInternal = gp.dstSimG
-		defer func() {
-			gp.dstGCInternal = gcInternal
-			gp.bubble = bubble
-		}()
+		if dstBuild {
+			// Also carry the simulation membership across the disassociation
+			// (dstGCInternal stands in for dstSimG while gp.bubble is nil);
+			// the else branch keeps the stock text for untagged builds.
+			gcInternal := gp.dstGCInternal
+			gp.bubble = nil
+			gp.dstGCInternal = gp.dstSimG
+			defer func() {
+				gp.dstGCInternal = gcInternal
+				gp.bubble = bubble
+			}()
+		} else {
+			gp.bubble = nil
+			defer func() {
+				gp.bubble = bubble
+			}()
+		}
 	}
 
 	// Pick up the remaining unswept/not being swept spans concurrently

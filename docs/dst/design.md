@@ -1578,9 +1578,11 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   build-constraint panic (`TestDSTRunRequiresBuildTag`), so the comparison never sees them
   unless a corpus program imports one — which the corpus therefore must not. Lands: when the differential untagged-inertness gate — an
   enforcing leg running this comparison — runs green. The named-anchor subset is enforced by
-  `TestDSTUntaggedCodeFootprint` (objdump at the panic, finalizer, NumCPU, and generic-AddCleanup
-  anchors); the synctest legs and `testing`'s framework-stream grant (`dstFrameworkStreamEnabled`)
-  share the same constant-guard pattern.
+  `TestDSTUntaggedCodeFootprint` (objdump at the panic, finalizer, NumCPU, generic-AddCleanup,
+  and goroutine-exit anchors); the synctest legs and `testing`'s framework-stream grant
+  (`dstFrameworkStreamEnabled`) share the same constant-guard pattern. The anchor mechanism sees
+  only `runtime.dst*` symbol references — residue expressed as bare field stores or loads of a
+  non-dst-named variable is invisible to it and is pinned only by the differential gate.
 
 The toolchain's own binaries are a recorded deviation class, outside INV-VANILLA's subject:
 `cmd/compile` and `cmd/go` carry the DST support code unconditionally (the `-tags dst` of the

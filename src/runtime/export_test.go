@@ -2364,3 +2364,54 @@ func DSTDisabledVisibilityProbe(g1p, g2p unsafe.Pointer) (inAt, inAnySim, inAnyV
 // DSTProbeG returns the calling goroutine's g pointer for
 // DSTDisabledVisibilityProbe.
 func DSTProbeG() unsafe.Pointer { return unsafe.Pointer(getg()) }
+
+// dstTestVisitGFields is the single list of per-g DST fields goroutine exit
+// must clear — dstGdestroy's full clear set. stamp=true writes a nonzero
+// sentinel into each; stamp=false reports whether any is nonzero. One list
+// drives both directions so the stamp and the residue check cannot drift
+// apart. dstSimG is the one residue-only entry: it is never stamped because
+// every cross-goroutine reader short-circuits on it, so a stray true would
+// expose the stamped g to the scheduler's simulation paths.
+func dstTestVisitGFields(gp *g, stamp bool) (residue bool) {
+	visit := func(zero bool, set func()) {
+		if stamp {
+			set()
+		} else if !zero {
+			residue = true
+		}
+	}
+	visit(gp.dstrand == 0, func() { gp.dstrand = 0xdeadbeef })
+	visit(gp.dstHost == 0, func() { gp.dstHost = 7 })
+	visit(gp.dstHostScope == nil, func() { gp.dstHostScope = new(dstHostScope) })
+	visit(gp.dstProc == 0, func() { gp.dstProc = 7 })
+	visit(gp.dstPid == 0, func() { gp.dstPid = 7 })
+	visit(gp.dstPrio == 0, func() { gp.dstPrio = 7 })
+	visit(gp.dstSeq == 0, func() { gp.dstSeq = 7 })
+	visit(gp.dstAccAddr == 0, func() { gp.dstAccAddr = 7 })
+	visit(gp.dstAccSize == 0, func() { gp.dstAccSize = 7 })
+	visit(!gp.dstAccWrite, func() { gp.dstAccWrite = true })
+	visit(gp.dstAccPC == 0, func() { gp.dstAccPC = 7 })
+	visit(gp.dstAccCount == 0, func() { gp.dstAccCount = 7 })
+	visit(!gp.dstAccPend, func() { gp.dstAccPend = true })
+	visit(!gp.dstAccAuto, func() { gp.dstAccAuto = true })
+	visit(!gp.dstSimG, func() {})
+	return residue
+}
+
+// DSTTestStampSelfG hand-stamps the caller's g with nonzero DST identity,
+// RNG, and pending-access state, standing in for the stamping an active run
+// performs, and returns the g's address so a test can tell which gs were
+// stamped.
+func DSTTestStampSelfG() uintptr {
+	gp := getg()
+	dstTestVisitGFields(gp, true)
+	return uintptr(unsafe.Pointer(gp))
+}
+
+// DSTTestSelfGResidue reports the caller's g address and whether it carries
+// any leftover per-g DST state — residue on a recycled g means goroutine
+// exit failed to clear it.
+func DSTTestSelfGResidue() (gaddr uintptr, residue bool) {
+	gp := getg()
+	return uintptr(unsafe.Pointer(gp)), dstTestVisitGFields(gp, false)
+}

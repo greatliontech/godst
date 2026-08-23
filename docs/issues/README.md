@@ -20,6 +20,11 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   discover` reports non-zero targets for the fork's std tree. Until then
   probes and campaigns fall back to hand edits, and reviewer hand-probes
   are unavailable. See [gomutant-std-tree.md](gomutant-std-tree.md).
+- **gcAssistAlloc's DST membership carry has no enforcing test** — Lands:
+  user decision (the enforcing test needs deterministic in-sim assist
+  steering — its own design). The gcStart twin is enforced; the assist twin
+  survives every current suite when dropped. See
+  [gc-assist-membership-carry-unenforced.md](gc-assist-membership-carry-unenforced.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept
   in two shapes. See
