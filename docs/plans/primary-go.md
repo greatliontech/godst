@@ -47,17 +47,20 @@ plan conforms code and CI to.
   `test:inert-std` into the per-PR gate, arm64 axis in matrix, untagged
   `go build std` sweep over the supported platform list, and the
   tagged-context dependency-policy evaluation (dispositions the
-  tagged-import-policy-gate issue); arm64 enablement of the vanilla text
-  gate (its drift heuristics are amd64-tuned).
-- [ ] 10. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
+  tagged-import-policy-gate issue).
+- [ ] 10. arm64 enablement of the vanilla text gate: arch profiles for the
+  normalizers (decimal displacements, RSP/R28, ZR-source immediate stores,
+  PC-relative branches), the arm64 allowlist deltas re-derived, the gate's
+  arch skip widened to the tuned set, and the matrix's arm64 axis runs it.
+- [ ] 11. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
   untagged; environment-red tests skipped by explicit name with citation.
-- [ ] 11. Release workflow validates the extracted distpack binary tarball:
+- [ ] 12. Release workflow validates the extracted distpack binary tarball:
   untagged version/build/test use plus the tagged smoke, run from the
   extraction rather than the checkout.
-- [ ] 12. Port cadence tooling: upstream tag-watch workflow, post-commit port
+- [ ] 13. Port cadence tooling: upstream tag-watch workflow, post-commit port
   verification (recoverable from the merge commit, no worktree state),
   scripted half of the port audit as a task, port rehearsal job, matrix
   trigger for port branches.
-- [ ] 13. Local install: distpack-based `task install` to a versioned prefix
+- [ ] 14. Local install: distpack-based `task install` to a versioned prefix
   with a `current` symlink; `go` (vanilla) and `godst` (`GOTOOLCHAIN=local`)
   launcher pair off one install; releases.md install documentation.

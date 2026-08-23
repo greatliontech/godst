@@ -245,8 +245,10 @@ The maintenance line thus starts at a validated, released state.
 Workflows under `.github/workflows`:
 
 - **`ci`** — on pull requests and pushes to `main` and `release-go1.*`:
-  build the toolchain, both-mode `std` builds, the legs cheap enough for a
-  pull-request gate (`test:untagged`, `test:cross`, `test:api`, and `test:inert-diff` —
+  build the toolchain, both-mode `std` builds, the per-PR legs
+  (`test:untagged`, `test:cross`, `test:api`; `test:testdir`, `test:cmd`,
+  and `test:inert-std` — the cmd and breadth legs covering the fork's
+  toolchain changes and untagged std; and `test:inert-diff` —
   the INV-VANILLA differential gate against the upstream base toolchain,
   which the workflow installs), and a tree check that
   no build artifact is committed: no tracked linked executable (ELF

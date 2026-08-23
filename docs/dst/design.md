@@ -1745,6 +1745,16 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   outside the harness — a differential leg requires a host counterpart for every op, and host
   power-loss cannot be injected — so the sim-side tear model remains pinned by its unit suites,
   not by this leg.
+- **`test:testdir`** (`go test cmd/internal/testdir`, untagged, own TMPDIR outside GOROOT):
+  the top-level `test/` suite — codegen, fixedbugs, errorcheck — over the fork's toolchain;
+  per-PR and in the matrix.
+- **`test:cmd`** (`go test -short cmd/go` plus `go test cmd/compile/... cmd/link/...`, untagged,
+  own TMPDIR — cmd/go's script tests refuse a work dir inside GOROOT): the cmd suites over the
+  fork's cmd/compile and cmd/go changes; per-PR and in the matrix. Only cmd/go runs `-short`, a
+  recorded coverage bound: its slow half (the `tooSlow` skips) and the scripts needing live
+  network or remote VCS are dropped. cmd/compile and cmd/link run in full — short mode would
+  drop the compiler tests this fork is most exposed to, `TestIntendedInlining` above all, which
+  pins the std inlinability surface the INV-VANILLA admissions lean on.
 - **`test:api`** (`go test cmd/api -check`, untagged): the exported-API gate — upstream's
   `api/go1.N.txt` corpus plus `api/go1-godst.txt`, godst's own exported std surface (the
   `testing/simulation` package; this document is the behavioral contract, the api file the
@@ -1762,17 +1772,20 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   under the recorded deviation classes. Per-PR in ci.yml and in the nightly matrix; amd64-only.
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the six fast legs
-  sequentially and fail-fast.
-- **`test:cross`** (`GOOS=windows GOARCH=amd64` and `GOOS=plan9 GOARCH=amd64`, each
-  `CGO_ENABLED=0 go build std`, untagged): ordinary standard-library builds remain valid for the
-  two file layouts that do not carry DST backend storage. This leg makes no tagged DST support
-  claim for Windows or Plan 9; the tagged filesystem requires a supported Unix, js/wasm, or wasip1
-  file layout. The leg also carries the architecture-scope refusal probes: a `-tags dst` build of
-  `runtime` for each excluded architecture (`linux/loong64` and the four MIPS ports) must fail
-  with the intended unsupported-architecture sentinel message (see "The interception boundary",
-  Architecture scope) —
-  a probe that fails either because the build succeeded or because the message is missing is a
-  scope regression. It runs separately from the `test` aggregate.
+  sequentially and fail-fast. Per-PR in ci.yml and in the nightly matrix.
+- **`test:cross`** (untagged `CGO_ENABLED=0 go build std` across the supported platform list):
+  ordinary standard-library builds remain valid upstream ports on every platform this document
+  claims — Windows and Plan 9 (the two file layouts that do not carry DST backend storage), the
+  fenced Unix architectures (`linux/386`, `arm`, `arm64`, `riscv64`, `ppc64`, `ppc64le`,
+  `s390x`; see "The interception boundary", Architecture scope), both darwin architectures,
+  `freebsd/amd64` and `openbsd/amd64`, and the `js/wasm` + `wasip1/wasm` file layouts the tagged
+  filesystem section names — fifteen targets. The leg makes no tagged DST support claim for any
+  of them; the tagged filesystem requires a supported Unix, js/wasm, or wasip1 file layout. The
+  leg also carries the architecture-scope refusal probes: a `-tags dst` build of `runtime` for
+  each excluded architecture (`linux/loong64` and the four MIPS ports) must fail with the
+  intended unsupported-architecture sentinel message (see "The interception boundary",
+  Architecture scope) — a probe that fails either because the build succeeded or because the
+  message is missing is a scope regression. It runs separately from the `test` aggregate.
 
 Two operational rules for running these configurations honestly: never let a pipeline eat the exit
 code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures
@@ -1790,8 +1803,10 @@ this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
 or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
-every command pins `TMPDIR` to the gitignored on-disk `.tmp/` at the repo root (freely deletable
-between runs); a FAIL of that shape can still appear in a bare `go test` run outside the tasks.
+every command except the cmd legs pins `TMPDIR` to the gitignored on-disk `.tmp/` at the repo
+root (freely deletable between runs; the cmd legs mktemp a per-run tree outside the repo instead,
+because cmd/go refuses a work dir inside GOROOT — the reason is recorded in their bullets); a
+FAIL of that shape can still appear in a bare `go test` run outside the tasks.
 A second environmental dependency: the non-`-short` net suite includes external-DNS tests
 (`TestLookupDotsWithRemoteSource` et al.) that require a recursive resolver returning real
 answers; a filtering/captive upstream (observed: quad9 echoing the arpa name for 8.8.8.8 reverse

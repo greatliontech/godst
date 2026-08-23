@@ -15,8 +15,8 @@ import "io/fs"
 // the api file pins the untagged twin, and nothing else stops the tagged
 // signature from drifting. A signature change or removal fails this file's
 // compile. Add here: any NEW dst-only export, and any new tagged/untagged
-// twin pair. The tagged-context gate gap is tracked in
-// docs/issues/tagged-import-policy-gate.md.
+// twin pair — until cmd/api itself learns a dst-tagged build context,
+// nothing catches an ADDED tagged export this list does not name.
 var (
 	_ func(name string) fs.FS  = HostFS
 	_ func(name string) string = HostIP

@@ -17,7 +17,11 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Budget rule: green wall time plus the largest `go test` per-package
+    # timeout (60m, in test:cmd; concurrent hangs expire together) must fit,
+    # so a hung test binary reaches `go test`'s own timeout and dies with a
+    # goroutine dump instead of a bare job cancellation.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
       - name: Tree carries no build artifact
@@ -25,8 +29,10 @@ jobs:
       - uses: ./.github/actions/build-toolchain
       - name: Both build modes
         run: GOTOOLCHAIN=local task build:both
-      - name: Fast legs
+      - name: Untagged, cross-build, and api legs
         run: GOTOOLCHAIN=local task test:untagged test:cross test:api
+      - name: cmd and breadth legs
+        run: GOTOOLCHAIN=local task test:testdir test:cmd test:inert-std
       - name: Upstream base toolchain for the differential gate
         id: base
         run: |

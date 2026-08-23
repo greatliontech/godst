@@ -11,17 +11,20 @@
 #      tool IDs come from the version, not the binary hash, and a reinstalled
 #      compiler does NOT invalidate cached objects.
 #
-# Every command runs as `GOROOT={{.ROOT_DIR}} TMPDIR={{.ROOT_DIR}}/.tmp ...`
-# (via the RUN var): an exported GOROOT in the developer's environment would
-# otherwise redirect every leg to another toolchain's runtime — green exit
-# codes, vacuous run — and TMPDIR pins the heavy build/test temp trees to the
-# gitignored on-disk .tmp/ at the repo root, because the std leg's parallel
-# build trees plus accumulated per-test temp dirs can fill a tmpfs /tmp
-# mid-leg ("disk quota exceeded" / "no space left on device" masquerading as
-# build regressions). .tmp/ is freely deletable between runs. The shell-level
-# assignments are deliberate: Taskfile `env:` loses to the OS environment by
-# default, a shell prefix never does. (The prefix assumes a space-free repo
-# path; quote RUN's expansion if that ever changes.)
+# Every command runs as `GOROOT={{.ROOT_DIR}} ...`: an exported GOROOT in
+# the developer's environment would otherwise redirect every leg to another
+# toolchain's runtime — green exit codes, vacuous run. Every command except
+# the cmd legs also pins `TMPDIR={{.ROOT_DIR}}/.tmp` (via the RUN var) to
+# keep the heavy build/test temp trees on the gitignored on-disk .tmp/ at
+# the repo root, because the std leg's parallel build trees plus accumulated
+# per-test temp dirs can fill a tmpfs /tmp mid-leg ("disk quota exceeded" /
+# "no space left on device" masquerading as build regressions). .tmp/ is
+# freely deletable between runs. The cmd legs are the one exception: cmd/go
+# refuses a work dir inside GOROOT, so they mktemp outside the repo (see
+# exttmp-go-test). The shell-level assignments are deliberate: Taskfile
+# `env:` loses to the OS environment by default, a shell prefix never does.
+# (The prefix assumes a space-free repo path; quote RUN's expansion if that
+# ever changes.)
 version: '3'
 
 # test:conformance runs a BOUNDED differential sweep by default (4 seeds per
@@ -92,6 +95,43 @@ tasks:
     cmds:
       - '{{.RUN}} test -tags dst -count=1 -timeout 30m testing/simulation/conformance'
 
+  # The cmd legs use a TMPDIR OUTSIDE the repo: cmd/go's script tests refuse
+  # to run when their work dir sits inside GOROOT ("testgo must not write to
+  # GOROOT"), so the usual {{.ROOT_DIR}}/.tmp pin cannot apply. mktemp keeps
+  # the heavy trees off tmpfs risk per-run and the EXIT trap removes them on
+  # success and on failure — but not on SIGKILL or a cancelled CI job, which
+  # leave the tree under the system temp dir (acceptable: CI runners are
+  # ephemeral, and a developer machine's temp dir is OS-cleaned).
+  # ARGS is spliced into the command as shell source, not passed as argv:
+  # keep it to metacharacter-free words (no spaces-in-words, quotes, globs).
+  exttmp-go-test:
+    internal: true
+    dir: src
+    cmds:
+      - |
+        set -e
+        t=$(mktemp -d)
+        trap 'rm -rf "$t"' EXIT
+        GOROOT={{.ROOT_DIR}} TMPDIR="$t" {{.ROOT_DIR}}/bin/go test {{.ARGS}}
+
+  test:testdir:
+    desc: The top-level test/ suite (codegen, fixedbugs, errorcheck) via cmd/internal/testdir — pins cmd/compile and cmd/link behavior
+    cmds:
+      - task: exttmp-go-test
+        vars: { ARGS: '-count=1 -timeout 40m cmd/internal/testdir' }
+
+  test:cmd:
+    desc: cmd suites over the fork's toolchain changes — cmd/go short (its slow/network half skips), cmd/compile and cmd/link in full
+    cmds:
+      - task: exttmp-go-test
+        vars: { ARGS: '-count=1 -short -timeout 60m cmd/go' }
+      # cmd/compile and cmd/link run WITHOUT -short: short mode drops the
+      # compiler tests this fork is most exposed to — TestIntendedInlining
+      # above all, which pins the std inlinability surface the INV-VANILLA
+      # admissions lean on.
+      - task: exttmp-go-test
+        vars: { ARGS: '-count=1 -timeout 60m cmd/compile/... cmd/link/...' }
+
   test:api:
     desc: Exported std API check — upstream's api/go1.N.txt corpus plus godst's own api/go1-godst.txt (testing/simulation)
     dir: src
@@ -124,12 +164,23 @@ tasks:
       - '{{.RUN}} test -count=1 -short std'
 
   test:cross:
-    desc: Untagged standard-library cross-builds for Windows and Plan 9 file layouts, plus the dst architecture-scope refusal probes
+    desc: Untagged `build std` across the supported platform list — Unix arches, darwin, the BSDs, js/wasip1, Windows, Plan 9 — plus the dst architecture-scope refusal probes
     dir: src
     deps: [tmpdir]
     cmds:
       - 'GOOS=windows GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
       - 'GOOS=plan9 GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
+      # Untagged builds must remain valid upstream ports on every platform
+      # the design claims: the fenced Unix architectures (design.md, "The
+      # interception boundary" → Architecture scope), both darwin arches,
+      # the BSDs, and the js/wasm + wasip1 file layouts the tagged
+      # filesystem section names.
+      - |
+        set -e
+        for p in linux/386 linux/arm linux/arm64 linux/riscv64 linux/ppc64 linux/ppc64le linux/s390x \
+                 darwin/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 js/wasm wasip1/wasm; do
+          GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 {{.RUN}} build std
+        done
       # Architecture-scope refusal: DST claims no support on loong64/MIPS
       # (design.md, "The interception boundary" → Architecture scope), so a
       # dst-tagged build there must fail AND fail with the intended sentinel

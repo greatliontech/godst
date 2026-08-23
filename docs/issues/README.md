@@ -8,10 +8,10 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- **tagged build contexts are outside two std gates** — Lands: 9
-  (primary-go plan). `deps_test` and the exported-API check both evaluate
-  untagged contexts only; dst-tagged imports and dst-only exports bypass
-  them (HostFS and HostIP's tagged twin are compile-pinned by hand). See
+- **dst-only exports are outside the exported-API gate** — Lands: user
+  decision (needs a dst-tagged `cmd/api` context — its own design). The
+  import-policy half closed as disproven: `deps_test` scans dst-tagged
+  files. HostFS and HostIP's tagged twin are compile-pinned by hand. See
   [tagged-import-policy-gate.md](tagged-import-policy-gate.md).
 - **gomutant cannot load the fork's std tree** — Lands: when `gomutant
   discover` reports non-zero targets for the fork's std tree. Until then
