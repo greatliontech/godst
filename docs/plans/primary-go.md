@@ -57,7 +57,7 @@ plan conforms code and CI to.
 - [x] 12. Release workflow validates the extracted distpack binary tarball:
   untagged version/build/test use plus the tagged smoke, run from the
   extraction rather than the checkout.
-- [ ] 13. Port cadence tooling: upstream tag-watch workflow, post-commit port
+- [x] 13. Port cadence tooling: upstream tag-watch workflow, post-commit port
   verification (recoverable from the merge commit, no worktree state),
   scripted half of the port audit as a task, port rehearsal job, matrix
   trigger for port branches.
