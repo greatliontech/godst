@@ -670,7 +670,7 @@ func (r *Resolver) LookupNS(ctx context.Context, name string) ([]*NS, error) {
 // LookupTXT uses [context.Background] internally; to specify the context, use
 // [Resolver.LookupTXT].
 func LookupTXT(name string) ([]string, error) {
-	return DefaultResolver.LookupTXT(context.Background(), name)
+	return DefaultResolver.lookupTXT(context.Background(), name)
 }
 
 // LookupTXT returns the DNS TXT records for the given domain name.
@@ -678,12 +678,6 @@ func LookupTXT(name string) ([]string, error) {
 // If a DNS TXT record holds multiple strings, they are concatenated as a
 // single string.
 func (r *Resolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
-	if dstActive() {
-		if !isDomainName(name) {
-			return nil, newDNSError(errNoSuchHost, name, "")
-		}
-		return nil, dstUnsupportedDNSLookup(name)
-	}
 	return r.lookupTXT(ctx, name)
 }
 

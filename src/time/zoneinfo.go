@@ -92,7 +92,7 @@ func (l *Location) get() *Location {
 	if l == nil {
 		return &utcLoc
 	}
-	if l == &localLoc || l == Local {
+	if dstTZBuild && (l == &localLoc || l == Local) {
 		// Inside a deterministic-simulation bubble, Local IS UTC — at
 		// the lookup, not the load, so a zone the HOST cached (or a
 		// *Location the host ASSIGNED to time.Local) before the run

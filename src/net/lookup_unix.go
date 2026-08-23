@@ -107,6 +107,18 @@ func (r *Resolver) lookupNS(ctx context.Context, name string) ([]*NS, error) {
 }
 
 func (r *Resolver) lookupTXT(ctx context.Context, name string) ([]string, error) {
+	// The in-simulation refusal lives here rather than on the exported
+	// method: the package-level LookupTXT calls this unexported method
+	// directly (stock shape, kept so its text stays stock), so this is the
+	// one chokepoint both public entries share. Bare-constant guard.
+	if dstNetEnabled {
+		if dstActive() {
+			if !isDomainName(name) {
+				return nil, newDNSError(errNoSuchHost, name, "")
+			}
+			return nil, dstUnsupportedDNSLookup(name)
+		}
+	}
 	return r.goLookupTXT(ctx, name)
 }
 

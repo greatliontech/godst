@@ -30,6 +30,17 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   consults `findfunc`; one role mechanism would serve both and delete the
   lookup from the tagged path. See
   [callback-loop-driver-discrimination.md](callback-loop-driver-discrimination.md).
+- **sysmonUpdateGOMAXPROCS's run-active guards have no enforcing test** —
+  Lands: user decision. The pre-push skip (prevents a mid-run STW the
+  helper's own gate cannot) and the under-lock recheck (rare second-pusher
+  race) both lack a deterministic probe; same class as the gc-assist carry.
+  See
+  [sysmon-maxprocs-recheck-unenforced.md](sysmon-maxprocs-recheck-unenforced.md).
+- **the syscall fences use three guard shapes for one concept** — Lands:
+  user decision. Nested zero-cost block, `dstSimFenced && …` conjunction, and
+  (pending the wrapper-split fold) unguarded stub calls; one shape, with the
+  inline-parity sweep as oracle. See
+  [syscall-fence-guard-shapes.md](syscall-fence-guard-shapes.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept
   in two shapes. See

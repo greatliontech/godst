@@ -180,14 +180,35 @@ func (s Signal) String() string {
 }
 
 func Read(fd int, p []byte) (n int, err error) {
-	if r0, e1, handled := dstTryRead(fd, p); handled {
-		n = r0
-		if e1 != 0 {
-			err = errnoErr(e1)
+	// Zero-cost guard: everything simulated — including the early return and
+	// the instrumentation tail — lives inside the constant-false block, so the
+	// stock statements below are untouched in text and in inline cost (the
+	// inliner skips a constant-false branch entirely; time.read inlines this
+	// function and sits right at the budget).
+	if dstSimFenced {
+		if r0, e1, handled := dstTryRead(fd, p); handled {
+			n = r0
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			if race.Enabled {
+				if n > 0 {
+					race.WriteRange(unsafe.Pointer(&p[0]), n)
+				}
+				if err == nil {
+					race.Acquire(unsafe.Pointer(&ioSync))
+				}
+			}
+			if msan.Enabled && n > 0 {
+				msan.Write(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			if asan.Enabled && n > 0 {
+				asan.Write(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			return
 		}
-	} else {
-		n, err = read(fd, p)
 	}
+	n, err = read(fd, p)
 	if race.Enabled {
 		if n > 0 {
 			race.WriteRange(unsafe.Pointer(&p[0]), n)
@@ -209,15 +230,31 @@ func Write(fd int, p []byte) (n int, err error) {
 	if race.Enabled {
 		race.ReleaseMerge(unsafe.Pointer(&ioSync))
 	}
+	if dstSimFenced {
+		// Zero-cost guard, as in Read. faketime's stdio path keeps precedence.
+		if !(faketime && (fd == 1 || fd == 2)) {
+			if r0, e1, handled := dstTryWrite(fd, p); handled {
+				n = r0
+				if e1 != 0 {
+					err = errnoErr(e1)
+				}
+				if race.Enabled && n > 0 {
+					race.ReadRange(unsafe.Pointer(&p[0]), n)
+				}
+				if msan.Enabled && n > 0 {
+					msan.Read(unsafe.Pointer(&p[0]), uintptr(n))
+				}
+				if asan.Enabled && n > 0 {
+					asan.Read(unsafe.Pointer(&p[0]), uintptr(n))
+				}
+				return
+			}
+		}
+	}
 	if faketime && (fd == 1 || fd == 2) {
 		n = faketimeWrite(fd, p)
 		if n < 0 {
 			n, err = 0, errnoErr(Errno(-n))
-		}
-	} else if r0, e1, handled := dstTryWrite(fd, p); handled {
-		n = r0
-		if e1 != 0 {
-			err = errnoErr(e1)
 		}
 	} else {
 		n, err = write(fd, p)
@@ -235,14 +272,31 @@ func Write(fd int, p []byte) (n int, err error) {
 }
 
 func Pread(fd int, p []byte, offset int64) (n int, err error) {
-	if r0, e1, handled := dstTryPread(fd, p, offset); handled {
-		n = r0
-		if e1 != 0 {
-			err = errnoErr(e1)
+	if dstSimFenced {
+		// Zero-cost guard, as in Read.
+		if r0, e1, handled := dstTryPread(fd, p, offset); handled {
+			n = r0
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			if race.Enabled {
+				if n > 0 {
+					race.WriteRange(unsafe.Pointer(&p[0]), n)
+				}
+				if err == nil {
+					race.Acquire(unsafe.Pointer(&ioSync))
+				}
+			}
+			if msan.Enabled && n > 0 {
+				msan.Write(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			if asan.Enabled && n > 0 {
+				asan.Write(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			return
 		}
-	} else {
-		n, err = pread(fd, p, offset)
 	}
+	n, err = pread(fd, p, offset)
 	if race.Enabled {
 		if n > 0 {
 			race.WriteRange(unsafe.Pointer(&p[0]), n)
@@ -264,14 +318,26 @@ func Pwrite(fd int, p []byte, offset int64) (n int, err error) {
 	if race.Enabled {
 		race.ReleaseMerge(unsafe.Pointer(&ioSync))
 	}
-	if r0, e1, handled := dstTryPwrite(fd, p, offset); handled {
-		n = r0
-		if e1 != 0 {
-			err = errnoErr(e1)
+	if dstSimFenced {
+		// Zero-cost guard, as in Write.
+		if r0, e1, handled := dstTryPwrite(fd, p, offset); handled {
+			n = r0
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			if race.Enabled && n > 0 {
+				race.ReadRange(unsafe.Pointer(&p[0]), n)
+			}
+			if msan.Enabled && n > 0 {
+				msan.Read(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			if asan.Enabled && n > 0 {
+				asan.Read(unsafe.Pointer(&p[0]), uintptr(n))
+			}
+			return
 		}
-	} else {
-		n, err = pwrite(fd, p, offset)
 	}
+	n, err = pwrite(fd, p, offset)
 	if race.Enabled && n > 0 {
 		race.ReadRange(unsafe.Pointer(&p[0]), n)
 	}

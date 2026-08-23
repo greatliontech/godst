@@ -423,15 +423,6 @@ type timeTimer struct {
 //
 //go:linkname newTimer time.newTimer
 func newTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
-	return newTimerOwned(when, period, f, arg, c, false)
-}
-
-//go:linkname newBaseTimer time.newBaseTimer
-func newBaseTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
-	return newTimerOwned(when, period, f, arg, c, true)
-}
-
-func newTimerOwned(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan, base bool) *timeTimer {
 	t := new(timeTimer)
 	t.timer.init(nil, nil)
 	t.trace("new")
@@ -449,7 +440,39 @@ func newTimerOwned(when, period int64, f func(arg any, seq uintptr, delay int64)
 	if bubble := getg().bubble; bubble != nil {
 		t.isFake = true
 	}
-	t.dstBase = base
+	t.modify(when, period, f, arg, 0)
+	t.init = true
+	return t
+}
+
+// newBaseTimer is newTimer for a DST universe-base-time timer: the dstBase
+// mark must be set before the first modify (which rate-converts non-base
+// timers under a drifting host), so it cannot be applied after newTimer
+// returns. The body mirrors newTimer statement for statement — keep them in
+// step — rather than sharing one through a flag parameter, which would leave
+// untagged newTimer as a wrapper around a one-sided helper. Only dst code
+// reaches it (time.newDSTBaseTimer), so it is dropped from untagged binaries.
+//
+//go:linkname newBaseTimer time.newBaseTimer
+func newBaseTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
+	t := new(timeTimer)
+	t.timer.init(nil, nil)
+	t.trace("new")
+	if raceenabled {
+		racerelease(unsafe.Pointer(&t.timer))
+	}
+	if c != nil {
+		lockInit(&t.sendLock, lockRankTimerSend)
+		t.isChan = true
+		c.timer = &t.timer
+		if c.dataqsiz == 0 {
+			throw("invalid timer channel: no capacity")
+		}
+	}
+	if bubble := getg().bubble; bubble != nil {
+		t.isFake = true
+	}
+	t.dstBase = true
 	t.modify(when, period, f, arg, 0)
 	t.init = true
 	return t

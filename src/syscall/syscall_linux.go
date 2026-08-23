@@ -1382,21 +1382,25 @@ var mapper = &mmapper{
 }
 
 func Mmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err error) {
-	if data, e1, handled := dstTryMmap(fd, offset, length, prot, flags); handled {
-		if e1 != 0 {
-			err = errnoErr(e1)
+	if dstSimFenced { // zero-cost guard: keeps Mmap inlinable in stock builds
+		if data, e1, handled := dstTryMmap(fd, offset, length, prot, flags); handled {
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			return data, err
 		}
-		return data, err
 	}
 	return mapper.Mmap(fd, offset, length, prot, flags)
 }
 
 func Munmap(b []byte) (err error) {
-	if e1, handled := dstTryMunmap(b); handled {
-		if e1 != 0 {
-			err = errnoErr(e1)
+	if dstSimFenced { // zero-cost guard, as in Mmap
+		if e1, handled := dstTryMunmap(b); handled {
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			return err
 		}
-		return err
 	}
 	return mapper.Munmap(b)
 }

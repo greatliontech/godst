@@ -25,10 +25,13 @@ func interrupt() {
 }
 
 func open(name string) (uintptr, error) {
-	if dstTZFenceActive() {
-		// Deterministic missing-database answer for bubble goroutines —
-		// see dst_tz.go. Folds away in stock builds.
-		return 0, syscall.ENOENT
+	if dstTZBuild {
+		if dstTZFenceActive() {
+			// Deterministic missing-database answer for bubble goroutines —
+			// see dst_tz.go. The bare-constant guard keeps open inlinable
+			// in stock builds.
+			return 0, syscall.ENOENT
+		}
 	}
 	fd, err := syscall.Open(name, syscall.O_RDONLY, 0)
 	if err != nil {

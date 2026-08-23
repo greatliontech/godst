@@ -55,11 +55,26 @@ type synctestBubble struct {
 	gcDrainDied bool
 }
 
+// idleInSynctestOrDurableWait is the bubble's durable-idle predicate: stock's
+// isIdleInSynctest, extended under dstBuild by the simulation's durable mutex
+// wait. One inlinable helper for changegstatus, its sibling, and
+// goroutineheader's "(durable)" suffix, rather than an `||` inside each
+// condition: the untagged fold then leaves no materialized boolean behind in
+// the callers' text.
+func idleInSynctestOrDurableWait(gp *g) bool {
+	if dstBuild {
+		return gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp)
+	}
+	return gp.waitreason.isIdleInSynctest()
+}
+
 // changegstatus is called when the non-lock status of a g changes.
 // It is never called with a Gscanstatus.
 func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
-	if dstBuild && gp.dstPid < 0 {
-		return
+	if dstBuild {
+		if gp.dstPid < 0 {
+			return
+		}
 	}
 	// Determine whether this change in status affects the idleness of the bubble.
 	// If this isn't a goroutine starting, stopping, durably blocking,
@@ -76,7 +91,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 		wasRunning = false
 		totalDelta++
 	case _Gwaiting:
-		if gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp) {
+		if idleInSynctestOrDurableWait(gp) {
 			wasRunning = false
 		}
 	}
@@ -89,7 +104,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 			bubble.done = true
 		}
 	case _Gwaiting:
-		if gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp) {
+		if idleInSynctestOrDurableWait(gp) {
 			isRunning = false
 		}
 	}
@@ -218,13 +233,15 @@ func synctestRun(f func()) {
 
 	gp.bubble = bubble
 	defer func() {
-		if dstActive() {
-			dstClearSchedState(gp)
+		if dstBuild { // bare-constant guard: the deferred body is open-coded into synctestRun's text
+			if dstActive() {
+				dstClearSchedState(gp)
+			}
+			if dstSimBubble == bubble {
+				dstSimBubble = nil
+			}
+			gp.dstSimG = false // the root outlives the run; a stale bit would make it a sim candidate of a LATER run (TestExploreForeignPriorRootSpinner hangs without this)
 		}
-		if dstBuild && dstSimBubble == bubble {
-			dstSimBubble = nil
-		}
-		gp.dstSimG = false // the root outlives the run; a stale bit would make it a sim candidate of a LATER run (TestExploreForeignPriorRootSpinner hangs without this)
 		gp.bubble = nil
 	}()
 
@@ -233,97 +250,101 @@ func synctestRun(f func()) {
 	systemstack(func() {
 		fv := *(**funcval)(unsafe.Pointer(&f))
 		bubble.main = newproc1(fv, gp, pc, false, waitReasonZero)
-		if dstActive() && gp == dstSimRootG && dstSimBubble == nil {
-			// Bubble created by the activating goroutine: this is the
-			// simulation's own bubble. Claim it. A FOREIGN synctest bubble —
-			// created by any other goroutine, even between activation and
-			// here (dstActivate's setup GCs block) — must not take this
-			// branch: it would re-root the simulation's scheduling RNG and
-			// heap counter and clobber the run's determinism. Its goroutines
-			// are scheduled RNG-free as infrastructure instead (see
-			// firstSystemG).
-			dstSimBubble = bubble
-			// Sticky membership for the two goroutines that predate the claim:
-			// the bubble main (created above, before dstSimBubble was set) and
-			// the root. Children inherit the bit at newproc1. The scheduler
-			// classification keys on the bit, not the live bubble field, which
-			// the GC assist paths temporarily nil (see g.dstSimG).
-			bubble.main.dstSimG = true
-			gp.dstSimG = true
-			dstSeqCtr.Store(0)
-			// Re-root the per-g DST tree at this bubble so the bubble's
-			// randomness is independent of what ran before it in this process: a
-			// bubble (test) is then reproducible in isolation. Without this,
-			// bubble.main would inherit the caller's tree position, which depends
-			// on global goroutine-creation order. Safe here: bubble.main is not
-			// yet runnable on any queue. See dstBubbleMainRoot (salted so
-			// bubble.main does not replay the run caller's draw sequence,
-			// which would alias a SUT goroutine's stream with the drain's).
-			bubble.main.dstrand = dstBubbleMainRoot(dstSeed.Load())
-			if bubble.main.dstrand == 0 {
-				bubble.main.dstrand = 1 // seeded root stays nonzero (dstReadRandom sentinel)
+		if dstBuild {
+			if dstActive() && gp == dstSimRootG && dstSimBubble == nil {
+				// Bubble created by the activating goroutine: this is the
+				// simulation's own bubble. Claim it. A FOREIGN synctest bubble —
+				// created by any other goroutine, even between activation and
+				// here (dstActivate's setup GCs block) — must not take this
+				// branch: it would re-root the simulation's scheduling RNG and
+				// heap counter and clobber the run's determinism. Its goroutines
+				// are scheduled RNG-free as infrastructure instead (see
+				// firstSystemG).
+				dstSimBubble = bubble
+				// Sticky membership for the two goroutines that predate the claim:
+				// the bubble main (created above, before dstSimBubble was set) and
+				// the root. Children inherit the bit at newproc1. The scheduler
+				// classification keys on the bit, not the live bubble field, which
+				// the GC assist paths temporarily nil (see g.dstSimG).
+				bubble.main.dstSimG = true
+				gp.dstSimG = true
+				dstSeqCtr.Store(0)
+				// Re-root the per-g DST tree at this bubble so the bubble's
+				// randomness is independent of what ran before it in this process: a
+				// bubble (test) is then reproducible in isolation. Without this,
+				// bubble.main would inherit the caller's tree position, which depends
+				// on global goroutine-creation order. Safe here: bubble.main is not
+				// yet runnable on any queue. See dstBubbleMainRoot (salted so
+				// bubble.main does not replay the run caller's draw sequence,
+				// which would alias a SUT goroutine's stream with the drain's).
+				bubble.main.dstrand = dstBubbleMainRoot(dstSeed.Load())
+				if bubble.main.dstrand == 0 {
+					bubble.main.dstrand = 1 // seeded root stays nonzero (dstReadRandom sentinel)
+				}
+				// Root the bubble main's host/process identity at the default (0,0) and its
+				// pid at the run's root pid (dstSimPID, the host-0/proc-0 driver pid);
+				// Host/Process stamp subtrees from there. Explicit (not relying on
+				// inheritance) so a reused g cannot carry a stale identity or pid in. The
+				// clock offset is not a g field: host 0's offset is 0 (dstHostClockOffset
+				// returns 0 for host 0), so the bubble main is in sync with the base clock.
+				bubble.main.dstHost = 0
+				bubble.main.dstHostScope = nil
+				bubble.main.dstProc = 0
+				bubble.main.dstPid = int32(dstSimPID)
+				// Re-root the scheduling RNG at this bubble too, so the seeded
+				// interleaving (which runnable goroutine proceeds next) is reproducible
+				// in isolation, independent of what scheduled before this bubble. See
+				// dstSchedRand.
+				dstSchedRand = dstSchedRoot(dstSeed.Load())
+				// Re-root the fault RNG at this bubble too (separate, salt-independent
+				// stream), so injected faults replay in isolation like the schedule. See
+				// dstFaultRand.
+				dstFaultRand.Store(dstFaultRoot(dstSeed.Load()))
+				dstSchedStatsReset()
+				dstHeapAlloc.Store(0) // start the bubble's per-object alloc counter clean
+				if dstSchedKind == dstSchedPCT {
+					// Re-root the PCT state (change points, step counter) for this bubble.
+					// Goroutine priorities are assigned at creation (newproc1), so the
+					// bubble's goroutines — created after this — get fresh priorities from
+					// the just-re-rooted scheduling RNG. Note bubble.main (created at
+					// newproc1 above, *before* this re-root) drew its priority from the
+					// activation-rooted stream state; that is still deterministic per seed
+					// (only deterministic, bubble-less draws occur between activation and
+					// here at P=1), it just comes from a different stream position than its
+					// children. Do not reorder the main creation after the re-root expecting
+					// to "fix" this — it would change the stream and is unnecessary.
+					dstSchedRootPCT()
+				} else if dstSchedKind == dstSchedScheduled {
+					// Reset the scheduled-strategy state (step counter, trace) for this
+					// bubble. The prefix itself is installed by the brain (dstSetSchedule)
+					// before the Run and persists across the re-root. See dst_explore.go.
+					dstScheduleReset()
+				}
+				dstEnsureSeq(bubble.main)
+				dstEnsureSeq(gp)
 			}
-			// Root the bubble main's host/process identity at the default (0,0) and its
-			// pid at the run's root pid (dstSimPID, the host-0/proc-0 driver pid);
-			// Host/Process stamp subtrees from there. Explicit (not relying on
-			// inheritance) so a reused g cannot carry a stale identity or pid in. The
-			// clock offset is not a g field: host 0's offset is 0 (dstHostClockOffset
-			// returns 0 for host 0), so the bubble main is in sync with the base clock.
-			bubble.main.dstHost = 0
-			bubble.main.dstHostScope = nil
-			bubble.main.dstProc = 0
-			bubble.main.dstPid = int32(dstSimPID)
-			// Re-root the scheduling RNG at this bubble too, so the seeded
-			// interleaving (which runnable goroutine proceeds next) is reproducible
-			// in isolation, independent of what scheduled before this bubble. See
-			// dstSchedRand.
-			dstSchedRand = dstSchedRoot(dstSeed.Load())
-			// Re-root the fault RNG at this bubble too (separate, salt-independent
-			// stream), so injected faults replay in isolation like the schedule. See
-			// dstFaultRand.
-			dstFaultRand.Store(dstFaultRoot(dstSeed.Load()))
-			dstSchedStatsReset()
-			dstHeapAlloc.Store(0) // start the bubble's per-object alloc counter clean
-			if dstSchedKind == dstSchedPCT {
-				// Re-root the PCT state (change points, step counter) for this bubble.
-				// Goroutine priorities are assigned at creation (newproc1), so the
-				// bubble's goroutines — created after this — get fresh priorities from
-				// the just-re-rooted scheduling RNG. Note bubble.main (created at
-				// newproc1 above, *before* this re-root) drew its priority from the
-				// activation-rooted stream state; that is still deterministic per seed
-				// (only deterministic, bubble-less draws occur between activation and
-				// here at P=1), it just comes from a different stream position than its
-				// children. Do not reorder the main creation after the re-root expecting
-				// to "fix" this — it would change the stream and is unnecessary.
-				dstSchedRootPCT()
-			} else if dstSchedKind == dstSchedScheduled {
-				// Reset the scheduled-strategy state (step counter, trace) for this
-				// bubble. The prefix itself is installed by the brain (dstSetSchedule)
-				// before the Run and persists across the re-root. See dst_explore.go.
-				dstScheduleReset()
-			}
-			dstEnsureSeq(bubble.main)
-			dstEnsureSeq(gp)
 		}
 		pp := getg().m.p.ptr()
 		runqput(pp, bubble.main, true)
-		if dstActive() && bubble == dstSimBubble {
-			// Start the per-bubble finalizer drain. Created here, exactly once per
-			// Run, so it advances the root's DST RNG stream a fixed number of times
-			// (bubble.main was already created and independently re-rooted above, and
-			// the root creates no other goroutines) — a per-quiescence spawn would
-			// perturb the seeds of goroutines the root creates. It inherits g.bubble
-			// from the root (gp.bubble, set above) via newproc1, so finalizers it runs
-			// may touch bubble channels (invariant DST-FIN-1). See synctestGCDrain.
-			//
-			// Record the drain's entry PC before newproc1 so isSystemGoroutine (called
-			// from newproc1) classifies it as a user goroutine and gives it the bubble.
-			// Set here rather than via a static initializer to avoid an init cycle.
-			synctestGCDrainPC = abi.FuncPCABIInternal(synctestGCDrain)
-			drainf := synctestGCDrain
-			drainfv := *(**funcval)(unsafe.Pointer(&drainf))
-			bubble.gcDrain = newproc1(drainfv, gp, pc, false, waitReasonZero)
-			runqput(pp, bubble.gcDrain, true)
+		if dstBuild {
+			if dstActive() && bubble == dstSimBubble {
+				// Start the per-bubble finalizer drain. Created here, exactly once per
+				// Run, so it advances the root's DST RNG stream a fixed number of times
+				// (bubble.main was already created and independently re-rooted above, and
+				// the root creates no other goroutines) — a per-quiescence spawn would
+				// perturb the seeds of goroutines the root creates. It inherits g.bubble
+				// from the root (gp.bubble, set above) via newproc1, so finalizers it runs
+				// may touch bubble channels (invariant DST-FIN-1). See synctestGCDrain.
+				//
+				// Record the drain's entry PC before newproc1 so isSystemGoroutine (called
+				// from newproc1) classifies it as a user goroutine and gives it the bubble.
+				// Set here rather than via a static initializer to avoid an init cycle.
+				synctestGCDrainPC = abi.FuncPCABIInternal(synctestGCDrain)
+				drainf := synctestGCDrain
+				drainfv := *(**funcval)(unsafe.Pointer(&drainf))
+				bubble.gcDrain = newproc1(drainfv, gp, pc, false, waitReasonZero)
+				runqput(pp, bubble.gcDrain, true)
+			}
 		}
 		wakep()
 	})

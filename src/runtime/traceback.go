@@ -1315,7 +1315,7 @@ func goroutineheader(gp *g) {
 	}
 	if bubble := gp.bubble; bubble != nil &&
 		gpstatus == _Gwaiting &&
-		(gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp)) &&
+		idleInSynctestOrDurableWait(gp) &&
 		!stringslite.HasSuffix(status, "(durable)") {
 		// If this isn't a status where the name includes a (durable)
 		// suffix to distinguish it from the non-durable form, add it here.

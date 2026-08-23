@@ -20,6 +20,16 @@
 // `if dstBuild { … } else { <stock text> }` so the untagged fold is the
 // stock text verbatim. Never a bare store or a runtime-variable guard.
 //
+// Inside a function stock inlines, the guard must also be cost-neutral: the
+// inliner's cost visitor skips a branch only when its condition is the bare
+// constant (`if dstBuild {`), and charges every other shape — `dstBuild &&
+// f()`, `dstActive()` at the top, a folding stub call, or `x || dstF()` (which
+// leaves a materialized boolean behind). So the whole hook, including any
+// early return and its instrumentation tail, goes inside the bare-constant
+// block and the stock statements stay untouched; a predicate stock writes
+// inline becomes `v := stock; if dstBuild { v = v || dstF() }`. goready,
+// syscall.Read/Write, and time.open are the reference shapes.
+//
 // The public entry point is package testing/simulation. dstActivate is also linkname'd
 // by the runtime's own white-box tests, which exercise the per-g mechanism under
 // GOMAXPROCS>1 M-migration that testing/simulation.Run (single-P) cannot reproduce.
@@ -3432,4 +3442,39 @@ func dstTakeStagedFinalizerStamps() (epoch uint64, seq uintptr, pid int32) {
 	sf := pp.dstFinSpecial
 	pp.dstFinSpecial = nil
 	return sf.dstEpoch, sf.dstSeq, sf.dstPid
+}
+
+// dstTestPushMaxProcs hands the GOMAXPROCS auto-update helper an update with
+// the given target, the same push sysmon performs, so a test can pin that the
+// helper refuses to resize while a simulation is active (the run owns
+// GOMAXPROCS). Returns false without pushing if the helper is not idle or not
+// started. Test-only linkname.
+//
+//go:linkname dstTestPushMaxProcs
+func dstTestPushMaxProcs(procs int32) bool {
+	if updateMaxProcsG.g == nil || !updateMaxProcsG.idle.Load() {
+		return false
+	}
+	lock(&updateMaxProcsG.lock)
+	if !updateMaxProcsG.idle.Load() {
+		unlock(&updateMaxProcsG.lock)
+		return false
+	}
+	updateMaxProcsG.procs = procs
+	updateMaxProcsG.idle.Store(false)
+	var list gList
+	list.push(updateMaxProcsG.g)
+	injectglist(&list)
+	unlock(&updateMaxProcsG.lock)
+	return true
+}
+
+// dstTestMaxProcsHelperIdle reports whether the auto-update helper has
+// finished its cycle and re-parked — the reachability observable for a test
+// that pushed it an update (a sampled GOMAXPROCS proves nothing until the
+// helper has actually run). Test-only linkname.
+//
+//go:linkname dstTestMaxProcsHelperIdle
+func dstTestMaxProcsHelperIdle() bool {
+	return updateMaxProcsG.idle.Load()
 }

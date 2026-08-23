@@ -31,5 +31,9 @@ import _ "unsafe" // for go:linkname
 // sentinel reads the var per lookup; a mid-run swap is a data race
 // on a documented-mutable global in any Go program).
 
+// dstTZBuild is the bare-constant guard for the zoneinfo hooks (see
+// dst_tz_off.go for the stock-build false).
+const dstTZBuild = true
+
 //go:linkname dstTZFenceActive runtime.dstFenceActive
 func dstTZFenceActive() bool

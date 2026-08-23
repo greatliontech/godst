@@ -27,7 +27,12 @@ plan conforms code and CI to.
   returns to stock shape; `os.root` dst nil-check residue;
   `testing.chattyPrinter` untagged initialization; the syscall fd-wrapper
   split (`Close`/`Fstat`/`Seek` → `closeFD`/`fstatFD`/`seekFD`) folds back
-  to stock untagged text.
+  to stock untagged text; the `os.dstFileBackend` interface type's
+  `time.Time`-carrying method retains the whole `time` package in untagged
+  binaries (~35 KB, `io/fs.FileMode.String` is one symptom) — break the
+  retention; `syscall.gettimeofday`'s fenced wrapper gained inlinability
+  (callers' text); stock-only `internal/abi.TypeOf` and the `type:.eq.*`
+  pair identified and dispositioned.
 - [ ] 7. Differential untagged-inertness gate: symbol-level text comparison
   of untagged-built probe-corpus programs (corpus closure covers every
   dst-modified std package) against the same programs built by the upstream

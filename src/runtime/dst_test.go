@@ -1240,6 +1240,19 @@ func TestDSTRunKeepsGOMAXPROCSPinned(t *testing.T) {
 	}
 }
 
+// A GOMAXPROCS auto-update pushed while a run is active is dropped: the
+// simulation owns GOMAXPROCS for the run (the public API pins it at 1; the
+// white-box activation this testprog uses leaves the value as auto mode
+// chose it), and the helper goroutine sysmon wakes must not resize the P set
+// underneath it. GOMAXPROCS is set empty explicitly: CleanCmdEnv does not
+// strip it, and any value would switch the child out of auto mode.
+func TestDSTRunAutoMaxProcsUpdateDropped(t *testing.T) {
+	out := runTestProgDST(t, "DSTRunAutoMaxProcsUpdateDropped", "GOMAXPROCS=")
+	if strings.TrimSpace(out) != "done" {
+		t.Fatalf("auto GOMAXPROCS update not dropped mid-run (got %q, want \"done\")", out)
+	}
+}
+
 // dstSchedSeeds is the seed spread the Seq-5 scheduling tests use for the
 // seed-variation and soundness sweeps.
 var dstSchedSeeds = []string{"1", "2", "3", "12345", "999", "777", "424242", "55"}
@@ -2544,22 +2557,26 @@ func main() {
 	for _, probe := range []struct {
 		pattern       string
 		mustBePresent bool // guards vacuity: a rename/inlining drift must fail loudly, not pass silently
+		mustBeAbsent  bool // inline-neutrality: stock inlines this at every site, so a surviving symbol is a lost inline
 	}{
-		{"runtime.gopanic$", true},
-		{"runtime.runFinqBlocks$", true},
-		{"runtime.NumCPU$", false},   // may be fully inlined away — trivially clean
-		{"runtime.AddCleanup", true}, // the user-package generic instantiation (prefix match)
-		{"runtime.GC$", false},       // the foreign-caller refusal folds; GC may inline into callers
-		{"runtime.gcForce$", true},   // the forced-cycle protocol behind GC
-		{"runtime.gdestroy$", true},  // the per-g DST clear + drain unhook fold into one gated call
-		{"runtime.addfinalizer$", true},                 // registration stamps fold into one gated call
-		{"runtime.addCleanup$", true},                   // same, cleanup twin
-		{"runtime.queuefinalizer$", true},               // queue-time stamping and routing fold
-		{"runtime.freeSpecial$", true},                  // the sweep-side caller of both queue paths
-		{`runtime\.\(\*cleanupQueue\)\.enqueue$`, true}, // cleanup queue routing folds
-		{"runtime.runCleanups$", true},                  // worker-park check folds
-		{"runtime.runCleanupBlock$", true},              // per-block ownership checks fold
-		{"runtime.runFinqBlocks$", true},                // the shared finalizer batch loop
+		{pattern: "runtime.goready$", mustBeAbsent: true}, // 12 call sites; its hook must stay a bare-constant guard
+		{pattern: "runtime.gopanic$", mustBePresent: true},
+		{pattern: "runtime.runFinqBlocks$", mustBePresent: true},                        // the shared finalizer batch loop
+		{pattern: "runtime.NumCPU$"},                                                    // may be fully inlined away — trivially clean
+		{pattern: "runtime.AddCleanup", mustBePresent: true},                            // the user-package generic instantiation (prefix match)
+		{pattern: "runtime.GC$"},                                                        // the foreign-caller refusal folds; GC may inline into callers
+		{pattern: "runtime.gcForce$", mustBePresent: true},                              // the forced-cycle protocol behind GC
+		{pattern: "runtime.gdestroy$", mustBePresent: true},                             // the per-g DST clear + drain unhook fold into one gated call
+		{pattern: "runtime.addfinalizer$", mustBePresent: true},                         // registration stamps fold into one gated call
+		{pattern: "runtime.addCleanup$", mustBePresent: true},                           // same, cleanup twin
+		{pattern: "runtime.queuefinalizer$", mustBePresent: true},                       // queue-time stamping and routing fold
+		{pattern: "runtime.freeSpecial$", mustBePresent: true},                          // the sweep-side caller of both queue paths
+		{pattern: `runtime\.\(\*cleanupQueue\)\.enqueue$`, mustBePresent: true},         // cleanup queue routing folds
+		{pattern: "runtime.runCleanups$", mustBePresent: true},                          // worker-park check folds
+		{pattern: "runtime.runCleanupBlock$", mustBePresent: true},                      // per-block ownership checks fold
+		{pattern: "runtime.goroutineheader$", mustBePresent: true},                      // the durable-wait predicate folds to stock's
+		{pattern: `runtime\.\(\*synctestBubble\)\.changegstatus$`, mustBePresent: true}, // same predicate, bubble side
+		{pattern: "runtime.sysmonUpdateGOMAXPROCS$", mustBePresent: true},               // the second-pusher recheck folds
 	} {
 		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
 		out, err := cmd.CombinedOutput()
@@ -2570,6 +2587,21 @@ func main() {
 			if probe.mustBePresent {
 				t.Errorf("untagged binary has no symbol matching %s — the anchor drifted; re-anchor the fold test", probe.pattern)
 			}
+			if probe.mustBeAbsent && runtime.DSTBuild {
+				// Vacuity guard for the absence claim: the pattern must name a
+				// real symbol somewhere, or a typo passes silently. A tagged
+				// test binary keeps the symbol (the hook body is live there);
+				// untagged this binary inlines it away too, so only the tagged
+				// run can vouch for the pattern.
+				self := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, os.Args[0]))
+				if selfOut, err := self.CombinedOutput(); err != nil || !strings.Contains(string(selfOut), "TEXT ") {
+					t.Errorf("absence anchor %s names no symbol even in the tagged test binary — pattern typo?", probe.pattern)
+				}
+			}
+			continue
+		}
+		if probe.mustBeAbsent {
+			t.Errorf("untagged binary has a symbol matching %s — stock inlines it everywhere; a hook cost it its inlinability", probe.pattern)
 			continue
 		}
 		// Residue is any reference to a dst-named symbol: a data reference
@@ -2686,5 +2718,37 @@ func TestDSTGoroutineExitClearsPerGState(t *testing.T) {
 	}
 	if !recycled {
 		t.Fatal("no checker landed on a stamped g: the test is vacuous, re-shape the churn")
+	}
+}
+
+// newBaseTimer mirrors newTimer statement for statement plus the dstBase
+// mark (runtime/time.go explains why a shared helper is not used). Nothing
+// structural keeps the two in step, so this pins the mirror at the source
+// level: the bodies must be identical once newBaseTimer's one extra line is
+// removed.
+func TestDSTNewBaseTimerMirrorsNewTimer(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join(runtime.GOROOT(), "src", "runtime", "time.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := func(name string) string {
+		start := strings.Index(string(src), "func "+name+"(")
+		if start < 0 {
+			t.Fatalf("%s not found", name)
+		}
+		open := strings.Index(string(src[start:]), "{")
+		if open < 0 {
+			t.Fatalf("%s: no body", name)
+		}
+		open += start
+		end := strings.Index(string(src[open:]), "\n}\n")
+		if end < 0 {
+			t.Fatalf("%s: unterminated body", name)
+		}
+		return string(src[open : open+end])
+	}
+	base := strings.Replace(body("newBaseTimer"), "\tt.dstBase = true\n", "", 1)
+	if base != body("newTimer") {
+		t.Fatalf("newBaseTimer no longer mirrors newTimer (plus the dstBase line):\n--- newTimer\n%s\n--- newBaseTimer (dstBase line removed)\n%s", body("newTimer"), base)
 	}
 }

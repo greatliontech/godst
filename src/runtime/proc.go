@@ -491,12 +491,17 @@ func goparkunlock(lock *mutex, reason waitReason, traceReason traceBlockReason, 
 //
 //go:linkname goready
 func goready(gp *g, traceskip int) {
-	if dstActive() && dstSchedKind == dstSchedScheduled {
-		// Record the happens-before edge (this goroutine -> gp) for the DPOR
-		// dependency relation. getg() here is the readier (the unlocker/sender/etc.,
-		// before the systemstack switch). Gated on the scheduled strategy so Random/
-		// PCT and non-dst builds are unaffected. See dst_explore.go.
-		dstRecordReadyEdge(getg(), gp)
+	// The bare-constant guard is what keeps goready inlinable untagged: the
+	// inliner's cost visitor skips a constant-false branch entirely, but
+	// would charge a dstActive() call at the top (see dst.go, gating shapes).
+	if dstBuild {
+		if dstActive() && dstSchedKind == dstSchedScheduled {
+			// Record the happens-before edge (this goroutine -> gp) for the DPOR
+			// dependency relation. getg() here is the readier (the unlocker/sender/etc.,
+			// before the systemstack switch). Gated on the scheduled strategy so Random/
+			// PCT builds are unaffected. See dst_explore.go.
+			dstRecordReadyEdge(getg(), gp)
+		}
 	}
 	systemstack(func() {
 		ready(gp, traceskip, true)
@@ -7324,8 +7329,8 @@ func updateMaxProcsGoroutine() {
 		lock(&sched.lock)
 		custom := sched.customGOMAXPROCS
 		unlock(&sched.lock)
-		if custom || dstActive() {
-			// dstActive: a white-box simulation (no public-API pin, so no
+		if maxProcsUpdateBlocked(custom) {
+			// The dstActive half: a white-box simulation (no public-API pin, so no
 			// custom flag) must not be resized mid-run any more than a
 			// pinned one; drop the update and re-park.
 			// A manual GOMAXPROCS set (or a DST run's pin) raced in between
@@ -7352,6 +7357,18 @@ func updateMaxProcsGoroutine() {
 	}
 }
 
+// maxProcsUpdateBlocked reports whether an automatic GOMAXPROCS update must
+// be dropped: a custom (user-set) value always wins, and under dstBuild so
+// does an active simulation, which owns GOMAXPROCS for the run. One helper
+// for sysmon's pre-push check and the helper goroutine's post-STW re-check;
+// it inlines, and untagged folds to the stock `custom` test.
+func maxProcsUpdateBlocked(custom bool) bool {
+	if dstBuild {
+		return custom || dstActive()
+	}
+	return custom
+}
+
 func sysmonUpdateGOMAXPROCS() {
 	// Synchronize with GOMAXPROCS. See comment on computeMaxProcsLock.
 	lock(&computeMaxProcsLock)
@@ -7363,7 +7380,7 @@ func sysmonUpdateGOMAXPROCS() {
 	custom := sched.customGOMAXPROCS
 	curr := gomaxprocs
 	unlock(&sched.lock)
-	if custom || dstActive() {
+	if maxProcsUpdateBlocked(custom) {
 		unlock(&computeMaxProcsLock)
 		return
 	}
@@ -7381,10 +7398,11 @@ func sysmonUpdateGOMAXPROCS() {
 	// still pending.
 	if updateMaxProcsG.idle.Load() {
 		lock(&updateMaxProcsG.lock)
-		// Recheck under the lock: another pusher (the runtime test hooks use
-		// the same protocol) may have readied the helper since the check
-		// above, and injecting an already-runnable g throws.
-		if updateMaxProcsG.idle.Load() {
+		// Recheck under the lock: in a dst build another pusher (the DST
+		// GOMAXPROCS hooks use the same protocol) may have readied the helper
+		// since the check above, and injecting an already-runnable g throws.
+		// Stock has a single waker, so untagged the recheck folds away.
+		if !dstBuild || updateMaxProcsG.idle.Load() {
 			updateMaxProcsG.procs = procs
 			updateMaxProcsG.idle.Store(false)
 			var list gList

@@ -36,6 +36,7 @@ func init() {
 	register("DSTRunNestedGuard", DSTRunNestedGuard)
 	register("DSTRunOverlapGuard", DSTRunOverlapGuard)
 	register("DSTRunGOMAXPROCSPinned", DSTRunGOMAXPROCSPinned)
+	register("DSTRunAutoMaxProcsUpdateDropped", DSTRunAutoMaxProcsUpdateDropped)
 	register("DSTPoolAcrossRuns", DSTPoolAcrossRuns)
 	register("DSTPooledFinalizerRunEnd", DSTPooledFinalizerRunEnd)
 	register("DSTPooledCleanupRunEnd", DSTPooledCleanupRunEnd)
@@ -110,6 +111,12 @@ func dstRuntimeActive() bool
 
 //go:linkname dstGOMAXPROCSAutoFP runtime.dstGOMAXPROCSAutoFP
 func dstGOMAXPROCSAutoFP() bool
+
+//go:linkname dstTestPushMaxProcs runtime.dstTestPushMaxProcs
+func dstTestPushMaxProcs(procs int32) bool
+
+//go:linkname dstTestMaxProcsHelperIdle runtime.dstTestMaxProcsHelperIdle
+func dstTestMaxProcsHelperIdle() bool
 
 //go:linkname dstSchedOvfPutsFP runtime.dstSchedOvfPutsFP
 func dstSchedOvfPutsFP() uint64
@@ -2564,6 +2571,52 @@ func DSTRunGOMAXPROCSPinned() {
 		" afterDefault=" + strconv.Itoa(afterDefault) +
 		" auto=" + strconv.FormatBool(autoAfterDefault) +
 		" restored=" + strconv.Itoa(after) + "\n")
+}
+
+// DSTRunAutoMaxProcsUpdateDropped pins that the GOMAXPROCS auto-update
+// helper (the goroutine sysmon wakes on a cgroup/affinity change) drops its
+// update while a simulation is active. The activation is white-box
+// (dstActivate, no public-API pin, so sched.customGOMAXPROCS stays false and
+// the helper's `custom` half cannot mask the dstActive half) in auto mode (no
+// GOMAXPROCS env, so the value under test is whatever auto mode chose); the
+// helper's re-park is awaited so the sample is evidence. Without the
+// run-active gate the helper would resize the P set under the simulation.
+func DSTRunAutoMaxProcsUpdateDropped() {
+	if !dstGOMAXPROCSAutoFP() {
+		os.Stdout.WriteString("not in GOMAXPROCS auto mode: probe vacuous\n")
+		return
+	}
+	dstActivate(7)
+	pinned := runtime.GOMAXPROCS(0)
+	// A target that differs from the current value, whatever auto mode
+	// chose on this host: a target equal to it could never be observed.
+	target := int32(pinned + 1)
+	// The helper starts asynchronously at runtime init; retry the push
+	// until it is idle rather than failing on a slow start.
+	pushed := false
+	for i := 0; i < 10000 && !pushed; i++ {
+		pushed = dstTestPushMaxProcs(target)
+		if !pushed {
+			runtime.Gosched()
+		}
+	}
+	ran := false
+	for i := 0; i < 10000 && !ran; i++ {
+		runtime.Gosched()
+		ran = dstTestMaxProcsHelperIdle()
+	}
+	during := runtime.GOMAXPROCS(0)
+	dstDeactivate()
+	switch {
+	case !pushed:
+		os.Stdout.WriteString("helper not idle or not started\n")
+	case !ran:
+		os.Stdout.WriteString("helper never ran mid-run: probe vacuous\n")
+	case during != pinned:
+		os.Stdout.WriteString("GOMAXPROCS resized mid-run " + strconv.Itoa(pinned) + " -> " + strconv.Itoa(during) + "\n")
+	default:
+		os.Stdout.WriteString("done\n")
+	}
 }
 
 // dstSelectSeq drains four always-ready buffered channels via select, rounds
