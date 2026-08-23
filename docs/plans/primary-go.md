@@ -52,7 +52,7 @@ plan conforms code and CI to.
   normalizers (decimal displacements, RSP/R28, ZR-source immediate stores,
   PC-relative branches), the arm64 allowlist deltas re-derived, the gate's
   arch skip widened to the tuned set, and the matrix's arm64 axis runs it.
-- [ ] 11. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
+- [x] 11. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
   untagged; environment-red tests skipped by explicit name with citation.
 - [ ] 12. Release workflow validates the extracted distpack binary tarball:
   untagged version/build/test use plus the tagged smoke, run from the
