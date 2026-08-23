@@ -20,7 +20,7 @@ plan conforms code and CI to.
   `runCleanups`, `(*cleanupQueue).enqueue`) folds away untagged;
   `TestDSTUntaggedCodeFootprint` moves its anchors to the carrier frames and
   design.md's anchor sentence is updated in the same chunk.
-- [ ] 5. Inline-neutrality: `goready`, `syscall.Read`/`Write` regain stock
+- [x] 5. Inline-neutrality: `goready`, `syscall.Read`/`Write` regain stock
   inlining; sweep for other guard-cost inlining losses; the hook shape that
   survives the inliner's pre-fold cost model is designed here.
 - [ ] 6. Small-residue sweep: `crypto/internal/sysrand` untagged read path
