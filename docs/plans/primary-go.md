@@ -9,7 +9,7 @@ plan conforms code and CI to.
   instruction-identity-modulo-recorded-allowlist (INV-VANILLA, spec-tier with
   `Lands:` until chunk 7); releases.md gains the positioning statement and the
   upstream patch-cadence policy.
-- [ ] 2. `os.Root` create ops (`OpenFile`/`Mkdir`/`MkdirAll`) return to stock
+- [x] 2. `os.Root` create ops (`OpenFile`/`Mkdir`/`MkdirAll`) return to stock
   `0o777` validation in both build modes; mode-bit preservation through
   creation/Chmod/durability stays; the design.md filesystem-metadata clause is
   rescoped to stock's accepted domains.
