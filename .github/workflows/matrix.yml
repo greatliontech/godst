@@ -41,19 +41,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [test:untagged, test:api, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:inert-diff, test:cross, test:testdir, test:cmd]
+        leg: [test:untagged, test:api, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:inert-diff, test:cross, test:testdir, test:cmd, test:dist]
         runner: [ubuntu-latest]
         include:
           # arm64 breadth: the published-but-untested-untagged gap. The dst
           # legs stay amd64 until the simulation's arm64 qualification is its
-          # own scheduled work; untagged inertness, std behavior, and the
+          # own scheduled work; untagged inertness, std behavior, the
           # INV-VANILLA differential gate (which carries an arm64
-          # normalization profile) run on both published platforms.
+          # normalization profile), and the dist release-validation harness
+          # run on both published platforms.
           - leg: test:untagged
             runner: ubuntu-24.04-arm
           - leg: test:inert-std
             runner: ubuntu-24.04-arm
           - leg: test:inert-diff
+            runner: ubuntu-24.04-arm
+          - leg: test:dist
             runner: ubuntu-24.04-arm
     name: ${{ matrix.leg }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

@@ -19,9 +19,9 @@
 # the repo root, because the std leg's parallel build trees plus accumulated
 # per-test temp dirs can fill a tmpfs /tmp mid-leg ("disk quota exceeded" /
 # "no space left on device" masquerading as build regressions). .tmp/ is
-# freely deletable between runs. The cmd legs are the one exception: cmd/go
-# refuses a work dir inside GOROOT, so they mktemp outside the repo (see
-# exttmp-go-test). The shell-level assignments are deliberate: Taskfile
+# freely deletable between runs. The cmd and dist legs are the exception:
+# cmd/go refuses a work dir inside GOROOT, so they mktemp outside the repo
+# (see exttmp-go). The shell-level assignments are deliberate: Taskfile
 # `env:` loses to the OS environment by default, a shell prefix never does.
 # (The prefix assumes a space-free repo path; quote RUN's expansion if that
 # ever changes.)
@@ -33,7 +33,11 @@ version: '3'
 # src/testing/simulation/conformance/doc.go).
 
 vars:
-  RUN: 'GOROOT={{.ROOT_DIR}} TMPDIR={{.ROOT_DIR}}/.tmp {{.ROOT_DIR}}/bin/go'
+  # GOTOOLCHAIN=local: without it a toolchain directive in the ambient
+  # environment (~/.config/go/env) or a go.mod would silently re-route
+  # bin/go to ANOTHER toolchain — green exit codes, vacuous run, the same
+  # class the GOROOT pin closes.
+  RUN: 'GOROOT={{.ROOT_DIR}} GOTOOLCHAIN=local TMPDIR={{.ROOT_DIR}}/.tmp {{.ROOT_DIR}}/bin/go'
 
 tasks:
   tmpdir:
@@ -95,16 +99,18 @@ tasks:
     cmds:
       - '{{.RUN}} test -tags dst -count=1 -timeout 30m testing/simulation/conformance'
 
-  # The cmd legs use a TMPDIR OUTSIDE the repo: cmd/go's script tests refuse
-  # to run when their work dir sits inside GOROOT ("testgo must not write to
-  # GOROOT"), so the usual {{.ROOT_DIR}}/.tmp pin cannot apply. mktemp keeps
-  # the heavy trees off tmpfs risk per-run and the EXIT trap removes them on
-  # success and on failure — but not on SIGKILL or a cancelled CI job, which
-  # leave the tree under the system temp dir (acceptable: CI runners are
-  # ephemeral, and a developer machine's temp dir is OS-cleaned).
-  # ARGS is spliced into the command as shell source, not passed as argv:
-  # keep it to metacharacter-free words (no spaces-in-words, quotes, globs).
-  exttmp-go-test:
+  # The cmd and dist legs use a TMPDIR OUTSIDE the repo: cmd/go's script
+  # tests refuse to run when their work dir sits inside GOROOT ("testgo must
+  # not write to GOROOT"), so the usual {{.ROOT_DIR}}/.tmp pin cannot apply.
+  # mktemp keeps the heavy trees off tmpfs risk per-run and the EXIT trap
+  # removes them on success and on failure — but not on SIGKILL or a
+  # cancelled CI job, which leave the tree under the system temp dir
+  # (acceptable: CI runners are ephemeral, and a developer machine's temp
+  # dir is OS-cleaned).
+  # ARGS is spliced into the command as shell source (everything after
+  # `bin/go`), not passed as argv: keep it to metacharacter-free words (no
+  # spaces-in-words, quotes, globs).
+  exttmp-go:
     internal: true
     dir: src
     cmds:
@@ -112,25 +118,33 @@ tasks:
         set -e
         t=$(mktemp -d)
         trap 'rm -rf "$t"' EXIT
-        GOROOT={{.ROOT_DIR}} TMPDIR="$t" {{.ROOT_DIR}}/bin/go test {{.ARGS}}
+        GOROOT={{.ROOT_DIR}} GOTOOLCHAIN=local TMPDIR="$t" {{.ROOT_DIR}}/bin/go {{.ARGS}}
 
   test:testdir:
     desc: The top-level test/ suite (codegen, fixedbugs, errorcheck) via cmd/internal/testdir — pins cmd/compile and cmd/link behavior
     cmds:
-      - task: exttmp-go-test
-        vars: { ARGS: '-count=1 -timeout 40m cmd/internal/testdir' }
+      - task: exttmp-go
+        vars: { ARGS: 'test -count=1 -timeout 40m cmd/internal/testdir' }
 
   test:cmd:
     desc: cmd suites over the fork's toolchain changes — cmd/go short (its slow/network half skips), cmd/compile and cmd/link in full
     cmds:
-      - task: exttmp-go-test
-        vars: { ARGS: '-count=1 -short -timeout 60m cmd/go' }
+      - task: exttmp-go
+        vars: { ARGS: 'test -count=1 -short -timeout 60m cmd/go' }
       # cmd/compile and cmd/link run WITHOUT -short: short mode drops the
       # compiler tests this fork is most exposed to — TestIntendedInlining
       # above all, which pins the std inlinability surface the INV-VANILLA
       # admissions lean on.
-      - task: exttmp-go-test
-        vars: { ARGS: '-count=1 -timeout 60m cmd/compile/... cmd/link/...' }
+      - task: exttmp-go
+        vars: { ARGS: 'test -count=1 -timeout 60m cmd/compile/... cmd/link/...' }
+
+  test:dist:
+    desc: Upstream's release-validation harness (`go tool dist test`), untagged — the full dist registration incl. the cgo suites and API check; std tests run in dist's default short mode (upstream's default-builder bound; the longtest axis is not claimed)
+    cmds:
+      # -k keeps going past a failure so a nightly red reports every red
+      # test, not just the first; the exit code is still non-zero.
+      - task: exttmp-go
+        vars: { ARGS: 'tool dist test -k' }
 
   test:api:
     desc: Exported std API check — upstream's api/go1.N.txt corpus plus godst's own api/go1-godst.txt (testing/simulation)
@@ -154,7 +168,7 @@ tasks:
           DST_STOCK_GOROOT=$(GOTOOLCHAIN=$base go env GOROOT)
           export DST_STOCK_GOROOT
         fi
-        DST_STOCK_GOROOT="$DST_STOCK_GOROOT" GOTOOLCHAIN=local {{.RUN}} test -tags dst -count=1 -timeout 20m -v -run 'TestUntaggedTextIdenticalToStock' testing/simulation
+        DST_STOCK_GOROOT="$DST_STOCK_GOROOT" {{.RUN}} test -tags dst -count=1 -timeout 20m -v -run 'TestUntaggedTextIdenticalToStock' testing/simulation
 
   test:inert-std:
     desc: Untagged -short std — build-mode inertness across all of std (heavy; not in `task test`)

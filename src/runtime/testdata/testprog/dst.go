@@ -2592,18 +2592,33 @@ func DSTRunAutoMaxProcsUpdateDropped() {
 	// chose on this host: a target equal to it could never be observed.
 	target := int32(pinned + 1)
 	// The helper starts asynchronously at runtime init; retry the push
-	// until it is idle rather than failing on a slow start.
+	// until it is idle rather than failing on a slow start. Both waits are
+	// wall-clock-bounded with a sleeping yield, not iteration-bounded: the
+	// woken helper can be dispatched to another P whose M is OS-starved
+	// when the whole machine is loaded (dist test runs suites in
+	// parallel), and empty Gosched spins complete in microseconds — an
+	// iteration count is a time assumption in disguise. The sleep releases
+	// this OS thread so the helper's can run; this goroutine is the
+	// activating root, not a bubble goroutine, so host timers remain
+	// available under the active run.
+	deadline := time.Now().Add(10 * time.Second)
 	pushed := false
-	for i := 0; i < 10000 && !pushed; i++ {
+	for !pushed && time.Now().Before(deadline) {
 		pushed = dstTestPushMaxProcs(target)
 		if !pushed {
-			runtime.Gosched()
+			time.Sleep(100 * time.Microsecond)
 		}
 	}
+	// A fresh deadline: the push wait may have consumed most of the first
+	// (the same OS-starvation class), and a truncated second wait would
+	// reintroduce the vacuous failure this shape exists to prevent.
+	deadline = time.Now().Add(10 * time.Second)
 	ran := false
-	for i := 0; i < 10000 && !ran; i++ {
+	for !ran && time.Now().Before(deadline) {
 		runtime.Gosched()
-		ran = dstTestMaxProcsHelperIdle()
+		if ran = dstTestMaxProcsHelperIdle(); !ran {
+			time.Sleep(100 * time.Microsecond)
+		}
 	}
 	during := runtime.GOMAXPROCS(0)
 	dstDeactivate()

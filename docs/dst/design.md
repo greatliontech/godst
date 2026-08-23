@@ -1725,7 +1725,7 @@ object; recorded here as the deliberate limit, with the rationale at the claim i
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the
-authoritative statement of its leg, and the `go test` command in the Taskfile is its definition:
+authoritative statement of its leg, and the command in the Taskfile is its definition:
 
 - **`test:untagged`** (`go test -count=1 -short runtime` and `go test -count=1 -short go/build`,
   untagged): DST hooks are inert; also
@@ -1794,6 +1794,19 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   network or remote VCS are dropped. cmd/compile and cmd/link run in full — short mode would
   drop the compiler tests this fork is most exposed to, `TestIntendedInlining` above all, which
   pins the std inlinability surface the INV-VANILLA admissions lean on.
+- **`test:dist`** (`go tool dist test -k`, untagged, own TMPDIR outside GOROOT — the harness
+  includes cmd/go's script tests): upstream's release-validation harness over the fork's
+  toolchain — the full short-mode dist registration (644 entries on linux/amd64), including the
+  pieces no package-list leg reaches: the build-variant suites (`os/user:osusergo`,
+  `net/http:nethttpomithttp2`, `crypto/...:purego` and the gofips140 corpus pins,
+  `encoding/json/...:nojsonv2`), the cgo internal suites, the linking-mode matrix
+  (internal/external, pie/exe, nolibgcc), the race-detector section, and the API checks. Std
+  tests run in dist's default short mode — the same bound upstream's default builders run; the
+  longtest axis (`GO_TEST_SHORT=0`, which also registers the gcstoptheworld/gccheckmark and
+  maymorestack variants) is not claimed. `-k` keeps a red run reporting every red test (the
+  exit code still fails). Nightly in the matrix on both amd64 and arm64 runners; not per-PR
+  (wall time). Environment-red tests are excluded by explicit `-run` name with a citation;
+  none are excluded.
 - **`test:api`** (`go test cmd/api -check`, untagged): the exported-API gate — upstream's
   `api/go1.N.txt` corpus plus `api/go1-godst.txt`, godst's own exported std surface (the
   `testing/simulation` package; this document is the behavioral contract, the api file the
@@ -1844,10 +1857,11 @@ this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
 or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
-every command except the cmd legs pins `TMPDIR` to the gitignored on-disk `.tmp/` at the repo
-root (freely deletable between runs; the cmd legs mktemp a per-run tree outside the repo instead,
-because cmd/go refuses a work dir inside GOROOT — the reason is recorded in their bullets); a
-FAIL of that shape can still appear in a bare `go test` run outside the tasks.
+every command except the cmd and dist legs pins `TMPDIR` to the gitignored on-disk `.tmp/` at
+the repo root (freely deletable between runs; the cmd and dist legs mktemp a per-run tree
+outside the repo instead, because cmd/go refuses a work dir inside GOROOT — the reason is
+recorded in their bullets); a FAIL of that shape can still appear in a bare `go test` run
+outside the tasks.
 A second environmental dependency: the non-`-short` net suite includes external-DNS tests
 (`TestLookupDotsWithRemoteSource` et al.) that require a recursive resolver returning real
 answers; a filtering/captive upstream (observed: quad9 echoing the arpa name for 8.8.8.8 reverse
