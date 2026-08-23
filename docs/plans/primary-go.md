@@ -48,7 +48,7 @@ plan conforms code and CI to.
   `go build std` sweep over the supported platform list, and the
   tagged-context dependency-policy evaluation (dispositions the
   tagged-import-policy-gate issue).
-- [ ] 10. arm64 enablement of the vanilla text gate: arch profiles for the
+- [x] 10. arm64 enablement of the vanilla text gate: arch profiles for the
   normalizers (decimal displacements, RSP/R28, ZR-source immediate stores,
   PC-relative branches), the arm64 allowlist deltas re-derived, the gate's
   arch skip widened to the tuned set, and the matrix's arm64 axis runs it.
