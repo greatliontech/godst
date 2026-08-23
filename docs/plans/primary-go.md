@@ -33,7 +33,7 @@ plan conforms code and CI to.
   retention; `syscall.gettimeofday`'s fenced wrapper gained inlinability
   (callers' text); stock-only `internal/abi.TypeOf` and the `type:.eq.*`
   pair identified and dispositioned.
-- [ ] 7. Differential untagged-inertness gate: symbol-level text comparison
+- [x] 7. Differential untagged-inertness gate: symbol-level text comparison
   of untagged-built probe-corpus programs (corpus closure covers every
   dst-modified std package) against the same programs built by the upstream
   base release toolchain, machine-checked
