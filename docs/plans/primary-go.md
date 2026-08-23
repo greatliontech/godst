@@ -16,7 +16,7 @@ plan conforms code and CI to.
 - [x] 3. Runtime residue gating: `gdestroy`'s ungated stores and bubble-drain
   guard, `gcStart`/`gcAssistAlloc` save-restores, and `isSystemGoroutine`'s
   package-var guard become constant-guarded and fold away untagged.
-- [ ] 4. Finalizer/cleanup callback residue (`addfinalizer`, `addCleanup`,
+- [x] 4. Finalizer/cleanup callback residue (`addfinalizer`, `addCleanup`,
   `runCleanups`, `(*cleanupQueue).enqueue`) folds away untagged;
   `TestDSTUntaggedCodeFootprint` moves its anchors to the carrier frames and
   design.md's anchor sentence is updated in the same chunk.
