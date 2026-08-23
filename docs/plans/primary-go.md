@@ -40,7 +40,7 @@ plan conforms code and CI to.
   allowlist of recorded deviations (each cited to design.md); Taskfile leg
   wired into CI; INV-VANILLA promoted to enforced; dispositions whether
   `TestDSTUntaggedCodeFootprint` is subsumed or kept as the fast leg.
-- [ ] 8. Exported-API baseline: `api/godst.txt` for `testing/simulation`,
+- [x] 8. Exported-API baseline: `api/godst.txt` for `testing/simulation`,
   `cmd/api` green, an api leg in per-PR CI.
 - [ ] 9. cmd and breadth legs: `cmd/internal/testdir` plus short
   `cmd/go`/`cmd/compile`/`cmd/link` legs (own TMPDIR outside GOROOT),
