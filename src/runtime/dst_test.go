@@ -2530,7 +2530,10 @@ func TestDSTUntaggedCodeFootprint(t *testing.T) {
 	dir := t.TempDir()
 	src := []byte(`package main
 
-import "runtime"
+import (
+	"os"
+	"runtime"
+)
 
 type big struct{ buf [64]byte }
 
@@ -2541,6 +2544,15 @@ func main() {
 	runtime.AddCleanup(new(int), func(int) {}, 0)
 	b = nil
 	runtime.GC()
+	// Link the fence-wrapper split so its anchor below is meaningful. (Seek's
+	// and gettimeofday's untagged wrappers inline fully away — the desired
+	// fold — so they are not presence-anchorable; the differential gate
+	// covers them.)
+	if f, err := os.CreateTemp("", "probe"); err == nil {
+		f.Seek(0, 0)
+		f.Close()
+		os.Remove(f.Name())
+	}
 	defer func() { recover() }()
 	panic("x")
 }
@@ -2577,6 +2589,7 @@ func main() {
 		{pattern: "runtime.goroutineheader$", mustBePresent: true},                      // the durable-wait predicate folds to stock's
 		{pattern: `runtime\.\(\*synctestBubble\)\.changegstatus$`, mustBePresent: true}, // same predicate, bubble side
 		{pattern: "runtime.sysmonUpdateGOMAXPROCS$", mustBePresent: true},               // the second-pusher recheck folds
+		{pattern: "syscall.Close$", mustBePresent: true},                                // fence-wrapper split: hook folds, one call remains
 	} {
 		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
 		out, err := cmd.CombinedOutput()

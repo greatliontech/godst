@@ -8,6 +8,8 @@ package sysrand
 
 import "os"
 
-func openUrandom() (*os.File, error) {
-	return os.Open("/dev/urandom")
+// dstOpenUrandom is referenced only from urandomRead's constant-false dst
+// branch in this build; the stub keeps it compiling and folds away.
+func dstOpenUrandom() (*os.File, error) {
+	return nil, nil
 }

@@ -68,18 +68,31 @@ var urandomErr error
 
 func urandomRead(b []byte) error {
 	urandomOnce.Do(func() {
-		urandomFile, urandomErr = openUrandom()
+		if dstReadRandomEnabled {
+			urandomFile, urandomErr = dstOpenUrandom()
+		} else {
+			// Stock path, textually stock so os.Open keeps inlining here.
+			urandomFile, urandomErr = os.Open("/dev/urandom")
+		}
 	})
 	if urandomErr != nil {
 		return urandomErr
 	}
 	for len(b) > 0 {
-		// Tagged os.File.Read has a simulated-backend interface arm, so escape
-		// analysis cannot prove its buffer stays synchronous. This file is
-		// structurally host-backed and Read never retains the slice.
-		p := unsafe.Slice((*byte)(abi.NoEscape(unsafe.Pointer(unsafe.SliceData(b)))), len(b))
-		n, err := urandomFile.Read(p)
-		runtime.KeepAlive(b)
+		var n int
+		var err error
+		if dstReadRandomEnabled {
+			// Tagged os.File.Read has a simulated-backend interface arm, so
+			// escape analysis cannot prove its buffer stays synchronous. This
+			// file is structurally host-backed and Read never retains the
+			// slice. Bare-constant guard: the stock build keeps the stock
+			// call and its escape behavior.
+			p := unsafe.Slice((*byte)(abi.NoEscape(unsafe.Pointer(unsafe.SliceData(b)))), len(b))
+			n, err = urandomFile.Read(p)
+			runtime.KeepAlive(b)
+		} else {
+			n, err = urandomFile.Read(b)
+		}
 		// Note that we don't ignore EAGAIN because it should not be possible to
 		// hit for a blocking read from urandom, although there were
 		// unreproducible reports of it at https://go.dev/issue/9205.

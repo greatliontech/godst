@@ -1233,6 +1233,8 @@ func dstChdir(dir string) (handled bool, err error) {
 // the seek offset, and the access mode. It is the tree-file backend behind
 // the os.File dst seam (dstFileBackend); the pipe (dst_pipe.go) is the
 // sibling stream backend — the non-foreclosure shape recorded in the spec.
+var _ dstFileBackendExt = (*dstFile)(nil) // keep a missing ext method a compile error
+
 type dstFile struct {
 	mu     sync.Mutex
 	node   *dstFSNode

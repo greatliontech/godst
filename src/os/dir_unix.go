@@ -48,7 +48,7 @@ func (d *dirInfo) close() {
 
 func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
 	if dstSimEnabled && f.dstf != nil {
-		dnames, dinfos, derr := f.dstf.readdir(n)
+		dnames, dinfos, derr := f.dstf.(dstFileBackendExt).readdir(n)
 		if derr != nil {
 			if derr == io.EOF {
 				return nil, nil, nil, io.EOF

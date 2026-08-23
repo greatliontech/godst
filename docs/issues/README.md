@@ -12,10 +12,6 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   (primary-go plan). `deps_test` evaluates untagged contexts only, so a
   dst-tagged std import bypasses the policy gate. See
   [tagged-import-policy-gate.md](tagged-import-policy-gate.md).
-- **hand edits to generated zsyscall files will fight regeneration** — Lands:
-  when the linux zsyscall files are next regenerated. The dst fd-wrapper
-  split renames symbols inside generated `zsyscall_linux_*.go`. See
-  [zsyscall-regeneration-conflict.md](zsyscall-regeneration-conflict.md).
 - **gomutant cannot load the fork's std tree** — Lands: when `gomutant
   discover` reports non-zero targets for the fork's std tree. Until then
   probes and campaigns fall back to hand edits, and reviewer hand-probes
@@ -36,10 +32,9 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   race) both lack a deterministic probe; same class as the gc-assist carry.
   See
   [sysmon-maxprocs-recheck-unenforced.md](sysmon-maxprocs-recheck-unenforced.md).
-- **the syscall fences use three guard shapes for one concept** — Lands:
-  user decision. Nested zero-cost block, `dstSimFenced && …` conjunction, and
-  (pending the wrapper-split fold) unguarded stub calls; one shape, with the
-  inline-parity sweep as oracle. See
+- **the syscall fences use two guard shapes for one concept** — Lands:
+  user decision. Nested zero-cost block and `dstSimFenced && …` conjunction;
+  one shape, with the inline-parity sweep as oracle. See
   [syscall-fence-guard-shapes.md](syscall-fence-guard-shapes.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept

@@ -349,6 +349,8 @@ func dstProcStackIsLeaf(stack []string) bool {
 	return len(stack) == 4 && stack[0] == "proc" && stack[1] == "self" && stack[2] == "ns" && stack[3] == "pid"
 }
 
+var _ dstFileBackendExt = (*dstProcFile)(nil) // see dst_fs.go's pin
+
 type dstProcFile struct {
 	mu     sync.Mutex
 	data   []byte

@@ -5,11 +5,13 @@
 package syscall
 
 func Kill(pid int, sig Signal) (err error) {
-	if e1, handled := dstTryKill(pid, sig); handled {
-		if e1 != 0 {
-			err = errnoErr(e1)
+	if dstSimFenced { // zero-cost guard: the stock call below stays untouched
+		if e1, handled := dstTryKill(pid, sig); handled {
+			if e1 != 0 {
+				err = errnoErr(e1)
+			}
+			return err
 		}
-		return err
 	}
 	return kill(pid, sig)
 }

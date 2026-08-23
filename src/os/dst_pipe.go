@@ -75,6 +75,8 @@ func (p *dstPipe) bump() {
 // read end ("|0") or the write end ("|1"). Whether an end is closed lives on
 // the shared pipe (rclosed/wclosed) — single source, also read by the peer
 // for EOF/EPIPE — never duplicated here.
+var _ dstFileBackendExt = (*dstPipeEnd)(nil) // see dst_fs.go's pin
+
 type dstPipeEnd struct {
 	p      *dstPipe
 	reader bool

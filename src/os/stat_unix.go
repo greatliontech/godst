@@ -17,7 +17,7 @@ func (f *File) Stat() (FileInfo, error) {
 		return nil, ErrInvalid
 	}
 	if dstSimEnabled && f.dstf != nil {
-		fi, err := f.dstf.stat()
+		fi, err := f.dstf.(dstFileBackendExt).stat()
 		if err != nil {
 			return nil, f.wrapErr("stat", err)
 		}

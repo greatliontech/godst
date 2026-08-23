@@ -31,12 +31,12 @@ type root struct {
 }
 
 func (r *root) Close() error {
-	if r.dst != nil {
+	if dstSimEnabled && r.dst != nil {
 		dstUnregisterRoot(r)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.closed && r.refs == 0 && r.dst == nil {
+	if !r.closed && r.refs == 0 && (!dstSimEnabled || r.dst == nil) {
 		syscall.Close(r.fd)
 	}
 	r.closed = true
@@ -61,7 +61,7 @@ func (r *root) decref() {
 		panic("bad Root refcount")
 	}
 	r.refs--
-	if r.closed && r.refs == 0 && r.dst == nil {
+	if r.closed && r.refs == 0 && (!dstSimEnabled || r.dst == nil) {
 		syscall.Close(r.fd)
 	}
 }

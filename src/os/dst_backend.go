@@ -33,13 +33,28 @@ type dstFileBackend interface {
 	seek(offset int64, whence int) (int64, error)
 	truncate(size int64) error
 	sync() error
-	stat() (FileInfo, error)
 	closeFile() error
-	readdir(n int) (names []string, infos []FileInfo, err error)
 	chdirHandle() error
+}
+
+// dstFileBackendExt carries the backend methods whose signatures name
+// method-bearing std types — time.Time, FileMode, FileInfo — deliberately
+// OUTSIDE dstFileBackend: a method signature on the named interface embedded
+// in every os.file marks its parameter and result types used-in-interface,
+// which retains the whole time package and io/fs method text (~35 KB) in
+// untagged binaries. Call sites assert to this interface under the
+// dstSimEnabled constant, so untagged the assertions — and the retention —
+// fold away; the var pins below keep a missing method a compile error, the
+// totality the split would otherwise trade for a runtime panic.
+type dstFileBackendExt interface {
+	stat() (FileInfo, error)
+	readdir(n int) (names []string, infos []FileInfo, err error)
 	chmodHandle(mode FileMode) error
 	setDeadline(rd, wd bool, t time.Time) error
 }
+
+// The var pins for the concrete backends live beside their dst-gated type
+// definitions (dst_fs.go, dst_pipe.go, dst_proc.go, dst_inherited_unix.go).
 
 func dstCloseCaller(file *file) error {
 	if file == nil {

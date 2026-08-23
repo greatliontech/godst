@@ -117,7 +117,7 @@ func (f *File) chmod(mode FileMode) error {
 	}
 	if dstSimEnabled {
 		if dstf := f.file.dstBackend(); dstf != nil {
-			if e := dstf.chmodHandle(mode); e != nil {
+			if e := dstf.(dstFileBackendExt).chmodHandle(mode); e != nil {
 				return f.wrapErr("chmod", e)
 			}
 			return nil
@@ -302,7 +302,7 @@ func (f *File) setDeadline(t time.Time) error {
 	}
 	if dstSimEnabled {
 		if dstf := f.file.dstBackend(); dstf != nil {
-			return dstf.setDeadline(true, true, t)
+			return dstf.(dstFileBackendExt).setDeadline(true, true, t)
 		}
 		if dstFenceActive() {
 			return dstErrUnsupportedFS
@@ -318,7 +318,7 @@ func (f *File) setReadDeadline(t time.Time) error {
 	}
 	if dstSimEnabled {
 		if dstf := f.file.dstBackend(); dstf != nil {
-			return dstf.setDeadline(true, false, t)
+			return dstf.(dstFileBackendExt).setDeadline(true, false, t)
 		}
 		if dstFenceActive() {
 			return dstErrUnsupportedFS
@@ -334,7 +334,7 @@ func (f *File) setWriteDeadline(t time.Time) error {
 	}
 	if dstSimEnabled {
 		if dstf := f.file.dstBackend(); dstf != nil {
-			return dstf.setDeadline(false, true, t)
+			return dstf.(dstFileBackendExt).setDeadline(false, true, t)
 		}
 		if dstFenceActive() {
 			return dstErrUnsupportedFS

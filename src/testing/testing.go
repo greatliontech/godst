@@ -601,8 +601,9 @@ type chattyPrinter struct {
 }
 
 func newChattyPrinter(w io.Writer) *chattyPrinter {
-	p := &chattyPrinter{w: w, json: chatty.json, hostFD: -1}
+	p := &chattyPrinter{w: w, json: chatty.json}
 	if dstFrameworkStreamEnabled {
+		p.hostFD = -1 // no granted host stream yet; 0 is a valid fd
 		if f, ok := w.(*os.File); ok {
 			// Fd() also switches a pollable descriptor back to BLOCKING
 			// mode (its documented side effect) — load-bearing here: the

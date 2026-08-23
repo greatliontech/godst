@@ -91,8 +91,10 @@ func rawGettimeofday(tv *Timeval) (err Errno)
 //
 //go:linkname gettimeofday
 func gettimeofday(tv *Timeval) (err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		dstSyscallRefuse(SYS_GETTIMEOFDAY)
+	if dstSimFenced { // zero-cost guard: untagged this is one call to the asm entry
+		if dstFenceActive() && !dstHostIOActive() {
+			dstSyscallRefuse(SYS_GETTIMEOFDAY)
+		}
 	}
 	return rawGettimeofday(tv)
 }

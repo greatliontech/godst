@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-func openUrandom() (*os.File, error) {
+func dstOpenUrandom() (*os.File, error) {
 	const name = "/dev/urandom"
 	var fd int
 	var err error
