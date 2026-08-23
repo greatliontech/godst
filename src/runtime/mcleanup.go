@@ -479,11 +479,10 @@ func (q *cleanupQueue) tryTakeWork() bool {
 // enqueue queues a single cleanup for execution.
 //
 // Called by the sweeper, and only the sweeper.
-func (q *cleanupQueue) enqueue(c cleanupFn, dstEpoch uint64) {
-	c.dstEpoch = dstEpoch
+func (q *cleanupQueue) enqueue(c cleanupFn) {
 	mp := acquirem()
 	pp := mp.p.ptr()
-	if dstActive() && dstEpoch != dstRunEpoch.Load() {
+	if dstActive() && c.dstEpoch != dstRunEpoch.Load() {
 		// Not this run's work (see dstCallbackEpoch and the queuefinalizer
 		// analog): defer it past dstDeactivate with the pre-bubble blocks
 		// rather than letting the bubble drain run it. The queued count still
@@ -819,7 +818,7 @@ var dstCleanupRunBaseQueued, dstCleanupRunExecuted atomic.Uint64
 // runCleanups is the entrypoint for all cleanup-running goroutines.
 func runCleanups() {
 	for {
-		if gcCleanups.dstParkWorkerIfBlocked() {
+		if dstBuild && gcCleanups.dstParkWorkerIfBlocked() {
 			continue
 		}
 		b := gcCleanups.dequeue()
@@ -838,14 +837,16 @@ func runCleanupBlock(b *cleanupBlock) {
 		racefingo()
 	}
 
-	onCleanupG := findfunc(getg().startpc).funcID == abi.FuncID_runCleanups
+	// Untagged there is no other driver, so the discrimination folds to true
+	// (no findfunc lookup) and the body is the stock loop.
+	onCleanupG := !dstBuild || findfunc(getg().startpc).funcID == abi.FuncID_runCleanups
 	onDrain := dstBuild && !onCleanupG && getg().bubble != nil && getg() == getg().bubble.gcDrain
 	if onCleanupG {
 		gcCleanups.beginRunningCleanups()
 	}
 	var executed uint64
 	for i := 0; i < int(b.n); i++ {
-		for onCleanupG && dstCallbackWorkersBlocked() {
+		for dstBuild && onCleanupG && dstCallbackWorkersBlocked() {
 			gcCleanups.endRunningCleanups()
 			gcCleanups.dstParkWorkerIfBlocked()
 			gcCleanups.beginRunningCleanups()
@@ -906,8 +907,12 @@ func runCleanupBlock(b *cleanupBlock) {
 		gcCleanups.endRunningCleanups()
 	}
 	if !onDrain {
-		gcCleanups.executed.Add(int64(executed))
-		gcCleanups.discarded.Add(int64(uint64(b.n) - executed))
+		if dstBuild {
+			gcCleanups.executed.Add(int64(executed))
+			gcCleanups.discarded.Add(int64(uint64(b.n) - executed))
+		} else {
+			gcCleanups.executed.Add(int64(b.n))
+		}
 	}
 
 	atomic.Store(&b.n, 0) // Synchronize with markroot. See comment in cleanupBlockHeader.

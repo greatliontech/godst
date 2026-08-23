@@ -1565,7 +1565,8 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   this document records as deliberate, each entry citing its clause; an applicable entry that
   never fires is itself a failure (the stale-entry discipline of the conformance harness). A
   recorded DATA deviation admits exactly the symbols whose text differs as a pure consequence of
-  the recorded layout (block entry-count constants, GC mask construction) — the allowlist names
+  the recorded layout (block entry-count constants, GC mask construction, by-value passing of a
+  widened record) — the allowlist names
   those symbols explicitly against the recording clause, and each entry records the expected
   difference class for its symbol, so a diff of any other kind in an admitted symbol still
   fails; unrecorded CODE deviations are inadmissible. The corpus is pinned by a coverage
@@ -1578,8 +1579,11 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   build-constraint panic (`TestDSTRunRequiresBuildTag`), so the comparison never sees them
   unless a corpus program imports one — which the corpus therefore must not. Lands: when the differential untagged-inertness gate — an
   enforcing leg running this comparison — runs green. The named-anchor subset is enforced by
-  `TestDSTUntaggedCodeFootprint` (objdump at the panic, finalizer, NumCPU, generic-AddCleanup,
-  and goroutine-exit anchors); the synctest legs and `testing`'s framework-stream grant
+  `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
+  goroutine-exit, and finalizer/cleanup registration, queueing, and execution anchors; a
+  dst-named symbol reference in any form — data reference, call, or jump, plain or method — is
+  residue); the synctest legs and
+  `testing`'s framework-stream grant
   (`dstFrameworkStreamEnabled`) share the same constant-guard pattern. The anchor mechanism sees
   only `runtime.dst*` symbol references — residue expressed as bare field stores or loads of a
   non-dst-named variable is invisible to it and is pinned only by the differential gate.
@@ -1595,16 +1599,36 @@ same machine. The identical-output claim is bound by INV-VANILLA itself — the 
 by godst's `cmd/go` and `cmd/compile`, so any untagged output the toolchain's DST support
 changed would surface as a text diff — and shares INV-VANILLA's Lands: line.
 
+One further recorded CODE deviation class, admitted by name and difference class:
+
+- **Shared-helper extractions.** Where the bubble drain or the forced-cycle protocol must run the
+  same unsafe-critical body as a stock runtime goroutine, the body is extracted into a helper
+  both call rather than duplicated: the finalizer batch loop (`runFinqBlocks`, out of
+  `runFinalizers`), the cleanup batch loop (`runCleanupBlock`, out of `runCleanups`), finalizer
+  block allocation with its pointer-mask construction (`finAllocBlockLocked`, out of
+  `queuefinalizer`), and the forced GC cycle (`gcForce`, out of `GC`). Duplicating a
+  `reflectcall`-driving loop or GC-bitmap construction per build mode is the same
+  unsafe-critical duplication the data-layout limit above rejects, and this is the recorded
+  limit for code.
+  The admission is pairwise and checkable: the extracted helper's body is the stock loop modulo
+  its own prologue/epilogue, register assignment, and the recorded layout consequences, the
+  caller differs by the one call, and the pair's callee set — minus the extracted call, and
+  modulo calls that are themselves recorded-layout consequences (a write-barrier form chosen by
+  a widened record's size) — equals the stock symbol's. Any other call the stock body never
+  makes is residue, not extraction.
+
 The DATA layout is the recorded deviation set — NOT zero-footprint, deliberately, in every build:
 `g` carries the per-goroutine DST words (the identity/RNG stamps, the race-access staging
 fields, the sticky simulation-membership bit the scheduler classification keys on, the
 GC-internal simulation-membership save slot, and the scoped host-I/O grant flag), `p` carries the
-run-queue overflow flag, `timer` carries fake-timer state (arming host, full-width registration
+run-queue overflow flag and the staged finalizer special (the sweep-to-queue stamp hand-off
+that keeps `queuefinalizer`'s signature stock), `timer` carries fake-timer state (arming host, full-width registration
 epoch, list link, the overdue-conversion delivery shift, and the universe-base-time mark that
 excludes a timer from host-rate re-mapping), `synctestBubble` carries the GC-drain bookkeeping,
-`specialfinalizer` carries epoch+sequence+PID, `specialCleanup` carries epoch while its embedded
-cleanup carries sequence+PID, and `finalizer`/`cleanupFn` each carry registration sequence plus
-run-epoch/process-invocation ownership (so untagged builds fit slightly fewer entries per block).
+`specialfinalizer` carries epoch+sequence+PID, `specialCleanup`'s embedded cleanup carries
+sequence+epoch+PID, and `finalizer`/`cleanupFn` each carry registration sequence plus
+run-epoch/process-invocation ownership (so untagged builds fit slightly fewer entries per block,
+and `cleanupFn` — passed by value — spills more registers at its call boundaries).
 Outside the runtime, `os.file` carries the DST backend words and fd map slot, `os`'s unexported
 `root` the DST root pointer, and `testing`'s chatty printer the host-stream fd slot. Restoring the untagged
 layouts would fork per-tag variants of the runtime's central `g` struct and of hand-maintained GC

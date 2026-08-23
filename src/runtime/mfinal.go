@@ -93,7 +93,18 @@ func lockRankMayQueueFinalizer() {
 	lockWithRankMayAcquire(&finlock, getLockRank(&finlock))
 }
 
-func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype, dstEpoch uint64, dstSeq uintptr, dstPid int32) {
+func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
+	// The registration stamps arrive staged on the P by freeSpecial (see
+	// p.dstFinSpecial); take them first, before anything could move this
+	// goroutine off the P.
+	var (
+		dstEpoch uint64
+		dstSeq   uintptr
+		dstPid   int32
+	)
+	if dstBuild {
+		dstEpoch, dstSeq, dstPid = dstTakeStagedFinalizerStamps()
+	}
 	if gcphase != _GCoff {
 		// Currently we assume that the finalizer queue won't
 		// grow during marking so we don't have to rescan it
@@ -134,9 +145,11 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 	f.fint = fint
 	f.ot = ot
 	f.arg = p
-	f.dstSeq = dstSeq // carried from the special; the bubble drain sorts its batch by it
-	f.dstEpoch = dstEpoch
-	f.dstPid = dstPid
+	if dstBuild {
+		f.dstSeq = dstSeq // carried from the special; the bubble drain sorts its batch by it
+		f.dstEpoch = dstEpoch
+		f.dstPid = dstPid
+	}
 	finqueued++
 	unlock(&finlock)
 	if !deferred {
@@ -294,7 +307,9 @@ func runFinalizers() {
 // goroutine drives it.
 func runFinqBlocks(fb *finBlock) {
 	gp := getg()
-	onFing := gp == fing
+	// Untagged there is no other driver, so the discrimination folds to true
+	// and the body is the stock loop.
+	onFing := !dstBuild || gp == fing
 	// On the DST bubble drain, publish the chain being run (dstDrainingFinq) so
 	// a callback panic or Goexit — which abandons this frame — leaves the unrun
 	// remainder discoverable for the teardown discard (dstDiscardQueuedFinq).
@@ -427,8 +442,12 @@ func runFinqBlocks(fb *finBlock) {
 		next := fb.next
 		lock(&finlock)
 		if !onDrain {
-			finexecuted += executed
-			findiscarded += uint64(n) - executed
+			if dstBuild {
+				finexecuted += executed
+				findiscarded += uint64(n) - executed
+			} else {
+				finexecuted += uint64(n)
+			}
 		}
 		fb.next = finc
 		finc = fb

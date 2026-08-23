@@ -25,6 +25,11 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   steering — its own design). The gcStart twin is enforced; the assist twin
   survives every current suite when dropped. See
   [gc-assist-membership-carry-unenforced.md](gc-assist-membership-carry-unenforced.md).
+- **callback batch loops discriminate their driver two ways** — Lands: user
+  decision. `runFinqBlocks` compares against `fing`, `runCleanupBlock`
+  consults `findfunc`; one role mechanism would serve both and delete the
+  lookup from the tagged path. See
+  [callback-loop-driver-discrimination.md](callback-loop-driver-discrimination.md).
 - **enterSimulation's build-mode refusals share one shape** — Lands: user
   decision. The FIPS latch and the arenas-experiment check are one concept
   in two shapes. See

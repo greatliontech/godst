@@ -2124,9 +2124,9 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s.nret = nret
 	s.fint = fint
 	s.ot = ot
-	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
-	s.dstSeq = dstNextCallbackSeq() // per-run registration sequence for the drain's reg-order sort
-	s.dstPid = dstCallbackPid()
+	if dstBuild {
+		dstStampFinalizerSpecial(s)
+	}
 	if addspecial(p, &s.special, false) {
 		// This is responsible for maintaining the same
 		// GC-related invariants as markrootSpans in any
@@ -2174,8 +2174,6 @@ type specialCleanup struct {
 	cleanup cleanupFn
 	// Globally unique ID for the cleanup, obtained from mheap_.cleanupID.
 	id uint64
-	// dstEpoch is the DST ownership stamp; see specialfinalizer.dstEpoch.
-	dstEpoch uint64
 }
 
 // addCleanup attaches a cleanup function to the object. Multiple
@@ -2194,10 +2192,10 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	unlock(&mheap_.speciallock)
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
-	s.cleanup.dstSeq = dstNextCallbackSeq() // per-run registration sequence; carried into the queue for the drain's reg-order sort
-	s.cleanup.dstPid = dstCallbackPid()
 	s.id = id
-	s.dstEpoch = dstCallbackEpoch() // unconditional: fixalloc reuses specials, so a stale stamp must be overwritten
+	if dstBuild {
+		dstStampCleanupSpecial(s)
+	}
 
 	mp := acquirem()
 	addspecial(p, &s.special, true)
@@ -2803,7 +2801,10 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 	switch s.kind {
 	case _KindSpecialFinalizer:
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
-		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot, sf.dstEpoch, sf.dstSeq, sf.dstPid)
+		if dstBuild {
+			dstStageFinalizerSpecial(sf)
+		}
+		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
 		unlock(&mheap_.speciallock)
@@ -2832,7 +2833,7 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		// Cleanups, unlike finalizers, do not resurrect the objects
 		// they're attached to, so we only need to pass the cleanup
 		// function, not the object.
-		gcCleanups.enqueue(sc.cleanup, sc.dstEpoch)
+		gcCleanups.enqueue(sc.cleanup)
 		lock(&mheap_.speciallock)
 		mheap_.specialCleanupAlloc.free(unsafe.Pointer(sc))
 		unlock(&mheap_.speciallock)

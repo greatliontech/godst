@@ -123,17 +123,15 @@ func dstNetEpoch() uint64 {
 // (TestDSTUntaggedCodeFootprint pins the fold; a generic like AddCleanup
 // instantiates in user packages where dstActive does not inline, so such
 // guards lead with the exported constant). The DATA layout is not
-// zero-footprint, deliberately, in every build: g carries thirteen
-// per-goroutine DST words (identity/RNG stamps and race-access staging), p a
-// run-queue overflow flag, synctestBubble the drain bookkeeping,
-// specialfinalizer/specialCleanup epoch/seq words, and finalizer/cleanupFn one
-// registration-sequence word each. Splitting
-// those by build tag would fork the runtime's central g struct and the
-// hand-maintained GC bitmap constants (finalizer1's word pattern;
-// cleanupBlockPtrMask, whose two-per-byte packing is load-bearing on the
-// 4-word cleanupFn) into per-tag variants — an unsafe-critical duplication for
-// a few words per object (design.md, "Untagged footprint"). In a `-tags dst`
-// build the guard is true and this is the runtime seed load as before.
+// zero-footprint, deliberately, in every build; the recorded deviation set
+// (which struct carries which DST words) has one home, design.md's
+// "Untagged footprint (contract)", and is not repeated here. The mechanism
+// reason it is not split by build tag: that would fork the runtime's central
+// g struct and the hand-maintained GC bitmap constants (finalizer1's word
+// pattern; cleanupBlockPtrMask, whose packing is load-bearing on the cleanupFn
+// layout) into per-tag variants — an unsafe-critical duplication for a few
+// words per object. In a `-tags dst` build the guard is true and this is the
+// runtime seed load as before.
 // (dstSeed is never set without dstBuild anyway: simulation.Run requires the
 // tag, and dstActivate is an unexported test-only linkname.)
 //
@@ -3382,4 +3380,56 @@ func dstGdestroy(gp *g) {
 	// foreign goroutine with a stale nonzero dstSeq silently no-ops the
 	// stable-index assignment paths that key on dstSeq == 0.
 	dstClearSchedState(gp)
+}
+
+// dstStampFinalizerSpecial records the DST ownership stamps on a finalizer
+// special at registration (SetFinalizer): run epoch, per-run registration
+// sequence, and owning process invocation. Unconditional within a dst build
+// — fixalloc reuses specials and addfinalizer assigns fields individually, so
+// a stale stamp must be overwritten even when no run is active (the helpers
+// then return 0). Called from addfinalizer under dstBuild only.
+func dstStampFinalizerSpecial(s *specialfinalizer) {
+	s.dstEpoch = dstCallbackEpoch()
+	s.dstSeq = dstNextCallbackSeq() // the drain sorts its batch by registration order
+	s.dstPid = dstCallbackPid()
+}
+
+// dstStampCleanupSpecial is dstStampFinalizerSpecial's cleanup twin: the
+// stamps ride the embedded cleanupFn so they travel into the queue record
+// unchanged (addCleanup's whole-struct `s.cleanup = c` already cleared any
+// stale stamp, so here the overwrite is for value, not staleness). Called
+// from addCleanup under dstBuild only.
+func dstStampCleanupSpecial(s *specialCleanup) {
+	s.cleanup.dstEpoch = dstCallbackEpoch()
+	s.cleanup.dstSeq = dstNextCallbackSeq()
+	s.cleanup.dstPid = dstCallbackPid()
+}
+
+// dstStageFinalizerSpecial stages sf on the current P for the
+// stock-signature queuefinalizer call that immediately follows in
+// freeSpecial (see p.dstFinSpecial). The P cannot change before the take:
+// freeSpecial runs only inside mspan.sweep, which asserts preemption is off
+// at its head. A missing P or an occupied stage is a broken invariant, not
+// a case to tolerate.
+func dstStageFinalizerSpecial(sf *specialfinalizer) {
+	pp := getg().m.p.ptr()
+	if pp == nil {
+		throw("dstStageFinalizerSpecial: no P")
+	}
+	if pp.dstFinSpecial != nil {
+		throw("dstStageFinalizerSpecial: stage already occupied")
+	}
+	pp.dstFinSpecial = sf
+}
+
+// dstTakeStagedFinalizerStamps is queuefinalizer's side of the staging:
+// returns the staged special's ownership stamps and clears the stage.
+func dstTakeStagedFinalizerStamps() (epoch uint64, seq uintptr, pid int32) {
+	pp := getg().m.p.ptr()
+	if pp == nil || pp.dstFinSpecial == nil {
+		throw("dstTakeStagedFinalizerStamps: nothing staged")
+	}
+	sf := pp.dstFinSpecial
+	pp.dstFinSpecial = nil
+	return sf.dstEpoch, sf.dstSeq, sf.dstPid
 }

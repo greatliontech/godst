@@ -846,6 +846,15 @@ type p struct {
 	// runq. Owner-P access only, like the ring; flushed to the global runq at
 	// dstDeactivate. Empty in non-DST operation.
 	dstRunqOvf gQueue
+	// dstFinSpecial stages the finalizer special whose stamps queuefinalizer
+	// must read: freeSpecial sets it immediately before its stock-signature
+	// call and queuefinalizer takes it as its first statement. The edge
+	// cannot change P because every freeSpecial call sits inside
+	// mspan.sweep, which asserts preemption is off (m.locks/mallocing/g0 at
+	// its head) for the whole sweep — that assertion, not the call shape, is
+	// what this staging relies on. Keeps queuefinalizer's signature stock so
+	// the untagged call site is stock text; unused when DST off.
+	dstFinSpecial *specialfinalizer
 
 	// Available G's (status == Gdead)
 	gFree gList

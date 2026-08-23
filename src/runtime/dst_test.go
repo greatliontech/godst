@@ -2552,6 +2552,14 @@ func main() {
 		{"runtime.GC$", false},       // the foreign-caller refusal folds; GC may inline into callers
 		{"runtime.gcForce$", true},   // the forced-cycle protocol behind GC
 		{"runtime.gdestroy$", true},  // the per-g DST clear + drain unhook fold into one gated call
+		{"runtime.addfinalizer$", true},                 // registration stamps fold into one gated call
+		{"runtime.addCleanup$", true},                   // same, cleanup twin
+		{"runtime.queuefinalizer$", true},               // queue-time stamping and routing fold
+		{"runtime.freeSpecial$", true},                  // the sweep-side caller of both queue paths
+		{`runtime\.\(\*cleanupQueue\)\.enqueue$`, true}, // cleanup queue routing folds
+		{"runtime.runCleanups$", true},                  // worker-park check folds
+		{"runtime.runCleanupBlock$", true},              // per-block ownership checks fold
+		{"runtime.runFinqBlocks$", true},                // the shared finalizer batch loop
 	} {
 		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
 		out, err := cmd.CombinedOutput()
@@ -2564,8 +2572,21 @@ func main() {
 			}
 			continue
 		}
-		if strings.Contains(string(out), "runtime.dst") {
-			t.Errorf("untagged %s references runtime.dst symbols:\n%s", probe.pattern, out)
+		// Residue is any reference to a dst-named symbol: a data reference
+		// (runtime.dstRunEpoch(SB) in a MOVQ/LEAQ) or a call/jump target in
+		// either form — plain (runtime.dstX) or a method on a runtime type
+		// (runtime.(*T).dstX). The position column (dst.go:NNN) is stripped
+		// before matching so a dst.go-homed inlined body cannot false-positive.
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			text := strings.Join(fields[3:], " ")
+			branch := strings.HasPrefix(text, "CALL ") || strings.HasPrefix(text, "JMP ")
+			if strings.Contains(text, "runtime.dst") || branch && strings.Contains(text, "dst") {
+				t.Errorf("untagged %s references a dst symbol: %s", probe.pattern, strings.TrimSpace(line))
+			}
 		}
 	}
 }
