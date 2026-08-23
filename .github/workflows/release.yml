@@ -102,6 +102,15 @@ jobs:
           DIST_VERSION: ${{ needs.verify.outputs.tag }}
       - name: Extracted distribution tagged smoke
         run: task smoke:dist
+      - name: Extracted distribution installs (versioned prefix, pinned launcher, reinstall)
+        run: |
+          set -eu
+          t="pkg/distpack/${{ needs.verify.outputs.tag }}.linux-${{ matrix.goarch }}.tar.gz"
+          task install "PREFIX=$RUNNER_TEMP/installcheck" "TARBALL=$t"
+          v=$("$RUNNER_TEMP/installcheck/bin/go" version | awk '{print $3}')
+          [ "$v" = "${{ needs.verify.outputs.tag }}" ] || { echo "launcher reports $v"; exit 1; }
+          task install "PREFIX=$RUNNER_TEMP/installcheck" "TARBALL=$t"
+          [ "$(readlink "$RUNNER_TEMP/installcheck/godst/current")" = "$RUNNER_TEMP/installcheck/godst/${{ needs.verify.outputs.tag }}" ] || { echo "current does not point at the installed version after reinstall"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: distpack-linux-${{ matrix.goarch }}

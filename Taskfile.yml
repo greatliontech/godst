@@ -305,6 +305,84 @@ tasks:
         cd "$DIST_GOROOT/src"
         $G "$DIST_GOROOT/bin/go" test -tags dst -short -count=1 -timeout 20m testing/simulation
 
+  # The local install (releases.md, "Installation" — the rationale lives
+  # there; this comment carries only the mechanics that keep it safe).
+  # Ordering is the invariant: the extraction is validated in a staging dir
+  # (verify:dist AND smoke:dist — the same pair the release workflow runs)
+  # BEFORE anything visible changes, `current` flips only between complete
+  # trees, and the old tree is deleted only after the flip. On a
+  # same-version reinstall the new tree first lands beside the old under a
+  # transient name and `current` flips to it, so a working toolchain exists
+  # on disk at every instant; the final rename-and-reflip leaves `current`
+  # dangling only between two syscalls, and an interrupt there is healed by
+  # rerunning install (the validated tree is already at its final path —
+  # use TARBALL= or a hand `ln -sfn` if the dangling launcher was the only
+  # go on PATH, since the default path needs a bootstrap go). Interrupted
+  # installs may leave a transient tree; the next install sweeps any not
+  # referenced by `current`. Concurrent installs into one prefix are not
+  # supported.
+  # The launcher is a script, not a symlink, because GOTOOLCHAIN=local must
+  # be baked in — the installed fork always runs, and a project requiring a
+  # newer base errors loudly instead of silently switching toolchains — and
+  # it clears GOROOT for the same reason (an exported GOROOT would redirect
+  # the launcher to another toolchain's runtime; empty means the go command
+  # derives it from its own resolved location). It execs through `current`,
+  # so upgrades touch no launcher. TARBALL and a non-absolute PREFIX are
+  # resolved/refused against the repo root — the task runs there, not in
+  # the caller's cwd.
+  install:
+    desc: 'Install this clone as the primary go: task install [PREFIX=<absolute dir, default ~/.local>] [TARBALL=<binary tarball>] — versioned prefix, validated before the current flip, single pinned `go` launcher'
+    cmds:
+      - |
+        set -eu
+        prefix='{{.PREFIX}}'
+        [ -n "$prefix" ] || prefix="$HOME/.local"
+        case "$prefix" in /*) ;; *) echo "PREFIX must be an absolute path (got '$prefix'; note: shells do not tilde-expand inside PREFIX=~/...)"; exit 1;; esac
+        tarball='{{.TARBALL}}'
+        if [ -z "$tarball" ]; then
+          echo "building the distribution (make.bash -distpack)..."
+          (cd {{.ROOT_DIR}}/src && ./make.bash -distpack)
+          ver=$(head -1 {{.ROOT_DIR}}/VERSION)
+          goos=$(GOROOT={{.ROOT_DIR}} GOTOOLCHAIN=local {{.ROOT_DIR}}/bin/go env GOOS)
+          goarch=$(GOROOT={{.ROOT_DIR}} GOTOOLCHAIN=local {{.ROOT_DIR}}/bin/go env GOARCH)
+          tarball="{{.ROOT_DIR}}/pkg/distpack/$ver.$goos-$goarch.tar.gz"
+        fi
+        [ -f "$tarball" ] || { echo "no binary tarball at $tarball"; exit 1; }
+        # The DIST_VERSION assert below is a structural guard on the
+        # rm -rf further down: an oddly named tarball yields a ver the
+        # extraction cannot report, so the install dies before any
+        # destructive step.
+        b=$(basename "$tarball" .tar.gz); ver=${b%.*}
+        # Sweep residue an interrupted earlier install left behind —
+        # anything transient (.staging.*, *.next.*) that current does not
+        # resolve to. A trap cannot own the .next tree (after the flip it
+        # IS the live tree), so the next install sweeps instead.
+        cur=$(readlink "$prefix/godst/current" 2>/dev/null || true)
+        for d in "$prefix/godst"/.staging.* "$prefix/godst"/*.next.*; do
+          [ -e "$d" ] || continue
+          [ "$d" = "$cur" ] || rm -rf "$d"
+        done
+        staging="$prefix/godst/.staging.$$"
+        trap 'rm -rf "$staging"' EXIT
+        task --taskfile {{.ROOT_DIR}}/Taskfile.yml dist:extract "TARBALL=$tarball" "DEST=$staging"
+        DIST_GOROOT="$staging/go" DIST_VERSION="$ver" task --taskfile {{.ROOT_DIR}}/Taskfile.yml verify:dist
+        DIST_GOROOT="$staging/go" task --taskfile {{.ROOT_DIR}}/Taskfile.yml smoke:dist
+        dest="$prefix/godst/$ver"
+        next="$dest.next.$$"
+        mv "$staging" "$next"
+        ln -sfn "$next" "$prefix/godst/current"
+        rm -rf "$dest"
+        mv "$next" "$dest"
+        ln -sfn "$dest" "$prefix/godst/current"
+        mkdir -p "$prefix/bin"
+        printf '#!/bin/sh\nGOROOT= GOTOOLCHAIN=local exec "%s/godst/current/go/bin/go" "$@"\n' "$prefix" > "$prefix/bin/.go.$$"
+        chmod +x "$prefix/bin/.go.$$"
+        mv -f "$prefix/bin/.go.$$" "$prefix/bin/go"
+        ln -sfn "$prefix/godst/current/go/bin/gofmt" "$prefix/bin/gofmt"
+        echo "installed $ver at $dest"
+        echo "launcher: $prefix/bin/go (GOTOOLCHAIN=local baked in, GOROOT cleared; ensure it precedes any other go on PATH)"
+        [ "$(command -v go || true)" = "$prefix/bin/go" ] || echo "note: 'go' on PATH currently resolves to $(command -v go || echo nothing), not the launcher"
+
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
     dir: src

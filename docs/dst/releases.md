@@ -353,8 +353,50 @@ Each release carries, as GitHub Release assets:
 - `SHA256SUMS`.
 
 A binary tarball extracts to `go/` (upstream's layout). Consumers run the
-extracted `go/bin/go` with `GOTOOLCHAIN=local` and `-tags dst`; the asset
-names and the tag are the consumer contract.
+extracted `go/bin/go` with `GOTOOLCHAIN=local` (and `-tags dst` for
+simulation builds); the asset names and the tag are the consumer
+contract. The Installation section below is the packaged form of exactly
+this contract.
+
+## Installation
+
+From a clone (a development machine): `task install` builds the
+distribution with upstream's own packaging, installs it under
+`<prefix>/godst/<version>/` (`PREFIX=<absolute dir>` overrides the
+`~/.local` default), validates the extracted artifact — `verify:dist` and
+`smoke:dist`, the same pair the release workflow runs — and only then
+flips `<prefix>/godst/current` to the new version and writes the
+launcher: a broken build never becomes the active toolchain, and a
+working toolchain exists on disk at every instant of an upgrade (the
+`current` link's flip windows are two syscalls; an interrupted install is
+healed by rerunning it, and leftover transient trees are swept by the
+next install).
+`TARBALL=<release asset>` installs a downloaded binary tarball instead of
+building (relative paths resolve against the repo root). The install task
+is Linux-scoped like the rest of the tooling; on Linux the go command
+resolves its executable path through symlinks, so `GOROOT` lands on the
+versioned directory and a build already running is immune to a
+concurrent upgrade.
+
+The launcher at `<prefix>/bin/go` is a single `go` serving both modes —
+untagged it is the upstream toolchain (design.md, "Untagged footprint
+(contract)"), `-tags dst` it is the simulation — with `GOTOOLCHAIN=local`
+baked in and `GOROOT` cleared: the installed fork always runs — a
+project whose `go.mod` requires a newer base errors loudly instead of
+silently switching to a downloaded upstream toolchain (which would drop
+DST support mid-workflow), and an exported `GOROOT` cannot redirect the
+launcher to another toolchain's runtime. Everything else (`GOFLAGS`, the
+go env file, `GOPATH`) applies normally — a primary `go` honors
+`go env -w`. There is deliberately no separate `godst` entry point. The
+launcher execs through `current`, so upgrades touch no launcher; the go
+command derives `GOROOT` from its own resolved location. `gofmt` is
+linked alongside.
+
+Without a clone: extract a release binary tarball anywhere and create the
+same launcher by hand (`chmod +x` it) —
+
+    #!/bin/sh
+    GOROOT= GOTOOLCHAIN=local exec <extraction>/go/bin/go "$@"
 
 ## Configurations the matrix does not cover
 

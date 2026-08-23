@@ -27,6 +27,8 @@ toolchain would redirect this `go` to that toolchain's runtime. Under the
 default `GOTOOLCHAIN=auto`, a module whose `go` directive is newer than this
 toolchain's version makes the go command fetch and switch to a stock
 toolchain, silently bypassing the simulation; `local` forbids the switch.
+`task install` packages both pins into a single installed `go` launcher —
+see releases.md, "Installation".
 Releases, the version scheme, and the download assets are specified in
 [dst/releases.md](dst/releases.md).
 
