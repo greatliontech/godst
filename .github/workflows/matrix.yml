@@ -46,11 +46,14 @@ jobs:
         include:
           # arm64 breadth: the published-but-untested-untagged gap. The dst
           # legs stay amd64 until the simulation's arm64 qualification is its
-          # own scheduled work; untagged inertness and std behavior run on
-          # both published platforms.
+          # own scheduled work; untagged inertness, std behavior, and the
+          # INV-VANILLA differential gate (which carries an arm64
+          # normalization profile) run on both published platforms.
           - leg: test:untagged
             runner: ubuntu-24.04-arm
           - leg: test:inert-std
+            runner: ubuntu-24.04-arm
+          - leg: test:inert-diff
             runner: ubuntu-24.04-arm
     name: ${{ matrix.leg }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}

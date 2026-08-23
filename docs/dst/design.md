@@ -1599,16 +1599,55 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   indexed immediate stores are admitted as the extracted loops' array-element clears.
   Extraction helpers are checked pairwise against the stock symbol (caller minus the
   extraction call plus helper, callee sets over the pair), the non-generic admitted runtime
-  symbols additionally pin their exact instruction-count delta (deterministic per base;
-  re-measured under review at a port — a mimicking store still adds a line and trips the pin),
-  and every fence-wrapper split body must be linked by the corpus and instruction-identical to
-  its stock counterpart (the morestack self-jump comparing under the stock name). Split
-  wrappers may touch only registers and their own stack frame; equality-function bodies admit
-  no store and no dst reference. The remaining recorded blind spot: within GENERIC admitted
-  instantiations and the availability class, a residue store that mimics an existing store
-  shape inside the numeric bound is beyond this gate; those hooks stay covered by the
-  footprint anchors and review. The gate is amd64-only until the arm64
-  matrix work tunes those heuristics.
+  symbols additionally pin their exact instruction-count delta (deterministic per base and per
+  architecture; re-measured under review at a port — a mimicking store still adds a line and
+  trips the pin), and every fence-wrapper split body must be linked by the corpus and
+  instruction-identical to its stock counterpart (the morestack self-jump comparing under the
+  stock name). Split wrappers may touch only registers and their own stack frame;
+  equality-function bodies admit no store and no dst reference. The remaining recorded blind
+  spot: within GENERIC admitted instantiations and the availability class, a residue store
+  that mimics an existing store shape inside the numeric bound is beyond this gate; those
+  hooks stay covered by the footprint anchors and review.
+  The gate is enforced on amd64 and arm64 through per-architecture normalization profiles —
+  the comparison rules are shared, the profile teaches them each register model's shapes. The
+  arm64 profile: operand masking covers decimal displacements and immediates and unifies the
+  two displacement spellings (a zero displacement prints as a bare `(Rn)`), so the
+  large-offset store sequence the widened layouts force through the assembler temp
+  (`ADD $off, Rn, R27`; store through `(R27)`) pairs against stock's direct store under
+  register-rename cancelling; each `ADRP` page reference folds into the IMMEDIATELY following
+  access as the ADDR marker (arm64 objdump never symbolizes data operands, and page offsets
+  flip sign with layout), so an unpaired folded global access is rejected like amd64's
+  RIP-relative forms — with two recorded arm64-only softenings: an access separated from its
+  `ADRP` by other instructions keeps a plain register base and is scored as an ordinary
+  store/load word under conservation rather than hitting the global rejection (folding across
+  intervening instructions would risk misattributing a jumped-into field access as a global),
+  and an address-taken global (`ADRP` with no following access — a lock address passed to a
+  call) is exempt address arithmetic exactly like amd64's LEA; `NOOP` lines and zero-word
+  alignment padding are excluded like amd64's NOPs, while a non-zero encoding objdump cannot
+  decode compares by its byte encoding on BOTH architectures (arm64's LSE atomics, amd64's
+  AVX-512 prefixes), and an UNMATCHED undecodable line — which may be an atomic RMW on
+  residue state — is rejected by the universal bound and by the per-register class rule,
+  while the aggregate class rule cancels undecodables pairwise across the sides and charges
+  the fork-side excess as stores (a stock-side excess grants nothing); the
+  rename-maskable registers are R0–R27 and the FP/SIMD banks, with ZR and the role registers
+  (R28 = g, R29 = FP, R30 = LR) kept distinct — g-relative accesses therefore compare
+  exactly. The field-clear signature is a ZR-source store to a plain displacement (arm64
+  cannot store an immediate; any other constant routes through a register), and
+  `STP (ZR, ZR)` pair-zeroing is class latitude with the recorded blind spot that a hook
+  clearing two ADJACENT fields merges into it — the mirror of amd64's X15 zeroing admission.
+  The class store rule on arm64 is aggregate conservation — fork-side unmatched store words
+  may not exceed stock-side unmatched store words plus fork-side unmatched load words —
+  where amd64 uses the per-register copy-word rule: arm64 record writes reshape freely
+  between STP pairs fed by live argument registers and spill-slot round-trips, so the
+  per-register form rejects legitimate reshapes; conservation still fails residue, which
+  adds stores, and the exact-delta pins back it up FOR THE PINNED SET — the eight non-generic
+  admitted runtime symbols. The unpinned admitted symbols (the generic AddCleanup
+  instantiations and the availability class) are protected by the conservation bound alone,
+  with zero slack measured at derivation; they sit inside the generic blind spot this
+  section already records. The arm64 deltas: addCleanup −1,
+  enqueue 7, freeSpecial 2, gcinit 21; pairs runFinalizers −6, GC 12, runCleanups 17,
+  queuefinalizer 22. The gettimeofday fence-wrapper split is linux/amd64 assembly and is
+  outside the arm64 profile's split class (its allowlist entries would be stale there).
   The named-anchor subset is enforced by
   `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
   goroutine-exit, finalizer/cleanup registration, queueing, and execution, and fence-wrapper
@@ -1769,7 +1808,9 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
 - **`test:inert-diff`** (`TestUntaggedTextIdenticalToStock`, `-tags dst`, non-short): the
   INV-VANILLA differential gate — the probe corpus built untagged by this toolchain and by the
   upstream base toolchain (from `DST_STOCK_GOROOT` or the host go), whole-binary text compared
-  under the recorded deviation classes. Per-PR in ci.yml and in the nightly matrix; amd64-only.
+  under the recorded deviation classes. Per-PR in ci.yml (amd64) and in the nightly matrix on
+  both amd64 and arm64 runners; the gate compares the native architecture and carries
+  per-architecture normalization profiles for both.
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the six fast legs
   sequentially and fail-fast. Per-PR in ci.yml and in the nightly matrix.
