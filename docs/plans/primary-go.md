@@ -54,7 +54,7 @@ plan conforms code and CI to.
   arch skip widened to the tuned set, and the matrix's arm64 axis runs it.
 - [x] 11. Nightly `go tool dist test` leg in matrix on amd64 and arm64,
   untagged; environment-red tests skipped by explicit name with citation.
-- [ ] 12. Release workflow validates the extracted distpack binary tarball:
+- [x] 12. Release workflow validates the extracted distpack binary tarball:
   untagged version/build/test use plus the tagged smoke, run from the
   extraction rather than the checkout.
 - [ ] 13. Port cadence tooling: upstream tag-watch workflow, post-commit port
