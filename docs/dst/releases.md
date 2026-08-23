@@ -227,7 +227,8 @@ The maintenance line thus starts at a validated, released state.
 ## Cutting a release
 
 1. The full enforcing matrix (design.md "Enforcing test configurations":
-   `task test`, `task test:inert-std`, `task test:cross`) is green on the
+   `task test`, `task test:inert-std`, `task test:inert-diff`,
+   `task test:cross`) is green on the
    candidate commit, as a run of the `matrix` workflow on that commit. A red
    leg blocks.
 2. The release commit is made on top of the candidate and changes only
@@ -245,7 +246,7 @@ Workflows under `.github/workflows`:
 
 - **`ci`** — on pull requests and pushes to `main` and `release-go1.*`:
   build the toolchain, both-mode `std` builds, the legs cheap enough for a
-  pull-request gate (`test:untagged`, `test:cross`, and `test:inert-diff` —
+  pull-request gate (`test:untagged`, `test:cross`, `test:api`, and `test:inert-diff` —
   the INV-VANILLA differential gate against the upstream base toolchain,
   which the workflow installs), and a tree check that
   no build artifact is committed: no tracked linked executable (ELF

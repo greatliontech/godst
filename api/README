@@ -24,3 +24,9 @@ that will be preserved when next/*.txt is concatenated into go1.XX.txt.)
 
 When you add a file to the api/next directory, you must add at least one file
 under doc/next. See doc/README.md for details.
+
+go1-godst.txt is godst's own exported std API (the testing/simulation
+package): not an upstream file, not frozen by an upstream release, and its
+entries carry no proposal numbers — the reviewed file itself is the
+approval record. docs/dst/design.md is the behavioral contract; the
+test:api Taskfile leg enforces this file.

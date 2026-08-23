@@ -26,7 +26,7 @@ jobs:
       - name: Both build modes
         run: GOTOOLCHAIN=local task build:both
       - name: Fast legs
-        run: GOTOOLCHAIN=local task test:untagged test:cross
+        run: GOTOOLCHAIN=local task test:untagged test:cross test:api
       - name: Upstream base toolchain for the differential gate
         id: base
         run: |

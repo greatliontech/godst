@@ -1153,6 +1153,13 @@ func needApproval(filename string) bool {
 	if name == "go1.txt" {
 		return false
 	}
+	if name == "go1-godst.txt" {
+		// godst's own exported std API (testing/simulation). There are no
+		// upstream proposal numbers to cite; the file itself is the reviewed
+		// approval record, so entries are exempt like go1.txt's pre-tracking
+		// corpus. An UNLISTED addition still fails the check.
+		return false
+	}
 	minor := strings.TrimSuffix(strings.TrimPrefix(name, "go1."), ".txt")
 	n, err := strconv.Atoi(minor)
 	if err != nil {

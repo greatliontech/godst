@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [test:untagged, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:inert-diff, test:cross]
+        leg: [test:untagged, test:api, test:dst, test:dst-race, test:determinism, test:conformance, test:inert-std, test:inert-diff, test:cross]
     name: ${{ matrix.leg }}
     runs-on: ubuntu-latest
     timeout-minutes: 300

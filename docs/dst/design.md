@@ -1745,12 +1745,23 @@ authoritative statement of its leg, and the `go test` command in the Taskfile is
   outside the harness — a differential leg requires a host counterpart for every op, and host
   power-loss cannot be injected — so the sim-side tear model remains pinned by its unit suites,
   not by this leg.
+- **`test:api`** (`go test cmd/api -check`, untagged): the exported-API gate — upstream's
+  `api/go1.N.txt` corpus plus `api/go1-godst.txt`, godst's own exported std surface (the
+  `testing/simulation` package; this document is the behavioral contract, the api file the
+  compatibility surface). An unlisted addition or a removed listed symbol fails; additions
+  land in the file deliberately, reviewed like any change set. Scope: `cmd/api` walks
+  untagged contexts only, so the file pins the untagged surface; the tagged surface is pinned
+  by compile-time signature assertions in the package's own tagged tests — the one dst-only
+  export (`HostFS`, invisible to the api file) and `HostIP` (whose tagged twin could drift
+  from the untagged one the api file pins) — and the tagged-context gate gap is a filed
+  issue. In the `test` aggregate,
+  per-PR in ci.yml, and in the matrix.
 - **`test:inert-diff`** (`TestUntaggedTextIdenticalToStock`, `-tags dst`, non-short): the
   INV-VANILLA differential gate — the probe corpus built untagged by this toolchain and by the
   upstream base toolchain (from `DST_STOCK_GOROOT` or the host go), whole-binary text compared
   under the recorded deviation classes. Per-PR in ci.yml and in the nightly matrix; amd64-only.
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
-  of std. Heavy; runs separately from the `test` aggregate, which runs the five fast legs
+  of std. Heavy; runs separately from the `test` aggregate, which runs the six fast legs
   sequentially and fail-fast.
 - **`test:cross`** (`GOOS=windows GOARCH=amd64` and `GOOS=plan9 GOARCH=amd64`, each
   `CGO_ENABLED=0 go build std`, untagged): ordinary standard-library builds remain valid for the

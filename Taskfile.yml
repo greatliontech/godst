@@ -38,9 +38,10 @@ tasks:
     cmds:
       - mkdir -p {{.ROOT_DIR}}/.tmp
   test:
-    desc: The fast enforcing legs (untagged, dst, dst-race, determinism, conformance), sequential and fail-fast; test:inert-std runs separately
+    desc: The fast enforcing legs (untagged, api, dst, dst-race, determinism, conformance), sequential and fail-fast; test:inert-std runs separately
     cmds:
       - task: test:untagged
+      - task: test:api
       - task: test:dst
       - task: test:dst-race
       - task: test:determinism
@@ -90,6 +91,13 @@ tasks:
     deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -tags dst -count=1 -timeout 30m testing/simulation/conformance'
+
+  test:api:
+    desc: Exported std API check — upstream's api/go1.N.txt corpus plus godst's own api/go1-godst.txt (testing/simulation)
+    dir: src
+    deps: [tmpdir]
+    cmds:
+      - '{{.RUN}} test -count=1 cmd/api -check'
 
   test:inert-diff:
     desc: INV-VANILLA differential gate — untagged probe-corpus text vs the upstream base toolchain (design.md, "Untagged footprint")
