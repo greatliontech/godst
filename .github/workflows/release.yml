@@ -3,8 +3,9 @@
 # VERSION equals the tag, the counter is unused elsewhere, the release commit
 # changes only VERSION, the release commit's parent has a green `matrix`
 # run), builds each published platform natively with upstream's own
-# packaging (make.bash -distpack), smoke-tests the built toolchain under
-# -tags dst, and publishes the assets.
+# packaging (make.bash -distpack), validates the EXTRACTED binary tarball
+# (untagged version/build/test use plus the tagged smoke — the artifact
+# consumers download, not the checkout), and publishes the assets.
 name: release
 
 on:
@@ -81,14 +82,22 @@ jobs:
       - uses: ./.github/actions/build-toolchain
         with:
           distpack: 'true'
-      - name: Built toolchain reports the tag
+      # Validation runs against the EXTRACTED binary tarball — the artifact
+      # consumers download — not the checkout it was packed from: a distpack
+      # packaging omission is invisible to any checkout-based check. The
+      # extraction step itself asserts the published asset name.
+      - name: Extract the binary distribution
         run: |
           set -eu
-          got=$(GOTOOLCHAIN=local GOROOT=$GITHUB_WORKSPACE bin/go version | awk '{print $3}')
-          [ "$got" = "${{ needs.verify.outputs.tag }}" ] || { echo "built toolchain reports $got"; exit 1; }
           ls -l pkg/distpack
-      - name: Tagged smoke
-        run: GOTOOLCHAIN=local task smoke
+          task dist:extract "TARBALL=pkg/distpack/${{ needs.verify.outputs.tag }}.linux-${{ matrix.goarch }}.tar.gz" "DEST=$RUNNER_TEMP/distcheck"
+          echo "DIST_GOROOT=$RUNNER_TEMP/distcheck/go" >> "$GITHUB_ENV"
+      - name: Extracted distribution reports the tag, builds, and tests untagged
+        run: task verify:dist
+        env:
+          DIST_VERSION: ${{ needs.verify.outputs.tag }}
+      - name: Extracted distribution tagged smoke
+        run: task smoke:dist
       - uses: actions/upload-artifact@v4
         with:
           name: distpack-linux-${{ matrix.goarch }}

@@ -13,7 +13,11 @@
 #
 # Every command runs as `GOROOT={{.ROOT_DIR}} ...`: an exported GOROOT in
 # the developer's environment would otherwise redirect every leg to another
-# toolchain's runtime — green exit codes, vacuous run. Every command except
+# toolchain's runtime — green exit codes, vacuous run. (One deliberate
+# inversion: the dist-validation tasks UNSET GOROOT — there the consumer
+# invocation of an extracted distribution is itself the thing under test.
+# The space-free-path assumption below extends to their $G prefix and to
+# dist:extract's TARBALL/DEST values.) Every command except
 # the cmd legs also pins `TMPDIR={{.ROOT_DIR}}/.tmp` (via the RUN var) to
 # keep the heavy build/test temp trees on the gitignored on-disk .tmp/ at
 # the repo root, because the std leg's parallel build trees plus accumulated
@@ -224,15 +228,77 @@ tasks:
       - '{{.RUN}} build std'
       - '{{.RUN}} build -tags dst std'
 
-  # The release workflow's smoke of a freshly built toolchain — tagged,
-  # -short (the sweeps skip), enough to prove the simulation starts and the
-  # dst_* files compiled into the packaged toolchain. Not a gate leg.
-  smoke:
-    desc: Tagged -short testing/simulation against the built toolchain
-    dir: src
-    deps: [tmpdir]
+  # The release workflow's validation of an EXTRACTED binary distribution —
+  # the artifact consumers download, not the checkout it was packed from
+  # (a distpack packaging omission is invisible to any checkout-based
+  # check). Both tasks run the consumer invocation: the extracted bin/go
+  # with GOROOT deliberately UNSET (auto-detection from the binary's
+  # location is part of the consumer contract, releases.md "Distribution").
+  # The shared per-run env prefix ($G in each block):
+  #   - GOENV=off + explicit GOFLAGS=/GOEXPERIMENT=/GOOS=/GOARCH=/GOWORK=off:
+  #     `env -u` alone does NOT neutralize these — the go env file
+  #     (~/.config/go/env) supplies them when the process env doesn't, so a
+  #     developer's `go env -w GOFLAGS=...` would silently redirect the
+  #     validation. GOROOT cannot be persisted there; -u suffices for it.
+  #   - GOCACHE in the per-run temp tree: this fork's tool IDs are
+  #     version-derived, so the extraction's compiler is indistinguishable
+  #     from the checkout's to a shared build cache (GOROOT package dirs are
+  #     deliberately not hashed into action IDs) — a shared cache would serve
+  #     checkout-built objects and never execute the extraction's tools,
+  #     vacuously passing exactly the packaging faults these tasks exist to
+  #     catch. The cold build is the check.
+  # Not gate legs.
+  dist:extract:
+    desc: 'Extract a distpack binary tarball for validation: task dist:extract TARBALL=pkg/distpack/goX.Y.Z-dst.N.<os>-<arch>.tar.gz DEST=<dir>; then DIST_GOROOT=<dir>/go'
+    preconditions:
+      - sh: test -n "{{.TARBALL}}" && test -n "{{.DEST}}"
+        msg: 'usage: task dist:extract TARBALL=<binary tarball> DEST=<dir>'
     cmds:
-      - '{{.RUN}} test -tags dst -short -count=1 -timeout 20m testing/simulation'
+      - |
+        set -eu
+        mkdir -p {{.DEST}}
+        # A reused DEST would MERGE extractions: leftovers from an earlier
+        # tarball can supply files the tarball under test omits — masking
+        # exactly the packaging-omission class the validation exists for.
+        [ -z "$(ls -A {{.DEST}})" ] || { echo "DEST {{.DEST}} is not empty; extraction must land in a fresh directory"; exit 1; }
+        tar -C {{.DEST}} -xzf {{.TARBALL}}
+        test -x {{.DEST}}/go/bin/go
+
+  verify:dist:
+    desc: Untagged version, build, and test use of an extracted distribution (DIST_GOROOT=<extraction>/go; DIST_VERSION asserts the version string)
+    cmds:
+      - |
+        set -eu
+        [ -n "${DIST_GOROOT:-}" ] || { echo "DIST_GOROOT must point at an extracted distribution's go/ directory"; exit 1; }
+        t=$(mktemp -d)
+        trap 'rm -rf "$t"' EXIT
+        G="env -u GOROOT GOENV=off GOFLAGS= GOEXPERIMENT= GOOS= GOARCH= GOWORK=off GOTOOLCHAIN=local TMPDIR=$t GOCACHE=$t/gocache"
+        vline=$($G "$DIST_GOROOT/bin/go" version)
+        got=${vline#go version }; got=${got%% *}
+        if [ -n "${DIST_VERSION:-}" ] && [ "$got" != "$DIST_VERSION" ]; then
+          echo "extracted toolchain reports $got, want $DIST_VERSION"; exit 1
+        fi
+        echo "extracted toolchain: $got"
+        gv=$($G "$DIST_GOROOT/bin/go" env GOVERSION)
+        mkdir "$t/use" && cd "$t/use"
+        gd=${gv#go}; gd=${gd%%-*}
+        printf 'module distcheck\n\ngo %s\n' "$gd" > go.mod
+        printf 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("ok") }\n' > main.go
+        printf 'package main\n\nimport "testing"\n\nfunc TestUse(t *testing.T) { t.Log("ok") }\n' > main_test.go
+        $G GOPATH="$t/gopath" "$DIST_GOROOT/bin/go" build ./...
+        $G GOPATH="$t/gopath" "$DIST_GOROOT/bin/go" test ./...
+
+  smoke:dist:
+    desc: Tagged -short testing/simulation run from an extracted distribution (DIST_GOROOT=<extraction>/go) — proves the dst_* files rode the tarball and the simulation starts; cold GOCACHE, so the extraction's own compiler is exercised
+    cmds:
+      - |
+        set -eu
+        [ -n "${DIST_GOROOT:-}" ] || { echo "DIST_GOROOT must point at an extracted distribution's go/ directory"; exit 1; }
+        t=$(mktemp -d)
+        trap 'rm -rf "$t"' EXIT
+        G="env -u GOROOT GOENV=off GOFLAGS= GOEXPERIMENT= GOOS= GOARCH= GOWORK=off GOTOOLCHAIN=local TMPDIR=$t GOCACHE=$t/gocache"
+        cd "$DIST_GOROOT/src"
+        $G "$DIST_GOROOT/bin/go" test -tags dst -short -count=1 -timeout 20m testing/simulation
 
   compiler:
     desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)

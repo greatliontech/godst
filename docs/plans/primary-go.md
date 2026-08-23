@@ -62,5 +62,7 @@ plan conforms code and CI to.
   scripted half of the port audit as a task, port rehearsal job, matrix
   trigger for port branches.
 - [ ] 14. Local install: distpack-based `task install` to a versioned prefix
-  with a `current` symlink; `go` (vanilla) and `godst` (`GOTOOLCHAIN=local`)
-  launcher pair off one install; releases.md install documentation.
+  with a `current` symlink; a single `go` launcher with `GOTOOLCHAIN=local`
+  baked in (user decision: no separate `godst` — the fork always runs, and a
+  project requiring a newer base errors loudly instead of silently switching
+  to an upstream toolchain); releases.md install documentation.

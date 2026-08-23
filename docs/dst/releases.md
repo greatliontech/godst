@@ -269,8 +269,15 @@ Workflows under `.github/workflows`:
   the release commit's parent; then, on a native runner per published
   platform, builds that platform's distribution with upstream's own
   packaging (`make.bash -distpack` — identical layout and naming to
-  upstream's downloads), runs the Taskfile `smoke` task (tagged `-short`
-  `testing/simulation`) with the built toolchain, and publishes a GitHub
+  upstream's downloads), validates the EXTRACTED binary tarball — the
+  artifact consumers download, not the checkout it was packed from, so a
+  distpack packaging omission fails the release: the Taskfile `verify:dist`
+  task (the extracted `bin/go` reports the tag and builds and tests an
+  untagged module, invoked the way a consumer invokes it — no `GOROOT`, in
+  a hermetic environment per the cache paragraph below) and the
+  `smoke:dist` task (tagged `-short`
+  `testing/simulation` from the extraction's own source tree, proving the
+  `dst_*` files rode the tarball) — and publishes a GitHub
   Release with the assets below — the source tarball once (the platforms'
   copies must be identical), each platform's binary tarball and module
   files, `SHA256SUMS`. The release workflow enforces the gate; it is not
@@ -285,10 +292,16 @@ Every workflow builds the toolchain from source on a fresh runner and never
 restores a Go build cache across commits: this fork's release-form version
 string makes tool IDs version-derived (design.md "Enforcing test
 configurations"), so a cached object built by a different compiler at the
-same version string would be served silently. The Taskfile is the single
-source of how the built toolchain is built against and tested; workflows
-build and test through its tasks (`build:both`, the legs, `smoke`) rather
-than open-coding `go build`/`go test` commands.
+same version string would be served silently. The extracted-distribution
+validation goes further and runs with its own empty `GOCACHE`: the
+extraction's tools are indistinguishable from the checkout's to any shared
+cache (`GOROOT` package directories are deliberately not hashed into action
+IDs), so a shared cache would serve checkout-built objects and never execute
+the extraction's compiler — vacuously passing exactly the packaging faults
+the validation exists to catch. The Taskfile is the single source of how the
+built toolchain is built against and tested; workflows build and test
+through its tasks (`build:both`, the legs, `dist:extract`, `verify:dist`,
+`smoke:dist`) rather than open-coding `go build`/`go test` commands.
 
 ## Distribution
 
