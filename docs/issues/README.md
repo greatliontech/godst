@@ -8,12 +8,6 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- **the extraction-validation workflow glue is unrehearsable until a tag
-  carries its tasks** — Lands: when the first `go*-dst.*` tag whose tree
-  carries `verify:dist`/`smoke:dist` exists. Until then the new
-  release-workflow steps first execute on a real tag; a failure burns a
-  counter (a cost the release contract prices). See
-  [release-rehearsal-task-gap.md](release-rehearsal-task-gap.md).
 - **dst-only exports are outside the exported-API gate** — Lands: user
   decision (needs a dst-tagged `cmd/api` context — its own design). The
   import-policy half closed as disproven: `deps_test` scans dst-tagged
