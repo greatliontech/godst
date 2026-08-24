@@ -285,6 +285,9 @@ func (c Cleanup) Stop() {
 		return
 	}
 	lock(&mheap_.speciallock)
+	if dstBuild {
+		dstSpecialStampTakeLocked(unsafe.Pointer(found)) // entry lifetime is a subset of special lifetime
+	}
 	mheap_.specialCleanupAlloc.free(unsafe.Pointer(found))
 	unlock(&mheap_.speciallock)
 
@@ -305,21 +308,18 @@ type cleanupBlock struct {
 	cleanups [(cleanupBlockSize - unsafe.Sizeof(cleanupBlockHeader{})) / unsafe.Sizeof(cleanupFn{})]cleanupFn
 }
 
-// cleanupFn starts with three pointers followed by non-pointer DST metadata.
-var cleanupFnPtrMask = [...]uint8{0b00111}
+var cleanupFnPtrMask = [...]uint8{0b111}
 
 // cleanupFn represents a cleanup function with it's argument, yet to be called.
+// The DST ownership stamps of queued cleanups live in per-block parallel
+// slabs (dst.go, dstCleanupSlab), NOT here: the record keeps upstream's
+// exact layout in both build modes, so the block entry count and
+// cleanupBlockPtrMask are stock.
 type cleanupFn struct {
 	// call is an adapter function that understands how to safely call fn(*arg).
 	call func(*funcval, unsafe.Pointer)
 	fn   *funcval       // cleanup function passed to AddCleanup.
 	arg  unsafe.Pointer // pointer to argument to pass to cleanup function.
-	// dstSeq is the DST per-run registration sequence (dstNextCallbackSeq at AddCleanup);
-	// the bubble drain sorts its batch by it (gc.md D4). uintptr = 1 word on every arch;
-	// a non-pointer tail, so cleanupFnPtrMask/cleanupBlockPtrMask mark it 0.
-	dstSeq   uintptr
-	dstEpoch uint64
-	dstPid   int32
 }
 
 var cleanupBlockPtrMask [cleanupBlockSize / goarch.PtrSize / 8]byte
@@ -370,12 +370,22 @@ func (a *cleanupBlock) take(b *cleanupBlock) {
 	if uint32(len(dst)) >= b.n {
 		// Take all.
 		copy(dst, b.cleanups[:])
+		if dstBuild {
+			// The stamp rows move WITH the entries (take is the one
+			// entry-relocating path in the queue; a row left behind
+			// would pair a moved cleanup with the destination slab's
+			// stale contents — wrong owner, silently dropped work).
+			dstCleanupSlabMove(a, a.n, b, 0, b.n)
+		}
 		a.n += b.n
 		b.n = 0
 	} else {
 		// Partial take. Copy from the tail to avoid having
 		// to move more memory around.
 		copy(dst, b.cleanups[b.n-uint32(len(dst)):b.n])
+		if dstBuild {
+			dstCleanupSlabMove(a, a.n, b, b.n-uint32(len(dst)), uint32(len(dst)))
+		}
 		a.n = uint32(len(a.cleanups))
 		b.n -= uint32(len(dst))
 	}
@@ -480,9 +490,16 @@ func (q *cleanupQueue) tryTakeWork() bool {
 //
 // Called by the sweeper, and only the sweeper.
 func (q *cleanupQueue) enqueue(c cleanupFn) {
+	// The registration stamps arrive staged on the P by freeSpecial (see
+	// p.dstSpecialStamp); take them first.
+	var dstSt dstCallbackStamp
+	if dstBuild {
+		e, sq, pid := dstTakeStagedSpecialStamps()
+		dstSt = dstCallbackStamp{seq: sq, epoch: e, pid: pid}
+	}
 	mp := acquirem()
 	pp := mp.p.ptr()
-	if dstActive() && c.dstEpoch != dstRunEpoch.Load() {
+	if dstActive() && dstSt.epoch != dstRunEpoch.Load() {
 		// Not this run's work (see dstCallbackEpoch and the queuefinalizer
 		// analog): defer it past dstDeactivate with the pre-bubble blocks
 		// rather than letting the bubble drain run it. The queued count still
@@ -504,7 +521,7 @@ func (q *cleanupQueue) enqueue(c cleanupFn) {
 		// stranding the entry on a drained chain.
 		lock(&finlock)
 		if dstActive() {
-			q.dstDeferCleanup(c)
+			q.dstDeferCleanup(c, dstSt)
 			unlock(&finlock)
 			pp.cleanupsQueued++
 			dstCleanupRunExecuted.Add(1)
@@ -521,6 +538,9 @@ func (q *cleanupQueue) enqueue(c cleanupFn) {
 		b = (*cleanupBlock)(q.free.pop())
 		if b == nil {
 			b = (*cleanupBlock)(persistentalloc(cleanupBlockSize, tagAlign, &memstats.gcMiscSys))
+			if dstBuild {
+				dstCleanupSlabAttach(b) // pair before any publication
+			}
 			for {
 				next := (*cleanupBlock)(q.all.Load())
 				b.alllink = next
@@ -531,7 +551,20 @@ func (q *cleanupQueue) enqueue(c cleanupFn) {
 		}
 		pp.cleanups = b
 	}
-	if full := b.enqueue(c); full {
+	full := b.enqueue(c)
+	if dstBuild {
+		// The stamps ride the block's parallel slab at the entry's index —
+		// written before any full-block publication below, so a consumer
+		// that can see the entry can see its stamps. The P-cached pair
+		// keeps the lookup O(1) for the refill-same-block pattern; the
+		// pointer-equality validation makes a stale cache harmless.
+		if pp.dstCleanupSlabBlock != b {
+			pp.dstCleanupSlabBlock = b
+			pp.dstCleanupSlab = dstCleanupSlabFor(b)
+		}
+		pp.dstCleanupSlab[b.n-1] = dstSt
+	}
+	if full {
 		q.full.push(&b.lfnode)
 		pp.cleanups = nil
 		q.addWork(1)
@@ -790,12 +823,13 @@ var (
 // Called only from enqueue — sweeper context, gcphase == _GCoff. Caller holds
 // finlock (proven rank-safe in sweep context by queuefinalizer, which takes it
 // from the same freeSpecial path).
-func (q *cleanupQueue) dstDeferCleanup(c cleanupFn) {
+func (q *cleanupQueue) dstDeferCleanup(c cleanupFn, st dstCallbackStamp) {
 	b := dstDeferredCleanupPartial
 	if b == nil {
 		b = (*cleanupBlock)(q.free.pop())
 		if b == nil {
 			b = (*cleanupBlock)(persistentalloc(cleanupBlockSize, tagAlign, &memstats.gcMiscSys))
+			dstCleanupSlabAttach(b) // pair before any publication
 			for {
 				next := (*cleanupBlock)(q.all.Load())
 				b.alllink = next
@@ -806,7 +840,9 @@ func (q *cleanupQueue) dstDeferCleanup(c cleanupFn) {
 		}
 		dstDeferredCleanupPartial = b
 	}
-	if full := b.enqueue(c); full {
+	full := b.enqueue(c)
+	dstCleanupSlabFor(b)[b.n-1] = st
+	if full {
 		dstDeferredCleanupBlocks++
 		dstDeferredCleanups.push(&b.lfnode)
 		dstDeferredCleanupPartial = nil
@@ -844,6 +880,10 @@ func runCleanupBlock(b *cleanupBlock) {
 	if onCleanupG {
 		gcCleanups.beginRunningCleanups()
 	}
+	var slab *[len(cleanupBlock{}.cleanups)]dstCallbackStamp
+	if dstBuild {
+		slab = dstCleanupSlabFor(b) // slab[i] pairs with b.cleanups[i]
+	}
 	var executed uint64
 	for i := 0; i < int(b.n); i++ {
 		for dstBuild && onCleanupG && dstCallbackWorkersBlocked() {
@@ -871,7 +911,7 @@ func runCleanupBlock(b *cleanupBlock) {
 		// Execute the next cleanup unless its registering invocation exited.
 		invoked := true
 		if dstBuild {
-			invoked = dstCallbackOwnerAlive(c.dstEpoch, c.dstPid)
+			invoked = dstCallbackOwnerAlive(slab[i].epoch, slab[i].pid)
 		}
 		if onDrain {
 			if invoked {
@@ -887,8 +927,8 @@ func runCleanupBlock(b *cleanupBlock) {
 			if dstBuild {
 				gp := getg()
 				oldPid := gp.dstPid
-				if !onCleanupG && c.dstPid > 0 {
-					gp.dstPid = c.dstPid
+				if !onCleanupG && slab[i].pid > 0 {
+					gp.dstPid = slab[i].pid
 				}
 				c.call(c.fn, c.arg)
 				gp.dstPid = oldPid
@@ -952,7 +992,7 @@ func dstDrainCleanups() {
 }
 
 // dstSortCleanupsBySeq reorders the queued cleanup batch so the drain runs it in
-// ASCENDING registration sequence (cleanupFn.dstSeq), the replay-stable order (gc.md
+// ASCENDING registration sequence (the slab stamps' seq), the replay-stable order (gc.md
 // D4), rather than the heap-address sweep order the per-P blocks + `full` LIFO stack
 // produce. It pops every full block, sorts all their cleanupFns ACROSS blocks, re-lays
 // them into the same blocks (forward, same counts), and re-pushes so `full`'s LIFO pop
@@ -973,17 +1013,25 @@ func dstSortCleanupsBySeq() {
 	for _, b := range blocks {
 		n += int(b.n)
 	}
-	all := make([]cleanupFn, 0, n)
-	for _, b := range blocks {
+	// Entries and their slab stamps permute TOGETHER: the sort key is the
+	// stamp's seq, and slab[i]'s pairing with cleanups[i] must hold at
+	// every index the re-lay writes.
+	all := make([]dstCleanupWithStamp, 0, n)
+	slabs := make([]*[len(cleanupBlock{}.cleanups)]dstCallbackStamp, len(blocks)) // one lookup per block
+	for bi, b := range blocks {
+		slab := dstCleanupSlabFor(b)
+		slabs[bi] = slab
 		for i := uint32(0); i < b.n; i++ {
-			all = append(all, b.cleanups[i])
+			all = append(all, dstCleanupWithStamp{c: b.cleanups[i], st: slab[i]})
 		}
 	}
-	dstSortCleanupFnsBySeq(all)
+	dstSortByStampSeq(all, func(p *dstCleanupWithStamp) uintptr { return p.st.seq })
 	k := 0
-	for _, b := range blocks {
+	for bi, b := range blocks {
+		slab := slabs[bi]
 		for i := uint32(0); i < b.n; i++ {
-			b.cleanups[i] = all[k]
+			b.cleanups[i] = all[k].c
+			slab[i] = all[k].st
 			k++
 		}
 	}
@@ -992,49 +1040,6 @@ func dstSortCleanupsBySeq() {
 		gcCleanups.full.push(&blocks[i].lfnode)
 	}
 	gcCleanups.addWork(len(blocks))
-}
-
-// dstSortCleanupFnsBySeq sorts the slice a ascending by dstSeq — a stable, non-recursive
-// bottom-up merge sort (package runtime cannot import sort). O(n log n), deterministic.
-func dstSortCleanupFnsBySeq(a []cleanupFn) {
-	n := len(a)
-	if n <= 1 {
-		return
-	}
-	buf := make([]cleanupFn, n)
-	src, dst := a, buf
-	for width := 1; width < n; width *= 2 {
-		for i := 0; i < n; i += 2 * width {
-			lo := i
-			mid := min(i+width, n)
-			hi := min(i+2*width, n)
-			l, r, k := lo, mid, lo
-			for l < mid && r < hi {
-				if src[l].dstSeq <= src[r].dstSeq {
-					dst[k] = src[l]
-					l++
-				} else {
-					dst[k] = src[r]
-					r++
-				}
-				k++
-			}
-			for l < mid {
-				dst[k] = src[l]
-				l++
-				k++
-			}
-			for r < hi {
-				dst[k] = src[r]
-				r++
-				k++
-			}
-		}
-		src, dst = dst, src
-	}
-	if &src[0] != &a[0] {
-		copy(a, src)
-	}
 }
 
 // dstDrainingCleanup is the block dstDrainCleanups is currently running; see

@@ -85,6 +85,9 @@ func init() {
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
 	register("DSTCleanupOrder", DSTCleanupOrder)
+	register("DSTFinalizerOrder", DSTFinalizerOrder)
+	register("DSTCleanupStopRecycle", DSTCleanupStopRecycle)
+	register("DSTCleanupFlushTake", DSTCleanupFlushTake)
 	register("DSTCleanupRNGIsolation", DSTCleanupRNGIsolation)
 	register("DSTCleanupPreBubble", DSTCleanupPreBubble)
 	register("DSTCleanupChanOpPriorG", DSTCleanupChanOpPriorG)
@@ -117,6 +120,9 @@ func dstTestPushMaxProcs(procs int32) bool
 
 //go:linkname dstTestMaxProcsHelperIdle runtime.dstTestMaxProcsHelperIdle
 func dstTestMaxProcsHelperIdle() bool
+
+//go:linkname dstTestSpecialStampCount runtime.dstTestSpecialStampCount
+func dstTestSpecialStampCount() int
 
 //go:linkname dstSchedOvfPutsFP runtime.dstSchedOvfPutsFP
 func dstSchedOvfPutsFP() uint64
@@ -1646,7 +1652,7 @@ func DSTFinRunSet() {
 
 // DSTCleanupOrder registers many cleanups (enough to span MULTIPLE cleanup blocks) and
 // prints the id of the FIRST cleanup to run. The bubble drain sorts its batch by
-// registration sequence (cleanupFn.dstSeq), so the id-0 cleanup runs first. Without the
+// registration sequence (the slab stamps' seq), so the id-0 cleanup runs first. Without the
 // sort the drain runs blocks in `full`-stack LIFO order — the LAST-filled block (holding
 // the highest-id, last-registered cleanups) pops first — so the first-run id is high, not
 // 0. Cross-block is the discriminator: within one block, forward execution already
@@ -1672,6 +1678,132 @@ func DSTCleanupOrder() {
 		first = firstRun.Load()
 	})
 	os.Stdout.WriteString(strconv.FormatInt(first, 10) + "\n")
+}
+
+// DSTFinalizerOrder is DSTCleanupOrder's finalizer twin: the bubble drain
+// runs its finalizer batch in registration-sequence order (the slab
+// stamps' seq), so the id-0 finalizer runs first. Without the cross-block
+// reg-seq sort the drain runs blocks in chain order with reverse-LIFO
+// entries, so the first-run id is far from 0.
+func DSTFinalizerOrder() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	var first int64
+	simulation.Run(n, func() {
+		var firstRun atomic.Int64
+		firstRun.Store(-1)
+		var ran atomic.Int64
+		const N = 1000 // > 1 finBlock (101 entries each), so block/sweep order != registration order
+		for i := 0; i < N; i++ {
+			o := &dstFinObj{}
+			id := int64(i)
+			runtime.SetFinalizer(o, func(*dstFinObj) {
+				firstRun.CompareAndSwap(-1, id) // only the first finalizer to run wins
+				ran.Add(1)
+			})
+			// o is unreachable after this iteration → all N finalizers fire at the GC below.
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond) // quiescence: the drain runs the sorted batch
+		time.Sleep(time.Millisecond)
+		if got := ran.Load(); got != N {
+			// The block-crossing premise is load-bearing: all N must fire.
+			first = -1000 - got
+		} else {
+			first = firstRun.Load()
+		}
+	})
+	os.Stdout.WriteString(strconv.FormatInt(first, 10) + "\n")
+}
+
+// DSTCleanupFlushTake pins that cleanupBlock.take (the sweep-end flush's
+// entry coalescing across partial per-P blocks) moves the DST stamp rows
+// with the entries: host-side cleanups registered after a simulation run,
+// coalesced into a block whose slab still carries the dead run's stamps,
+// must all execute — a left-behind row pairs a host cleanup with a dead
+// run's (epoch,pid) and silently discards it.
+func DSTCleanupFlushTake() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	// Phase 1: a run whose in-run cleanups stamp slab rows with pid>0 on
+	// blocks that return to the free list at run end.
+	simulation.Run(n, func() {
+		for i := 0; i < 40; i++ {
+			o := &dstFinObj{}
+			runtime.AddCleanup(o, func(int) {}, 0)
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	})
+	// Phase 2: multi-P host registrations filling PARTIAL per-P blocks
+	// (recycled, stale-stamped), then GCs whose sweep-end flushes coalesce
+	// them via take. Every host cleanup must run.
+	runtime.GOMAXPROCS(2)
+	const rounds, perG = 10, 15
+	var ran atomic.Int64
+	var registered int64
+	for r := 0; r < rounds; r++ {
+		var wg sync.WaitGroup
+		for g := 0; g < 2; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perG; i++ {
+					o := &dstFinObj{}
+					runtime.AddCleanup(o, func(int) { ran.Add(1) }, 0)
+				}
+			}()
+		}
+		wg.Wait()
+		registered += 2 * perG
+		runtime.GC()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for ran.Load() != registered && time.Now().Before(deadline) {
+		runtime.GC()
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := ran.Load(); got != registered {
+		os.Stdout.WriteString("cleanups dropped: ran " + strconv.FormatInt(got, 10) + " of " + strconv.FormatInt(registered, 10) + "\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
+}
+
+// DSTCleanupStopRecycle pins the special-stamp table's lifecycle invariant
+// (entry lifetime ⊆ special lifetime): an in-run AddCleanup stamps the
+// special's table entry, Stop must delete it with the special, and the
+// recycled fixalloc address is then re-stamped by a fresh registration. A
+// missed delete makes the fresh insert find the stale live entry and throw
+// ("a free path missed its delete"), crashing this program.
+func DSTCleanupStopRecycle() {
+	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
+	stamped := false
+	simulation.Run(n, func() {
+		held := make([]*dstFinObj, 0, 64)
+		for i := 0; i < 64; i++ {
+			o := &dstFinObj{}
+			held = append(held, o) // keep o alive: Stop, not death, frees the special
+			c := runtime.AddCleanup(o, func(int) {}, 0)
+			// Anti-vacuity teeth: the in-run registration must actually
+			// have stamped the table — without this, a silent loss of
+			// stamping would make the recycle path never exercised and
+			// this program pass for the wrong reason.
+			if dstTestSpecialStampCount() > 0 {
+				stamped = true
+			}
+			c.Stop() // frees the special; fixalloc recycles its address next iteration
+		}
+		// One surviving registration on a recycled address, then let it run.
+		o := &dstFinObj{}
+		runtime.AddCleanup(o, func(int) {}, 0)
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+		_ = held
+	})
+	if !stamped {
+		os.Stdout.WriteString("in-run registrations never stamped the table: probe vacuous\n")
+		return
+	}
+	os.Stdout.WriteString("done\n")
 }
 
 // dstMakeCleanupSender attaches a cleanup that sends on a bubble channel to a

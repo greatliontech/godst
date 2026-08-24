@@ -846,15 +846,29 @@ type p struct {
 	// runq. Owner-P access only, like the ring; flushed to the global runq at
 	// dstDeactivate. Empty in non-DST operation.
 	dstRunqOvf gQueue
-	// dstFinSpecial stages the finalizer special whose stamps queuefinalizer
-	// must read: freeSpecial sets it immediately before its stock-signature
-	// call and queuefinalizer takes it as its first statement. The edge
-	// cannot change P because every freeSpecial call sits inside
-	// mspan.sweep, which asserts preemption is off (m.locks/mallocing/g0 at
-	// its head) for the whole sweep — that assertion, not the call shape, is
-	// what this staging relies on. Keeps queuefinalizer's signature stock so
-	// the untagged call site is stock text; unused when DST off.
-	dstFinSpecial *specialfinalizer
+	// dstSpecialStamp/dstSpecialStaged stage the ownership stamps the
+	// stock-signature queue calls (queuefinalizer, cleanupQueue.enqueue)
+	// must read: freeSpecial sets them (taking the stamps out of the side
+	// table, dst.go) immediately before the call, and the queue side takes
+	// them as its first act. The edge cannot
+	// change P because every freeSpecial call sits inside mspan.sweep,
+	// which asserts preemption is off (m.locks/mallocing/g0 at its head)
+	// for the whole sweep — that assertion, not the call shape, is what
+	// this staging relies on. Keeps queuefinalizer's signature stock so the
+	// untagged call site is stock text; unused when DST off. Values, not
+	// the special pointer: the special is freed right after the call, and
+	// staging values keeps the take lock-free.
+	dstSpecialStamp  dstCallbackStamp
+	dstSpecialStaged bool
+	// dstCleanupSlabBlock/dstCleanupSlab cache the enqueue-side cleanup
+	// block's slab pair. Written only by enqueue on the owner P;
+	// validated at use by pointer equality, which is decisive because
+	// cleanup blocks are never freed (an address denotes one block
+	// forever), so no invalidation hook exists to forget — flush may
+	// steal p.cleanups from another M and the stale cache stays
+	// harmless.
+	dstCleanupSlabBlock *cleanupBlock
+	dstCleanupSlab      *[len(cleanupBlock{}.cleanups)]dstCallbackStamp
 
 	// Available G's (status == Gdead)
 	gFree gList

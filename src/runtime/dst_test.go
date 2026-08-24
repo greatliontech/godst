@@ -505,7 +505,7 @@ func TestDSTGCPerCycleDiscoveryDeterministic(t *testing.T) {
 }
 
 // TestDSTGCCleanupOrderRegistration is the H6 cleanup regression: the bubble drain runs
-// its cleanup batch in registration-sequence order (cleanupFn.dstSeq), so the id-0
+// its cleanup batch in registration-sequence order (the slab stamps' seq), so the id-0
 // cleanup runs first. Teeth: without the cross-block reg-seq sort the drain runs blocks
 // in `full`-stack LIFO order, so the last-registered (highest-id) block runs first and
 // the first-run id is far from 0.
@@ -513,6 +513,52 @@ func TestDSTGCCleanupOrderRegistration(t *testing.T) {
 	out := strings.TrimSpace(runTestProgDST(t, "DSTCleanupOrder", "DSTSEED=12345"))
 	if out != "0" {
 		t.Errorf("first cleanup to run was id %s, want 0: the cleanup drain is not running in registration order (sweep/block-LIFO order)", out)
+	}
+}
+
+// TestDSTGCFinalizerOrderRegistration is TestDSTGCCleanupOrderRegistration's
+// finalizer twin: the bubble drain runs its finalizer batch in
+// registration-sequence order, so the id-0 finalizer runs first. Teeth:
+// with the slab stamps' seq neutralized (or the cross-block sort dropped)
+// the drain runs in block/sweep order and the first-run id is far from 0.
+func TestDSTGCFinalizerOrderRegistration(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTFinalizerOrder", "DSTSEED=12345"))
+	if out != "0" {
+		t.Errorf("first finalizer to run was id %s, want 0: the finalizer drain is not running in registration order", out)
+	}
+}
+
+// TestDSTCleanupStopRecycleStamps pins the special-stamp table's lifecycle
+// invariant: Cleanup.Stop deletes the special's stamp entry with the
+// special, so a fresh in-run registration on the recycled fixalloc address
+// inserts cleanly. Teeth: with Stop's delete dropped, the fresh insert
+// finds the stale live entry and throws ("a free path missed its delete"),
+// crashing the child.
+func TestDSTCleanupStopRecycleStamps(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTCleanupStopRecycle", "DSTSEED=12345"))
+	if out != "done" {
+		t.Errorf("got %q, want done: the Stop→recycle→re-register sequence did not complete", out)
+	}
+}
+
+// TestDSTCleanupFlushTakeStamps pins that cleanupBlock.take moves the DST
+// stamp rows with the entries it coalesces across partial per-P blocks:
+// host cleanups landing on a recycled, previously in-run-stamped block must
+// all execute. Teeth: with the row move dropped, moved entries pair with
+// the dead run's (epoch,pid) rows and are silently discarded — the child
+// reports the shortfall.
+// TestDSTCleanupTakeMovesStamps is the enforcing white-box oracle for the
+// take stamp-row move; see DstTestCleanupTakeMovesStamps.
+func TestDSTCleanupTakeMovesStamps(t *testing.T) {
+	if !runtime.DstTestCleanupTakeMovesStamps() {
+		t.Fatal("cleanupBlock.take does not move the DST stamp rows with the entries it relocates")
+	}
+}
+
+func TestDSTCleanupFlushTakeStamps(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTCleanupFlushTake", "DSTSEED=12345"))
+	if out != "done" {
+		t.Errorf("got %q, want done", out)
 	}
 }
 

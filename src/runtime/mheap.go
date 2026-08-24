@@ -2099,19 +2099,6 @@ type specialfinalizer struct {
 	nret    uintptr
 	fint    *_type   // May be a heap pointer, but always live.
 	ot      *ptrtype // May be a heap pointer, but always live.
-
-	// dstEpoch is the DST ownership stamp (dstCallbackEpoch at registration):
-	// the run epoch if SetFinalizer was called by the active simulation's
-	// bubble, else 0. queuefinalizer defers entries whose stamp is not the
-	// current run's so only the run's own finalizers reach the bubble drain.
-	dstEpoch uint64
-	// dstSeq is the DST per-run registration sequence (dstNextCallbackSeq at
-	// registration): the drain sorts its batch by it so execution order is
-	// registration order, not heap-address sweep order (gc.md D4). Carried onto the
-	// queued finalizer by queuefinalizer, since the special is freed at sweep. uintptr
-	// to match finalizer.dstSeq (1 word on every arch).
-	dstSeq uintptr
-	dstPid int32
 }
 
 // Adds a finalizer to the object p. Returns true if it succeeded.
@@ -2124,8 +2111,21 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s.nret = nret
 	s.fint = fint
 	s.ot = ot
+	// The DST ownership stamps live in a side table (dst.go), not on the
+	// special, so the record keeps upstream's layout. The sequence is
+	// consumed at the same point the embedded stamp was written, and an
+	// entry is made only for in-run registrations (zero stamps are
+	// absence). Insert precedes addspecial so a concurrent removefinalizer
+	// after a successful addspecial always finds the entry to delete; the
+	// failure branch below deletes the never-published entry.
+	var dstStamped bool
 	if dstBuild {
-		dstStampFinalizerSpecial(s)
+		if st := dstCallbackStampAtRegistration(); st != (dstCallbackStamp{}) {
+			lock(&mheap_.speciallock)
+			dstSpecialStampInsertLocked(unsafe.Pointer(s), st)
+			unlock(&mheap_.speciallock)
+			dstStamped = true
+		}
 	}
 	if addspecial(p, &s.special, false) {
 		// This is responsible for maintaining the same
@@ -2151,6 +2151,9 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 
 	// There was an old finalizer
 	lock(&mheap_.speciallock)
+	if dstBuild && dstStamped {
+		dstSpecialStampTakeLocked(unsafe.Pointer(s)) // the never-published entry dies with the special
+	}
 	mheap_.specialfinalizeralloc.free(unsafe.Pointer(s))
 	unlock(&mheap_.speciallock)
 	return false
@@ -2163,6 +2166,9 @@ func removefinalizer(p unsafe.Pointer) {
 		return // there wasn't a finalizer to remove
 	}
 	lock(&mheap_.speciallock)
+	if dstBuild {
+		dstSpecialStampTakeLocked(unsafe.Pointer(s)) // entry lifetime is a subset of special lifetime
+	}
 	mheap_.specialfinalizeralloc.free(unsafe.Pointer(s))
 	unlock(&mheap_.speciallock)
 }
@@ -2193,8 +2199,16 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
 	s.id = id
+	// DST ownership stamps live in the side table (dst.go), keeping the
+	// special and its embedded cleanupFn at upstream's layout; entries
+	// exist only for in-run registrations. addspecial below is forced and
+	// cannot fail, so no failure-path delete is needed.
 	if dstBuild {
-		dstStampCleanupSpecial(s)
+		if st := dstCallbackStampAtRegistration(); st != (dstCallbackStamp{}) {
+			lock(&mheap_.speciallock)
+			dstSpecialStampInsertLocked(unsafe.Pointer(s), st)
+			unlock(&mheap_.speciallock)
+		}
 	}
 
 	mp := acquirem()
@@ -2802,7 +2816,7 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 	case _KindSpecialFinalizer:
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
 		if dstBuild {
-			dstStageFinalizerSpecial(sf)
+			dstStageSpecialStamps(unsafe.Pointer(sf))
 		}
 		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot)
 		lock(&mheap_.speciallock)
@@ -2830,6 +2844,9 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		unlock(&mheap_.speciallock)
 	case _KindSpecialCleanup:
 		sc := (*specialCleanup)(unsafe.Pointer(s))
+		if dstBuild {
+			dstStageSpecialStamps(unsafe.Pointer(sc))
+		}
 		// Cleanups, unlike finalizers, do not resurrect the objects
 		// they're attached to, so we only need to pass the cleanup
 		// function, not the object.

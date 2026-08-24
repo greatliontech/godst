@@ -412,15 +412,16 @@ var profiles = map[string]*archProfile{
 			"syscall.rawGettimeofday.abi0": "syscall.gettimeofday.abi0",
 		},
 		exactDeltas: map[string]int{
-			"runtime.addCleanup":              2,
-			"runtime.(*cleanupQueue).enqueue": 17,
-			"runtime.freeSpecial":             3,
-			"runtime.gcinit":                  21,
-			// pairs: caller minus the extraction call, plus helper, vs stock
-			"runtime.runFinalizers":  7,
+			// pairs: caller minus the extraction call, plus helper, vs
+			// stock. The non-pair symbols this map once pinned
+			// (addCleanup, enqueue, freeSpecial, gcinit) became
+			// stock-equal when the finalizer/cleanup stamps moved out of
+			// line and are no longer admitted at all — a pin on an equal
+			// symbol can never fire and would be silently vacuous.
+			"runtime.runFinalizers":  6,
 			"runtime.GC":             8,
-			"runtime.runCleanups":    15,
-			"runtime.queuefinalizer": 21,
+			"runtime.runCleanups":    10,
+			"runtime.queuefinalizer": 10,
 		},
 	},
 	"arm64": {
@@ -473,15 +474,11 @@ var profiles = map[string]*archProfile{
 		postNorm:        foldADRPARM64,
 		aggregateStores: true,
 		exactDeltas: map[string]int{
-			"runtime.addCleanup":              -1,
-			"runtime.(*cleanupQueue).enqueue": 7,
-			"runtime.freeSpecial":             2,
-			"runtime.gcinit":                  21,
-			// pairs: caller minus the extraction call, plus helper, vs stock
-			"runtime.runFinalizers":  -6,
+			// pairs only — see the amd64 map's comment.
+			"runtime.runFinalizers":  8,
 			"runtime.GC":             12,
-			"runtime.runCleanups":    17,
-			"runtime.queuefinalizer": 22,
+			"runtime.runCleanups":    13,
+			"runtime.queuefinalizer": 12,
 		},
 	},
 }
@@ -1117,10 +1114,13 @@ func buildAllowlist(p *archProfile) []allowEntry {
 				}
 				return ""
 			}},
-		// Layout consequences: by-value cleanupFn widening, callback-record
-		// constants, and GC mask construction. Callee sets must match modulo the
+		// Layout consequences in the remaining widened-record paths: the
+		// generic AddCleanup instantiations shift with the layouts their
+		// shapes close over. (The finalizer/cleanup registration and
+		// queueing symbols this class once admitted are stock-equal since
+		// the stamps moved out of line.) Callee sets must match modulo the
 		// barrier-form equivalence class.
-		{pattern: `^runtime\.(addCleanup|AddCleanup\[.*|\(\*cleanupQueue\)\.enqueue|freeSpecial|gcinit)$`, class: "layout",
+		{pattern: `^runtime\.AddCleanup\[.*$`, class: "layout",
 			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
 				if !ok {
 					return "expected on both sides"

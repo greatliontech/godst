@@ -387,7 +387,7 @@ wall-clock). So the achievable invariant is **set-at-quiescence, not per-cycle**
 > machinery is untouched. Pinned by `TestDSTFinalizerGoexitLedger` (the Goexit finalizer registered first
 > runs first, so its seven successors are discarded and only one execution is reported). **Landed for cleanups too:**
 > `dstDrainCleanups` calls `dstSortCleanupsBySeq`, which pops every `full` cleanup block, sorts all their
-> `cleanupFn`s ACROSS blocks by `cleanupFn.dstSeq` (`dstSortCleanupFnsBySeq`, the same merge sort), re-lays
+> `cleanupFn`s ACROSS blocks by their slab stamps' seq (`dstSortByStampSeq`, the shared merge sort — the stamps ride per-block parallel slabs, not the record; design.md, the data-layout paragraph), re-lays
 > them into the same blocks, and re-pushes so the `full` LIFO pop yields the lowest-seq block first —
 > leaving the blocks on `full` so the existing drain loop's discard/ledger machinery is untouched. Pinned
 > by `TestDSTGCCleanupOrderRegistration` (id-0 cleanup runs first under the sort; block-LIFO sweep order

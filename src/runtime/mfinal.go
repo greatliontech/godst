@@ -76,15 +76,44 @@ var dstFinqRunBaseQueued, dstFinqRunExecuted atomic.Uint64
 var allfin *finBlock // list of all blocks
 
 // NOTE: Layout known to queuefinalizer.
+// The DST ownership stamps of queued entries live in per-block parallel
+// slabs (dst.go, dstFinSlab), NOT here: the record keeps upstream's exact
+// layout in both build modes, so the block entry count and finptrmask are
+// stock.
 type finalizer struct {
-	fn       *funcval       // function to call (may be a heap pointer)
-	arg      unsafe.Pointer // ptr to object (may be a heap pointer)
-	nret     uintptr        // bytes of return values from fn
-	fint     *_type         // type of first argument of fn
-	ot       *ptrtype       // type of ptr to object (may be a heap pointer)
-	dstSeq   uintptr        // DST per-run registration sequence (from specialfinalizer.dstSeq); the bubble drain sorts by it. 0 for non-DST/foreign.
-	dstEpoch uint64         // DST run generation paired with dstPid
-	dstPid   int32          // DST process invocation owner; 0 for process-level or foreign work
+	fn   *funcval       // function to call (may be a heap pointer)
+	arg  unsafe.Pointer // ptr to object (may be a heap pointer)
+	nret uintptr        // bytes of return values from fn
+	fint *_type         // type of first argument of fn
+	ot   *ptrtype       // type of ptr to object (may be a heap pointer)
+}
+
+var finalizer1 = [...]byte{
+	// Each Finalizer is 5 words, ptr ptr INT ptr ptr (INT = uintptr here)
+	// Each byte describes 8 words.
+	// Need 8 Finalizers described by 5 bytes before pattern repeats:
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	//	ptr ptr INT ptr ptr
+	// aka
+	//
+	//	ptr ptr INT ptr ptr ptr ptr INT
+	//	ptr ptr ptr ptr INT ptr ptr ptr
+	//	ptr INT ptr ptr ptr ptr INT ptr
+	//	ptr ptr ptr INT ptr ptr ptr ptr
+	//	INT ptr ptr ptr ptr INT ptr ptr
+	//
+	// Assumptions about Finalizer layout checked below.
+	1<<0 | 1<<1 | 0<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 0<<7,
+	1<<0 | 1<<1 | 1<<2 | 1<<3 | 0<<4 | 1<<5 | 1<<6 | 1<<7,
+	1<<0 | 0<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 0<<6 | 1<<7,
+	1<<0 | 1<<1 | 1<<2 | 0<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
+	0<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 0<<5 | 1<<6 | 1<<7,
 }
 
 // lockRankMayQueueFinalizer records the lock ranking effects of a
@@ -95,7 +124,7 @@ func lockRankMayQueueFinalizer() {
 
 func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
 	// The registration stamps arrive staged on the P by freeSpecial (see
-	// p.dstFinSpecial); take them first, before anything could move this
+	// p.dstSpecialStamp); take them first, before anything could move this
 	// goroutine off the P.
 	var (
 		dstEpoch uint64
@@ -103,7 +132,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 		dstPid   int32
 	)
 	if dstBuild {
-		dstEpoch, dstSeq, dstPid = dstTakeStagedFinalizerStamps()
+		dstEpoch, dstSeq, dstPid = dstTakeStagedSpecialStamps()
 	}
 	if gcphase != _GCoff {
 		// Currently we assume that the finalizer queue won't
@@ -146,9 +175,16 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 	f.ot = ot
 	f.arg = p
 	if dstBuild {
-		f.dstSeq = dstSeq // carried from the special; the bubble drain sorts its batch by it
-		f.dstEpoch = dstEpoch
-		f.dstPid = dstPid
+		// The stamps ride the block's parallel slab at the entry's index —
+		// written only where fin[i] is written (here; finq has no
+		// entry-relocating path — the cleanup queue's is covered in
+		// cleanupBlock.take). The finlock-guarded memo keeps the slab
+		// lookup O(1) for the common refill-same-block pattern.
+		if dstFinSlabMemo.block != *q {
+			dstFinSlabMemo.block = *q
+			dstFinSlabMemo.st = dstFinSlabFor(*q)
+		}
+		dstFinSlabMemo.st[(*q).cnt-1] = dstCallbackStamp{seq: dstSeq, epoch: dstEpoch, pid: dstPid}
 	}
 	finqueued++
 	unlock(&finlock)
@@ -165,32 +201,26 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 func finAllocBlockLocked() *finBlock {
 	if finc == nil {
 		finc = (*finBlock)(persistentalloc(finBlockSize, 0, &memstats.gcMiscSys))
+		if dstBuild {
+			// Pair the newborn block with its parallel stamp slab before
+			// it can carry entries (finlock held here).
+			dstFinSlabAttachLocked(finc)
+		}
 		finc.alllink = allfin
 		allfin = finc
 		if finptrmask[0] == 0 {
 			// Build pointer mask for Finalizer array in block.
 			// Check assumptions made in finalizer1 array above.
-			words := unsafe.Sizeof(finalizer{}) / goarch.PtrSize
-			if (words != 8 && words != 9 ||
+			if (unsafe.Sizeof(finalizer{}) != 5*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.fn) != 0 ||
 				unsafe.Offsetof(finalizer{}.arg) != goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.nret) != 2*goarch.PtrSize ||
 				unsafe.Offsetof(finalizer{}.fint) != 3*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.dstSeq) != 5*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.dstEpoch) != 6*goarch.PtrSize ||
-				unsafe.Offsetof(finalizer{}.dstPid) != 6*goarch.PtrSize+unsafe.Sizeof(uint64(0))) {
+				unsafe.Offsetof(finalizer{}.ot) != 4*goarch.PtrSize) {
 				throw("finalizer out of sync")
 			}
 			for i := range finptrmask {
-				var mask byte
-				for bit := 0; bit < 8; bit++ {
-					word := i*8 + bit
-					if word%int(words) == 0 || word%int(words) == 1 || word%int(words) == 3 || word%int(words) == 4 {
-						mask |= 1 << bit
-					}
-				}
-				finptrmask[i] = mask
+				finptrmask[i] = finalizer1[i%len(finalizer1)]
 			}
 		}
 	}
@@ -334,6 +364,10 @@ func runFinqBlocks(fb *finBlock) {
 		racefingo()
 	}
 	for fb != nil {
+		var slab *[len(finBlock{}.fin)]dstCallbackStamp
+		if dstBuild {
+			slab = dstFinSlabFor(fb) // slab[i] pairs with fb.fin[i]
+		}
 		if onDrain { // onDrain embeds dstBuild: folds untagged
 			dstDrainingFinq = fb
 		}
@@ -397,7 +431,7 @@ func runFinqBlocks(fb *finBlock) {
 			}
 			invoked := true
 			if dstBuild {
-				invoked = dstCallbackOwnerAlive(f.dstEpoch, f.dstPid)
+				invoked = dstCallbackOwnerAlive(slab[i-1].epoch, slab[i-1].pid)
 			}
 			if onDrain {
 				lock(&finlock)
@@ -411,13 +445,13 @@ func runFinqBlocks(fb *finBlock) {
 					dstFinqRunExecuted.Add(1)
 				}
 				// Mark this entry handled before user code can terminate the drain.
-				f.dstEpoch = 0
+				slab[i-1].epoch = 0
 			}
 			if invoked {
 				if dstBuild {
 					oldPid := gp.dstPid
-					if onDrain && f.dstPid > 0 {
-						gp.dstPid = f.dstPid
+					if onDrain && slab[i-1].pid > 0 {
+						gp.dstPid = slab[i-1].pid
 					}
 					reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
 					gp.dstPid = oldPid
@@ -556,7 +590,7 @@ func dstDrainFinq() {
 
 // dstSortFinqBySeq reorders the detached finalizer chain fb IN PLACE so runFinqBlocks —
 // which executes reverse-LIFO within each block, blocks in chain order — runs the
-// finalizers in ASCENDING registration sequence (finalizer.dstSeq), the replay-stable
+// finalizers in ASCENDING registration sequence (the slab stamps' seq), the replay-stable
 // order (gc.md D4). It preserves the block structure (same blocks, same per-block
 // counts), so the discard/ledger machinery in runFinqBlocks is untouched. Its scratch
 // slices are the drain goroutine's own (SUT-external) allocations of the deterministic
@@ -569,36 +603,48 @@ func dstSortFinqBySeq(fb *finBlock) {
 	if n <= 1 {
 		return
 	}
-	all := make([]finalizer, n)
+	// Entries and their slab stamps permute TOGETHER: the sort key is the
+	// stamp's seq, and slab[i]'s pairing with fin[i] must hold at every
+	// index the re-lay writes.
+	all := make([]dstFinWithStamp, n)
+	var slabs []*[len(finBlock{}.fin)]dstCallbackStamp // one lookup per block, reused by the re-lay
 	k := 0
 	for b := fb; b != nil; b = b.next {
+		slab := dstFinSlabFor(b)
+		slabs = append(slabs, slab)
 		for i := 0; i < int(b.cnt); i++ {
-			all[k] = b.fin[i]
+			all[k] = dstFinWithStamp{fin: b.fin[i], st: slab[i]}
 			k++
 		}
 	}
-	dstSortFinalizersBySeq(all)
+	dstSortByStampSeq(all, func(p *dstFinWithStamp) uintptr { return p.st.seq })
 	// Re-lay so runFinqBlocks's reverse-per-block-in-chain-order traversal is ascending:
 	// filling fin[cnt-1], fin[cnt-2], … with consecutive ascending entries makes the
 	// block execute them fin[cnt-1] first (ascending), and blocks run in chain order.
 	k = 0
+	bi := 0
 	for b := fb; b != nil; b = b.next {
+		slab := slabs[bi]
+		bi++
 		cnt := int(b.cnt)
 		for i := 0; i < cnt; i++ {
-			b.fin[cnt-1-i] = all[k]
+			b.fin[cnt-1-i] = all[k].fin
+			slab[cnt-1-i] = all[k].st
 			k++
 		}
 	}
 }
 
-// dstSortFinalizersBySeq sorts a ascending by dstSeq — a stable, non-recursive
-// bottom-up merge sort (package runtime cannot import sort). O(n log n), deterministic.
-func dstSortFinalizersBySeq(a []finalizer) {
+// dstSortByStampSeq sorts a ascending by seq(&a[i]) — a stable,
+// non-recursive bottom-up merge sort (package runtime cannot import sort).
+// O(n log n), deterministic. One implementation serves the finalizer and
+// cleanup drains' batches.
+func dstSortByStampSeq[T any](a []T, seq func(*T) uintptr) {
 	n := len(a)
 	if n <= 1 {
 		return
 	}
-	buf := make([]finalizer, n)
+	buf := make([]T, n)
 	src, dst := a, buf
 	for width := 1; width < n; width *= 2 {
 		for i := 0; i < n; i += 2 * width {
@@ -607,7 +653,7 @@ func dstSortFinalizersBySeq(a []finalizer) {
 			hi := min(i+2*width, n)
 			l, r, k := lo, mid, lo
 			for l < mid && r < hi {
-				if src[l].dstSeq <= src[r].dstSeq {
+				if seq(&src[l]) <= seq(&src[r]) {
 					dst[k] = src[l]
 					l++
 				} else {
@@ -673,10 +719,11 @@ func dstDiscardFinChainLocked(fb *finBlock) uint64 {
 	var n uint64
 	for fb != nil {
 		next := fb.next
+		slab := dstFinSlabFor(fb)
 		cnt := atomic.Load(&fb.cnt)
 		for i := cnt; i > 0; i-- {
 			f := &fb.fin[i-1]
-			if f.dstEpoch != 0 {
+			if slab[i-1].epoch != 0 {
 				n++
 			}
 			f.fn = nil

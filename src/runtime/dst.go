@@ -39,7 +39,9 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe" // race annotations + go:linkname
 )
 
@@ -3392,56 +3394,294 @@ func dstGdestroy(gp *g) {
 	dstClearSchedState(gp)
 }
 
-// dstStampFinalizerSpecial records the DST ownership stamps on a finalizer
-// special at registration (SetFinalizer): run epoch, per-run registration
-// sequence, and owning process invocation. Unconditional within a dst build
-// — fixalloc reuses specials and addfinalizer assigns fields individually, so
-// a stale stamp must be overwritten even when no run is active (the helpers
-// then return 0). Called from addfinalizer under dstBuild only.
-func dstStampFinalizerSpecial(s *specialfinalizer) {
-	s.dstEpoch = dstCallbackEpoch()
-	s.dstSeq = dstNextCallbackSeq() // the drain sorts its batch by registration order
-	s.dstPid = dstCallbackPid()
+// The DST ownership stamps of finalizer specials and queued finalizer
+// records live OUT OF LINE, in dst-owned side structures, so that
+// specialfinalizer and the finalizer record keep upstream's exact layout in
+// BOTH build modes: the structs' identity across modes is the vanilla
+// gate's premise, and keeping them at stock size returns the untagged
+// finalizer path — fixalloc width, finq block entry count, finptrmask
+// construction — to stock text.
+//
+// Two structures, two lifetimes:
+//
+//   - dstSpecialStampTable: special -> stamps (both *specialfinalizer and
+//     *specialCleanup — one table, one lock, one lifecycle rule), from
+//     registration (SetFinalizer/AddCleanup) to the special's free.
+//     Guarded by mheap_.speciallock.
+//     Entries exist only for in-run registrations (zero stamps are
+//     represented by absence), so host-side SetFinalizer outside a run
+//     costs one empty lookup. fixalloc reuses special addresses, so entry
+//     lifetime must be a subset of special lifetime: every free path
+//     deletes, and insert THROWS on finding a live entry — a missed delete
+//     is caught at the next insert on that address, not silently reserved.
+//
+//   - dstFinSlabs: per-finBlock parallel stamp arrays, slab[i] pairing with
+//     block.fin[i]. Blocks are persistentalloc'd once and recycled forever
+//     (allfin), so a slab attaches when its block is born (under finlock)
+//     and lives as long; entries are overwritten as the block refills,
+//     exactly as the embedded fields were. The pairing invariant is kept by
+//     writing slab[i] only at the sites that write fin[i].
+type dstCallbackStamp struct {
+	seq   uintptr
+	epoch uint64
+	pid   int32
 }
 
-// dstStampCleanupSpecial is dstStampFinalizerSpecial's cleanup twin: the
-// stamps ride the embedded cleanupFn so they travel into the queue record
-// unchanged (addCleanup's whole-struct `s.cleanup = c` already cleared any
-// stale stamp, so here the overwrite is for value, not staleness). Called
-// from addCleanup under dstBuild only.
-func dstStampCleanupSpecial(s *specialCleanup) {
-	s.cleanup.dstEpoch = dstCallbackEpoch()
-	s.cleanup.dstSeq = dstNextCallbackSeq()
-	s.cleanup.dstPid = dstCallbackPid()
+type dstSpecialStampEntry struct {
+	_    sys.NotInHeap
+	sp   unsafe.Pointer // *specialfinalizer or *specialCleanup
+	st   dstCallbackStamp
+	next *dstSpecialStampEntry
 }
 
-// dstStageFinalizerSpecial stages sf on the current P for the
-// stock-signature queuefinalizer call that immediately follows in
-// freeSpecial (see p.dstFinSpecial). The P cannot change before the take:
-// freeSpecial runs only inside mspan.sweep, which asserts preemption is off
-// at its head. A missing P or an occupied stage is a broken invariant, not
-// a case to tolerate.
-func dstStageFinalizerSpecial(sf *specialfinalizer) {
+// dstSpecialStampBuckets is fixed: chains grow linearly past ~thousands of
+// simultaneously live in-run registrations — a deterministic, dst-only
+// slowdown, recorded as this table's scaling bound.
+const dstSpecialStampBuckets = 256
+
+var (
+	dstSpecialStampTable *[dstSpecialStampBuckets]*dstSpecialStampEntry // persistentalloc'd on first insert; guarded by mheap_.speciallock
+	dstSpecialStampAlloc fixalloc                                       // entry pool; guarded by mheap_.speciallock
+	dstSpecialStampInit  bool
+)
+
+func dstSpecialStampBucket(sp unsafe.Pointer) uintptr {
+	h := uintptr(sp)
+	h ^= h >> 9 // specials are fixalloc-spaced; mix the low structure out
+	return (h >> 4) % dstSpecialStampBuckets
+}
+
+// dstSpecialStampInsertLocked records sp's ownership stamps. Caller holds
+// mheap_.speciallock. A live entry for sp means a free path missed its
+// delete and a recycled address would inherit a dead run's stamps — a
+// determinism corruption, thrown loudly instead.
+func dstSpecialStampInsertLocked(sp unsafe.Pointer, st dstCallbackStamp) {
+	if !dstSpecialStampInit {
+		dstSpecialStampAlloc.init(unsafe.Sizeof(dstSpecialStampEntry{}), nil, nil, &memstats.other_sys)
+		dstSpecialStampTable = (*[dstSpecialStampBuckets]*dstSpecialStampEntry)(persistentalloc(unsafe.Sizeof(*dstSpecialStampTable), goarch.PtrSize, &memstats.other_sys))
+		dstSpecialStampInit = true
+	}
+	b := dstSpecialStampBucket(sp)
+	for e := dstSpecialStampTable[b]; e != nil; e = e.next {
+		if e.sp == sp {
+			throw("dstSpecialStampInsertLocked: live entry for a fresh special — a free path missed its delete")
+		}
+	}
+	e := (*dstSpecialStampEntry)(dstSpecialStampAlloc.alloc())
+	e.sp = sp
+	e.st = st
+	e.next = dstSpecialStampTable[b]
+	dstSpecialStampTable[b] = e
+}
+
+// dstSpecialStampTakeLocked removes and returns sp's stamps; absence means
+// the registration was not in-run (zero stamps). Caller holds
+// mheap_.speciallock.
+func dstSpecialStampTakeLocked(sp unsafe.Pointer) dstCallbackStamp {
+	if !dstSpecialStampInit {
+		return dstCallbackStamp{}
+	}
+	b := dstSpecialStampBucket(sp)
+	for p := &dstSpecialStampTable[b]; *p != nil; p = &(*p).next {
+		e := *p
+		if e.sp == sp {
+			st := e.st
+			*p = e.next
+			e.sp = nil
+			e.next = nil
+			dstSpecialStampAlloc.free(unsafe.Pointer(e))
+			return st
+		}
+	}
+	return dstCallbackStamp{}
+}
+
+// dstTestSpecialStampCount reports the number of live special-stamp table
+// entries. Test-only linkname: anti-vacuity teeth for the lifecycle tests —
+// a test that believes it exercised in-run stamping can assert the table
+// actually held entries.
+//
+//go:linkname dstTestSpecialStampCount
+func dstTestSpecialStampCount() int {
+	lock(&mheap_.speciallock)
+	n := 0
+	if dstSpecialStampInit {
+		for i := range dstSpecialStampTable {
+			for e := dstSpecialStampTable[i]; e != nil; e = e.next {
+				n++
+			}
+		}
+	}
+	unlock(&mheap_.speciallock)
+	return n
+}
+
+// dstCallbackStampAtRegistration computes the stamps for a registration
+// happening now: run epoch, per-run registration sequence, owning process
+// invocation. Zero outside a run.
+func dstCallbackStampAtRegistration() dstCallbackStamp {
+	return dstCallbackStamp{
+		seq:   dstNextCallbackSeq(), // the drain sorts its batch by registration order
+		epoch: dstCallbackEpoch(),
+		pid:   dstCallbackPid(),
+	}
+}
+
+// dstFinWithStamp pairs a queued finalizer entry with its slab stamps for
+// the drain's sort batch: entries and stamps permute together.
+type dstFinWithStamp struct {
+	fin finalizer
+	st  dstCallbackStamp
+}
+
+// dstFinSlab is a finBlock's parallel stamp array: st[i] pairs with
+// block.fin[i]. Attached when the block is persistentalloc'd (finlock
+// held) and CAS-published like the cleanup twin: writers hold finlock,
+// but the drain-side readers (runFinqBlocks, the sort) run WITHOUT it,
+// so the head is an atomic pointer. Each slab costs
+// len(finBlock.fin)×sizeof(stamp) of persistent memory per block —
+// tagged-only, never freed, the out-of-line price of the stock records.
+type dstFinSlab struct {
+	_     sys.NotInHeap
+	block *finBlock
+	next  *dstFinSlab
+	st    [len(finBlock{}.fin)]dstCallbackStamp
+}
+
+var dstFinSlabHead atomic.UnsafePointer
+
+// dstFinSlabMemo caches queuefinalizer's last (block, slab) pair —
+// finlock-guarded like every access to it; validated by pointer equality,
+// which is decisive because blocks are never freed: an address denotes one
+// block for the life of the process, so a stale entry either matches (same
+// block, same once-attached slab) or is refreshed.
+var dstFinSlabMemo struct {
+	block *finBlock
+	st    *[len(finBlock{}.fin)]dstCallbackStamp
+}
+
+// dstFinSlabAttachLocked pairs a freshly allocated block with its slab.
+// Caller holds finlock (block birth is finlock-serialized); the CAS keeps
+// the lock-free readers sound.
+func dstFinSlabAttachLocked(b *finBlock) {
+	s := (*dstFinSlab)(persistentalloc(unsafe.Sizeof(dstFinSlab{}), goarch.PtrSize, &memstats.other_sys))
+	s.block = b
+	for {
+		head := (*dstFinSlab)(dstFinSlabHead.Load())
+		s.next = head
+		if dstFinSlabHead.CompareAndSwap(unsafe.Pointer(head), unsafe.Pointer(s)) {
+			return
+		}
+	}
+}
+
+// dstFinSlabFor returns the stamp array paired with b. Every block is
+// paired at birth, so a miss is a broken invariant.
+func dstFinSlabFor(b *finBlock) *[len(finBlock{}.fin)]dstCallbackStamp {
+	for s := (*dstFinSlab)(dstFinSlabHead.Load()); s != nil; s = s.next {
+		if s.block == b {
+			return &s.st
+		}
+	}
+	throw("dstFinSlabFor: block has no stamp slab")
+	return nil
+}
+
+// dstCleanupSlab is the cleanup twin of dstFinSlab: a cleanupBlock's
+// parallel stamp array, st[i] pairing with block.cleanups[i]. Unlike
+// finBlocks, cleanupBlocks are born under NO shared lock (concurrent
+// sweepers persistentalloc and CAS them onto the queue's all-list), so the
+// slab list is CAS-published the same way: the attach happens before the
+// block is pushed anywhere a consumer can see it, and the CAS pair gives
+// the consumer the happens-before edge to the slab node.
+type dstCleanupSlab struct {
+	_     sys.NotInHeap
+	block *cleanupBlock
+	next  *dstCleanupSlab
+	st    [len(cleanupBlock{}.cleanups)]dstCallbackStamp
+}
+
+var dstCleanupSlabHead atomic.UnsafePointer
+
+// dstCleanupSlabAttach pairs a freshly allocated cleanup block with its
+// slab (CAS push; callable from concurrent sweepers).
+func dstCleanupSlabAttach(b *cleanupBlock) {
+	s := (*dstCleanupSlab)(persistentalloc(unsafe.Sizeof(dstCleanupSlab{}), goarch.PtrSize, &memstats.other_sys))
+	s.block = b
+	for {
+		head := (*dstCleanupSlab)(dstCleanupSlabHead.Load())
+		s.next = head
+		if dstCleanupSlabHead.CompareAndSwap(unsafe.Pointer(head), unsafe.Pointer(s)) {
+			return
+		}
+	}
+}
+
+// dstCleanupSlabFor returns the stamp array paired with b. Every block is
+// paired at birth, so a miss is a broken invariant.
+func dstCleanupSlabFor(b *cleanupBlock) *[len(cleanupBlock{}.cleanups)]dstCallbackStamp {
+	for s := (*dstCleanupSlab)(dstCleanupSlabHead.Load()); s != nil; s = s.next {
+		if s.block == b {
+			return &s.st
+		}
+	}
+	throw("dstCleanupSlabFor: block has no stamp slab")
+	return nil
+}
+
+// dstCleanupSlabMove moves n stamp rows from b's slab [bStart, bStart+n)
+// to a's slab at aStart, zeroing the source rows — cleanupBlock.take's
+// dst side: entries and their rows relocate together, in both take arms.
+func dstCleanupSlabMove(a *cleanupBlock, aStart uint32, b *cleanupBlock, bStart, n uint32) {
+	as, bs := dstCleanupSlabFor(a), dstCleanupSlabFor(b)
+	copy(as[aStart:aStart+n], bs[bStart:bStart+n])
+	for i := bStart; i < bStart+n; i++ {
+		bs[i] = dstCallbackStamp{}
+	}
+}
+
+// dstCleanupWithStamp pairs a queued cleanup with its slab stamps for the
+// drain's sort batch: entries and stamps permute together.
+type dstCleanupWithStamp struct {
+	c  cleanupFn
+	st dstCallbackStamp
+}
+
+// dstStageSpecialStamps stages a special's ownership stamps (taken from
+// the stamp table, deleting the entry — the special is about to be freed)
+// on the current P for the stock-signature queue call that immediately
+// follows in freeSpecial (queuefinalizer for finalizer specials,
+// cleanupQueue.enqueue for cleanup specials). The P cannot change before
+// the take: freeSpecial runs only inside mspan.sweep, which asserts
+// preemption is off at its head. A missing P or an occupied stage is a
+// broken invariant, not a case to tolerate.
+func dstStageSpecialStamps(sp unsafe.Pointer) {
 	pp := getg().m.p.ptr()
 	if pp == nil {
-		throw("dstStageFinalizerSpecial: no P")
+		throw("dstStageSpecialStamps: no P")
 	}
-	if pp.dstFinSpecial != nil {
-		throw("dstStageFinalizerSpecial: stage already occupied")
+	if pp.dstSpecialStaged {
+		throw("dstStageSpecialStamps: stage already occupied")
 	}
-	pp.dstFinSpecial = sf
+	lock(&mheap_.speciallock)
+	st := dstSpecialStampTakeLocked(sp)
+	unlock(&mheap_.speciallock)
+	pp.dstSpecialStamp = st
+	pp.dstSpecialStaged = true
 }
 
-// dstTakeStagedFinalizerStamps is queuefinalizer's side of the staging:
-// returns the staged special's ownership stamps and clears the stage.
-func dstTakeStagedFinalizerStamps() (epoch uint64, seq uintptr, pid int32) {
+// dstTakeStagedSpecialStamps is the queue side of the staging
+// (queuefinalizer and cleanupQueue.enqueue): returns the staged ownership
+// stamps and clears the stage.
+func dstTakeStagedSpecialStamps() (epoch uint64, seq uintptr, pid int32) {
 	pp := getg().m.p.ptr()
-	if pp == nil || pp.dstFinSpecial == nil {
-		throw("dstTakeStagedFinalizerStamps: nothing staged")
+	if pp == nil || !pp.dstSpecialStaged {
+		throw("dstTakeStagedSpecialStamps: nothing staged")
 	}
-	sf := pp.dstFinSpecial
-	pp.dstFinSpecial = nil
-	return sf.dstEpoch, sf.dstSeq, sf.dstPid
+	st := pp.dstSpecialStamp
+	pp.dstSpecialStamp = dstCallbackStamp{}
+	pp.dstSpecialStaged = false
+	return st.epoch, st.seq, st.pid
 }
 
 // dstTestPushMaxProcs hands the GOMAXPROCS auto-update helper an update with

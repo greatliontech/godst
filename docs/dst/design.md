@@ -1640,13 +1640,14 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   where amd64 uses the per-register copy-word rule: arm64 record writes reshape freely
   between STP pairs fed by live argument registers and spill-slot round-trips, so the
   per-register form rejects legitimate reshapes; conservation still fails residue, which
-  adds stores, and the exact-delta pins back it up FOR THE PINNED SET — the eight non-generic
-  admitted runtime symbols. The unpinned admitted symbols (the generic AddCleanup
+  adds stores, and the exact-delta pins back it up FOR THE PINNED SET — the four
+  extraction-pair symbols (the finalizer/cleanup registration and queueing symbols once
+  pinned here became stock-equal when their stamps moved out of line). The unpinned admitted
+  symbols (the generic AddCleanup
   instantiations and the availability class) are protected by the conservation bound alone,
   with zero slack measured at derivation; they sit inside the generic blind spot this
-  section already records. The arm64 deltas: addCleanup −1,
-  enqueue 7, freeSpecial 2, gcinit 21; pairs runFinalizers −6, GC 12, runCleanups 17,
-  queuefinalizer 22. The gettimeofday fence-wrapper split is linux/amd64 assembly and is
+  section already records. The arm64 pair deltas: runFinalizers 8, GC 12, runCleanups 13,
+  queuefinalizer 12. The gettimeofday fence-wrapper split is linux/amd64 assembly and is
   outside the arm64 profile's split class (its allowlist entries would be stale there).
   The named-anchor subset is enforced by
   `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
@@ -1708,20 +1709,30 @@ The DATA layout is the recorded deviation set — NOT zero-footprint, deliberate
 `g` carries the per-goroutine DST words (the identity/RNG stamps, the race-access staging
 fields, the sticky simulation-membership bit the scheduler classification keys on, the
 GC-internal simulation-membership save slot, and the scoped host-I/O grant flag), `p` carries the
-run-queue overflow flag and the staged finalizer special (the sweep-to-queue stamp hand-off
-that keeps `queuefinalizer`'s signature stock), `timer` carries fake-timer state (arming host, full-width registration
+run-queue overflow flag and the staged special stamps (the sweep-to-queue value hand-off
+that keeps `queuefinalizer`'s and `cleanupQueue.enqueue`'s signatures stock), `timer` carries
+fake-timer state (arming host, full-width registration
 epoch, list link, the overdue-conversion delivery shift, and the universe-base-time mark that
-excludes a timer from host-rate re-mapping), `synctestBubble` carries the GC-drain bookkeeping,
-`specialfinalizer` carries epoch+sequence+PID, `specialCleanup`'s embedded cleanup carries
-sequence+epoch+PID, and `finalizer`/`cleanupFn` each carry registration sequence plus
-run-epoch/process-invocation ownership (so untagged builds fit slightly fewer entries per block,
-and `cleanupFn` — passed by value — spills more registers at its call boundaries).
+excludes a timer from host-rate re-mapping), and `synctestBubble` carries the GC-drain
+bookkeeping. The FINALIZER and CLEANUP records are deliberately NOT in this set:
+`specialfinalizer`, `specialCleanup`, the queued `finalizer` record, and `cleanupFn` all keep
+upstream's exact layout in both builds — their DST ownership stamps live out of line, in
+dst-owned side structures (one speciallock-guarded table for both special kinds from
+registration to sweep, and per-block parallel stamp slabs — CAS-published for lock-free
+readers on both queues, entry-relocation covered in `cleanupBlock.take` — from queue to
+execution; the slabs are persistent tagged-only memory, the out-of-line price of the stock
+records; the mechanism and its lifetime invariants are documented at the structures in
+`runtime/dst.go`) — so the untagged
+finalizer and cleanup paths, including both block entry counts and the `finptrmask` and
+`cleanupBlockPtrMask` constructions, are stock.
 Outside the runtime, `os.file` carries the DST backend words and fd map slot, `os`'s unexported
-`root` the DST root pointer, and `testing`'s chatty printer the host-stream fd slot. Restoring the untagged
-layouts would fork per-tag variants of the runtime's central `g` struct and of hand-maintained GC
-bitmap construction (`finptrmask` and `cleanupBlockPtrMask`, whose repeating patterns are
-load-bearing on queued callback layouts) — an unsafe-critical duplication for a few words per
-object; recorded here as the deliberate limit, with the rationale at the claim in `runtime/dst.go`.
+`root` the DST root pointer, and `testing`'s chatty printer the host-stream fd slot. The
+remaining in-record state stays in-record deliberately: per-tag struct variants of the
+runtime's central `g` are unsafe-critical duplication, and relocating `g`'s hot DST words (the
+per-goroutine RNG state above all) or `timer`'s fake-timer state out of line would put a lookup
+on the simulation's hottest paths or cross the run boundary's lifetime rules — each such move
+is judged per structure, as the finalizer/cleanup stamps were, not assumed; the rationale for
+each residency lives at the fields.
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the

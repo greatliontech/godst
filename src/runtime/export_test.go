@@ -2365,6 +2365,70 @@ func DSTDisabledVisibilityProbe(g1p, g2p unsafe.Pointer) (inAt, inAnySim, inAnyV
 // DSTDisabledVisibilityProbe.
 func DSTProbeG() unsafe.Pointer { return unsafe.Pointer(getg()) }
 
+// DstTestCleanupTakeMovesStamps is the white-box oracle for
+// cleanupBlock.take's stamp-row move (the one entry-relocating path in the
+// cleanup queue): it builds two slab-attached blocks, stamps the source's
+// rows with sentinels and the destination's tail with a dead-run pattern,
+// runs both take arms, and reports whether every moved entry's row moved
+// with it and the vacated source rows were zeroed. Deterministic and
+// self-contained — the integration net (DSTCleanupFlushTake) exercises the
+// real flush path but cannot force the multi-P arrangement reliably.
+func DstTestCleanupTakeMovesStamps() bool {
+	if !dstBuild {
+		return true
+	}
+	newBlock := func() *cleanupBlock {
+		b := (*cleanupBlock)(persistentalloc(cleanupBlockSize, tagAlign, &memstats.other_sys))
+		dstCleanupSlabAttach(b)
+		return b
+	}
+	mk := func(seq uintptr) dstCallbackStamp {
+		return dstCallbackStamp{seq: seq, epoch: 7, pid: 9}
+	}
+	// Arm 1: take-all. dst has 2 entries; src has 3 sentinel-stamped ones;
+	// dst's TAIL rows carry a stale dead-run pattern the move must overwrite.
+	a, b := newBlock(), newBlock()
+	as, bs := dstCleanupSlabFor(a), dstCleanupSlabFor(b)
+	a.n = 2
+	for i := range as {
+		as[i] = dstCallbackStamp{seq: 0xDEAD, epoch: 0xDEAD, pid: 3}
+	}
+	b.n = 3
+	for i := uint32(0); i < b.n; i++ {
+		bs[i] = mk(uintptr(100 + i))
+	}
+	a.take(b)
+	if a.n != 5 || b.n != 0 {
+		return false
+	}
+	for i := uint32(0); i < 3; i++ {
+		if as[2+i] != mk(uintptr(100+i)) {
+			return false
+		}
+		if bs[i] != (dstCallbackStamp{}) {
+			return false
+		}
+	}
+	// Arm 2: partial take (dst has room for 1; src's TAIL entry moves).
+	c, d := newBlock(), newBlock()
+	cs, ds := dstCleanupSlabFor(c), dstCleanupSlabFor(d)
+	c.n = uint32(len(c.cleanups)) - 1
+	cs[len(cs)-1] = dstCallbackStamp{seq: 0xDEAD, epoch: 0xDEAD, pid: 3}
+	d.n = 2
+	ds[0], ds[1] = mk(200), mk(201)
+	c.take(d)
+	if c.n != uint32(len(c.cleanups)) || d.n != 1 {
+		return false
+	}
+	if cs[len(cs)-1] != mk(201) { // src's tail entry (index 1) moved
+		return false
+	}
+	if ds[1] != (dstCallbackStamp{}) || ds[0] != mk(200) {
+		return false
+	}
+	return true
+}
+
 // dstTestVisitGFields is the single list of per-g DST fields goroutine exit
 // must clear — dstGdestroy's full clear set. stamp=true writes a nonzero
 // sentinel into each; stamp=false reports whether any is nonzero. One list
