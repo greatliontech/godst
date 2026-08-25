@@ -3434,21 +3434,32 @@ type dstSpecialStampEntry struct {
 	next *dstSpecialStampEntry
 }
 
-// dstSpecialStampBuckets is fixed: chains grow linearly past ~thousands of
-// simultaneously live in-run registrations — a deterministic, dst-only
-// slowdown, recorded as this table's scaling bound.
+// dstSpecialStampBuckets is the table's initial bucket count. The table
+// GROWS (rehashing under speciallock, ×4 once live registrations would
+// push mean chain length past four), so lookups stay O(1) at any
+// registration volume: the earlier fixed-size table's recorded linear
+// bound past ~thousands of live in-run registrations measured as a
+// first-order cost in cleanup-heavy simulations (a per-object
+// AddCleanup workload holds every not-yet-collected registration live
+// at once).
 const dstSpecialStampBuckets = 256
 
 var (
-	dstSpecialStampTable *[dstSpecialStampBuckets]*dstSpecialStampEntry // persistentalloc'd on first insert; guarded by mheap_.speciallock
-	dstSpecialStampAlloc fixalloc                                       // entry pool; guarded by mheap_.speciallock
+	dstSpecialStampSlots unsafe.Pointer // persistentalloc'd bucket array; guarded by mheap_.speciallock
+	dstSpecialStampMask  uintptr        // bucket count - 1 (power of two); guarded by mheap_.speciallock
+	dstSpecialStampCount uintptr        // live entries; guarded by mheap_.speciallock
+	dstSpecialStampAlloc fixalloc       // entry pool; guarded by mheap_.speciallock
 	dstSpecialStampInit  bool
 )
 
-func dstSpecialStampBucket(sp unsafe.Pointer) uintptr {
+func dstSpecialStampBucketPtr(slots unsafe.Pointer, i uintptr) **dstSpecialStampEntry {
+	return (**dstSpecialStampEntry)(unsafe.Pointer(uintptr(slots) + i*goarch.PtrSize))
+}
+
+func dstSpecialStampBucket(sp unsafe.Pointer, mask uintptr) uintptr {
 	h := uintptr(sp)
 	h ^= h >> 9 // specials are fixalloc-spaced; mix the low structure out
-	return (h >> 4) % dstSpecialStampBuckets
+	return (h >> 4) & mask
 }
 
 // dstSpecialStampInsertLocked records sp's ownership stamps. Caller holds
@@ -3458,11 +3469,32 @@ func dstSpecialStampBucket(sp unsafe.Pointer) uintptr {
 func dstSpecialStampInsertLocked(sp unsafe.Pointer, st dstCallbackStamp) {
 	if !dstSpecialStampInit {
 		dstSpecialStampAlloc.init(unsafe.Sizeof(dstSpecialStampEntry{}), nil, nil, &memstats.other_sys)
-		dstSpecialStampTable = (*[dstSpecialStampBuckets]*dstSpecialStampEntry)(persistentalloc(unsafe.Sizeof(*dstSpecialStampTable), goarch.PtrSize, &memstats.other_sys))
+		dstSpecialStampSlots = persistentalloc(dstSpecialStampBuckets*goarch.PtrSize, goarch.PtrSize, &memstats.other_sys)
+		dstSpecialStampMask = dstSpecialStampBuckets - 1
 		dstSpecialStampInit = true
 	}
-	b := dstSpecialStampBucket(sp)
-	for e := dstSpecialStampTable[b]; e != nil; e = e.next {
+	if dstSpecialStampCount >= (dstSpecialStampMask+1)*4 {
+		newMask := (dstSpecialStampMask+1)*4 - 1
+		newSlots := persistentalloc((newMask+1)*goarch.PtrSize, goarch.PtrSize, &memstats.other_sys)
+		for i := uintptr(0); i <= dstSpecialStampMask; i++ {
+			e := *dstSpecialStampBucketPtr(dstSpecialStampSlots, i)
+			for e != nil {
+				next := e.next
+				nb := dstSpecialStampBucket(e.sp, newMask)
+				slot := dstSpecialStampBucketPtr(newSlots, nb)
+				e.next = *slot
+				*slot = e
+				e = next
+			}
+		}
+		// The old bucket array stays persistentalloc'd — the runtime's
+		// usual growth residue, bounded by a third of the final table.
+		dstSpecialStampSlots = newSlots
+		dstSpecialStampMask = newMask
+	}
+	b := dstSpecialStampBucket(sp, dstSpecialStampMask)
+	slot := dstSpecialStampBucketPtr(dstSpecialStampSlots, b)
+	for e := *slot; e != nil; e = e.next {
 		if e.sp == sp {
 			throw("dstSpecialStampInsertLocked: live entry for a fresh special — a free path missed its delete")
 		}
@@ -3470,8 +3502,9 @@ func dstSpecialStampInsertLocked(sp unsafe.Pointer, st dstCallbackStamp) {
 	e := (*dstSpecialStampEntry)(dstSpecialStampAlloc.alloc())
 	e.sp = sp
 	e.st = st
-	e.next = dstSpecialStampTable[b]
-	dstSpecialStampTable[b] = e
+	e.next = *slot
+	*slot = e
+	dstSpecialStampCount++
 }
 
 // dstSpecialStampTakeLocked removes and returns sp's stamps; absence means
@@ -3481,8 +3514,8 @@ func dstSpecialStampTakeLocked(sp unsafe.Pointer) dstCallbackStamp {
 	if !dstSpecialStampInit {
 		return dstCallbackStamp{}
 	}
-	b := dstSpecialStampBucket(sp)
-	for p := &dstSpecialStampTable[b]; *p != nil; p = &(*p).next {
+	b := dstSpecialStampBucket(sp, dstSpecialStampMask)
+	for p := dstSpecialStampBucketPtr(dstSpecialStampSlots, b); *p != nil; p = &(*p).next {
 		e := *p
 		if e.sp == sp {
 			st := e.st
@@ -3490,6 +3523,7 @@ func dstSpecialStampTakeLocked(sp unsafe.Pointer) dstCallbackStamp {
 			e.sp = nil
 			e.next = nil
 			dstSpecialStampAlloc.free(unsafe.Pointer(e))
+			dstSpecialStampCount--
 			return st
 		}
 	}
@@ -3506,8 +3540,8 @@ func dstTestSpecialStampCount() int {
 	lock(&mheap_.speciallock)
 	n := 0
 	if dstSpecialStampInit {
-		for i := range dstSpecialStampTable {
-			for e := dstSpecialStampTable[i]; e != nil; e = e.next {
+		for i := uintptr(0); i <= dstSpecialStampMask; i++ {
+			for e := *dstSpecialStampBucketPtr(dstSpecialStampSlots, i); e != nil; e = e.next {
 				n++
 			}
 		}
@@ -3603,8 +3637,56 @@ type dstCleanupSlab struct {
 
 var dstCleanupSlabHead atomic.UnsafePointer
 
+// The slab index makes dstCleanupSlabFor O(1). The CAS list stays the
+// authoritative attach structure (push callable from concurrent
+// sweepers); the index is a lock-free-read open-addressing table over
+// it — atomic slots, entries never deleted (cleanup blocks are never
+// freed), growth republishes a superset built from the list, and a
+// probe that reaches an empty slot falls back to the list walk (an
+// entry attached but not yet indexed, or a read racing a growth).
+// Without it every per-block lookup the deferred-enqueue and drain
+// paths make walked the whole list — O(blocks) per lookup, O(blocks²)
+// per drain — a first-order cost in cleanup-heavy simulations.
+var (
+	dstCleanupSlabIndexLock mutex
+	dstCleanupSlabIndex     atomic.UnsafePointer // *dstCleanupSlabIndexTable
+	dstCleanupSlabCount     uintptr              // guarded by dstCleanupSlabIndexLock
+)
+
+// dstCleanupSlabIndexTable is a persistentalloc'd header followed inline
+// by mask+1 atomic slab-pointer slots; load stays at or below half so a
+// probe always terminates at an empty slot.
+type dstCleanupSlabIndexTable struct {
+	_    sys.NotInHeap
+	mask uintptr
+}
+
+func dstCleanupSlabIndexSlot(t *dstCleanupSlabIndexTable, i uintptr) *atomic.UnsafePointer {
+	return (*atomic.UnsafePointer)(unsafe.Pointer(uintptr(unsafe.Pointer(t)) + unsafe.Sizeof(dstCleanupSlabIndexTable{}) + i*goarch.PtrSize))
+}
+
+func dstCleanupSlabHash(b *cleanupBlock, mask uintptr) uintptr {
+	h := uintptr(unsafe.Pointer(b))
+	h ^= h >> 17
+	h ^= h >> 7
+	return h & mask
+}
+
+// dstCleanupSlabIndexInsert probes s's block into t. Caller holds
+// dstCleanupSlabIndexLock; concurrent lock-free readers see each slot
+// either empty or fully published.
+func dstCleanupSlabIndexInsert(t *dstCleanupSlabIndexTable, s *dstCleanupSlab) {
+	for i := dstCleanupSlabHash(s.block, t.mask); ; i = (i + 1) & t.mask {
+		slot := dstCleanupSlabIndexSlot(t, i)
+		if slot.Load() == nil {
+			slot.Store(unsafe.Pointer(s))
+			return
+		}
+	}
+}
+
 // dstCleanupSlabAttach pairs a freshly allocated cleanup block with its
-// slab (CAS push; callable from concurrent sweepers).
+// slab (CAS push; callable from concurrent sweepers) and indexes it.
 func dstCleanupSlabAttach(b *cleanupBlock) {
 	s := (*dstCleanupSlab)(persistentalloc(unsafe.Sizeof(dstCleanupSlab{}), goarch.PtrSize, &memstats.other_sys))
 	s.block = b
@@ -3612,14 +3694,47 @@ func dstCleanupSlabAttach(b *cleanupBlock) {
 		head := (*dstCleanupSlab)(dstCleanupSlabHead.Load())
 		s.next = head
 		if dstCleanupSlabHead.CompareAndSwap(unsafe.Pointer(head), unsafe.Pointer(s)) {
-			return
+			break
 		}
 	}
+	lock(&dstCleanupSlabIndexLock)
+	dstCleanupSlabCount++
+	t := (*dstCleanupSlabIndexTable)(dstCleanupSlabIndex.Load())
+	if t == nil || dstCleanupSlabCount*2 > t.mask+1 {
+		size := uintptr(512)
+		if t != nil {
+			size = (t.mask + 1) * 4
+		}
+		nt := (*dstCleanupSlabIndexTable)(persistentalloc(unsafe.Sizeof(dstCleanupSlabIndexTable{})+size*goarch.PtrSize, goarch.PtrSize, &memstats.other_sys))
+		nt.mask = size - 1
+		// Rebuild from the authoritative list — s is already pushed, so
+		// the new table indexes it too; the old table stays
+		// persistentalloc'd, the runtime's usual growth residue.
+		for w := (*dstCleanupSlab)(dstCleanupSlabHead.Load()); w != nil; w = w.next {
+			dstCleanupSlabIndexInsert(nt, w)
+		}
+		dstCleanupSlabIndex.Store(unsafe.Pointer(nt))
+	} else {
+		dstCleanupSlabIndexInsert(t, s)
+	}
+	unlock(&dstCleanupSlabIndexLock)
 }
 
 // dstCleanupSlabFor returns the stamp array paired with b. Every block is
-// paired at birth, so a miss is a broken invariant.
+// paired at birth, so a miss in both the index and the list is a broken
+// invariant.
 func dstCleanupSlabFor(b *cleanupBlock) *[len(cleanupBlock{}.cleanups)]dstCallbackStamp {
+	if t := (*dstCleanupSlabIndexTable)(dstCleanupSlabIndex.Load()); t != nil {
+		for i := dstCleanupSlabHash(b, t.mask); ; i = (i + 1) & t.mask {
+			p := dstCleanupSlabIndexSlot(t, i).Load()
+			if p == nil {
+				break
+			}
+			if s := (*dstCleanupSlab)(p); s.block == b {
+				return &s.st
+			}
+		}
+	}
 	for s := (*dstCleanupSlab)(dstCleanupSlabHead.Load()); s != nil; s = s.next {
 		if s.block == b {
 			return &s.st

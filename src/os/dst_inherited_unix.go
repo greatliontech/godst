@@ -74,7 +74,7 @@ func dstInheritFile(src *File) (*File, error) {
 	if !dstFSActive() || !dstInSimBubble() {
 		return nil, errors.New("simulation.InheritFile called outside a simulation")
 	}
-	if src == nil || src.file == nil || src.dstf != nil || src.pfd.Sysfd < 0 {
+	if src == nil || src.file == nil || dstBackendOf(src.file) != nil || src.pfd.Sysfd < 0 {
 		return nil, ErrInvalid
 	}
 	hostID, procID := dstFSCurrentNode()

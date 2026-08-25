@@ -163,7 +163,7 @@ tasks:
       - '{{.RUN}} test -count=1 cmd/api -check'
 
   test:inert-diff:
-    desc: INV-VANILLA differential gate — untagged probe-corpus text vs the upstream base toolchain (design.md, "Untagged footprint")
+    desc: INV-VANILLA + INV-TYPESHAPE differential gates — untagged probe-corpus text and declared type shapes vs the upstream base toolchain (design.md, "Untagged footprint")
     dir: src
     deps: [tmpdir]
     cmds:
@@ -177,7 +177,7 @@ tasks:
           DST_STOCK_GOROOT=$(GOTOOLCHAIN=$base go env GOROOT)
           export DST_STOCK_GOROOT
         fi
-        DST_STOCK_GOROOT="$DST_STOCK_GOROOT" {{.RUN}} test -tags dst -count=1 -timeout 20m -v -run 'TestUntaggedTextIdenticalToStock' testing/simulation
+        DST_STOCK_GOROOT="$DST_STOCK_GOROOT" {{.RUN}} test -tags dst -count=1 -timeout 20m -v -run 'TestUntaggedTextIdenticalToStock|TestUntaggedTypeShapesIdenticalToStock' testing/simulation
 
   test:inert-std:
     desc: Untagged -short std — build-mode inertness across all of std (heavy; not in `task test`)

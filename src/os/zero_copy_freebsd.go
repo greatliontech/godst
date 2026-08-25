@@ -47,7 +47,7 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 		// leave further error handling as the responsibility of the caller.
 		return 0, false, nil
 	}
-	if dstSimEnabled && src.dstf != nil {
+	if dstSimEnabled && dstBackendOf(src.file) != nil {
 		// Simulated source: no real descriptor; generic loop (DST). Must sit
 		// below checkValid — a typed-nil *File reaches this unwrap.
 		return 0, false, nil

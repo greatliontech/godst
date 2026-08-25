@@ -27,7 +27,7 @@ func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {
 	// there and os/pidfd_linux.go) — sendfile has no such Once, so this arm is
 	// defense-in-depth. A non-bubble goroutine keeps the optimization. See
 	// design.md "The interception boundary".
-	if dstSimEnabled && (f.dstf != nil || dstFenceActive()) {
+	if dstSimEnabled && (dstBackendOf(f.file) != nil || dstFenceActive()) {
 		return 0, false, nil
 	}
 	pfd, network := getPollFDAndNetwork(w)
@@ -72,7 +72,7 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 	// poison it host-wide (same hazard class as os/pidfd_linux.go). The simulated
 	// source is also checked in copyFileRange, after the unwrap — the only point
 	// that sees through fileWithoutWriteTo/LimitedReader wrappers.
-	if dstSimEnabled && (f.dstf != nil || dstFenceActive()) {
+	if dstSimEnabled && (dstBackendOf(f.file) != nil || dstFenceActive()) {
 		return 0, false, nil
 	}
 
@@ -137,7 +137,7 @@ func (f *File) copyFileRange(r io.Reader) (written int64, handled bool, err erro
 		// leave further error handling as the responsibility of the caller.
 		return 0, false, nil
 	}
-	if dstSimEnabled && src.dstf != nil {
+	if dstSimEnabled && dstBackendOf(src.file) != nil {
 		// Simulated source: no real descriptor; generic loop (DST).
 		return 0, false, nil
 	}

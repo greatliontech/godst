@@ -47,27 +47,29 @@ func (d *dirInfo) close() {
 }
 
 func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
-	if dstSimEnabled && f.dstf != nil {
-		dnames, dinfos, derr := f.dstf.(dstFileBackendExt).readdir(n)
-		if derr != nil {
-			if derr == io.EOF {
-				return nil, nil, nil, io.EOF
+	if dstSimEnabled {
+		if dstf := dstBackendOf(f.file); dstf != nil {
+			dnames, dinfos, derr := dstf.(dstFileBackendExt).readdir(n)
+			if derr != nil {
+				if derr == io.EOF {
+					return nil, nil, nil, io.EOF
+				}
+				if derr == poll.ErrFileClosing {
+					derr = ErrClosed
+				}
+				return nil, nil, nil, &PathError{Op: "readdirent", Path: f.name, Err: derr}
 			}
-			if derr == poll.ErrFileClosing {
-				derr = ErrClosed
+			switch mode {
+			case readdirName:
+				return dnames, nil, nil, nil
+			case readdirDirEntry:
+				for _, fi := range dinfos {
+					dirents = append(dirents, fs.FileInfoToDirEntry(fi))
+				}
+				return nil, dirents, nil, nil
+			default:
+				return nil, nil, dinfos, nil
 			}
-			return nil, nil, nil, &PathError{Op: "readdirent", Path: f.name, Err: derr}
-		}
-		switch mode {
-		case readdirName:
-			return dnames, nil, nil, nil
-		case readdirDirEntry:
-			for _, fi := range dinfos {
-				dirents = append(dirents, fs.FileInfoToDirEntry(fi))
-			}
-			return nil, dirents, nil, nil
-		default:
-			return nil, nil, dinfos, nil
 		}
 	}
 	// If this file has no dirInfo, create one.

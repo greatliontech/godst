@@ -11,7 +11,6 @@ import (
 	"internal/poll"
 	"io"
 	"path"
-	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -162,12 +161,13 @@ func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {
 		files[i] = v.f
 	}
 	for _, f := range files {
-		if f.dstf == nil {
+		dstf := dstBackendOf(f)
+		if dstf == nil {
 			continue
 		}
-		_ = f.dstf.closeFile()
+		_ = dstf.closeFile()
 		dstReleaseFD(f)
-		dstDropClosedNode(f.dstf)
+		dstDropClosedNode(dstf)
 	}
 }
 
@@ -265,6 +265,11 @@ func dstFSRoll() {
 //
 //go:linkname dstFSRunTeardown
 func dstFSRunTeardown() {
+	// The one sweep point for the out-of-line state tables: host
+	// context, bubble dead, so weak.Value's potential GC park is an
+	// ordinary wait (dst_filestate.go). Before the early return —
+	// rows from a filesystem-free run's pipes still deserve the sweep.
+	dstStateTablesSweep()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	if dstFS.disks == nil {
@@ -1380,18 +1385,19 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	return dstNewFile(d, name), true, nil
 }
 
-// dstNewFile builds an *os.File backed by a simulated file. The pfd is left
-// with an invalid Sysfd so any not-yet-gated path fails with EBADF
-// deterministically instead of touching a real descriptor.
+// dstNewFile builds an *os.File backed by a simulated file. The pfd's
+// Sysfd carries the out-of-line state row's slot (below the -1
+// sentinel, so still invalid): any not-yet-gated path fails with EBADF
+// deterministically instead of touching a real descriptor
+// (dst_filestate.go).
 func dstNewFile(d dstFileBackend, name string) *File {
 	if df, ok := d.(*dstFile); ok {
 		df.epoch = dstFSEpoch()
 	}
-	f := &File{&file{name: name, dstf: d}}
-	f.pfd.Sysfd = -1
+	f := &File{&file{name: name}}
+	dstSetFileBackend(f.file, d)
 	host, proc := dstFSCurrentNode()
 	dstRegisterOpenFile(f.file, host, proc)
-	runtime.SetFinalizer(f.file, (*file).close)
 	return f
 }
 

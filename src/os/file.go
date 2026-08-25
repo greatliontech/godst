@@ -730,7 +730,7 @@ func (f *File) SyscallConn() (syscall.RawConn, error) {
 		return nil, err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return nil, f.wrapErr("syscallconn", dstErrUnsupportedFS)
 		}
 		if dstFenceActive() {

@@ -69,20 +69,20 @@ type file struct {
 	stdoutOrErr bool                    // whether this is stdout or stderr
 	appendMode  bool                    // whether file is opened for appending
 	inRoot      bool                    // whether file is opened in a Root
-	dstf        dstFileBackend          // simulated backing under DST; nil otherwise (inert untagged)
-	dstfds      map[dstFDKey]int        // simulated descriptors registered with the DST syscall boundary
 }
 
-func (f *file) dstBackend() dstFileBackend {
-	return f.dstf
-}
+// The DST simulated backing and virtual-fd map live out of line in
+// dstFileStates (dst_filestate.go), the row index parked in pfd.Sysfd
+// below the -1 sentinel: the struct keeps upstream's exact type shape
+// in both build modes (design.md, "Untagged footprint (contract)", the
+// type-shape clause).
 
 // fd is the Unix implementation of Fd.
 func (f *File) fd() uintptr {
 	if f == nil {
 		return ^(uintptr(0))
 	}
-	if dstSimEnabled && f.dstf != nil {
+	if dstSimEnabled && dstBackendOf(f.file) != nil {
 		return uintptr(dstFD(f.file))
 	}
 
@@ -332,17 +332,18 @@ func (file *file) close() error {
 	if file == nil {
 		return syscall.EINVAL
 	}
-	if dstSimEnabled && file.dstf != nil {
-		var err error
-		if e := file.dstf.closeFile(); e != nil {
-			err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
-		} else {
-			dstUnregisterOpenFile(file)
-			dstReleaseFD(file)
-			dstDropClosedNode(file.dstf)
+	if dstSimEnabled {
+		if dstf := dstBackendOf(file); dstf != nil {
+			var err error
+			if e := dstf.closeFile(); e != nil {
+				err = &PathError{Op: "close", Path: file.name, Err: ErrClosed}
+			} else {
+				dstUnregisterOpenFile(file)
+				dstReleaseFD(file)
+				dstDropClosedNode(dstf)
+			}
+			return err
 		}
-		runtime.SetFinalizer(file, nil)
-		return err
 	}
 	if info := file.dirinfo.Swap(nil); info != nil {
 		info.close()
@@ -365,8 +366,10 @@ func (file *file) close() error {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (f *File) seek(offset int64, whence int) (ret int64, err error) {
-	if dstSimEnabled && f.dstf != nil {
-		return f.dstf.seek(offset, whence)
+	if dstSimEnabled {
+		if dstf := dstBackendOf(f.file); dstf != nil {
+			return dstf.seek(offset, whence)
+		}
 	}
 	if info := f.dirinfo.Swap(nil); info != nil {
 		// Free cached dirinfo, so we allocate a new one if we

@@ -110,14 +110,31 @@ func dstCloseHostRoots(host uint32) {
 	dstCloseRoots(func(e dstOpenFileEntry) bool { return e.host == host })
 }
 
+// dstRootOf returns r's simulated root, its row index parked in
+// root.fd below the -1 sentinel — row lifetime equals what the former
+// struct field's was, per the dstStateTable contract in
+// dst_filestate.go (which also declares dstRootStates). A free
+// function, deliberately not a method — see dstBackendOf.
+func dstRootOf(r *root) *dstRoot {
+	idx, ok := dstStateIndex(int(r.fd))
+	if !ok {
+		return nil
+	}
+	d := dstRootStates.get(idx)
+	// The object, not the derived index, anchors the row's lifetime
+	// (see dstFileStateOf).
+	runtime.KeepAlive(r)
+	return d
+}
+
 func dstRootActive(r *Root) bool {
-	return r != nil && r.root != nil && r.root.dst != nil
+	return r != nil && r.root != nil && dstRootOf(r.root) != nil
 }
 
 func dstNewRoot(name string, node *dstFSNode, disk *dstFSDisk) *Root {
-	r := &Root{&root{fd: -1, name: name, dst: &dstRoot{node: node, disk: disk, epoch: dstFSEpoch()}}}
+	r := &Root{&root{fd: -1, name: name}}
+	r.root.fd = sysfdType(dstStateSlot(dstRootStates.register(r.root, dstRoot{node: node, disk: disk, epoch: dstFSEpoch()})))
 	dstRegisterRoot(r.root)
-	runtime.SetFinalizer(r.root, (*root).Close)
 	return r
 }
 
@@ -163,7 +180,8 @@ func dstRootEnter(r *Root) (*dstRoot, error) {
 	if err := r.root.incref(); err != nil {
 		return nil, err
 	}
-	if r.root.dst.epoch != dstFSEpoch() {
+	dst := dstRootOf(r.root)
+	if dst.epoch != dstFSEpoch() {
 		// A Root from a dead run: refused like a closed handle, the identity
 		// a closed Root and a leaked *File both surface (the File's
 		// ErrFileClosing is converted by wrapErr; the Root path has no such
@@ -171,7 +189,7 @@ func dstRootEnter(r *Root) (*dstRoot, error) {
 		r.root.decref()
 		return nil, ErrClosed
 	}
-	return r.root.dst, nil
+	return dst, nil
 }
 
 func dstRootResolveLocked(r *dstRoot, name string) (parent *dstFSNode, base string, node *dstFSNode, trailingSlash bool, err error) {

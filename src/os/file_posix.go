@@ -33,7 +33,7 @@ func (f *File) Close() error {
 // It returns the number of bytes read and an error, if any.
 func (f *File) read(b []byte) (n int, err error) {
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.read(b)
 		}
 	}
@@ -47,7 +47,7 @@ func (f *File) read(b []byte) (n int, err error) {
 // EOF is signaled by a zero count with err set to nil.
 func (f *File) pread(b []byte, off int64) (n int, err error) {
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.pread(b, off)
 		}
 	}
@@ -60,7 +60,7 @@ func (f *File) pread(b []byte, off int64) (n int, err error) {
 // It returns the number of bytes written and an error, if any.
 func (f *File) write(b []byte) (n int, err error) {
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.write(b)
 		}
 	}
@@ -73,7 +73,7 @@ func (f *File) write(b []byte) (n int, err error) {
 // It returns the number of bytes written and an error, if any.
 func (f *File) pwrite(b []byte, off int64) (n int, err error) {
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.pwrite(b, off)
 		}
 	}
@@ -116,7 +116,7 @@ func (f *File) chmod(mode FileMode) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			if e := dstf.(dstFileBackendExt).chmodHandle(mode); e != nil {
 				return f.wrapErr("chmod", e)
 			}
@@ -182,7 +182,7 @@ func (f *File) Chown(uid, gid int) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return f.wrapErr("chown", dstErrUnsupportedFS)
 		}
 	}
@@ -200,7 +200,7 @@ func (f *File) Truncate(size int64) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			if e := dstf.truncate(size); e != nil {
 				return f.wrapErr("truncate", e)
 			}
@@ -221,7 +221,7 @@ func (f *File) Sync() error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			if e := dstf.sync(); e != nil {
 				return f.wrapErr("sync", e)
 			}
@@ -276,7 +276,7 @@ func (f *File) Chdir() error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			if e := dstf.chdirHandle(); e != nil {
 				return f.wrapErr("chdir", e)
 			}
@@ -301,7 +301,7 @@ func (f *File) setDeadline(t time.Time) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.(dstFileBackendExt).setDeadline(true, true, t)
 		}
 		if dstFenceActive() {
@@ -317,7 +317,7 @@ func (f *File) setReadDeadline(t time.Time) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.(dstFileBackendExt).setDeadline(true, false, t)
 		}
 		if dstFenceActive() {
@@ -333,7 +333,7 @@ func (f *File) setWriteDeadline(t time.Time) error {
 		return err
 	}
 	if dstSimEnabled {
-		if dstf := f.file.dstBackend(); dstf != nil {
+		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.(dstFileBackendExt).setDeadline(false, true, t)
 		}
 		if dstFenceActive() {

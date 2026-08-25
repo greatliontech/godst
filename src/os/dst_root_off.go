@@ -10,6 +10,13 @@ import "time"
 
 type dstRoot struct{}
 
+// Untagged (and on platforms without the simulated filesystem) a Root
+// has no simulated backing: the constant nil folds the
+// dstSimEnabled-guarded gates to dead code. A free function,
+// deliberately not a method — see dstBackendOf (design.md,
+// INV-TYPESHAPE).
+func dstRootOf(r *root) *dstRoot { return nil }
+
 func dstUnregisterRoot(*root)  {}
 func dstCloseProcRoots(uint32) {}
 func dstCloseHostRoots(uint32) {}

@@ -60,7 +60,7 @@ func dstCloseCaller(file *file) error {
 	if file == nil {
 		return nil
 	}
-	backend := file.dstBackend()
+	backend := dstBackendOf(file)
 	if backend == nil {
 		if dstFenceActive() && !dstHostIOActive() {
 			return dstHostCloseError()

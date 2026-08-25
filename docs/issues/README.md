@@ -8,6 +8,13 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **`-tags dst` does not build on non-linux GOOS** — Lands: with the next
+  port or build-surface change set touching the dst build-tag matrix; a
+  tagged cross-build leg in CI is the enforcement half. Plain-`dst` files
+  call helpers declared under narrower constraints; pre-existing at
+  dst.10. See
+  [dst-tag-nonlinux-unbuildable.md](dst-tag-nonlinux-unbuildable.md).
+
 - **dst-only exports are outside the exported-API gate** — Lands: user
   decision (needs a dst-tagged `cmd/api` context — its own design). The
   import-policy half closed as disproven: `deps_test` scans dst-tagged

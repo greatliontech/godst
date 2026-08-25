@@ -1725,14 +1725,63 @@ records; the mechanism and its lifetime invariants are documented at the structu
 `runtime/dst.go`) — so the untagged
 finalizer and cleanup paths, including both block entry counts and the `finptrmask` and
 `cleanupBlockPtrMask` constructions, are stock.
-Outside the runtime, `os.file` carries the DST backend words and fd map slot, `os`'s unexported
-`root` the DST root pointer, and `testing`'s chatty printer the host-stream fd slot. The
+Outside the runtime, `os.file`'s simulated backing and virtual-fd map and `os`'s unexported
+`root`'s DST root pointer are deliberately NOT in this set: both live out of line in dst-owned
+state tables (`dstStateTable` in `os/dst_filestate.go`), the row index parked as a VALUE in
+the object's existing descriptor slot below the `-1` sentinel the simulated constructors
+already leave there (`pfd.Sysfd`, `root.fd` — still negative, so every not-yet-gated path
+fails EBADF exactly as before), so both types keep upstream's exact shape in BOTH build modes.
+Row lifetime equals what the fields' was (created before the object escapes its constructor,
+surviving Close so a closed simulated handle still answers through its backend, reclaimed only
+after the OBJECT is collected: each row carries a weak backref to its object and the sweep
+releases exactly the rows whose backref died. The sweep runs at RUN TEARDOWN only
+(`dstFSRunTeardown` — host context, after the bubble has exited): `weak.Value` can park its
+goroutine on an in-flight GC's mark termination, which inside a bubble would be a wait on a
+nondeterministic event under the table mutex, so no in-bubble path sweeps. No callback rides
+the run-scoped cleanup/finalizer channel, which discards a dead simulated process's callbacks
+by design and would leak every row that process registered. The recorded bound: in-run growth
+is at most the run's registrations — negligible beyond the run's own footprint, since a row is
+two words plus state whose backend graph the run's tree pins until teardown regardless — and a
+row is reclaimed at the first teardown after its object's collection, so growth across runs
+comes only from objects still referenced or not yet collected). Index reuse can never alias a
+reachable object — release requires the object collected — and every in-flight operation pins
+its object across the derived-index window (`runtime.KeepAlive` at the accessors and across
+`dstFD`). The tagged price is one field
+compare per gated operation on host objects and a spine load plus two dependent loads on
+simulated ones, measured against the in-record field by the SimFile benchmarks beside the
+simulation suite.
+`testing`'s chatty printer deviations stay recorded in the type-shape clause's exception
+list below. The
 remaining in-record state stays in-record deliberately: per-tag struct variants of the
 runtime's central `g` are unsafe-critical duplication, and relocating `g`'s hot DST words (the
 per-goroutine RNG state above all) or `timer`'s fake-timer state out of line would put a lookup
 on the simulation's hottest paths or cross the run boundary's lifetime rules — each such move
 is judged per structure, as the finalizer/cleanup stamps were, not assumed; the rationale for
 each residency lives at the fields.
+
+**Type-shape parity (contract).** Declared type shapes are a consumer-observable surface the
+text gate cannot see: static analyzers walk them and reflect traverses them, in every build
+mode — a fork-added field in a user-visible std type changes what those consumers observe even
+where the untagged text is stock (the incident class: an interface-typed backend field on
+`os.file` flipped a consumer analyzer's dynamic-carrier judgment for `*os.File`).
+
+- **INV-TYPESHAPE**: every type declared in an upstream-present, user-importable standard
+  package keeps upstream's exact shape — field set, field ORDER, embeddedness, struct tags,
+  named-type underlying, interface method set, and concrete method set (promotions included)
+  — in BOTH build modes; DST per-object state attaches out of line. Fork-only type
+  declarations are outside the clause. The runtime's internals (`g`, `p`, `timer`,
+  `synctestBubble`) are outside the clause — runtime-internal, in no user signature,
+  unreachable by reflect — and keep their recorded DATA deviations above. Exceptions are
+  recorded per shape line with their judgment (today: `testing.chattyPrinter`'s host-stream
+  fd slot and bubble-output methods — harness-internal state and channels no user signature
+  carries; the state accessors are free functions precisely so no method enters an
+  upstream-present type's set), and a recorded exception that admits no divergence in either
+  build mode fails the gate (the stale-entry discipline). The gate's package list is cross-checked against
+  the live dst delta so it cannot drift below the clause. Enforced:
+  `TestUntaggedTypeShapesIdenticalToStock` (`testing/simulation/vanilla_typeshape_test.go`) —
+  a `go/types` shape inventory of the dst-modified user-importable packages, resolved from
+  the fork's and the upstream base's GOROOT sources under both tag sets and compared
+  line-exact, in the `test:inert-diff` leg beside the text gate.
 
 The DST contract tests are dead in a stock `-short`/untagged run. The enforcing configurations are
 the tasks in `Taskfile.yml` at the repo root (the A2-25 runner choice); each task name below is the

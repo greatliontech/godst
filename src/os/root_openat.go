@@ -19,7 +19,12 @@ import (
 // relative to a directory.
 type root struct {
 	name string
-	dst  *dstRoot
+
+	// The DST simulated root lives out of line in dstRootStates
+	// (dst_root.go), the row index parked in fd below the -1
+	// sentinel: the struct keeps upstream's exact type shape in both
+	// build modes (design.md, "Untagged footprint (contract)", the
+	// type-shape clause).
 
 	// refs is incremented while an operation is using fd.
 	// closed is set when Close is called.
@@ -31,12 +36,12 @@ type root struct {
 }
 
 func (r *root) Close() error {
-	if dstSimEnabled && r.dst != nil {
+	if dstSimEnabled && dstRootOf(r) != nil {
 		dstUnregisterRoot(r)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.closed && r.refs == 0 && (!dstSimEnabled || r.dst == nil) {
+	if !r.closed && r.refs == 0 && (!dstSimEnabled || dstRootOf(r) == nil) {
 		syscall.Close(r.fd)
 	}
 	r.closed = true
@@ -61,7 +66,7 @@ func (r *root) decref() {
 		panic("bad Root refcount")
 	}
 	r.refs--
-	if r.closed && r.refs == 0 && (!dstSimEnabled || r.dst == nil) {
+	if r.closed && r.refs == 0 && (!dstSimEnabled || dstRootOf(r) == nil) {
 		syscall.Close(r.fd)
 	}
 }

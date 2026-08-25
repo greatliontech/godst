@@ -16,12 +16,14 @@ func (f *File) Stat() (FileInfo, error) {
 	if f == nil {
 		return nil, ErrInvalid
 	}
-	if dstSimEnabled && f.dstf != nil {
-		fi, err := f.dstf.(dstFileBackendExt).stat()
-		if err != nil {
-			return nil, f.wrapErr("stat", err)
+	if dstSimEnabled {
+		if dstf := dstBackendOf(f.file); dstf != nil {
+			fi, err := dstf.(dstFileBackendExt).stat()
+			if err != nil {
+				return nil, f.wrapErr("stat", err)
+			}
+			return fi, nil
 		}
-		return fi, nil
 	}
 	var fs fileStat
 	err := f.pfd.Fstat(&fs.sys)

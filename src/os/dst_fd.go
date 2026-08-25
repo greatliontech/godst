@@ -10,6 +10,7 @@ import (
 	"errors"
 	"internal/poll"
 	"io"
+	"runtime"
 	"sync"
 	"syscall"
 	_ "unsafe" // for go:linkname
@@ -99,11 +100,15 @@ func dstFD(file *file) int {
 	if !dstFSActive() {
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
+	state := dstFileStateOf(file)
+	if state == nil {
+		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
+	}
 	// Tree files and proc-overlay files both mint virtual fds — the
 	// proc-overlay contract (zero (st_dev, st_ino) through fstat) is only
 	// reachable through here. Other backends (the pipe) keep the fence.
 	var closed bool
-	switch b := file.dstf.(type) {
+	switch b := state.backend.(type) {
 	case *dstFile:
 		b.mu.Lock()
 		closed = b.closed
@@ -116,6 +121,7 @@ func dstFD(file *file) int {
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
 	if closed {
+		runtime.KeepAlive(file)
 		return -1
 	}
 	host, proc := dstFSCurrentNode()
@@ -124,28 +130,39 @@ func dstFD(file *file) int {
 	dstFDRegistry.mu.Lock()
 	defer dstFDRegistry.mu.Unlock()
 	dstFDRollLocked()
-	if fd := file.dstfds[key]; fd != 0 {
+	if fd := state.fds[key]; fd != 0 {
 		entry, ok := dstFDRegistry.fds[fd]
-		if ok && entry.backend == file.dstf && entry.epoch == epoch && entry.host == host && entry.proc == proc {
+		if ok && entry.backend == state.backend && entry.epoch == epoch && entry.host == host && entry.proc == proc {
 			return fd
 		}
-		delete(file.dstfds, key)
+		delete(state.fds, key)
 	}
 	if dstFDRegistry.next >= dstVirtualFDBase+dstVirtualFDCount {
 		panic("os: too many simulated file descriptors")
 	}
 	fd := dstFDRegistry.next
 	dstFDRegistry.next++
-	if file.dstfds == nil {
-		file.dstfds = make(map[dstFDKey]int)
+	if state.fds == nil {
+		state.fds = make(map[dstFDKey]int)
 	}
-	file.dstfds[key] = fd
-	dstFDRegistry.fds[fd] = dstFDEntry{backend: file.dstf, epoch: epoch, host: host, proc: proc}
+	state.fds[key] = fd
+	dstFDRegistry.fds[fd] = dstFDEntry{backend: state.backend, epoch: epoch, host: host, proc: proc}
+	// The file, not the derived state pointer, anchors the row across
+	// this whole function (see dstFileStateOf).
+	runtime.KeepAlive(file)
 	return fd
 }
 
 func dstReleaseFD(file *file) {
-	if file.dstfds == nil {
+	dstReleaseFDState(dstFileStateOf(file))
+	runtime.KeepAlive(file)
+}
+
+// dstReleaseFDState is dstReleaseFD on the file's out-of-line state
+// directly: the row's cleanup releases fds after the *file is already
+// unreachable (dst_filestate.go).
+func dstReleaseFDState(state *dstFileState) {
+	if state == nil || state.fds == nil {
 		return
 	}
 	type release struct {
@@ -155,13 +172,13 @@ func dstReleaseFD(file *file) {
 	var releases []release
 	dstFDRegistry.mu.Lock()
 	dstFDRollLocked()
-	for key, fd := range file.dstfds {
+	for key, fd := range state.fds {
 		entry, ok := dstFDRegistry.fds[fd]
-		if ok && entry.backend == file.dstf && entry.epoch == key.epoch && entry.host == key.host && entry.proc == key.proc {
+		if ok && entry.backend == state.backend && entry.epoch == key.epoch && entry.host == key.host && entry.proc == key.proc {
 			delete(dstFDRegistry.fds, fd)
 			releases = append(releases, release{fd: fd, entry: entry})
 		}
-		delete(file.dstfds, key)
+		delete(state.fds, key)
 	}
 	dstFDRegistry.mu.Unlock()
 	for _, rel := range releases {
