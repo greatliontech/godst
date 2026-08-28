@@ -196,8 +196,15 @@ func (f *File) Stat() (FileInfo, error) {
 		return nil, ErrInvalid
 	}
 	// See stat_unix.go: an fd-based stat is an observation of the
-	// opened identity's metadata and must reach the test log.
+	// opened identity's metadata and must reach the test log; the log
+	// line belongs to the public method only.
 	testlog.Stat(f.name)
+	return f.fstatNolog()
+}
+
+// fstatNolog is (*File).Stat with no test logging, for stdlib-internal
+// stats whose result does not escape to the caller.
+func (f *File) fstatNolog() (FileInfo, error) {
 	d, err := dirstat(f)
 	if err != nil {
 		return nil, err

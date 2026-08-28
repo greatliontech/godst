@@ -1684,6 +1684,17 @@ func TestFileStatTestlog(t *testing.T) {
 		if _, err := f.Stat(); err != nil {
 			t.Fatalf("f.Stat: %s", err)
 		}
+		// ReadFile's internal buffer-sizing stat never escapes to the
+		// caller and must NOT log: it would mark every ReadFile input
+		// as a metadata observation nothing consumed.
+		other := filepath.Join(TempDir(), "file-readfile-testlog.txt")
+		if err := WriteFile(other, []byte("y"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		defer Remove(other)
+		if _, err := ReadFile(other); err != nil {
+			t.Fatalf("ReadFile: %s", err)
+		}
 		return
 	}
 
@@ -1703,14 +1714,20 @@ func TestFileStatTestlog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stats := 0
+	stats, readFileStats := 0, 0
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "stat ") && strings.Contains(line, "file-stat-testlog.txt") {
 			stats++
 		}
+		if strings.HasPrefix(line, "stat ") && strings.Contains(line, "file-readfile-testlog.txt") {
+			readFileStats++
+		}
 	}
 	if stats < 1 {
 		t.Fatalf("fd-based stat not recorded; testlog:\n%s", data)
+	}
+	if readFileStats != 0 {
+		t.Fatalf("ReadFile's internal stat leaked into the testlog; testlog:\n%s", data)
 	}
 }
 
