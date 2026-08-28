@@ -1665,6 +1665,55 @@ func TestFileChdirTestlog(t *testing.T) {
 	}
 }
 
+// TestFileStatTestlog verifies that (*File).Stat notifies the testlog,
+// just like os.Stat does. An fd-based stat observes the same metadata a
+// path stat would; without the record a caller can branch on an opened
+// file's modification time unobserved, so cache keys built from the log
+// under-pin exactly the metadata this call returns.
+func TestFileStatTestlog(t *testing.T) {
+	if Getenv("GO_TEST_FILE_STAT_TESTLOG") == "1" {
+		name := filepath.Join(TempDir(), "file-stat-testlog.txt")
+		if err := WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, err := Open(name)
+		if err != nil {
+			t.Fatalf("Open: %s", err)
+		}
+		defer f.Close()
+		if _, err := f.Stat(); err != nil {
+			t.Fatalf("f.Stat: %s", err)
+		}
+		return
+	}
+
+	testenv.MustHaveExec(t)
+	exe := testenv.Executable(t)
+	logfile := filepath.Join(t.TempDir(), "testlog.txt")
+	cmd := testenv.Command(t, exe,
+		"-test.run=^TestFileStatTestlog$",
+		"-test.testlogfile="+logfile)
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, "GO_TEST_FILE_STAT_TESTLOG=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper failed: %v\n%s", err, out)
+	}
+
+	data, err := ReadFile(logfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "stat ") && strings.Contains(line, "file-stat-testlog.txt") {
+			stats++
+		}
+	}
+	if stats < 1 {
+		t.Fatalf("fd-based stat not recorded; testlog:\n%s", data)
+	}
+}
+
 func TestChdirAndGetwd(t *testing.T) {
 	t.Chdir(t.TempDir()) // Ensure wd is restored after the test.
 

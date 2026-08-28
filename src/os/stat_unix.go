@@ -7,6 +7,7 @@
 package os
 
 import (
+	"internal/testlog"
 	"syscall"
 )
 
@@ -16,6 +17,11 @@ func (f *File) Stat() (FileInfo, error) {
 	if f == nil {
 		return nil, ErrInvalid
 	}
+	// An fd-based stat observes the same metadata a path stat would;
+	// leaving it out of the test log lets a caller read an opened
+	// file's modification time unobserved, so cache keys built from
+	// the log under-pin exactly the metadata this call returns.
+	testlog.Stat(f.name)
 	if dstSimEnabled {
 		if dstf := dstBackendOf(f.file); dstf != nil {
 			fi, err := dstf.(dstFileBackendExt).stat()

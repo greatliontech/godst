@@ -195,6 +195,9 @@ func (f *File) Stat() (FileInfo, error) {
 	if f == nil {
 		return nil, ErrInvalid
 	}
+	// See stat_unix.go: an fd-based stat is an observation of the
+	// opened identity's metadata and must reach the test log.
+	testlog.Stat(f.name)
 	d, err := dirstat(f)
 	if err != nil {
 		return nil, err

@@ -5,6 +5,7 @@
 package os
 
 import (
+	"internal/testlog"
 	"errors"
 	"internal/filepathlite"
 	"internal/syscall/windows"
@@ -18,6 +19,9 @@ func (file *File) Stat() (FileInfo, error) {
 	if file == nil {
 		return nil, ErrInvalid
 	}
+	// See stat_unix.go: an fd-based stat is an observation of the
+	// opened identity's metadata and must reach the test log.
+	testlog.Stat(file.name)
 	return statHandle(file.name, file.pfd.Sysfd)
 }
 
