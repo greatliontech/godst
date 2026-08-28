@@ -140,7 +140,8 @@ func openDirNolog(name string) (*File, error) {
 	if e != nil {
 		return nil, e
 	}
-	d, e := f.Stat()
+	// openDirNolog: the stat's result never escapes (IsDir check only).
+	d, e := f.fstatNolog()
 	if e != nil {
 		f.Close()
 		return nil, e

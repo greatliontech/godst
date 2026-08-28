@@ -144,7 +144,8 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 					// [1] https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/fa8194e0-53ec-413b-8315-e8fa85396fd8
 					break
 				}
-				if s, _ := file.Stat(); s != nil && !s.IsDir() {
+				// The stat's result never escapes (error-shaping only).
+				if s, _ := file.fstatNolog(); s != nil && !s.IsDir() {
 					err = &PathError{Op: "readdir", Path: file.name, Err: syscall.ENOTDIR}
 				} else {
 					err = &PathError{Op: "GetFileInformationByHandleEx", Path: file.name, Err: err}
