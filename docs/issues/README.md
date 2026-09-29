@@ -8,6 +8,13 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
+- **LimitDisk never fails a write into a sparse hole** — Lands: user
+  decision (logical-byte versus allocated-block accounting is a modeling
+  choice with a stated boundary). A slab-write engine that grows its file
+  sparsely and pwrites into the hole cannot reach a full-disk refusal
+  inside a commit under this fault; filed from pando's disk-fault chunk.
+  See [limitdisk-sparse-write-charge.md](limitdisk-sparse-write-charge.md).
+
 - **`-tags dst` does not build on non-linux GOOS** — Lands: with the next
   port or build-surface change set touching the dst build-tag matrix; a
   tagged cross-build leg in CI is the enforcement half. Plain-`dst` files
