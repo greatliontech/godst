@@ -24,6 +24,7 @@ import (
 // in no user signature and are unreachable by reflect, so their
 // recorded DATA deviations (design.md) stay in-record.
 var typeShapePackages = []string{
+	"go/types",
 	"internal/poll", "internal/sync", "net", "os", "os/exec",
 	"os/signal", "os/user", "sync", "syscall", "testing", "time",
 }

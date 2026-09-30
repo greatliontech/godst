@@ -12,6 +12,10 @@ package main
 
 import (
 	cryptorand "crypto/rand"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"net"
 	"os"
 	"os/signal"
@@ -73,6 +77,13 @@ func main() {
 		r.Close()
 	}
 	println(os.Getpid())
+
+	// go/types: a checker over one parsed file, so the checker's cycle
+	// detection (the carried fix in isComplete) is linked and compared.
+	fset := token.NewFileSet()
+	if f, err := parser.ParseFile(fset, "x.go", "package x\ntype A B\ntype B struct{ a *A }\n", 0); err == nil {
+		types.NewChecker(&types.Config{}, fset, types.NewPackage("x", "x"), nil).Files([]*ast.File{f})
+	}
 
 	// syscall wrappers the fork splits or fences.
 	var tv syscall.Timeval

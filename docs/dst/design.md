@@ -1658,7 +1658,8 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   instantiations and the availability class) are protected by the conservation bound alone,
   with zero slack measured at derivation; they sit inside the generic blind spot this
   section already records. The arm64 pair deltas: runFinalizers 8, GC 12, runCleanups 13,
-  queuefinalizer 12, (*File).Stat 19 (amd64: 6, 8, 10, 10, 18). The gettimeofday fence-wrapper split is linux/amd64 assembly and is
+  queuefinalizer 12, (*File).Stat 19 (amd64: 6, 8, 10, 10, 18); the carried fix
+  `(*Checker).isComplete`: 17 (amd64 18). The gettimeofday fence-wrapper split is linux/amd64 assembly and is
   outside the arm64 profile's split class (its allowlist entries would be stale there).
   The named-anchor subset is enforced by
   `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
@@ -1715,6 +1716,37 @@ Further recorded CODE deviation classes, each admitted by name and difference cl
   must be linked by the corpus and calling the helper, and a helper call anywhere else is an
   unadmitted difference, so a logged stat cannot be quietly unlogged elsewhere). The
   unexported method is a recorded type-shape exception on the file types.
+- **Carried upstream fixes.** Where the pinned toolchain's own gates run on the fork, an
+  upstream defect that flakes them is the fork's to fix ahead of upstream. Each is recorded
+  here and in the gate's `carriedFixes` (the symbol, the calls the fix adds, the upstream
+  reference), admitted only as: on both sides, callee set stock's plus the recorded additions
+  (each firing), nothing of stock's dropped, text within the extraction pairs' bound (48 instructions / 64 mnemonics), and the exact
+  per-arch instruction-count delta pinned on every profiled arch — a missing pin refuses,
+  never skips, for the carried fixes and the extraction pairs alike (one shared check). The
+  64-mnemonic budget is accepted as is: the exact count fixes the instruction total, and the
+  class's store rules (no immediate or global store, every register-source store fed by an
+  unmatched load) close the residue shape a same-count substitution could otherwise hide.
+  Retirement is the port procedure's (releases.md step 4): the porter judges every entry
+  against the new base — a fix upstream landed in the same shape fails its entry stale
+  mechanically; one landed in another shape is dropped in favor of upstream's by the porter,
+  since the gate cannot tell a superseded divergence from a needed one; one not landed stays
+  with its cite re-checked. The one carried today, in `cmd/compile/internal/types2/cycles.go`
+  (go/types's copy is generated from it): `(*Checker).isComplete` read `Named.fromRHS`
+  unguarded while `unpack` writes it under the type's mutex — a data race under concurrent
+  type-checking of package variants sharing an instantiation (the `golang/go#79035` family; a
+  race report one run in six to twelve on an arch-walking test corpus, stock go1.27.0/go1.27.1
+  and this fork alike) — and now reads an instance's field only once the writer's atomic state bit says the value
+  is there, stock's own nil before that (unpacking an instance there would expand one whose
+  origin is still being declared — issue57522), and unpacks every other kind first as the
+  other readers do (a declared type's unpack sets state bits only; a lazily imported type
+  loads what the Underlying call behind it loads anyway), branching on the immutable `inst`
+  alone so the guard reads nothing the writer touches: stock's semantics, the race gone. Pinned by
+  `TestIsCompleteRacesUnpack` in both packages (the race detector the oracle, run in the
+  `test:dst-race` leg: the bare read reports the write/read pair, the state-guarded read does
+  not). The corpus type-checks one parsed
+  file so the checker's cycle detection is linked and compared — which links go/parser,
+  go/scanner, go/constant and math/big beside it, untouched symbols the comparison now also
+  walks (objdump time, no correctness cost).
 - **Export-data inline-body availability.** The fork's runtime instantiates `abi.TypeFor`
   (DST bookkeeping), which places `abi.TypeOf` and `abi.NoEscape` inline bodies in runtime's
   export data; every package implicitly imports runtime, so a downstream generic instantiation

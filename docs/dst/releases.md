@@ -198,6 +198,16 @@ the new base excludes them by construction.
    commit message records them). Builds are deliberately absent from the
    post-commit form: they belong to the branch's ci/matrix runs.
 4. **Port audit** — a port re-derives the model against the new base; it
+   also judges every carried upstream fix (design.md, "Carried upstream
+   fixes"; the gate's `carriedFixes` table, each entry citing its upstream
+   reference): against the new base, a fix upstream has since landed in the
+   same shape retires itself (its gate entry fires on no symbol and fails
+   stale — remove it and the record), one upstream landed in another shape
+   is re-derived or dropped in favor of upstream's (the fork's text must
+   then equal the base's, or the entry keeps admitting a divergence upstream
+   no longer needs), and one upstream has not landed stays, its cite
+   re-checked; the disposition per entry rides the port commit message.
+   Beyond that, a port
    is not "the old code compiles against the new tree". Walk upstream's
    change set between the bases (`git log`/`git diff <old base>..<new
    base>` over the surface the simulation intercepts or models: the

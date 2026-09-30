@@ -182,9 +182,9 @@ func TestUntaggedTextIdenticalToStock(t *testing.T) {
 func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	t.Helper()
 	required := []string{
-		"crypto/internal/sysrand", "internal/runtime/maps", "internal/sync",
-		"net", "os", "os/signal", "os/user", "runtime", "sync", "syscall",
-		"testing", "time",
+		"crypto/internal/sysrand", "go/types", "internal/runtime/maps",
+		"internal/sync", "net", "os", "os/signal", "os/user", "runtime",
+		"sync", "syscall", "testing", "time",
 	}
 	// The closure is computed for the arch under comparison — under the
 	// DST_VANILLA_GOARCH cross knob the host's closure could differ from
@@ -423,6 +423,8 @@ var profiles = map[string]*archProfile{
 			"runtime.runCleanups":    10,
 			"runtime.queuefinalizer": 10,
 			"os.(*File).Stat":        18,
+			// carried fixes (design.md, "Carried upstream fixes")
+			"go/types.(*Checker).isComplete": 18,
 		},
 	},
 	"arm64": {
@@ -481,6 +483,8 @@ var profiles = map[string]*archProfile{
 			"runtime.runCleanups":    13,
 			"runtime.queuefinalizer": 12,
 			"os.(*File).Stat":        19,
+			// carried fixes (design.md, "Carried upstream fixes")
+			"go/types.(*Checker).isComplete": 17,
 		},
 	},
 }
@@ -1013,8 +1017,77 @@ var extractions = map[string]extraction{
 	},
 }
 
-// sortedKeys orders the extraction callers so the allowlist is stable.
-func sortedKeys(m map[string]extraction) []string {
+// carriedFix is one upstream defect the fork fixes ahead of upstream
+// (design.md, "Carried upstream fixes"): the stock symbol the fix changes,
+// the calls the fix adds that stock's body never makes, and the upstream
+// reference that names the defect — the entry retires at the port whose
+// base carries upstream's own fix (it then fires on no symbol and fails
+// stale).
+type carriedFix struct {
+	adds map[string]bool
+	cite string
+}
+
+// carriedFixes maps each carried fix's symbol to its record.
+var carriedFixes = map[string]carriedFix{
+	// isComplete read Named.fromRHS unguarded while unpack writes it under
+	// the type's mutex (concurrent type-checking of package variants
+	// sharing an instantiation); the fix reads an instance only once the
+	// writer's atomic state bit is set and unpacks every other kind first.
+	"go/types.(*Checker).isComplete": {adds: map[string]bool{"go/types.(*Named).unpack": true}, cite: "golang/go#79035 family — Named.fromRHS read in isComplete"},
+}
+
+// checkExactDelta is the mandatory instruction-count pin shared by the
+// extraction pairs and the carried fixes: prints the measured delta under
+// DST_VANILLA_DELTAS, refuses an arch with no pin (a new profile or a new
+// admitted symbol fails closed), and refuses a delta off its pin — the
+// mimicry closure a residue store that copies an admitted shape cannot
+// pass. what names the symbol for the refusal (the cite for a fix).
+func checkExactDelta(name string, d int, what string) string {
+	if os.Getenv("DST_VANILLA_DELTAS") != "" {
+		fmt.Printf("DELTA %s: %d\n", what, d)
+	}
+	want, pinned := prof.exactDeltas[name]
+	if !pinned {
+		return fmt.Sprintf("no instruction-count delta pinned for this arch — measure (DST_VANILLA_DELTAS=1) and pin under review (%s)", what)
+	}
+	if d != want {
+		return fmt.Sprintf("instruction-count delta %d, pinned %d — re-measure only with review (%s)", d, want, what)
+	}
+	return ""
+}
+
+// checkCarriedFix admits a carried fix's symbol: on both sides, differing
+// from stock by the fix's own calls (the recorded additions, each firing)
+// within the extraction pairs' text bound, no dst reference, nothing of
+// stock's dropped, and — the mimicry gap closed as for the extraction
+// pairs — its exact instruction-count delta pinned per arch, mandatory. Every
+// refusal names the fix's upstream cite, so the porter judging it against
+// a new base has the reference in hand.
+func checkCarriedFix(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
+	cf := carriedFixes[name]
+	if !ok {
+		return fmt.Sprintf("expected on both sides (%s)", cf.cite)
+	}
+	for c := range cf.adds {
+		if !fb.calls[c] {
+			return fmt.Sprintf("stale carried-fix addition %s: the fork no longer makes the call (%s)", c, cf.cite)
+		}
+	}
+	if extra := calleeSetDiff(fb, sb, cf.adds); len(extra) > 0 {
+		return fmt.Sprintf("makes calls neither stock nor the recorded fix makes: %v (%s)", extra, cf.cite)
+	}
+	if extra := calleeSetDiff(sb, fb, nil); len(extra) > 0 {
+		return fmt.Sprintf("dropped stock calls: %v (%s)", extra, cf.cite)
+	}
+	if msg := checkExactDelta(name, len(fb.lines)-len(sb.lines), "carried "+name+" ("+cf.cite+")"); msg != "" {
+		return msg
+	}
+	return classRelaxed(fb.lines, sb.lines, fb.dstRaw, 48, 64)
+}
+
+// sortedKeys orders a record map's keys so the allowlist is stable.
+func sortedKeys[V any](m map[string]V) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
@@ -1096,13 +1169,8 @@ func checkExtractionCaller(name string, fb, sb symbol, ok bool, fork, stock map[
 	if extra := calleeSetDiff(sb, pairSym, abiMicro); len(extra) > 0 {
 		return fmt.Sprintf("pair dropped stock calls: %v", extra)
 	}
-	if os.Getenv("DST_VANILLA_DELTAS") != "" {
-		fmt.Printf("DELTA pair %s: %d\n", name, len(pairSym.lines)-len(sb.lines))
-	}
-	if want, pinned := prof.exactDeltas[name]; pinned {
-		if d := len(pairSym.lines) - len(sb.lines); d != want {
-			return fmt.Sprintf("pair instruction-count delta %d, pinned %d — re-measure only with review", d, want)
-		}
+	if msg := checkExactDelta(name, len(pairSym.lines)-len(sb.lines), "pair "+name); msg != "" {
+		return msg
 	}
 	return classRelaxed(pairSym.lines, sb.lines, pairSym.dstRaw, 48, 64)
 }
@@ -1158,6 +1226,11 @@ func buildAllowlist(p *archProfile) []allowEntry {
 		list = append(list,
 			allowEntry{pattern: "^" + regexp.QuoteMeta(caller) + "$", class: "extraction-caller", check: checkExtractionCaller},
 			allowEntry{pattern: "^" + regexp.QuoteMeta(extractions[caller].helper) + "$", class: "extraction-helper", check: checkForkOnly})
+	}
+	// Carried upstream fixes, one entry per symbol (the stale-entry
+	// discipline retires each at the port that absorbs its fix).
+	for _, sym := range sortedKeys(carriedFixes) {
+		list = append(list, allowEntry{pattern: "^" + regexp.QuoteMeta(sym) + "$", class: "carried-fix", check: checkCarriedFix})
 	}
 	list = append(list, []allowEntry{
 		// Fence-wrapper splits: the split body must be instruction-identical to

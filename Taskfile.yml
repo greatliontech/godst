@@ -93,6 +93,10 @@ tasks:
     deps: [tmpdir]
     cmds:
       - '{{.RUN}} test -tags dst -race -count=1 -timeout 60m testing/simulation testing/simulation/determinism'
+      # The carried go/types fix's regression twins (design.md, "Carried
+      # upstream fixes"): the race detector is their oracle, so they pin
+      # only here.
+      - '{{.RUN}} test -race -count=1 -run TestIsCompleteRacesUnpack go/types cmd/compile/internal/types2'
 
   test:determinism:
     desc: Same-seed determinism sweep — cross-run, cross-process, and environmental-perturbation transcript equality

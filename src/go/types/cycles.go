@@ -119,7 +119,27 @@ func (check *Checker) isComplete(t Type) bool {
 		rhs = t.fromRHS
 	case *Named:
 		obj = t.obj
-		rhs = t.fromRHS
+		// Carried fix (godst; upstream's read is unguarded — the
+		// golang/go#79035 family). The concurrently reachable writer of
+		// fromRHS is unpack — expanding an instance, or loading an
+		// imported type — under n.mu, and a checker reading the field
+		// bare here races it (go/packages type-checking package variants
+		// that share an instantiation). An instance is read only once
+		// the unpacked state — an atomic the writer sets after the
+		// write — says the value is there, stock's own nil before that
+		// (unpacking it here would expand an instance whose origin is
+		// still being declared: issue57522); every other kind unpacks
+		// first, as the other readers do — a declared type's unpack
+		// only sets state bits, a lazily imported type's loads what the
+		// Underlying call behind this one loads anyway. inst is
+		// immutable after construction, so the branch itself reads
+		// nothing the writer touches.
+		if t.inst == nil {
+			t.unpack()
+			rhs = t.fromRHS
+		} else if t.stateHas(unpacked) {
+			rhs = t.fromRHS
+		}
 	default:
 		return true
 	}
