@@ -53,10 +53,15 @@ type dstMMapEntry struct {
 	mapBase uintptr
 	mapLen  uintptr
 	node    *dstFSNode
-	epoch   uint64
-	host    uint32
-	proc    uint32
-	off     int64
+	// file is the open file description the mapping was taken through:
+	// on Linux a shared mapping references the description, so a flock it
+	// holds outlives its descriptor's close until the mapping is gone
+	// (dstFlockReleaseFD, dstMMapReleaseFile).
+	file  *dstFile
+	epoch uint64
+	host  uint32
+	proc  uint32
+	off   int64
 	// writable is the map-time prot's write bit; fdWritable is the backing
 	// descriptor's access mode at map time — the model's VM_MAYWRITE, which
 	// caps what mprotect may grant later (an O_RDWR-backed read-only mapping
@@ -178,6 +183,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		mapBase:    mapBase,
 		mapLen:     mapLen,
 		node:       file.node,
+		file:       file,
 		epoch:      dstFSEpoch(),
 		host:       host,
 		proc:       proc,
@@ -223,14 +229,48 @@ func dstMMapLookupRange(data []byte) (*dstMMapEntry, syscall.Errno, bool) {
 	return nil, 0, false
 }
 
+// dstMMapLiveThroughLocked counts this run's live mappings taken through
+// file's description. The mapping registry's lock is held.
+func dstMMapLiveThroughLocked(file *dstFile) int {
+	n := 0
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.file == file && entry.epoch == dstFSEpoch() {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// dstMMapReleaseFileLocked is the description's side of an unmap: when the
+// dropped mapping was the last one through its description and that
+// description's descriptor already closed holding a flock, the lock's
+// release is now due. Returns it for the caller to perform once the locks
+// are dropped (the release announces to the explorer, which yields). The
+// mapping registry's lock is held; the decision is atomic against
+// dstFlockReleaseFD, which records the pending release under the same lock.
+func dstMMapReleaseFileLocked(file *dstFile) *dstFlockPending {
+	if file == nil || dstMMapLiveThroughLocked(file) > 0 {
+		return nil
+	}
+	return file.flockPending.Swap(nil)
+}
+
 func dstMunmap(data []byte) (syscall.Errno, bool) {
+	errno, handled, pending := dstMunmapLocked(data)
+	dstFlockReleasePending(pending)
+	return errno, handled
+}
+
+func dstMunmapLocked(data []byte) (syscall.Errno, bool, *dstFlockPending) {
 	key, errno := dstMMapKey(data)
 	if errno != 0 {
-		return errno, true
+		return errno, true, nil
 	}
 	start, end, errno := dstMMapRange(data)
 	if errno != 0 {
-		return errno, true
+		return errno, true, nil
 	}
 	host, proc := dstFSCurrentNode()
 	dstFS.mu.Lock()
@@ -249,12 +289,12 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 			} else {
 				dstMMapRegistry.maps[key] = bucket
 			}
-			return 0, true
+			return 0, true, dstMMapReleaseFileLocked(entry.file)
 		}
 	}
 	for _, entry := range bucket {
 		if entry.epoch == dstFSEpoch() && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
-			return syscall.EINVAL, true
+			return syscall.EINVAL, true, nil
 		}
 	}
 	for _, bucket := range dstMMapRegistry.maps {
@@ -264,11 +304,11 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 				continue
 			}
 			if start >= mapStart && end <= mapEnd && entry.epoch == dstFSEpoch() {
-				return syscall.EINVAL, true
+				return syscall.EINVAL, true, nil
 			}
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // dstMMapReleaseHost unmaps every mapping made on host. The host/process crash
@@ -278,39 +318,35 @@ func dstMunmap(data []byte) (syscall.Errno, bool) {
 // instead, and dstRestoreHostDiskFor is what rewinds the page cache to the
 // durable image — this function only gives back the address space.
 func dstMMapReleaseHost(host uint32) {
-	dstFS.mu.Lock()
-	defer dstFS.mu.Unlock()
-	dstMMapRegistry.mu.Lock()
-	defer dstMMapRegistry.mu.Unlock()
-	dstMMapRollLocked()
-	for key, bucket := range dstMMapRegistry.maps {
-		out := bucket[:0]
-		for _, entry := range bucket {
-			if entry.epoch == dstFSEpoch() && entry.host == host {
-				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
-				continue
-			}
-			out = append(out, entry)
-		}
-		if len(out) == 0 {
-			delete(dstMMapRegistry.maps, key)
-		} else {
-			dstMMapRegistry.maps[key] = out
-		}
+	for _, p := range dstMMapReleaseWhere(func(e *dstMMapEntry) bool { return e.host == host }) {
+		dstFlockReleasePending(p)
 	}
 }
 
 func dstMMapReleaseProc(proc uint32) {
+	for _, p := range dstMMapReleaseWhere(func(e *dstMMapEntry) bool { return e.proc == proc }) {
+		dstFlockReleasePending(p)
+	}
+}
+
+// dstMMapReleaseWhere unmaps every mapping of this run that match selects
+// (a crashed process's or host's), and returns the flock releases the
+// dropped mappings were the last reference for — performed by the caller
+// once the locks are gone, as an exiting process's mm teardown drops its
+// descriptions' last references.
+func dstMMapReleaseWhere(match func(*dstMMapEntry) bool) []*dstFlockPending {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstMMapRegistry.mu.Lock()
 	defer dstMMapRegistry.mu.Unlock()
 	dstMMapRollLocked()
+	var dropped []*dstFile
 	for key, bucket := range dstMMapRegistry.maps {
 		out := bucket[:0]
 		for _, entry := range bucket {
-			if entry.epoch == dstFSEpoch() && entry.proc == proc {
+			if entry.epoch == dstFSEpoch() && match(entry) {
 				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
+				dropped = append(dropped, entry.file)
 				continue
 			}
 			out = append(out, entry)
@@ -321,6 +357,13 @@ func dstMMapReleaseProc(proc uint32) {
 			dstMMapRegistry.maps[key] = out
 		}
 	}
+	var pendings []*dstFlockPending
+	for _, file := range dropped {
+		if p := dstMMapReleaseFileLocked(file); p != nil {
+			pendings = append(pendings, p)
+		}
+	}
+	return pendings
 }
 
 func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {

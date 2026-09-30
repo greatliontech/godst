@@ -2397,3 +2397,111 @@ func TestDSTProcOverlayFDIdentity(t *testing.T) {
 		}
 	})
 }
+
+// TestDSTFSVirtualFDFlockSurvivesCloseUnderMapping: Linux releases a BSD
+// flock with the open file description's last reference, and a shared
+// mapping taken through the description is one — so closing the locked
+// descriptor while its mapping lives keeps the lock, and the last unmap
+// releases it.
+func TestDSTFSVirtualFDFlockSurvivesCloseUnderMapping(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/lock", []byte("mapped"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		fd := int(f.Fd())
+		if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+			t.Fatalf("LOCK_EX: %v", err)
+		}
+		m, err := syscall.Mmap(fd, 0, 6, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("Mmap: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		probe := func() error {
+			g, err := os.Open("/lock")
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer g.Close()
+			return syscall.Flock(int(g.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		}
+		if err := probe(); !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Fatalf("LOCK_EX|LOCK_NB with the holder's mapping live: %v, want EWOULDBLOCK", err)
+		}
+		if err := syscall.Munmap(m); err != nil {
+			t.Fatalf("Munmap: %v", err)
+		}
+		if err := probe(); err != nil {
+			t.Fatalf("LOCK_EX|LOCK_NB after the last unmap: %v", err)
+		}
+	})
+}
+
+// TestDSTFSVirtualFDFlockReleasedWithProcessUnderMapping: a process that
+// exits holding a locked descriptor's mapping — the descriptor closed,
+// the mapping never unmapped — drops the lock with its address space,
+// so a survivor's nonblocking lock succeeds after the exit.
+func TestDSTFSVirtualFDFlockReleasedWithProcessUnderMapping(t *testing.T) {
+	simulation.Run(1, func() {
+		held := make(chan error, 1)
+		exit := make(chan struct{})
+		exited := make(chan struct{})
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			if err := os.WriteFile("/lock", []byte("mapped"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+		})
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			go simulation.Process("holder", func() {
+				defer close(exited)
+				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
+				if err != nil {
+					held <- err
+					return
+				}
+				fd := int(f.Fd())
+				if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+					held <- err
+					return
+				}
+				if _, err := syscall.Mmap(fd, 0, 6, syscall.PROT_READ, syscall.MAP_SHARED); err != nil {
+					held <- err
+					return
+				}
+				held <- f.Close()
+				<-exit // exit with the mapping live
+			})
+		})
+		if err := <-held; err != nil {
+			t.Fatalf("holder: %v", err)
+		}
+		probe := func() error {
+			var err error
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				simulation.Process("contender", func() {
+					g, oerr := os.Open("/lock")
+					if oerr != nil {
+						t.Fatalf("contender open: %v", oerr)
+					}
+					defer g.Close()
+					err = syscall.Flock(int(g.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				})
+			})
+			return err
+		}
+		if err := probe(); !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Fatalf("contender with the holder's mapping live: %v, want EWOULDBLOCK", err)
+		}
+		close(exit)
+		<-exited
+		if err := probe(); err != nil {
+			t.Fatalf("contender after the holder exited: %v", err)
+		}
+	})
+}

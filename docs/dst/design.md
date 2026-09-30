@@ -997,7 +997,11 @@ dropped with the process.
 
 Linux virtual fds support BSD-style `syscall.Flock` on regular tree files and directories. Supported
 operations are `LOCK_EX`, `LOCK_SH`, `LOCK_UN`, and `LOCK_NB`. Locks are scoped to the simulated host and
-file node, owned by the simulated process and fd, and released when that fd closes. An incompatible
+file node, owned by the simulated process and fd, and released with the open file description's last
+reference, as Linux releases them: at the fd's close, unless a shared mapping taken through the
+description is still live — a mapping references the description — in which case the lock survives the
+close until the last such mapping is unmapped, or the process exits (its address-space teardown drops the
+reference). An incompatible
 nonblocking lock returns `EWOULDBLOCK`; an incompatible blocking lock waits until the lock becomes
 compatible. Lock **conversions** follow Linux's remove-then-try semantics (`fs/locks.c`): the holder's
 existing lock of the other type is dropped before the conflict scan, so a successful conversion is atomic

@@ -1259,6 +1259,13 @@ type dstFile struct {
 	// dereferenced them. The virtual-fd front door has the same gate
 	// (dstFDLookup's epoch check answers EBADF).
 	epoch uint64
+	// flockPending is a flock this description still holds after its
+	// descriptor closed: Linux releases a BSD flock with the open file
+	// description's last reference, and a shared mapping taken through
+	// the description is one, so the close defers the release to the last
+	// unmap (dstFlockReleaseFD, dstMMapReleaseFile). Atomic: set and taken
+	// under the mapping registry's lock, never under this handle's mu.
+	flockPending atomic.Pointer[dstFlockPending]
 }
 
 // dstOpenFile implements OpenFile against the simulated tree while a run is

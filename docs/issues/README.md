@@ -8,15 +8,6 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- **A simulated flock releases at fd close, not at the open file
-  description's last reference** — Lands: when a change set next touches
-  the flock model or the fd-close and mapping-teardown release paths, or
-  when a consumer schedule depends on a lock outliving its descriptor
-  through a mapping or a dup. Linux holds a BSD flock while a shared
-  mapping or a dup of the description lives; filed from pando's
-  store-lock chunk. See
-  [flock-release-on-last-reference.md](flock-release-on-last-reference.md).
-
 - **LimitDisk never fails a write into a sparse hole** — Lands: user
   decision (logical-byte versus allocated-block accounting is a modeling
   choice with a stated boundary). A slab-write engine that grows its file
