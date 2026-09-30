@@ -106,7 +106,10 @@ stamps it into every archive entry and the toolchain module's `.info`). At a
 release commit both lines are the release's own. Between releases the file
 names the line's current base and its **latest released** counter and time —
 a build of an untagged commit therefore reports the most recent release
-string plus whatever has landed since; only a tag is a release. A port sets
+string plus whatever has landed since; only a tag is a release, and a
+release commit whose tag is not made (the matrix red, the cut abandoned)
+is reverted before the line's next commit, so the file never names a
+counter no tag carries. A port sets
 the version string to the new base with the line's latest released counter
 (`go1.27.0-dst.6` directly after porting to `go1.27.0` on a line whose last
 release was `dst.6`) and keeps the `time` line; the release commit updates

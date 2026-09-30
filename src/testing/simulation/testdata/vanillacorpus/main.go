@@ -58,6 +58,10 @@ func main() {
 		f.Close()
 		os.Chtimes(f.Name(), time.Time{}, time.Now())
 		os.Chmod(f.Name(), 0o600)
+		// The stdlib-internal fd-stats (ReadFile's buffer sizing, Getwd's
+		// parent walk) — the sites the fd-stat observation pair redirects.
+		os.ReadFile(f.Name())
+		os.Getwd()
 		os.Remove(f.Name())
 	}
 	if root, err := os.OpenRoot(os.TempDir()); err == nil {

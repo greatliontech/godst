@@ -333,8 +333,8 @@ type archProfile struct {
 	// the body set, the wrapper set, and the patterns cannot drift.
 	splitBodies map[string]string
 	// exactDeltas pins the fork-vs-stock instruction-count delta of
-	// every non-generic admitted runtime symbol (pairs measured as
-	// caller minus the extraction call plus helper). The compiler is
+	// every admitted extraction pair (measured as caller minus the
+	// extraction call plus helper). The compiler is
 	// deterministic, so these are stable per base and per arch; a port
 	// re-measures them under review. The pin closes the remaining
 	// mimicry gap: a residue store that copies the shape of a legit
@@ -395,8 +395,8 @@ var profiles = map[string]*archProfile{
 		nonStackMem: regexp.MustCompile(`(HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)`),
 		immStore:    regexp.MustCompile(`^(MOV[A-Z]*|AND[A-Z]*|OR[A-Z]*|XOR[A-Z]*|BT[SRC][A-Z]*) \$-?(HEX|0x[0-9a-f]+|[0-9]+), (HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)$`),
 		regSrcStore: regexp.MustCompile(`^(MOV[A-Z]*|AND[A-Z]*|OR[A-Z]*|XOR[A-Z]*|BT[SRC][A-Z]*) (AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15), (HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)$`),
-		stackGuard: regexp.MustCompile(`^CMPQ SP, (0x10|HEX)\(R14\)$`),
-		addrArith:  regexp.MustCompile(`^LEA`),
+		stackGuard:  regexp.MustCompile(`^CMPQ SP, (0x10|HEX)\(R14\)$`),
+		addrArith:   regexp.MustCompile(`^LEA`),
 		memDest:     regexp.MustCompile(`^(?:LOCK )?(?:MOV|AND|OR|XOR|ADD|SUB|INC|DEC|BT|XCHG|CMPXCHG)[A-Z]*\b.*(?:\((?:AX|BX|CX|DX|SI|DI|BP|R8|R9|R10|R11|R12|R13|R14|R15)\)(?:\((?:AX|BX|CX|DX|SI|DI|BP|R8|R9|R10|R11|R12|R13|R14|R15)\*[0-9]+\))?|ADDR)$`),
 		splitBodies: map[string]string{
 			"syscall.closeFD":              "syscall.Close",
@@ -422,6 +422,7 @@ var profiles = map[string]*archProfile{
 			"runtime.GC":             8,
 			"runtime.runCleanups":    10,
 			"runtime.queuefinalizer": 10,
+			"os.(*File).Stat":        18,
 		},
 	},
 	"arm64": {
@@ -447,7 +448,7 @@ var profiles = map[string]*archProfile{
 		// goes through a register and falls under store conservation.
 		// regSrcStore is deliberately absent: the aggregate branch
 		// classifies stores through memDest.
-		immStore: regexp.MustCompile(`^MOV[DWBH]U?(\.[WP])? ZR, -?HEX\((R[0-9]|R1[0-9]|R2[0-8])\)$`),
+		immStore:      regexp.MustCompile(`^MOV[DWBH]U?(\.[WP])? ZR, -?HEX\((R[0-9]|R1[0-9]|R2[0-8])\)$`),
 		zeroPairStore: regexp.MustCompile(`^STP \(ZR, ZR\), -?HEX\((R[0-9]|R1[0-9]|R2[0-8])\)$`),
 		addrArith:     regexp.MustCompile(`^ADRP `),
 		// The raw-text (16|HEX) alternation mirrors amd64's: the
@@ -479,6 +480,7 @@ var profiles = map[string]*archProfile{
 			"runtime.GC":             12,
 			"runtime.runCleanups":    13,
 			"runtime.queuefinalizer": 12,
+			"os.(*File).Stat":        19,
 		},
 	},
 }
@@ -489,6 +491,7 @@ var profiles = map[string]*archProfile{
 var rawDstRef = regexp.MustCompile(`([\w/]+\.|\(\*?[\w\[\]]+\)\.)dst\w*[+(]|runtime\.dst|\(\*?dst\w+\)`)
 
 type symbol struct {
+	name   string   // the linked symbol name, the key it is stored under
 	lines  []string // normalized instructions (position/address/bytes stripped)
 	masked string   // lines joined, numeric operands masked
 	calls  map[string]bool
@@ -528,7 +531,7 @@ func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
 			if i := strings.LastIndex(name, "(SB)"); i >= 0 {
 				name = name[:i]
 			}
-			cur = symbol{calls: make(map[string]bool)}
+			cur = symbol{name: name, calls: make(map[string]bool)}
 			continue
 		}
 		f := strings.Fields(line)
@@ -573,6 +576,13 @@ func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
 			// where stock calls the stock name — the class admits callers
 			// "modulo the call-target name alone", so canonicalize the target.
 			if stockName, isSplit := prof.splitBodies[target]; isSplit {
+				text = strings.Replace(text, target+"(SB)", stockName+"(SB)", 1)
+			}
+			// A recorded fork-internal site calling an extraction helper
+			// where stock calls the pair's caller compares under the stock
+			// name too; the pair's own caller is never a site, and keeps
+			// its helper call for the pairwise check to strip.
+			if stockName, ok := redirectedCallee(target, name); ok {
 				text = strings.Replace(text, target+"(SB)", stockName+"(SB)", 1)
 			}
 		} else if !strings.HasPrefix(text, "JMP ") {
@@ -925,6 +935,9 @@ func calleeSetDiff(fb, sb symbol, drop map[string]bool) []string {
 			if stockName, isSplit := prof.splitBodies[c]; isSplit {
 				c = stockName // split call targets compare under the stock name
 			}
+			if stockName, ok := redirectedCallee(c, fb.name); ok {
+				c = stockName // a recorded redirected site compares under the pair's caller
+			}
 			if barrierRe.MatchString(c) {
 				c = "WB"
 			} else if sizeClassRe.MatchString(c) {
@@ -965,20 +978,70 @@ func admit(name string) *allowEntry {
 	return nil
 }
 
-// extractions maps each shared-helper extraction's caller to its extracted
-// helper (design.md, "Shared-helper extractions").
-var extractions = map[string]string{
-	"runtime.runFinalizers":  "runtime.runFinqBlocks",
-	"runtime.runCleanups":    "runtime.runCleanupBlock",
-	"runtime.queuefinalizer": "runtime.finAllocBlockLocked",
-	"runtime.GC":             "runtime.gcForce",
+// extraction is one shared-helper extraction pair (design.md, "Shared-helper
+// extractions"): the fork-only helper the caller's body was extracted into,
+// the observed calls the record admits in the caller (calls stock never
+// makes — the fd-stat observation's test-log line — checked in the CALLER's
+// callee set, never the helper's: "the public method only"), and the
+// recorded fork-internal sites that call the helper where stock calls the
+// caller, which compare under the stock name — at those sites only: every
+// site must be linked and calling the helper (a vanished site stales the
+// record), and a helper call anywhere else is an unadmitted difference.
+type extraction struct {
+	helper   string
+	observed map[string]bool
+	sites    map[string]bool
+}
+
+// extractions maps each extraction's caller to its pair — the single
+// source the allowlist entries, the pairwise check, and the redirected
+// call-target canonicalization derive from.
+var extractions = map[string]extraction{
+	"runtime.runFinalizers":  {helper: "runtime.runFinqBlocks"},
+	"runtime.runCleanups":    {helper: "runtime.runCleanupBlock"},
+	"runtime.queuefinalizer": {helper: "runtime.finAllocBlockLocked"},
+	"runtime.GC":             {helper: "runtime.gcForce"},
+	// The fd-stat observation (design.md, "Untagged observation
+	// completeness"): (*File).Stat logs, its core is the helper, and the
+	// stdlib-internal stats whose result never escapes (ReadFile's
+	// buffer-sizing stat, Getwd's parent walk) call the helper where
+	// stock calls Stat.
+	"os.(*File).Stat": {
+		helper:   "os.(*File).fstatNolog",
+		observed: map[string]bool{"internal/testlog.Stat": true},
+		sites:    map[string]bool{"os.statOrZero": true, "os.Getwd": true},
+	},
+}
+
+// sortedKeys orders the extraction callers so the allowlist is stable.
+func sortedKeys(m map[string]extraction) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// redirectedCallee answers the stock name a helper's call target compares
+// under at symbol site — the pair's caller, for a recorded redirected site
+// only; any other symbol's call to the helper keeps the helper's name and
+// fails its comparison as an unadmitted difference.
+func redirectedCallee(target, site string) (string, bool) {
+	for caller, ex := range extractions {
+		if ex.helper == target && ex.sites[site] {
+			return caller, true
+		}
+	}
+	return "", false
 }
 
 func checkExtractionCaller(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
 	if !ok {
 		return "expected on both sides"
 	}
-	helperName := extractions[name]
+	ex := extractions[name]
+	helperName := ex.helper
 	// Pairwise admission: caller (minus the extraction call) plus helper must
 	// be the stock body modulo the class latitude, and the PAIR's callee set
 	// must match stock's — calls the extraction moved into the helper are not
@@ -1003,7 +1066,31 @@ func checkExtractionCaller(name string, fb, sb symbol, ok bool, fork, stock map[
 	for c := range helper.calls {
 		pairSym.calls[c] = true
 	}
-	if extra := calleeSetDiff(pairSym, sb, nil); len(extra) > 0 {
+	// The observed calls the record admits: each present in the CALLER's
+	// callee set (a helper making it is the observation leaking into the
+	// unlogged core) — and firing, so a vanished observation stales the
+	// admission rather than sitting unused.
+	for c := range ex.observed {
+		if helper.calls[c] {
+			return fmt.Sprintf("the helper makes the observed call %s — the observation belongs to the public method only", c)
+		}
+		if !fb.calls[c] {
+			return fmt.Sprintf("stale observed-call admission %s: the caller no longer makes it", c)
+		}
+	}
+	// The recorded redirected sites: each linked by the corpus and calling
+	// the helper — an unlinked site escapes the comparison, a site no
+	// longer calling the helper stales the record; either fails here.
+	for site := range ex.sites {
+		ss, linked := fork[site]
+		if !linked {
+			return fmt.Sprintf("recorded redirected site %s is not linked by the corpus — its redirection is unverified; exercise it", site)
+		}
+		if !ss.calls[helperName] {
+			return fmt.Sprintf("stale redirected site %s: it no longer calls %s", site, helperName)
+		}
+	}
+	if extra := calleeSetDiff(pairSym, sb, ex.observed); len(extra) > 0 {
 		return fmt.Sprintf("pair makes calls stock never makes: %v", extra)
 	}
 	if extra := calleeSetDiff(sb, pairSym, abiMicro); len(extra) > 0 {
@@ -1030,8 +1117,8 @@ func checkForkOnly(name string, fb, sb symbol, ok bool, fork, stock map[string]s
 	}
 	// A helper's text bound rides its caller's pairwise check, so the caller
 	// must be in the binary too.
-	for caller, helper := range extractions {
-		if helper == name {
+	for caller, ex := range extractions {
+		if ex.helper == name {
 			if _, present := fork[caller]; !present {
 				return fmt.Sprintf("extracted helper without its caller %s in the binary — the pairwise check cannot run", caller)
 			}
@@ -1061,12 +1148,18 @@ func splitPatterns(bodies map[string]string) (bodyPat, wrapperPat string) {
 
 func buildAllowlist(p *archProfile) []allowEntry {
 	bodyPat, wrapperPat := splitPatterns(p.splitBodies)
-	list := []allowEntry{
-		// Shared-helper extractions: the caller differs by the one call, the
-		// helper is fork-only (its body-vs-stock-loop identity is carried by the
-		// caller's callee-set check plus the recorded clause).
-		{pattern: `^runtime\.(runFinalizers|runCleanups|queuefinalizer|GC)$`, class: "extraction-caller", check: checkExtractionCaller},
-		{pattern: `^runtime\.(runFinqBlocks|runCleanupBlock|finAllocBlockLocked|gcForce)$`, class: "extraction-helper", check: checkForkOnly},
+	var list []allowEntry
+	// Shared-helper extractions, one entry per member so the stale-entry
+	// discipline judges each pair on its own: the caller differs by the one
+	// call (plus the observed calls the record admits), the helper is
+	// fork-only (its body-vs-stock-loop identity is carried by the caller's
+	// callee-set check plus the recorded clause).
+	for _, caller := range sortedKeys(extractions) {
+		list = append(list,
+			allowEntry{pattern: "^" + regexp.QuoteMeta(caller) + "$", class: "extraction-caller", check: checkExtractionCaller},
+			allowEntry{pattern: "^" + regexp.QuoteMeta(extractions[caller].helper) + "$", class: "extraction-helper", check: checkForkOnly})
+	}
+	list = append(list, []allowEntry{
 		// Fence-wrapper splits: the split body must be instruction-identical to
 		// the stock symbol it replaces; the stock-named wrapper (where it
 		// survives inlining) may only call the split body.
@@ -1183,7 +1276,7 @@ func buildAllowlist(p *archProfile) []allowEntry {
 				}
 				return ""
 			}},
-	}
+	}...)
 	for i := range list {
 		list[i].re = regexp.MustCompile(list[i].pattern)
 	}

@@ -1550,7 +1550,8 @@ routes these through the fenced `RawSyscall` wrapper). Enforced: `TestDSTGettime
 
 ### Enforcing test configurations
 
-**Untagged footprint (contract).** An untagged (non-`-tags dst`) build is the upstream toolchain,
+**Untagged footprint (contract).** An untagged (non-`-tags dst`) build is the upstream toolchain
+— modulo the one recorded untagged behavior, the fd-stat observation completeness below —
 and untagged use — including as a consumer's primary `go` — is first-class. The CODE contract is
 **instruction identity of built programs**: what an untagged consumer observes is the text the
 toolchain emits, so the invariant is stated over programs godst builds, not over the toolchain's
@@ -1577,8 +1578,12 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   fails; unrecorded CODE deviations are inadmissible. The corpus is pinned by a coverage
   property, not by enumeration: the transitive import closure of the corpus programs covers
   every upstream-present std package the dst delta modifies — packages that exist in the base
-  tag; the delta path set against the base tag is the checkable source — so every patched call
-  site is reachable by the comparison; the concrete programs live with the gate. godst-only std
+  tag; the delta path set against the base tag is the checkable source — and, at symbol
+  level, every fork-internal call site an admitted deviation redirects (a stdlib function
+  calling an extraction's helper where stock calls its caller) is named by the gate's record
+  and must be linked by a corpus program — the gate fails on a named site the corpus does not
+  link — so the redirection is compared under the stock name rather than escaping the
+  comparison unlinked; the concrete programs live with the gate. godst-only std
   packages (the `testing/simulation` tree) are a recorded deviation class outside the corpus
   property: they enter a consumer's binary only if imported, and untagged they are inert by the
   build-constraint panic (`TestDSTRunRequiresBuildTag`), so the comparison never sees them
@@ -1602,8 +1607,9 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   feeding them (the copy-word latitude; a surplus is the save-restore residue shape), and
   indexed immediate stores are admitted as the extracted loops' array-element clears.
   Extraction helpers are checked pairwise against the stock symbol (caller minus the
-  extraction call plus helper, callee sets over the pair), the non-generic admitted runtime
-  symbols additionally pin their exact instruction-count delta (deterministic per base and per
+  extraction call plus helper, callee sets over the pair, an observed call the record admits
+  required in the caller's set and refused in the helper's), every extraction pair
+  additionally pins its exact instruction-count delta (deterministic per base and per
   architecture; re-measured under review at a port — a mimicking store still adds a line and
   trips the pin), and every fence-wrapper split body must be linked by the corpus and
   instruction-identical to its stock counterpart (the morestack self-jump comparing under the
@@ -1644,14 +1650,15 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   where amd64 uses the per-register copy-word rule: arm64 record writes reshape freely
   between STP pairs fed by live argument registers and spill-slot round-trips, so the
   per-register form rejects legitimate reshapes; conservation still fails residue, which
-  adds stores, and the exact-delta pins back it up FOR THE PINNED SET — the four
-  extraction-pair symbols (the finalizer/cleanup registration and queueing symbols once
-  pinned here became stock-equal when their stamps moved out of line). The unpinned admitted
+  adds stores, and the exact-delta pins back it up FOR THE PINNED SET — the five
+  extraction-pair symbols, the fd-stat observation pair among them (the finalizer/cleanup
+  registration and queueing symbols once pinned here became stock-equal when their stamps
+  moved out of line). The unpinned admitted
   symbols (the generic AddCleanup
   instantiations and the availability class) are protected by the conservation bound alone,
   with zero slack measured at derivation; they sit inside the generic blind spot this
   section already records. The arm64 pair deltas: runFinalizers 8, GC 12, runCleanups 13,
-  queuefinalizer 12. The gettimeofday fence-wrapper split is linux/amd64 assembly and is
+  queuefinalizer 12, (*File).Stat 19 (amd64: 6, 8, 10, 10, 18). The gettimeofday fence-wrapper split is linux/amd64 assembly and is
   outside the arm64 profile's split class (its allowlist entries would be stale there).
   The named-anchor subset is enforced by
   `TestDSTUntaggedCodeFootprint` (objdump at the panic, NumCPU, generic-AddCleanup,
@@ -1691,7 +1698,23 @@ Further recorded CODE deviation classes, each admitted by name and difference cl
   consequences, the caller differs by the one call, and the pair's callee set — minus the
   extracted call, and modulo calls that are themselves recorded-layout consequences (a
   write-barrier form chosen by a widened record's size) — equals the stock symbol's. Any other
-  call the stock body never makes is residue, not extraction.
+  call the stock body never makes is residue, not extraction — except the one observed call
+  the next class records.
+- **Untagged observation completeness.** The one recorded untagged BEHAVIOR deviation: an
+  fd-based `(*File).Stat` observes the same metadata a path stat would, and upstream leaves
+  it out of the test log, so a caller can read an opened file's modification time unobserved
+  and a cache key built from the log — cmd/go's test cache, and every consumer keying on the
+  log — under-pins exactly the metadata the call returned. The fork logs it (`testlog.Stat`,
+  the public method only) in BOTH build modes, so an untagged consumer's cache keys carry
+  fd-stat metadata stock's would not: the stat itself is extracted into `fstatNolog` (the
+  extraction class above, the pair's callee set being stock's plus that one observed call,
+  required in the caller and refused in the helper) so stdlib-internal stats whose result
+  never escapes (`ReadFile`'s buffer-sizing stat, `Getwd`'s parent walk) stay unlogged — and
+  those sites, calling the helper where stock calls `Stat`, compare under the stock name AT
+  THE RECORDED SITES ONLY (the gate's per-pair `sites` set: `os.statOrZero`, `os.Getwd` — each
+  must be linked by the corpus and calling the helper, and a helper call anywhere else is an
+  unadmitted difference, so a logged stat cannot be quietly unlogged elsewhere). The
+  unexported method is a recorded type-shape exception on the file types.
 - **Export-data inline-body availability.** The fork's runtime instantiates `abi.TypeFor`
   (DST bookkeeping), which places `abi.TypeOf` and `abi.NoEscape` inline bodies in runtime's
   export data; every package implicitly imports runtime, so a downstream generic instantiation

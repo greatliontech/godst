@@ -46,6 +46,13 @@ var typeShapeExceptions = map[string]string{
 	"testing chattyPrinter cmethod dstBubbleFramework func() bool":                                                                         "chatty printer bubble output (dst-tagged build only)",
 	"testing chattyPrinter cmethod dstBubblePrintf func(testName string, format string, args ...any) bool":                                 "chatty printer bubble output",
 	"testing chattyPrinter cmethod dstBubbleUpdatef func(testName string, format string, args ...any) bool":                                "chatty printer bubble output",
+	// The fd-stat observation's unlogged core, split out of (*File).Stat
+	// so the test log records exactly what a caller could read — an
+	// unexported method on the file types, judged in-record (design.md,
+	// "Shared-helper extractions").
+	"os File cmethod fstatNolog func() (os.FileInfo, error)":                "fd-stat observation core",
+	"os fileWithoutReadFrom cmethod fstatNolog func() (os.FileInfo, error)": "fd-stat observation core",
+	"os fileWithoutWriteTo cmethod fstatNolog func() (os.FileInfo, error)":  "fd-stat observation core",
 }
 
 // TestUntaggedTypeShapesIdenticalToStock is the type-shape half of the
