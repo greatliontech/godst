@@ -27,12 +27,12 @@ func (f *File) Stat() (FileInfo, error) {
 	// caller cannot read would over-pin every ReadFile input to
 	// metadata nothing consumed.
 	testlog.Stat(f.name)
-	return f.fstatNolog()
+	return fstatNolog(f)
 }
 
 // fstatNolog is (*File).Stat with no test logging, for stdlib-internal
 // stats whose result does not escape to the caller.
-func (f *File) fstatNolog() (FileInfo, error) {
+func fstatNolog(f *File) (FileInfo, error) {
 	if dstSimEnabled {
 		if dstf := dstBackendOf(f.file); dstf != nil {
 			fi, err := dstf.(dstFileBackendExt).stat()

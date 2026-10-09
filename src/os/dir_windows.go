@@ -145,7 +145,7 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 					break
 				}
 				// The stat's result never escapes (error-shaping only).
-				if s, _ := file.fstatNolog(); s != nil && !s.IsDir() {
+				if s, _ := fstatNolog(file); s != nil && !s.IsDir() {
 					err = &PathError{Op: "readdir", Path: file.name, Err: syscall.ENOTDIR}
 				} else {
 					err = &PathError{Op: "GetFileInformationByHandleEx", Path: file.name, Err: err}

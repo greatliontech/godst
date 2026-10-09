@@ -141,7 +141,7 @@ func openDirNolog(name string) (*File, error) {
 		return nil, e
 	}
 	// openDirNolog: the stat's result never escapes (IsDir check only).
-	d, e := f.fstatNolog()
+	d, e := fstatNolog(f)
 	if e != nil {
 		f.Close()
 		return nil, e
@@ -200,12 +200,12 @@ func (f *File) Stat() (FileInfo, error) {
 	// opened identity's metadata and must reach the test log; the log
 	// line belongs to the public method only.
 	testlog.Stat(f.name)
-	return f.fstatNolog()
+	return fstatNolog(f)
 }
 
 // fstatNolog is (*File).Stat with no test logging, for stdlib-internal
 // stats whose result does not escape to the caller.
-func (f *File) fstatNolog() (FileInfo, error) {
+func fstatNolog(f *File) (FileInfo, error) {
 	d, err := dirstat(f)
 	if err != nil {
 		return nil, err

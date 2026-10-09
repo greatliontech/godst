@@ -61,7 +61,7 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 	// Check out https://go.dev/issue/68863 for more details.
 	if runtime.GOOS == "illumos" {
 		// The stat's result never escapes (regular-file check only).
-		fi, err := f.fstatNolog()
+		fi, err := fstatNolog(f)
 		if err != nil {
 			return 0, false, nil
 		}

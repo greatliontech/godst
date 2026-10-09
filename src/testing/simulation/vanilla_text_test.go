@@ -1106,7 +1106,7 @@ var extractions = map[string]extraction{
 	// buffer-sizing stat, Getwd's parent walk) call the helper where
 	// stock calls Stat.
 	"os.(*File).Stat": {
-		helper:   "os.(*File).fstatNolog",
+		helper:   "os.fstatNolog",
 		observed: map[string]bool{"internal/testlog.Stat": true},
 		sites:    map[string]bool{"os.statOrZero": true, "os.Getwd": true},
 	},

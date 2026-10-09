@@ -635,7 +635,7 @@ func (p *chattyPrinter) Updatef(testName, format string, args ...any) {
 	// path (see dst_hostio.go and the fields on chattyPrinter): it must not
 	// park on lastNameMu, which a host goroutine can hold across wall-clock
 	// work. Folded out of stock builds by the const guard.
-	if dstFrameworkStreamEnabled && p.dstBubbleUpdatef(testName, format, args...) {
+	if dstFrameworkStreamEnabled && dstBubbleUpdatef(p, testName, format, args...) {
 		return
 	}
 
@@ -654,7 +654,7 @@ func (p *chattyPrinter) Updatef(testName, format string, args ...any) {
 // necessarily mention that tests's name itself.
 func (p *chattyPrinter) Printf(testName, format string, args ...any) {
 	// Bubble-domain path, as in Updatef (see dst_hostio.go).
-	if dstFrameworkStreamEnabled && p.dstBubblePrintf(testName, format, args...) {
+	if dstFrameworkStreamEnabled && dstBubblePrintf(p, testName, format, args...) {
 		return
 	}
 
@@ -1330,7 +1330,7 @@ func (o *outputWriter) writeLine(b []byte, errBegin, errEnd bool) {
 		// simulation bubble the write takes the granted bubble-domain
 		// path like every framework-stream write (see dst_hostio.go);
 		// folded out of stock builds by the const guard.
-		if dstFrameworkStreamEnabled && o.c.chatty.dstBubbleBenchWrite(strErrBegin, indent, b, strErrEnd, c) {
+		if dstFrameworkStreamEnabled && dstBubbleBenchWrite(o.c.chatty, strErrBegin, indent, b, strErrEnd, c) {
 			return
 		}
 		fmt.Printf("%s%s%s%s%s", strErrBegin, indent, b, strErrEnd, c)

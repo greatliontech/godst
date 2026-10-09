@@ -41,19 +41,6 @@ var typeShapeExceptions = map[string]string{
 	// harness-internal state in a struct no user signature carries,
 	// judged in-record (design.md, "Untagged footprint (contract)").
 	"testing chattyPrinter field 4 hostFD int embedded=false tag=\"\"": "chatty printer host-stream slot",
-	// The chatty printer's simulation-bubble output methods: the same
-	// harness-internal judgment as its hostFD slot (design.md).
-	"testing chattyPrinter cmethod dstBubbleBenchWrite func(strErrBegin string, indent string, b []byte, strErrEnd string, c []byte) bool": "chatty printer bubble output",
-	"testing chattyPrinter cmethod dstBubbleFramework func() bool":                                                                         "chatty printer bubble output (dst-tagged build only)",
-	"testing chattyPrinter cmethod dstBubblePrintf func(testName string, format string, args ...any) bool":                                 "chatty printer bubble output",
-	"testing chattyPrinter cmethod dstBubbleUpdatef func(testName string, format string, args ...any) bool":                                "chatty printer bubble output",
-	// The fd-stat observation's unlogged core, split out of (*File).Stat
-	// so the test log records exactly what a caller could read — an
-	// unexported method on the file types, judged in-record (design.md,
-	// "Shared-helper extractions").
-	"os File cmethod fstatNolog func() (os.FileInfo, error)":                "fd-stat observation core",
-	"os fileWithoutReadFrom cmethod fstatNolog func() (os.FileInfo, error)": "fd-stat observation core",
-	"os fileWithoutWriteTo cmethod fstatNolog func() (os.FileInfo, error)":  "fd-stat observation core",
 }
 
 // TestUntaggedTypeShapesIdenticalToStock is the type-shape half of the
@@ -87,6 +74,7 @@ func TestUntaggedTypeShapesIdenticalToStock(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build corpus: %v\n%s", err, out)
 	}
+	checkSyntheticTypeShapes(t, bin)
 	inventory := func(goroot, tags string) map[string]bool {
 		t.Helper()
 		args := []string{}
@@ -173,6 +161,55 @@ func typeKey(line string) string {
 		return line
 	}
 	return f[0] + " " + f[1]
+}
+
+func checkSyntheticTypeShapes(t *testing.T, bin string) {
+	t.Helper()
+	inventory := func(source string) string {
+		t.Helper()
+		out, err := exec.Command(bin, "-source", "package shape; "+source).CombinedOutput()
+		if err != nil {
+			t.Fatalf("synthetic inventory: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	for _, pair := range []struct{ name, before, after string }{
+		{"receiver", "type T int; func (T) M() {}", "type T int; func (*T) M() {}"},
+		{"embedding", "type A interface{ A() }; type B interface{ B() }; type T interface{ A }", "type A interface{ A() }; type B interface{ B() }; type T interface{ B }"},
+		{"empty", "type T interface{}", "type Other interface{}"},
+		{"alias-target", "type Anchor struct{}; type T = int", "type Anchor struct{}; type T = string"},
+		{"alias-presence", "type Anchor struct{}; type T = int", "type Anchor struct{}"},
+		{"alias-definition", "type T = int", "type T int"},
+		{"constraint", "type T[P any] struct{}", "type T[P comparable] struct{}"},
+		{"alias-constraint", "type T[P any] = []P", "type T[P comparable] = []P"},
+	} {
+		t.Run(pair.name, func(t *testing.T) {
+			before := inventory(pair.before)
+			if before != inventory(pair.before) {
+				t.Fatal("identical source produced different inventories")
+			}
+			if before == inventory(pair.after) {
+				t.Fatalf("shape change invisible: %s -> %s", pair.before, pair.after)
+			}
+		})
+	}
+	out := inventory("type A interface{ A() }; type T interface{ A }")
+	if !strings.Contains(out, "shape T method A func()\n") {
+		t.Fatalf("promoted interface method absent: %s", out)
+	}
+	for _, source := range []string{
+		"type T int; func (*T) M() {}",
+		"type A int; func (*A) M() {}; type T struct{ A }",
+	} {
+		out := inventory(source)
+		if !strings.Contains(out, "shape T pointer-method M func()\n") || strings.Contains(out, "shape T value-method M func()\n") {
+			t.Fatalf("pointer-only method set not retained: %s", out)
+		}
+	}
+	out = inventory("type A int; func (*A) M() {}; type T struct{ *A }")
+	if !strings.Contains(out, "shape T pointer-method M func()\n") || !strings.Contains(out, "shape T value-method M func()\n") {
+		t.Fatalf("embedded pointer method not promoted to both sets: %s", out)
+	}
 }
 
 // typeShapeCoverageCheck asserts typeShapePackages covers every

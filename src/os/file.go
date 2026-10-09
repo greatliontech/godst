@@ -920,7 +920,7 @@ func statOrZero(f *File) int64 {
 	// The buffer-sizing stat's result never escapes to the caller:
 	// logging it would mark every ReadFile input as a metadata
 	// observation nothing consumed (see (*File).Stat).
-	if fi, err := f.fstatNolog(); err == nil {
+	if fi, err := fstatNolog(f); err == nil {
 		return fi.Size()
 	}
 	return 0

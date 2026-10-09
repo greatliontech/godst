@@ -1715,7 +1715,7 @@ Further recorded CODE deviation classes, each admitted by name and difference cl
   THE RECORDED SITES ONLY (the gate's per-pair `sites` set: `os.statOrZero`, `os.Getwd` — each
   must be linked by the corpus and calling the helper, and a helper call anywhere else is an
   unadmitted difference, so a logged stat cannot be quietly unlogged elsewhere). The
-  unexported method is a recorded type-shape exception on the file types.
+  unlogged core is a free function, so file method sets remain stock-exact.
 - **Carried upstream fixes.** Where the pinned toolchain's own gates run on the fork, an
   upstream defect that flakes them is the fork's to fix ahead of upstream. Each is recorded
   here and in the gate's `carriedFixes` (the symbol, the calls the fix adds, the upstream
@@ -1809,8 +1809,9 @@ its object across the derived-index window (`runtime.KeepAlive` at the accessors
 compare per gated operation on host objects and a spine load plus two dependent loads on
 simulated ones, measured against the in-record field by the SimFile benchmarks beside the
 simulation suite.
-`testing`'s chatty printer deviations stay recorded in the type-shape clause's exception
-list below. The
+`testing`'s chatty printer descriptor slot stays recorded in the type-shape clause's
+exception list below. Its bubble-output operations are free functions, leaving the
+printer's method sets unchanged. The
 remaining in-record state stays in-record deliberately: per-tag struct variants of the
 runtime's central `g` are unsafe-critical duplication, and relocating `g`'s hot DST words (the
 per-goroutine RNG state above all) or `timer`'s fake-timer state out of line would put a lookup
@@ -1826,15 +1827,16 @@ where the untagged text is stock (the incident class: an interface-typed backend
 
 - **INV-TYPESHAPE**: every type declared in an upstream-present, user-importable standard
   package keeps upstream's exact shape — field set, field ORDER, embeddedness, struct tags,
-  named-type underlying, interface method set, and concrete method set (promotions included)
-  — in BOTH build modes; DST per-object state attaches out of line. Fork-only type
+  alias target, ordered type parameters and constraints, named-type underlying,
+  complete interface method set, and both concrete value and
+  pointer method sets (promotions included) — in BOTH build modes; DST per-object
+  state attaches out of line. Fork-only type
   declarations are outside the clause. The runtime's internals (`g`, `p`, `timer`,
   `synctestBubble`) are outside the clause — runtime-internal, in no user signature,
   unreachable by reflect — and keep their recorded DATA deviations above. Exceptions are
   recorded per shape line with their judgment (today: `testing.chattyPrinter`'s host-stream
-  fd slot and bubble-output methods — harness-internal state and channels no user signature
-  carries; the state accessors are free functions precisely so no method enters an
-  upstream-present type's set), and a recorded exception that admits no divergence in either
+  fd slot — harness-internal state no user signature carries), and a recorded
+  exception that admits no divergence in either
   build mode fails the gate (the stale-entry discipline). The gate's package list is cross-checked against
   the live dst delta so it cannot drift below the clause. Enforced:
   `TestUntaggedTypeShapesIdenticalToStock` (`testing/simulation/vanilla_typeshape_test.go`) —

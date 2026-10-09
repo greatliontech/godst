@@ -96,7 +96,7 @@ const dstPipeBufChunk = 4096
 // newChattyPrinter captures); it exists so a future wiring change fails
 // loudly here rather than silently falling back to the host-lock path, whose
 // parking couples the seeded schedule to wall time.
-func (p *chattyPrinter) dstBubbleFramework() bool {
+func dstBubbleFramework(p *chattyPrinter) bool {
 	if !dstInSimBubble() {
 		return false
 	}
@@ -111,8 +111,8 @@ func (p *chattyPrinter) dstBubbleFramework() bool {
 // the caller takes the ordinary host path. Updatef messages carry the test
 // name themselves (the method's contract), so no attribution header is
 // needed.
-func (p *chattyPrinter) dstBubbleUpdatef(testName, format string, args ...any) bool {
-	if !p.dstBubbleFramework() {
+func dstBubbleUpdatef(p *chattyPrinter, testName, format string, args ...any) bool {
+	if !dstBubbleFramework(p) {
 		return false
 	}
 	dstHostStreamWrite(p.hostFD, nil, fmt.Appendf(nil, p.prefix()+format, args...))
@@ -123,8 +123,8 @@ func (p *chattyPrinter) dstBubbleUpdatef(testName, format string, args ...any) b
 // attribution header, emitted in the same atomic chunk as the payload it
 // attributes (see the package comment for why the header is constant, and
 // dstPipeBufChunk for the atomicity bound).
-func (p *chattyPrinter) dstBubblePrintf(testName, format string, args ...any) bool {
-	if !p.dstBubbleFramework() {
+func dstBubblePrintf(p *chattyPrinter, testName, format string, args ...any) bool {
+	if !dstBubbleFramework(p) {
 		return false
 	}
 	header := fmt.Appendf(nil, "%s=== NAME  %s\n", p.prefix(), testName)
@@ -135,8 +135,8 @@ func (p *chattyPrinter) dstBubblePrintf(testName, format string, args ...any) bo
 // dstBubbleBenchWrite is the benchmark output branch's bubble-domain leg
 // (writeLine's bench arm prints straight to stdout, with no name-header
 // machinery — mirrored here). Reports false outside a bubble, as above.
-func (p *chattyPrinter) dstBubbleBenchWrite(strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
-	if !p.dstBubbleFramework() {
+func dstBubbleBenchWrite(p *chattyPrinter, strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
+	if !dstBubbleFramework(p) {
 		return false
 	}
 	// The same five-part line writeLine prints on the host path: the -json

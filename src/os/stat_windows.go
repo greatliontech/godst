@@ -23,12 +23,12 @@ func (file *File) Stat() (FileInfo, error) {
 	// opened identity's metadata and must reach the test log; the log
 	// line belongs to the public method only.
 	testlog.Stat(file.name)
-	return file.fstatNolog()
+	return fstatNolog(file)
 }
 
 // fstatNolog is (*File).Stat with no test logging, for stdlib-internal
 // stats whose result does not escape to the caller.
-func (file *File) fstatNolog() (FileInfo, error) {
+func fstatNolog(file *File) (FileInfo, error) {
 	return statHandle(file.name, file.pfd.Sysfd)
 }
 

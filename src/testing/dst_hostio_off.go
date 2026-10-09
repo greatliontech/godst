@@ -19,11 +19,11 @@ import (
 
 const dstFrameworkStreamEnabled = false
 
-func (p *chattyPrinter) dstBubbleUpdatef(testName, format string, args ...any) bool { return false }
+func dstBubbleUpdatef(p *chattyPrinter, testName, format string, args ...any) bool { return false }
 
-func (p *chattyPrinter) dstBubblePrintf(testName, format string, args ...any) bool { return false }
+func dstBubblePrintf(p *chattyPrinter, testName, format string, args ...any) bool { return false }
 
-func (p *chattyPrinter) dstBubbleBenchWrite(strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
+func dstBubbleBenchWrite(p *chattyPrinter, strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
 	return false
 }
 
