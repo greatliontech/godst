@@ -185,13 +185,28 @@ func (p *chattyPrinter) dstBubbleBenchWrite(strErrBegin, indent string, b []byte
 // completeness — the property this seam exists for — and degrades to a
 // busy-wait form of the blocking write the model already admits, where a
 // panic would turn cosmetic wiring drift into a spurious run failure. Any
-// other error is swallowed, exactly like the host leg's ignored fmt.Fprintf
-// error: the framework's diagnostic stream has no better channel to report
-// its own failure.
-func dstHostStreamWrite(fd int, header, payload []byte) {
+// other error ends that chunk's write; every later chunk is still
+// attempted (each carries its own header, so a transient fault loses one
+// chunk, never the attribution of the rest), and the FIRST error is
+// RETURNED with the count of payload bytes delivered in whole chunks
+// before the first failure — a prefix of the payload, as io.Writer's
+// count must be, so a buffered writer above it drops only bytes that
+// landed (a chunk landing after the failure, and the delivered part of a
+// failing chunk, stay buffered and are never retried once the error
+// sticks): the framework-stream callers drop it, exactly like the host
+// leg's ignored fmt.Fprintf error — the diagnostic stream has no better
+// channel to report its own failure — and the test-log writer
+// (dstTestlogWriter) returns it, since the test log has one: its
+// buffered writer keeps the
+// error and StopTestLog's flush fails the binary, as the same writer does
+// on the host path, so a log the harness could not deliver whole never
+// reads as complete. The count's witnessed ends are the whole payload and
+// none (a refused descriptor); a failure mid-payload counts the chunks
+// before it.
+func dstHostStreamWrite(fd int, header, payload []byte) (written int, err error) {
 	old := dstSetHostIO(true)
 	defer dstSetHostIO(old)
-	writeFull := func(b []byte) {
+	writeFull := func(b []byte) error {
 		for len(b) > 0 {
 			r1, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 			n := int(r1)
@@ -205,9 +220,10 @@ func dstHostStreamWrite(fd int, header, payload []byte) {
 				continue
 			}
 			if errno != 0 {
-				return
+				return errno
 			}
 		}
+		return nil
 	}
 	budget := dstPipeBufChunk - len(header)
 	if budget <= 0 {
@@ -234,17 +250,23 @@ func dstHostStreamWrite(fd int, header, payload []byte) {
 			}
 			chunk = chunk[:cut]
 		}
+		var chunkErr error
 		if len(header) > 0 {
 			buf := make([]byte, 0, len(header)+len(chunk))
 			buf = append(buf, header...)
 			buf = append(buf, chunk...)
-			writeFull(buf)
+			chunkErr = writeFull(buf)
 		} else {
-			writeFull(chunk)
+			chunkErr = writeFull(chunk)
+		}
+		if chunkErr == nil && err == nil {
+			written += len(chunk)
+		} else if chunkErr != nil && err == nil {
+			err = chunkErr
 		}
 		payload = payload[len(chunk):]
 		if len(payload) == 0 {
-			return
+			return written, err
 		}
 	}
 }
@@ -258,7 +280,12 @@ func dstHostStreamWrite(fd int, header, payload []byte) {
 // host-owned descriptor captured before any run starts, outbound
 // only, feeding no nondeterminism back. In-bubble flushes take the
 // same granted raw-write path as the framework stream; host
-// goroutines write normally. The residual log.mu schedule coupling (a
+// goroutines write normally. A host write the in-bubble leg cannot
+// complete is returned (writeFromBubble), never dropped: the log's
+// buffered writer keeps the error and StopTestLog's flush fails the
+// binary, exactly as on the host path — a test log a consumer reads as
+// the record of every file and variable the test touched must reach it
+// whole or fail loudly. The residual log.mu schedule coupling (a
 // bubble flush parking on the buffer lock a host goroutine holds
 // across wall-clock work) is recorded in the issue index — it needs
 // the printer-style lock-free treatment, a design of its own.
@@ -271,10 +298,27 @@ func dstWrapTestlogWriter(f *os.File) io.Writer {
 	return &dstTestlogWriter{f: f, fd: int(f.Fd())}
 }
 
+// dstTestlogInBubble is the writer's bubble predicate — dstInSimBubble,
+// behind a variable so a pin can drive Write's in-bubble leg from a host
+// goroutine.
+var dstTestlogInBubble = dstInSimBubble
+
 func (w *dstTestlogWriter) Write(p []byte) (int, error) {
-	if !dstInSimBubble() {
+	if !dstTestlogInBubble() {
 		return w.f.Write(p)
 	}
-	dstHostStreamWrite(w.fd, nil, p)
-	return len(p), nil
+	return w.writeFromBubble(p)
+}
+
+// writeFromBubble is the in-bubble leg: the granted raw-write path over
+// the captured descriptor, its host error returned with the bytes
+// delivered before it, spelled as the host path spells a write error
+// (a *os.PathError over the log's name; Name is a field read, safe in a
+// bubble).
+func (w *dstTestlogWriter) writeFromBubble(p []byte) (int, error) {
+	n, err := dstHostStreamWrite(w.fd, nil, p)
+	if err != nil {
+		err = &os.PathError{Op: "write", Path: w.f.Name(), Err: err}
+	}
+	return n, err
 }

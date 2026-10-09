@@ -1854,7 +1854,7 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   library's import-policy gate (which package may import which, over every build-tagged file):
   the fork adds imports to std packages, and a violation otherwise surfaces only in the heavy
   `inert-std` leg.
-- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing/simulation crypto/rand net os syscall os/exec os/signal`,
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing testing/simulation crypto/rand net os syscall os/exec os/signal`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
   `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
@@ -1863,6 +1863,9 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
   fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
   `crypto/rand` enforces that the tagged outside-run entropy path remains allocation-free.
+  `testing` carries the tagged framework-stream and test-log writer pins (`dst_chatty_test.go`,
+  `dst_testlog_test.go` — the in-bubble test-log write returns its host error so the harness's
+  buffered writer fails the binary as on the host path), which build only under `-tags dst`.
 - **`test:dst-race`** (`go test -tags dst -race -count=1 -timeout 60m testing/simulation testing/simulation/determinism`): the dst-race
   sync-hook encodings, plus the determinism sweep under instrumentation (race instrumentation must
   not shift the seeded schedule). The suite is `-race`-clean: every SUT that runs under `-race` is race-free —

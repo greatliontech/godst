@@ -85,7 +85,7 @@ tasks:
     dir: src
     deps: [tmpdir]
     cmds:
-      - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing/simulation crypto/rand net os syscall os/exec os/signal'
+      - '{{.RUN}} test -tags dst -count=1 -timeout 60m runtime testing testing/simulation crypto/rand net os syscall os/exec os/signal'
 
   test:dst-race:
     desc: -tags dst -race testing/simulation + determinism sweep — suite is race-clean; any TSan report here is a real finding
