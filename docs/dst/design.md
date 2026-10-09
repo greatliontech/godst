@@ -1657,8 +1657,8 @@ shapes (live residue inside a symbol; inlining loss in every caller) mechanicall
   symbols (the generic AddCleanup
   instantiations and the availability class) are protected by the conservation bound alone,
   with zero slack measured at derivation; they sit inside the generic blind spot this
-  section already records. The arm64 pair deltas: runFinalizers 8, GC 12, runCleanups 13,
-  queuefinalizer 12, (*File).Stat 19 (amd64: 6, 8, 10, 10, 18); the carried fix
+  section already records. The arm64 pair deltas: runFinalizers 22, GC 12, runCleanups 13,
+  queuefinalizer 12, (*File).Stat 19 (amd64: 21, 8, 10, 10, 18); the carried fix
   `(*Checker).isComplete`: 17 (amd64 18). The gettimeofday fence-wrapper split is linux/amd64 assembly and is
   outside the arm64 profile's split class (its allowlist entries would be stale there).
   The named-anchor subset is enforced by

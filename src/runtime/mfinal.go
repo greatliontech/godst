@@ -310,6 +310,8 @@ func runFinalizers() {
 	fing = gp
 	unlock(&finlock)
 
+	var frame unsafe.Pointer
+	var framecap uintptr
 	for {
 		lock(&finlock)
 		if dstCallbackWorkersBlocked() {
@@ -323,7 +325,7 @@ func runFinalizers() {
 			continue
 		}
 		unlock(&finlock)
-		runFinqBlocks(fb)
+		frame, framecap = runFinqBlocks(fb, frame, framecap)
 	}
 }
 
@@ -334,8 +336,10 @@ func runFinalizers() {
 //
 // It is shared by the async system finalizer goroutine (runFinalizers) and the
 // DST bubble drain (dstDrainFinq), so a finalizer runs identically whichever
-// goroutine drives it.
-func runFinqBlocks(fb *finBlock) {
+// goroutine drives it. The caller retains the returned scratch frame across
+// its batches; drivers never share a frame. An abandoned bubble drain's frame
+// becomes unreachable with its stack, independently of callback accounting.
+func runFinqBlocks(fb *finBlock, frame unsafe.Pointer, framecap uintptr) (unsafe.Pointer, uintptr) {
 	gp := getg()
 	// Untagged there is no other driver, so the discrimination folds to true
 	// and the body is the stock loop.
@@ -355,10 +359,6 @@ func runFinqBlocks(fb *finBlock) {
 	// runs only after the drain has died, can never observe it. Do not add a
 	// park or preemption point between the free below and the next publish.
 	onDrain := dstBuild && gp.bubble != nil && gp == gp.bubble.gcDrain
-	var (
-		frame    unsafe.Pointer
-		framecap uintptr
-	)
 	argRegs := intArgRegs
 	if raceenabled {
 		racefingo()
@@ -491,6 +491,7 @@ func runFinqBlocks(fb *finBlock) {
 	if onDrain {
 		dstDrainingFinq = nil
 	}
+	return frame, framecap
 }
 
 // finPending reports whether any finalizers have been queued but not yet
@@ -569,6 +570,8 @@ func dstReleaseDeferredFinq() {
 // has g.bubble == nil and would fatal on a bubble channel op (invariant
 // DST-FIN-1). The caller must not hold finlock.
 func dstDrainFinq() {
+	var frame unsafe.Pointer
+	var framecap uintptr
 	for {
 		lock(&finlock)
 		fb := finq
@@ -584,7 +587,7 @@ func dstDrainFinq() {
 		// Ledger (finexecuted and dstFinqRunExecuted) is kept per-entry inside
 		// runFinqBlocks on the drain path, so a callback panic or Goexit cannot
 		// lose a block's worth of accounting.
-		runFinqBlocks(fb)
+		frame, framecap = runFinqBlocks(fb, frame, framecap)
 	}
 }
 

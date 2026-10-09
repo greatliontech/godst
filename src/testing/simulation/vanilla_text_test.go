@@ -513,7 +513,7 @@ var profiles = map[string]*archProfile{
 			// stock-equal when the finalizer/cleanup stamps moved out of
 			// line and are no longer admitted at all — a pin on an equal
 			// symbol can never fire and would be silently vacuous.
-			"runtime.runFinalizers":  6,
+			"runtime.runFinalizers":  21,
 			"runtime.GC":             8,
 			"runtime.runCleanups":    10,
 			"runtime.queuefinalizer": 10,
@@ -573,7 +573,7 @@ var profiles = map[string]*archProfile{
 		aggregateStores: true,
 		exactDeltas: map[string]int{
 			// pairs only — see the amd64 map's comment.
-			"runtime.runFinalizers":  8,
+			"runtime.runFinalizers":  22,
 			"runtime.GC":             12,
 			"runtime.runCleanups":    13,
 			"runtime.queuefinalizer": 12,
