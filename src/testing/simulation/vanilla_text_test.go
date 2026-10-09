@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -216,8 +217,7 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	if i := strings.Index(tag, "-dst."); i >= 0 {
 		tag = tag[:i]
 	}
-	git := exec.Command("git", "-C", fork, "diff", "--name-only", tag, "HEAD", "--", "src")
-	gout, err := git.Output()
+	gout, err := liveSourceDelta(fork, tag)
 	if err != nil {
 		if os.Getenv("DST_REQUIRE_LIVE_DELTA") != "" {
 			t.Errorf("coverage: live delta REQUIRED but unavailable (git diff %s: %v)", tag, err)
@@ -230,7 +230,7 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	for _, p := range required {
 		req[p] = true
 	}
-	for _, f := range strings.Split(string(gout), "\n") {
+	for _, f := range gout {
 		if !strings.HasPrefix(f, "src/") || strings.Contains(f, "_test.go") ||
 			strings.Contains(f, "/testdata/") || strings.HasPrefix(f, "src/cmd/") {
 			continue
@@ -249,6 +249,101 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 			t.Errorf("dst delta modifies %s but the corpus closure does not reach it (and the embedded list lags)", pkg)
 		}
 	}
+}
+
+// liveSourceDelta includes staged, unstaged and untracked changes because the
+// compiler and source inventory read the working tree, not the last commit.
+// Git ignore rules do not exclude source files from the compiler's input.
+func liveSourceDelta(fork, tag string) ([]string, error) {
+	changed, err := exec.Command("git", "-C", fork, "diff", "--name-only", "-z", tag, "--", "src").Output()
+	if err != nil {
+		return nil, err
+	}
+	untracked, err := exec.Command("git", "-C", fork, "ls-files", "--others", "-z", "--", "src").Output()
+	if err != nil {
+		return nil, err
+	}
+	paths := func(data []byte) []string {
+		if len(data) == 0 {
+			return nil
+		}
+		return strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+	}
+	result := paths(changed)
+	for _, name := range paths(untracked) {
+		// cmd/dist emits these files in every source build, including stock.
+		// Their tracked generators, not the generated build artifacts, are
+		// members of the source delta. Keep this list exact: an arbitrary
+		// ignored or z-prefixed Go file can still add a fork-only hook.
+		switch name {
+		case "", "src/cmd/cgo/zdefaultcc.go", "src/cmd/go/internal/cfg/zdefaultcc.go",
+			"src/cmd/internal/objabi/zbootstrap.go", "src/internal/buildcfg/zbootstrap.go",
+			"src/internal/runtime/sys/zversion.go", "src/time/tzdata/zzipdata.go":
+			continue
+		}
+		result = append(result, name)
+	}
+	return result, nil
+}
+
+func TestLiveSourceDeltaIncludesUncommittedChanges(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=" + os.DevNull}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	if err := os.Mkdir(filepath.Join(dir, "src"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, text string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, "src", name)), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "src", name), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("staged.go", "package original\n")
+	write("unstaged.go", "package original\n")
+	git("add", "src")
+	git("commit", "-qm", "base")
+	git("tag", "base")
+	write("committed.go", "package added\n")
+	git("add", "src/committed.go")
+	git("commit", "-qm", "fork addition")
+	write("staged.go", "package changed\n")
+	git("add", "src/staged.go")
+	write("unstaged.go", "package changed\n")
+	write("untracked.go", "package added\n")
+	if err := os.WriteFile(filepath.Join(dir, ".git", "info", "exclude"), []byte("src/ignored.go\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	write("ignored.go", "package added\n")
+	write("é.go", "package added\n")
+	write("quote\"tab\tline\n.go", "package added\n")
+	write("time/tzdata/zzipdata.go", "package generated\n")
+	write("time/tzdata/zzipdata_extra.go", "package added\n")
+	want := []string{"src/committed.go", "src/ignored.go", "src/staged.go", "src/unstaged.go", "src/untracked.go", "src/é.go", "src/quote\"tab\tline\n.go", "src/time/tzdata/zzipdata_extra.go"}
+	check := func() {
+		t.Helper()
+		out, err := liveSourceDelta(dir, "base")
+		sort.Strings(out)
+		sort.Strings(want)
+		if err != nil || !slices.Equal(out, want) {
+			t.Fatalf("live source delta = %q, %v; want %q", out, err, want)
+		}
+	}
+	check()
+	git("add", "-f", "src/time/tzdata/zzipdata.go")
+	want = append(want, "src/time/tzdata/zzipdata.go")
+	check()
 }
 
 // archProfile carries everything about the comparison that depends on the

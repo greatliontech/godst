@@ -190,8 +190,7 @@ func typeShapeCoverageCheck(t *testing.T, fork string) {
 	if i := strings.Index(tag, "-dst."); i >= 0 {
 		tag = tag[:i]
 	}
-	git := exec.Command("git", "-C", fork, "diff", "--name-only", tag, "--", "src")
-	out, err := git.Output()
+	out, err := liveSourceDelta(fork, tag)
 	if err != nil {
 		if os.Getenv("DST_REQUIRE_LIVE_DELTA") != "" {
 			t.Errorf("type-shape coverage: live delta REQUIRED but unavailable (git diff %s: %v)", tag, err)
@@ -204,7 +203,7 @@ func typeShapeCoverageCheck(t *testing.T, fork string) {
 	for _, p := range typeShapePackages {
 		listed[p] = true
 	}
-	for _, f := range strings.Fields(string(out)) {
+	for _, f := range out {
 		if !strings.HasSuffix(f, ".go") || strings.HasSuffix(f, "_test.go") || strings.Contains(f, "/testdata/") {
 			continue
 		}
