@@ -15,22 +15,11 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   inside a commit under this fault; filed from pando's disk-fault chunk.
   See [limitdisk-sparse-write-charge.md](limitdisk-sparse-write-charge.md).
 
-- **`-tags dst` does not build on non-linux GOOS** — Lands: with the next
-  port or build-surface change set touching the dst build-tag matrix; a
-  tagged cross-build leg in CI is the enforcement half. Plain-`dst` files
-  call helpers declared under narrower constraints; pre-existing at
-  dst.10. See
-  [dst-tag-nonlinux-unbuildable.md](dst-tag-nonlinux-unbuildable.md).
-
 - **dst-only exports are outside the exported-API gate** — Lands: user
   decision (needs a dst-tagged `cmd/api` context — its own design). The
   import-policy half closed as disproven: `deps_test` scans dst-tagged
   files. HostFS and HostIP's tagged twin are compile-pinned by hand. See
   [tagged-import-policy-gate.md](tagged-import-policy-gate.md).
-- **gomutant cannot load the fork's std tree** — Lands: when `gomutant
-  discover` reports non-zero targets for the fork's std tree. Until then
-  probes and campaigns fall back to hand edits, and reviewer hand-probes
-  are unavailable. See [gomutant-std-tree.md](gomutant-std-tree.md).
 - **gcAssistAlloc's DST membership carry has no enforcing test** — Lands:
   user decision (the enforcing test needs deterministic in-sim assist
   steering — its own design). The gcStart twin is enforced; the assist twin

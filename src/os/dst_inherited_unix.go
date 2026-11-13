@@ -272,7 +272,7 @@ func (f *dstInheritedFile) chmodHandle(mode FileMode) error {
 }
 
 // The ext pin lives here rather than dst_backend.go: dstInheritedFile is
-// unix-only, and the shared file must compile for every port.
+// linux-only, and the shared file must compile for every port.
 var _ dstFileBackendExt = (*dstInheritedFile)(nil)
 
 func (f *dstInheritedFile) setDeadline(rd, wd bool, t time.Time) error {

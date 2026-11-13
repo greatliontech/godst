@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !dst || (dst && !(unix || wasip1))
+//go:build !dst
 
 package os
 
@@ -10,8 +10,7 @@ import "time"
 
 type dstRoot struct{}
 
-// Untagged (and on platforms without the simulated filesystem) a Root
-// has no simulated backing: the constant nil folds the
+// Untagged, a Root has no simulated backing: the constant nil folds the
 // dstSimEnabled-guarded gates to dead code. A free function,
 // deliberately not a method — see dstBackendOf (design.md,
 // INV-TYPESHAPE).

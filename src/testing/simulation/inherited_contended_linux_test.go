@@ -134,7 +134,7 @@ func TestInheritedWriteContentionHostSpam(t *testing.T) {
 			// re-enters a blocking syscall mid-run (that would hold the
 			// single gated P for the whole sleep and strangle the run).
 			ms := int64(100 + 120*i) // 0.1s .. ~2.9s
-			tv := syscall.Timeval{Sec: ms / 1000, Usec: (ms % 1000) * 1000}
+			tv := syscall.NsecToTimeval(ms * 1e6)
 			syscall.Select(0, nil, nil, nil, &tv)
 		}(i)
 	}

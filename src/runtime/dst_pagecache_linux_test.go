@@ -29,11 +29,21 @@ func mappingBytes(base uintptr, n uintptr) []byte {
 // fault, and a test that expects one would pass for the wrong reason.
 var pcSink atomic.Uint32
 
+func mustHavePageCacheRegion(t *testing.T) uintptr {
+	t.Helper()
+	regionSize := uintptr(runtime.DSTMapRegionSize)
+	if regionSize == 0 {
+		t.Skip("page-cache mapping region requires a 64-bit host")
+	}
+	return regionSize
+}
+
 // newPageCache returns a page cache of the given length plus a writable
 // mapping of reserveN bytes over it — a reservation, since reserveN may exceed
 // the length.
 func newPageCache(t *testing.T, length int64, reserveN uintptr) (fd int32, base uintptr) {
 	t.Helper()
+	mustHavePageCacheRegion(t)
 	fd = runtime.DSTPageCacheNew()
 	runtime.DSTPageCacheResize(fd, length)
 	base = runtime.DSTPageCacheMap(fd, reserveN, runtime.DSTProtRead|runtime.DSTProtWrite)
@@ -102,6 +112,7 @@ func TestDSTPageCacheSharesBytesNotProtections(t *testing.T) {
 // died, and a false positive launders a genuine harness nil-dereference into a
 // simulated process death.
 func TestDSTMappingFaultAddr(t *testing.T) {
+	mustHavePageCacheRegion(t)
 	// Tombstones persist until the run boundary, so a neighbor test's released
 	// mapping would otherwise claim adjacent addresses here.
 	runtime.DSTPageCacheReset()
@@ -264,6 +275,7 @@ func TestDSTMappingFaultReadOnlyWrite(t *testing.T) {
 // invocations, exactly as the fork already pins the heap base. Kernel-chosen
 // mmap addresses fail this: mmap_base is randomized per exec.
 func TestDSTMappingAddressDeterministicAcrossInvocations(t *testing.T) {
+	mustHavePageCacheRegion(t)
 	got1 := runTestProgDST(t, "DSTMappingAddr")
 	got2 := runTestProgDST(t, "DSTMappingAddr")
 	if got1 != got2 {
@@ -279,6 +291,7 @@ func TestDSTMappingAddressDeterministicAcrossInvocations(t *testing.T) {
 // lands at identical addresses, so one seed yields one address however many
 // runs precede it in the process.
 func TestDSTPageCacheCarveResetDeterminism(t *testing.T) {
+	mustHavePageCacheRegion(t)
 	sequence := func() [2]uintptr {
 		fd := runtime.DSTPageCacheNew()
 		runtime.DSTPageCacheResize(fd, pcPage)
@@ -307,12 +320,13 @@ func TestDSTPageCacheCarveResetDeterminism(t *testing.T) {
 // sequence — unlike kernel ENOMEM, which is host state. The sentinel is 0,
 // which the os layer hands to the system under test as ENOMEM.
 func TestDSTPageCacheRegionExhaustionIsDeterministicENOMEM(t *testing.T) {
+	regionSize := mustHavePageCacheRegion(t)
 	runtime.DSTPageCacheReset()
 	defer runtime.DSTPageCacheReset()
 	fd := runtime.DSTPageCacheNew()
 	defer runtime.DSTPageCacheClose(fd)
 	runtime.DSTPageCacheResize(fd, pcPage)
-	almost := uintptr(runtime.DSTMapRegionSize) - 64<<10
+	almost := regionSize - 64<<10
 	a := runtime.DSTPageCacheMap(fd, almost, runtime.DSTProtRead)
 	if a == 0 {
 		t.Fatalf("a %d-byte reservation did not fit an empty region", almost)
@@ -333,6 +347,7 @@ func TestDSTPageCacheRegionExhaustionIsDeterministicENOMEM(t *testing.T) {
 // exist), and it must abort with the NAMED reason — not "unexpected fault
 // address" (which reads as a harness bug), and not a laundered process death.
 func TestDSTCrashedMappingTouchIsNamed(t *testing.T) {
+	mustHavePageCacheRegion(t)
 	got := runTestProgDST(t, "DSTCrashedMappingTouch")
 	if !strings.Contains(got, "dst: access to a dead owner's mapping") {
 		t.Fatalf("touching a crashed owner's mapping reported:\n%s\nwant the named abort", got)

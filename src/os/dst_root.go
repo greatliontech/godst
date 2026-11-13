@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dst && (unix || wasip1)
+//go:build dst
 
 package os
 
@@ -796,21 +796,6 @@ func dstRootFinalIsDot(name string) bool {
 		return false
 	}
 	return parts[len(parts)-1] == "."
-}
-
-func dstNodeContains(root, node *dstFSNode) bool {
-	if root == node {
-		return true
-	}
-	if !root.isDir {
-		return false
-	}
-	for _, child := range root.entries {
-		if dstNodeContains(child, node) {
-			return true
-		}
-	}
-	return false
 }
 
 // dstRootLink mirrors the HOST os.Root.Link surface (Go's openat walk

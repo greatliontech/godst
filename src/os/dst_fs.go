@@ -994,6 +994,21 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 	return true, nil
 }
 
+func dstNodeContains(root, node *dstFSNode) bool {
+	if root == node {
+		return true
+	}
+	if !root.isDir {
+		return false
+	}
+	for _, child := range root.entries {
+		if dstNodeContains(child, node) {
+			return true
+		}
+	}
+	return false
+}
+
 // dstStatName implements named Stat (and Lstat — no symlinks in the base
 // model, so they coincide).
 func dstStatName(op, name string) (FileInfo, bool, error) {

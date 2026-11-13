@@ -637,19 +637,19 @@ func DSTFakeTimersTestRemap(host uint32, now, oldPPB, newPPB int64, timers ...*D
 
 func DSTTestStableCandidateSelection(physical []uint64, ordinal uint32) uint64 {
 	gs := make([]g, len(physical))
-	var pp p
+	pp := new(p)
 	for i, seq := range physical {
 		gs[i].dstSimG = true
 		gs[i].dstSeq = seq
 		pp.runq[i].set(&gs[i])
 	}
-	c := dstCandidates{pp: &pp, ringN: uint32(len(physical))}
+	c := dstCandidates{pp: pp, ringN: uint32(len(physical))}
 	return c.at(c.simSeqIdx(uint32(len(physical)), ordinal)).dstSeq
 }
 
 func DSTTestPCTTieSelection(physicalSeq, physicalGoid []uint64) uint64 {
 	gs := make([]g, len(physicalSeq))
-	var pp p
+	pp := new(p)
 	for i, seq := range physicalSeq {
 		gs[i].dstSimG = true
 		gs[i].dstSeq = seq
@@ -660,7 +660,7 @@ func DSTTestPCTTieSelection(physicalSeq, physicalGoid []uint64) uint64 {
 	old := dstPCT
 	dstPCT = dstPCTState{}
 	defer func() { dstPCT = old }()
-	c := dstCandidates{pp: &pp, ringN: uint32(len(physicalSeq))}
+	c := dstCandidates{pp: pp, ringN: uint32(len(physicalSeq))}
 	return c.at(dstPCTSelect(&c, uint32(len(physicalSeq)))).dstSeq
 }
 

@@ -3023,8 +3023,9 @@ func TestExploreWithStepBudgetReportsIncomplete(t *testing.T) {
 // TestExploreOptionsBudgetKnobs pins the arc-scale budget surface:
 // MaxAccesses/MaxEdges replace their per-bubble capacities, zero keeps the
 // defaults, MaxSteps still never raises the access budget, and both knobs
-// clamp at MaxInt32 (the access index stores int32 log positions —
-// accPairEntry — so a larger budget would corrupt indexing, not extend it).
+// clamp at exploreBudgetClamp (1<<30 - 1; the access index stores 1-based
+// int32 log positions doubled for pair capacity — accPairEntry — so a larger
+// budget would corrupt indexing, not extend it).
 func TestExploreOptionsBudgetKnobs(t *testing.T) {
 	def := defaultExploreConfig()
 	cfg := exploreConfigFromOptions(ExploreOptions{})
@@ -3035,15 +3036,27 @@ func TestExploreOptionsBudgetKnobs(t *testing.T) {
 	if cfg.maxAccesses != 1<<20 || cfg.maxEdges != 1<<19 {
 		t.Fatalf("the knobs did not land: %+v", cfg)
 	}
-	cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: 1 << 40, MaxEdges: 1 << 40})
+	over32 := 1<<31 - 1
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: over32, MaxEdges: over32})
 	if cfg.maxAccesses != exploreBudgetClamp || cfg.maxEdges != exploreBudgetClamp {
-		t.Fatalf("the soundness clamp did not hold: %+v", cfg)
+		t.Fatalf("the 32-bit soundness clamp did not hold: %+v", cfg)
 	}
-	// The MaxSteps-derived budgets clamp on the same bound (their step
-	// and offset fields are int32 runtime-side too).
-	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: 1 << 40})
+	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: over32})
 	if cfg.maxDecisions != exploreBudgetClamp || cfg.maxEnabledTotal != exploreBudgetClamp {
-		t.Fatalf("the derived-budget clamp did not hold: %+v", cfg)
+		t.Fatalf("the 32-bit derived-budget clamp did not hold: %+v", cfg)
+	}
+	if ^uint(0)>>32 != 0 {
+		over := int(uint64(1)<<40 & uint64(^uint(0)>>1))
+		cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: over, MaxEdges: over})
+		if cfg.maxAccesses != exploreBudgetClamp || cfg.maxEdges != exploreBudgetClamp {
+			t.Fatalf("the 64-bit soundness clamp did not hold: %+v", cfg)
+		}
+		// The MaxSteps-derived budgets clamp on the same bound (their step
+		// and offset fields are int32 runtime-side too).
+		cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: over})
+		if cfg.maxDecisions != exploreBudgetClamp || cfg.maxEnabledTotal != exploreBudgetClamp {
+			t.Fatalf("the 64-bit derived-budget clamp did not hold: %+v", cfg)
+		}
 	}
 	cfg = exploreConfigFromOptions(ExploreOptions{MaxSteps: 1 << 20})
 	if cfg.maxAccesses != def.maxAccesses || cfg.maxEdges != def.maxEdges {

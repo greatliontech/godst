@@ -1,0 +1,78 @@
+[compiler:gccgo] skip
+
+# End-to-end test that cmd/go normalizes -dst. compiler -V=full buildIDs to
+# contentID:
+#   1. Matching contentID across distinct actionIDs (stage-2 vs stage-3
+#      bootstrap) hits GOCACHE.
+#   2. Changed contentID at the same goX.Y.Z-dst.N version string (reinstalled
+#      compiler via `task compiler`) invalidates GOCACHE without `go clean -cache`.
+
+# Build the -toolexec wrapper using the harness's warm stdlib cache first.
+go build -o $WORK/wrap${GOEXE} ./wrap
+
+# Isolate GOCACHE for the target package builds.
+env GOCACHE=$WORK/gocache
+env COMPILE_LOG=$WORK/compile.log
+mkdir $GOCACHE
+
+# Cold build: compiler must run once for zero-import package p.
+env FAKE_BUILD_ID=actA/mainA/cnt1
+go build -toolexec=$WORK/wrap${GOEXE} ./p
+exists $COMPILE_LOG
+rm $COMPILE_LOG
+
+# Same contentID (cnt1) with a different actionID (actB/mainB): cache hit.
+env FAKE_BUILD_ID=actB/mainB/cnt1
+go build -toolexec=$WORK/wrap${GOEXE} ./p
+! exists $COMPILE_LOG
+
+# New contentID (cnt2) at the identical -dst. version string: cache miss.
+env FAKE_BUILD_ID=actC/mainC/cnt2
+go build -toolexec=$WORK/wrap${GOEXE} ./p
+exists $COMPILE_LOG
+
+-- go.mod --
+module example.com/dstcache
+
+go 1.26
+
+-- p/p.go --
+package p
+
+func F() int { return 42 }
+
+-- wrap/main.go --
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+func main() {
+	tool := os.Args[1]
+	args := os.Args[2:]
+	base := strings.TrimSuffix(filepath.Base(tool), ".exe")
+	if base == "compile" && len(args) == 1 && args[0] == "-V=full" {
+		fmt.Printf("compile version go1.27.4-dst.16 buildID=%s\n", os.Getenv("FAKE_BUILD_ID"))
+		return
+	}
+	if base == "compile" {
+		if err := os.WriteFile(os.Getenv("COMPILE_LOG"), []byte("compiled\n"), 0o644); err != nil {
+			os.Exit(2)
+		}
+	}
+	cmd := exec.Command(tool, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			os.Exit(ee.ExitCode())
+		}
+		os.Exit(1)
+	}
+}

@@ -118,10 +118,10 @@ both.
 A release-form version string is required (not `devel …`): `cmd/go` derives
 a `devel` toolchain's local version as the bare language version `1.N`,
 which a consumer module's `go 1.N.0` directive rejects under
-`GOTOOLCHAIN=local`. The `-dst.N` suffix also keeps distinct checkouts from
-cross-poisoning the shared build cache; the tool-ID mechanism, its
-within-checkout stale-compiler trap, and the clean-cache rule are in
-design.md "Enforcing test configurations".
+`GOTOOLCHAIN=local`. On `-dst.N` toolchains `-V=full` also carries the tool
+binary's build ID (normalized to its content ID by `cmd/go`), keeping
+distinct checkouts and compiler rebuilds within a checkout from serving stale
+cached objects (design.md "Enforcing test configurations").
 
 ## Porting procedure
 
@@ -186,7 +186,7 @@ the new base excludes them by construction.
    place a silent drop can still hide; and (c) **both modes build** — `go
    build std` and `go build -tags dst std`: make.bash and the untagged build
    never compile the `dst_*` files, so an upstream signature change that
-   breaks only a tagged file (a `dst && unix` file no untagged build
+   breaks only a tagged file (a `dst && linux` file no untagged build
    touches) is invisible until the tagged build runs.
    The same delta-survival pair is re-verifiable long after the port
    landed: `task port:verify REF=<merge>` recovers everything from the
@@ -240,9 +240,7 @@ the new base excludes them by construction.
    list rides the port commit message. The matrix (step 6) is necessary,
    not sufficient: it proves the existing contract survived, not that the
    new base's additions are modeled.
-5. Commit the merge. Rebuild the toolchain and clean the build cache
-   (upstream may have touched cmd/compile; the tool-ID trap makes a stale
-   compiler silently pass).
+5. Commit the merge and rebuild the toolchain (`./make.bash`).
 6. Run the full enforcing matrix. A red leg blocks the port; fixes land as
    their own commits on top of the merge.
 7. Push the port commit and the base tag together (`git push origin <line>
@@ -334,20 +332,17 @@ Workflows under `.github/workflows`:
   action, Taskfile, scripts — is the tag's, so only `release.yml` is
   exercised at the dispatched ref).
 
-Every workflow builds the toolchain from source on a fresh runner and never
-restores a Go build cache across commits: this fork's release-form version
-string makes tool IDs version-derived (design.md "Enforcing test
-configurations"), so a cached object built by a different compiler at the
-same version string would be served silently. The extracted-distribution
-validation goes further and runs with its own empty `GOCACHE`: the
-extraction's tools are indistinguishable from the checkout's to any shared
-cache (`GOROOT` package directories are deliberately not hashed into action
-IDs), so a shared cache would serve checkout-built objects and never execute
-the extraction's compiler — vacuously passing exactly the packaging faults
-the validation exists to catch. The Taskfile is the single source of how the
-built toolchain is built against and tested; workflows build and test
-through its tasks (`build:both`, the legs, `dist:extract`, `verify:dist`,
-`smoke:dist`) rather than open-coding `go build`/`go test` commands.
+Every workflow builds the toolchain from source on a fresh runner without
+restoring cross-run Go build caches. The extracted-distribution validation
+runs with its own empty `GOCACHE`: `distpack` archives the checkout's own
+stage-3 tool binaries (matching content ID), and `GOROOT` package directories
+are deliberately not hashed into action IDs, so a shared cache would serve
+checkout-built objects and never execute the extraction's compiler — vacuously
+passing exactly the packaging faults the validation exists to catch. The
+Taskfile is the single source of how the built toolchain is built against and
+tested; workflows build and test through its tasks (`build:both`, the legs,
+`dist:extract`, `verify:dist`, `smoke:dist`) rather than open-coding `go
+build`/`go test` commands.
 
 ## Distribution
 

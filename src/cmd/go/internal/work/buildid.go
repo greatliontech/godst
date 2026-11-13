@@ -168,19 +168,37 @@ func (b *Builder) toolID(name string) string {
 			base.Fatalf("go: error obtaining buildID for %s: %v", desc, err)
 		}
 
-		line := stdout.String()
-		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != name && path != VetTool || f[1] != "version" || strings.Contains(f[2], "devel") && !strings.HasPrefix(f[len(f)-1], "buildID=") {
-			base.Fatalf("go: parsing buildID from %s -V=full: unexpected output:\n\t%s", desc, line)
+		id, err := parseToolID(desc, name, path, VetTool, stdout.String())
+		if err != nil {
+			base.Fatalf("%s", err)
 		}
-		if strings.Contains(f[2], "devel") {
-			// On the development branch, use the content ID part of the build ID.
-			return contentID(f[len(f)-1])
-		}
-		// For a release, the output is like: "compile version go1.9.1 X:framepointer".
-		// Use the whole line.
-		return strings.TrimSpace(line)
+		return id
 	})
+}
+
+func parseToolID(desc, name, path, vetTool, line string) (string, error) {
+	f := strings.Fields(line)
+	if len(f) < 3 || f[0] != name && path != vetTool || f[1] != "version" || (strings.Contains(f[2], "devel") || strings.Contains(f[2], "-dst.")) && !strings.HasPrefix(f[len(f)-1], "buildID=") {
+		return "", fmt.Errorf("go: parsing buildID from %s -V=full: unexpected output:\n\t%s", desc, line)
+	}
+	if strings.Contains(f[2], "devel") {
+		// On the development branch, use the content ID part of the build ID.
+		return contentID(f[len(f)-1]), nil
+	}
+	if strings.Contains(f[2], "-dst.") {
+		// On a -dst. toolchain, VERSION stays fixed between releases, so the
+		// tool binary's content ID must participate in toolID to invalidate
+		// cached objects across compiler rebuilds. Normalize buildID= to its
+		// content ID (rather than the full actionID/.../contentID) so stage-2
+		// and stage-3 bootstrap compilers agree on checkNotStale, while keeping
+		// the version string and any GOEXPERIMENT X:... tokens intact.
+		raw := strings.TrimPrefix(f[len(f)-1], "buildID=")
+		f[len(f)-1] = "buildID=" + contentID(raw)
+		return strings.Join(f, " "), nil
+	}
+	// For a release, the output is like: "compile version go1.9.1 X:framepointer".
+	// Use the whole line.
+	return strings.TrimSpace(line), nil
 }
 
 // gccToolID returns the unique ID to use for a tool that is invoked

@@ -1,15 +1,13 @@
 # DST enforcing test configurations — docs/dst/design.md "Enforcing test
 # configurations" is the authoritative list; this file encodes it verbatim.
 #
-# Two operational rules these tasks exist to enforce:
-#   1. Honest exit codes: no pipelines around `go test` (a `| tail -1` reports
-#      the pipe's status, not the test's — this masked real failures twice).
-#      Each command's failure fails its task; the aggregate is sequential and
-#      fail-fast.
-#   2. After ANY cmd/compile change, run `task compiler` (or at minimum
-#      `bin/go clean -cache`): this fork reports a release version string, so
-#      tool IDs come from the version, not the binary hash, and a reinstalled
-#      compiler does NOT invalidate cached objects.
+# Operational rule these tasks exist to enforce:
+#   Honest exit codes: no pipelines around `go test` (a `| tail -1` reports
+#   the pipe's status, not the test's — this masked real failures twice).
+#   Each command's failure fails its task; the aggregate is sequential and
+#   fail-fast. (Tool IDs on `-dst.` toolchains include the tool binary's
+#   contentID via `-V=full`, so reinstalling `cmd/compile` invalidates stale
+#   `GOCACHE` entries automatically without `go clean -cache`.)
 #
 # Every command runs as `GOROOT={{.ROOT_DIR}} ...`: an exported GOROOT in
 # the developer's environment would otherwise redirect every leg to another
@@ -140,10 +138,10 @@ tasks:
         vars: { ARGS: 'test -count=1 -timeout 40m cmd/internal/testdir' }
 
   test:cmd:
-    desc: cmd suites over the fork's toolchain changes — cmd/go short (its slow/network half skips), cmd/compile and cmd/link in full
+    desc: cmd suites over the fork's toolchain changes — cmd/go + cmd/go/internal/work short (slow/network half skips), cmd/compile and cmd/link in full
     cmds:
       - task: exttmp-go
-        vars: { ARGS: 'test -count=1 -short -timeout 60m cmd/go' }
+        vars: { ARGS: 'test -count=1 -short -timeout 60m cmd/go cmd/go/internal/work' }
       # cmd/compile and cmd/link run WITHOUT -short: short mode drops the
       # compiler tests this fork is most exposed to — TestIntendedInlining
       # above all, which pins the std inlinability surface the INV-VANILLA
@@ -191,37 +189,56 @@ tasks:
       - '{{.RUN}} test -count=1 -short std'
 
   test:cross:
-    desc: Untagged `build std` across the supported platform list — Unix arches, darwin, the BSDs, js/wasip1, Windows, Plan 9 — plus the dst architecture-scope refusal probes
+    desc: Untagged `build std` across all cross targets, `-tags dst` `build std` + `vet` across fenced Linux targets, and `-tags dst` OS/arch refusal probes
     dir: src
     deps: [tmpdir]
     cmds:
-      - 'GOOS=windows GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
-      - 'GOOS=plan9 GOARCH=amd64 CGO_ENABLED=0 {{.RUN}} build std'
-      # Untagged builds must remain valid upstream ports on every platform
-      # the design claims: the fenced Unix architectures (design.md, "The
-      # interception boundary" → Architecture scope), both darwin arches,
-      # the BSDs, and the js/wasm + wasip1 file layouts the tagged
-      # filesystem section names.
+      # Untagged builds remain valid upstream ports across all fifteen cross
+      # targets (design.md, "Enforcing test configurations" → test:cross).
       - |
         set -e
         for p in linux/386 linux/arm linux/arm64 linux/riscv64 linux/ppc64 linux/ppc64le linux/s390x \
-                 darwin/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 js/wasm wasip1/wasm; do
+                 darwin/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 js/wasm wasip1/wasm \
+                 windows/amd64 plan9/amd64; do
           GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 {{.RUN}} build std
         done
-      # Architecture-scope refusal: DST claims no support on loong64/MIPS
-      # (design.md, "The interception boundary" → Architecture scope), so a
+      # Tagged (`-tags dst`) standard-library builds and DST test-package
+      # typechecking across all seven fenced Linux cross architectures
+      # (design.md, "The interception boundary" → Platform scope).
+      - |
+        set -e
+        for a in 386 arm arm64 riscv64 ppc64 ppc64le s390x; do
+          GOOS=linux GOARCH=$a CGO_ENABLED=0 {{.RUN}} build -tags dst std
+          GOOS=linux GOARCH=$a CGO_ENABLED=0 {{.RUN}} vet -unsafeptr=false -tags dst runtime syscall time os os/signal os/user net crypto/internal/sysrand testing testing/simulation
+        done
+      # Architecture-scope refusal: DST claims no support on Linux loong64/MIPS
+      # (design.md, "The interception boundary" → Platform scope), so a
       # dst-tagged build there must fail AND fail with the intended sentinel
       # message from runtime/dst_arch_unsupported.go — an accidental
       # missing-symbol failure would pass a bare negation but not this probe.
       # Pipeline-free by design: the case-match is the assertion.
       - |
         for a in loong64 mips mipsle mips64 mips64le; do
-          if out=$(GOOS=linux GOARCH=$a CGO_ENABLED=0 {{.RUN}} build -tags dst runtime 2>&1); then
+          if out=$(GOOS=linux GOARCH=$a CGO_ENABLED=0 {{.RUN}} build -tags dst std 2>&1); then
             echo "dst-tagged build unexpectedly succeeded on linux/$a"; exit 1
           fi
           case "$out" in
             *"unsupported on this architecture"*) ;;
             *) printf '%s\n' "$out"; echo "linux/$a dst refusal is missing the intended sentinel message"; exit 1;;
+          esac
+        done
+      # Operating-system-scope refusal: DST's enforced host-isolation floor
+      # exists only on Linux (runtime/dst_os_unsupported.go), so a dst-tagged
+      # build of std on every non-Linux cross target must pass package-graph
+      # loading and fail cleanly with the unsupported-OS sentinel.
+      - |
+        for p in darwin/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 js/wasm wasip1/wasm windows/amd64 plan9/amd64; do
+          if out=$(GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 {{.RUN}} build -tags dst std 2>&1); then
+            echo "dst-tagged build unexpectedly succeeded on $p"; exit 1
+          fi
+          case "$out" in
+            *"unsupported on this operating system"*) ;;
+            *) printf '%s\n' "$out"; echo "$p dst refusal is missing the intended sentinel message"; exit 1;;
           esac
         done
 
@@ -249,10 +266,9 @@ tasks:
   #     (~/.config/go/env) supplies them when the process env doesn't, so a
   #     developer's `go env -w GOFLAGS=...` would silently redirect the
   #     validation. GOROOT cannot be persisted there; -u suffices for it.
-  #   - GOCACHE in the per-run temp tree: this fork's tool IDs are
-  #     version-derived, so the extraction's compiler is indistinguishable
-  #     from the checkout's to a shared build cache (GOROOT package dirs are
-  #     deliberately not hashed into action IDs) — a shared cache would serve
+  #   - GOCACHE in the per-run temp tree: distpack archives the checkout's own
+  #     stage-3 tool binaries (matching contentID), and GOROOT package dirs are
+  #     deliberately not hashed into action IDs — a shared cache would serve
   #     checkout-built objects and never execute the extraction's tools,
   #     vacuously passing exactly the packaging faults these tasks exist to
   #     catch. The cold build is the check.
@@ -388,12 +404,11 @@ tasks:
         [ "$(command -v go || true)" = "$prefix/bin/go" ] || echo "note: 'go' on PATH currently resolves to $(command -v go || echo nothing), not the launcher"
 
   compiler:
-    desc: Reinstall cmd/compile, then clean the build cache (release version string ⇒ stale tool IDs otherwise)
+    desc: Reinstall cmd/compile (-V=full carries the binary contentID on -dst. toolchains, invalidating stale GOCACHE entries automatically)
     dir: src
     deps: [tmpdir]
     cmds:
       - '{{.RUN}} install cmd/compile'
-      - '{{.RUN}} clean -cache'
 
   # Porting: docs/dst/releases.md "Porting procedure" is the contract; `port`
   # is its executable step 1 and `port:check` its step 3. The port commit is

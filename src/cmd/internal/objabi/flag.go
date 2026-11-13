@@ -225,11 +225,12 @@ func (versionFlag) Set(s string) error {
 
 	// The go command invokes -V=full to get a unique identifier
 	// for this tool. It is assumed that the release version is sufficient
-	// for releases, but during development we include the full
+	// for releases, but during development (and on -dst. toolchains, whose
+	// VERSION stays fixed between releases) we include the full
 	// build ID of the binary, so that if the compiler is changed and
 	// rebuilt, we notice and rebuild all packages.
 	if s == "full" {
-		if strings.Contains(buildcfg.Version, "devel") {
+		if strings.Contains(buildcfg.Version, "devel") || strings.Contains(buildcfg.Version, "-dst.") {
 			p += " buildID=" + buildID
 		}
 	}

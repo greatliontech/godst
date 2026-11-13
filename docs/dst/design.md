@@ -903,9 +903,9 @@ reproduced.
 File is created: the tree-file backend here, and the pipe feature's `os.Pipe` landed exactly there
 — a stream-shaped second implementation of the same seam (`dstFileBackend`), a backend rather than
 a retrofit, validating the Non-foreclosure invariant this paragraph recorded for that slot when the
-seam was built. On Linux, a tree file or directory's `Fd()` returns a **virtual descriptor** owned by the
-calling simulated process; non-Linux simulated file `Fd()` remains fenced until its raw-syscall boundary
-can fence virtual fd numbers before host dispatch. A virtual descriptor is only meaningful to the DST
+seam was built. A tree file or directory's `Fd()` returns a **virtual descriptor** owned by the
+calling simulated process (`GOOS=linux` is the sole `-tags dst` operating system; see "Platform
+scope" below). A virtual descriptor is only meaningful to the DST
 syscall boundary: selected split-safe Linux `syscall` package wrappers dispatch it back to the file backend,
 and every unsupported operation on it is refused or returns a deterministic kernel-shaped error. Virtual
 descriptors live in a **reserved number range** ([2³⁰, 2³⁰+2²⁰)) the simulation owns outright: the named
@@ -1411,17 +1411,21 @@ real host I/O and reads real entropy silently — same seed, different run, no e
 falsifies host isolation as an *enforced* invariant. Every fence below fires only for **bubble goroutines while a run is
 active** — non-bubble goroutines keep full host access, so the harness around the run is untouched.
 
-**Architecture scope** (GOARCH-quantified; operating-system scope is governed by the Linux-only
-feature clauses elsewhere in this document). Because host isolation is *enforced*, the dst runtime
-carries arch arms only for architectures whose raw-entry surface the fence table below covers:
-amd64 (the verified primary target) and the architectures sharing the generic trampoline surface —
-arm64, riscv64, ppc64/ppc64le, s390x, and the 32-bit 386/arm (fenced in full; the page cache
-additionally refuses 32-bit hosts at first use). loong64 and the MIPS family carry arch-private
-raw entries the fork does not claim (loong64's Fstat dispatches a direct `statx`; linux/mips
-exports an additional ninth-argument `Syscall9` trampoline) whose fences would be verifiable only
-on emulated targets, so a `-tags dst` build is **refused at compile time** on those architectures
-(`runtime/dst_arch_unsupported.go`; pinned by `test:cross`'s negative build probes across all five).
-Untagged builds remain valid upstream ports everywhere. The fences:
+**Platform scope** (`GOOS` and `GOARCH`). Because host isolation is an *enforced* invariant —
+pre-run `*os.File` and stdio fencing, virtual descriptors, raw-trampoline and socketcall fences,
+`golang.org/x/sys/unix` interception, the memfd page cache, futexes, and `InheritFile` all depend on
+the Linux syscall floor — `-tags dst` builds are supported **only on `GOOS=linux`**, and every
+non-Linux operating system is **refused at compile time** (`runtime/dst_os_unsupported.go`; pinned by
+`test:cross`'s negative build probes across all eight non-Linux cross targets). Within `GOOS=linux`,
+the dst runtime carries arch arms only for architectures whose raw-entry surface the fence table
+below covers: amd64 (the verified primary target) and the seven architectures sharing the generic
+trampoline surface — arm64, riscv64, ppc64/ppc64le, s390x, and the 32-bit 386/arm (fenced in full;
+the page cache additionally refuses 32-bit hosts at first use). loong64 and the MIPS family carry
+arch-private raw entries the fork does not claim (loong64's Fstat dispatches a direct `statx`;
+linux/mips exports an additional ninth-argument `Syscall9` trampoline) whose fences would be
+verifiable only on emulated targets, so a `-tags dst` build is **refused at compile time** on those
+Linux architectures as well (`runtime/dst_arch_unsupported.go`; pinned by `test:cross`'s negative
+build probes across all five). Untagged builds remain valid upstream ports everywhere. The fences:
 
 - **Resource-minting `syscall` entry points** (`Open`/`Openat`/`Creat`, `Socket`/`Socketpair`,
   `Pipe`/`Pipe2`, `Dup`/`Dup2`/`Dup3`, host-backed `Mmap`, `ForkExec`/`Exec`) fail with the standard
@@ -1676,9 +1680,9 @@ The toolchain's own binaries are a recorded deviation class, outside INV-VANILLA
 *target* build, not of the toolchain build, selects it), gated so that untagged compilations
 produce identical emitted text to stock — the non-text surfaces (rodata, pclntab, DWARF) are
 not separately enforced. Build action IDs deliberately differ from stock's:
-tool IDs derive from the fork's version string (see the build-cache discipline below), and that
-difference is what keeps godst's cache entries from colliding with a stock toolchain's on the
-same machine. The identical-output claim is bound by INV-VANILLA itself — the corpus is compiled
+tool IDs derive from the fork's `-dst.` version string plus the tool binary's content ID (see the
+build-cache discipline below), and that difference keeps godst's cache entries from colliding with
+either a stock toolchain's or an older build of the same checkout on the same machine. The identical-output claim is bound by INV-VANILLA itself — the corpus is compiled
 by godst's `cmd/go` and `cmd/compile`, so any untagged output the toolchain's DST support
 changed would surface as a text diff — and is enforced by INV-VANILLA's gate
 (`TestUntaggedTextIdenticalToStock` compiles the corpus with godst's `cmd/go` and
@@ -1911,9 +1915,9 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
 - **`test:testdir`** (`go test cmd/internal/testdir`, untagged, own TMPDIR outside GOROOT):
   the top-level `test/` suite — codegen, fixedbugs, errorcheck — over the fork's toolchain;
   per-PR and in the matrix.
-- **`test:cmd`** (`go test -short cmd/go` plus `go test cmd/compile/... cmd/link/...`, untagged,
+- **`test:cmd`** (`go test -short cmd/go cmd/go/internal/work` plus `go test cmd/compile/... cmd/link/...`, untagged,
   own TMPDIR — cmd/go's script tests refuse a work dir inside GOROOT): the cmd suites over the
-  fork's cmd/compile and cmd/go changes; per-PR and in the matrix. Only cmd/go runs `-short`, a
+  fork's cmd/compile and cmd/go changes; per-PR and in the matrix. Only cmd/go and cmd/go/internal/work run `-short`, a
   recorded coverage bound: its slow half (the `tooSlow` skips) and the scripts needing live
   network or remote VCS are dropped. cmd/compile and cmd/link run in full — short mode would
   drop the compiler tests this fork is most exposed to, `TestIntendedInlining` above all, which
@@ -1951,33 +1955,37 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
 - **`test:inert-std`** (`go test -count=1 -short std`, untagged): build-mode inertness across all
   of std. Heavy; runs separately from the `test` aggregate, which runs the six fast legs
   sequentially and fail-fast. Per-PR in ci.yml and in the nightly matrix.
-- **`test:cross`** (untagged `CGO_ENABLED=0 go build std` across the supported platform list):
-  ordinary standard-library builds remain valid upstream ports on every platform this document
-  claims — Windows and Plan 9 (the two file layouts that do not carry DST backend storage), the
-  fenced Unix architectures (`linux/386`, `arm`, `arm64`, `riscv64`, `ppc64`, `ppc64le`,
-  `s390x`; see "The interception boundary", Architecture scope), both darwin architectures,
-  `freebsd/amd64` and `openbsd/amd64`, and the `js/wasm` + `wasip1/wasm` file layouts the tagged
-  filesystem section names — fifteen targets. The leg makes no tagged DST support claim for any
-  of them; the tagged filesystem requires a supported Unix, js/wasm, or wasip1 file layout. The
-  leg also carries the architecture-scope refusal probes: a `-tags dst` build of `runtime` for
-  each excluded architecture (`linux/loong64` and the four MIPS ports) must fail with the
-  intended unsupported-architecture sentinel message (see "The interception boundary",
-  Architecture scope) — a probe that fails either because the build succeeded or because the
-  message is missing is a scope regression. It runs separately from the `test` aggregate.
+- **`test:cross`** (`CGO_ENABLED=0 go build std` untagged across all fifteen supported cross
+  targets, `CGO_ENABLED=0 go build -tags dst std` plus `go vet -unsafeptr=false -tags dst` over the
+  DST-hooked packages across the seven fenced Linux cross architectures, and `-tags dst` refusal
+  probes across excluded architectures and operating systems): ordinary standard-library builds remain valid
+  upstream ports on every platform this document claims — the seven fenced Linux cross architectures
+  (`linux/386`, `arm`, `arm64`, `riscv64`, `ppc64`, `ppc64le`, `s390x`), `darwin/amd64`,
+  `darwin/arm64`, `freebsd/amd64`, `openbsd/amd64`, `js/wasm`, `wasip1/wasm`, `windows/amd64`, and
+  `plan9/amd64` (fifteen targets). Tagged (`-tags dst`) standard-library builds and DST test-package
+  typechecking (`go vet -unsafeptr=false -tags dst`, matching `go test`'s vet profile over low-level
+  syscall/mmap pointer arithmetic) are enforced across all seven fenced Linux cross architectures
+  (see "The interception boundary", Platform scope). The leg also carries the compile-time refusal
+  probes: a `-tags dst` build of `std` for each excluded Linux architecture (`loong64` and the four
+  MIPS ports; `runtime/dst_arch_unsupported.go`) and each non-Linux cross target (`darwin/amd64`,
+  `darwin/arm64`, `freebsd/amd64`, `openbsd/amd64`, `js/wasm`, `wasip1/wasm`, `windows/amd64`, and
+  `plan9/amd64`; `runtime/dst_os_unsupported.go`) must pass `std` package-graph loading and fail
+  with the intended sentinel message — a probe that fails because the build succeeded, because
+  package loading aborted before `runtime`, or because the sentinel message is missing is a scope
+  regression. It runs separately from the `test` aggregate.
 
-Two operational rules for running these configurations honestly: never let a pipeline eat the exit
+Operational rules for running these configurations honestly: never let a pipeline eat the exit
 code (`go test ... | tail -1` reports the pipe's status, not the test's — this masked real failures
 twice; the Taskfile must stay pipeline-free, so each leg's `go test` exit code is the task's exit
-code), and after ANY cmd/compile change run `task compiler` — it chains `go clean -cache` after the
-reinstall because this fork reports a release-form version string, so tool IDs come from the
-version, not the binary hash, and a reinstalled compiler does NOT invalidate cached objects
-(stale-compiler builds silently pass). The `VERSION` file carries a `-dst.N` suffix
-(`goX.Y.Z-dst.N`, see releases.md), so this checkout's tool IDs differ from stock's and from any sibling worktree
-still reporting the bare release — distinct checkouts cannot cross-poison the shared
-`~/.cache/go-build`. The suffix does NOT fix the within-checkout trap (a suffixed release is still
-a release to the tool-ID logic: the whole `-V=full` line, constant across rebuilds), so the
-clean-cache rule stands unchanged. All legs gate green; a red leg is a regression against
-this section.
+code), and after ANY `cmd/compile` change reinstall the compiler (`task compiler` or `./make.bash`).
+Tool IDs on `-dst.` toolchains combine the `goX.Y.Z-dst.N` version string, any enabled `X:...`
+experiments, and the tool binary's normalized `contentID` (`objabi` appends `buildID=` to `-V=full`
+on `-dst.` builds and `cmd/go/internal/work` normalizes `buildID=<contentID>` so stage-2 and
+stage-3 bootstrap compilers agree on `checkNotStale`): distinct checkouts cannot cross-poison the
+shared `~/.cache/go-build`, and reinstalling `cmd/compile` inside a checkout invalidates stale
+cached objects automatically without `go clean -cache` (`TestParseToolID`,
+`TestDSTCompilerVFullHasBuildID`, `TestScript/build_dst_toolid_cache`). All legs gate green; a red
+leg is a regression against this section.
 One environmental failure mode masquerades as a build regression: the `std` leg's parallel build
 trees plus accumulated per-test temp dirs can fill a tmpfs `/tmp` mid-leg ("disk quota exceeded"
 or "no space left on device" from compile/link/cgo). The Taskfile closes this by construction —
