@@ -15,7 +15,7 @@ const (
 
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error)
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT
+// Fstat is tag-split between dst_split_fstat_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat_on_linux.go (dst).
 //sys	Fstatfs(fd int, buf *Statfs_t) (err error)
 //sys	Ftruncate(fd int, length int64) (err error)
 //sysnb	Getegid() (egid int)
@@ -30,7 +30,7 @@ const (
 //sys	pread(fd int, p []byte, offset int64) (n int, err error) = SYS_PREAD64
 //sys	pwrite(fd int, p []byte, offset int64) (n int, err error) = SYS_PWRITE64
 //sys	Renameat(olddirfd int, oldpath string, newdirfd int, newpath string) (err error)
-//sys	seekFD(fd int, offset int64, whence int) (off int64, err error) = SYS_LSEEK
+// Seek is tag-split between dst_split_seek64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_seek64_on_linux.go (dst).
 //sys	Select(nfd int, r *FdSet, w *FdSet, e *FdSet, timeout *Timeval) (n int, err error)
 //sys	sendfile(outfd int, infd int, offset *int64, count int) (written int, err error)
 //sys	Setfsgid(gid int) (err error)
@@ -72,32 +72,6 @@ func Lstat(path string, stat *Stat_t) (err error) {
 }
 
 //sys	futimesat(dirfd int, path string, times *[2]Timeval) (err error)
-
-// rawGettimeofday is the assembly entry (vDSO with a raw-syscall fallback);
-// it enters the kernel through none of the fenced trampolines.
-//
-//go:noescape
-func rawGettimeofday(tv *Timeval) (err Errno)
-
-// gettimeofday is the fenced wrapper over the assembly entry, and the symbol
-// golang.org/x/sys/unix enters by name (its amd64 assembly jumps to
-// syscall·gettimeofday): exporting the raw entry instead would hand a
-// bubble goroutine an unfenced host WALL-clock read. Without the fence,
-// in-bubble wall time flows silently into the seeded schedule (same stance
-// as the refused CLOCK_REALTIME leg; the virtual clock serves only the
-// monotonic/boottime ids). Gettimeofday and Time below, and every other dst
-// arch's generated Gettimeofday over the fenced RawSyscall, meet the same
-// fence.
-//
-//go:linkname gettimeofday
-func gettimeofday(tv *Timeval) (err Errno) {
-	if dstSimFenced { // zero-cost guard: untagged this is one call to the asm entry
-		if dstFenceActive() && !dstHostIOActive() {
-			dstSyscallRefuse(SYS_GETTIMEOFDAY)
-		}
-	}
-	return rawGettimeofday(tv)
-}
 
 func Gettimeofday(tv *Timeval) (err error) {
 	errno := gettimeofday(tv)

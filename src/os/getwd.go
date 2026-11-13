@@ -133,10 +133,7 @@ func Getwd() (dir string, err error) {
 		}
 
 	Found:
-		// The fallback walk is deliberately log-free (statNolog,
-		// openDirNolog, lstatNolog above); this fd-stat's result never
-		// escapes Getwd either - it feeds SameFile and the next hop.
-		pd, err := fstatNolog(fd)
+		pd, err := fd.Stat()
 		fd.Close()
 		if err != nil {
 			return "", err

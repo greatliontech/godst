@@ -25,7 +25,7 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	if stat == nil {
 		return syscall.EFAULT, true
 	}
-	info, err := entry.backend.(dstFileBackendExt).stat()
+	info, err := entry.backend.stat()
 	if errno := dstFDErr(err); errno != 0 {
 		return errno, true
 	}

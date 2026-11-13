@@ -9,8 +9,6 @@
 // System calls for AMD64, Linux
 //
 
-#define SYS_gettimeofday 96
-
 // func rawVforkSyscall(trap, a1, a2, a3 uintptr) (r1, err uintptr)
 TEXT ·rawVforkSyscall(SB),NOSPLIT|NOFRAME,$0-48
 	MOVQ	a1+8(FP), DI
@@ -43,31 +41,4 @@ TEXT ·rawSyscallNoError(SB),NOSPLIT,$0-48
 	SYSCALL
 	MOVQ	AX, r1+32(FP)
 	MOVQ	DX, r2+40(FP)
-	RET
-
-// func rawGettimeofday(tv *Timeval) (err uintptr)
-// The fenced Go wrapper gettimeofday (syscall_linux_amd64.go) is the named entry.
-TEXT ·rawGettimeofday(SB),NOSPLIT,$0-16
-	// Usually, we'd check if we're running
-	// secret code here, but because we execute
-	// gettimeofday on the G stack, it's fine to leave
-	// the registers uncleared
-	MOVQ	tv+0(FP), DI
-	MOVQ	$0, SI
-	MOVQ	runtime·vdsoGettimeofdaySym(SB), AX
-	TESTQ   AX, AX
-	JZ fallback
-	CALL	AX
-ret:
-	CMPQ	AX, $0xfffffffffffff001
-	JLS	ok7
-	NEGQ	AX
-	MOVQ	AX, err+8(FP)
-	RET
-fallback:
-	MOVL	$SYS_gettimeofday, AX
-	SYSCALL
-	JMP ret
-ok7:
-	MOVQ	$0, err+8(FP)
 	RET

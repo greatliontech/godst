@@ -271,9 +271,9 @@ func (f *dstInheritedFile) chmodHandle(mode FileMode) error {
 	return f.host.pfd.Fchmod(syscallMode(mode))
 }
 
-// The ext pin lives here rather than dst_backend.go: dstInheritedFile is
-// linux-only, and the shared file must compile for every port.
-var _ dstFileBackendExt = (*dstInheritedFile)(nil)
+// The interface pin lives here rather than dst_backend.go: dstInheritedFile is
+// unix-only, and dst_backend.go compiles for every port.
+var _ dstFileBackend = (*dstInheritedFile)(nil)
 
 func (f *dstInheritedFile) setDeadline(rd, wd bool, t time.Time) error {
 	old, err := f.begin()

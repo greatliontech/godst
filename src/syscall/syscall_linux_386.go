@@ -25,7 +25,7 @@ func setTimeval(sec, usec int64) Timeval {
 // (386 default is 32-bit file system and 16-bit uid).
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error) = SYS_FCHOWN32
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
+// Fstat is tag-split between dst_split_fstat64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat64_on_linux.go (dst).
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_FSTATAT64
 //sys	Ftruncate(fd int, length int64) (err error) = SYS_FTRUNCATE64
 //sysnb	Getegid() (egid int) = SYS_GETEGID32
@@ -72,26 +72,6 @@ func mmap(addr uintptr, length uintptr, prot int, flags int, fd int, offset int6
 	return mmap2(addr, length, prot, flags, fd, page)
 }
 
-// Underlying system call writes to newoffset via pointer.
-// Implemented in assembly to avoid allocation.
-func rawSeek(fd int, offset int64, whence int) (newoffset int64, err Errno)
-
-//go:linkname seek
-func seek(fd int, offset int64, whence int) (newoffset int64, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		dstSyscallRefuse(SYS__LLSEEK)
-	}
-	return rawSeek(fd, offset, whence)
-}
-
-func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
-	newoffset, errno := seek(fd, offset, whence)
-	if errno != 0 {
-		return 0, errno
-	}
-	return newoffset, nil
-}
-
 //sys	futimesat(dirfd int, path string, times *[2]Timeval) (err error)
 //sysnb	Gettimeofday(tv *Timeval) (err error)
 //sysnb	Time(t *Time_t) (tt Time_t, err error)
@@ -128,58 +108,6 @@ const (
 	_RECVMMSG    = 19
 	_SENDMMSG    = 20
 )
-
-func socketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
-func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
-
-// socketcall and rawsocketcall dispatch the multiplexed socket-family
-// syscalls through the dedicated SYS_SOCKETCALL assembly entries — a path
-// that never passes the fenced Syscall/RawSyscall trampolines, so the DST
-// fence is consulted HERE: without it, a bubble goroutine's syscall.Socket
-// (or Bind/Connect/...) would mint a live host socket, a silent simulation
-// escape (design.md, interception boundary, DST-NODE-ISOLATION). Same
-// predicate and refusal shape as the trampolines give the raw
-// SYS_SOCKETCALL trap; non-bubble callers fall through to the host
-// unchanged. Folds away in stock builds (dstSimFenced const).
-
-// The push linknames keep golang.org/x/sys/unix linking: its 386 assembly
-// enters these by name (JMP syscall·socketcall(SB)), a pull reference the
-// linker permits only against assembly-defined or linkname-exported symbols —
-// and deliberately so: routed through the FENCED wrappers, unix.Socket and
-// friends are refused in-bubble exactly like syscall.Socket, which the
-// trampolines never see on this architecture.
-//
-// uintptrkeepalive keeps pointer-derived arguments live, and nosplit prevents
-// stack copying from leaving their integer addresses stale before dispatch.
-//
-//go:uintptrkeepalive
-//go:nosplit
-//go:linkname socketcall
-func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		// A sockopt on a virtual socket descriptor is the simulation's
-		// (dstSocketcallSockopt); every other in-bubble socketcall meets the
-		// fence. rawsocketcall dispatches nothing, like the raw trampolines.
-		if e, handled := dstSocketcallSockopt(call, a0, a1, a2, a3, a4); handled {
-			if e != 0 {
-				return -1, e
-			}
-			return 0, 0
-		}
-		dstSyscallRefuse(SYS_SOCKETCALL)
-	}
-	return socketcall1(call, a0, a1, a2, a3, a4, a5)
-}
-
-//go:uintptrkeepalive
-//go:nosplit
-//go:linkname rawsocketcall
-func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		dstSyscallRefuse(SYS_SOCKETCALL)
-	}
-	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)
-}
 
 func accept4(s int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (fd int, err error) {
 	fd, e := socketcall(_ACCEPT4, uintptr(s), uintptr(unsafe.Pointer(rsa)), uintptr(unsafe.Pointer(addrlen)), uintptr(flags), 0, 0)

@@ -193,11 +193,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if c.bubble != nil && getg().bubble != c.bubble {
 		fatal("send on synctest channel from outside bubble")
 	}
-	if dstBuild && raceenabled && !block {
-		// A non-blocking send that fails in this run may be the successful acquirer in
-		// a reversed run. Announce before the fast-fail check so DPOR can reverse that
-		// order; spurious failed-attempt conflicts only over-explore.
-		dstSyncAcquire(unsafe.Pointer(c))
+	if dstBuild && raceenabled {
+		if !block {
+			dstSyncAcquire(unsafe.Pointer(c))
+		}
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -225,17 +224,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
-	// DST Level-2: announce this blocking send's impending channel acquisition on the
-	// hchan identity BEFORE taking c.lock, so the order in which contending goroutines
-	// acquire the channel is a DPOR transition (the manual chanChoiceSUT does the same
-	// by hand). The dstBuild && raceenabled compile-time constants gate it to a
-	// -tags dst -race build — the same gate as the memory-access auto-instrumentation
-	// and compile it away otherwise, so non-dst, plain -race, and dst-without-race
-	// builds are hook-inert (DST-L2-4). The announce is before c.lock is taken,
-	// so dstSyncAcquire's safe-point guard can yield without running a blocked G
-	// (DST-L2-1).
-	if dstBuild && raceenabled && block {
-		dstSyncAcquire(unsafe.Pointer(c))
+	if dstBuild && raceenabled {
+		if block {
+			dstSyncAcquire(unsafe.Pointer(c))
+		}
 	}
 
 	lock(&c.lock)
@@ -254,19 +246,14 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 
 	if c.qcount < c.dataqsiz {
 		// Space is available in the channel buffer. Enqueue the element to send.
-		slot := c.sendx
-		qp := chanbuf(c, slot)
+		qp := chanbuf(c, c.sendx)
 		if raceenabled {
-			racenotify(c, slot, nil)
+			racenotify(c, c.sendx, nil)
 		}
 		typedmemmove(c.elemtype, qp, ep)
 		if dstBuild && raceenabled {
-			// Mirror racereleaseacquire on the slot: the send also ACQUIRES it,
-			// pairing with the receive that previously released it — the
-			// k'th-receive → (k+C)'th-send edge of the memory model. Acquire
-			// before release so predecessors merge before publishing.
-			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
-			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
 		}
 		c.sendx++
 		if c.sendx == c.dataqsiz {
@@ -455,8 +442,6 @@ func closechan(c *hchan) {
 		fatal("close of synctest channel from outside bubble")
 	}
 	if dstBuild && raceenabled {
-		// Closing a channel can flip a racing non-blocking receive from default to the
-		// closed receive case. Record the channel identity before the state transition.
 		dstSyncAcquire(unsafe.Pointer(c))
 	}
 
@@ -588,11 +573,10 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	if c.timer != nil {
 		c.timer.maybeRunChan(c)
 	}
-	if dstBuild && raceenabled && !block {
-		// A non-blocking receive that fails in this run may be the successful acquirer
-		// in a reversed run. Announce before the fast-fail check so DPOR can reverse
-		// that order; spurious failed-attempt conflicts only over-explore.
-		dstSyncAcquire(unsafe.Pointer(c))
+	if dstBuild && raceenabled {
+		if !block {
+			dstSyncAcquire(unsafe.Pointer(c))
+		}
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -636,12 +620,10 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		t0 = cputicks()
 	}
 
-	// DST Level-2: announce this blocking recv's impending channel acquisition on the
-	// hchan identity BEFORE taking c.lock, so the rendezvous order is a DPOR transition.
-	// Gated to a -tags dst -race build (dead-code-eliminated otherwise, DST-L2-4); see
-	// the matching note in chansend.
-	if dstBuild && raceenabled && block {
-		dstSyncAcquire(unsafe.Pointer(c))
+	if dstBuild && raceenabled {
+		if block {
+			dstSyncAcquire(unsafe.Pointer(c))
+		}
 	}
 
 	lock(&c.lock)
@@ -675,16 +657,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
 	if c.qcount > 0 {
 		// Receive directly from queue
-		slot := c.recvx
-		qp := chanbuf(c, slot)
+		qp := chanbuf(c, c.recvx)
 		if raceenabled {
-			racenotify(c, slot, nil)
+			racenotify(c, c.recvx, nil)
 		}
 		if dstBuild && raceenabled {
-			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
-			// Mirror racereleaseacquire: the receive also RELEASES the slot for
-			// the sender that will reuse it (the k → k+C edge).
-			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
 		}
 		if ep != nil {
 			typedmemmove(c.elemtype, ep, qp)
@@ -788,17 +767,14 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		// head of the queue. Make the sender enqueue
 		// its item at the tail of the queue. Since the
 		// queue is full, those are both the same slot.
-		slot := c.recvx
-		qp := chanbuf(c, slot)
+		qp := chanbuf(c, c.recvx)
 		if raceenabled {
-			racenotify(c, slot, nil)
-			racenotify(c, slot, sg)
+			racenotify(c, c.recvx, nil)
+			racenotify(c, c.recvx, sg)
 		}
 		if dstBuild && raceenabled {
-			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
-			// Mirror racereleaseacquire: the receive also RELEASES the slot
-			// (the k → k+C edge).
-			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(slot)+1)
+			dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
+			dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
 		}
 		// copy data from queue to receiver
 		if ep != nil {
@@ -807,7 +783,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		// copy data from sender to queue
 		typedmemmove(c.elemtype, qp, sg.elem.get())
 		if dstBuild && raceenabled {
-			dstRecordSyncEventForGID(dstSyncEventRelease, uintptr(unsafe.Pointer(c)), uintptr(slot)+1, sg.g)
+			dstRecordSyncEventForGID(dstSyncEventRelease, uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1, sg.g)
 		}
 		c.recvx++
 		if c.recvx == c.dataqsiz {
@@ -897,18 +873,12 @@ func reflect_chanrecv(c *hchan, nb bool, elem unsafe.Pointer) (selected bool, re
 }
 
 func chanlen(c *hchan) int {
-	if c == nil {
-		return 0
-	}
 	if dstBuild && raceenabled {
-		// A len(ch) observed concurrently with a send/recv/close is an
-		// outcome-determining order: announce the channel identity as a
-		// READ-conflict (it pairs with the ops' write-conflict announces;
-		// len-len pairs commute) and yield before reading the count. cap(ch)
-		// is deliberately not announced — capacity is immutable after make.
-		dstSyncObserve(unsafe.Pointer(c))
+		if c != nil {
+			dstSyncObserve(unsafe.Pointer(c))
+		}
 	}
-	if c.timer != nil {
+	if c == nil || c.timer != nil {
 		// timer channels have a buffered implementation
 		// but present to users as unbuffered, so that we can
 		// undo sends without users noticing.
@@ -991,8 +961,10 @@ func (q *waitq) dequeue() *sudog {
 				continue
 			}
 		}
-		if dstBuild && sgp.g.dstPid < 0 {
-			continue
+		if dstBuild {
+			if dstIsCrashedG(sgp.g) {
+				continue
+			}
 		}
 
 		return sgp
@@ -1014,10 +986,6 @@ func racesync(c *hchan, sg *sudog) {
 	racereleaseg(sg.g, chanbuf(c, 0))
 	raceacquire(chanbuf(c, 0))
 	if dstBuild && raceenabled {
-		// Distinct aux from close (aux 0): TSan keys the rendezvous on
-		// chanbuf(c,0) and close on c.raceaddr() — separate sync objects.
-		// Sharing aux 0 would accumulate a rendezvous-participant →
-		// later-closed-receiver edge the memory model does not order.
 		id := uintptr(unsafe.Pointer(c))
 		dstRecordSyncReleaseID(id, dstSyncRendezvousAux)
 		dstRecordSyncEventForGID(dstSyncEventAcquire, id, dstSyncRendezvousAux, sg.g)

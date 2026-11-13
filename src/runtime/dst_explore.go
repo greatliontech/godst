@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 // Deterministic simulation testing (DST) Level-2 exploration substrate: the
 // scheduled scheduling strategy (dstSchedScheduled). Under it the runtime is a
 // pure schedule-FOLLOWER and trace-RECORDER — it follows an explicit prefix of

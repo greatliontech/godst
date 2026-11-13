@@ -8,6 +8,8 @@
 // asleep"), which testprog's crash tests depend on. Driven by dst_test.go's
 // harness via a -tags=dst build of this program.
 
+//go:build dst
+
 package main
 
 import (

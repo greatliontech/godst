@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -22,21 +23,11 @@ import (
 // TestUntaggedTextIdenticalToStock is INV-VANILLA's enforcing gate
 // (design.md, "Untagged footprint (contract)"): the probe corpus, built
 // untagged by this toolchain and by the upstream base release toolchain,
-// must produce binaries whose text symbols are instruction-identical modulo
-// the allowlist below — every entry a deviation design.md records as
-// deliberate, with its class checked mechanically where the class permits,
-// and an entry that fires on no symbol failing as stale.
-//
-// The stock toolchain comes from DST_STOCK_GOROOT (the `test:inert-diff`
-// Taskfile leg provides it); without it the test skips with that
-// instruction — the leg, not this test, is the enforcement point.
-//
-// The comparison is arch-profiled: each supported GOARCH carries its own
-// normalization and store-shape heuristics (registers, displacement forms,
-// the global-reference and stack-guard shapes). DST_VANILLA_GOARCH cross-
-// builds the corpus for another profiled architecture — the CI enforcement
-// points run natively, the knob exists for profile derivation and
-// debugging on a development host.
+// must produce binaries with the exact same text symbol set, zero dst-symbol
+// references, and instruction-identical bodies for every symbol modulo
+// .rodata/.data link-address relocations (shifted solely by the -dst.N suffix
+// in runtime.buildVersion). Zero allowlist exceptions or codegen-drift slack
+// are admitted.
 func TestUntaggedTextIdenticalToStock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips the differential build")
@@ -45,18 +36,9 @@ func TestUntaggedTextIdenticalToStock(t *testing.T) {
 	if goarch == "" {
 		goarch = runtime.GOARCH
 	}
-	prof = profiles[goarch]
-	if prof == nil {
-		// The drift-bound store heuristics are register-model specific;
-		// an architecture needs its own tuned profile before this gate
-		// can vouch for it.
-		var have []string
-		for a := range profiles {
-			have = append(have, a)
-		}
-		t.Skipf("no normalization profile for GOARCH=%s; profiled: %v", goarch, have)
+	if goarch != "amd64" && goarch != "arm64" {
+		t.Skipf("relocation canonicalizer supports amd64 and arm64; got GOARCH=%s", goarch)
 	}
-	allowlist = buildAllowlist(prof)
 	stock := os.Getenv("DST_STOCK_GOROOT")
 	if stock == "" {
 		t.Skip("DST_STOCK_GOROOT not set; run via `task test:inert-diff`, which locates or installs the upstream base toolchain")
@@ -96,90 +78,66 @@ func TestUntaggedTextIdenticalToStock(t *testing.T) {
 
 	coverageCheck(t, fork, corpus, goarch)
 
-	forkSyms := disassemble(t, fork, forkBin)
-	stockSyms := disassemble(t, fork, stockBin)
+	forkSyms := disassemble(t, fork, forkBin, goarch)
+	stockSyms := disassemble(t, fork, stockBin, goarch)
 
 	if dbg := os.Getenv("DST_VANILLA_DEBUG"); dbg != "" {
 		fb, sb := forkSyms[dbg], stockSyms[dbg]
-		t.Logf("fork %s: %d lines, calls %v\n%s", dbg, len(fb.lines), fb.calls, strings.Join(fb.lines, "\n"))
-		t.Logf("stock %s: %d lines, calls %v\n%s", dbg, len(sb.lines), sb.calls, strings.Join(sb.lines, "\n"))
+		t.Logf("fork %s (%d lines):\n%s", dbg, len(fb.lines), strings.Join(fb.lines, "\n"))
+		t.Logf("stock %s (%d lines):\n%s", dbg, len(sb.lines), strings.Join(sb.lines, "\n"))
 	}
-	fired := make(map[*allowEntry]bool)
+
 	var failures []string
-	seen := make(map[string]bool)
-	for name, fb := range forkSyms {
-		seen[name] = true
-		sb, ok := stockSyms[name]
-		if ok && (fb.masked == sb.masked || equalRelaxed(fb, sb)) {
-			continue // identical modulo addresses/offsets, or within the recorded codegen-drift bound
-		}
-		e := admit(name)
-		if e == nil {
-			if !ok {
-				failures = append(failures, fmt.Sprintf("fork-only symbol %s (%d instructions) admitted by no recorded class", name, len(fb.lines)))
-			} else {
-				d := multisetSymDiff(fb.lines, sb.lines)
-				if len(d) > 8 {
-					d = d[:8]
-				}
-				failures = append(failures, fmt.Sprintf("symbol %s differs from stock and is admitted by no recorded class; differing lines: %q", name, d))
-			}
-			continue
-		}
-		fired[e] = true
-		if msg := e.check(name, fb, sb, ok, forkSyms, stockSyms); msg != "" {
-			failures = append(failures, fmt.Sprintf("%s (class %s): %s", name, e.class, msg))
-		}
+	var names []string
+	for name := range forkSyms {
+		names = append(names, name)
 	}
-	for name, sb := range stockSyms {
-		if seen[name] {
-			continue
-		}
-		e := admit(name)
-		if e == nil {
-			failures = append(failures, fmt.Sprintf("stock-only symbol %s (%d instructions): the fork dropped or renamed it and no recorded class admits that", name, len(sb.lines)))
-			continue
-		}
-		fired[e] = true
-		if msg := e.check(name, symbol{}, sb, false, forkSyms, stockSyms); msg != "" {
-			failures = append(failures, fmt.Sprintf("%s (class %s): %s", name, e.class, msg))
-		}
-	}
-	for body := range prof.splitBodies {
-		if strings.HasSuffix(body, ".abi0") {
-			continue // rides its base name
-		}
-		if _, ok := forkSyms[body]; !ok {
-			if _, abi0 := forkSyms[body+".abi0"]; abi0 {
-				continue // an assembly entry links through its ABI0 wrapper
-			}
-			failures = append(failures, fmt.Sprintf("split body %s is not linked by the corpus — its deviation is unverified; exercise it", body))
-		}
-	}
-	for i := range allowlist {
-		if !fired[&allowlist[i]] {
-			failures = append(failures, fmt.Sprintf("stale allowlist entry %q (class %s): fired on no symbol — the deviation it admits no longer exists; remove it", allowlist[i].pattern, allowlist[i].class))
-		}
-	}
-	// No dst-named residue anywhere in the untagged fork binary — checked on
-	// the raw text captured before operand canonicalization, so a symbolized
-	// data reference cannot hide behind the ADDR rewrite.
-	for name, fb := range forkSyms {
+	sort.Strings(names)
+	for _, name := range names {
+		fb := forkSyms[name]
 		for _, l := range fb.dstRaw {
 			failures = append(failures, fmt.Sprintf("untagged %s references a dst symbol: %s", name, strings.TrimSpace(l)))
 		}
+		sb, ok := stockSyms[name]
+		if !ok {
+			failures = append(failures, fmt.Sprintf("fork-only symbol %s (%d instructions)", name, len(fb.lines)))
+			continue
+		}
+		if fb.canon != sb.canon {
+			failures = append(failures, fmt.Sprintf("symbol %s differs from stock (%s)", name, firstDiff(fb.lines, sb.lines)))
+		}
+	}
+	var stockNames []string
+	for name := range stockSyms {
+		if _, ok := forkSyms[name]; !ok {
+			stockNames = append(stockNames, name)
+		}
+	}
+	sort.Strings(stockNames)
+	for _, name := range stockNames {
+		failures = append(failures, fmt.Sprintf("stock-only symbol %s (%d instructions)", name, len(stockSyms[name].lines)))
 	}
 	if len(failures) > 0 {
-		t.Fatalf("untagged text diverges from the upstream base beyond the recorded deviations:\n  %s", strings.Join(failures, "\n  "))
+		if len(failures) > 40 {
+			failures = append(failures[:40], fmt.Sprintf("... and %d more", len(failures)-40))
+		}
+		t.Fatalf("untagged text diverges from stock:\n  %s", strings.Join(failures, "\n  "))
 	}
+}
+
+func firstDiff(a, b []string) string {
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return fmt.Sprintf("line %d: fork=%q vs stock=%q; len %d vs %d", i, a[i], b[i], len(a), len(b))
+		}
+	}
+	return fmt.Sprintf("length %d vs %d", len(a), len(b))
 }
 
 // coverageCheck pins the corpus property (design.md): the corpus's
 // transitive import closure covers every upstream-present std package the
-// dst delta modifies. The live delta path set is consulted through git when
-// available (base tag from VERSION); without git the embedded list — kept in
-// step by this very check wherever git IS available — is the fallback, and
-// the skip of the live consultation is reported, not silent.
+// dst delta modifies.
 func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	t.Helper()
 	required := []string{
@@ -187,9 +145,6 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 		"internal/sync", "net", "os", "os/signal", "os/user", "runtime",
 		"sync", "syscall", "testing", "time",
 	}
-	// The closure is computed for the arch under comparison — under the
-	// DST_VANILLA_GOARCH cross knob the host's closure could differ from
-	// the target's and silently satisfy the property.
 	cmd := exec.Command(filepath.Join(fork, "bin", "go"), "list", "-deps", ".")
 	cmd.Dir = corpus
 	cmd.Env = append(os.Environ(), "GOROOT="+fork, "GOTOOLCHAIN=local", "GO111MODULE=off",
@@ -207,7 +162,6 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 			t.Errorf("corpus closure misses dst-modified package %s", p)
 		}
 	}
-	// Live delta consultation: the embedded list must not lag the tree.
 	base, err := os.ReadFile(filepath.Join(fork, "VERSION"))
 	if err != nil {
 		t.Logf("coverage: VERSION unreadable (%v); embedded list not cross-checked", err)
@@ -253,7 +207,6 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 
 // liveSourceDelta includes staged, unstaged and untracked changes because the
 // compiler and source inventory read the working tree, not the last commit.
-// Git ignore rules do not exclude source files from the compiler's input.
 func liveSourceDelta(fork, tag string) ([]string, error) {
 	changed, err := exec.Command("git", "-C", fork, "diff", "--name-only", "-z", tag, "--", "src").Output()
 	if err != nil {
@@ -271,10 +224,6 @@ func liveSourceDelta(fork, tag string) ([]string, error) {
 	}
 	result := paths(changed)
 	for _, name := range paths(untracked) {
-		// cmd/dist emits these files in every source build, including stock.
-		// Their tracked generators, not the generated build artifacts, are
-		// members of the source delta. Keep this list exact: an arbitrary
-		// ignored or z-prefixed Go file can still add a fork-only hook.
 		switch name {
 		case "", "src/cmd/cgo/zdefaultcc.go", "src/cmd/go/internal/cfg/zdefaultcc.go",
 			"src/cmd/internal/objabi/zbootstrap.go", "src/internal/buildcfg/zbootstrap.go",
@@ -346,262 +295,48 @@ func TestLiveSourceDeltaIncludesUncommittedChanges(t *testing.T) {
 	check()
 }
 
-// archProfile carries everything about the comparison that depends on the
-// target's register model and objdump syntax. The comparison rules
-// themselves — the universal drift bound, the class latitudes, the residue
-// rejections — are shared; the profile only teaches them each
-// architecture's shapes.
-type archProfile struct {
-	// mask normalizes one instruction's operands so layout-shifted
-	// offsets, immediates, and branch displacements compare equal. On
-	// amd64 objdump prints these hex; on arm64 decimal, and a zero
-	// displacement prints as a bare (Rn) where a nonzero one prints
-	// N(Rn) — the mask rewrites both to one form, so the large-offset
-	// store sequence the widened layouts force through the assembler
-	// temp (ADD $off, Rn, R27; store (R27)) pairs against stock's
-	// direct N(Rn) store under register-rename cancelling.
-	mask func(string) string
-	// canonData canonicalizes non-branch PC-relative data operands to
-	// ADDR: amd64's symbolization-dependent `sym(SB)`/`0x...(IP)`
-	// forms, arm64's ADRP page offsets (which flip sign when a global
-	// lands on the other side of the code).
-	canonData func(string) string
-	// postNorm, where non-nil, runs over a symbol's normalized lines.
-	// arm64 folds each `ADRP ADDR, Rx` into the immediately following
-	// access through `(Rx)`, rewriting that operand to ADDR — a global
-	// access then carries the same ADDR marker as amd64's RIP-relative
-	// form, so the unpaired-global rejections see arm64 globals too
-	// (an unfolded ADRP — a global's address taken, not accessed — is
-	// the LEA analogue and stays subject to addrArith).
-	postNorm func([]string) []string
-	// regToken masks the allocatable registers for rename cancelling.
-	// Role registers stay distinct: on arm64, ZR (a ZR-source store is
-	// the field-clear signature), R28 (g), R29 (FP), R30 (LR).
-	regToken *regexp.Regexp
-	// nonStackMem matches a memory access through a non-stack base —
-	// as source or destination — the shape of field residue.
-	nonStackMem *regexp.Regexp
-	// immStore matches the store shape the compiler emits for a
-	// hand-written field clear: an immediate store to a plain
-	// displacement on amd64, a ZR-source store on arm64 (arm64 cannot
-	// store an immediate; zero goes through ZR, any other constant
-	// through a register and the copy-word rule).
-	immStore *regexp.Regexp
-	// regSrcStore matches a register-source store to a plain
-	// displacement (subject to the copy-word feeding-load rule).
-	regSrcStore *regexp.Regexp
-	// zeroPairStore, where non-nil, matches the compiler's bulk
-	// zeroing of ADJACENT widened-record words (arm64's STP (ZR, ZR));
-	// admitted as class latitude. Recorded blind spot: a hook clearing
-	// two adjacent fields merges into the same shape (the amd64
-	// analogue is X15-based zeroing, recorded in design.md).
-	zeroPairStore *regexp.Regexp
-	// addrArith matches pure address arithmetic that never touches
-	// memory — amd64's LEA, arm64's ADRP page computation — exempt in
-	// the CLASS latitude. (The universal bound stays strict: there an
-	// unpaired ADRP is rejected through its canonicalized ADDR
-	// operand, while amd64's LEA stays exempt — LEA is the common way
-	// spills shift, ADRP only appears for globals.)
-	addrArith *regexp.Regexp
-	// aggregateStores selects the class store rule. amd64 (false):
-	// each unmatched register-source store needs an unmatched load
-	// into exactly its source register (the copy-word rule). arm64
-	// (true): store conservation in aggregate — fork-side unmatched
-	// store words may not exceed stock-side unmatched store words plus
-	// fork-side unmatched load words. arm64's record writes reshape
-	// freely between STP pairs fed by live argument registers and
-	// spill-slot round-trips, so the per-register feeding rule fails
-	// legitimate reshapes; conservation still fails residue, which
-	// ADDS stores, and the exact-delta pins back it up (recorded in
-	// design.md with the class blind spot).
-	aggregateStores bool
-	// stackGuard matches the stack-growth prologue's g read.
-	stackGuard *regexp.Regexp
-	// memDest matches a memory write (for the equality-function
-	// no-store rule).
-	memDest *regexp.Regexp
-	// splitBodies maps each fork-side split-body symbol to the stock
-	// symbol whose text it must equal (design.md, "Fence-wrapper
-	// splits"). Per-arch: the gettimeofday split is linux/amd64
-	// assembly and does not exist on arm64. The split class's
-	// allowlist patterns are derived from this map (splitPatterns), so
-	// the body set, the wrapper set, and the patterns cannot drift.
-	splitBodies map[string]string
-	// exactDeltas pins the fork-vs-stock instruction-count delta of
-	// every admitted extraction pair (measured as caller minus the
-	// extraction call plus helper). The compiler is
-	// deterministic, so these are stable per base and per arch; a port
-	// re-measures them under review. The pin closes the remaining
-	// mimicry gap: a residue store that copies the shape of a legit
-	// widened-record store still adds a line.
-	exactDeltas map[string]int
-}
-
-// prof is the active profile, set by the test before any comparison; the
-// helpers below read it. Package-level because the comparison helpers are
-// deliberately free functions mirroring the design.md rule names; exactly
-// one gate run executes per process.
-var prof *archProfile
-
-var hexRe = regexp.MustCompile(`0x[0-9a-f]+`)
-var decRe = regexp.MustCompile(`\b\d+\b`)
-var bareBaseRe = regexp.MustCompile(`(^|[^)\w])\((R\d+|RSP)\)`)
-var adrpOperand = regexp.MustCompile(`-?\d+\(PC\)`)
-
-func maskHex(s string) string { return hexRe.ReplaceAllString(s, "HEX") }
-
-// maskARM64 masks hex and decimal operands (arm64 objdump prints
-// displacements, immediates, and branch offsets in decimal; digits inside
-// register names are protected by the word boundaries) and rewrites a bare
-// zero-displacement base `(Rn)` to `HEX(Rn)` so both displacement
-// spellings compare as one form. Lines carrying a symbol operand — branch
-// and call targets (CALL/JMP and the occasional conditional branch to a
-// symbol), the only (SB) forms arm64 objdump emits — keep their digits:
-// `net.map.init.0` masked to `net.map.init.HEX` would let two different
-// call targets compare equal.
-func maskARM64(s string) string {
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		l = hexRe.ReplaceAllString(l, "HEX")
-		if !strings.Contains(l, "(SB)") {
-			l = decRe.ReplaceAllString(l, "HEX")
-			l = bareBaseRe.ReplaceAllString(l, "${1}HEX($2)")
-		}
-		lines[i] = l
-	}
-	return strings.Join(lines, "\n")
-}
-
-var symOperand = regexp.MustCompile(`([\w./:*()\[\]<>@$-]+\(SB\)|0x[0-9a-f]+\(IP\))`)
-
-var profiles = map[string]*archProfile{
-	"amd64": {
-		mask: maskHex,
-		canonData: func(text string) string {
-			// objdump symbolizes a PC-relative operand only when the
-			// target happens to land on a symbol, so the same
-			// instruction prints as `LEAQ 0x...(IP)` in one binary and
-			// `LEAQ sym(SB)` in the other. Canonicalize every non-branch
-			// memory operand; branch targets keep their (semantic)
-			// symbol names.
-			return symOperand.ReplaceAllString(text, "ADDR")
-		},
-		regToken:    regexp.MustCompile(`\b(AX|BX|CX|DX|SI|DI|BP|R8|R9|R10|R11|R12|R13|R14|R15|X[0-9]+)\b`),
-		nonStackMem: regexp.MustCompile(`(HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)`),
-		immStore:    regexp.MustCompile(`^(MOV[A-Z]*|AND[A-Z]*|OR[A-Z]*|XOR[A-Z]*|BT[SRC][A-Z]*) \$-?(HEX|0x[0-9a-f]+|[0-9]+), (HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)$`),
-		regSrcStore: regexp.MustCompile(`^(MOV[A-Z]*|AND[A-Z]*|OR[A-Z]*|XOR[A-Z]*|BT[SRC][A-Z]*) (AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15), (HEX|0x[0-9a-f]+|-?[0-9]+)?\((AX|BX|CX|DX|SI|DI|R8|R9|R10|R11|R12|R13|R14|R15)\)$`),
-		stackGuard:  regexp.MustCompile(`^CMPQ SP, (0x10|HEX)\(R14\)$`),
-		addrArith:   regexp.MustCompile(`^LEA`),
-		memDest:     regexp.MustCompile(`^(?:LOCK )?(?:MOV|AND|OR|XOR|ADD|SUB|INC|DEC|BT|XCHG|CMPXCHG)[A-Z]*\b.*(?:\((?:AX|BX|CX|DX|SI|DI|BP|R8|R9|R10|R11|R12|R13|R14|R15)\)(?:\((?:AX|BX|CX|DX|SI|DI|BP|R8|R9|R10|R11|R12|R13|R14|R15)\*[0-9]+\))?|ADDR)$`),
-		splitBodies: map[string]string{
-			"syscall.closeFD":              "syscall.Close",
-			"syscall.fstatFD":              "syscall.Fstat",
-			"syscall.seekFD":               "syscall.Seek",
-			"syscall.fsync":                "syscall.Fsync",
-			"syscall.fdatasync":            "syscall.Fdatasync",
-			"syscall.flock":                "syscall.Flock",
-			"syscall.kill":                 "syscall.Kill",
-			"syscall.madvise":              "syscall.Madvise",
-			"syscall.mprotect":             "syscall.Mprotect",
-			"syscall.rawGettimeofday":      "syscall.gettimeofday",
-			"syscall.rawGettimeofday.abi0": "syscall.gettimeofday.abi0",
-		},
-		exactDeltas: map[string]int{
-			// pairs: caller minus the extraction call, plus helper, vs
-			// stock. The non-pair symbols this map once pinned
-			// (addCleanup, enqueue, freeSpecial, gcinit) became
-			// stock-equal when the finalizer/cleanup stamps moved out of
-			// line and are no longer admitted at all — a pin on an equal
-			// symbol can never fire and would be silently vacuous.
-			"runtime.runFinalizers":  21,
-			"runtime.GC":             8,
-			"runtime.runCleanups":    10,
-			"runtime.queuefinalizer": 10,
-			"os.(*File).Stat":        18,
-			// carried fixes (design.md, "Carried upstream fixes")
-			"go/types.(*Checker).isComplete": 18,
-		},
-	},
-	"arm64": {
-		mask: maskARM64,
-		canonData: func(text string) string {
-			// arm64 objdump never symbolizes data references; a global
-			// access is an ADRP page offset that flips sign when the
-			// global lands on the other side of the code. Canonicalize
-			// the page operand; conditional-branch (PC) targets stay
-			// (they mask to one form anyway).
-			if strings.HasPrefix(text, "ADRP ") {
-				return adrpOperand.ReplaceAllString(text, "ADDR")
-			}
-			return text
-		},
-		// R0-R27 and the FP/SIMD registers are rename-maskable; ZR,
-		// R28 (g), R29 (FP), R30 (LR), RSP stay distinct.
-		regToken:    regexp.MustCompile(`\b(R[0-9]|R1[0-9]|R2[0-7]|F[0-9]+|V[0-9]+)\b`),
-		nonStackMem: regexp.MustCompile(`(-?HEX|-?[0-9]+)?\((R[0-9]|R1[0-9]|R2[0-8])\)`),
-		// arm64 cannot store an immediate: a hand-written field clear
-		// (`gp.dstX = 0`) is a ZR-source store to a plain displacement
-		// (pre/post-index .W/.P spellings included); any other constant
-		// goes through a register and falls under store conservation.
-		// regSrcStore is deliberately absent: the aggregate branch
-		// classifies stores through memDest.
-		immStore:      regexp.MustCompile(`^MOV[DWBH]U?(\.[WP])? ZR, -?HEX\((R[0-9]|R1[0-9]|R2[0-8])\)$`),
-		zeroPairStore: regexp.MustCompile(`^STP \(ZR, ZR\), -?HEX\((R[0-9]|R1[0-9]|R2[0-8])\)$`),
-		addrArith:     regexp.MustCompile(`^ADRP `),
-		// The raw-text (16|HEX) alternation mirrors amd64's: the
-		// wrapper check reads unmasked lines, the class checks masked
-		// ones.
-		stackGuard: regexp.MustCompile(`^MOVD (16|HEX)\(R28\), R16$`),
-		// RSP-based accesses are frame construction (the prologue's
-		// MOVD.W R30, -16(RSP) push), not field writes. The FP/SIMD
-		// store mnemonics (FMOV/FSTP/VST with a memory destination) are
-		// stores like any other — leaving them out both undercounts
-		// fork stores AND miscredits them as feeding loads.
-		memDest: regexp.MustCompile(`^(MOV[DWBH]U?|FMOV[SDQ]?|FSTP[SDQ]?|VST[0-9A-Z]*|STP|STLR[A-Z]*|STXR[A-Z]*|SWP[A-Z]*|CAS[A-Z]*)[\w.]* .*\((R[0-9]|R1[0-9]|R2[0-8])\)(\(R[0-9]+(<<[0-9]+|<<HEX)?\))?$`),
-		splitBodies: map[string]string{
-			"syscall.closeFD":   "syscall.Close",
-			"syscall.fstatFD":   "syscall.Fstat",
-			"syscall.seekFD":    "syscall.Seek",
-			"syscall.fsync":     "syscall.Fsync",
-			"syscall.fdatasync": "syscall.Fdatasync",
-			"syscall.flock":     "syscall.Flock",
-			"syscall.kill":      "syscall.Kill",
-			"syscall.madvise":   "syscall.Madvise",
-			"syscall.mprotect":  "syscall.Mprotect",
-		},
-		postNorm:        foldADRPARM64,
-		aggregateStores: true,
-		exactDeltas: map[string]int{
-			// pairs only — see the amd64 map's comment.
-			"runtime.runFinalizers":  22,
-			"runtime.GC":             12,
-			"runtime.runCleanups":    13,
-			"runtime.queuefinalizer": 12,
-			"os.(*File).Stat":        19,
-			// carried fixes (design.md, "Carried upstream fixes")
-			"go/types.(*Checker).isComplete": 17,
-		},
-	},
-}
-
-// rawDstRef matches any reference to a dst-named symbol — data operand,
-// call, or jump — on the RAW instruction text, before operand
-// canonicalization can hide a symbolized data reference.
+// rawDstRef matches any reference to a dst-named symbol on raw instruction
+// text, before relocation canonicalization can rewrite data operands.
 var rawDstRef = regexp.MustCompile(`([\w/]+\.|\(\*?[\w\[\]]+\)\.)dst\w*[+(]|runtime\.dst|\(\*?dst\w+\)`)
 
-type symbol struct {
-	name   string   // the linked symbol name, the key it is stored under
-	lines  []string // normalized instructions (position/address/bytes stripped)
-	masked string   // lines joined, numeric operands masked
-	calls  map[string]bool
-	dstRaw []string // raw lines referencing a dst-named symbol, captured before operand canonicalization
+var (
+	amd64IPRel      = regexp.MustCompile(`-?0x[0-9a-f]+\(IP\)`)
+	amd64HexBranch  = regexp.MustCompile(`^(J[A-Z0-9]+)\s+(0x[0-9a-f]+)$`)
+	arm64ADRP       = regexp.MustCompile(`^(ADRP?)\s+-?\d+\(PC\),\s*(R\d+)$`)
+	arm64AddImm     = regexp.MustCompile(`^(ADD\s+)\$\d+(,\s*R\d+,\s*(R\d+|RSP))$`)
+	arm64PCRelLabel = regexp.MustCompile(`(-?\d+)\(PC\)$`)
+	arm64DstPair    = regexp.MustCompile(`\(\s*(R\d+|ZR)\s*,\s*(R\d+|ZR)\s*\)$`)
+	arm64BaseReg    = regexp.MustCompile(`\((R\d+)\)$`)
+)
+
+var arm64BranchOps = map[string]bool{
+	"CALL": true, "JMP": true, "RET": true,
+	"CBZ": true, "CBNZ": true, "CBZW": true, "CBNZW": true,
+	"TBZ": true, "TBNZ": true,
+	"BEQ": true, "BNE": true, "BCS": true, "BHS": true,
+	"BCC": true, "BLO": true, "BMI": true, "BPL": true,
+	"BVS": true, "BVC": true, "BHI": true, "BLS": true,
+	"BGE": true, "BLT": true, "BGT": true, "BLE": true,
+	"BAL": true, "BNV": true,
 }
 
-// disassemble dumps every text symbol of bin with tool's objdump and
-// normalizes each instruction: the position, address, and byte columns are
-// stripped; masked additionally replaces numeric operands so layout offsets
-// and branch targets compare equal.
-func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
+type symbol struct {
+	name   string
+	lines  []string
+	canon  string
+	dstRaw []string
+}
+
+var arm64MemImmMatchers = func() map[string]*regexp.Regexp {
+	m := make(map[string]*regexp.Regexp, 31)
+	for i := 0; i <= 30; i++ {
+		reg := fmt.Sprintf("R%d", i)
+		m[reg] = regexp.MustCompile(`(\s)(?:\d+)?\(` + reg + `\)(,|$)`)
+	}
+	return m
+}()
+
+func disassemble(t *testing.T, goroot, bin, goarch string) map[string]symbol {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(goroot, "bin", "go"), "tool", "objdump", bin)
 	cmd.Env = append(os.Environ(), "GOROOT="+goroot, "GOTOOLCHAIN=local")
@@ -609,28 +344,38 @@ func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
 	if err != nil {
 		t.Fatalf("objdump %s: %v", bin, err)
 	}
+	return parseDisassembly(string(out), goarch)
+}
+
+type rawIns struct {
+	pc    uint64
+	hasP  bool
+	isNOP bool
+	text  string
+}
+
+func parseDisassembly(out, goarch string) map[string]symbol {
 	syms := make(map[string]symbol)
 	var name string
 	var cur symbol
+	var raw []rawIns
 	flush := func() {
-		if name != "" {
-			if prof.postNorm != nil {
-				cur.lines = prof.postNorm(cur.lines)
-			}
-			cur.masked = prof.mask(strings.Join(cur.lines, "\n"))
-			syms[name] = cur
+		if name == "" {
+			return
 		}
+		cur.lines = canonicalizeSymbol(raw, goarch)
+		cur.canon = strings.Join(cur.lines, "\n")
+		syms[name] = cur
+		raw = raw[:0]
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "TEXT ") {
 			flush()
-			// Generic shape names contain spaces; the name is everything
-			// between "TEXT " and the final "(SB)".
 			name = line[len("TEXT "):]
 			if i := strings.LastIndex(name, "(SB)"); i >= 0 {
 				name = name[:i]
 			}
-			cur = symbol{name: name, calls: make(map[string]bool)}
+			cur = symbol{name: name}
 			continue
 		}
 		f := strings.Fields(line)
@@ -639,11 +384,6 @@ func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
 		}
 		text := strings.Join(f[3:], " ")
 		if text == "?" {
-			// An encoding objdump cannot decode. All-zero words are
-			// end-of-function alignment padding — semantics-free, and they
-			// shift with layout, so they are excluded like NOPs. A non-zero
-			// undecodable instruction (arm64's LSE atomics) compares by its
-			// encoding, so a real difference cannot hide behind the `?`.
 			if strings.Trim(f[2], "0") == "" {
 				continue
 			}
@@ -652,801 +392,183 @@ func disassemble(t *testing.T, goroot, bin string) map[string]symbol {
 		if rawDstRef.MatchString(text) {
 			cur.dstRaw = append(cur.dstRaw, text)
 		}
-		if strings.HasPrefix(text, "NOP") || strings.HasPrefix(text, "NOOP") {
-			// Alignment/inline-marker nops shift freely with layout; they
-			// carry no semantics and are excluded from every comparison.
-			// (amd64 spells them NOPW/NOPL, arm64 NOOP — note NOOP does
-			// NOT have the prefix NOP.)
-			continue
-		}
-		if strings.HasPrefix(text, "JMP ") && strings.Contains(text, "(SB)") {
-			// The morestack epilogue tail-jumps to the symbol itself; a split
-			// body self-references its split name where stock names the stock
-			// symbol — the same "modulo the call-target name" admission.
-			target := strings.TrimSuffix(strings.Fields(text)[1], "(SB)")
-			if stockName, isSplit := prof.splitBodies[target]; isSplit {
-				text = strings.Replace(text, target+"(SB)", stockName+"(SB)", 1)
-			}
-		}
-		if strings.HasPrefix(text, "CALL ") && strings.Contains(text, "(SB)") {
-			target := strings.TrimSuffix(strings.Fields(text)[1], "(SB)")
-			cur.calls[target] = true
-			// A fork caller that inlined a split wrapper calls the split body
-			// where stock calls the stock name — the class admits callers
-			// "modulo the call-target name alone", so canonicalize the target.
-			if stockName, isSplit := prof.splitBodies[target]; isSplit {
-				text = strings.Replace(text, target+"(SB)", stockName+"(SB)", 1)
-			}
-			// A recorded fork-internal site calling an extraction helper
-			// where stock calls the pair's caller compares under the stock
-			// name too; the pair's own caller is never a site, and keeps
-			// its helper call for the pairwise check to strip.
-			if stockName, ok := redirectedCallee(target, name); ok {
-				text = strings.Replace(text, target+"(SB)", stockName+"(SB)", 1)
-			}
-		} else if !strings.HasPrefix(text, "JMP ") {
-			text = prof.canonData(text)
-		}
-		cur.lines = append(cur.lines, text)
+		isNOP := strings.HasPrefix(text, "NOP") || strings.HasPrefix(text, "NOOP")
+		pc, err := strconv.ParseUint(strings.TrimPrefix(f[1], "0x"), 16, 64)
+		raw = append(raw, rawIns{pc: pc, hasP: err == nil, isNOP: isNOP, text: text})
 	}
 	flush()
 	return syms
 }
 
-// equalRelaxed is the recorded codegen-drift bound (design.md admission
-// rule): the recorded data layouts shift register allocation, instruction
-// scheduling, block order, and size-class selection in functions that touch
-// the widened structs. Within this bound a difference is a layout
-// consequence, not residue: the callee sets must be equal (modulo the
-// barrier and size-class-specialized-malloc families), the fork side must
-// reference no dst symbol, the instruction counts may differ by at most 3,
-// and the mnemonic multisets by at most 6 entries.
-func equalRelaxed(fb, sb symbol) bool {
-	if len(calleeSetDiff(fb, sb, nil)) > 0 || len(calleeSetDiff(sb, fb, nil)) > 0 {
-		return false
-	}
-	if len(fb.dstRaw) > 0 {
-		return false
-	}
-	d := len(fb.lines) - len(sb.lines)
-	if d < -3 || d > 3 {
-		return false
-	}
-	if mnemonicSymDiff(fb.lines, sb.lines) > 6 {
-		return false
-	}
-	// The lines that differ may shuffle registers and stack spills. Pair
-	// fork-extra and stock-extra lines that are equal once register names are
-	// masked — pure register renames. An UNPAIRED memory store to a
-	// non-stack base is the signature of field residue (a hook clearing
-	// per-object DST words), not of register allocation — reject it.
-	forkExtra, stockExtra := splitSymDiff(fb.lines, sb.lines)
-	forkLeft, _ := cancelRegRenames(forkExtra, stockExtra)
-	for _, l := range forkLeft {
-		// LEA computes an address without touching memory — pure register
-		// arithmetic, register-allocation freedom. (arm64 address
-		// arithmetic is ADD/SUB on registers, which the memory matcher
-		// never matches.)
-		if strings.HasPrefix(l, "LEA") {
-			continue
-		}
-		// Any fork-side unmatched memory touch — register-base or a
-		// canonicalized global (ADDR) operand — is potential residue: a
-		// field load/store or a package-var guard. An unmatched
-		// undecodable encoding (`? <bytes>`) may be an atomic RMW on
-		// residue state and cannot be inspected — rejected the same way.
-		if prof.nonStackMem.MatchString(l) || strings.Contains(l, "ADDR") || strings.HasPrefix(l, "? ") {
-			return false
-		}
-	}
-	return true
-}
-
-// cancelRegRenames pairs fork-extra against stock-extra lines that are
-// equal once register names are masked, returning what remains UNPAIRED on
-// each side. Residue can only live on the fork side; stock-side leftovers
-// are stock's own text and never rejected on their own.
-func cancelRegRenames(a, b []string) (aLeft, bLeft []string) {
-	bm := make(map[string]int)
-	for _, l := range b {
-		bm[prof.regToken.ReplaceAllString(l, "R")]++
-	}
-	for _, l := range a {
-		k := prof.regToken.ReplaceAllString(l, "R")
-		if bm[k] > 0 {
-			bm[k]--
-			continue
-		}
-		aLeft = append(aLeft, l)
-	}
-	for _, l := range b {
-		k := prof.regToken.ReplaceAllString(l, "R")
-		if bm[k] > 0 {
-			bm[k]--
-			bLeft = append(bLeft, l)
-		}
-	}
-	return aLeft, bLeft
-}
-
-func splitSymDiff(a, b []string) (aExtra, bExtra []string) {
-	count := make(map[string]int)
-	for _, l := range a {
-		count[prof.mask(l)]++
-	}
-	for _, l := range b {
-		count[prof.mask(l)]--
-	}
-	for l, n := range count {
-		for ; n > 0; n-- {
-			aExtra = append(aExtra, l)
-		}
-		for ; n < 0; n++ {
-			bExtra = append(bExtra, l)
-		}
-	}
-	return
-}
-
-// classReject applies the rejections and exemptions shared by both class
-// store rules to one unpaired fork-side line. handled=true means the line
-// is fully dispositioned: a non-empty msg is a hard rejection; an empty one
-// is an exemption — pure address arithmetic (amd64's LEA, arm64's ADRP),
-// or arm64's STP (ZR, ZR) bulk-zeroing latitude (blind spot recorded in
-// design.md: a hook clearing two ADJACENT fields merges into that shape).
-func classReject(l string) (msg string, handled bool) {
-	if prof.addrArith.MatchString(l) {
-		return "", true
-	}
-	if prof.immStore.MatchString(l) {
-		// A hand-written field clear or flag set.
-		return fmt.Sprintf("unpaired field store in the diff: %q", l), true
-	}
-	if prof.zeroPairStore != nil && prof.zeroPairStore.MatchString(l) {
-		return "", true
-	}
-	if strings.Contains(l, "ADDR") && !strings.HasPrefix(l, "CALL") && !strings.HasPrefix(l, "JMP") {
-		// A canonicalized global operand — a package-var guard or store.
-		return fmt.Sprintf("unpaired global access in the diff: %q", l), true
-	}
-	return "", false
-}
-
-// classRelaxed is the admitted-class text bound (design.md admission rule):
-// wider numeric drift than the universal bound — widened-record spills and
-// mask loops are large — but an unpaired plain-displacement store to a
-// non-stack base still fails, in every class. Unpaired plain loads and
-// indexed stores are the classes' recorded latitude.
-func classRelaxed(fLines, sLines []string, fDst []string, maxD, maxM int) string {
-	if len(fDst) > 0 {
-		return fmt.Sprintf("references a dst symbol: %s", fDst[0])
-	}
-	d := len(fLines) - len(sLines)
-	if d < -maxD || d > maxD {
-		return fmt.Sprintf("instruction count drifts by %d (bound %d)", d, maxD)
-	}
-	if m := mnemonicSymDiff(fLines, sLines); m > maxM {
-		return fmt.Sprintf("mnemonic drift %d exceeds bound %d", m, maxM)
-	}
-	fe, se := splitSymDiff(fLines, sLines)
-	forkLeft, stockLeft := cancelRegRenames(fe, se)
-	if prof.aggregateStores {
-		// Store conservation (the arm64 class rule; see the profile
-		// field's comment): reject the hand-written store shapes
-		// outright, then require fork-side unmatched store words not to
-		// exceed stock-side unmatched store words plus fork-side
-		// unmatched load words.
-		words := func(l string) int {
-			for _, p := range []string{"STP", "LDP", "FSTP", "FLDP"} {
-				if strings.HasPrefix(l, p) {
-					return 2
-				}
-			}
-			return 1
-		}
-		forkStores, stockStores, loadCredits := 0, 0, 0
-		forkUndec, stockUndec := 0, 0
-		for _, l := range forkLeft {
-			if msg, handled := classReject(l); handled {
-				if msg != "" {
-					return msg
-				}
+func canonicalizeSymbol(raw []rawIns, goarch string) []string {
+	lines := make([]string, 0, len(raw))
+	switch goarch {
+	case "amd64":
+		for _, ins := range raw {
+			if ins.isNOP {
 				continue
 			}
-			switch {
-			case strings.HasPrefix(l, "? "):
-				// An undecodable encoding (the LSE atomics) may be an
-				// atomic RMW store; it cannot be inspected. Fork-side
-				// excess over the stock side's is charged as stores
-				// below — never as load credits.
-				forkUndec += words(l)
-			case prof.memDest.MatchString(l) && prof.nonStackMem.MatchString(l):
-				forkStores += words(l)
-			case strings.HasPrefix(l, "ST") && prof.nonStackMem.MatchString(l):
-				return fmt.Sprintf("unpaired store of unrecognized shape in the diff: %q", l)
-			case prof.nonStackMem.MatchString(l):
-				loadCredits += words(l)
+			text := ins.text
+			if m := amd64HexBranch.FindStringSubmatch(text); m != nil && ins.hasP {
+				if dst, err := strconv.ParseUint(strings.TrimPrefix(m[2], "0x"), 16, 64); err == nil {
+					text = fmt.Sprintf("%s PC%+d", m[1], int64(dst-ins.pc))
+				}
+			} else if !strings.HasPrefix(text, "CALL ") && !strings.HasPrefix(text, "JMP ") {
+				text = amd64IPRel.ReplaceAllString(text, "ADDR(IP)")
 			}
+			lines = append(lines, text)
 		}
-		for _, l := range stockLeft {
-			if strings.HasPrefix(l, "? ") {
-				stockUndec += words(l)
+	case "arm64":
+		joinPCs := make(map[uint64]bool)
+		for _, ins := range raw {
+			if ins.isNOP || !ins.hasP || !isARM64Branch(ins.text) {
 				continue
 			}
-			if prof.memDest.MatchString(l) && prof.nonStackMem.MatchString(l) &&
-				!(prof.zeroPairStore != nil && prof.zeroPairStore.MatchString(l)) {
-				stockStores += words(l)
-			}
-		}
-		// Undecodables cancel pairwise across the sides; the fork-side
-		// excess is charged as stores, and a stock-side excess grants
-		// NOTHING (stock atomics the fork lacks must not buy fork-side
-		// residue budget).
-		if forkUndec > stockUndec {
-			forkStores += forkUndec - stockUndec
-		}
-		if forkStores > stockStores+loadCredits {
-			return fmt.Sprintf("fork-side unmatched stores (%d words) exceed stock-side unmatched stores (%d) plus fork-side unmatched loads (%d) — added stores are the residue shape (unpaired fork-side context: %q)",
-				forkStores, stockStores, loadCredits, forkLeft)
-		}
-		return ""
-	}
-	loadsInto := make(map[string]int)
-	var stores []string
-	for _, l := range forkLeft {
-		if msg, handled := classReject(l); handled {
-			if msg != "" {
-				return msg
-			}
-			continue
-		}
-		switch {
-		case strings.HasPrefix(l, "? "):
-			// An unmatched undecodable encoding cannot be inspected and
-			// can have no feeding load — rejected outright under the
-			// per-register rule.
-			return fmt.Sprintf("unpaired undecodable instruction in the diff: %q", l)
-		case prof.regSrcStore.MatchString(l):
-			stores = append(stores, l)
-		case prof.nonStackMem.MatchString(l):
-			// A widened-record copy word being read; note its destination
-			// register.
-			f := strings.Fields(l)
-			loadsInto[f[len(f)-1]]++
-		}
-	}
-	for _, l := range stores {
-		// The classes' latitude is copy words: a copy loads and stores the
-		// SAME register, so every unmatched register-source store must have
-		// an unmatched load into exactly that register. A store whose source
-		// register has no feeding load is a hook writing computed state (the
-		// save-restore residue shape).
-		f := strings.Fields(l)
-		src := strings.TrimSuffix(f[1], ",")
-		if loadsInto[src] == 0 {
-			return fmt.Sprintf("unpaired register-source field store with no feeding load: %q", l)
-		}
-		loadsInto[src]--
-	}
-	return ""
-}
-
-var adrpTarget = regexp.MustCompile(`^ADRP ADDR, (R[0-9]+)$`)
-var adrpAdd = regexp.MustCompile(`^ADD \$-?[0-9]+, (R[0-9]+), (R[0-9]+)$`)
-var dispBaseRe = regexp.MustCompile(`(-?[0-9]+)?\((R[0-9]+)\)`)
-
-// foldADRPARM64 folds each `ADRP ADDR, Rx` (optionally followed by an
-// `ADD $lo, Rx, Rx` low-bits step) into the immediately following memory
-// access through `(Rx)`, rewriting that operand to ADDR and dropping the
-// address-forming lines. The immediate follower is the only sound fold
-// target: ADRP just clobbered Rx, so a next-line `(Rx)` base can only be
-// the global. An ADRP whose follower does not access through Rx (address
-// taken, not accessed) is kept as-is.
-func foldADRPARM64(lines []string) []string {
-	out := lines[:0]
-	for i := 0; i < len(lines); i++ {
-		m := adrpTarget.FindStringSubmatch(lines[i])
-		if m == nil {
-			out = append(out, lines[i])
-			continue
-		}
-		reg, j := m[1], i+1
-		if j < len(lines) {
-			if a := adrpAdd.FindStringSubmatch(lines[j]); a != nil && a[1] == reg && a[2] == reg {
-				j++ // low-bits ADD folds with its ADRP
-			}
-		}
-		if j < len(lines) && !strings.HasPrefix(lines[j], "ADRP") {
-			folded := false
-			rewritten := dispBaseRe.ReplaceAllStringFunc(lines[j], func(m string) string {
-				if sub := dispBaseRe.FindStringSubmatch(m); sub[2] == reg {
-					folded = true
-					return "ADDR"
+			if m := arm64PCRelLabel.FindStringSubmatch(ins.text); m != nil {
+				if d, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+					joinPCs[uint64(int64(ins.pc)+4*d)] = true
 				}
-				return m
-			})
-			if folded {
-				out = append(out, rewritten)
-				i = j
+			}
+		}
+		adrpRegs := make(map[string]bool)
+		for _, ins := range raw {
+			if ins.hasP && joinPCs[ins.pc] {
+				clear(adrpRegs)
+			}
+			if ins.isNOP {
 				continue
 			}
-		}
-		out = append(out, lines[i])
-	}
-	return out
-}
-
-func multisetSymDiff(a, b []string) []string {
-	count := make(map[string]int)
-	for _, l := range a {
-		count[prof.mask(l)]++
-	}
-	for _, l := range b {
-		count[prof.mask(l)]--
-	}
-	var out []string
-	for l, n := range count {
-		if n != 0 {
-			out = append(out, l)
-		}
-	}
-	return out
-}
-
-func mnemonics(lines []string) map[string]int {
-	m := make(map[string]int)
-	for _, l := range lines {
-		m[strings.Fields(l)[0]]++
-	}
-	return m
-}
-
-func mnemonicSymDiff(a, b []string) int {
-	ma, mb := mnemonics(a), mnemonics(b)
-	n := 0
-	for k, v := range ma {
-		if d := v - mb[k]; d > 0 {
-			n += d
-		}
-	}
-	for k, v := range mb {
-		if d := v - ma[k]; d > 0 {
-			n += d
-		}
-	}
-	return n
-}
-
-// barrier forms are a recorded layout consequence (a widened record selects
-// a different write-barrier helper), so callee-set comparisons treat them as
-// one equivalence class.
-var barrierRe = regexp.MustCompile(`^(runtime\.)?(gcWriteBarrier[0-9]*|wbZero|wbMove)$`)
-
-// sizeClassRe: the size-class-specialized malloc entry points — a widened
-// struct selects a different one, a pure layout consequence.
-var sizeClassRe = regexp.MustCompile(`^runtime\.mallocgc(SmallScanNoHeader|SmallNoscan|Tiny)?SC[0-9]+$`)
-
-func calleeSetDiff(fb, sb symbol, drop map[string]bool) []string {
-	var extra []string
-	norm := func(m map[string]bool) map[string]bool {
-		out := make(map[string]bool)
-		for c := range m {
-			if stockName, isSplit := prof.splitBodies[c]; isSplit {
-				c = stockName // split call targets compare under the stock name
+			text := ins.text
+			if m := arm64ADRP.FindStringSubmatch(text); m != nil {
+				text = fmt.Sprintf("%s ADDR(PC), %s", m[1], m[2])
+				if m[1] == "ADRP" {
+					adrpRegs[m[2]] = true
+				} else {
+					delete(adrpRegs, m[2])
+				}
+			} else {
+				text = canonARM64PageOff(text, adrpRegs)
 			}
-			if stockName, ok := redirectedCallee(c, fb.name); ok {
-				c = stockName // a recorded redirected site compares under the pair's caller
+			lines = append(lines, text)
+		}
+	default:
+		for _, ins := range raw {
+			if ins.isNOP {
+				continue
 			}
-			if barrierRe.MatchString(c) {
-				c = "WB"
-			} else if sizeClassRe.MatchString(c) {
-				c = "MALLOC_SC"
+			lines = append(lines, ins.text)
+		}
+	}
+	return lines
+}
+
+func isARM64Branch(text string) bool {
+	op := text
+	if i := strings.IndexByte(text, ' '); i >= 0 {
+		op = text[:i]
+	}
+	return arm64BranchOps[op]
+}
+
+func canonARM64PageOff(text string, adrpRegs map[string]bool) string {
+	if isARM64Branch(text) {
+		clear(adrpRegs)
+		return text
+	}
+	if len(adrpRegs) == 0 {
+		return text
+	}
+	op := text
+	if i := strings.IndexByte(text, ' '); i >= 0 {
+		op = text[:i]
+	}
+	if m := arm64AddImm.FindStringSubmatch(text); m != nil {
+		parts := strings.Split(m[2], ",")
+		src := strings.TrimSpace(parts[1])
+		dst := strings.TrimSpace(parts[2])
+		if adrpRegs[src] {
+			text = m[1] + "$PAGEOFF" + m[2]
+			delete(adrpRegs, dst)
+			return text
+		}
+	}
+	if !strings.Contains(op, ".") {
+		for reg := range adrpRegs {
+			if re, ok := arm64MemImmMatchers[reg]; ok && re.MatchString(text) {
+				text = re.ReplaceAllString(text, "${1}PAGEOFF("+reg+")${2}")
 			}
-			out[c] = true
 		}
-		return out
-	}
-	fc, sc := norm(fb.calls), norm(sb.calls)
-	for c := range fc {
-		if !sc[c] && !drop[c] {
-			extra = append(extra, c)
-		}
-	}
-	return extra
-}
-
-type allowEntry struct {
-	pattern string
-	re      *regexp.Regexp
-	class   string
-	// check returns "" when the observed difference is of the recorded
-	// class; ok reports whether the symbol exists on both sides.
-	check func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string
-}
-
-// allowlist is built per profile at test start (the split-class patterns
-// are per-arch).
-var allowlist []allowEntry
-
-func admit(name string) *allowEntry {
-	for i := range allowlist {
-		if allowlist[i].re.MatchString(name) {
-			return &allowlist[i]
-		}
-	}
-	return nil
-}
-
-// extraction is one shared-helper extraction pair (design.md, "Shared-helper
-// extractions"): the fork-only helper the caller's body was extracted into,
-// the observed calls the record admits in the caller (calls stock never
-// makes — the fd-stat observation's test-log line — checked in the CALLER's
-// callee set, never the helper's: "the public method only"), and the
-// recorded fork-internal sites that call the helper where stock calls the
-// caller, which compare under the stock name — at those sites only: every
-// site must be linked and calling the helper (a vanished site stales the
-// record), and a helper call anywhere else is an unadmitted difference.
-type extraction struct {
-	helper   string
-	observed map[string]bool
-	sites    map[string]bool
-}
-
-// extractions maps each extraction's caller to its pair — the single
-// source the allowlist entries, the pairwise check, and the redirected
-// call-target canonicalization derive from.
-var extractions = map[string]extraction{
-	"runtime.runFinalizers":  {helper: "runtime.runFinqBlocks"},
-	"runtime.runCleanups":    {helper: "runtime.runCleanupBlock"},
-	"runtime.queuefinalizer": {helper: "runtime.finAllocBlockLocked"},
-	"runtime.GC":             {helper: "runtime.gcForce"},
-	// The fd-stat observation (design.md, "Untagged observation
-	// completeness"): (*File).Stat logs, its core is the helper, and the
-	// stdlib-internal stats whose result never escapes (ReadFile's
-	// buffer-sizing stat, Getwd's parent walk) call the helper where
-	// stock calls Stat.
-	"os.(*File).Stat": {
-		helper:   "os.fstatNolog",
-		observed: map[string]bool{"internal/testlog.Stat": true},
-		sites:    map[string]bool{"os.statOrZero": true, "os.Getwd": true},
-	},
-}
-
-// carriedFix is one upstream defect the fork fixes ahead of upstream
-// (design.md, "Carried upstream fixes"): the stock symbol the fix changes,
-// the calls the fix adds that stock's body never makes, and the upstream
-// reference that names the defect — the entry retires at the port whose
-// base carries upstream's own fix (it then fires on no symbol and fails
-// stale).
-type carriedFix struct {
-	adds map[string]bool
-	cite string
-}
-
-// carriedFixes maps each carried fix's symbol to its record.
-var carriedFixes = map[string]carriedFix{
-	// isComplete read Named.fromRHS unguarded while unpack writes it under
-	// the type's mutex (concurrent type-checking of package variants
-	// sharing an instantiation); the fix reads an instance only once the
-	// writer's atomic state bit is set and unpacks every other kind first.
-	"go/types.(*Checker).isComplete": {adds: map[string]bool{"go/types.(*Named).unpack": true}, cite: "golang/go#79035 family — Named.fromRHS read in isComplete"},
-}
-
-// checkExactDelta is the mandatory instruction-count pin shared by the
-// extraction pairs and the carried fixes: prints the measured delta under
-// DST_VANILLA_DELTAS, refuses an arch with no pin (a new profile or a new
-// admitted symbol fails closed), and refuses a delta off its pin — the
-// mimicry closure a residue store that copies an admitted shape cannot
-// pass. what names the symbol for the refusal (the cite for a fix).
-func checkExactDelta(name string, d int, what string) string {
-	if os.Getenv("DST_VANILLA_DELTAS") != "" {
-		fmt.Printf("DELTA %s: %d\n", what, d)
-	}
-	want, pinned := prof.exactDeltas[name]
-	if !pinned {
-		return fmt.Sprintf("no instruction-count delta pinned for this arch — measure (DST_VANILLA_DELTAS=1) and pin under review (%s)", what)
-	}
-	if d != want {
-		return fmt.Sprintf("instruction-count delta %d, pinned %d — re-measure only with review (%s)", d, want, what)
-	}
-	return ""
-}
-
-// checkCarriedFix admits a carried fix's symbol: on both sides, differing
-// from stock by the fix's own calls (the recorded additions, each firing)
-// within the extraction pairs' text bound, no dst reference, nothing of
-// stock's dropped, and — the mimicry gap closed as for the extraction
-// pairs — its exact instruction-count delta pinned per arch, mandatory. Every
-// refusal names the fix's upstream cite, so the porter judging it against
-// a new base has the reference in hand.
-func checkCarriedFix(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-	cf := carriedFixes[name]
-	if !ok {
-		return fmt.Sprintf("expected on both sides (%s)", cf.cite)
-	}
-	for c := range cf.adds {
-		if !fb.calls[c] {
-			return fmt.Sprintf("stale carried-fix addition %s: the fork no longer makes the call (%s)", c, cf.cite)
-		}
-	}
-	if extra := calleeSetDiff(fb, sb, cf.adds); len(extra) > 0 {
-		return fmt.Sprintf("makes calls neither stock nor the recorded fix makes: %v (%s)", extra, cf.cite)
-	}
-	if extra := calleeSetDiff(sb, fb, nil); len(extra) > 0 {
-		return fmt.Sprintf("dropped stock calls: %v (%s)", extra, cf.cite)
-	}
-	if msg := checkExactDelta(name, len(fb.lines)-len(sb.lines), "carried "+name+" ("+cf.cite+")"); msg != "" {
-		return msg
-	}
-	return classRelaxed(fb.lines, sb.lines, fb.dstRaw, 48, 64)
-}
-
-// sortedKeys orders a record map's keys so the allowlist is stable.
-func sortedKeys[V any](m map[string]V) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
-}
-
-// redirectedCallee answers the stock name a helper's call target compares
-// under at symbol site — the pair's caller, for a recorded redirected site
-// only; any other symbol's call to the helper keeps the helper's name and
-// fails its comparison as an unadmitted difference.
-func redirectedCallee(target, site string) (string, bool) {
-	for caller, ex := range extractions {
-		if ex.helper == target && ex.sites[site] {
-			return caller, true
-		}
-	}
-	return "", false
-}
-
-func checkExtractionCaller(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-	if !ok {
-		return "expected on both sides"
-	}
-	ex := extractions[name]
-	helperName := ex.helper
-	// Pairwise admission: caller (minus the extraction call) plus helper must
-	// be the stock body modulo the class latitude, and the PAIR's callee set
-	// must match stock's — calls the extraction moved into the helper are not
-	// "dropped".
-	helper, hok := fork[helperName]
-	if !hok {
-		return fmt.Sprintf("extracted helper %s missing from the fork binary", helperName)
-	}
-	pairSym := symbol{calls: make(map[string]bool), dstRaw: append(append([]string{}, fb.dstRaw...), helper.dstRaw...)}
-	for _, l := range fb.lines {
-		if strings.Contains(l, helperName+"(SB)") {
-			continue
-		}
-		pairSym.lines = append(pairSym.lines, l)
-	}
-	pairSym.lines = append(pairSym.lines, helper.lines...)
-	for c := range fb.calls {
-		if c != helperName {
-			pairSym.calls[c] = true
-		}
-	}
-	for c := range helper.calls {
-		pairSym.calls[c] = true
-	}
-	// The observed calls the record admits: each present in the CALLER's
-	// callee set (a helper making it is the observation leaking into the
-	// unlogged core) — and firing, so a vanished observation stales the
-	// admission rather than sitting unused.
-	for c := range ex.observed {
-		if helper.calls[c] {
-			return fmt.Sprintf("the helper makes the observed call %s — the observation belongs to the public method only", c)
-		}
-		if !fb.calls[c] {
-			return fmt.Sprintf("stale observed-call admission %s: the caller no longer makes it", c)
-		}
-	}
-	// The recorded redirected sites: each linked by the corpus and calling
-	// the helper — an unlinked site escapes the comparison, a site no
-	// longer calling the helper stales the record; either fails here.
-	for site := range ex.sites {
-		ss, linked := fork[site]
-		if !linked {
-			return fmt.Sprintf("recorded redirected site %s is not linked by the corpus — its redirection is unverified; exercise it", site)
-		}
-		if !ss.calls[helperName] {
-			return fmt.Sprintf("stale redirected site %s: it no longer calls %s", site, helperName)
-		}
-	}
-	if extra := calleeSetDiff(pairSym, sb, ex.observed); len(extra) > 0 {
-		return fmt.Sprintf("pair makes calls stock never makes: %v", extra)
-	}
-	if extra := calleeSetDiff(sb, pairSym, abiMicro); len(extra) > 0 {
-		return fmt.Sprintf("pair dropped stock calls: %v", extra)
-	}
-	if msg := checkExactDelta(name, len(pairSym.lines)-len(sb.lines), "pair "+name); msg != "" {
-		return msg
-	}
-	return classRelaxed(pairSym.lines, sb.lines, pairSym.dstRaw, 48, 64)
-}
-
-// abiMicro: the availability class lets any admitted symbol inline these
-// micro-bodies away where stock calls them.
-var abiMicro = map[string]bool{"internal/abi.TypeOf": true, "internal/abi.NoEscape": true}
-
-func checkForkOnly(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-	if ok || len(fb.lines) == 0 {
-		return "expected fork-only"
-	}
-	// A helper's text bound rides its caller's pairwise check, so the caller
-	// must be in the binary too.
-	for caller, ex := range extractions {
-		if ex.helper == name {
-			if _, present := fork[caller]; !present {
-				return fmt.Sprintf("extracted helper without its caller %s in the binary — the pairwise check cannot run", caller)
+	} else {
+		// Pre-index (.W) and post-index (.P) addressing modes mutate their base register.
+		for _, tok := range strings.Split(text, ",") {
+			if m := arm64BaseReg.FindStringSubmatch(strings.TrimSpace(tok)); m != nil {
+				delete(adrpRegs, m[1])
 			}
-			return ""
 		}
 	}
-	return "helper not named in the extractions map"
+	// Retire destination register(s) overwritten by this instruction.
+	if m := arm64DstPair.FindStringSubmatch(text); m != nil {
+		delete(adrpRegs, m[1])
+		delete(adrpRegs, m[2])
+	} else if i := strings.LastIndex(text, ","); i >= 0 {
+		dst := strings.TrimSpace(text[i+1:])
+		delete(adrpRegs, dst)
+	}
+	return text
 }
 
-// splitPatterns derives the split class's allowlist patterns from the
-// profile's splitBodies map — the map is the single source of the body and
-// wrapper sets.
-func splitPatterns(bodies map[string]string) (bodyPat, wrapperPat string) {
-	var bs, ws []string
-	seen := make(map[string]bool)
-	for b, w := range bodies {
-		bs = append(bs, regexp.QuoteMeta(b))
-		if !seen[w] {
-			seen[w] = true
-			ws = append(ws, regexp.QuoteMeta(w))
+func TestCanonicalizerRejectsRealMutations(t *testing.T) {
+	wrap := func(arch string, lines ...string) symbol {
+		var b strings.Builder
+		b.WriteString("TEXT pkg.fn(SB) /src/pkg/fn.go\n")
+		for i, l := range lines {
+			fmt.Fprintf(&b, "  fn.go:%d 0x%x 0000 %s\n", i+1, 0x1000+i*4, l)
+		}
+		return parseDisassembly(b.String(), arch)["pkg.fn"]
+	}
+
+	// Legitimate .rodata link-address relocation shifts must match, including
+	// zero-offset page boundaries and non-branch B* instructions (BIC/BFI/BFM).
+	if a, b := wrap("amd64", "LEAQ 0x1eefbb(IP), AX", "JEQ 0x1008", "RET"),
+		wrap("amd64", "LEAQ 0x1eeb73(IP), AX", "JEQ 0x1008", "RET"); a.canon != b.canon {
+		t.Fatalf("amd64 IP-rel relocation shift rejected: %q vs %q", a.canon, b.canon)
+	}
+	if a, b := wrap("arm64", "ADRP 3059712(PC), R1", "ADD $160, R1, R1", "ADRP 8192(PC), R2", "BIC $7, R9, R9", "MOVD (R2), R3"),
+		wrap("arm64", "ADRP 3055616(PC), R1", "ADD $2808, R1, R1", "ADRP 4096(PC), R2", "BIC $7, R9, R9", "MOVD 64(R2), R3"); a.canon != b.canon {
+		t.Fatalf("arm64 ADRP+pageoff relocation shift rejected: %q vs %q", a.canon, b.canon)
+	}
+
+	// Real codegen deviations (named globals, struct/stack offsets, immediates,
+	// registers, call targets, join-block fallthrough, LDP clobbers, indexed loads)
+	// must NOT be masked.
+	rejects := []struct {
+		name string
+		arch string
+		a, b []string
+	}{
+		{"amd64-named-global", "amd64", []string{"MOVQ pkg.globA(SB), AX"}, []string{"MOVQ pkg.globB(SB), AX"}},
+		{"amd64-typeassert-num", "amd64", []string{"LEAQ os..typeAssert.1(SB), AX"}, []string{"LEAQ os..typeAssert.2(SB), AX"}},
+		{"amd64-stack-offset", "amd64", []string{"MOVQ 16(SP), AX"}, []string{"MOVQ 24(SP), AX"}},
+		{"amd64-struct-offset", "amd64", []string{"MOVQ 32(R14), AX"}, []string{"MOVQ 40(R14), AX"}},
+		{"amd64-immediate", "amd64", []string{"MOVQ $1, AX"}, []string{"MOVQ $2, AX"}},
+		{"amd64-register", "amd64", []string{"MOVQ AX, BX"}, []string{"MOVQ AX, CX"}},
+		{"amd64-call-target", "amd64", []string{"CALL pkg.foo(SB)"}, []string{"CALL pkg.bar(SB)"}},
+		{"arm64-struct-offset", "arm64", []string{"MOVD 32(R28), R0"}, []string{"MOVD 40(R28), R0"}},
+		{"arm64-non-adrp-add", "arm64", []string{"ADD $8, R1, R1"}, []string{"ADD $16, R1, R1"}},
+		{"arm64-retired-adrp-add", "arm64", []string{"ADRP 4096(PC), R1", "ADD $16, R1, R1", "ADD $8, R1, R1"}, []string{"ADRP 4096(PC), R1", "ADD $16, R1, R1", "ADD $24, R1, R1"}},
+		{"arm64-join-block-fallthrough", "arm64", []string{"CBZ R0, 2(PC)", "ADRP 4096(PC), R1", "MOVD 32(R1), R2"}, []string{"CBZ R0, 2(PC)", "ADRP 4096(PC), R1", "MOVD 40(R1), R2"}},
+		{"arm64-join-block-noop-header", "arm64", []string{"CBZ R0, 2(PC)", "ADRP 4096(PC), R1", "NOOP", "MOVD 32(R1), R2"}, []string{"CBZ R0, 2(PC)", "ADRP 4096(PC), R1", "NOOP", "MOVD 40(R1), R2"}},
+		{"arm64-ldp-clobber", "arm64", []string{"ADRP 4096(PC), R1", "LDP 16(RSP), (R1, R2)", "MOVD 8(R1), R3"}, []string{"ADRP 4096(PC), R1", "LDP 16(RSP), (R1, R2)", "MOVD 16(R1), R3"}},
+		{"arm64-reg-index-not-pageoff", "arm64", []string{"ADRP 4096(PC), R1", "MOVD (R1)(R2), R3"}, []string{"ADRP 4096(PC), R1", "MOVD 8(R1), R3"}},
+		{"arm64-call-target", "arm64", []string{"CALL pkg.foo(SB)"}, []string{"CALL pkg.bar(SB)"}},
+	}
+	for _, tc := range rejects {
+		sa, sb := wrap(tc.arch, tc.a...), wrap(tc.arch, tc.b...)
+		if sa.canon == sb.canon {
+			t.Errorf("%s: canonicalizer masked real mutation (%q == %q)", tc.name, sa.canon, sb.canon)
 		}
 	}
-	sort.Strings(bs)
-	sort.Strings(ws)
-	return "^(" + strings.Join(bs, "|") + ")$", "^(" + strings.Join(ws, "|") + ")$"
-}
-
-func buildAllowlist(p *archProfile) []allowEntry {
-	bodyPat, wrapperPat := splitPatterns(p.splitBodies)
-	var list []allowEntry
-	// Shared-helper extractions, one entry per member so the stale-entry
-	// discipline judges each pair on its own: the caller differs by the one
-	// call (plus the observed calls the record admits), the helper is
-	// fork-only (its body-vs-stock-loop identity is carried by the caller's
-	// callee-set check plus the recorded clause).
-	for _, caller := range sortedKeys(extractions) {
-		list = append(list,
-			allowEntry{pattern: "^" + regexp.QuoteMeta(caller) + "$", class: "extraction-caller", check: checkExtractionCaller},
-			allowEntry{pattern: "^" + regexp.QuoteMeta(extractions[caller].helper) + "$", class: "extraction-helper", check: checkForkOnly})
+	if s := wrap("amd64", "CALL runtime.dstPollBlock(SB)"); len(s.dstRaw) == 0 {
+		t.Error("rawDstRef missed runtime.dstPollBlock(SB)")
 	}
-	// Carried upstream fixes, one entry per symbol (the stale-entry
-	// discipline retires each at the port that absorbs its fix).
-	for _, sym := range sortedKeys(carriedFixes) {
-		list = append(list, allowEntry{pattern: "^" + regexp.QuoteMeta(sym) + "$", class: "carried-fix", check: checkCarriedFix})
-	}
-	list = append(list, []allowEntry{
-		// Fence-wrapper splits: the split body must be instruction-identical to
-		// the stock symbol it replaces; the stock-named wrapper (where it
-		// survives inlining) may only call the split body.
-		{pattern: bodyPat, class: "split-body",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if ok {
-					return "expected fork-only"
-				}
-				counterpart, exists := stock[p.splitBodies[name]]
-				if !exists {
-					return fmt.Sprintf("stock has no %s to compare the split body against", p.splitBodies[name])
-				}
-				if fb.masked != counterpart.masked {
-					return fmt.Sprintf("split body is not instruction-identical to stock's %s", p.splitBodies[name])
-				}
-				return ""
-			}},
-		{pattern: wrapperPat, class: "split-wrapper",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if len(fb.lines) == 0 {
-					return "" // wrapper fully inlined away: the split body carries the text
-				}
-				for c := range fb.calls {
-					if p.splitBodies[c] != name && !barrierRe.MatchString(c) && c != "runtime.morestack_noctxt.abi0" {
-						return fmt.Sprintf("wrapper calls %s, not its own split body", c)
-					}
-				}
-				if len(fb.dstRaw) > 0 {
-					return fmt.Sprintf("wrapper references a dst symbol: %s", fb.dstRaw[0])
-				}
-				// A wrapper is prologue + one call + epilogue: it may touch
-				// registers and its own stack frame, nothing else. Any other
-				// memory access — a global, a field — is fence residue in the
-				// likeliest hand-written site.
-				for _, l := range fb.lines {
-					if strings.HasPrefix(l, "CALL") || strings.HasPrefix(l, "JMP") || strings.HasPrefix(l, "LEA") {
-						continue
-					}
-					if p.stackGuard.MatchString(l) {
-						continue // the canonical stack-growth prologue reads g's stackguard
-					}
-					if p.nonStackMem.MatchString(l) || strings.Contains(l, "ADDR") {
-						return fmt.Sprintf("wrapper touches non-stack memory: %q", l)
-					}
-				}
-				return ""
-			}},
-		// Layout consequences in the remaining widened-record paths: the
-		// generic AddCleanup instantiations shift with the layouts their
-		// shapes close over. (The finalizer/cleanup registration and
-		// queueing symbols this class once admitted are stock-equal since
-		// the stamps moved out of line.) Callee sets must match modulo the
-		// barrier-form equivalence class.
-		{pattern: `^runtime\.AddCleanup\[.*$`, class: "layout",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if !ok {
-					return "expected on both sides"
-				}
-				if extra := calleeSetDiff(fb, sb, nil); len(extra) > 0 {
-					return fmt.Sprintf("calls stock never makes: %v", extra)
-				}
-				if extra := calleeSetDiff(sb, fb, abiMicro); len(extra) > 0 {
-					return fmt.Sprintf("dropped stock calls: %v", extra)
-				}
-				if os.Getenv("DST_VANILLA_DELTAS") != "" {
-					fmt.Printf("DELTA %s: %d\n", name, len(fb.lines)-len(sb.lines))
-				}
-				if want, pinned := prof.exactDeltas[name]; pinned {
-					if d := len(fb.lines) - len(sb.lines); d != want {
-						return fmt.Sprintf("instruction-count delta %d, pinned %d — re-measure only with review", d, want)
-					}
-				}
-				return classRelaxed(fb.lines, sb.lines, fb.dstRaw, 48, 64)
-			}},
-		// Export-data inline-body availability: stock leaves abi micro-calls;
-		// the fork inlines them. Fork callees must be a subset of stock's with
-		// only those two missing; the abi symbols themselves go one-sided.
-		{pattern: `^internal/abi\.(TypeOf|NoEscape)$`, class: "availability-symbol",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if ok || len(sb.lines) == 0 {
-					return "expected stock-only"
-				}
-				return ""
-			}},
-		{pattern: `^(internal/)?sync\.`, class: "availability-substitution",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if !ok {
-					return "expected on both sides"
-				}
-				if extra := calleeSetDiff(fb, sb, nil); len(extra) > 0 {
-					return fmt.Sprintf("calls stock never makes: %v", extra)
-				}
-				for c := range sb.calls {
-					if !fb.calls[c] && c != "internal/abi.TypeOf" && c != "internal/abi.NoEscape" && !barrierRe.MatchString(c) {
-						return fmt.Sprintf("dropped stock call %s (only the abi micro-bodies may be inlined away)", c)
-					}
-				}
-				return classRelaxed(fb.lines, sb.lines, fb.dstRaw, 12, 16)
-			}},
-		// Autogenerated equality functions renamed by a changed layout's hash.
-		// Their bodies are compiler-generated comparisons: loads and CMPs only,
-		// so any store or dst reference inside one is residue, not generation.
-		{pattern: `^type:\.eq\.`, class: "eq-rename",
-			check: func(name string, fb, sb symbol, ok bool, fork, stock map[string]symbol) string {
-				if len(fb.dstRaw) > 0 {
-					return fmt.Sprintf("references a dst symbol: %s", fb.dstRaw[0])
-				}
-				for _, l := range fb.lines {
-					// Generation emits loads and CMPs only: any non-LEA line
-					// whose destination operand is memory is residue.
-					if !strings.HasPrefix(l, "LEA") && p.memDest.MatchString(l) {
-						return fmt.Sprintf("memory write inside an equality function: %q", l)
-					}
-				}
-				return ""
-			}},
-	}...)
-	for i := range list {
-		list[i].re = regexp.MustCompile(list[i].pattern)
-	}
-	return list
 }

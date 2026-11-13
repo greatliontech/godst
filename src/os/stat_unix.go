@@ -7,7 +7,6 @@
 package os
 
 import (
-	"internal/testlog"
 	"syscall"
 )
 
@@ -17,25 +16,9 @@ func (f *File) Stat() (FileInfo, error) {
 	if f == nil {
 		return nil, ErrInvalid
 	}
-	// An fd-based stat observes the same metadata a path stat would;
-	// leaving it out of the test log lets a caller read an opened
-	// file's modification time unobserved, so cache keys built from
-	// the log under-pin exactly the metadata this call returns. The
-	// log line belongs to the public method only: stdlib-internal
-	// helpers whose FileInfo never escapes (ReadFile's buffer-sizing
-	// stat) go through fstatNolog, because logging an observation the
-	// caller cannot read would over-pin every ReadFile input to
-	// metadata nothing consumed.
-	testlog.Stat(f.name)
-	return fstatNolog(f)
-}
-
-// fstatNolog is (*File).Stat with no test logging, for stdlib-internal
-// stats whose result does not escape to the caller.
-func fstatNolog(f *File) (FileInfo, error) {
 	if dstSimEnabled {
 		if dstf := dstBackendOf(f.file); dstf != nil {
-			fi, err := dstf.(dstFileBackendExt).stat()
+			fi, err := dstf.stat()
 			if err != nil {
 				return nil, f.wrapErr("stat", err)
 			}

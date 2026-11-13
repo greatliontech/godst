@@ -67,8 +67,10 @@ func newRoot(fd int, name string) (*Root, error) {
 
 // openRootInRoot is Root.OpenRoot.
 func openRootInRoot(r *Root, name string) (*Root, error) {
-	if dstRootActive(r) {
-		return dstRootOpenRoot(r, name)
+	if dstSimEnabled {
+		if dstRootActive(r) {
+			return dstRootOpenRoot(r, name)
+		}
 	}
 	fd, err := doInRoot(r, name, 0, nil, func(parent int, name string, endsInSlash bool) (fd int, err error) {
 		ignoringEINTR(func() error {
@@ -88,8 +90,10 @@ func openRootInRoot(r *Root, name string) (*Root, error) {
 
 // rootOpenFileNolog is Root.OpenFile.
 func rootOpenFileNolog(root *Root, name string, flag int, perm FileMode) (*File, error) {
-	if dstRootActive(root) {
-		return dstRootOpenFile(root, name, flag, perm)
+	if dstSimEnabled {
+		if dstRootActive(root) {
+			return dstRootOpenFile(root, name, flag, perm)
+		}
 	}
 	fd, err := doInRoot(root, name, 0, nil, func(parent int, name string, endsInSlash bool) (fd int, err error) {
 		ignoringEINTR(func() error {
@@ -141,8 +145,10 @@ func rootOpenDir(parent int, name string) (int, error) {
 }
 
 func rootStat(r *Root, name string, lstat bool) (FileInfo, error) {
-	if dstRootActive(r) {
-		return dstRootStat(r, name, lstat)
+	if dstSimEnabled {
+		if dstRootActive(r) {
+			return dstRootStat(r, name, lstat)
+		}
 	}
 	fi, err := doInRoot(r, name, 0, nil, func(parent sysfdType, n string, endsInSlash bool) (FileInfo, error) {
 		fi, err := lstatatWithName(parent, name, n)
@@ -161,12 +167,14 @@ func rootStat(r *Root, name string, lstat bool) (FileInfo, error) {
 }
 
 func rootSymlink(r *Root, oldname, newname string) error {
-	if dstRootActive(r) {
-		if err := r.root.incref(); err != nil {
-			return &LinkError{"symlinkat", oldname, newname, err}
+	if dstSimEnabled {
+		if dstRootActive(r) {
+			if err := r.root.incref(); err != nil {
+				return &LinkError{"symlinkat", oldname, newname, err}
+			}
+			r.root.decref()
+			return &LinkError{"symlinkat", oldname, newname, dstErrUnsupportedFS}
 		}
-		r.root.decref()
-		return &LinkError{"symlinkat", oldname, newname, dstErrUnsupportedFS}
 	}
 	_, err := doInRoot(r, newname, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
 		return struct{}{}, symlinkat(oldname, parent, name)

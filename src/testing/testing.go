@@ -581,39 +581,13 @@ type chattyPrinter struct {
 	lastNameMu sync.Mutex // guards lastName
 	lastName   string     // last printed test name in chatty mode
 	json       bool       // -v=json output mode
-
-	// Deterministic-simulation support (see dst_hostio.go; folded out of
-	// stock builds by the dstFrameworkStreamEnabled const guard).
-	//
-	// hostFD is the printer's stream captured as a raw descriptor at
-	// construction — a framework-owned host capability predating every run —
-	// or -1 when w is not an *os.File. A goroutine inside a simulation
-	// bubble writes the framework stream through hostFD with a direct,
-	// granted, self-attributing write; it must never take lastNameMu or
-	// enter the poll layer, because a HOST goroutine (a t.Parallel test
-	// logging concurrently) can hold those across wall-clock work, and a
-	// bubble goroutine parking on a host-held lock wakes at a
-	// wall-clock-dependent point in the seeded schedule — a nondeterminism
-	// escape. In-bubble the -1 arm never falls back to that host-lock path:
-	// it panics loudly instead (dstBubbleFramework), and is unreachable
-	// under real go-test wiring.
-	hostFD int
 }
 
 func newChattyPrinter(w io.Writer) *chattyPrinter {
-	p := &chattyPrinter{w: w, json: chatty.json}
 	if dstFrameworkStreamEnabled {
-		p.hostFD = -1 // no granted host stream yet; 0 is a valid fd
-		if f, ok := w.(*os.File); ok {
-			// Fd() also switches a pollable descriptor back to BLOCKING
-			// mode (its documented side effect) — load-bearing here: the
-			// bubble path's raw writes assume a blocking stream (see
-			// dstHostStreamWrite's EAGAIN stance). Stdio starts blocking,
-			// so for the real go-test wiring this is a no-op.
-			p.hostFD = int(f.Fd())
-		}
+		return dstNewChattyPrinter(w)
 	}
-	return p
+	return &chattyPrinter{w: w, json: chatty.json}
 }
 
 // prefix is like chatty.prefix but using p.json instead of chatty.json.
@@ -632,9 +606,9 @@ func (p *chattyPrinter) prefix() string {
 // The formatted message must include the test name itself.
 func (p *chattyPrinter) Updatef(testName, format string, args ...any) {
 	// A goroutine inside a simulation bubble takes the granted bubble-domain
-	// path (see dst_hostio.go and the fields on chattyPrinter): it must not
-	// park on lastNameMu, which a host goroutine can hold across wall-clock
-	// work. Folded out of stock builds by the const guard.
+	// path (see dst_hostio.go): it must not park on lastNameMu, which a host
+	// goroutine can hold across wall-clock work. Folded out of stock builds
+	// by the const guard.
 	if dstFrameworkStreamEnabled && dstBubbleUpdatef(p, testName, format, args...) {
 		return
 	}
@@ -2361,26 +2335,6 @@ func testingSynctestTest(t *T, f func(*T)) (ok bool) {
 		runtime.Goexit()
 	}
 	return !t2.failed
-}
-
-// testingSimulationTest runs f within a simulation-backed synctest bubble.
-// It is called by simulation.Test, from within an already-created bubble.
-//
-//go:linkname testingSimulationTest testing/simulation.testingSimulationTest
-func testingSimulationTest(t *T, f func(*T)) (ok bool) {
-	return testingSynctestTest(t, f)
-}
-
-// testingSimulationCleanupStarted reports whether t is already running its
-// cleanup functions. simulation.Test/TestWith check it on the CALLER goroutine
-// before entering the bubble, so the rejection panics where the user can
-// recover it, in the package's own panic style (testingSynctestTest's own
-// check would fire on the bubble main goroutine, where a raw panic kills the
-// process, and names synctest.Run).
-//
-//go:linkname testingSimulationCleanupStarted testing/simulation.testingSimulationCleanupStarted
-func testingSimulationCleanupStarted(t *T) bool {
-	return t.cleanupStarted.Load()
 }
 
 // Deadline reports the time at which the test binary will have

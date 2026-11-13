@@ -21,26 +21,6 @@ func setTimeval(sec, usec int64) Timeval {
 	return Timeval{Sec: int32(sec), Usec: int32(usec)}
 }
 
-// Underlying system call writes to newoffset via pointer.
-// Implemented in assembly to avoid allocation.
-func rawSeek(fd int, offset int64, whence int) (newoffset int64, err Errno)
-
-//go:linkname seek
-func seek(fd int, offset int64, whence int) (newoffset int64, err Errno) {
-	if dstSimFenced && dstFenceActive() && !dstHostIOActive() {
-		dstSyscallRefuse(SYS__LLSEEK)
-	}
-	return rawSeek(fd, offset, whence)
-}
-
-func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
-	newoffset, errno := seek(fd, offset, whence)
-	if errno != 0 {
-		return 0, errno
-	}
-	return newoffset, nil
-}
-
 //sys	accept4(s int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (fd int, err error)
 //sys	bind(s int, addr unsafe.Pointer, addrlen _Socklen) (err error)
 //sys	connect(s int, addr unsafe.Pointer, addrlen _Socklen) (err error)
@@ -60,7 +40,7 @@ func seekFD(fd int, offset int64, whence int) (newoffset int64, err error) {
 // (16-bit uid calls are not always supported in newer kernels)
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error) = SYS_FCHOWN32
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
+// Fstat is tag-split between dst_split_fstat64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat64_on_linux.go (dst).
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_FSTATAT64
 //sysnb	Getegid() (egid int) = SYS_GETEGID32
 //sysnb	Geteuid() (euid int) = SYS_GETEUID32

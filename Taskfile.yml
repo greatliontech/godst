@@ -144,8 +144,8 @@ tasks:
         vars: { ARGS: 'test -count=1 -short -timeout 60m cmd/go cmd/go/internal/work' }
       # cmd/compile and cmd/link run WITHOUT -short: short mode drops the
       # compiler tests this fork is most exposed to — TestIntendedInlining
-      # above all, which pins the std inlinability surface the INV-VANILLA
-      # admissions lean on.
+      # above all, which pins the std inlinability surface across untagged
+      # compilations.
       - task: exttmp-go
         vars: { ARGS: 'test -count=1 -timeout 60m cmd/compile/... cmd/link/...' }
 

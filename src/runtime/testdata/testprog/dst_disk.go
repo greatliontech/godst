@@ -7,6 +7,8 @@
 // import disables deadlock detection — see design.md "Enforcing test
 // configurations").
 
+//go:build dst
+
 package main
 
 import (

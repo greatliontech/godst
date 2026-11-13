@@ -188,23 +188,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.c.timer.maybeRunChan(cas.c)
 		}
 
-		// Under deterministic scheduling (DST active), draw the poll
-		// order from this goroutine's per-g DST stream instead of the per-m
-		// cheaprand stream, so the chosen ready case depends only on the
-		// goroutine's logical history. An unseeded goroutine (dstrand == 0 —
-		// outside the run-seeded tree) keeps the per-m stream: its zero-rooted
-		// stream must not advance, or the sentinel dstReadRandom's entropy gate
-		// relies on is destroyed. See dstrandUint64.
 		var j uint32
-		if dstActive() && gp.dstrand != 0 {
-			var raw uint64
-			j, raw = dstrandnRaw(gp, uint32(norder+1))
-			if dstSchedTraceOn {
-				// The ident is the RAW draw, not the bounded index: with tiny
-				// candidate counts a bounded ident aliases in the xorIdent
-				// freeze-detection fold (see dstrandnRaw).
-				dstTraceRecord(dstTraceSiteSelect, uint32(norder+1), j, raw)
-			}
+		if dstBuild {
+			j = dstSelectPollOrder(gp, uint32(norder+1))
 		} else {
 			j = cheaprandn(uint32(norder + 1))
 		}
@@ -267,11 +253,6 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		}
 	}
 
-	// DST Level-2: select cases acquire channels inside selectgo rather than through
-	// chansend/chanrecv's hook path. Announce each unique channel before taking any
-	// channel locks so the safe-point guard can yield. This is a conservative
-	// dependency for multi-channel selects: it may wake extra backtracks, but it cannot
-	// keep an outcome-determining channel decision order invisible.
 	if dstBuild && raceenabled {
 		var lastc *hchan
 		for _, o := range lockorder {
@@ -496,8 +477,6 @@ bufrecv:
 	qp = chanbuf(c, c.recvx)
 	if dstBuild && raceenabled {
 		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
-		// Mirror racereleaseacquire: the receive also releases the slot (the
-		// k → k+C edge); see chan.go.
 		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.recvx)+1)
 	}
 	if cas.elem != nil {
@@ -524,10 +503,8 @@ bufsend:
 	if asanenabled {
 		asanread(cas.elem, c.elemtype.Size_)
 	}
-	qp = chanbuf(c, c.sendx)
-	typedmemmove(c.elemtype, qp, cas.elem)
+	typedmemmove(c.elemtype, chanbuf(c, c.sendx), cas.elem)
 	if dstBuild && raceenabled {
-		// Mirror racereleaseacquire: the send also acquires the slot; see chan.go.
 		dstRecordSyncAcquireID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
 		dstRecordSyncReleaseID(uintptr(unsafe.Pointer(c)), uintptr(c.sendx)+1)
 	}

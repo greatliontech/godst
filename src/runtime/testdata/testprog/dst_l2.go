@@ -9,6 +9,8 @@
 // white-box. See docs/dst/exploration.md "Level 2 — access-granularity interleaving +
 // DPOR".
 
+//go:build dst
+
 package main
 
 import (

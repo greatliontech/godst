@@ -14,3 +14,5 @@ const dstMutexVirtualStarvation = false
 // dstStarvationWakeThreshold is unused when the gate above is false; it
 // exists so the folded branch typechecks.
 const dstStarvationWakeThreshold = 0
+
+func runtime_dstMutexWaitVirtual() bool { return false }

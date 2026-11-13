@@ -198,8 +198,10 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 	if _, err := netip.ParseAddr(host); err == nil {
 		return []string{host}, nil
 	}
-	if dstActive() {
-		return nil, dstUnsupportedDNSLookup(host)
+	if dstNetEnabled {
+		if dstActive() {
+			return nil, dstUnsupportedDNSLookup(host)
+		}
 	}
 	return r.lookupHost(ctx, host)
 }
@@ -313,8 +315,10 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []IPAddr{{IP: IP(ip.AsSlice()).To16(), Zone: ip.Zone()}}, nil
 	}
-	if dstActive() {
-		return nil, dstUnsupportedDNSLookup(host)
+	if dstNetEnabled {
+		if dstActive() {
+			return nil, dstUnsupportedDNSLookup(host)
+		}
 	}
 	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
 	if trace != nil && trace.DNSStart != nil {
@@ -428,8 +432,10 @@ func (r *Resolver) LookupPort(ctx context.Context, network, service string) (por
 		default:
 			return 0, &AddrError{Err: "unknown network", Addr: network}
 		}
-		if dstActive() {
-			return 0, dstUnsupportedServiceLookup(network, service)
+		if dstNetEnabled {
+			if dstActive() {
+				return 0, dstUnsupportedServiceLookup(network, service)
+			}
 		}
 		port, err = r.lookupPort(ctx, network, service)
 		if err != nil {
@@ -476,8 +482,10 @@ func LookupCNAME(host string) (cname string, err error) {
 // The returned canonical name is validated to be a properly
 // formatted presentation-format domain name.
 func (r *Resolver) LookupCNAME(ctx context.Context, host string) (string, error) {
-	if dstActive() {
-		return "", dstUnsupportedDNSLookup(host)
+	if dstNetEnabled {
+		if dstActive() {
+			return "", dstUnsupportedDNSLookup(host)
+		}
 	}
 	cname, err := r.lookupCNAME(ctx, host)
 	if err != nil {
@@ -532,15 +540,17 @@ func LookupSRV(service, proto, name string) (cname string, addrs []*SRV, err err
 // invalid names, those records are filtered out and an error
 // will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
-	target := name
-	if service != "" || proto != "" {
-		target = "_" + service + "._" + proto + "." + name
-	}
-	if dstActive() {
-		if !isDomainName(target) {
-			return "", nil, newDNSError(errNoSuchHost, target, "")
+	if dstNetEnabled {
+		if dstActive() {
+			target := name
+			if service != "" || proto != "" {
+				target = "_" + service + "._" + proto + "." + name
+			}
+			if !isDomainName(target) {
+				return "", nil, newDNSError(errNoSuchHost, target, "")
+			}
+			return "", nil, dstUnsupportedDNSLookup(target)
 		}
-		return "", nil, dstUnsupportedDNSLookup(target)
 	}
 	cname, addrs, err := r.lookupSRV(ctx, service, proto, name)
 	if err != nil {
@@ -585,11 +595,13 @@ func LookupMX(name string) ([]*MX, error) {
 // If the response contains invalid names, those records are filtered out
 // and an error will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupMX(ctx context.Context, name string) ([]*MX, error) {
-	if dstActive() {
-		if !isDomainName(name) {
-			return nil, newDNSError(errNoSuchHost, name, "")
+	if dstNetEnabled {
+		if dstActive() {
+			if !isDomainName(name) {
+				return nil, newDNSError(errNoSuchHost, name, "")
+			}
+			return nil, dstUnsupportedDNSLookup(name)
 		}
-		return nil, dstUnsupportedDNSLookup(name)
 	}
 	records, err := r.lookupMX(ctx, name)
 	if err != nil {
@@ -636,11 +648,13 @@ func LookupNS(name string) ([]*NS, error) {
 // invalid names, those records are filtered out and an error
 // will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupNS(ctx context.Context, name string) ([]*NS, error) {
-	if dstActive() {
-		if !isDomainName(name) {
-			return nil, newDNSError(errNoSuchHost, name, "")
+	if dstNetEnabled {
+		if dstActive() {
+			if !isDomainName(name) {
+				return nil, newDNSError(errNoSuchHost, name, "")
+			}
+			return nil, dstUnsupportedDNSLookup(name)
 		}
-		return nil, dstUnsupportedDNSLookup(name)
 	}
 	records, err := r.lookupNS(ctx, name)
 	if err != nil {
@@ -704,11 +718,13 @@ func LookupAddr(addr string) (names []string, err error) {
 // domain names. If the response contains invalid names, those records are filtered
 // out and an error will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
-	if dstActive() {
-		if _, err := reverseaddr(addr); err != nil {
-			return nil, err
+	if dstNetEnabled {
+		if dstActive() {
+			if _, err := reverseaddr(addr); err != nil {
+				return nil, err
+			}
+			return nil, dstUnsupportedDNSLookup(addr)
 		}
-		return nil, dstUnsupportedDNSLookup(addr)
 	}
 	names, err := r.lookupAddr(ctx, addr)
 	if err != nil {

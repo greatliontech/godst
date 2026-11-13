@@ -25,11 +25,6 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   steering — its own design). The gcStart twin is enforced; the assist twin
   survives every current suite when dropped. See
   [gc-assist-membership-carry-unenforced.md](gc-assist-membership-carry-unenforced.md).
-- **callback batch loops discriminate their driver two ways** — Lands: user
-  decision. `runFinqBlocks` compares against `fing`, `runCleanupBlock`
-  consults `findfunc`; one role mechanism would serve both and delete the
-  lookup from the tagged path. See
-  [callback-loop-driver-discrimination.md](callback-loop-driver-discrimination.md).
 - **sysmonUpdateGOMAXPROCS's run-active guards have no enforcing test** —
   Lands: user decision. The pre-push skip (prevents a mid-run STW the
   helper's own gate cannot) and the under-lock recheck (rare second-pusher

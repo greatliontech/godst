@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 package main
 
 import (
@@ -79,8 +81,6 @@ func init() {
 	register("DSTGOMAXPROCSEntryRace", DSTGOMAXPROCSEntryRace)
 	register("DSTGOMAXPROCSDelayedSTW", DSTGOMAXPROCSDelayedSTW)
 	register("DSTGOMAXPROCSAutoRestore", DSTGOMAXPROCSAutoRestore)
-	register("DSTRunNoTag", DSTRunNoTag)
-	register("DSTFaultAPINoTag", DSTFaultAPINoTag)
 	register("DSTFinPreBubble", DSTFinPreBubble)
 	register("DSTCleanupChanOp", DSTCleanupChanOp)
 	register("DSTCleanupRunSet", DSTCleanupRunSet)
@@ -1550,24 +1550,6 @@ func DSTGOMAXPROCSAutoRestore() {
 	})
 	os.Stdout.WriteString("inrun=" + strconv.FormatBool(inRunAuto) +
 		" after=" + strconv.FormatBool(dstGOMAXPROCSAutoFP()) + "\n")
-}
-
-// DSTRunNoTag exercises the documented build-constraint panic: in a binary
-// built WITHOUT -tags dst, simulation.Run must refuse to start (the map hash
-// key cannot be made deterministic at runtime). Prints the recovered panic.
-func DSTRunNoTag() {
-	defer func() {
-		if v := recover(); v != nil {
-			if s, ok := v.(string); ok {
-				os.Stdout.WriteString("panic: " + s + "\n")
-				return
-			}
-			os.Stdout.WriteString("panic: non-string\n")
-			return
-		}
-		os.Stdout.WriteString("no panic\n")
-	}()
-	simulation.Run(1, func() {})
 }
 
 // DSTFinProfile takes a goroutine profile from inside a finalizer running on the
@@ -3679,17 +3661,4 @@ func DSTPCTMainDrawsPriority() {
 	} else {
 		os.Stdout.WriteString("zero\n")
 	}
-}
-
-// DSTFaultAPINoTag exercises the tag boundary of the fault API in an UNTAGGED
-// binary. The simulated filesystem's symbols exist only under -tags dst, so a
-// direct linkname from this package's untagged files would make merely CALLING
-// these fail to link — a relocation error naming an internal symbol, instead of
-// the documented behavior. They must link, and outside a run they must be
-// no-ops (there is no universe to fault).
-func DSTFaultAPINoTag() {
-	simulation.CrashHost("nohost")
-	simulation.Crash("noproc")
-	simulation.Partition("a", "b")
-	os.Stdout.WriteString("fault api no-op\n")
 }

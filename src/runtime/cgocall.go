@@ -146,8 +146,10 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 	// never calls in-run). Here getg() is the calling user goroutine (cgocall
 	// runs on the g stack before asmcgocall switches to g0), so dstFenceActive
 	// tests the bubble directly. Folds away in stock builds (dstBuild const).
-	if dstBuild && dstFenceActive() {
-		dstCgoRefuse()
+	if dstBuild {
+		if dstFenceActive() {
+			dstCgoRefuse()
+		}
 	}
 
 	if raceenabled {

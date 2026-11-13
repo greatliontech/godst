@@ -1036,14 +1036,6 @@ const doubleCheckMalloc = false
 // mallocgc implementation: the experiment must be enabled, and none of the sanitizers should
 // be enabled. The tables used to select the size-specialized malloc function do not compile
 // properly on plan9, so size-specialized malloc is also disabled on plan9.
-// !dstBuild: under -tags dst, route every heap allocation through the mallocgc
-// dispatcher rather than the compiler-emitted per-size-class fast paths, so the
-// DST per-bubble allocation accounting and trigger check (dstHeapAlloc; see below
-// in mallocgc) have a single choke point. The size-specialized
-// experiment is off by default and already off under -race/-msan/-asan, so this
-// only matters if it is explicitly enabled together with -tags dst; the guard
-// keeps DST determinism robust to that. dstBuild is a constant, so this is free
-// (and unchanged) in non-dst builds.
 const sizeSpecializedMallocEnabled = goexperiment.SizeSpecializedMalloc && GOOS != "plan9" && !asanenabled && !raceenabled && !msanenabled && !valgrindenabled && !dstBuild
 
 // runtimeFreegcEnabled is the set of conditions where we enable the runtime.freegc
@@ -1210,95 +1202,8 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if debug.malloc {
 		postMallocgcDebug(x, elemsize, typ)
 	}
-
-	if dstActive() {
-		// Accumulate this object's size-class size (elemsize) into the per-bubble
-		// allocation counter, then check the DST heap trigger — on EVERY allocation,
-		// not only at span grabs. The DST trigger fires when dstHeapAlloc crosses a
-		// per-object target (floor, or the GOGC ratio of heapMarked), so the cycle
-		// boundary lands at the exact, deterministic allocation rather than at a
-		// span-grab boundary (heapLive advances span-granularly, mcache.go), which
-		// varies run to run with the entry span-fill phase. That makes *which* GC
-		// cycle discovers a given object a deterministic function of the seed in
-		// normal AND -race builds. elemsize matches heapMarked's units (the GC counts
-		// the slot size), so the GOGC-scaled comparison is exact, and it is
-		// deterministic and -race-invariant (size classes do not change under -race,
-		// which uses shadow memory, not redzones). Under -tags dst the
-		// size-specialized fast paths are disabled (sizeSpecializedMallocEnabled), so
-		// every heap allocation passes through here exactly once with elemsize set. x
-		// is already published (publicationBarrier/gcmarknewobject ran and mp.mallocing
-		// is reset), so a GC started here will not collect it.
-		if cur := getg().m.curg; cur != nil && cur.dstSimG {
-			// Only the simulation bubble's own allocations reach the counters
-			// and the trigger. Sticky membership remains set while GC paths
-			// temporarily clear cur.bubble; foreign goroutines never acquire it.
-			if dstIsInternalPooledType(typ) {
-				if typ != dstInternalPooledTypes.g {
-					// sudog/_defer count here by type. g's count at their
-					// allgadd publication instead: only allgs-pinned g's are
-					// provably immortal (allocm's g0/gsignal reach this
-					// branch with a bubble m.curg too, but can die via
-					// sched.freem — counting one would break
-					// counted-implies-live).
-					dstPooledAlloc.Add(int64(elemsize))
-				}
-				// A pooled struct (g/sudog/_defer) allocated on behalf of a
-				// bubble goroutine — on EITHER stack: malg allocates the g
-				// struct on systemstack with m.curg still the creating bubble
-				// goroutine. EXCLUDED from the trigger counter because whether
-				// one is allocated or reused from its cross-run-surviving
-				// cache (gFree / sudogcache / deferpool) is a pooling artifact
-				// of pre-run process history, not SUT heap growth — counting
-				// it would move the GC cycle boundary run-to-run for
-				// channel/goroutine-heavy SUTs (gc.md M4; no cache flush:
-				// flushing gFree would leak, allgs pins g's forever). But
-				// TRACKED here: the allocated ones stay live at every in-run
-				// mark (allgs; the caches, central ones uncleared while a run
-				// is active), so the target computation subtracts them back
-				// out of heapMarked (dstPooledMarked) — otherwise a cold run's
-				// fresh pool allocations inflate the GOGC-scaled target
-				// relative to a warmed rerun that reuses them, shifting the
-				// last cycle's discovery boundary and its tail.
-			} else if getg() == cur {
-				// getg() == cur excludes allocations the runtime performs ON
-				// SYSTEMSTACK on the bubble goroutine's behalf (m.curg is still
-				// the bubble goroutine there) that are not pooled structs:
-				// runtime bookkeeping whose size and timing depend on
-				// process-wide history — e.g. newproc1's allgs-append growth,
-				// whose old backing arrays also DIE mid-run, so it cannot be
-				// tracked as live like the pooled structs above — not SUT heap
-				// growth. Counting one would shift the crossing run-to-run,
-				// and a crossing latched on g0 cannot start the GC anyway
-				// (gcStart bails on g0), which would leak the start to a
-				// later, possibly foreign, allocation (gc.md M4). Stacks are
-				// already excluded entirely (stackalloc, not mallocgc).
-				//
-				// Also attribute the object to the allocating goroutine's
-				// process (per-process allocation accounting, the OOM-fault
-				// metric; see dstProcAllocAdd). Same gate, same elemsize —
-				// deterministic allocation flow per process. No-op for the
-				// un-budgeted root (dstProc 0).
-				dstHeapAlloc.Add(int64(elemsize))
-				dstProcAllocAdd(cur.dstProc, int64(elemsize))
-			}
-			if getg() == cur {
-				// The crossing fires on the BUBBLE's OWN allocation: evaluate
-				// the trigger and start the GC only inside this gate, never
-				// for a foreign/infra allocation that happens next — otherwise
-				// a crossing latched by a bubble allocation that could not
-				// start GC at that point (e.g. m.locks > 1) would leak the
-				// start to an unseeded process-wide allocation (gc.md M4). An
-				// excluded-type allocation still runs the test (dstHeapAlloc
-				// is unchanged, so it only re-checks a possibly-already-crossed
-				// target) — a deterministic bubble point to start a GC the
-				// previous SUT allocation could not. A systemstack allocation
-				// does not (gcStart bails on g0; the next user-stack bubble
-				// allocation re-checks).
-				if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-					gcStart(t)
-				}
-			}
-		}
+	if dstBuild {
+		dstMallocgcPost(x, elemsize, typ)
 	}
 	return x
 }
@@ -1435,11 +1340,13 @@ func mallocgcTiny(size uintptr, typ *_type) (unsafe.Pointer, uintptr) {
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger && !dstActive() {
-		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
-		// and starts the DST-armed cycle only inside the bubble-allocation gate,
-		// so a span-grab reached by a foreign/infra allocation must not start a
-		// cycle a bubble allocation latched but could not start (gc.md M4).
+	if dstBuild {
+		if checkGCTrigger && !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+				gcStart(t)
+			}
+		}
+	} else if checkGCTrigger {
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1551,11 +1458,13 @@ func mallocgcSmallNoscan(size uintptr, typ *_type, needzero bool) (unsafe.Pointe
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger && !dstActive() {
-		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
-		// and starts the DST-armed cycle only inside the bubble-allocation gate,
-		// so a span-grab reached by a foreign/infra allocation must not start a
-		// cycle a bubble allocation latched but could not start (gc.md M4).
+	if dstBuild {
+		if checkGCTrigger && !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+				gcStart(t)
+			}
+		}
+	} else if checkGCTrigger {
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1695,11 +1604,13 @@ func mallocgcSmallScanNoHeader(size uintptr, typ *_type) (unsafe.Pointer, uintpt
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger && !dstActive() {
-		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
-		// and starts the DST-armed cycle only inside the bubble-allocation gate,
-		// so a span-grab reached by a foreign/infra allocation must not start a
-		// cycle a bubble allocation latched but could not start (gc.md M4).
+	if dstBuild {
+		if checkGCTrigger && !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+				gcStart(t)
+			}
+		}
+	} else if checkGCTrigger {
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1792,11 +1703,13 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	mp.mallocing = 0
 	releasem(mp)
 
-	if checkGCTrigger && !dstActive() {
-		// Under DST the mallocgc dispatcher owns the heap trigger: it evaluates
-		// and starts the DST-armed cycle only inside the bubble-allocation gate,
-		// so a span-grab reached by a foreign/infra allocation must not start a
-		// cycle a bubble allocation latched but could not start (gc.md M4).
+	if dstBuild {
+		if checkGCTrigger && !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+				gcStart(t)
+			}
+		}
+	} else if checkGCTrigger {
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)
 		}
@@ -1870,13 +1783,15 @@ func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uin
 	mp.mallocing = 0
 	releasem(mp)
 
-	// Check to see if we need to trigger the GC. Under DST the mallocgc
-	// dispatcher owns the heap trigger (evaluated and started only inside the
-	// bubble-allocation gate; gc.md M4).
-	if !dstActive() {
-		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-			gcStart(t)
+	// Check to see if we need to trigger the GC.
+	if dstBuild {
+		if !dstActive() {
+			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+				gcStart(t)
+			}
 		}
+	} else if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+		gcStart(t)
 	}
 
 	// Objects can be zeroed late in a context where preemption can occur.

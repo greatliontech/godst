@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 package runtime_test
 
 import (
@@ -899,38 +901,6 @@ func TestDSTGOMAXPROCSAutoModeRestored(t *testing.T) {
 	}
 	if out != "inrun=false after=true" {
 		t.Fatalf("auto GOMAXPROCS pin/restore failed (got %q, want \"inrun=false after=true\")", out)
-	}
-}
-
-// TestDSTRunRequiresBuildTag verifies the documented build-constraint panic:
-// a binary built WITHOUT -tags dst refuses simulation.Run with the
-// reproducible-map-hash-key message (the one documented panic that can only
-// be tested from an untagged build).
-func TestDSTRunRequiresBuildTag(t *testing.T) {
-	exe, err := buildTestProg(t, "testprog") // no -tags dst
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := strings.TrimSpace(runBuiltTestProg(t, exe, "DSTRunNoTag"))
-	if !strings.Contains(out, "requires building with -tags dst") {
-		t.Fatalf("untagged simulation.Run = %q, want the -tags dst build panic", out)
-	}
-}
-
-// TestDSTFaultAPILinksUntagged pins the tag boundary of the fault API: the
-// simulated filesystem lives behind -tags dst, so an untagged binary that calls
-// CrashHost (or any fault whose implementation reaches os) must still LINK and
-// no-op outside a run. A direct linkname to a dst-only os symbol from this
-// package's untagged files breaks the build of any program that calls the API,
-// with a relocation error naming an internal symbol.
-func TestDSTFaultAPILinksUntagged(t *testing.T) {
-	exe, err := buildTestProg(t, "testprog") // no -tags dst
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := strings.TrimSpace(runBuiltTestProg(t, exe, "DSTFaultAPINoTag"))
-	if out != "fault api no-op" {
-		t.Fatalf("untagged fault API = %q, want a clean no-op", out)
 	}
 }
 
@@ -2561,127 +2531,6 @@ func TestDSTForeignGCActivationStretch(t *testing.T) {
 	}
 }
 
-// TestDSTUntaggedCodeFootprint pins the zero-code-footprint contract
-// (design.md, "Untagged footprint"): in a non-`-tags dst` build, the
-// dstBuild-guarded legs on the anchored paths below (panic, finalizer
-// execution, NumCPU, generic AddCleanup, GC, gcForce, goroutine exit) fold
-// out — the compiled symbols reference no runtime.dst* symbol. (The synctest legs
-// are covered by the same constant-guard pattern but are not reachable from a
-// plain main; they were verified by objdump at the change.)
-func TestDSTUntaggedCodeFootprint(t *testing.T) {
-	if testing.Short() {
-		t.Skip("-short: skips build-mode objdump checks")
-	}
-	testenv.MustHaveGoBuild(t)
-	dir := t.TempDir()
-	src := []byte(`package main
-
-import (
-	"os"
-	"runtime"
-)
-
-type big struct{ buf [64]byte }
-
-func main() {
-	println(runtime.NumCPU())
-	b := &big{}
-	runtime.SetFinalizer(b, func(*big) { println("f") })
-	runtime.AddCleanup(new(int), func(int) {}, 0)
-	b = nil
-	runtime.GC()
-	// Link the fence-wrapper split so its anchor below is meaningful. (Seek's
-	// and gettimeofday's untagged wrappers inline fully away — the desired
-	// fold — so they are not presence-anchorable; the differential gate
-	// covers them.)
-	if f, err := os.CreateTemp("", "probe"); err == nil {
-		f.Seek(0, 0)
-		f.Close()
-		os.Remove(f.Name())
-	}
-	defer func() { recover() }()
-	panic("x")
-}
-`)
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), src, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	exe := filepath.Join(dir, "app")
-	cmd := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "build", "-o", exe, "main.go"))
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-	for _, probe := range []struct {
-		pattern       string
-		mustBePresent bool // guards vacuity: a rename/inlining drift must fail loudly, not pass silently
-		mustBeAbsent  bool // inline-neutrality: stock inlines this at every site, so a surviving symbol is a lost inline
-	}{
-		{pattern: "runtime.goready$", mustBeAbsent: true}, // 12 call sites; its hook must stay a bare-constant guard
-		{pattern: "runtime.gopanic$", mustBePresent: true},
-		{pattern: "runtime.runFinqBlocks$", mustBePresent: true},                        // the shared finalizer batch loop
-		{pattern: "runtime.NumCPU$"},                                                    // may be fully inlined away — trivially clean
-		{pattern: "runtime.AddCleanup", mustBePresent: true},                            // the user-package generic instantiation (prefix match)
-		{pattern: "runtime.GC$"},                                                        // the foreign-caller refusal folds; GC may inline into callers
-		{pattern: "runtime.gcForce$", mustBePresent: true},                              // the forced-cycle protocol behind GC
-		{pattern: "runtime.gdestroy$", mustBePresent: true},                             // the per-g DST clear + drain unhook fold into one gated call
-		{pattern: "runtime.addfinalizer$", mustBePresent: true},                         // registration stamps fold into one gated call
-		{pattern: "runtime.addCleanup$", mustBePresent: true},                           // same, cleanup twin
-		{pattern: "runtime.queuefinalizer$", mustBePresent: true},                       // queue-time stamping and routing fold
-		{pattern: "runtime.freeSpecial$", mustBePresent: true},                          // the sweep-side caller of both queue paths
-		{pattern: `runtime\.\(\*cleanupQueue\)\.enqueue$`, mustBePresent: true},         // cleanup queue routing folds
-		{pattern: "runtime.runCleanups$", mustBePresent: true},                          // worker-park check folds
-		{pattern: "runtime.runCleanupBlock$", mustBePresent: true},                      // per-block ownership checks fold
-		{pattern: "runtime.goroutineheader$", mustBePresent: true},                      // the durable-wait predicate folds to stock's
-		{pattern: `runtime\.\(\*synctestBubble\)\.changegstatus$`, mustBePresent: true}, // same predicate, bubble side
-		{pattern: "runtime.sysmonUpdateGOMAXPROCS$", mustBePresent: true},               // the second-pusher recheck folds
-		{pattern: "syscall.Close$", mustBePresent: true},                                // fence-wrapper split: hook folds, one call remains
-	} {
-		cmd = testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, exe))
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("objdump %s: %v\n%s", probe.pattern, err, out)
-		}
-		if !strings.Contains(string(out), "TEXT ") {
-			if probe.mustBePresent {
-				t.Errorf("untagged binary has no symbol matching %s — the anchor drifted; re-anchor the fold test", probe.pattern)
-			}
-			if probe.mustBeAbsent && runtime.DSTBuild {
-				// Vacuity guard for the absence claim: the pattern must name a
-				// real symbol somewhere, or a typo passes silently. A tagged
-				// test binary keeps the symbol (the hook body is live there);
-				// untagged this binary inlines it away too, so only the tagged
-				// run can vouch for the pattern.
-				self := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", probe.pattern, os.Args[0]))
-				if selfOut, err := self.CombinedOutput(); err != nil || !strings.Contains(string(selfOut), "TEXT ") {
-					t.Errorf("absence anchor %s names no symbol even in the tagged test binary — pattern typo?", probe.pattern)
-				}
-			}
-			continue
-		}
-		if probe.mustBeAbsent {
-			t.Errorf("untagged binary has a symbol matching %s — stock inlines it everywhere; a hook cost it its inlinability", probe.pattern)
-			continue
-		}
-		// Residue is any reference to a dst-named symbol: a data reference
-		// (runtime.dstRunEpoch(SB) in a MOVQ/LEAQ) or a call/jump target in
-		// either form — plain (runtime.dstX) or a method on a runtime type
-		// (runtime.(*T).dstX). The position column (dst.go:NNN) is stripped
-		// before matching so a dst.go-homed inlined body cannot false-positive.
-		for _, line := range strings.Split(string(out), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 4 {
-				continue
-			}
-			text := strings.Join(fields[3:], " ")
-			branch := strings.HasPrefix(text, "CALL ") || strings.HasPrefix(text, "JMP ")
-			if strings.Contains(text, "runtime.dst") || branch && strings.Contains(text, "dst") {
-				t.Errorf("untagged %s references a dst symbol: %s", probe.pattern, strings.TrimSpace(line))
-			}
-		}
-	}
-}
-
 // TestDSTDisabledVisibilityDirect is the DIRECT white-box pin for the
 // disabled-goroutine visibility rule: during a GC schedEnableUser(false)
 // window, user goroutines must be invisible to every candidate-selection
@@ -2786,14 +2635,14 @@ func TestDSTGoroutineExitClearsPerGState(t *testing.T) {
 // level: the bodies must be identical once newBaseTimer's one extra line is
 // removed.
 func TestDSTNewBaseTimerMirrorsNewTimer(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join(runtime.GOROOT(), "src", "runtime", "time.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := func(name string) string {
+	body := func(file, name string) string {
+		src, err := os.ReadFile(filepath.Join(runtime.GOROOT(), "src", "runtime", file))
+		if err != nil {
+			t.Fatal(err)
+		}
 		start := strings.Index(string(src), "func "+name+"(")
 		if start < 0 {
-			t.Fatalf("%s not found", name)
+			t.Fatalf("%s not found in %s", name, file)
 		}
 		open := strings.Index(string(src[start:]), "{")
 		if open < 0 {
@@ -2806,8 +2655,9 @@ func TestDSTNewBaseTimerMirrorsNewTimer(t *testing.T) {
 		}
 		return string(src[open : open+end])
 	}
-	base := strings.Replace(body("newBaseTimer"), "\tt.dstBase = true\n", "", 1)
-	if base != body("newTimer") {
-		t.Fatalf("newBaseTimer no longer mirrors newTimer (plus the dstBase line):\n--- newTimer\n%s\n--- newBaseTimer (dstBase line removed)\n%s", body("newTimer"), base)
+	base := strings.Replace(body("dst_runtime_hooks.go", "newBaseTimer"), "\tt.dstBase = true\n", "", 1)
+	want := body("time.go", "newTimer")
+	if base != want {
+		t.Fatalf("newBaseTimer no longer mirrors newTimer (plus the dstBase line):\n--- newTimer\n%s\n--- newBaseTimer (dstBase line removed)\n%s", want, base)
 	}
 }

@@ -177,9 +177,13 @@ func (m *Mutex) lockSlow() {
 				waitStartTime = runtime_nanotime()
 			}
 			runtime_SemacquireMutex(&m.sema, queueLifo, 2)
-			if dstMutexVirtualStarvation && runtime_dstMutexWaitVirtual() {
-				lostWakes++
-				starving = starving || lostWakes > dstStarvationWakeThreshold
+			if dstMutexVirtualStarvation {
+				if runtime_dstMutexWaitVirtual() {
+					lostWakes++
+					starving = starving || lostWakes > dstStarvationWakeThreshold
+				} else {
+					starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
+				}
 			} else {
 				starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
 			}
@@ -235,8 +239,10 @@ func (m *Mutex) Unlock() {
 
 	// Fast path: drop lock bit.
 	new := atomic.AddInt32(&m.state, -mutexLocked)
-	if dstHookEnabled && (new+mutexLocked)&mutexLocked != 0 {
-		dstSyncRelease(m)
+	if dstHookEnabled {
+		if (new+mutexLocked)&mutexLocked != 0 {
+			dstSyncRelease(m)
+		}
 	}
 	if new != 0 {
 		// Outlined slow path to allow inlining the fast path.

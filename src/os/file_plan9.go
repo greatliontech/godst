@@ -140,8 +140,7 @@ func openDirNolog(name string) (*File, error) {
 	if e != nil {
 		return nil, e
 	}
-	// openDirNolog: the stat's result never escapes (IsDir check only).
-	d, e := fstatNolog(f)
+	d, e := f.Stat()
 	if e != nil {
 		f.Close()
 		return nil, e
@@ -196,16 +195,6 @@ func (f *File) Stat() (FileInfo, error) {
 	if f == nil {
 		return nil, ErrInvalid
 	}
-	// See stat_unix.go: an fd-based stat is an observation of the
-	// opened identity's metadata and must reach the test log; the log
-	// line belongs to the public method only.
-	testlog.Stat(f.name)
-	return fstatNolog(f)
-}
-
-// fstatNolog is (*File).Stat with no test logging, for stdlib-internal
-// stats whose result does not escape to the caller.
-func fstatNolog(f *File) (FileInfo, error) {
 	d, err := dirstat(f)
 	if err != nil {
 		return nil, err

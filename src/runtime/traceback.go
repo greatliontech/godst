@@ -1313,9 +1313,16 @@ func goroutineheader(gp *g) {
 	if isScan {
 		print(" (scan)")
 	}
-	if bubble := gp.bubble; bubble != nil &&
+	if dstBuild {
+		if bubble := gp.bubble; bubble != nil &&
+			gpstatus == _Gwaiting &&
+			(gp.waitreason.isIdleInSynctest() || dstDurableMutexWait(gp)) &&
+			!stringslite.HasSuffix(status, "(durable)") {
+			print(" (durable)")
+		}
+	} else if bubble := gp.bubble; bubble != nil &&
 		gpstatus == _Gwaiting &&
-		idleInSynctestOrDurableWait(gp) &&
+		gp.waitreason.isIdleInSynctest() &&
 		!stringslite.HasSuffix(status, "(durable)") {
 		// If this isn't a status where the name includes a (durable)
 		// suffix to distinguish it from the non-durable form, add it here.
@@ -1496,20 +1503,10 @@ func isSystemGoroutine(gp *g, fixed bool) bool {
 	if f.funcID == abi.FuncID_runtime_main || f.funcID == abi.FuncID_corostart || f.funcID == abi.FuncID_handleAsyncEvent {
 		return false
 	}
-	// dstBuild-gated: synctestGCDrainPC is only ever set by the dst drain
-	// spawn, so untagged builds fold this comparison away entirely.
-	if dstBuild && synctestGCDrainPC != 0 && gp.startpc == synctestGCDrainPC {
-		// The DST per-bubble finalizer-drain goroutine runs user finalizer
-		// callbacks inside a synctest bubble. Like runFinalizers it is a runtime
-		// goroutine that executes user code, but unlike the process-global fing it
-		// is bubble-scoped, so it must always be a user goroutine: newproc1 only
-		// gives g.bubble to user goroutines (invariant DST-FIN-1), and the synctest
-		// deadlock detector must account for it. Identified by PC (the idiom the
-		// runtime uses for sighandler); the PC is held in a var rather than taken
-		// via abi.FuncPCABIInternal here to avoid a package initialization cycle
-		// (isSystemGoroutine is reachable from the mallocScanTable initializer and
-		// the drain body reaches mallocgc). See synctestGCDrainPC.
-		return false
+	if dstBuild {
+		if dstIsSynctestGCDrainG(gp) {
+			return false
+		}
 	}
 	if f.funcID == abi.FuncID_runFinalizers {
 		// We include the finalizer goroutine if it's calling

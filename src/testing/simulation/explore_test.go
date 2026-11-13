@@ -22,36 +22,6 @@ import (
 	"unsafe"
 )
 
-//go:linkname dstAccessYield runtime.dstAccessYield
-func dstAccessYield(addr unsafe.Pointer, write bool)
-
-//go:linkname dstFilterForceConservativeFP runtime.dstFilterForceConservativeFP
-func dstFilterForceConservativeFP(on bool)
-
-//go:linkname dstAccessYieldRange runtime.dstAccessYieldRange
-func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool)
-
-//go:linkname dstAccessYieldFP runtime.dstAccessYieldFP
-func dstAccessYieldFP() uint64
-
-//go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
-func dstAccessYieldReset()
-
-//go:linkname dstYieldPoint runtime.dstYieldPoint
-func dstYieldPoint()
-
-//go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
-func dstSetPostGoYield(enabled bool) bool
-
-//go:linkname dstRunningPanicDefersFP runtime.dstRunningPanicDefersFP
-func dstRunningPanicDefersFP() uint32
-
-//go:linkname dstCurrentSeqFP runtime.dstCurrentSeqFP
-func dstCurrentSeqFP() uint64
-
-//go:linkname dstSyncEventOverflowProbe runtime.dstSyncEventOverflowFP
-func dstSyncEventOverflowProbe() bool
-
 func assertUniqueEnabledSeqs(t *testing.T, tr exploreTrace) {
 	t.Helper()
 	for i, enabled := range tr.enabled {
@@ -3304,9 +3274,6 @@ func TestExploreSyncEventOverflowReportsIncomplete(t *testing.T) {
 		t.Fatalf("sync-event overflow did not mark the trace incomplete — a dropped HB event can silently lose a class")
 	}
 }
-
-//go:linkname dstAccPageCharge runtime.dstAccPageCharge
-func dstAccPageCharge(size uintptr) uintptr
 
 // TestExploreAccPageChargeAddressIndependent pins the M17 fix: the access-filter's
 // page-node capacity charge is a function of the access SIZE alone — the exact

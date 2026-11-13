@@ -915,16 +915,10 @@ func (c *gcControllerState) releaseNextGCMarkWorker(pp *p) {
 func (c *gcControllerState) resetLive(bytesMarked uint64) {
 	c.heapMarked = bytesMarked
 	c.heapLive.Store(bytesMarked)
-	if dstActive() {
-		// Re-baseline the per-bubble allocation counter at the same point heapLive
-		// resets to heapMarked, so it measures bytes allocated *since this GC* — the
-		// deterministic, per-object analogue of heapLive - heapMarked that drives the
-		// DST heap trigger. See runtime/dst.go dstHeapAlloc.
-		dstHeapAlloc.Store(0)
-		// Snapshot the pooled-struct bytes contained in this heapMarked, at
-		// the same STW point that sets it, so the trigger's target
-		// computation can subtract them consistently (see dstPooledMarked).
-		dstPooledMarked.Store(dstPooledAlloc.Load())
+	if dstBuild {
+		if dstActive() {
+			dstGCResetLive()
+		}
 	}
 	c.heapScan.Store(uint64(c.heapScanWork.Load()))
 	c.lastHeapScan = uint64(c.heapScanWork.Load())
@@ -1335,21 +1329,6 @@ func (c *gcControllerState) commit(isSweepDone bool) {
 	// Furthermore, by setting the runway so that CPU resources are divided
 	// this way, assuming that the cons/mark ratio is correct, we make that
 	// division a reality.
-	//
-	// Note on DST: runway is intentionally NOT special-cased here, even though it
-	// is the only trigger input derived from wall-clock time (via consMark, whose
-	// idleUtilization term carries idle-mark-worker time — assists are 0 under STW,
-	// but idle mark workers still run because gcForceBlockMode does not set
-	// debug.gcstoptheworld). Pinning runway to a constant was tried and removed: it
-	// does NOT make the trigger deterministic, because the trigger also depends on
-	// heapLive/heapMarked (via the goal and sweepDistMinTrigger), which carry
-	// run-to-run accounting noise of their own (process heap history at bubble
-	// entry, internal allocations) that cascades through the trigger feedback loop.
-	// Byte-exact trigger determinism is therefore neither achievable here nor
-	// required: what DST guarantees is OBSERVABLE program determinism (allocation
-	// results, scheduling, and — via STW eliminating concurrent floating garbage —
-	// the GC count), which holds with or without a runway override. So we leave the
-	// production runway formula untouched. See docs/dst/gc.md (Tier 2, D1).
 	c.runway.Store(uint64((c.consMark * (1 - gcGoalUtilization) / (gcGoalUtilization)) * float64(c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load())))
 }
 
@@ -1375,11 +1354,7 @@ func (c *gcControllerState) setGCPercent(in int32) int32 {
 //go:linkname setGCPercent runtime/debug.setGCPercent
 func setGCPercent(in int32) (out int32) {
 	if dstBuild {
-		lock(&dstGCControlLock)
-		if dstForeignForcedGC() {
-			unlock(&dstGCControlLock)
-			dstPanicForeignForcedGC()
-		}
+		dstEnterSetGCPercent()
 	}
 	// Run on the system stack since we grab the heap lock.
 	systemstack(func() {
@@ -1389,7 +1364,7 @@ func setGCPercent(in int32) (out int32) {
 		unlock(&mheap_.lock)
 	})
 	if dstBuild {
-		unlock(&dstGCControlLock)
+		dstExitSetGCPercent()
 	}
 
 	// If we just disabled GC, wait for any concurrent GC mark to

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build race
+//go:build dst && race
 
 // White-box fixture for the DST HB shadow's raceignore mirror: every HB
 // recorder funnels through dstRecordSyncEventForGID, which honors the

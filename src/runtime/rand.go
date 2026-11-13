@@ -42,25 +42,16 @@ func randinit() {
 	}
 
 	seed := &globalRand.seed
-	switch {
-	case dstBuild:
-		// In a DST build (-tags dst), seed the global generator from a fixed
-		// constant so every startup draw from it (heap-base randomization,
-		// per-m generators, anything else taken before activation) is
-		// identical every run. The process-global map hash key no longer
-		// depends on it — internal/runtime/maps derives it from a fixed
-		// constant directly under dst — but the stream cannot be re-seeded at
-		// runtime without corrupting state created before DST activation.
-		// See docs/dst/design.md.
+	if dstBuild {
 		dstFixedSeed(seed)
-	case len(startupRand) >= 16 &&
+	} else if len(startupRand) >= 16 &&
 		// Check that at least the first two words of startupRand weren't
 		// cleared by any libc initialization.
-		!allZero(startupRand[:8]) && !allZero(startupRand[8:16]):
+		!allZero(startupRand[:8]) && !allZero(startupRand[8:16]) {
 		for i, c := range startupRand {
 			seed[i%len(seed)] ^= c
 		}
-	default:
+	} else {
 		if readRandom(seed[:]) != len(seed) || allZero(seed[:]) {
 			// readRandom should never fail, but if it does we'd rather
 			// not make Go binaries completely unusable, so make up
@@ -74,12 +65,6 @@ func randinit() {
 
 	if startupRand != nil {
 		if dstBuild {
-			// Don't consume the global generator to scrub startupRand in a DST
-			// build: keep the hash-key derivation at a fixed stream position.
-			// Still overwrite the OS-provided bytes (with a fixed pattern -
-			// deterministic, no stream draw) so the startup entropy does not
-			// stay readable in memory; a cgo program reading startupRand for
-			// entropy is not a supported configuration in a dst test build.
 			for i := range startupRand {
 				startupRand[i] = 0xA5
 			}
@@ -141,20 +126,6 @@ func allZero(b []byte) bool {
 	return acc == 0
 }
 
-// dstFixedSeed fills the 32-byte global chacha8 key from a fixed constant via
-// splitmix64, for DST builds (see randinit). The value is arbitrary but fixed,
-// so the derived map hash key is the same every run; it is never all-zero.
-func dstFixedSeed(seed *[32]byte) {
-	x := uint64(0x6470736565643031) // "dpseed01"
-	for i := 0; i < len(seed); i += 8 {
-		x += 0x9e3779b97f4a7c15
-		z := x
-		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
-		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-		byteorder.BEPutUint64(seed[i:i+8], z^(z>>31))
-	}
-}
-
 // Used in internal/runtime/maps
 // bootstrapRand returns a random uint64 from the global random generator.
 //
@@ -199,30 +170,16 @@ func rand32() uint32 {
 //go:nosplit
 //go:linkname rand
 func rand() uint64 {
-	gp := getg()
-	if dstActive() && gp.dstrand != 0 {
-		// Under deterministic scheduling, draw from the per-g DST stream. rand is
-		// the source for the math/rand and math/rand/v2 globals (linkname'd to
-		// runtime.rand), for map seeds/iteration (maps.rand), and for
-		// compiler-emitted map seeds and NaN-key hashing — all application-
-		// observable, and all drawn at counts that are a function of the
-		// goroutine's own logical history, so routing them per-g is correct.
-		// The one internal caller drawn at a load-dependent count on a user
-		// goroutine's stack — mrandinit, when a new m is spawned — is exempted
-		// there (it seeds from bootstrapRand under DST). randomizeScheduler's
-		// randn (proc.go) is -race-only and outside DST scope.
-		//
-		// An UNSEEDED goroutine (dstrand == 0 — outside the run-seeded tree)
-		// keeps the per-m path below, as in production: drawing here would
-		// advance the zero-rooted stream and destroy the sentinel dstReadRandom's
-		// entropy gate relies on (INV-CRYPTO unseeded leg; see dstrandUint64).
-		return dstrandUint64(gp)
+	if dstBuild {
+		if x, ok := dstRand(); ok {
+			return x
+		}
 	}
 	// Note: We avoid acquirem here so that in the fast path
 	// there is just a getg, an inlined c.Next, and a return.
 	// The performance difference on a 16-core AMD is
 	// 3.7ns/call this way versus 4.3ns/call with acquirem (+16%).
-	mp := gp.m
+	mp := getg().m
 	c := &mp.chacha8
 	for {
 		// Note: c.Next is marked nosplit,
@@ -241,108 +198,7 @@ func rand() uint64 {
 
 //go:linkname maps_rand internal/runtime/maps.rand
 func maps_rand() uint64 {
-	// rand() already draws map seeds and iteration offsets from the per-g DST
-	// stream under DST, so map order is a function of the
-	// creating and iterating goroutine's logical history, not of which m runs it.
 	return rand()
-}
-
-// dstrandUint64 returns the next value of g's deterministic DST RNG stream,
-// advancing it. It is used only under DST, to make
-// per-goroutine randomness — select poll order, map seed and iteration order,
-// and child-goroutine seeds — a function of the goroutine's own logical history,
-// independent of which m runs it and of runtime-internal RNG draws (work
-// stealing, goroutine tracking) that share the per-m streams. The stream is a
-// splitmix64 sequence keyed by gp.dstrand, seeded as a deterministic tree: the
-// root from the DST seed (dstActivate, or a synctest bubble re-root via
-// dstBubbleRoot) and each child from its parent at newproc1.
-//
-// Callers must never draw from an UNSEEDED g (gp.dstrand == 0): zero is the
-// sentinel dstReadRandom reads as "outside the run-seeded tree — use real OS
-// entropy", and a draw would flip it to the fixed, seed-independent constant
-// below, admitting the goroutine (and, via newproc1, its descendants) into the
-// deterministic crypto stream — the INV-CRYPTO violation the sentinel exists
-// to prevent. Every draw site (rand, select pollorder, fake-timer tie-break)
-// gates on dstrand != 0, newproc1 extends the tree only through seeded
-// parents, and dstDeactivate clears the run caller's surviving root — so
-// dstrand != 0 holds only within the run that seeded it.
-//
-//go:nosplit
-func dstrandUint64(gp *g) uint64 {
-	gp.dstrand += 0x9e3779b97f4a7c15
-	z := gp.dstrand
-	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
-	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-	return z ^ (z >> 31)
-}
-
-// dstrandnRaw returns a deterministic value in [0,n) from g's DST RNG
-// stream, together with the raw 64-bit draw the bounded value was reduced
-// from. The seeded-decision trace records the raw draw as a choice site's
-// ident: a bounded index aliases in the order-independent xorIdent fold when
-// candidate counts are tiny (n=2 folds only 0/1), hiding a frozen stream
-// behind equal folds; the full-width draw keeps the fold's detection strength
-// uniform across sites (the timer site already records its raw key).
-//
-//go:nosplit
-func dstrandnRaw(gp *g, n uint32) (j uint32, raw uint64) {
-	raw = dstrandUint64(gp)
-	return uint32((uint64(uint32(raw)) * uint64(n)) >> 32), raw
-}
-
-// dstReadRandom fills b from the active run's deterministic per-g RNG stream and
-// reports true, or returns false (filling nothing) when no run is active. It is
-// the crypto/rand entropy seam: crypto/internal/sysrand.Read calls it first, so
-// inside a Run all crypto/rand output — UUIDs, TLS nonces, tokens, key material —
-// is a reproducible function of the seed, drawn from the same per-g stream as
-// math/rand. Production crypto is untouched: dstActive() is false outside a run
-// (dstSeed is never set in production — only simulation.Run, which requires
-// -tags dst, sets it), so the OS-entropy path is taken there. The gate is the
-// same cheap atomic load rand() already does on its hot path. Bytes are drawn
-// big-endian per 8-byte word, matching dstFixedSeed.
-//
-//go:linkname dstReadRandom
-func dstReadRandom(b []byte) bool {
-	if !dstActive() {
-		return false
-	}
-	gp := getg()
-	if gp.dstrand == 0 {
-		// This goroutine's per-g stream was never seeded — it was created before
-		// activation, or descends from such a goroutine. The sentinel is stable:
-		// no draw site advances an unseeded stream and newproc1 seeds children
-		// only from seeded parents (see dstrandUint64), so dstrand stays 0 for
-		// the goroutine's lifetime outside the run-seeded tree. Filling from the
-		// zero-rooted stream would hand every such goroutine the SAME fixed,
-		// seed-independent bytes: the exact "predictable outside a run" hole
-		// INV-CRYPTO forbids. Fall through to real OS entropy instead
-		// (docs/dst/design.md, INV-CRYPTO unseeded-goroutine leg).
-		return false
-	}
-	for len(b) >= 8 {
-		byteorder.BEPutUint64(b, dstrandUint64(gp))
-		b = b[8:]
-	}
-	if len(b) > 0 {
-		var tmp [8]byte
-		byteorder.BEPutUint64(tmp[:], dstrandUint64(gp))
-		copy(b, tmp[:])
-	}
-	return true
-}
-
-// dstBubbleRoot derives a synctest bubble's per-g tree root from the process DST
-// seed, independent of the bubble's position in the global goroutine tree. This
-// re-roots the tree per bubble so a bubble's randomness is reproducible
-// regardless of what ran before it in the same process — i.e. a test reproduces
-// identically in isolation. It is a splitmix64 step so the bubble root differs
-// from g0's raw root (schedinit). A future per-bubble seed (the public DST
-// control API) would override this.
-func dstBubbleRoot(seed uint64) uint64 {
-	seed += 0x9e3779b97f4a7c15
-	seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9
-	seed = (seed ^ (seed >> 27)) * 0x94d049bb133111eb
-	return seed ^ (seed >> 31)
 }
 
 // mrandinit initializes the random state of an m.
@@ -353,18 +209,14 @@ func mrandinit(mp *m) {
 	}
 	bootstrapRandReseed() // erase key we just extracted
 	mp.chacha8.Init64(seed)
-	if dstActive() {
-		// Don't seed from rand() under DST: rand() routes through the caller
-		// goroutine's per-g stream, and mrandinit can run on a user goroutine's
-		// stack (ready -> wakep -> newm -> allocm -> mcommoninit -> mrandinit, no
-		// systemstack switch). Drawing here would advance that goroutine's per-g
-		// stream by a load-dependent amount (new-m creation timing) and so
-		// reintroduce the nondeterminism the per-g tree removes. Seed both
-		// per-m generators from the global bootstrap generator instead; the
-		// new m's cheaprand/cheaprand64 are not application-observable under
-		// DST (select/map/math-rand use the per-g stream).
-		mp.cheaprand = uint32(bootstrapRand())
-		mp.cheaprand64 = bootstrapRand()
+	if dstBuild {
+		if dstActive() {
+			mp.cheaprand = uint32(bootstrapRand())
+			mp.cheaprand64 = bootstrapRand()
+		} else {
+			mp.cheaprand = uint32(rand())
+			mp.cheaprand64 = rand()
+		}
 	} else {
 		mp.cheaprand = uint32(rand())
 		mp.cheaprand64 = rand()

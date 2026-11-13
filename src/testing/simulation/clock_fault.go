@@ -4,10 +4,7 @@
 
 package simulation
 
-import (
-	"time"
-	_ "unsafe" // for go:linkname
-)
+import "time"
 
 // Clock faults over the per-host clock seam (docs/dst/faults.md "Clock faults"). A
 // step is a sudden wall-clock jump — an NTP slew/correction — injected during a run,
@@ -18,12 +15,6 @@ import (
 // host — its whole subtree (every process and goroutine) moves together; timer
 // deadlines (time.After, time.NewTimer, context deadlines) read the base clock and are
 // untouched, so they still fire at the same base time. Calls outside a run are no-ops.
-
-//go:linkname dstStepHostClock runtime.dstStepHostClock
-func dstStepHostClock(host uint32, delta int64) bool
-
-//go:linkname dstDriftHostClock runtime.dstDriftHostClock
-func dstDriftHostClock(host uint32, ppb int64)
 
 // StepClock applies an instantaneous wall-clock step to the named host's clock,
 // modeling an NTP slew/correction during the run. A positive delta jumps the host's

@@ -520,20 +520,9 @@ type workType struct {
 // garbage collection is complete. It may also block the entire
 // program.
 func GC() {
-	dstRefuseForeignForcedGC()
-	gcForce()
-}
-
-// gcForce runs the full forced-cycle protocol behind GC, bypassing the
-// foreign-caller refusal. It exists for the activation baseline GC
-// (dstActivate): that cycle runs after the seed store on the activating
-// goroutine, which carries no bubble yet — exactly the position the refusal
-// rejects. The DST runtime's other deterministic cycles (the pre-activation
-// preparation GCs in dstActivate, and the quiescence/stop-drain GCs in
-// synctest, which run on the root goroutine while it carries the bubble)
-// would pass the refusal anyway; they use this entry so the internal
-// protocol is bypass-by-construction, not bypass-by-analysis.
-func gcForce() {
+	if dstBuild {
+		dstBeforeForcedGC()
+	}
 	// We consider a cycle to be: sweep termination, mark, mark
 	// termination, and sweep. This function shouldn't return
 	// until a full cycle has been completed, from beginning to
@@ -561,21 +550,8 @@ func gcForce() {
 	// Wait until the current sweep termination, mark, and mark
 	// termination complete.
 	n := work.cycles.Load()
-	if dstBuild && getg() != dstSimRootG {
-		// Re-run the foreign-caller refusal after the cycle-number capture: a
-		// foreign GC() suspended across simulation activation (entry refusal
-		// read the seed as 0, cooperative preemption landed at this
-		// function's prologue) resumes here, and only the resumption whose n
-		// is post-baseline can hurt — a stale n self-heals (gcStart no-ops on
-		// an already-run cycle number, and a foreign cycle serialized ahead
-		// of the baseline is re-absorbed by it). A post-baseline n means the
-		// load above read the baseline cycle's increment, which makes the
-		// seed store visible to this check — it cannot miss. The activating
-		// goroutine (dstSimRootG, the baseline GC itself) is the one
-		// sanctioned non-bubble caller through here. No deterministic test
-		// can pin this re-check (the window is a wall-clock preemption
-		// race); its guarantee is the synchronizes-with edge just described.
-		dstRefuseForeignForcedGC()
+	if dstBuild {
+		dstAfterCycleCaptureForcedGC()
 	}
 	gcWaitOnMark(n)
 
@@ -621,36 +597,13 @@ func gcForce() {
 	releasem(mp)
 }
 
-// dstGoroutineLeakPendingFP reports whether the goroutine-leak-detection
-// pending flag is armed. White-box probe (testprog): a refused foreign
-// goroutineLeakGC must not have armed it — an armed flag surviving a
-// recovered refusal would put the next cycle anywhere, possibly the
-// simulation's own, into leak-detection mode.
-//
-//go:linkname dstGoroutineLeakPendingFP
-func dstGoroutineLeakPendingFP() bool {
-	return work.goroutineLeak.pending.Load()
-}
-
-// dstGoroutineLeakGCFP invokes the goroutine-leak GC entry; white-box probe
-// (testprog) companion to dstGoroutineLeakPendingFP — the pprof linkname the
-// entry carries is not pullable from a test program.
-//
-//go:linkname dstGoroutineLeakGCFP
-func dstGoroutineLeakGCFP() {
-	goroutineLeakGC()
-}
-
 // goroutineLeakGC runs a GC cycle that performs goroutine leak detection.
 //
 //go:linkname goroutineLeakGC runtime/pprof.runtime_goroutineLeakGC
 func goroutineLeakGC() {
-	// Refuse a foreign caller BEFORE arming the process-global pending flag:
-	// GC() below would refuse too, but by then the flag is set, a recovered
-	// panic (e.g. net/http's handler recoverer) leaks it armed, and the next
-	// cycle anywhere — possibly the simulation's own — silently runs in
-	// leak-detection mode.
-	dstRefuseForeignForcedGC()
+	if dstBuild {
+		dstRefuseForeignForcedGC()
+	}
 	// Set the pending flag to true, instructing the next GC cycle to
 	// perform goroutine leak detection.
 	work.goroutineLeak.pending.Store(true)
@@ -765,90 +718,9 @@ func (t gcTrigger) test() bool {
 	}
 	switch t.kind {
 	case gcTriggerHeap:
-		if dstActive() {
-			// Per-bubble relative trigger: fire when the bubble's allocation since the
-			// last mark (dstHeapAlloc) reaches the GOGC ratio of the bubble's *own*
-			// live set (heapMarked - dstHeapBase), excluding the run-to-run-varying
-			// process baseline. This makes the GC *set level* — numGC and the total
-			// finalizer/weak set discovered — a deterministic function of the bubble's
-			// allocation (the contract, DST-GC-1). The heapMinimum floor is as
-			// production. See docs/dst/gc.md.
-			//
-			// It fires on dstHeapAlloc — bytes summed per-object at allocation
-			// (mallocgc) — NOT physical heapLive. heapLive advances span-granularly
-			// (a whole span when grabbed, mcache.go), so the allocation at which it
-			// crosses the target depends on the entry span-fill phase, which varies
-			// run to run (and is perturbed by -race/binary composition); that moved
-			// *which cycle* discovered a given object. Per-object accumulation crosses
-			// at a deterministic allocation, so per-cycle discovery is a deterministic
-			// function of the seed in normal AND -race builds — not merely the set
-			// level. (A rare sub-object residual remains in the GOGC-scaled target via
-			// the dstHeapBase process baseline; sub-observable, see DST-MEM-1.)
-			hm := gcController.heapMarked
-			base := dstHeapBase.Load()
-			// bubbleMarked is the bubble's *own* live set at the last mark
-			// (heapMarked - dstHeapBase), excluding the run-to-run-varying process
-			// baseline. The bubble's net heap *now* is then bubbleMarked + dstHeapAlloc
-			// (live-at-last-mark + per-object bytes allocated since) — the per-object
-			// deterministic analogue of the physical heapLive - base. Both the memory
-			// limit and the GOGC target are expressed against these, so every crossing
-			// is per-cycle race-deterministic, not just set-level.
-			bubbleMarked := uint64(0)
-			if hm > base {
-				bubbleMarked = hm - base
-			}
-			// Subtract the pooled-struct bytes (g/sudog/_defer) the bubble
-			// allocated since activation: they sit inside heapMarked (live in
-			// allgs and the pools) but whether they were allocated or reused
-			// is pre-run process history — leaving them in would give a cold
-			// process a larger GOGC-scaled target than a warmed one at the
-			// same seed, shifting the last cycle's discovery boundary. The
-			// snapshot is taken at the same STW that set heapMarked, so the
-			// nondeterministic term cancels exactly (see dstPooledAlloc).
-			if pm := dstPooledMarked.Load(); bubbleMarked > pm {
-				bubbleMarked -= pm
-			} else {
-				bubbleMarked = 0
-			}
-			// Deterministic bubble-local memory limit (Options.MemoryLimit). The env
-			// GOMEMLIMIT cannot be honored deterministically under DST — its goal
-			// derives from total mapped memory, which is not bubble-local and varies
-			// run to run (the scavenger is parked and process mmap history/ASLR perturb
-			// it). This knob instead bounds the bubble's *own* net heap
-			// (bubbleMarked + dstHeapAlloc), a deterministic per-object measure, so both
-			// the GC count and *which cycle* discovers each object under the limit are
-			// reproducible (normal and -race). Redefined semantics under DST: "bound
-			// bubble heap growth", not "bound total RSS". When set it is an upper bound
-			// applied on top of the GOGC trigger (GOGC may still fire earlier for a small
-			// live set).
-			if dstMemLimit > 0 && bubbleMarked+dstHeapAlloc.Load() >= uint64(dstMemLimit) {
-				return true
-			}
-			gp := gcController.gcPercent.Load()
-			switch {
-			case gp < 0 && dstMemLimit > 0:
-				// GOGC=off with a memory limit: the heap is bounded solely by the limit
-				// (handled above); do not also apply the floor, which would undercut a
-				// limit set above defaultHeapMinimum.
-				return false
-			case gp < 0:
-				// GOGC=off, no limit. Production would leave the heap unbounded; so a
-				// GOGC=off bubble that allocates is still *deterministically* bounded
-				// rather than growing without limit, fall back to a fixed floor instead
-				// of never triggering. Use the constant defaultHeapMinimum, not
-				// gcController.heapMinimum, which is defaultHeapMinimum*GOGC/100 and so
-				// overflows to garbage when GOGC=off (gcPercent == -1). Bubbles that
-				// allocate below this floor (e.g. the logical-only DST tests) never GC.
-				return dstHeapAlloc.Load() >= defaultHeapMinimum
-			default:
-				// Per-bubble relative target: the GOGC ratio of the bubble's own live
-				// set, so the GC count and the total finalizer/weak set are a
-				// deterministic function of the bubble's allocation.
-				target := bubbleMarked * uint64(gp) / 100
-				if target < gcController.heapMinimum {
-					target = gcController.heapMinimum
-				}
-				return dstHeapAlloc.Load() >= target
+		if dstBuild {
+			if dstActive() {
+				return dstGCTriggerHeapTest()
 			}
 		}
 		trigger, _ := gcController.trigger()
@@ -891,14 +763,10 @@ func gcStart(trigger gcTrigger) {
 		// but avoids any contamination between GC and synctest.
 		bubble := gp.bubble
 		if dstBuild {
-			// Also carry the simulation membership across the disassociation
-			// (dstGCInternal stands in for dstSimG while gp.bubble is nil);
-			// the else branch keeps the stock text for untagged builds.
-			gcInternal := gp.dstGCInternal
+			gcInternal := dstEnterGCDisassociate(gp)
 			gp.bubble = nil
-			gp.dstGCInternal = gp.dstSimG
 			defer func() {
-				gp.dstGCInternal = gcInternal
+				dstExitGCDisassociate(gp, gcInternal)
 				gp.bubble = bubble
 			}()
 		} else {
@@ -941,14 +809,10 @@ func gcStart(trigger gcTrigger) {
 	} else if debug.gcstoptheworld == 2 {
 		mode = gcForceBlockMode
 	}
-	if dstActive() {
-		// DST: force stop-the-world GC with synchronous sweep. Concurrent mark
-		// would interleave nondeterministically with runnable bubble goroutines,
-		// and lazy/proportional sweep would float finalizer/weak-handle discovery
-		// order; gcForceBlockMode does mark and sweep with the world stopped, so
-		// the whole cycle is a deterministic function of the (deterministic) heap.
-		// See docs/dst/gc.md (Tier 2, D2/D3).
-		mode = gcForceBlockMode
+	if dstBuild {
+		if dstActive() {
+			mode = gcForceBlockMode
+		}
 	}
 
 	// Ok, we're doing it! Stop everybody else
@@ -2347,23 +2211,10 @@ func clearpools() {
 		atomicstorep(p, nil)
 	}
 
-	if dstBuild && dstActive() {
-		// While a simulation run is active, leave the central sudog/defer
-		// caches alone too (per-P caches are always left alone): the DST
-		// trigger's target computation subtracts the pooled-struct bytes the
-		// bubble allocated since activation (dstPooledAlloc), and that
-		// cancellation is exact only if counted structs stay live at every
-		// in-run mark — a central-cache drop would let some die mid-run at a
-		// pool-traffic-dependent point. The caches are cleared by the first
-		// cycle after deactivation; growth meanwhile is bounded by the run's
-		// own overflow traffic. (Mid-run deaths would in fact hit a cold and
-		// a warm run through equal-magnitude terms — counted-but-dead
-		// over-subtraction vs base-resident erosion, with a
-		// schedule-deterministic death pattern — so no cold-vs-warm shape
-		// observes this gate; it is kept because it makes the subtraction's
-		// soundness a LOCAL liveness invariant, counted implies live, rather
-		// than a global symmetry argument.)
-		return
+	if dstBuild {
+		if dstActive() {
+			return
+		}
 	}
 
 	// Clear central sudog cache.

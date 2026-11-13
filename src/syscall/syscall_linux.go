@@ -1150,7 +1150,7 @@ func Mount(source string, target string, fstype string, flags uintptr, data stri
 //sys	Adjtimex(buf *Timex) (state int, err error)
 //sys	Chdir(path string) (err error)
 //sys	Chroot(path string) (err error)
-//sys	closeFD(fd int) (err error) = SYS_CLOSE
+// Close is tag-split between dst_split_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_on_linux.go (dst).
 //sys	Dup(oldfd int) (fd int, err error)
 //sys	Dup3(oldfd int, newfd int, flags int) (err error)
 //sysnb	EpollCreate1(flag int) (fd int, err error)
@@ -1160,9 +1160,7 @@ func Mount(source string, target string, fstype string, flags uintptr, data stri
 //sys	Fchmod(fd int, mode uint32) (err error)
 //sys	Fchownat(dirfd int, path string, uid int, gid int, flags int) (err error)
 //sys	fcntl(fd int, cmd int, arg int) (val int, err error)
-//sys	fdatasync(fd int) (err error) = SYS_FDATASYNC
-//sys	flock(fd int, how int) (err error) = SYS_FLOCK
-//sys	fsync(fd int) (err error) = SYS_FSYNC
+// Fdatasync, Flock, and Fsync are tag-split between dst_split_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_on_linux.go (dst).
 //sys	Getdents(fd int, buf []byte) (n int, err error) = SYS_GETDENTS64
 //sysnb	Getpgid(pid int) (pgid int, err error)
 
@@ -1180,7 +1178,7 @@ func Getpgrp() (pid int) {
 //sys	InotifyAddWatch(fd int, pathname string, mask uint32) (watchdesc int, err error)
 //sysnb	InotifyInit1(flags int) (fd int, err error)
 //sysnb	InotifyRmWatch(fd int, watchdesc uint32) (success int, err error)
-//sysnb	kill(pid int, sig Signal) (err error) = SYS_KILL
+// Kill is tag-split between dst_split_off_linux.go (!dst) and dst_kill_linux.go + dst_split_on_linux.go (dst).
 //sys	Klogctl(typ int, buf []byte) (n int, err error) = SYS_SYSLOG
 //sys	Listxattr(path string, dest []byte) (sz int, err error)
 //sys	Mkdirat(dirfd int, path string, mode uint32) (err error)
@@ -1405,8 +1403,7 @@ func Munmap(b []byte) (err error) {
 	return mapper.Munmap(b)
 }
 
-//sys	madvise(b []byte, advice int) (err error) = SYS_MADVISE
-//sys	mprotect(b []byte, prot int) (err error) = SYS_MPROTECT
+// Madvise and Mprotect are tag-split between dst_split_off_linux.go (!dst) and dst_mmap_wrappers_linux.go + dst_split_on_linux.go (dst).
 //sys	Mlock(b []byte) (err error)
 //sys	Munlock(b []byte) (err error)
 //sys	Mlockall(flags int) (err error)

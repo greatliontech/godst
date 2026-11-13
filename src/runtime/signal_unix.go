@@ -914,16 +914,12 @@ func sigpanic() {
 	if !canpanic() {
 		throw("unexpected signal during runtime execution")
 	}
-	if dstClockCopyoutFault(gp) {
-		panicmemAddr(gp.sigcode1)
+	if dstBuild {
+		if dstClockCopyoutFault(gp) {
+			panicmemAddr(gp.sigcode1)
+		}
+		dstMappingSigpanic(gp)
 	}
-
-	// A fault inside a simulated file mapping is that file's end-of-file, or its
-	// read-only protection, enforced by the MMU. It kills the simulated process
-	// and never returns. Checked ahead of gp.paniconfault: a system under test
-	// cannot recover from the SIGBUS production would deliver, so it must not
-	// recover from this one either.
-	dstMappingSigpanic(gp)
 
 	switch gp.sig {
 	case _SIGBUS:

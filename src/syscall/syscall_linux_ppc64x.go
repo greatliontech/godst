@@ -16,7 +16,7 @@ const (
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	EpollWait(epfd int, events []EpollEvent, msec int) (n int, err error)
 //sys	Fchown(fd int, uid int, gid int) (err error)
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT
+// Fstat is tag-split between dst_split_fstat_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat_on_linux.go (dst).
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_NEWFSTATAT
 //sys	Fstatfs(fd int, buf *Statfs_t) (err error)
 //sys	Ftruncate(fd int, length int64) (err error)
@@ -34,7 +34,7 @@ const (
 //sys	pread(fd int, p []byte, offset int64) (n int, err error) = SYS_PREAD64
 //sys	pwrite(fd int, p []byte, offset int64) (n int, err error) = SYS_PWRITE64
 //sys	Renameat(olddirfd int, oldpath string, newdirfd int, newpath string) (err error)
-//sys	seekFD(fd int, offset int64, whence int) (off int64, err error) = SYS_LSEEK
+// Seek is tag-split between dst_split_seek64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_seek64_on_linux.go (dst).
 //sys	Select(nfd int, r *FdSet, w *FdSet, e *FdSet, timeout *Timeval) (n int, err error) = SYS__NEWSELECT
 //sys	sendfile(outfd int, infd int, offset *int64, count int) (written int, err error)
 //sys	Setfsgid(gid int) (err error)

@@ -60,8 +60,7 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 	// anything other than regular files conservatively and leave them to generic copy.
 	// Check out https://go.dev/issue/68863 for more details.
 	if runtime.GOOS == "illumos" {
-		// The stat's result never escapes (regular-file check only).
-		fi, err := fstatNolog(f)
+		fi, err := f.Stat()
 		if err != nil {
 			return 0, false, nil
 		}

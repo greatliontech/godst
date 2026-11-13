@@ -134,10 +134,14 @@ func (check *Checker) isComplete(t Type) bool {
 		// Underlying call behind this one loads anyway. inst is
 		// immutable after construction, so the branch itself reads
 		// nothing the writer touches.
-		if t.inst == nil {
-			t.unpack()
-			rhs = t.fromRHS
-		} else if t.stateHas(unpacked) {
+		if dstSafeFromRHS {
+			if t.inst == nil {
+				t.unpack()
+				rhs = t.fromRHS
+			} else if t.stateHas(unpacked) {
+				rhs = t.fromRHS
+			}
+		} else {
 			rhs = t.fromRHS
 		}
 	default:

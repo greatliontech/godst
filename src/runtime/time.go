@@ -15,35 +15,13 @@ import (
 
 //go:linkname time_runtimeNow time.runtimeNow
 func time_runtimeNow() (sec int64, nsec int32, mono int64) {
-	gp := getg()
-	if bubble := gp.bubble; bubble != nil {
-		wall := bubble.now
-		if dstActive() {
-			// Under an active simulation, shift only the wall reading by the calling
-			// goroutine's host's clock offset (testing/simulation.Host's clock config,
-			// plus any StepClock the host has taken), so co-located processes share a
-			// clock while different hosts can be skewed/stepped — the primitive an HLC
-			// is built to tolerate. The offset lives in a per-host table keyed by
-			// g.dstHost (not on g) so a step can shift a whole host's subtree at once;
-			// it never touches bubble.now, so monotonic time (time_runtimeNano), timer
-			// deadlines, and the synctest advance are unaffected: a static offset (and
-			// a step between two readings) shifts what time.Now reads, while timers
-			// still fire at the same base time. Folds away in non-dst builds (dstActive
-			// is a constant false), leaving the reading byte-identical. See
-			// runtime.dstReestablishHostClock/dstStepHostClock and docs/dst/faults.md
-			// "Per-host clock" / "Clock faults". The adjustment includes a drifting
-			// host's accumulated wall departure (rate ≠ 1), a function of base time.
-			// Saturating add: a far-future skew/step saturates at the farthest
-			// int64-ns-representable wall time (year ~2262 — real kernels accept
-			// later times, this representation cannot; deterministic, recorded as
-			// the wall-representability boundary). The wall can never go negative:
-			// every application point (dstStepHostClock, dstReestablishHostClock)
-			// rejects a pre-epoch wall, and it only grows from there — a negative
-			// wall would corrupt the sec/nsec split below.
-			wall = dstSatAdd(wall, dstHostWallAdjust(gp.dstHost, bubble.now))
+	if bubble := getg().bubble; bubble != nil {
+		if dstBuild {
+			sec, nsec = dstTimeNowWall(bubble.now)
+		} else {
+			sec = bubble.now / (1000 * 1000 * 1000)
+			nsec = int32(bubble.now % (1000 * 1000 * 1000))
 		}
-		sec = wall / (1000 * 1000 * 1000)
-		nsec = int32(wall % (1000 * 1000 * 1000))
 		// Don't return a monotonic time inside a synctest bubble.
 		// If we return a monotonic time based on the fake clock,
 		// arithmetic on times created inside/outside bubbles is confusing.
@@ -93,13 +71,9 @@ type timer struct {
 	isChan bool         // timer has a channel; immutable; can be read without lock
 	isFake bool         // timer is using fake time; immutable; can be read without lock
 
-	blocked      uint32 // number of goroutines blocked on timer's channel
-	rand         uint32 // randomizes order of timers at same instant; only set when isFake
-	dstHost      uint32 // DST: host id of the goroutine that armed this fake timer (set at modify under an active simulation); lets DriftClock find a host's pending timers to rate-convert on a mid-run rate change. Unused when DST off / not a fake timer
-	dstBase      bool   // DST: this fake timer measures universe base time and is therefore excluded from host-rate re-mapping
-	dstReg       uint64 // DST: run epoch in which this fake timer was registered in the per-run fake-timer list (dst.go dstFakeTimers); dedups registration and ignores a timer object reused from a prior run. Unused when DST off / not a fake timer
-	dstFakeNext  *timer // DST: intrusive link in the per-run fake-timer list (dst.go dstFakeTimers); set once per run at registration. Unused when DST off / not a fake timer
-	dstWhenShift int64  // DST: base-ns the DriftClock overdue conversion moved when TOWARD now (new-old, accumulated across changes); added back to the fire-time delay so the DELIVERED timestamp keeps the original due time while the re-arm catch-up uses the converted anchor. Cleared at fire and at modify. Unused when DST off / not a fake timer
+	blocked uint32 // number of goroutines blocked on timer's channel
+	rand    uint32 // randomizes order of timers at same instant; only set when isFake
+	dstTimer
 
 	// Timer wakes up at when, and then at when+period, ... (period > 0 only)
 	// each time calling f(arg, seq, delay) in the timer goroutine, so f must be
@@ -445,39 +419,6 @@ func newTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg
 	return t
 }
 
-// newBaseTimer is newTimer for a DST universe-base-time timer: the dstBase
-// mark must be set before the first modify (which rate-converts non-base
-// timers under a drifting host), so it cannot be applied after newTimer
-// returns. The body mirrors newTimer statement for statement — keep them in
-// step — rather than sharing one through a flag parameter, which would leave
-// untagged newTimer as a wrapper around a one-sided helper. Only dst code
-// reaches it (time.newDSTBaseTimer), so it is dropped from untagged binaries.
-//
-//go:linkname newBaseTimer time.newBaseTimer
-func newBaseTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg any, c *hchan) *timeTimer {
-	t := new(timeTimer)
-	t.timer.init(nil, nil)
-	t.trace("new")
-	if raceenabled {
-		racerelease(unsafe.Pointer(&t.timer))
-	}
-	if c != nil {
-		lockInit(&t.sendLock, lockRankTimerSend)
-		t.isChan = true
-		c.timer = &t.timer
-		if c.dataqsiz == 0 {
-			throw("invalid timer channel: no capacity")
-		}
-	}
-	if bubble := getg().bubble; bubble != nil {
-		t.isFake = true
-	}
-	t.dstBase = true
-	t.modify(when, period, f, arg, 0)
-	t.init = true
-	return t
-}
-
 // stopTimer stops a timer.
 // It reports whether t was stopped before being run.
 //
@@ -617,29 +558,8 @@ func (t *timer) modify(when, period int64, f func(arg any, seq uintptr, delay in
 	if period < 0 {
 		throw("timer period must be non-negative")
 	}
-	if dstActive() && t.isFake {
-		gp := getg()
-		// Tag the arming host on the fake timer and register it in the per-run fake-timer
-		// list, so DriftClock can find this host's armed timers — heaped OR not — to
-		// rate-convert on a mid-run rate change. Done for every fake-timer arm (even a
-		// non-drifting host), so a host that drifts only later still owns and can re-map
-		// its already-armed timers. A channel timer is heaped only while a goroutine is
-		// blocked on it (needsAdd), so the heap alone is not a complete set of armed
-		// timers; the list is.
-		t.dstHost = gp.dstHost
-		t.dstWhenShift = 0 // fresh when: any overdue-conversion shift is stale
-		dstRegisterFakeTimer(t)
-		// Under a drifting host's clock (rate ≠ 1), convert the arming host's perceived
-		// fire time and repeat interval to universe base time, so a rate-r host's d-timer
-		// fires after d/r of base. This is the single timer choke point every relative arm
-		// (Sleep/After/NewTimer/NewTicker/AfterFunc/context) funnels through; identity for
-		// rate 1. Folds away in non-dst builds. Gated on t.isFake — only a bubble's
-		// simulated timers are in base time; a real-FD poll deadline (non-fake) carries
-		// real-monotonic time, which must not be rate-converted against bubble.now (real
-		// I/O in a bubble is out of the simulation).
-		if !t.dstBase {
-			when, period = dstTimerArmForDrift(when, period)
-		}
+	if dstBuild {
+		when, period = dstTimerModify(t, when, period)
 	}
 
 	if t.isChan {
@@ -801,25 +721,8 @@ func (t *timer) maybeAdd() {
 			// Re-randomize timer order.
 			// We could do this for all timers, but unbubbled timers are highly
 			// unlikely to have the same when.
-			//
-			// Under deterministic scheduling (DST active), draw this
-			// tie-break from the adding goroutine's per-g DST stream rather than
-			// the per-m cheaprand stream, so the firing order of fake (synctest
-			// bubble) timers that share a wake time is reproducible and immune to
-			// which m runs the goroutine. An unseeded adder (dstrand == 0: a
-			// FOREIGN synctest bubble's goroutine, mid-run) keeps the per-m
-			// draw — its zero-rooted stream must not advance, or the sentinel
-			// dstReadRandom's entropy gate relies on is destroyed. See
-			// dstrandUint64.
-			if dstActive() && getg().dstrand != 0 {
-				r := dstrandUint64(getg())
-				t.rand = uint32(r)
-				if dstSchedTraceOn {
-					// A tie-break KEY draw, not an index: recorded with
-					// n=dstTraceMaxN and the key's low bits as an 8-bucket
-					// uniformity histogram (see dstTraceState).
-					dstTraceRecord(dstTraceSiteTimer, dstTraceMaxN, uint32(r)&(dstTraceMaxN-1), r)
-				}
+			if dstBuild {
+				t.rand = dstTimerRand()
 			} else {
 				t.rand = cheaprand()
 			}
@@ -1224,17 +1127,6 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 	seq := t.seq
 	var next int64
 	delay := now - t.when
-	fdelay := delay
-	if dstBuild && t.dstWhenShift != 0 {
-		// A DriftClock overdue conversion re-anchored t.when TOWARD now for
-		// the re-arm catch-up (dst.go dstRemapHostTimers), shrinking
-		// now - when; the DELIVERED timestamp must still reflect the
-		// original due time (sendTime subtracts the delay from a wall
-		// reading), so the accumulated move is added back for the callback
-		// only. The catch-up below keeps the converted anchor.
-		fdelay += t.dstWhenShift
-		t.dstWhenShift = 0
-	}
 	if t.period > 0 {
 		// Leave in heap but adjust next time to fire.
 		next = t.when + t.period*(1+delay/t.period)
@@ -1243,6 +1135,9 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 		}
 	} else {
 		next = 0
+	}
+	if dstBuild {
+		delay = dstTimerConsumeWhenShift(t, delay)
 	}
 	ts := t.ts
 	t.when = next
@@ -1322,7 +1217,7 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 		}
 	}
 
-	f(arg, seq, fdelay)
+	f(arg, seq, delay)
 
 	if t.isChan {
 		unlock(&t.sendLock)

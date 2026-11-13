@@ -16,7 +16,7 @@ const (
 //sys	Dup2(oldfd int, newfd int) (err error)
 //sys	EpollWait(epfd int, events []EpollEvent, msec int) (n int, err error)
 //sys	Fchown(fd int, uid int, gid int) (err error)
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT
+// Fstat is tag-split between dst_split_fstat_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat_on_linux.go (dst).
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error) = SYS_NEWFSTATAT
 //sys	Fstatfs(fd int, buf *Statfs_t) (err error)
 //sys	Ftruncate(fd int, length int64) (err error)
@@ -31,7 +31,7 @@ const (
 //sys	pread(fd int, p []byte, offset int64) (n int, err error) = SYS_PREAD64
 //sys	pwrite(fd int, p []byte, offset int64) (n int, err error) = SYS_PWRITE64
 //sys	Renameat(olddirfd int, oldpath string, newdirfd int, newpath string) (err error)
-//sys	seekFD(fd int, offset int64, whence int) (off int64, err error) = SYS_LSEEK
+// Seek is tag-split between dst_split_seek64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_seek64_on_linux.go (dst).
 //sys	Select(nfd int, r *FdSet, w *FdSet, e *FdSet, timeout *Timeval) (n int, err error)
 //sys	sendfile(outfd int, infd int, offset *int64, count int) (written int, err error)
 //sys	Setfsgid(gid int) (err error)
@@ -110,55 +110,6 @@ const (
 	_RECVMMSG    = 19
 	_SENDMMSG    = 20
 )
-
-func socketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
-func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
-
-// socketcall and rawsocketcall dispatch the multiplexed socket-family
-// syscalls through the dedicated SYS_SOCKETCALL assembly entries — a path
-// that never passes the fenced Syscall/RawSyscall trampolines, so the DST
-// fence is consulted HERE: without it, a bubble goroutine's syscall.Socket
-// (or Bind/Connect/...) would mint a live host socket, a silent simulation
-// escape (design.md, interception boundary, DST-NODE-ISOLATION). Same
-// predicate and refusal shape as the trampolines give the raw
-// SYS_SOCKETCALL trap; non-bubble callers fall through to the host
-// unchanged. Folds away in stock builds (dstSimFenced const).
-
-// uintptrkeepalive keeps pointer-derived arguments live, and nosplit prevents
-// stack copying from leaving their integer addresses stale before dispatch.
-//
-// The push linknames keep golang.org/x/net linking: its s390x assembly enters
-// these by name, and routed through the FENCED wrappers its socket calls are
-// refused in-bubble exactly like syscall.Socket.
-//
-//go:uintptrkeepalive
-//go:nosplit
-//go:linkname socketcall
-func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		// A sockopt on a virtual socket descriptor is the simulation's
-		// (dstSocketcallSockopt); every other in-bubble socketcall meets the
-		// fence. rawsocketcall dispatches nothing, like the raw trampolines.
-		if e, handled := dstSocketcallSockopt(call, a0, a1, a2, a3, a4); handled {
-			if e != 0 {
-				return -1, e
-			}
-			return 0, 0
-		}
-		dstSyscallRefuse(SYS_SOCKETCALL)
-	}
-	return socketcall1(call, a0, a1, a2, a3, a4, a5)
-}
-
-//go:uintptrkeepalive
-//go:nosplit
-//go:linkname rawsocketcall
-func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		dstSyscallRefuse(SYS_SOCKETCALL)
-	}
-	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)
-}
 
 func accept4(s int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (fd int, err error) {
 	fd, e := socketcall(_ACCEPT4, uintptr(s), uintptr(unsafe.Pointer(rsa)), uintptr(unsafe.Pointer(addrlen)), uintptr(flags), 0, 0)

@@ -71,7 +71,7 @@ func Syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr,
 //sys	utimes(path string, times *[2]Timeval) (err error)
 
 //sys	Lstat(path string, stat *Stat_t) (err error) = SYS_LSTAT64
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT64
+// Fstat is tag-split between dst_split_fstat64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat64_on_linux.go (dst).
 //sys	Stat(path string, stat *Stat_t) (err error) = SYS_STAT64
 //sys	EpollWait(epfd int, events []EpollEvent, msec int) (n int, err error)
 
@@ -89,14 +89,6 @@ func Statfs(path string, buf *Statfs_t) (err error) {
 		return err
 	}
 	_, _, e := Syscall(SYS_STATFS64, uintptr(unsafe.Pointer(p)), unsafe.Sizeof(*buf), uintptr(unsafe.Pointer(buf)))
-	if e != 0 {
-		err = errnoErr(e)
-	}
-	return
-}
-
-func seekFD(fd int, offset int64, whence int) (off int64, err error) {
-	_, _, e := Syscall6(SYS__LLSEEK, uintptr(fd), uintptr(offset>>32), uintptr(offset), uintptr(unsafe.Pointer(&off)), uintptr(whence), 0)
 	if e != 0 {
 		err = errnoErr(e)
 	}

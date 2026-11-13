@@ -78,9 +78,11 @@ func GOMAXPROCS(n int) int {
 		unlock(&sched.lock)
 		return ret
 	}
-	if dstActive() {
-		unlock(&sched.lock)
-		return ret
+	if dstBuild {
+		if dstActive() {
+			unlock(&sched.lock)
+			return ret
+		}
 	}
 	// Set early so we can wait for sysmon befor STW. See comment on
 	// computeMaxProcsLock.
@@ -97,23 +99,16 @@ func GOMAXPROCS(n int) int {
 		return ret
 	}
 
-	if dstBuild && dstGOMAXPROCSSTWHook != nil {
-		dstGOMAXPROCSSTWHook()
+	if dstBuild {
+		dstMaybeRunGOMAXPROCSSTWHook()
 	}
 	stw := stopTheWorldGC(stwGOMAXPROCS)
 
-	// A simulation can have activated between the dstActive gate above
-	// (checked before this STW) and here — the gate is check-then-act, and
-	// run entry's pin->activate sequence is not atomic against it. Re-check
-	// under the STW and drop the update rather than defeat the run's P=1 pin
-	// mid-run. The racing caller's end state is exactly GOMAXPROCS(ret) —
-	// manual mode at the unchanged old value, a legal API outcome — and a
-	// public-API run's exit restore rewrites both flag and value anyway.
-	// Enforced by TestDSTGOMAXPROCSDelayedSTWDropped; design.md, the
-	// simulation.Run bullet, records the contract.
-	if dstActive() {
-		startTheWorldGC(stw)
-		return ret
+	if dstBuild {
+		if dstActive() {
+			startTheWorldGC(stw)
+			return ret
+		}
 	}
 
 	// newprocs will be processed by startTheWorld
@@ -136,8 +131,10 @@ func GOMAXPROCS(n int) int {
 // update if the caller is aware of a change to the total logical CPU count, CPU
 // affinity mask or cgroup quota.
 func SetDefaultGOMAXPROCS() {
-	if dstActive() {
-		return
+	if dstBuild {
+		if dstActive() {
+			return
+		}
 	}
 
 	// SetDefaultGOMAXPROCS conceptually means "[re]do what the runtime
@@ -157,16 +154,16 @@ func SetDefaultGOMAXPROCS() {
 		return
 	}
 
-	if dstBuild && dstGOMAXPROCSSTWHook != nil {
-		dstGOMAXPROCSSTWHook()
+	if dstBuild {
+		dstMaybeRunGOMAXPROCSSTWHook()
 	}
 	stw := stopTheWorldGC(stwGOMAXPROCS)
 
-	// Same entry-race re-check as GOMAXPROCS: a simulation activated since
-	// the gate above must keep its pin (and the custom flag backing it).
-	if dstActive() {
-		startTheWorldGC(stw)
-		return
+	if dstBuild {
+		if dstActive() {
+			startTheWorldGC(stw)
+			return
+		}
 	}
 
 	// newprocs will be processed by startTheWorld
@@ -181,50 +178,14 @@ func SetDefaultGOMAXPROCS() {
 	startTheWorldGC(stw)
 }
 
-// dstGOMAXPROCSSTWHook, when non-nil, runs in GOMAXPROCS/SetDefaultGOMAXPROCS
-// after the not-active gate and before the stop-the-world — the window a
-// contended computeMaxProcsLock (sysmon reads cgroup files under it) extends
-// in production. Test-only: it lets the entry-race regression hold a setter
-// in flight deterministically while a simulation activates, proving the
-// post-STW dstActive re-check drops the update. Set via the linkname'd
-// dstSetGOMAXPROCSSTWHook; nil in normal operation, and the dstBuild guard on
-// its checks folds them out of non-dst builds entirely (the zero-footprint
-// contract in dst.go).
-var dstGOMAXPROCSSTWHook func()
-
-//go:linkname dstSetGOMAXPROCSSTWHook
-func dstSetGOMAXPROCSSTWHook(f func()) { dstGOMAXPROCSSTWHook = f }
-
-//go:linkname dstGOMAXPROCSAutoFP
-func dstGOMAXPROCSAutoFP() bool {
-	lock(&sched.lock)
-	auto := !sched.customGOMAXPROCS
-	unlock(&sched.lock)
-	return auto
-}
-
 // NumCPU returns the number of logical CPUs usable by the current process.
 //
 // The set of available CPUs is checked by querying the operating system
 // at process startup. Changes to operating system CPU allocation after
 // process startup are not reflected.
 func NumCPU() int {
-	// dstBuild is a build constant: untagged, the whole branch folds out and
-	// NumCPU compiles to the numCPUStartup load alone (the zero-code-footprint
-	// contract in dst.go). dstSimEnvSet cannot be true untagged anyway
-	// (simulation.Run panics before activating), so this is cost, not
-	// correctness.
-	if dstBuild && dstSimEnvSet {
-		// Deterministic simulation: report the simulated CPU count so a SUT that
-		// sizes pools/shards by NumCPU is reproducible across hosts. Per-host (this
-		// host's HostConfig.NumCPU if it set one) falling back to the run default
-		// (dstSimNumCPU); GOMAXPROCS is independently forced to 1, so the goroutines
-		// it creates still multiplex deterministically. Real value outside a run.
-		n := dstSimNumCPU
-		if id, ok := dstHostIdentFor(getg().dstHost); ok && id.numcpu > 0 {
-			n = int(id.numcpu)
-		}
-		if n > 0 {
+	if dstBuild {
+		if n, ok := dstSimNumCPUForCaller(); ok {
 			return n
 		}
 	}

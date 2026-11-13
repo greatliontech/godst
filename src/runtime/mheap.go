@@ -1802,10 +1802,9 @@ func (h *mheap) scavengeAll() {
 
 //go:linkname runtime_debug_freeOSMemory runtime/debug.freeOSMemory
 func runtime_debug_freeOSMemory() {
-	// Refuse before either forced action. GC also carries this guard, but keep
-	// it at the funnel entry so reordering the scavenge cannot expose foreign
-	// wall-clock memory reclamation during a simulation.
-	dstRefuseForeignForcedGC()
+	if dstBuild {
+		dstRefuseForeignForcedGC()
+	}
 	GC()
 	systemstack(func() { mheap_.scavengeAll() })
 }
@@ -2111,21 +2110,8 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s.nret = nret
 	s.fint = fint
 	s.ot = ot
-	// The DST ownership stamps live in a side table (dst.go), not on the
-	// special, so the record keeps upstream's layout. The sequence is
-	// consumed at the same point the embedded stamp was written, and an
-	// entry is made only for in-run registrations (zero stamps are
-	// absence). Insert precedes addspecial so a concurrent removefinalizer
-	// after a successful addspecial always finds the entry to delete; the
-	// failure branch below deletes the never-published entry.
-	var dstStamped bool
 	if dstBuild {
-		if st := dstCallbackStampAtRegistration(); st != (dstCallbackStamp{}) {
-			lock(&mheap_.speciallock)
-			dstSpecialStampInsertLocked(unsafe.Pointer(s), st)
-			unlock(&mheap_.speciallock)
-			dstStamped = true
-		}
+		dstRegisterSpecialStamp(unsafe.Pointer(s))
 	}
 	if addspecial(p, &s.special, false) {
 		// This is responsible for maintaining the same
@@ -2151,8 +2137,8 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 
 	// There was an old finalizer
 	lock(&mheap_.speciallock)
-	if dstBuild && dstStamped {
-		dstSpecialStampTakeLocked(unsafe.Pointer(s)) // the never-published entry dies with the special
+	if dstBuild {
+		dstDiscardSpecialStampLocked(unsafe.Pointer(s))
 	}
 	mheap_.specialfinalizeralloc.free(unsafe.Pointer(s))
 	unlock(&mheap_.speciallock)
@@ -2167,7 +2153,7 @@ func removefinalizer(p unsafe.Pointer) {
 	}
 	lock(&mheap_.speciallock)
 	if dstBuild {
-		dstSpecialStampTakeLocked(unsafe.Pointer(s)) // entry lifetime is a subset of special lifetime
+		dstDiscardSpecialStampLocked(unsafe.Pointer(s))
 	}
 	mheap_.specialfinalizeralloc.free(unsafe.Pointer(s))
 	unlock(&mheap_.speciallock)
@@ -2199,16 +2185,8 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
 	s.id = id
-	// DST ownership stamps live in the side table (dst.go), keeping the
-	// special and its embedded cleanupFn at upstream's layout; entries
-	// exist only for in-run registrations. addspecial below is forced and
-	// cannot fail, so no failure-path delete is needed.
 	if dstBuild {
-		if st := dstCallbackStampAtRegistration(); st != (dstCallbackStamp{}) {
-			lock(&mheap_.speciallock)
-			dstSpecialStampInsertLocked(unsafe.Pointer(s), st)
-			unlock(&mheap_.speciallock)
-		}
+		dstRegisterSpecialStamp(unsafe.Pointer(s))
 	}
 
 	mp := acquirem()

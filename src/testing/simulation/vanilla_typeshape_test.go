@@ -20,27 +20,14 @@ import (
 // user-importable std packages the dst delta modifies, plus the
 // internal packages whose types embed into their exported shapes
 // (internal/poll.FD sits inside os.file; internal/sync inside sync).
-// The runtime is deliberately outside the clause: its internals appear
-// in no user signature and are unreachable by reflect, so their
-// recorded DATA deviations (design.md) stay in-record.
+// The runtime is outside the clause: its internals appear in no user
+// signature and are unreachable by reflect (untagged runtime structs keep
+// zero overhead via runtime/sizeof_test.go; tagged runtime structs carry
+// simulation state).
 var typeShapePackages = []string{
 	"go/types",
 	"internal/poll", "internal/sync", "net", "os", "os/exec",
 	"os/signal", "os/user", "sync", "syscall", "testing", "time",
-}
-
-// typeShapeExceptions records the deliberate per-structure shape
-// deviations the type-shape clause admits, each judged in design.md's
-// untagged footprint contract. An entry admits exactly one inventory
-// line the fork adds over stock; an entry that admits nothing fails
-// (the stale-entry discipline of the text gate). Placeholder lines are
-// resolved to exact inventory text by running the gate; a mismatch
-// fails as BOTH an unadmitted addition and a stale exception.
-var typeShapeExceptions = map[string]string{
-	// The framework stream's raw descriptor, captured at construction:
-	// harness-internal state in a struct no user signature carries,
-	// judged in-record (design.md, "Untagged footprint (contract)").
-	"testing chattyPrinter field 4 hostFD int embedded=false tag=\"\"": "chatty printer host-stream slot",
 }
 
 // TestUntaggedTypeShapesIdenticalToStock is the type-shape half of the
@@ -49,10 +36,10 @@ var typeShapeExceptions = map[string]string{
 // field and method-set shape — in BOTH build modes, because analyzers
 // and reflect observe declared shapes, not built text — with DST
 // per-object state attached out of line (dst_filestate.go,
-// dst_root.go). Fork-only type declarations are outside the clause;
-// a field added to or removed from an upstream-present type fails
-// unless a recorded exception admits it (design.md, "Untagged
-// footprint (contract)", the type-shape clause).
+// dst_root.go, testing's dst_hostio.go). Fork-only type declarations are
+// outside the clause; any field added to or removed from an
+// upstream-present type fails unconditionally (design.md, "Untagged
+// footprint (contract)", INV-TYPESHAPE).
 func TestUntaggedTypeShapesIdenticalToStock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: skips the differential resolution")
@@ -125,7 +112,6 @@ func TestUntaggedTypeShapesIdenticalToStock(t *testing.T) {
 	for l := range stockInv {
 		stockTypes[typeKey(l)] = true
 	}
-	fired := map[string]bool{}
 	var failures []string
 	for _, tags := range []string{"", "dst"} {
 		forkInv := inventory(fork, tags)
@@ -136,21 +122,12 @@ func TestUntaggedTypeShapesIdenticalToStock(t *testing.T) {
 		}
 		for l := range forkInv {
 			if !stockInv[l] && stockTypes[typeKey(l)] {
-				if _, ok := typeShapeExceptions[l]; ok {
-					fired[l] = true
-					continue
-				}
 				failures = append(failures, fmt.Sprintf("tags=%q: fork adds to an upstream-present type: %s", tags, l))
 			}
 		}
 	}
-	for l := range typeShapeExceptions {
-		if !fired[l] {
-			failures = append(failures, fmt.Sprintf("stale type-shape exception %q: fired on no line in either build mode — the deviation it admits no longer exists; remove it", l))
-		}
-	}
 	if len(failures) > 0 {
-		t.Fatalf("declared type shapes diverge from the upstream base beyond the recorded exceptions:\n  %s", strings.Join(failures, "\n  "))
+		t.Fatalf("declared type shapes diverge from the upstream base:\n  %s", strings.Join(failures, "\n  "))
 	}
 }
 

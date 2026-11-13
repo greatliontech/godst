@@ -4,8 +4,6 @@
 
 package simulation
 
-import _ "unsafe" // for go:linkname
-
 // Network partition targeting. These imperative calls cut and restore links in the
 // simulated network during a run, so a SUT can test how it tolerates partitions.
 // They name hosts (the same names passed to Host); the call interns the name to the
@@ -22,15 +20,6 @@ import _ "unsafe" // for go:linkname
 // is no network to cut). Call them from within a Run: during an active run a call
 // from a goroutine outside the run's bubble panics (the caller-position rule,
 // docs/dst/faults.md "Fault callers fail loud too").
-
-//go:linkname dstNetPartitionOp runtime.dstNetPartitionOp
-func dstNetPartitionOp(op, a, b uint32)
-
-//go:linkname dstNetHostDead runtime.dstNetHostDead
-func dstNetHostDead(host uint32) bool
-
-//go:linkname dstInSimBubble runtime.dstInSimBubble
-func dstInSimBubble() bool
 
 // Net-fault op codes — must match net's dst_partition.go.
 const (

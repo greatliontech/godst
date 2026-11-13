@@ -4,10 +4,7 @@
 
 package simulation
 
-import (
-	"time"
-	_ "unsafe" // for go:linkname
-)
+import "time"
 
 // Disk faults over the per-host filesystem seam (docs/dst/faults.md "Disk faults"),
 // the storage-axis counterpart of the network targeting API (Partition / Reset). A
@@ -28,9 +25,6 @@ import (
 // file — leaving every other host and file untouched (DST-FAULT-VICTIM). Calls
 // outside a run, or in a run whose binary links no filesystem use, are no-ops. Call
 // them from within a Run.
-
-//go:linkname dstDiskFaultOp runtime.dstDiskFaultOp
-func dstDiskFaultOp(op, host uint32, arg int64, name string)
 
 // Disk-fault op codes — must match os's dst_disk_fault.go.
 const (

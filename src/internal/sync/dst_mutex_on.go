@@ -6,6 +6,16 @@
 
 package sync
 
+import _ "unsafe"
+
+// runtime_dstMutexWaitVirtual reports whether the calling goroutine's mutex
+// wait is measured virtually — true when running inside a DST simulation
+// bubble, where lockSlow replaces the wall-clock starvation measure with the
+// deterministic lost-wakeup count.
+//
+//go:linkname runtime_dstMutexWaitVirtual
+func runtime_dstMutexWaitVirtual() bool
+
 // dstMutexVirtualStarvation compile-time gates the in-bubble starvation-mode
 // measure in lockSlow: true only in a -tags dst build, false in
 // dst_mutex_off.go, so the branch is a guaranteed const fold and untagged

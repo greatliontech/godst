@@ -19,6 +19,8 @@ import (
 
 const dstFrameworkStreamEnabled = false
 
+func dstNewChattyPrinter(w io.Writer) *chattyPrinter { return nil }
+
 func dstBubbleUpdatef(p *chattyPrinter, testName, format string, args ...any) bool { return false }
 
 func dstBubblePrintf(p *chattyPrinter, testName, format string, args ...any) bool { return false }

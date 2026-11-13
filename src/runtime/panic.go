@@ -858,9 +858,11 @@ func gopanic(e any) {
 		}
 		fn()
 	}
-	if dstBuild && dstExploreRecordUncaughtPanic(e) {
-		dstExploreDropPanicDefers(gp)
-		goexit1()
+	if dstBuild {
+		if dstExploreRecordUncaughtPanic(e) {
+			dstExploreDropPanicDefers(gp)
+			goexit1()
+		}
 	}
 
 	// If we're tracing, flush the current generation to make the trace more

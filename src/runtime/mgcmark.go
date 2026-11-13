@@ -303,7 +303,11 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			if gp.gcscandone {
 				throw("g already scanned")
 			}
-			if !dstBuild || gp.dstPid >= 0 {
+			if dstBuild {
+				if !dstIsCrashedG(gp) {
+					workDone += scanstack(gp, gcw)
+				}
+			} else {
 				workDone += scanstack(gp, gcw)
 			}
 			gp.gcscandone = true
@@ -514,14 +518,10 @@ func gcAssistAlloc(gp *g) {
 		// but avoids any contamination between GC assist and synctest.
 		bubble := gp.bubble
 		if dstBuild {
-			// Also carry the simulation membership across the disassociation
-			// (dstGCInternal stands in for dstSimG while gp.bubble is nil);
-			// the else branch keeps the stock text for untagged builds.
-			gcInternal := gp.dstGCInternal
+			gcInternal := dstEnterGCDisassociate(gp)
 			gp.bubble = nil
-			gp.dstGCInternal = gp.dstSimG
 			defer func() {
-				gp.dstGCInternal = gcInternal
+				dstExitGCDisassociate(gp, gcInternal)
 				gp.bubble = bubble
 			}()
 		} else {

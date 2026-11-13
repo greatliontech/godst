@@ -188,7 +188,9 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		}
 		// Any semrelease after the cansemacquire knows we're waiting
 		// (we set nwait above), so go to sleep.
-		dstNoteSyncBlindBlock(reason)
+		if dstBuild {
+			dstNoteSyncBlindBlock(reason)
+		}
 		root.queue(addr, s, lifo)
 		goparkunlock(&root.lock, reason, traceBlockSync, 4+skipframes)
 		if s.ticket != 0 || cansemacquire(addr) {
@@ -229,12 +231,7 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		root.nwait.Add(-1)
 	}
 	if dstBuild {
-		// A crashed simulated process's goroutine (dstPid < 0) never runs
-		// again: waking it loses the wakeup, and a starvation-mode mutex
-		// HANDOFF to it would strand the mutex with no owner. Skip crashed
-		// waiters at dequeue, exactly as chan.go's rendezvous dequeue does —
-		// the next live waiter (or none) receives the release.
-		for s != nil && s.g.dstPid < 0 {
+		for s != nil && dstIsCrashedG(s.g) {
 			s, t0, tailtime = root.dequeue(addr)
 			if s != nil {
 				root.nwait.Add(-1)
@@ -667,19 +664,11 @@ func notifyListNotifyAll(l *notifyList) {
 	for s != nil {
 		next := s.next
 		s.next = nil
-		if dstBuild && s.g.dstPid < 0 {
-			// A crashed simulated process's goroutine (dstPid < 0) never
-			// runs again: drop it at dequeue, exactly as the chan and sema
-			// dequeues skip crashed waiters. The broadcast loses nothing —
-			// every live waiter in the pulled list is still readied below —
-			// and the sudog stays with the permanently parked goroutine, as
-			// at the sibling sites. Checked before the bubble-identity
-			// fatal: a run abandoned by a panic retires its parked members
-			// with this same mark while they still point at the dead
-			// bubble, and a later run signaling a shared Cond must skip
-			// them, not trip the cross-bubble wake check.
-			s = next
-			continue
+		if dstBuild {
+			if dstIsCrashedG(s.g) {
+				s = next
+				continue
+			}
 		}
 		if s.g.bubble != nil && getg().bubble != s.g.bubble {
 			println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
@@ -725,8 +714,9 @@ func notifyListNotifyOne(l *notifyList) {
 	// be too long. This applies even when the g is missing:
 	// it hasn't yet gotten to sleep and has lost the race to
 	// the (few) other g's that we find on the list.
-	for {
-		skipped := false
+	if dstBuild {
+		dstNotifyListNotifyOne(l, t)
+	} else {
 		for p, s := (*sudog)(nil), l.head; s != nil; p, s = s, s.next {
 			if s.ticket == t {
 				n := s.next
@@ -738,22 +728,8 @@ func notifyListNotifyOne(l *notifyList) {
 				if n == nil {
 					l.tail = p
 				}
-				s.next = nil
-				if dstBuild && s.g.dstPid < 0 {
-					// A crashed simulated process's goroutine (dstPid < 0)
-					// never runs again: waking it loses the signal (the
-					// dead waiter can neither act on it nor re-signal).
-					// Unlink it and pass the notification to the next
-					// ticket, exactly as the sema dequeue re-dequeues past
-					// crashed waiters — the next live waiter (or none)
-					// receives the signal. Checked before the
-					// bubble-identity fatal for the same reason as in
-					// notifyListNotifyAll: an abandoned run's retired
-					// parked members still point at the dead bubble.
-					skipped = true
-					break
-				}
 				unlock(&l.lock)
+				s.next = nil
 				if s.g.bubble != nil && getg().bubble != s.g.bubble {
 					println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
 					fatal("semaphore wake of synctest goroutine from outside bubble")
@@ -762,20 +738,7 @@ func notifyListNotifyOne(l *notifyList) {
 				return
 			}
 		}
-		if !skipped {
-			unlock(&l.lock)
-			return
-		}
-		// Consume the next ticket on the crashed waiter's behalf. If no
-		// waiter has taken a ticket beyond the crashed one, there is nobody
-		// to pass the signal to; l.notify already covers every issued
-		// ticket, so a future waiter is unaffected.
-		t++
-		if t == l.wait.Load() {
-			unlock(&l.lock)
-			return
-		}
-		atomic.Store(&l.notify, t+1)
+		unlock(&l.lock)
 	}
 }
 
@@ -790,38 +753,9 @@ func notifyListCheck(sz uintptr) {
 //go:linkname internal_sync_nanotime internal/sync.runtime_nanotime
 func internal_sync_nanotime() int64 {
 	if dstBuild {
-		// A bubbled goroutine measures time on the bubble's fake clock, the
-		// same collapse time.runtimeNano applies. The only caller is
-		// sync.Mutex's lockSlow, and on the real clock it is a wall-VALUE
-		// read inside a run: whether a waiter's wall wait crossed the 1ms
-		// starvation threshold decided the mutex's handoff mode — barging
-		// versus direct FIFO — so lock acquisition ORDER became a function
-		// of machine speed, host load, and GC pause wall time (demonstrated:
-		// a same-seed run with ~300us critical sections flips a waiter's
-		// acquisition slot run-to-run;
-		// TestMutexStarvationHandoffDeterministic). In-bubble the starvation
-		// flip is not time-measured at all: mutex waits are not durably
-		// blocking, so virtual time cannot advance while a waiter is pending
-		// (a fake-clock measure would deterministically never fire, and a
-		// SUT whose progress depends on the starvation handoff would
-		// livelock in-sim where production always terminates). lockSlow
-		// instead flips on the waiter's deterministic lost-wakeup count —
-		// seed-pure, liveness-restoring, and production-producible; see
-		// internal/sync's dst_mutex_on.go and
-		// internal_sync_dstMutexWaitVirtual below. The value returned here
-		// then only feeds lockSlow's waitStartTime queue-position sentinel
-		// (and the wall branch bubbled goroutines never take).
 		if bubble := getg().bubble; bubble != nil {
 			return bubble.now
 		}
 	}
 	return nanotime()
-}
-
-//go:linkname internal_sync_dstMutexWaitVirtual internal/sync.runtime_dstMutexWaitVirtual
-func internal_sync_dstMutexWaitVirtual() bool {
-	if dstBuild {
-		return getg().bubble != nil
-	}
-	return false
 }

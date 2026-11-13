@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -87,23 +90,107 @@ func dstInSimBubble() bool
 // line longer than the budget can tear mid-line — output cosmetics only.
 const dstPipeBufChunk = 4096
 
-// dstBubbleFramework reports whether the calling goroutine's framework-stream
-// write must take the granted bubble path, and panics — the interception
-// boundary's loud unsupported shape; the printer's call sites carry no error
-// channel — if that path is unavailable because the printer's stream is not
-// a raw-descriptor-backed file. The panic is unreachable under any real
-// `go test` wiring (cmd/go always hands the child an *os.File stdout, which
-// newChattyPrinter captures); it exists so a future wiring change fails
-// loudly here rather than silently falling back to the host-lock path, whose
-// parking couples the seeded schedule to wall time.
-func dstBubbleFramework(p *chattyPrinter) bool {
-	if !dstInSimBubble() {
-		return false
+// dstChattyEntry associates a live *chattyPrinter (identified by its raw
+// address while held live by the caller) with its captured host stream fd.
+// Keeping hostFD out of line preserves chattyPrinter's exact upstream field
+// shape in both build modes (INV-TYPESHAPE); reading dstChattyEntries via an
+// atomic.Pointer keeps the bubble hot path completely lock-free and free of
+// weak-pointer GC mark-termination parks.
+type dstChattyEntry struct {
+	id   uint64
+	addr uintptr
+	fd   int
+}
+
+var (
+	dstChattyMu      sync.Mutex
+	dstChattyNextID  uint64
+	dstChattyEntries atomic.Pointer[[]dstChattyEntry]
+)
+
+func dstNewChattyPrinter(w io.Writer) *chattyPrinter {
+	p := &chattyPrinter{w: w, json: chatty.json}
+	if f, ok := w.(*os.File); ok {
+		// Fd() also switches a pollable descriptor back to BLOCKING mode (its
+		// documented side effect) — load-bearing here: the bubble path's raw
+		// writes assume a blocking stream (see dstHostStreamWrite's EAGAIN
+		// stance). Stdio starts blocking, so for real go-test wiring this is a
+		// no-op.
+		if fd := int(f.Fd()); fd >= 0 {
+			addr := uintptr(unsafe.Pointer(p))
+			dstChattyMu.Lock()
+			dstChattyNextID++
+			id := dstChattyNextID
+			var next []dstChattyEntry
+			if cur := dstChattyEntries.Load(); cur != nil {
+				next = make([]dstChattyEntry, len(*cur), len(*cur)+1)
+				copy(next, *cur)
+			}
+			next = append(next, dstChattyEntry{id: id, addr: addr, fd: fd})
+			dstChattyEntries.Store(&next)
+			dstChattyMu.Unlock()
+			runtime.AddCleanup(p, dstUnregisterChatty, id)
+		}
 	}
-	if p.hostFD < 0 {
+	return p
+}
+
+func dstUnregisterChatty(id uint64) {
+	dstChattyMu.Lock()
+	defer dstChattyMu.Unlock()
+	cur := dstChattyEntries.Load()
+	if cur == nil {
+		return
+	}
+	next := make([]dstChattyEntry, 0, len(*cur))
+	for _, e := range *cur {
+		if e.id != id {
+			next = append(next, e)
+		}
+	}
+	dstChattyEntries.Store(&next)
+}
+
+func dstChattyHostFD(p *chattyPrinter) int {
+	if p == nil {
+		return -1
+	}
+	addr := uintptr(unsafe.Pointer(p))
+	entries := dstChattyEntries.Load()
+	fd := -1
+	if entries != nil {
+		// Scan newest-to-oldest so that even before an earlier instance's
+		// async cleanup runs, a reused address resolves to the currently live p.
+		for i := len(*entries) - 1; i >= 0; i-- {
+			if (*entries)[i].addr == addr {
+				fd = (*entries)[i].fd
+				break
+			}
+		}
+	}
+	runtime.KeepAlive(p)
+	return fd
+}
+
+// dstBubbleFramework reports whether the calling goroutine's framework-stream
+// write must take the granted bubble path, returns the printer's captured host
+// descriptor when it must, and panics — the interception boundary's loud
+// unsupported shape; the printer's call sites carry no error channel — if that
+// path is unavailable because the printer's stream is not a raw-descriptor-
+// backed file. The panic is unreachable under any real `go test` wiring
+// (cmd/go always hands the child an *os.File stdout, which dstNewChattyPrinter
+// captures); it exists so a future wiring change fails loudly here rather than
+// silently falling back to the host-lock path, whose parking couples the
+// seeded schedule to wall time.
+func dstBubbleFramework(p *chattyPrinter) (int, bool) {
+	if !dstInSimBubble() {
+		return -1, false
+	}
+	hostFD := dstChattyHostFD(p)
+	if hostFD < 0 {
 		panic("testing: framework output stream is not file-backed: unsupported under deterministic simulation")
 	}
-	return true
+	return hostFD, true
 }
 
 // dstBubbleUpdatef is Updatef's bubble-domain leg. It reports false when the
@@ -112,10 +199,11 @@ func dstBubbleFramework(p *chattyPrinter) bool {
 // name themselves (the method's contract), so no attribution header is
 // needed.
 func dstBubbleUpdatef(p *chattyPrinter, testName, format string, args ...any) bool {
-	if !dstBubbleFramework(p) {
+	hostFD, ok := dstBubbleFramework(p)
+	if !ok {
 		return false
 	}
-	dstHostStreamWrite(p.hostFD, nil, fmt.Appendf(nil, p.prefix()+format, args...))
+	dstHostStreamWrite(hostFD, nil, fmt.Appendf(nil, p.prefix()+format, args...))
 	return true
 }
 
@@ -124,11 +212,12 @@ func dstBubbleUpdatef(p *chattyPrinter, testName, format string, args ...any) bo
 // attributes (see the package comment for why the header is constant, and
 // dstPipeBufChunk for the atomicity bound).
 func dstBubblePrintf(p *chattyPrinter, testName, format string, args ...any) bool {
-	if !dstBubbleFramework(p) {
+	hostFD, ok := dstBubbleFramework(p)
+	if !ok {
 		return false
 	}
 	header := fmt.Appendf(nil, "%s=== NAME  %s\n", p.prefix(), testName)
-	dstHostStreamWrite(p.hostFD, header, fmt.Appendf(nil, format, args...))
+	dstHostStreamWrite(hostFD, header, fmt.Appendf(nil, format, args...))
 	return true
 }
 
@@ -136,14 +225,35 @@ func dstBubblePrintf(p *chattyPrinter, testName, format string, args ...any) boo
 // (writeLine's bench arm prints straight to stdout, with no name-header
 // machinery — mirrored here). Reports false outside a bubble, as above.
 func dstBubbleBenchWrite(p *chattyPrinter, strErrBegin, indent string, b []byte, strErrEnd string, c []byte) bool {
-	if !dstBubbleFramework(p) {
+	hostFD, ok := dstBubbleFramework(p)
+	if !ok {
 		return false
 	}
 	// The same five-part line writeLine prints on the host path: the -json
 	// error framing (^O … ^N) around the indented text, then the trailing
 	// newline split off for the marker.
-	dstHostStreamWrite(p.hostFD, nil, fmt.Appendf(nil, "%s%s%s%s%s", strErrBegin, indent, b, strErrEnd, c))
+	dstHostStreamWrite(hostFD, nil, fmt.Appendf(nil, "%s%s%s%s%s", strErrBegin, indent, b, strErrEnd, c))
 	return true
+}
+
+// testingSimulationTest runs f within a simulation-backed synctest bubble.
+// It is called by simulation.Test, from within an already-created bubble.
+//
+//go:linkname testingSimulationTest testing/simulation.testingSimulationTest
+func testingSimulationTest(t *T, f func(*T)) (ok bool) {
+	return testingSynctestTest(t, f)
+}
+
+// testingSimulationCleanupStarted reports whether t is already running its
+// cleanup functions. simulation.Test/TestWith check it on the CALLER goroutine
+// before entering the bubble, so the rejection panics where the user can
+// recover it, in the package's own panic style (testingSynctestTest's own
+// check would fire on the bubble main goroutine, where a raw panic kills the
+// process, and names synctest.Run).
+//
+//go:linkname testingSimulationCleanupStarted testing/simulation.testingSimulationCleanupStarted
+func testingSimulationCleanupStarted(t *T) bool {
+	return t.cleanupStarted.Load()
 }
 
 // dstHostStreamWrite performs the granted raw writes of one framework-stream

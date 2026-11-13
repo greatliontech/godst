@@ -15,7 +15,7 @@ const (
 
 //sys	EpollWait(epfd int, events []EpollEvent, msec int) (n int, err error) = SYS_EPOLL_PWAIT
 //sys	Fchown(fd int, uid int, gid int) (err error)
-//sys	fstatFD(fd int, stat *Stat_t) (err error) = SYS_FSTAT
+// Fstat is tag-split between dst_split_fstat_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_fstat_on_linux.go (dst).
 //sys	fstatat(dirfd int, path string, stat *Stat_t, flags int) (err error)
 
 func Fstatat(fd int, path string, stat *Stat_t, flags int) error {
@@ -32,7 +32,7 @@ func Fstatat(fd int, path string, stat *Stat_t, flags int) error {
 //sys	pread(fd int, p []byte, offset int64) (n int, err error) = SYS_PREAD64
 //sys	pwrite(fd int, p []byte, offset int64) (n int, err error) = SYS_PWRITE64
 //sys	Renameat(olddirfd int, oldpath string, newdirfd int, newpath string) (err error)
-//sys	seekFD(fd int, offset int64, whence int) (off int64, err error) = SYS_LSEEK
+// Seek is tag-split between dst_split_seek64_off_linux.go (!dst) and dst_fd_wrappers_linux.go + dst_split_seek64_on_linux.go (dst).
 //sys	sendfile(outfd int, infd int, offset *int64, count int) (written int, err error)
 //sys	Setfsgid(gid int) (err error)
 //sys	Setfsuid(uid int) (err error)

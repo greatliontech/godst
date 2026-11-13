@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	_ "unsafe" // for go:linkname
 )
 
 // Host and Process declare the distributed model's two identity layers within a
@@ -23,93 +22,6 @@ import (
 // The runtime carries integer ids; this file owns the string↔id interning. The
 // default (unstamped) host and process are id 0 — so a program that declares
 // neither is one host, one process (the N=1 collapse, identical to a plain Run).
-
-//go:linkname dstSetNode runtime.dstSetNode
-func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
-
-//go:linkname dstPushHostScope runtime.dstPushHostScope
-func dstPushHostScope(host, proc uint32) (oldHost, oldProc uint32)
-
-//go:linkname dstPopHostScope runtime.dstPopHostScope
-func dstPopHostScope(oldHost, oldProc uint32)
-
-//go:linkname dstCurrentNode runtime.dstCurrentNode
-func dstCurrentNode() (host, proc uint32)
-
-//go:linkname dstNetEpoch runtime.dstNetEpoch
-func dstNetEpoch() uint64
-
-//go:linkname dstReestablishHostClock runtime.dstReestablishHostClock
-func dstReestablishHostClock(host uint32, offset, ppb int64) bool
-
-//go:linkname dstHostSeededClockOffset runtime.dstHostSeededClockOffset
-func dstHostSeededClockOffset(hostid uint32, bound int64) int64
-
-//go:linkname dstHostSeededDriftPPB runtime.dstHostSeededDriftPPB
-func dstHostSeededDriftPPB(hostid uint32, maxPPB int64) int64
-
-//go:linkname dstSetHostIdent runtime.dstSetHostIdent
-func dstSetHostIdent(host uint32, hostname string, numcpu int)
-
-//go:linkname dstBootHost runtime.dstBootHost
-func dstBootHost(host uint32)
-
-//go:linkname dstAllocPid runtime.dstAllocPid
-func dstAllocPid() int32
-
-//go:linkname dstCheckPidAvailable runtime.dstCheckPidAvailable
-func dstCheckPidAvailable()
-
-//go:linkname dstSetProcessPid runtime.dstSetProcessPid
-func dstSetProcessPid(pid int32) (old int32)
-
-//go:linkname dstRegisterPid runtime.dstRegisterPid
-func dstRegisterPid(pid int32, ns uint32)
-
-//go:linkname dstUnregisterPid runtime.dstUnregisterPid
-func dstUnregisterPid(pid int32)
-
-//go:linkname dstCrashProcessPid runtime.dstCrashProcessPid
-func dstCrashProcessPid(pid int32)
-
-//go:linkname dstStopProcessThreads runtime.dstStopProcessThreads
-func dstStopProcessThreads(pid int32)
-
-//go:linkname dstProcessTeardown runtime.dstProcessTeardown
-func dstProcessTeardown(proc uint32)
-
-//go:linkname dstProcessStateTeardown runtime.dstProcessStateTeardown
-func dstProcessStateTeardown(proc uint32)
-
-//go:linkname dstSetMappingFaultTeardownHook runtime.dstSetMappingFaultTeardownHook
-func dstSetMappingFaultTeardownHook(fn func(proc uint32))
-
-//go:linkname dstSetHostDeclaredHook runtime.dstSetHostDeclaredHook
-func dstSetHostDeclaredHook(fn func(host uint32) bool)
-
-//go:linkname dstSelfCrashed runtime.dstSelfCrashed
-func dstSelfCrashed() bool
-
-//go:linkname dstParkCrashedSelf runtime.dstParkCrashedSelf
-func dstParkCrashedSelf()
-
-//go:linkname dstPidAliveSim runtime.dstPidAlive
-func dstPidAliveSim(pid int32) bool
-
-//go:linkname dstPidOwnsBubbleMain runtime.dstPidOwnsBubbleMain
-func dstPidOwnsBubbleMain(pid int32) bool
-
-//go:linkname dstHostOwnsBubbleMain runtime.dstHostOwnsBubbleMain
-func dstHostOwnsBubbleMain(host uint32) bool
-
-//go:linkname dstMarkHostGoroutinesCrashed runtime.dstMarkHostGoroutinesCrashed
-func dstMarkHostGoroutinesCrashed(host uint32)
-
-//go:linkname dstProcAllocEnsure runtime.dstProcAllocEnsure
-func dstProcAllocEnsure(procid uint32)
-
-//go:linkname dstProcAllocBytes runtime.dstProcAllocBytes
-func dstProcAllocBytes(procid uint32) int64
 
 // dstHostIdentMu serializes dstSetHostIdent, which publishes a host's identity into
 // a copy-on-write table that concurrent Host/Process declarations would otherwise

@@ -17,10 +17,10 @@ import (
 // (dst_hostio.go), so a zero value would aim them at stdin.
 func TestDSTChattyPrinterNonFileWriterHasNoHostFD(tt *T) {
 	var buf bytes.Buffer
-	if p := newChattyPrinter(&buf); p.hostFD != -1 {
-		tt.Fatalf("chattyPrinter over a non-File writer: hostFD = %d, want -1", p.hostFD)
+	if p := newChattyPrinter(&buf); dstChattyHostFD(p) != -1 {
+		tt.Fatalf("chattyPrinter over a non-File writer: hostFD = %d, want -1", dstChattyHostFD(p))
 	}
-	if p := newChattyPrinter(os.Stdout); p.hostFD != 1 {
-		tt.Fatalf("chattyPrinter over os.Stdout: hostFD = %d, want 1", p.hostFD)
+	if p := newChattyPrinter(os.Stdout); dstChattyHostFD(p) != 1 {
+		tt.Fatalf("chattyPrinter over os.Stdout: hostFD = %d, want 1", dstChattyHostFD(p))
 	}
 }

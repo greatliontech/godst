@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build dst
+
 // Deterministic simulation testing (DST) runtime support.
 //
 // When DST is active (dstSeed != 0), runtime randomness that is
@@ -128,22 +130,13 @@ func dstNetEpoch() uint64 {
 // dstActive reports whether deterministic simulation testing is active.
 //
 // The dstBuild guard is load-bearing for cost, not just correctness: dstBuild is
-// a constant (dst_on.go/dst_off.go), so in a non-`-tags dst` build dstActive()
-// folds to a constant false and every `if dstActive()`/`if dstBuild` guard — on
-// the rand(), scheduler, panic, finalizer, and synctest paths included — is
-// dead-code-eliminated: zero CODE footprint unless the build opted in
-// (TestDSTUntaggedCodeFootprint pins the fold; a generic like AddCleanup
-// instantiates in user packages where dstActive does not inline, so such
-// guards lead with the exported constant). The DATA layout is not
-// zero-footprint, deliberately, in every build; the recorded deviation set
-// (which struct carries which DST words) has one home, design.md's
-// "Untagged footprint (contract)", and is not repeated here. The mechanism
-// reason it is not split by build tag: that would fork the runtime's central
-// g struct and the hand-maintained GC bitmap constants (finalizer1's word
-// pattern; cleanupBlockPtrMask, whose packing is load-bearing on the cleanupFn
-// layout) into per-tag variants — an unsafe-critical duplication for a few
-// words per object. In a `-tags dst` build the guard is true and this is the
-// runtime seed load as before.
+// a constant (dst_on.go/dst_off.go), so in a non-`-tags dst` build every bare
+// `if dstBuild` guard — on the rand(), scheduler, panic, finalizer, and synctest
+// paths included — is stripped during Unified IR construction, and the embedded
+// per-object DST structs (dstG, dstP, dstTimer, dstBubble) resolve to zero-size
+// struct{} at interior positions: zero CODE and DATA footprint unless the build
+// opted in (design.md, "Untagged footprint (contract)"). In a `-tags dst` build
+// the guard is true and this is the runtime seed load.
 // (dstSeed is never set without dstBuild anyway: simulation.Run requires the
 // tag, and dstActivate is an unexported test-only linkname.)
 //
@@ -220,7 +213,7 @@ func dstActivate(seed uint64) {
 	// dstDeactivate.
 	dstPreparing.Store(true)
 	for range 2 {
-		gcForce()
+		dstGCForce()
 		dstDeferPreBubbleFinq()
 		dstDeferPreBubbleCleanups()
 	}
@@ -252,7 +245,7 @@ func dstActivate(seed uint64) {
 	// garbage that the first in-bubble GC then frees, driving heapMarked below the
 	// baseline and breaking the relative computation. See docs/dst/gc.md
 	// (Tier 2, per-bubble relative trigger).
-	gcForce()
+	dstGCForce()
 	dstHeapBase.Store(gcController.heapMarked)
 	dstFinqBase.Store(finqueued)
 }
@@ -3373,25 +3366,12 @@ func dstGdestroy(gp *g) {
 		}
 		unlock(&bubble.mu)
 	}
-	gp.dstSimG = false
-	// Clear the DST per-g state so a recycled g cannot carry a prior run's identity
-	// or RNG root into a goroutine created BETWEEN runs (newproc1 only re-stamps
-	// these while a run is active). Otherwise a g recycled from run N's Host-5
-	// subtree, reused between runs, would report host 5 / that stream — and the
-	// unseeded-crypto gate keys on dstrand == 0, which a stale nonzero would defeat.
-	gp.dstrand = 0
-	gp.dstHost = 0
-	gp.dstHostScope = nil
-	gp.dstProc = 0
-	gp.dstPid = 0
-	gp.dstPrio = 0
-	// Scheduled-strategy identity (dstSeq) and pending-access state are the
-	// same leak class: newproc1's dstClearSchedState re-stamps them only for
-	// creations while a run is active, so a g recycled BETWEEN runs would
-	// otherwise carry a dead episode's stable index into its next life — a
-	// foreign goroutine with a stale nonzero dstSeq silently no-ops the
-	// stable-index assignment paths that key on dstSeq == 0.
-	dstClearSchedState(gp)
+	// Zero all per-g DST state so a recycled g cannot carry a prior run's
+	// identity, RNG stream, or scheduled-strategy index into a goroutine
+	// created BETWEEN runs (newproc1 only re-stamps dstG while a run is
+	// active; the unseeded-crypto gate keys on dstrand == 0 and stable-index
+	// assignment keys on dstSeq == 0).
+	gp.dstG = dstG{}
 }
 
 // The DST ownership stamps of finalizer specials and queued finalizer

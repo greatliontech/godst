@@ -7,6 +7,8 @@
 // importing os/user links cgo into the program, and a cgo binary disables the
 // runtime's deadlock detection, which testprog's crash tests depend on.
 
+//go:build dst
+
 package main
 
 import (

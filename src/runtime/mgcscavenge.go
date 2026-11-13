@@ -434,14 +434,10 @@ func (s *scavengerState) ready() {
 //
 // Safe to run without a P.
 func (s *scavengerState) wake() {
-	if dstActive() {
-		// DST: the scavenger is timer/nanotime-driven and so nondeterministic. It
-		// is logically transparent (it returns free pages to the OS; it changes
-		// RSS, not program semantics), so leave it parked for the duration of a
-		// run. The one observable consequence is that MemStats.HeapReleased is a
-		// DST artifact — documented alongside the no-real-I/O caveats. See
-		// docs/dst/gc.md (Tier 2, D5).
-		return
+	if dstBuild {
+		if dstActive() {
+			return
+		}
 	}
 	lock(&s.lock)
 	if s.parked {

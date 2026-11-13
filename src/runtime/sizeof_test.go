@@ -16,18 +16,16 @@ import (
 func TestSizeof(t *testing.T) {
 	const _64bit = unsafe.Sizeof(uintptr(0)) == 8
 	const xreg = unsafe.Sizeof(runtime.XRegPerG{}) // Varies per architecture
+	g32, g64 := uintptr(288), uintptr(448)
+	if runtime.DSTBuild {
+		g32, g64 = 356, 544
+	}
 	var tests = []struct {
 		val    any     // type as a value
 		_32bit uintptr // size on 32bit platforms
 		_64bit uintptr // size on 64bit platforms
 	}{
-		// g carries the DST per-goroutine fields (dstrand, dstPrio, dstSeq, the
-		// host/process identity dstHost/dstProc, the per-process pid dstPid, and the
-		// entered-Host ancestry, and pending-access record — see runtime2.go): +68 bytes on 32-bit, +96 on 64-bit
-		// over upstream's 288/448. The per-host clock offset is NOT a g field — it
-		// lives in a per-host table keyed by dstHost (dst.go dstHostClock) so a step
-		// can move a whole host's subtree (see runtime2.go dstHost).
-		{runtime.G{}, 356 + xreg, 544 + xreg}, // g, but exported for testing
+		{runtime.G{}, g32 + xreg, g64 + xreg}, // g, but exported for testing
 		{runtime.Sudog{}, 64, 104},            // sudog, but exported for testing
 	}
 
