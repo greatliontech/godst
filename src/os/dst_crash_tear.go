@@ -74,120 +74,164 @@ const (
 	dstPageTorn                              // a sector caught in flight: a byte-granular mix
 )
 
-// dstTearFileLocked returns the content a power loss leaves for a file whose
-// durable image is synced and whose page cache holds data. rot is the file's
-// silent-corruption mask set (dstFSNode.rot): it modifies the PLATTER baseline,
-// so a page writeback landed (current or the torn prefix) overwrites its rot —
-// the sector was rewritten — while a clean page, a lost page, and the torn
-// suffix keep it. The landed/lost/torn draws themselves compare against the
-// UNROTTED durable bytes: rot never makes a clean page look dirty, because a
-// page nothing wrote is not in the writeback set and its fate is not a degree
-// of freedom (only its platter bytes rotted). Caller holds dstFS.mu.
-func dstTearFileLocked(synced, data []byte, wbDropped map[int64]struct{}, rot map[int64]byte) []byte {
-	// The file's length is itself unsynced state when the file grew or was
-	// truncated: one draw decides what on-disk i_size the crash left. For a
-	// SHRINK (unsynced truncate-down) the inode update is a single metadata
-	// write — it landed or it did not (two outcomes). For a GROWTH the
-	// candidates additionally include every INTERMEDIATE page-boundary size
-	// between the durable and current lengths: real writeback flushes the
-	// grown tail page by page and advances the on-disk i_size as each lands,
-	// so a crash mid-writeback leaves an inode covering only a prefix of the
-	// landed tail — sizes the binary durable-or-current draw could never
-	// reach (a completeness gap inside the contract's own MAY-be-lost
-	// language; sim ⊆ real is preserved in both directions, since a page
-	// below the drawn size that did not land reads as a hole, exactly the
-	// sparse region delayed allocation leaves). One draw either way, uniform
-	// over the candidate set, ordered smallest-first so the draw meaning is
-	// stable. (A grown file whose tail pages are all lost still reads as
-	// zeros there — the sparse tail a real crash leaves.)
-	size := len(synced)
-	if len(data) != len(synced) {
-		if len(data) > len(synced) {
-			// Candidates: len(synced), each page boundary strictly between,
-			// len(data).
-			first := (len(synced)/dstPageSize + 1) * dstPageSize // first page boundary past the durable size
-			boundaries := 0
-			if first < len(data) {
-				boundaries = (len(data)-1-first)/dstPageSize + 1
+// dstCloneImageWithRot clones synced clipped to size and folds rot XOR masks
+// into the affected 4 KB pages, preserving COW sharing on untouched pages.
+func dstCloneImageWithRot(synced dstDurableImage, size int64, rot map[int64]byte) map[int64]dstDurablePage {
+	var pages map[int64]dstDurablePage
+	setPage := func(pg int64, p dstDurablePage) {
+		if pages == nil {
+			pages = make(map[int64]dstDurablePage)
+		}
+		pages[pg] = p
+	}
+	for pg, p := range synced.pages {
+		pStart := pg * dstPageSize
+		if pStart >= size {
+			continue
+		}
+		limit := int(min(int64(dstPageSize), size-pStart))
+		if dstBytesAllZero(p[:limit]) {
+			continue
+		}
+		if dstBytesAllZero(p[limit:]) {
+			setPage(pg, p)
+			continue
+		}
+		var buf [dstPageSize]byte
+		copy(buf[:], p[:limit])
+		setPage(pg, &buf)
+	}
+	for off, mask := range rot {
+		if off >= size || mask == 0 {
+			continue
+		}
+		pg := off / dstPageSize
+		var buf [dstPageSize]byte
+		if old := pages[pg]; old != nil {
+			buf = *old
+		}
+		buf[off%dstPageSize] ^= mask
+		if dstBytesAllZero(buf[:]) {
+			delete(pages, pg)
+		} else {
+			setPage(pg, &buf)
+		}
+	}
+	return pages
+}
+
+// dstTearFileLocked returns the sparse durable image a power loss leaves for
+// node. rot is the file's silent-corruption mask set (dstFSNode.rot): it
+// modifies the PLATTER baseline, so a page writeback landed (current or the
+// torn prefix) overwrites its rot — the sector was rewritten — while a clean
+// page, a lost page, and the torn suffix keep it. The landed/lost/torn draws
+// compare against the UNROTTED durable bytes in ascending page order, skipping
+// hole pages absent from both memfd (SEEK_DATA) and synced.pages (where cur and
+// dur are both all-zero and therefore never draw). Caller holds dstFS.mu.
+func dstTearFileLocked(node *dstFSNode) dstDurableImage {
+	synced := node.synced
+	dataLen := int64(len(node.data))
+	size := synced.size
+	if dataLen != synced.size {
+		if dataLen > synced.size {
+			first := (synced.size/dstPageSize + 1) * dstPageSize
+			boundaries := int64(0)
+			if first < dataLen {
+				boundaries = (dataLen-1-first)/dstPageSize + 1
 			}
-			switch k := int(dstFaultRandN(int64(2 + boundaries))); {
+			switch k := dstFaultRandN(2 + boundaries); {
 			case k == 0:
 				// durable size stands
 			case k == 1+boundaries:
-				size = len(data)
+				size = dataLen
 			default:
 				size = first + (k-1)*dstPageSize
 			}
 		} else if dstFaultRandN(2) == 1 {
-			size = len(data)
+			size = dataLen
 		}
 	}
-	out := make([]byte, size)
-	copy(out, synced) // durable bytes are stable, always
-	// Iteration order is free: the masks are independent XORs at distinct
-	// offsets, and no draw depends on them.
-	for off, mask := range rot {
-		if off < int64(size) {
-			out[off] ^= mask
+	pages := dstCloneImageWithRot(synced, size, node.rot)
+	setPage := func(pg int64, p dstDurablePage) {
+		if pages == nil {
+			pages = make(map[int64]dstDurablePage)
+		}
+		pages[pg] = p
+	}
+	scanEnd := min(size, dataLen)
+	if scanEnd > 0 {
+		maxCandPg := (scanEnd + dstPageSize - 1) / dstPageSize
+		var cands []int64
+		if node.pc != nil {
+			for off := int64(0); off < scanEnd; {
+				d, h, ok := dstPageCacheNextData(node.pc.fd, off, scanEnd)
+				if !ok {
+					break
+				}
+				p0 := d / dstPageSize
+				p1 := (h + dstPageSize - 1) / dstPageSize
+				for pg := p0; pg < p1; pg++ {
+					cands = append(cands, pg)
+				}
+				off = h
+			}
+		}
+		for pg := range synced.pages {
+			if pg < maxCandPg {
+				cands = append(cands, pg)
+			}
+		}
+		slices.Sort(cands)
+		cands = slices.Compact(cands)
+		for _, pg := range cands {
+			start := pg * dstPageSize
+			end := min(start+dstPageSize, size)
+			curEnd := min(end, dataLen)
+			if curEnd <= start {
+				continue
+			}
+			cur := node.data[start:curEnd]
+			durValid := int(max(0, min(curEnd, synced.size)-start))
+			if dstDurablePageMatchesSlice(synced.pages[pg], durValid, cur) {
+				continue
+			}
+			if node.isPageDroppedLocked(pg) {
+				continue
+			}
+			switch dstTearPageOutcome(dstFaultRandN(3)) {
+			case dstPageDurable:
+				// leave pages[pg] as the durable (+ rot) bytes already cloned
+			case dstPageCurrent:
+				var buf [dstPageSize]byte
+				if old := pages[pg]; old != nil {
+					buf = *old
+				}
+				copy(buf[:len(cur)], cur)
+				if dstBytesAllZero(buf[:]) {
+					delete(pages, pg)
+				} else {
+					setPage(pg, &buf)
+				}
+			case dstPageTorn:
+				split := int(dstFaultRandN(int64(len(cur)) + 1))
+				var buf [dstPageSize]byte
+				if old := pages[pg]; old != nil {
+					buf = *old
+				}
+				copy(buf[:split], cur[:split])
+				if dstBytesAllZero(buf[:]) {
+					delete(pages, pg)
+				} else {
+					setPage(pg, &buf)
+				}
+			}
 		}
 	}
-	for start := 0; start < size; start += dstPageSize {
-		end := min(start+dstPageSize, size)
-		// Only bytes the page cache actually HOLDS can be written back. Where
-		// the current file has ended (an unsynced truncate whose size change did
-		// not land), the platter still carries the durable bytes: the blocks
-		// were never freed, and nothing overwrote them. Treating the absent
-		// bytes as zeros and letting them "land" would erase durable data — a
-		// state no crash produces, and the one the truncate-down sweep caught.
-		curEnd := min(end, len(data))
-		if curEnd <= start {
-			continue // wholly past the live file: durable bytes stand
-		}
-		cur := data[start:curEnd]
-		dur := dstPageSlice(synced, start, curEnd)
-		if slices.Equal(cur, dur) {
-			continue // nothing unsynced in this page
-		}
-		if _, dropped := wbDropped[int64(start)/dstPageSize]; dropped {
-			// A page a failed writeback DROPPED is clean in the kernel's
-			// eyes: it was never in flight and will never be resubmitted, so
-			// power loss cannot land any of it — the durable bytes stand,
-			// with no outcome draw (its fate is not a degree of freedom).
-			// Letting it land would fabricate a write the disk cannot
-			// perform, and would probabilistically mask the fsyncgate trap
-			// this mark exists to model.
-			continue
-		}
-		switch dstTearPageOutcome(dstFaultRandN(3)) {
-		case dstPageDurable:
-			// leave out[start:curEnd] as the durable bytes already copied
-		case dstPageCurrent:
-			copy(out[start:curEnd], cur)
-		case dstPageTorn:
-			// A sector was being written when the power went: bytes before the
-			// split landed, the rest did not. This is the physical torn-write
-			// shape (bytes go out in order; the cut lands somewhere), so it is a
-			// strict SUBSET of the arbitrary byte mixes the contract permits —
-			// sound, and the sound direction to be incomplete in.
-			split := int(dstFaultRandN(int64(curEnd-start) + 1))
-			copy(out[start:start+split], cur[:split])
-		}
+	return dstDurableImage{
+		size:   size,
+		pages:  pages,
+		blocks: dstBlocksClampImage(synced.blocks, size, pages),
 	}
-	return out
-}
-
-// dstPageSlice returns b[start:end] padded with zeros where b is shorter — the
-// bytes a page of the file holds, whether or not the file reaches that far.
-func dstPageSlice(b []byte, start, end int) []byte {
-	if start >= len(b) {
-		return make([]byte, end-start)
-	}
-	if end <= len(b) {
-		return b[start:end]
-	}
-	out := make([]byte, end-start)
-	copy(out, b[start:])
-	return out
 }
 
 // dstTearEntriesLocked returns the directory entries a power loss leaves. Names

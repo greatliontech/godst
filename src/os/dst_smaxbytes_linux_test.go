@@ -19,9 +19,9 @@ import (
 // vfs does. Before the bound existed, huge growth ran into the page-cache
 // mapping reserve and died with a runtime fatal no real kernel produces.
 // The near-limit files these tests mint are SPARSE (the page cache is a
-// memfd: size is address space, physical pages only where touched), so the
-// arms are cheap despite the sizes — but none of them may Sync a near-limit
-// file: the durable image is an ordinary copied slice, not a sparse view.
+// memfd: size is address space, physical pages only where touched, and the
+// durable image stores only non-zero 4 KB pages), so the arms stay cheap
+// despite the sizes.
 
 // TestDSTSMaxBytesTruncate: growth to the limit succeeds; one byte past is
 // EFBIG, with the size untouched — and never the mapping-reserve fatal.

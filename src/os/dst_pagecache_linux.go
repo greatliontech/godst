@@ -27,8 +27,11 @@
 // so growth within the reservation is a reslice and never a reallocation.
 // Nothing may append to or reassign it: dstNodeSetSizeLocked is the only way
 // to change a node's length, and in-place copy the only way to change its
-// bytes. The durable image (node.synced) stays an ordinary slice — nothing
-// maps it.
+// bytes. The durable image (node.synced) is a sparse COW 4 KB page map so
+// multi-hundred-GiB sparse files never densify on sync or crash restore. When
+// a regular file loses its last live link, durable parent entry, open handle,
+// and live mapping, dstNodeMaybeReleaseLocked closes its memfd and retires its
+// view back to the mapping region's free list.
 
 package os
 
@@ -62,6 +65,9 @@ const (
 //go:linkname dstPageCacheClose runtime.dstPageCacheClose
 func dstPageCacheClose(fd int32)
 
+//go:linkname dstPageCacheNextData runtime.dstPageCacheNextData
+func dstPageCacheNextData(fd int32, off, size int64) (dataOff, holeOff int64, ok bool)
+
 //go:linkname dstPageCacheProtect runtime.dstPageCacheProtect
 func dstPageCacheProtect(base, n uintptr, prot int32) bool
 
@@ -79,9 +85,10 @@ const dstPageCacheMinReserve = 64 << 10
 
 // dstNodeCache is a node's page cache and the model's writable view of it.
 type dstNodeCache struct {
-	fd      int32
-	base    uintptr
-	reserve uintptr
+	fd        int32
+	base      uintptr
+	reserve   uintptr
+	backedIdx int
 }
 
 // dstNodeBackLocked gives a newborn regular node its page cache. Caller holds
@@ -96,9 +103,44 @@ func dstNodeBackLocked(node *dstFSNode) {
 	if base == 0 {
 		dstPageCacheFatal("dst: the mapping region cannot hold another file view")
 	}
-	node.pc = &dstNodeCache{fd: fd, base: base, reserve: dstPageCacheMinReserve}
+	node.pc = &dstNodeCache{
+		fd:        fd,
+		base:      base,
+		reserve:   dstPageCacheMinReserve,
+		backedIdx: len(dstFS.backed),
+	}
 	node.data = dstNodeViewLocked(node)[:0:dstPageCacheMinReserve]
 	dstFS.backed = append(dstFS.backed, node)
+}
+
+// dstNodeMaybeReleaseLocked reclaims node's memfd and internal mapping-region
+// view once no live dirent, durable parent dirent, open file description, or
+// live SUT mapping can ever reach it again. Caller holds dstFS.mu.
+func dstNodeMaybeReleaseLocked(node *dstFSNode) {
+	if node == nil || node.pc == nil {
+		return
+	}
+	if node.nlink > 0 || node.durableRefs > 0 || node.openFiles > 0 || node.liveMaps > 0 {
+		return
+	}
+	idx := node.pc.backedIdx
+	last := len(dstFS.backed) - 1
+	if idx != last {
+		moved := dstFS.backed[last]
+		dstFS.backed[idx] = moved
+		moved.pc.backedIdx = idx
+	}
+	dstFS.backed[last] = nil
+	dstFS.backed = dstFS.backed[:last]
+	dstPageCacheUnmap(node.pc.base, node.pc.reserve, dstSpanRetired)
+	dstPageCacheClose(node.pc.fd)
+	node.pc = nil
+	node.data = nil
+	node.blocks = nil
+	node.synced = dstDurableImage{}
+	node.wbDroppedPages = 0
+	node.wbRedirtied = nil
+	node.rot = nil
 }
 
 // dstNodeViewLocked is the node's whole reservation as a slice. Only the

@@ -145,21 +145,23 @@ func TestDSTFODSyncWriteCommitThreshold(t *testing.T) {
 				if err := os.Remove("/zero"); err != nil {
 					t.Fatal(err)
 				}
+				const blk = 4096
 				f, _ = os.OpenFile("/refused", os.O_CREATE|os.O_RDWR, 0o644)
 				f.Sync()
-				f.WriteString("pending")
+				f.Write(make([]byte, blk))
 				f.Close()
 
-				simulation.LimitDisk("h", 10)
+				simulation.LimitDisk("h", 2*blk)
 				f, _ = os.OpenFile("/partial", os.O_CREATE|os.O_RDWR|syscall.O_DSYNC, 0o644)
+				f.Seek(blk-3, 0)
 				n, err := f.Write([]byte("abcde"))
 				if n != 3 || !errors.Is(err, syscall.ENOSPC) {
 					t.Fatalf("partial write = %d, %v", n, err)
 				}
 				f.Close()
 				_, synced, _, _, _, _, _ = os.DSTFSNodeState("/partial")
-				if synced != "abc" {
-					t.Fatalf("partial durable data = %q", synced)
+				if len(synced) != blk || synced[blk-3:] != "abc" {
+					t.Fatalf("partial durable data len=%d tail=%q", len(synced), synced[max(0, len(synced)-3):])
 				}
 				f, _ = os.OpenFile("/refused", os.O_WRONLY|os.O_APPEND|syscall.O_DSYNC, 0)
 				n, err = f.Write([]byte("x"))

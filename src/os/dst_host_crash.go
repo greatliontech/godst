@@ -51,7 +51,39 @@ func dstRestoreHostDiskFor(host uint32) {
 	// no test can distinguish it: the guard buys one draw per inode, not
 	// soundness. TestDSTCrashTearRenameDoubleLinkRestoredOnce pins that the
 	// two links agree and that every byte is durable-or-written.
+	// Reset link and durable-parent counts across this host's nodes before the
+	// durable walk rebuilds them from surviving syncedEntries edges, then
+	// reclaim any regular file on this disk that no longer survives on the
+	// platter (closeHostFilesFor already dropped openFiles and liveMaps).
+	seenDirs := make(map[*dstFSNode]bool)
+	var zeroDirs func(d *dstFSNode)
+	zeroDirs = func(d *dstFSNode) {
+		if d == nil || !d.isDir || seenDirs[d] {
+			return
+		}
+		seenDirs[d] = true
+		d.durableRefs = 0
+		for _, c := range d.entries {
+			zeroDirs(c)
+		}
+		for _, c := range d.syncedEntries {
+			zeroDirs(c)
+		}
+	}
+	zeroDirs(disk.root)
+	disk.root.durableRefs = 1
+	for _, n := range dstFS.backed {
+		if n.disk == disk {
+			n.nlink = 0
+			n.durableRefs = 0
+		}
+	}
 	dstRestoreNodeLocked(disk.root, make(map[*dstFSNode]bool))
+	for i := len(dstFS.backed) - 1; i >= 0; i-- {
+		if n := dstFS.backed[i]; n.disk == disk {
+			dstNodeMaybeReleaseLocked(n)
+		}
+	}
 	// The working directories of the host's processes are kernel state
 	// (per-process cwd lives in the task struct); a reboot starts every
 	// process at the root of the restored tree.
@@ -101,45 +133,46 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		return
 	}
 	if !node.isDir {
-		// In place, never by reassignment: node.data aliases the node's page
-		// cache, and the rewind must land where any still-registered mapping
-		// of a dead process's would have looked (they are unmapped by then,
-		// but the bytes' home does not move).
+		// Rebuild the memfd sparsely from the durable (or torn) image:
+		// truncating to 0 discards all unsynced pages in one ftruncate, and
+		// resizing to image.size + copying only image.pages keeps holes sparse.
 		image := node.synced
 		if dstCrashTear {
-			image = dstTearFileLocked(node.synced, node.data, node.wbDropped, node.rot)
+			image = dstTearFileLocked(node)
 		} else if node.rot != nil {
-			// The all-or-nothing restore reads the platter, and the platter
-			// carries the rot: no writeback landed (that is why the unsynced
-			// bytes are gone), so every mask applies. Copy first — synced must
-			// not be mutated before the commit below re-bases it.
-			image = append([]byte(nil), node.synced...)
-			for off, mask := range node.rot {
-				if off < int64(len(image)) {
-					image[off] ^= mask
-				}
+			pages := dstCloneImageWithRot(node.synced, node.synced.size, node.rot)
+			image = dstDurableImage{
+				size:   node.synced.size,
+				pages:  pages,
+				blocks: dstBlocksClampImage(node.synced.blocks, node.synced.size, pages),
 			}
 		}
-		dstNodeSetSizeLocked(node, int64(len(image)))
-		copy(node.data, image)
+		dstNodeSetSizeLocked(node, 0)
+		if image.size > 0 {
+			dstNodeSetSizeLocked(node, image.size)
+			for pg, p := range image.pages {
+				off := pg * dstPageSize
+				end := min(off+dstPageSize, image.size)
+				copy(node.data[off:end], p[:end-off])
+			}
+		}
+		node.blocks = dstBlocksClampImage(image.blocks, image.size, image.pages)
+		node.everMappedWrite.Store(false)
 		// A crash clears the fsyncgate mark: the page cache is rebuilt from
-		// the platter, so nothing is clean-but-stale afterwards — and the
-		// commit below must be the full one.
-		node.wbDropped = nil
+		// the platter, so nothing is clean-but-stale afterwards.
+		node.wbDroppedPages = 0
+		node.wbRedirtied = nil
 		// The reboot folds rot into content: the corrupted bytes ARE what the
 		// platter holds now — what recovery reads, and what a checksum must
-		// catch. Cleared BEFORE the commit below, so the commit's own
-		// writeback-heal comparison cannot re-clear or double-apply a mask.
+		// catch.
 		node.rot = nil
-		// The restored image IS what the platter now holds: commit it as the
-		// new durable image. Left uncommitted, a torn restore leaves synced
-		// at the PRE-crash durable image while disk and cache agree on the
-		// torn bytes — so a second crash with no intervening writes re-tears
-		// against stale durable content and redraws pages, persisting an
-		// earlier durable state no real crash ordering can produce (bytes on
-		// the platter reverting with nothing having written — the
-		// DST-FAULT-SOUND false-positive class).
-		node.commitDataLocked()
+		// Re-base synced to the restored platter image so a second crash with
+		// no intervening writes cannot re-tear against pre-crash bytes.
+		node.synced = dstDurableImage{
+			size:   image.size,
+			pages:  image.pages,
+			blocks: slices.Clone(node.blocks),
+		}
 		return
 	}
 	if dstCrashTear {
@@ -156,6 +189,7 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 	node.syncedEntries = make(map[string]*dstFSNode, len(node.entries))
 	for name, child := range node.entries {
 		node.syncedEntries[name] = child
+		dstNodeAddDurableRefLocked(child)
 	}
 	// Recurse in sorted name order: the children's own draws must come off the
 	// fault RNG in a fixed order, never the map's (DST-FAULT-REPLAY).

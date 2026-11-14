@@ -8,13 +8,6 @@ promoted into a kept-current artifact and the resolved entry is deleted.
 
 ## Open
 
-- **LimitDisk never fails a write into a sparse hole** — Lands: user
-  decision (logical-byte versus allocated-block accounting is a modeling
-  choice with a stated boundary). A slab-write engine that grows its file
-  sparsely and pwrites into the hole cannot reach a full-disk refusal
-  inside a commit under this fault; filed from pando's disk-fault chunk.
-  See [limitdisk-sparse-write-charge.md](limitdisk-sparse-write-charge.md).
-
 - **dst-only exports are outside the exported-API gate** — Lands: user
   decision (needs a dst-tagged `cmd/api` context — its own design). The
   import-policy half closed as disproven: `deps_test` scans dst-tagged
@@ -78,18 +71,3 @@ promoted into a kept-current artifact and the resolved entry is deleted.
   mutex can still park a bubble flush behind a HOST goroutine's
   wall-clock work — the same coupling the -v printer's lock-free
   bubble path was built to avoid; the testlog needs that treatment.
-- **page-cache region reclamation (aggregate capacity)** — Lands: when a
-  SUT legitimately holds more near-limit files than the mapping region
-  carries (~8 at s_maxbytes; fewer under incremental doubling — the
-  region is carved, never reclaimed). Growth of an IN-BOUNDS sibling
-  then still dies with the mapping-reserve fatal s_maxbytes closed for
-  the single-file class. No sound errno exists (a real kernel evicts
-  page cache rather than failing), so the honest fix is reclamation or
-  an eviction model; until then the loud fatal is the recorded shape.
-- **densification-free durable images** — Lands: when a SUT syncs a
-  near-limit sparse file. commitDataLocked copies node.data into an
-  ordinary slice, so the sync densifies the sparse view and the harness
-  dies as an UNTYPED kernel OOM kill — the least loud failure shape,
-  same in-spec-input-kills-harness class s_maxbytes fixed for growth.
-  Needs a sparse (or COW page-referencing) durable-image
-  representation.

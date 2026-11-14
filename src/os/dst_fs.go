@@ -182,13 +182,14 @@ func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {
 // the page cache serves them without touching the failing medium (and this model
 // never evicts). A node, not a path, is the per-file key, so a faulted file stays faulted
 // across a rename and a removed-but-open handle keeps failing — the physical
-// bad-block semantics. capped/capacity model a full disk: writes that would grow the
-// disk past capacity, and creates on an already-full disk, fail with ENOSPC. The
-// space in use is summed on demand from the live tree (residentLocked), not tracked
-// incrementally, so a delete or truncate-down frees space for the next write with no
-// accounting threaded through every mutation — and never a false ENOSPC a
-// budget-that-ignores-frees would produce. latency models a slow disk: a per-op
-// delay (nanoseconds) the calling goroutine sleeps before each disk-touching op. It
+// bad-block semantics. capped/capacity model a full disk: writes or fallocate
+// calls whose newly allocated 4 KB blocks would exceed capacity/4096, and creates
+// on an already-full disk, fail with ENOSPC. The space in use is summed on demand
+// from the live tree (residentPagesLocked), not tracked incrementally, so a delete
+// or truncate-down frees blocks for the next write with no accounting threaded
+// through every mutation — and never a false ENOSPC a budget-that-ignores-frees
+// would produce. latency models a slow disk: a per-op delay (nanoseconds) the
+// calling goroutine sleeps before each disk-touching op. It
 // is atomic, not under dstFS.mu, because the delay is read and slept on BEFORE the op
 // takes the tree lock — sleeping while holding dstFS.mu would freeze every host's
 // filesystem, not just the slow one. (eio/capacity are read inside the op under the
@@ -200,7 +201,7 @@ type dstFSDisk struct {
 	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
 	wbFail   bool                // writeback EIO: syncs fail (data syncs drop dirty pages); cache-served reads/writes succeed
 	capped   bool                // whether a capacity (full-disk / ENOSPC) limit is set
-	capacity int64               // max total regular-file bytes when capped
+	capacity int64               // max total allocated regular-file bytes (capacity/4096 4 KB blocks) when capped
 	latency  atomic.Int64        // slow-disk: per-op delay in nanoseconds (0 = none)
 }
 
@@ -272,10 +273,10 @@ func dstFSRunTeardown() {
 	dstStateTablesSweep()
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
+	dstNodeReleaseRunLocked()
 	if dstFS.disks == nil {
 		return // the run made no filesystem use, or was already torn down
 	}
-	dstNodeReleaseRunLocked()
 	dstFS.disks = nil
 	dstFS.cwds = nil
 	dstDiskSlow.Store(false)
@@ -296,11 +297,12 @@ func dstFSRunTeardown() {
 // of which only dstFSModeMask survives — the split means a user perm cannot
 // type a node, a call site cannot smuggle metadata through typ, and no
 // creation path can skip the mask. Caller holds dstFS.mu.
-func dstFSNewNode(typ, perm FileMode) *dstFSNode {
+func dstFSNewNode(disk *dstFSDisk, typ, perm FileMode) *dstFSNode {
 	now := time.Now()
 	mode := typ&ModeType | perm&dstFSModeMask
 	node := &dstFSNode{
 		isDir:         typ&ModeDir != 0,
+		disk:          disk,
 		nlink:         1,
 		ino:           dstFSAllocIno(),
 		mode:          mode,
@@ -349,11 +351,14 @@ func dstFSDiskHere() *dstFSDisk {
 // its own /tmp and /dev/null; os.TempDir reports the fixed path "/tmp" during
 // a run.
 func newDstFSDisk() *dstFSDisk {
-	root := dstFSNewNode(ModeDir, 0o755)
-	root.entries["tmp"] = dstFSNewNode(ModeDir, ModeSticky|0o777)
-	dev := dstFSNewNode(ModeDir, 0o755)
-	dev.entries["null"] = dstFSNewNode(ModeDevice|ModeCharDevice, 0o666)
+	disk := &dstFSDisk{}
+	root := dstFSNewNode(disk, ModeDir, 0o755)
+	root.durableRefs = 1 // the root inode is permanently anchored on the platter
+	root.entries["tmp"] = dstFSNewNode(disk, ModeDir, ModeSticky|0o777)
+	dev := dstFSNewNode(disk, ModeDir, 0o755)
+	dev.entries["null"] = dstFSNewNode(disk, ModeDevice|ModeCharDevice, 0o666)
 	root.entries["dev"] = dev
+	disk.root = root
 	// The mkfs image is part of the durable image: a filesystem is born with
 	// its initial tree ON THE PLATTER, so a host crash preserves root, /tmp,
 	// and /dev/null. Without this commit the tree is born unsynced and the
@@ -367,7 +372,7 @@ func newDstFSDisk() *dstFSDisk {
 	root.entries["tmp"].commitLocked()
 	dev.commitLocked()
 	dev.entries["null"].commitLocked()
-	return &dstFSDisk{root: root}
+	return disk
 }
 
 // dstFSCwdHere returns the calling process's working directory (default "/");
@@ -420,6 +425,7 @@ func (node *dstFSNode) isDevice() bool {
 // the durability increment wires its commit points.
 type dstFSNode struct {
 	isDir bool
+	disk  *dstFSDisk
 
 	// ino is the node's synthetic inode number, allocated at creation from the
 	// per-run counter (dstFSAllocIno) — schedule-deterministic, never reused
@@ -437,43 +443,42 @@ type dstFSNode struct {
 	// Nlink synthesis is recorded in the spec).
 	nlink int
 
+	// durableRefs counts syncedEntries edges referencing this node across its
+	// disk's directories; openFiles and liveMaps count open file descriptions
+	// and live SUT mappings on regular files. Together with nlink they govern
+	// dstNodeMaybeReleaseLocked (INV-NODE-BACKING, INV-DURABLE-REACH).
+	durableRefs int
+	openFiles   int
+	liveMaps    int
+
 	// unlinked marks a directory removed from the namespace (Remove/RemoveAll,
 	// or replaced by Rename). The kernel fails entry CREATION in an rmdir'd
 	// directory with ENOENT even through a still-open handle (a Root captured
 	// before the removal); lookups need no flag — an unlinked dir is empty.
 	unlinked bool
 
-	// Regular file state. Once the file is mapped, data aliases the node's page
-	// cache (dstNodeCache) and MUST NOT be appended to: an append that
-	// reallocated would move the bytes out of the page cache, and the system
-	// under test's mappings would stop seeing them. dstNodeSetSizeLocked is the
-	// only way to change its length. synced, the durable image, is always an
-	// ordinary slice — nothing maps it.
-	data   []byte
-	synced []byte
-	pc     *dstNodeCache
+	// Regular file state. data aliases the node's page cache (dstNodeCache)
+	// and MUST NOT be appended to: an append that reallocated would move the
+	// bytes out of the page cache, and the system under test's mappings would
+	// stop seeing them. dstNodeSetSizeLocked is the only way to change its
+	// length. blocks tracks allocated 4 KB pages (holes from truncate-grow stay
+	// unallocated until written, preallocated via fallocate, or dirtied through
+	// a writable mmap); synced is a sparse COW 4 KB page image.
+	data            []byte
+	blocks          []dstBlockSpan
+	synced          dstDurableImage
+	pc              *dstNodeCache
+	everMappedWrite atomic.Bool
 
-	// wbDropped is the fsyncgate mark: the set of page indices the kernel
-	// marked CLEAN without writing back when a data sync failed with EIO
-	// (Linux >= 4.13 drops the dirty pages from the writeback set on
-	// writeback error). A failed sync drops EVERY page (dropping an
-	// already-clean page is unobservable — staying at its synced content);
-	// a write REDIRTIES exactly the pages it touches, removing them from
-	// the set. A later successful sync commits everything EXCEPT the still-
-	// dropped pages, which keep their platter bytes — so "retry fsync after
-	// EIO" SUCCEEDS while the unrewritten data never reaches the disk (the
-	// fsyncgate trap), while the correct recovery (rewrite, then fsync)
-	// works even when the rewrite carries byte-identical content: dirtiness
-	// is a write EVENT, not a content diff. Recorded bound: a store through
-	// a SUT MAPPING is an event the model cannot observe, so it does not
-	// redirty a dropped page (write()-path stores do); and the model never
-	// EVICTS a clean-stale page, so reads keep returning the never-persisted
-	// content — one legal Linux schedule (real kernels may evict, after
-	// which reads return the old platter bytes). Nil = no failed writeback
-	// pending. Reset by a host crash (the cache is rebuilt from the platter;
-	// nothing is clean-but-stale afterwards). Crash TEAR consults the set:
-	// a dropped page cannot land (dstTearFileLocked).
-	wbDropped map[int64]struct{}
+	// wbDroppedPages / wbRedirtied encode the fsyncgate mark in O(redirtied)
+	// space rather than O(file_pages) so multi-hundred-GiB sparse files stay
+	// O(1) on failed writeback: every page index pg < wbDroppedPages not in
+	// wbRedirtied was marked CLEAN without writing back when a data sync failed
+	// with EIO (Linux >= 4.13). A write redirties touched pages (inserting into
+	// wbRedirtied); a later successful sync commits everything except still-
+	// dropped pages, which keep their platter bytes. Reset on host crash.
+	wbDroppedPages int64
+	wbRedirtied    map[int64]struct{}
 
 	// rot is the silent-corruption mark (the CorruptFile fault): XOR masks
 	// keyed by byte offset into the durable image — bit rot sitting on the
@@ -697,10 +702,11 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if node != nil {
 		return wrap(syscall.EEXIST)
 	}
-	if dstFSDiskHere().diskFullForCreate() {
+	disk := dstFSDiskHere()
+	if disk.diskFullForCreate() {
 		return wrap(syscall.ENOSPC)
 	}
-	parent.entries[base] = dstFSNewNode(ModeDir, perm)
+	parent.entries[base] = dstFSNewNode(disk, ModeDir, perm)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -725,6 +731,42 @@ func dstFSMarkUnlinked(node *dstFSNode) {
 		dstFSMarkUnlinked(child)
 	}
 	clear(node.entries)
+	if node.durableRefs == 0 {
+		node.dropSyncedEntriesLocked()
+	}
+}
+
+func (dir *dstFSNode) dropSyncedEntriesLocked() {
+	if len(dir.syncedEntries) == 0 {
+		dir.syncedEntries = nil
+		return
+	}
+	old := dir.syncedEntries
+	dir.syncedEntries = nil
+	for _, child := range old {
+		dstNodeDropDurableRefLocked(child)
+	}
+}
+
+func dstNodeAddDurableRefLocked(node *dstFSNode) {
+	if node == nil || node.isDevice() {
+		return
+	}
+	node.durableRefs++
+}
+
+func dstNodeDropDurableRefLocked(node *dstFSNode) {
+	if node == nil || node.isDevice() || node.durableRefs <= 0 {
+		return
+	}
+	node.durableRefs--
+	if node.isDir {
+		if node.unlinked && node.durableRefs == 0 {
+			node.dropSyncedEntriesLocked()
+		}
+		return
+	}
+	dstNodeMaybeReleaseLocked(node)
 }
 
 // dstFSDropLink accounts one dirent's removal against a regular file's
@@ -735,6 +777,7 @@ func dstFSMarkUnlinked(node *dstFSNode) {
 func dstFSDropLink(node *dstFSNode) {
 	if !node.isDir && node.nlink > 0 {
 		node.nlink--
+		dstNodeMaybeReleaseLocked(node)
 	}
 }
 
@@ -1036,15 +1079,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if dstFSIsRoot(node) {
 		base = "/"
 	}
-	size := int64(len(node.data))
-	return &dstFileInfo{
-		name:    base,
-		size:    size,
-		mode:    node.mode,
-		modTime: node.modTime,
-		isDir:   node.isDir,
-		ident:   node,
-	}, true, nil
+	return dstFileInfoForNode(base, node), true, nil
 }
 
 // dstTempDir reports the fixed simulated temp directory while a run is
@@ -1109,18 +1144,24 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 		return syscall.EFBIG
 	}
 	if size < int64(len(node.data)) {
-		// A shrink zeroes the kept partial page's tail — a content change
-		// the kernel dirties, so it must leave the fsyncgate dropped set
-		// like any write event.
-		node.dstMarkRedirtiedLocked(size, 1)
-		// Pages wholly beyond the new size are destroyed outright: they
-		// leave the dropped set too, or a later regrow would restore dead
-		// platter bytes over what Linux gives back as holes (zeros).
-		for pg := range node.wbDropped {
-			if pg*dstPageSize >= size {
-				delete(node.wbDropped, pg)
+		// A shrink zeroes the kept partial page's tail (redirtying size/4096)
+		// and destroys pages wholly beyond size (>= ceil(size/4096)), leaving
+		// only dropped pages strictly below size/dstPageSize.
+		keepPages := size / dstPageSize
+		if keepPages < node.wbDroppedPages {
+			node.wbDroppedPages = keepPages
+			for pg := range node.wbRedirtied {
+				if pg >= keepPages {
+					delete(node.wbRedirtied, pg)
+				}
+			}
+			if int64(len(node.wbRedirtied)) == node.wbDroppedPages {
+				node.wbDroppedPages = 0
+				node.wbRedirtied = nil
 			}
 		}
+		node.syncMmapBlocksLocked()
+		node.blocks = dstBlocksTruncate(node.blocks, (size+dstPageSize-1)/dstPageSize)
 	}
 	dstNodeSetSizeLocked(node, size)
 	node.modTime = time.Now()
@@ -1341,10 +1382,11 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 			// trailing slash on an existing non-dir (ENOTDIR); this is its create leg.
 			return wrap(syscall.EISDIR)
 		}
-		if dstFSDiskHere().diskFullForCreate() {
+		disk := dstFSDiskHere()
+		if disk.diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = dstFSNewNode(0, perm)
+		node = dstFSNewNode(disk, 0, perm)
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
@@ -1415,6 +1457,9 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 func dstNewFile(d dstFileBackend, name string) *File {
 	if df, ok := d.(*dstFile); ok {
 		df.epoch = dstFSEpoch()
+		if df.node != nil && !df.node.isDir && !df.node.isDevice() {
+			df.node.openFiles++
+		}
 	}
 	f := &File{&file{name: name}}
 	dstSetFileBackend(f.file, d)
@@ -1544,15 +1589,61 @@ func (d *dstFile) syncEIO() error {
 	return d.diskEIO()
 }
 
-// residentLocked sums the live byte size of every regular file on the disk — the
-// space a capacity is measured against. Summed on demand (not tracked incrementally)
-// so a delete or truncate-down frees space for the next write with no accounting in
-// the mutation paths. Crash recovery can leave two names for one renamed inode,
-// so identity tracking counts each reachable node once. Removed-but-open files
-// are not in the tree and so are not counted, which only ever under-counts space in
-// use — never a false ENOSPC. Caller holds dstFS.mu.
-func (disk *dstFSDisk) residentLocked() int64 {
-	var total int64
+// syncMmapBlocksLocked folds non-zero pages dirtied through a PROT_WRITE
+// mapping into node.blocks, skipping kernel holes via SEEK_DATA/SEEK_HOLE and
+// already-recorded spans in O(extents). On Linux shmem, a read fault on a
+// MAP_SHARED hole can instantiate a zeroed page in the memfd's radix tree; the
+// !dstBytesAllZero check ensures reads never charge disk blocks or trigger
+// ENOSPC (the only uncharged case is an mmap store of 0x00 into a hole, which
+// errs in the sound <=-real direction). Caller holds dstFS.mu.
+func (node *dstFSNode) syncMmapBlocksLocked() {
+	if node.pc == nil || !node.everMappedWrite.Load() {
+		return
+	}
+	size := int64(len(node.data))
+	if size == 0 {
+		return
+	}
+	for off := int64(0); off < size; {
+		d, h, ok := dstPageCacheNextData(node.pc.fd, off, size)
+		if !ok {
+			break
+		}
+		p0 := d / dstPageSize
+		p1 := (h + dstPageSize - 1) / dstPageSize
+		for pg := p0; pg < p1; {
+			if allocEnd := dstBlocksSpanEndAt(node.blocks, pg); allocEnd > pg {
+				pg = allocEnd
+				continue
+			}
+			pStart := pg * dstPageSize
+			pEnd := min(pStart+dstPageSize, size)
+			if !dstBytesAllZero(node.data[pStart:pEnd]) {
+				node.blocks = dstBlocksAdd(node.blocks, pg, pg+1)
+			}
+			pg++
+		}
+		off = h
+	}
+}
+
+func (node *dstFSNode) allocatedPagesLocked() int64 {
+	if node.isDir || node.isDevice() {
+		return 0
+	}
+	node.syncMmapBlocksLocked()
+	return dstBlocksCount(node.blocks)
+}
+
+// residentPagesLocked sums the allocated 4 KB pages across all reachable
+// regular files on the disk. Sparse holes (from truncate-grow) cost 0 blocks
+// until written, preallocated via fallocate, or dirtied through PROT_WRITE
+// mmap. Summed on demand so unlinking or truncating down frees blocks
+// immediately; identity tracking counts hard-linked inodes once, and
+// removed-but-open files are omitted (which only ever under-counts space in use
+// — never a false ENOSPC). Caller holds dstFS.mu.
+func (disk *dstFSDisk) residentPagesLocked() int64 {
+	var pages int64
 	seen := make(map[*dstFSNode]bool)
 	var walk func(n *dstFSNode)
 	walk = func(n *dstFSNode) {
@@ -1566,22 +1657,30 @@ func (disk *dstFSDisk) residentLocked() int64 {
 			}
 			return
 		}
-		total += int64(len(n.data))
+		pages += n.allocatedPagesLocked()
 	}
 	walk(disk.root)
-	return total
+	return pages
 }
 
-// enospcAllowed returns how many of the n bytes a write at off may store before the
-// disk's capacity is hit. It is a dstFile method (not dstFSDisk) because it needs the
-// file's current length to tell growth from an in-place overwrite. Equal to n when
-// the disk is uncapped, when the write does
-// not grow the file (a pure in-place overwrite consumes no space), or when the growth
-// fits; otherwise it is the short count that fills the remaining space (0 if none is
-// left). A real disk fills what it can and reports the shortfall, so the caller writes
-// the allowed prefix and returns ENOSPC only when nothing fit (DST-FAULT-SOUND: a
-// growth a real disk would partially satisfy is never failed outright). Caller holds
-// dstFS.mu.
+func (disk *dstFSDisk) freeBlocksLocked() int64 {
+	if disk.capacity <= 0 {
+		return 0
+	}
+	capPages := disk.capacity / dstPageSize
+	usedPages := disk.residentPagesLocked()
+	if usedPages >= capPages {
+		return 0
+	}
+	return capPages - usedPages
+}
+
+// writeAllowed returns how many of the n bytes a write at off may store before
+// EFBIG or the disk's 4 KB block capacity (ENOSPC) binds. In-place overwrites
+// of already-allocated 4 KB blocks consume zero free blocks; writes into sparse
+// holes or past EOF charge 1 block per newly touched 4 KB page, clipping at the
+// exact 4 KB block boundary when remaining free blocks run out mid-write.
+// Caller holds dstFS.mu.
 func (d *dstFile) writeAllowed(off, n int64) (int64, syscall.Errno) {
 	// generic_write_checks first: a write starting at or past s_maxbytes is
 	// EFBIG outright; one crossing it is clipped, and the caller's retry at
@@ -1594,34 +1693,45 @@ func (d *dstFile) writeAllowed(off, n int64) (int64, syscall.Errno) {
 	if room := dstSMaxBytes - off; n > room {
 		n = room
 	}
-	if d.disk.capped {
-		L := int64(len(d.node.data))
-		end := off + n
-		if end > L {
-			room := d.disk.capacity - d.disk.residentLocked()
-			if room < 0 {
-				room = 0
-			}
-			writableEnd := L + room
-			switch {
-			case end <= writableEnd:
-				// the growth fits
-			case writableEnd <= off:
-				return 0, syscall.ENOSPC // not even the start offset is reachable
-			default:
-				n, refuse = writableEnd-off, syscall.ENOSPC
-			}
+	if n <= 0 || !d.disk.capped {
+		return n, refuse
+	}
+	d.node.syncMmapBlocksLocked()
+	startPg := off / dstPageSize
+	endPg := (off+n-1)/dstPageSize + 1
+	need := dstBlocksUnallocatedIn(d.node.blocks, startPg, endPg)
+	if need == 0 {
+		return n, refuse
+	}
+	free := d.disk.freeBlocksLocked()
+	if need <= free {
+		return n, refuse
+	}
+	rem := free
+	for pg := startPg; pg < endPg; {
+		if allocEnd := dstBlocksSpanEndAt(d.node.blocks, pg); allocEnd > pg {
+			pg = min(allocEnd, endPg)
+			continue
 		}
+		nextAlloc := dstBlocksNextStartAfter(d.node.blocks, pg, endPg)
+		holeLen := nextAlloc - pg
+		if rem < holeLen {
+			stopOff := (pg + rem) * dstPageSize
+			if stopOff <= off {
+				return 0, syscall.ENOSPC
+			}
+			return stopOff - off, syscall.ENOSPC
+		}
+		rem -= holeLen
+		pg = nextAlloc
 	}
 	return n, refuse
 }
 
-// diskFullForCreate reports whether the disk has no room to allocate a new file or
-// directory (ENOSPC on create/mkdir on a full disk). A 0-byte create consumes no file
-// bytes, so it is refused only once the disk is already at or over capacity. Caller
-// holds dstFS.mu.
+// diskFullForCreate reports whether a capped disk has zero free 4 KB blocks
+// left (ENOSPC on create/mkdir on a full disk). Caller holds dstFS.mu.
 func (disk *dstFSDisk) diskFullForCreate() bool {
-	return disk.capped && disk.residentLocked() >= disk.capacity
+	return disk.capped && disk.freeBlocksLocked() == 0
 }
 
 func (d *dstFile) read(b []byte) (int, error) {
@@ -1876,6 +1986,9 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 	// A backed node's data IS the page cache, so the copy is the whole of the
 	// write: every mapping of this file already sees it.
 	n := copy(node.data[off:], b)
+	startPg := off / dstPageSize
+	endPg := (off+int64(n)-1)/dstPageSize + 1
+	node.blocks = dstBlocksAdd(node.blocks, startPg, endPg)
 	node.dstMarkRedirtiedLocked(off, int64(n))
 	node.modTime = time.Now()
 	return n, nil
@@ -1998,14 +2111,7 @@ func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
 		if node == nil {
 			continue // racing remove between snapshot and here is impossible under the lock; defensive
 		}
-		infos = append(infos, &dstFileInfo{
-			name:    name,
-			size:    int64(len(node.data)),
-			mode:    node.mode,
-			modTime: node.modTime,
-			isDir:   node.isDir,
-			ident:   node,
-		})
+		infos = append(infos, dstFileInfoForNode(name, node))
 	}
 	return names, infos, nil
 }
@@ -2045,15 +2151,15 @@ func (d *dstFile) truncate(size int64) error {
 
 // fallocate backs fallocate(2) mode 0 — preallocation, the WAL warmed-segment
 // idiom (allocate the file's full span up front, write into place, fdatasync).
-// In the logical-bytes model allocation IS size: mode 0 with offset+len past
-// EOF grows the file there (zeros — what a read of never-written preallocated
-// blocks returns), checked against the disk capacity all-or-nothing first (a
-// real fallocate's reason to exist is failing ENOSPC up front rather than
-// mid-write; it allocates nothing when it refuses). A span inside the current
-// size is a no-op — in-range blocks are always "allocated" here, the recorded
-// logical-bytes/sparse boundary the ENOSPC fault documents. The growth is a
-// mutation like truncate-grow: durable only after a sync, and the crash tear's
-// intermediate-size draws apply to it. Gate order is vfs_fallocate's
+// Mode 0 preallocates every unallocated 4 KB page in [off, off+len), growing
+// the file with zeros if off+len exceeds EOF, and checks unallocated 4 KB pages
+// against the disk capacity all-or-nothing first (a real fallocate's reason to
+// exist is failing ENOSPC up front rather than mid-write; it allocates nothing
+// when it refuses). Already-allocated pages in [off, off+len) consume zero
+// additional blocks, while sparse holes inside EOF charge 1 block per hole page
+// and persist in st_blocks across sync and crash restore. The growth and block
+// allocation are durable only after a sync, and the crash tear's
+// intermediate-size draws apply to growth. Gate order is vfs_fallocate's
 // (fs/open.c, host-probed): arguments (EINVAL); then modes OUTSIDE
 // FALLOC_FL_SUPPORTED_MASK (EOPNOTSUPP — the vfs's own pre-access gate);
 // then write access (EBADF — which also covers directories, never
@@ -2104,20 +2210,20 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 	if err := d.diskEIO(); err != nil {
 		return err
 	}
-	cur := int64(len(d.node.data))
-	if newSize <= cur {
-		return nil // in-range blocks are allocated by construction (logical bytes)
+	d.node.syncMmapBlocksLocked()
+	startPg := off / dstPageSize
+	endPg := (newSize-1)/dstPageSize + 1
+	need := dstBlocksUnallocatedIn(d.node.blocks, startPg, endPg)
+	if d.disk.capped && need > d.disk.freeBlocksLocked() {
+		return syscall.ENOSPC // refused whole: a failed fallocate allocates nothing
 	}
-	if d.disk.capped {
-		// Overflow-safe: capacity and resident are both non-negative, so the
-		// subtraction cannot wrap — summing resident with a near-MaxInt64
-		// growth CAN, and a wrapped sum once turned this refusal into a
-		// mapping-region fatal (review-caught, reproducer pinned).
-		if newSize-cur > d.disk.capacity-d.disk.residentLocked() {
-			return syscall.ENOSPC // refused whole: a failed fallocate allocates nothing
+	if newSize > int64(len(d.node.data)) {
+		if err := d.node.truncateLocked(newSize); err != nil {
+			return err
 		}
 	}
-	return d.node.truncateLocked(newSize)
+	d.node.blocks = dstBlocksAdd(d.node.blocks, startPg, endPg)
+	return nil
 }
 
 // sync commits the durable image (the durability contract's commit points):
@@ -2192,9 +2298,19 @@ func (d *dstFile) datasync() error {
 // Caller holds dstFS.mu.
 func (node *dstFSNode) commitLocked() {
 	if node.isDir {
-		node.syncedEntries = make(map[string]*dstFSNode, len(node.entries))
-		for name, child := range node.entries {
-			node.syncedEntries[name] = child
+		old := node.syncedEntries
+		if node.unlinked && node.durableRefs == 0 {
+			node.syncedEntries = nil
+		} else {
+			next := make(map[string]*dstFSNode, len(node.entries))
+			for name, child := range node.entries {
+				next[name] = child
+				dstNodeAddDurableRefLocked(child)
+			}
+			node.syncedEntries = next
+		}
+		for _, child := range old {
+			dstNodeDropDurableRefLocked(child)
 		}
 	} else {
 		node.commitDataLocked()
@@ -2203,35 +2319,105 @@ func (node *dstFSNode) commitLocked() {
 	node.syncedModTime = node.modTime
 }
 
+func (node *dstFSNode) isPageDroppedLocked(pg int64) bool {
+	if pg >= node.wbDroppedPages {
+		return false
+	}
+	_, redirtied := node.wbRedirtied[pg]
+	return !redirtied
+}
+
 func (node *dstFSNode) commitDataLocked() {
-	old := node.synced
-	if node.wbDropped == nil {
-		node.synced = append([]byte(nil), node.data...)
-		node.clearRotWrittenBackLocked(old)
+	if node.pc == nil {
 		return
 	}
-	// fsyncgate commit: everything reaches the platter except the pages the
-	// failed writeback dropped and nothing has rewritten since — those keep
-	// their old platter bytes (zero where the platter held nothing). See
-	// dstFSNode.wbDropped.
-	synced := append([]byte(nil), node.data...)
-	for pg := range node.wbDropped {
-		off := pg * dstPageSize
-		if off >= int64(len(synced)) {
-			continue
+	node.syncMmapBlocksLocked()
+	old := node.synced
+	size := int64(len(node.data))
+	var pages map[int64]dstDurablePage
+	setPage := func(pg int64, p dstDurablePage) {
+		if pages == nil {
+			pages = make(map[int64]dstDurablePage)
 		}
-		end := min(off+dstPageSize, int64(len(synced)))
-		for i := off; i < end; i++ {
-			if i < int64(len(old)) {
-				synced[i] = old[i]
-			} else {
-				synced[i] = 0
+		pages[pg] = p
+	}
+	for off := int64(0); off < size; {
+		d, h, ok := dstPageCacheNextData(node.pc.fd, off, size)
+		if !ok {
+			break
+		}
+		p0 := d / dstPageSize
+		p1 := (h + dstPageSize - 1) / dstPageSize
+		for pg := p0; pg < p1; pg++ {
+			if node.isPageDroppedLocked(pg) {
+				continue
+			}
+			pStart := pg * dstPageSize
+			pEnd := min(pStart+dstPageSize, size)
+			cur := node.data[pStart:pEnd]
+			if dstBytesAllZero(cur) {
+				continue
+			}
+			if oldPg := old.pages[pg]; oldPg != nil && slices.Equal(oldPg[:len(cur)], cur) && dstBytesAllZero(oldPg[len(cur):]) {
+				setPage(pg, oldPg)
+				continue
+			}
+			var buf [dstPageSize]byte
+			copy(buf[:], cur)
+			setPage(pg, &buf)
+		}
+		off = h
+	}
+	if node.wbDroppedPages > 0 {
+		for pg, oldPg := range old.pages {
+			if pg*dstPageSize >= size || !node.isPageDroppedLocked(pg) {
+				continue
+			}
+			limit := int(min(int64(dstPageSize), size-pg*dstPageSize))
+			if dstBytesAllZero(oldPg[:limit]) {
+				continue
+			}
+			if dstBytesAllZero(oldPg[limit:]) {
+				setPage(pg, oldPg)
+				continue
+			}
+			var buf [dstPageSize]byte
+			copy(buf[:], oldPg[:limit])
+			setPage(pg, &buf)
+		}
+	}
+	var blocks []dstBlockSpan
+	maxPages := (size + dstPageSize - 1) / dstPageSize
+	if node.wbDroppedPages == 0 {
+		blocks = dstBlocksTruncate(slices.Clone(node.blocks), maxPages)
+	} else {
+		// Merge non-dropped current block spans with dropped durable block spans.
+		for _, s := range node.blocks {
+			for pg := s.start; pg < min(s.end, maxPages); {
+				if !node.isPageDroppedLocked(pg) {
+					end := pg + 1
+					for end < min(s.end, maxPages) && !node.isPageDroppedLocked(end) {
+						end++
+					}
+					blocks = dstBlocksAdd(blocks, pg, end)
+					pg = end
+				} else {
+					pg++
+				}
+			}
+		}
+		for _, s := range old.blocks {
+			for pg := s.start; pg < min(s.end, maxPages); pg++ {
+				if node.isPageDroppedLocked(pg) {
+					blocks = dstBlocksAdd(blocks, pg, pg+1)
+				}
 			}
 		}
 	}
-	node.synced = synced
-	if len(node.wbDropped) == 0 {
-		node.wbDropped = nil // fully redirtied: back to the plain full-commit path
+	node.synced = dstDurableImage{
+		size:   size,
+		pages:  pages,
+		blocks: blocks,
 	}
 	node.clearRotWrittenBackLocked(old)
 }
@@ -2243,18 +2429,21 @@ func (node *dstFSNode) commitDataLocked() {
 // their rot survives by the same comparison). Masks past the new image fall
 // off the platter's readable surface (a shrink freed the i_size range) and are
 // dropped with it. Caller holds dstFS.mu; old is the pre-commit durable image.
-func (node *dstFSNode) clearRotWrittenBackLocked(old []byte) {
+func (node *dstFSNode) clearRotWrittenBackLocked(old dstDurableImage) {
 	if node.rot == nil {
 		return
 	}
+	size := node.synced.size
 	for off := range node.rot {
-		if off >= int64(len(node.synced)) {
+		if off >= size {
 			delete(node.rot, off)
 			continue
 		}
-		start := off / dstPageSize * dstPageSize
-		end := min(start+dstPageSize, int64(len(node.synced)))
-		if !slices.Equal(node.synced[start:end], dstPageSlice(old, int(start), int(end))) {
+		pg := off / dstPageSize
+		pStart := pg * dstPageSize
+		n := int(min(int64(dstPageSize), size-pStart))
+		oldValid := int(max(0, min(int64(n), old.size-pStart)))
+		if !dstDurablePageEqualAt(node.synced.pages[pg], n, old.pages[pg], oldValid, n) {
 			delete(node.rot, off)
 		}
 	}
@@ -2263,26 +2452,49 @@ func (node *dstFSNode) clearRotWrittenBackLocked(old []byte) {
 	}
 }
 
-// markWritebackDroppedLocked records the fsyncgate mark: the failed writeback
-// dropped every page from the writeback set. A page leaves the set only when
-// a write event touches it (dstMarkRedirtiedLocked). Caller holds dstFS.mu.
+// markWritebackDroppedLocked records the fsyncgate mark in O(1): every page in
+// [0, ceil(len(data)/4096)) is dropped until a write event redirties it.
+// Caller holds dstFS.mu.
 func (node *dstFSNode) markWritebackDroppedLocked() {
-	pages := (int64(len(node.data)) + dstPageSize - 1) / dstPageSize
-	node.wbDropped = make(map[int64]struct{}, pages)
-	for pg := int64(0); pg < pages; pg++ {
-		node.wbDropped[pg] = struct{}{}
-	}
+	node.wbDroppedPages = (int64(len(node.data)) + dstPageSize - 1) / dstPageSize
+	clear(node.wbRedirtied)
 }
 
 // dstMarkRedirtiedLocked removes the pages [off, off+n) touch from the
 // dropped set: a write event redirties them, so the next successful sync
 // writes them back. Caller holds dstFS.mu.
 func (node *dstFSNode) dstMarkRedirtiedLocked(off, n int64) {
-	if node.wbDropped == nil || n <= 0 {
+	if node.wbDroppedPages == 0 || n <= 0 {
 		return
 	}
-	for pg := off / dstPageSize; pg <= (off+n-1)/dstPageSize; pg++ {
-		delete(node.wbDropped, pg)
+	p0 := off / dstPageSize
+	p1 := min((off+n-1)/dstPageSize, node.wbDroppedPages-1)
+	if p0 > p1 {
+		return
+	}
+	if node.wbRedirtied == nil {
+		node.wbRedirtied = make(map[int64]struct{})
+	}
+	for pg := p0; pg <= p1; pg++ {
+		node.wbRedirtied[pg] = struct{}{}
+	}
+	if int64(len(node.wbRedirtied)) == node.wbDroppedPages {
+		node.wbDroppedPages = 0
+		node.wbRedirtied = nil
+	}
+}
+
+func dstFileInfoForNode(name string, node *dstFSNode) *dstFileInfo {
+	return &dstFileInfo{
+		name:    name,
+		size:    int64(len(node.data)),
+		mode:    node.mode,
+		modTime: node.modTime,
+		isDir:   node.isDir,
+		ident:   node,
+		ino:     node.ino,
+		nlink:   node.nlink,
+		blocks:  node.allocatedPagesLocked() * (dstPageSize / 512),
 	}
 }
 
@@ -2295,14 +2507,7 @@ func (d *dstFile) stat() (FileInfo, error) {
 		return nil, err
 	}
 	defer d.leave()
-	return &dstFileInfo{
-		name:    path.Base(d.path),
-		size:    int64(len(d.node.data)),
-		mode:    d.node.mode,
-		modTime: d.node.modTime,
-		isDir:   d.node.isDir,
-		ident:   d.node,
-	}, nil
+	return dstFileInfoForNode(path.Base(d.path), d.node), nil
 }
 
 // setDeadline implements the deadline half of the backend seam for tree
@@ -2334,10 +2539,23 @@ func (d *dstFile) closeFile() error {
 
 func (d *dstFile) dropClosedNode() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed {
+	var node *dstFSNode
+	var epoch uint64
+	if d.closed && d.node != nil {
+		node = d.node
+		epoch = d.epoch
 		d.node = nil
 	}
+	d.mu.Unlock()
+	if node == nil || node.isDir || node.isDevice() {
+		return
+	}
+	dstFS.mu.Lock()
+	if dstFS.disks != nil && epoch == dstFSEpoch() {
+		node.openFiles--
+		dstNodeMaybeReleaseLocked(node)
+	}
+	dstFS.mu.Unlock()
 }
 
 // dstFileInfo is the FileInfo for simulated nodes. Sys() is nil: there is no
@@ -2350,6 +2568,9 @@ type dstFileInfo struct {
 	modTime time.Time
 	isDir   bool
 	ident   any // identity for SameFile: *dstFSNode, or *dstPipe (both ends share it, as both host fds share one pipe inode)
+	ino     uint64
+	nlink   int
+	blocks  int64
 }
 
 // dstSameFile reports SameFile for simulated FileInfos. handled=false when

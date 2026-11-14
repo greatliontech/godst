@@ -21,12 +21,13 @@ import (
 // stores reach through unix.Fallocate. syscall.Fallocate and unix.Fallocate
 // enter the same generic trampolines, so driving syscall.Fallocate on a
 // virtual fd exercises the raw-boundary dispatch itself (dstRawFallocate),
-// not a separate named path. The contract under test: mode 0 grows the file
-// to offset+len with zeros (allocation IS size in the logical-bytes model),
-// checked all-or-nothing against the disk capacity; a span inside the current
-// size is a no-op; every other mode answers EOPNOTSUPP; the vfs gate order
-// (EBADF for a read-only fd, ENODEV for a device) holds; and the growth is a
-// mutation — durable only after a sync.
+// not a separate named path. The contract under test: mode 0 preallocates
+// unallocated 4 KB blocks in [offset, offset+len) and grows the file to
+// offset+len with zeros when past EOF, checked all-or-nothing against the disk
+// capacity; an already-allocated span inside the current size consumes zero
+// additional blocks; every other mode answers EOPNOTSUPP; the vfs gate order
+// (EBADF for a read-only fd, ENODEV for a device) holds; and the growth and
+// block allocation are mutations — durable only after a sync.
 
 // falloc drives the dispatch through the real trampoline path.
 func falloc(f *os.File, mode uint32, off, length int64) error {
@@ -153,7 +154,7 @@ func TestDSTFallocateENOSPC(t *testing.T) {
 			mustOK(t, "create", err)
 			defer f.Close()
 			mustOK(t, "seed sibling", os.WriteFile("/g", []byte("x"), 0o644))
-			simulation.LimitDisk("h", (8<<10)+1)
+			simulation.LimitDisk("h", 12<<10)
 			mustOK(t, "fallocate under cap", falloc(f, 0, 0, 4<<10))
 			wantErrno(t, "fallocate past cap", falloc(f, 0, 0, 16<<10), syscall.ENOSPC)
 			// The near-MaxInt64 span: refused up front, never an overflowed

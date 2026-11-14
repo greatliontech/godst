@@ -63,6 +63,7 @@ package runtime
 import (
 	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"internal/runtime/syscall/linux"
 	"unsafe"
 )
@@ -85,18 +86,27 @@ const (
 
 var dstMemfdName = [...]byte{'d', 's', 't', '-', 'p', 'a', 'g', 'e', 'c', 'a', 'c', 'h', 'e', 0}
 
-// A mapping's registry entry outlives the mapping as a TOMBSTONE: the address
-// space is PROT_NONE-covered and never reused within the run, so the entry
-// keeps enough truth to attribute a later fault to what the range USED to be —
-// the difference between a process touching memory it unmapped (its own
-// SIGSEGV death, as in production), code reaching a dead machine's or dead
+// A SUT mapping's registry entry outlives the mapping as a TOMBSTONE: its
+// address space is PROT_NONE-covered and never reused within the run, so the
+// entry keeps enough truth to attribute a later fault to what the range USED
+// to be — the difference between a process touching memory it unmapped (its
+// own SIGSEGV death, as in production), code reaching a dead machine's or dead
 // process's memory (no production analog: the memory does not exist — a named
 // model-boundary abort), and a genuine harness bug (everything else).
+//
+// Model-internal file views (dstSpanRetired) NEVER escape to the SUT: when a
+// file outgrows its view or its last reference drops, the retired range is
+// PROT_NONE-covered and returned to a deterministic lowest-address coalescing
+// free list so aggregate capacity across growing/closed files does not exhaust
+// the region. While unallocated, a retired range still carries its retired
+// entry so an internal dangling read throws by name; once re-carved, the newer
+// entry shadows it (readers scan newest-to-oldest) and growth compacts shadowed
+// retired intervals out of dstSpans.
 const (
 	dstSpanLive     = iota
 	dstSpanUnmapped // the owner unmapped it: a later touch is the toucher's SIGSEGV
 	dstSpanCrashed  // its process or machine died: a later touch is a named abort
-	dstSpanRetired  // a model-internal view, replaced: a later touch is a harness bug, named
+	dstSpanRetired  // a model-internal view, replaced or closed: reusable by future carves
 )
 
 // dstSpan is one mapping's address range and its state.
@@ -106,15 +116,16 @@ type dstSpan struct {
 	state uint8
 }
 
-// dstSpanSet is an append-only vector published by pointer. It must be safe
-// against its OWN mutator faulting mid-mutation (sigpanic re-enters the reader
-// on the same thread, so a lock here would self-deadlock) and against readers
-// racing a mutation from another M (a P migration is a full barrier; the
-// length is published atomically after the entry is written, so a reader
-// either sees the entry whole or not at all). Tombstones made the set
-// monotonic per run, so the shape is amortized in-place append plus in-place
-// state stores — never a copy per operation, which over m map/unmap cycles
-// was O(m²) bytes.
+// dstFreeSpan is a half-open [base, base+size) interval, kept sorted and
+// coalesced in dstMapRegion.free and during dstSpanCompact.
+type dstFreeSpan struct {
+	base uintptr
+	size uintptr
+}
+
+// dstSpanSet is an append-only vector published by pointer. Readers
+// (dstMappingFaultAddr in sigpanic) are lock-free so a fault on the mutator's
+// own thread never self-deadlocks; writers serialize on dstMapRegion.lock.
 type dstSpanSet struct {
 	spans []dstSpan // entries [0, n) are published; capacity is pre-allocated
 	n     atomic.Uintptr
@@ -122,17 +133,95 @@ type dstSpanSet struct {
 
 var dstSpans atomic.Pointer[dstSpanSet]
 
-func dstSpanAdd(base, size uintptr) {
+func dstIntervalInsert(spans []dstFreeSpan, base, size uintptr) []dstFreeSpan {
+	end := base + size
+	i := 0
+	for i < len(spans) && spans[i].base+spans[i].size < base {
+		i++
+	}
+	j := i
+	for j < len(spans) && spans[j].base <= end {
+		j++
+	}
+	if i < j {
+		if spans[i].base < base {
+			base = spans[i].base
+		}
+		if lastEnd := spans[j-1].base + spans[j-1].size; lastEnd > end {
+			end = lastEnd
+		}
+		spans[i] = dstFreeSpan{base: base, size: end - base}
+		copy(spans[i+1:], spans[j:])
+		return spans[:len(spans)-(j-i-1)]
+	}
+	spans = append(spans, dstFreeSpan{})
+	copy(spans[i+1:], spans[i:])
+	spans[i] = dstFreeSpan{base: base, size: size}
+	return spans
+}
+
+// dstSpanCompact trims retired spans shadowed by newer spans, preserving the
+// exact classification dstMappingFaultAddr's newest-to-oldest scan observes at
+// every address while keeping the table bounded by live + tombstoned + free
+// fragments. Caller holds dstMapRegion.lock.
+func dstSpanCompact(old []dstSpan) []dstSpan {
+	var cov []dstFreeSpan
+	rev := make([]dstSpan, 0, len(old))
+	for i := len(old) - 1; i >= 0; i-- {
+		s := old[i]
+		st := atomic.Load8(&s.state)
+		if st != dstSpanRetired {
+			rev = append(rev, dstSpan{base: s.base, size: s.size, state: st})
+			cov = dstIntervalInsert(cov, s.base, s.size)
+			continue
+		}
+		cur := s.base
+		end := s.base + s.size
+		k := 0
+		for k < len(cov) && cov[k].base+cov[k].size <= cur {
+			k++
+		}
+		keptAny := false
+		for k < len(cov) && cov[k].base < end {
+			if cov[k].base > cur {
+				rev = append(rev, dstSpan{base: cur, size: cov[k].base - cur, state: dstSpanRetired})
+				keptAny = true
+			}
+			if covEnd := cov[k].base + cov[k].size; covEnd > cur {
+				cur = covEnd
+			}
+			k++
+		}
+		if cur < end {
+			rev = append(rev, dstSpan{base: cur, size: end - cur, state: dstSpanRetired})
+			keptAny = true
+		}
+		if keptAny {
+			cov = dstIntervalInsert(cov, s.base, s.size)
+		}
+	}
+	for l, r := 0, len(rev)-1; l < r; l, r = l+1, r-1 {
+		rev[l], rev[r] = rev[r], rev[l]
+	}
+	return rev
+}
+
+// dstSpanAddLocked publishes a new live mapping span. Caller holds
+// dstMapRegion.lock (m.locks > 0 suppresses GC start/assist across the make).
+func dstSpanAddLocked(base, size uintptr) {
 	set := dstSpans.Load()
 	n := uintptr(0)
 	if set != nil {
 		n = set.n.Load()
 	}
 	if set == nil || n == uintptr(cap(set.spans)) {
-		grown := &dstSpanSet{spans: make([]dstSpan, max(16, 2*int(n)))}
+		var kept []dstSpan
 		if set != nil {
-			copy(grown.spans, set.spans[:n])
+			kept = dstSpanCompact(set.spans[:n])
 		}
+		grown := &dstSpanSet{spans: make([]dstSpan, max(16, 2*(len(kept)+1)))}
+		copy(grown.spans, kept)
+		n = uintptr(len(kept))
 		grown.n.Store(n)
 		dstSpans.Store(grown)
 		set = grown
@@ -141,18 +230,15 @@ func dstSpanAdd(base, size uintptr) {
 	set.n.Store(n + 1) // publish after the entry is whole
 }
 
-func dstSpanKill(base uintptr, state uint8) {
+// dstSpanKillLocked transitions the live span at base to state. Caller holds
+// dstMapRegion.lock.
+func dstSpanKillLocked(base uintptr, state uint8) {
 	set := dstSpans.Load()
 	if set == nil {
 		return
 	}
-	n := set.n.Load()
-	for i := uintptr(0); i < n; i++ {
-		if set.spans[i].base == base {
-			// An in-place store: every state transition a fault could race
-			// (live→unmapped, live→crashed) leaves both attributions sound at
-			// the racing instant, and under a single P the race cannot occur
-			// anyway — the store is atomic for form.
+	for i := int(set.n.Load()) - 1; i >= 0; i-- {
+		if set.spans[i].base == base && atomic.Load8(&set.spans[i].state) == dstSpanLive {
 			atomic.Store8(&set.spans[i].state, state)
 			return
 		}
@@ -176,20 +262,24 @@ func dstPageCacheCheckHost() {
 const (
 	_dstMapFixed          = 0x10
 	_dstMapFixedNoReplace = 0x100000
+	_dstSeekData          = 3
+	_dstSeekHole          = 4
+	_dstEnxio             = 0x6
 )
 
 // dstMapRegion is the carve state. reserved flips once; next is the bump
-// pointer, in bytes from dstMapRegionBase. Plain atomics suffice for the
-// consistency they must provide: under dst there is a single P and no
-// asynchronous preemption, so two carves never interleave mid-flight, and
-// dstPageCacheResetRegion's stronger requirement — no live carve at all — is
-// the caller's run-boundary guarantee, not something a lock here could add.
+// offset from dstMapRegionBase; maxNext tracks the high-water bump offset for
+// run-boundary reset; free holds retired internal file views sorted by base
+// and coalesced so lowest-address first-fit stays deterministic.
 var dstMapRegion struct {
+	lock     mutex
 	reserved atomic.Uint32
-	next     atomic.Uintptr
+	next     uintptr
+	maxNext  uintptr
+	free     []dstFreeSpan
 }
 
-func dstMapRegionReserve() {
+func dstMapRegionReserveLocked() {
 	if dstMapRegion.reserved.Load() != 0 {
 		return
 	}
@@ -197,92 +287,149 @@ func dstMapRegionReserve() {
 	p, err := mmap(unsafe.Pointer(uintptr(dstMapRegionBase)), dstMapRegionSize, _PROT_NONE,
 		_MAP_ANON|_MAP_PRIVATE|_dstMapFixedNoReplace|_dstMapNoReserve, -1, 0)
 	if err != 0 || uintptr(p) != dstMapRegionBase {
+		unlock(&dstMapRegion.lock)
 		print("dst: cannot reserve the mapping region at ", hex(dstMapRegionBase), " (errno ", err, ")\n")
 		throw("dst: the canonical mapping region is unavailable on this host")
 	}
 	dstMapRegion.reserved.Store(1)
 }
 
-// dstMapRegionCarve hands out the next n bytes of the region, or ^uintptr(0)
-// when the region is exhausted — a deterministic outcome, since the bump
-// pointer is a pure function of the run's mapping sequence.
-func dstMapRegionCarve(n uintptr) uintptr {
-	dstMapRegionReserve()
-	for {
-		off := dstMapRegion.next.Load()
-		if n > dstMapRegionSize-off {
-			return ^uintptr(0)
+// dstMapRegionCarveLocked hands out n bytes from the lowest fitting retired
+// span or bumps next, returning ^uintptr(0) when the region cannot hold n — a
+// deterministic outcome, since both free-list order and bump offset are pure
+// functions of the run's mapping sequence. Caller holds dstMapRegion.lock.
+func dstMapRegionCarveLocked(n uintptr) uintptr {
+	dstMapRegionReserveLocked()
+	for i := 0; i < len(dstMapRegion.free); i++ {
+		f := dstMapRegion.free[i]
+		if f.size >= n {
+			base := f.base
+			if f.size == n {
+				copy(dstMapRegion.free[i:], dstMapRegion.free[i+1:])
+				dstMapRegion.free = dstMapRegion.free[:len(dstMapRegion.free)-1]
+			} else {
+				dstMapRegion.free[i].base += n
+				dstMapRegion.free[i].size -= n
+			}
+			return base
 		}
-		if dstMapRegion.next.CompareAndSwap(off, off+n) {
-			return dstMapRegionBase + off
+	}
+	off := dstMapRegion.next
+	if n > dstMapRegionSize-off {
+		return ^uintptr(0)
+	}
+	dstMapRegion.next = off + n
+	if dstMapRegion.next > dstMapRegion.maxNext {
+		dstMapRegion.maxNext = dstMapRegion.next
+	}
+	return dstMapRegionBase + off
+}
+
+func dstMapRegionReturnLocked(base, n uintptr) {
+	dstMapRegion.free = dstIntervalInsert(dstMapRegion.free, base, n)
+	if m := len(dstMapRegion.free); m > 0 {
+		last := dstMapRegion.free[m-1]
+		if last.base+last.size == dstMapRegionBase+dstMapRegion.next {
+			dstMapRegion.next = last.base - dstMapRegionBase
+			dstMapRegion.free = dstMapRegion.free[:m-1]
 		}
 	}
 }
 
 // dstPageCacheResetRegion rewinds the region for the next run: every carve is
-// re-covered inaccessible in one stroke and the bump pointer returns to zero,
-// so the next run's first mapping lands at the same address the last run's
-// did. The caller guarantees the old run's mappings are all dead — this runs
-// at the run boundary, after the page caches are released.
+// re-covered inaccessible in one stroke and the allocator state returns to
+// zero, so the next run's first mapping lands at the same address the last
+// run's did. The caller guarantees the old run's mappings are all dead — this
+// runs at the run boundary, after the page caches are released.
 //
 //go:linkname dstPageCacheResetRegion
 func dstPageCacheResetRegion() {
-	used := dstMapRegion.next.Load()
+	lock(&dstMapRegion.lock)
+	used := dstMapRegion.maxNext
 	if used == 0 {
+		dstMapRegion.next = 0
+		dstMapRegion.free = nil
+		dstSpans.Store(nil)
+		unlock(&dstMapRegion.lock)
 		return
 	}
 	p, err := mmap(unsafe.Pointer(uintptr(dstMapRegionBase)), used, _PROT_NONE,
 		_MAP_ANON|_MAP_PRIVATE|_dstMapFixed|_dstMapNoReserve, -1, 0)
 	if err != 0 || uintptr(p) != dstMapRegionBase {
+		unlock(&dstMapRegion.lock)
 		throw("dst: mapping region reset failed")
 	}
-	dstMapRegion.next.Store(0)
+	dstMapRegion.next = 0
+	dstMapRegion.maxNext = 0
+	dstMapRegion.free = nil
 	dstSpans.Store(nil)
+	unlock(&dstMapRegion.lock)
 }
 
-// dstPageCacheFDs is an atomically-published bitmap of live page-cache fd
-// numbers, indexed by fd. The simulated process must not be able to reach
-// these descriptors: the syscall boundary consults dstPageCacheFDReserved and
-// answers EBADF for a bubble goroutine, exactly as for a fd the SUT never
-// opened — a passed-through close would kill a live file's cache (fatal at
-// the next resize or mmap), and a freed number reused by a later memfd_create
-// would silently alias another file's bytes. Readers are lock-free (atomic
-// pointer load + atomic word load) and nosplit-safe: the raw syscall boundary
-// runs without a P. Writers serialize on dstPageCacheFDLock, and the
-// memfd_create/closefd syscalls happen INSIDE that lock together with the bit
-// flip: holding a runtime mutex (m.locks > 0) suppresses cooperative
-// preemption, so no other goroutine can run — and sweep-close an
-// unregistered newborn memfd, or catch the gap between unregister and the
-// host close — while a descriptor exists in one state but is recorded in the
-// other.
-var dstPageCacheFDs atomic.Pointer[dstPageCacheFDSet]
+// dstPageCacheFDs is an atomically-published bitmap (*dstPageCacheFDSet) of
+// live page-cache fd numbers, indexed by fd. The simulated process must not be
+// able to reach these descriptors: the syscall boundary consults
+// dstPageCacheFDReserved and answers EBADF for a bubble goroutine, exactly as
+// for a fd the SUT never opened — a passed-through close would kill a live
+// file's cache (fatal at the next resize or mmap), and a freed number reused
+// by a later memfd_create would silently alias another file's bytes. Readers
+// are lock-free (atomic pointer load + atomic word load) and nosplit-safe: the
+// raw syscall boundary runs without a P. Writers serialize on
+// dstPageCacheFDLock, and the memfd_create/closefd syscalls happen INSIDE that
+// lock together with the bit flip: holding a runtime mutex (m.locks > 0)
+// suppresses cooperative preemption, so no other goroutine can run — and
+// sweep-close an unregistered newborn memfd, or catch the gap between
+// unregister and the host close — while a descriptor exists in one state but
+// is recorded in the other.
+//
+// The bitmap lives off the GC heap via persistentalloc so host-chosen memfd
+// descriptor numbers and cross-run table warmth never perturb dstHeapAlloc
+// (DST-GC-1) or dstProcAlloc (MemoryLimit).
+var dstPageCacheFDs atomic.UnsafePointer
 var dstPageCacheFDLock mutex
 
 type dstPageCacheFDSet struct {
-	words []uint32
+	_ sys.NotInHeap
+	n uintptr
+}
+
+//go:nosplit
+func dstPageCacheFDWord(set *dstPageCacheFDSet, i uintptr) *uint32 {
+	return (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(set)) + unsafe.Sizeof(dstPageCacheFDSet{}) + i*4))
 }
 
 // dstPageCacheFDRegisterLocked flips fd's reserved bit. Caller holds
-// dstPageCacheFDLock. The in-lock make is sound: gcStart and gcAssistAlloc
-// both bail while m.locks > 0.
+// dstPageCacheFDLock.
 func dstPageCacheFDRegisterLocked(fd int32, on bool) {
-	set := dstPageCacheFDs.Load()
-	w := uint(fd) >> 5
-	if set == nil || w >= uint(len(set.words)) {
+	if fd < 0 {
+		return
+	}
+	set := (*dstPageCacheFDSet)(dstPageCacheFDs.Load())
+	w := uintptr(fd) >> 5
+	if set == nil || w >= set.n {
 		if !on {
 			return
 		}
-		grown := &dstPageCacheFDSet{words: make([]uint32, (w+1)*2)}
+		nw := max(uintptr(16), (w+1)*2)
+		grown := (*dstPageCacheFDSet)(persistentalloc(
+			unsafe.Sizeof(dstPageCacheFDSet{})+nw*4,
+			goarch.PtrSize,
+			&memstats.other_sys,
+		))
+		grown.n = nw
 		if set != nil {
-			copy(grown.words, set.words)
+			for i := uintptr(0); i < set.n; i++ {
+				*dstPageCacheFDWord(grown, i) = atomic.Load(dstPageCacheFDWord(set, i))
+			}
 		}
-		dstPageCacheFDs.Store(grown)
+		dstPageCacheFDs.Store(unsafe.Pointer(grown))
 		set = grown
 	}
+	mask := uint32(1) << (uint(fd) & 31)
 	if on {
-		atomic.Or32(&set.words[w], 1<<(uint(fd)&31))
+		atomic.Or32(dstPageCacheFDWord(set, w), mask)
 	} else {
-		atomic.And32(&set.words[w], ^uint32(1<<(uint(fd)&31)))
+		atomic.And32(dstPageCacheFDWord(set, w), ^mask)
 	}
 }
 
@@ -293,15 +440,15 @@ func dstPageCacheFDRegisterLocked(fd int32, on bool) {
 //go:linkname dstPageCacheFDReserved
 //go:nosplit
 func dstPageCacheFDReserved(fd uintptr) bool {
-	set := dstPageCacheFDs.Load()
+	set := (*dstPageCacheFDSet)(dstPageCacheFDs.Load())
 	if set == nil {
 		return false
 	}
 	w := fd >> 5
-	if w >= uintptr(len(set.words)) {
+	if w >= set.n {
 		return false
 	}
-	return atomic.Load(&set.words[w])&(1<<(fd&31)) != 0
+	return atomic.Load(dstPageCacheFDWord(set, w))&(1<<(fd&31)) != 0
 }
 
 // dstPageCacheNew creates an empty page cache. The descriptor is the harness's,
@@ -362,15 +509,19 @@ func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr {
 	if rem := n % dstPageCachePageSize; rem != 0 {
 		n += dstPageCachePageSize - rem
 	}
-	base := dstMapRegionCarve(n)
+	lock(&dstMapRegion.lock)
+	base := dstMapRegionCarveLocked(n)
 	if base == ^uintptr(0) {
+		unlock(&dstMapRegion.lock)
 		return 0
 	}
 	p, err := mmap(unsafe.Pointer(base), n, prot, _dstMapShared|_dstMapFixed, fd, 0)
 	if err != 0 || uintptr(p) != base {
+		unlock(&dstMapRegion.lock)
 		throw("dst: page cache mapping failed")
 	}
-	dstSpanAdd(base, n)
+	dstSpanAddLocked(base, n)
+	unlock(&dstMapRegion.lock)
 	return base
 }
 
@@ -380,19 +531,70 @@ func dstPageCacheMap(fd int32, n uintptr, prot int32) uintptr {
 // the region is space the kernel may hand to an unrelated mmap, and a foreign
 // mapping inside the region would confuse that attribution. Covered space
 // stays ours; adjacent PROT_NONE anonymous mappings merge, so the cover does
-// not accumulate VMAs.
+// not accumulate VMAs. Model-internal views (dstSpanRetired) are returned to
+// dstMapRegion.free for deterministic reuse.
 //
 //go:linkname dstPageCacheUnmap
 func dstPageCacheUnmap(base, n uintptr, state uint8) {
-	dstSpanKill(base, state)
 	if rem := n % dstPageCachePageSize; rem != 0 {
 		n += dstPageCachePageSize - rem
 	}
+	lock(&dstMapRegion.lock)
+	dstSpanKillLocked(base, state)
 	p, err := mmap(unsafe.Pointer(base), n, _PROT_NONE,
 		_MAP_ANON|_MAP_PRIVATE|_dstMapFixed|_dstMapNoReserve, -1, 0)
 	if err != 0 || uintptr(p) != base {
+		unlock(&dstMapRegion.lock)
 		throw("dst: page cache unmap failed")
 	}
+	if state == dstSpanRetired {
+		dstMapRegionReturnLocked(base, n)
+	}
+	unlock(&dstMapRegion.lock)
+}
+
+// dstPageCacheNextData returns the first kernel-allocated [dataOff, holeOff)
+// byte interval in fd at or after off within [0, size), using SEEK_DATA and
+// SEEK_HOLE so sparse multi-hundred-GiB memfds are scanned in O(allocated
+// extents) without faulting hole pages.
+//
+//go:linkname dstPageCacheNextData
+func dstPageCacheNextData(fd int32, off, size int64) (dataOff, holeOff int64, ok bool) {
+	if off < 0 {
+		throw("dst: negative page cache seek offset")
+	}
+	if off >= size {
+		return 0, 0, false
+	}
+	d, errno := dstLseek(fd, off, _dstSeekData)
+	if errno == _dstEnxio {
+		return 0, 0, false
+	}
+	if errno != 0 {
+		throw("dst: page cache SEEK_DATA failed")
+	}
+	if d >= size {
+		return 0, 0, false
+	}
+	h, errno := dstLseek(fd, d, _dstSeekHole)
+	if errno != 0 {
+		throw("dst: page cache SEEK_HOLE failed")
+	}
+	if h > size {
+		h = size
+	}
+	if h <= d {
+		return 0, 0, false
+	}
+	return d, h, true
+}
+
+func dstSpanCount() int {
+	set := dstSpans.Load()
+	if set == nil {
+		return 0
+	}
+	return int(set.n.Load())
 }
 
 //go:linkname dstPageCacheClose
@@ -429,14 +631,16 @@ func dstPageCacheFatal(reason string) {
 }
 
 // dstMappingFaultAddr classifies addr: not a simulated mapping's (found=false),
-// or found with the span's state — live (the file does not have the page, or
-// the view is read-only), unmapped, crashed, or retired.
+// or found with the newest covering span's state — live (the file does not have
+// the page, or the view is read-only), unmapped, crashed, or retired. Scanning
+// newest-to-oldest lets a re-carved span shadow the retired internal view whose
+// address range it reused while leaving any un-reused tail classified retired.
 func dstMappingFaultAddr(addr uintptr) (state uint8, found bool) {
 	set := dstSpans.Load()
 	if set == nil {
 		return 0, false
 	}
-	for i, n := uintptr(0), set.n.Load(); i < n; i++ {
+	for i := int(set.n.Load()) - 1; i >= 0; i-- {
 		s := &set.spans[i]
 		if addr >= s.base && addr < s.base+s.size {
 			return atomic.Load8(&s.state), true

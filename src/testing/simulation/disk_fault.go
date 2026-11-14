@@ -110,22 +110,21 @@ func HealFile(host, path string) {
 	withBubbleFaultCaller("HealFile", func() { dstDiskFaultOp(diskOpHealFile, lookupHost(host), 0, path) })
 }
 
-// LimitDisk caps the named host's disk at bytes total of regular-file content,
-// modeling a full (or filling) disk: a write that would grow the disk past the cap
-// fills the remaining space and the rest fails with ENOSPC, and creating a new file
-// or directory on an already-full disk fails with ENOSPC. Space in use is the live
-// total, so deleting or truncating a file frees room for later writes; an in-place
-// overwrite (no growth) always succeeds, and reads are unaffected. A cap below the
-// current usage is allowed (the disk is over quota: growth and creates fail until
-// enough is freed). bytes must be >= 0. UnlimitDisk removes the cap. Call from within
-// a Run.
-//
-// Recorded modeling boundary (docs/dst/faults.md, ENOSPC): the accounting is
-// LOGICAL bytes, not allocated blocks, so sparse files diverge from a real
-// disk in both directions — a sparse Truncate-grow's hole counts against the
-// cap (a real hole allocates nothing), writes filling a hole are never
-// charged, and truncate growth is charged but not itself ENOSPC-checked. A
-// SUT relying on sparse preallocation is outside this fault's honest surface.
+// LimitDisk caps the named host's disk at bytes/4096 allocated 4 KB regular-file
+// blocks, modeling a full (or filling) disk: sparse Truncate growth allocates 0
+// blocks, in-place overwrites of already-allocated 4 KB pages consume 0 new
+// blocks, a write into sparse holes or past EOF fills remaining free 4 KB blocks
+// and fails the rest at the 4 KB boundary with ENOSPC, fallocate mode 0 checks
+// unallocated 4 KB blocks in its span all-or-nothing (failing ENOSPC without
+// mutating size or blocks), and creating a new file or directory on a disk with
+// 0 free 4 KB blocks fails with ENOSPC. Non-zero pages dirtied through a
+// PROT_WRITE mapping count against the same 4 KB block total (reads never
+// allocate blocks; an mmap store of 0x00 into an already-zero hole is uncharged,
+// erring in the sound <=-real direction). Space in use is summed on demand across
+// live reachable inodes, so deleting or truncating a file frees blocks
+// immediately. A cap below current usage is allowed (the disk is over quota:
+// block allocations and creates fail until enough blocks are freed). bytes must
+// be >= 0. UnlimitDisk removes the cap. Call from within a Run.
 func LimitDisk(host string, bytes int64) {
 	withBubbleFaultCaller("LimitDisk", func() {
 		if bytes < 0 {

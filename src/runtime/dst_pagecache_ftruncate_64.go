@@ -13,3 +13,8 @@ func dstFtruncate(fd int32, size int64) uintptr {
 	_, _, errno := linux.Syscall6(dstSysFtruncate, uintptr(fd), uintptr(size), 0, 0, 0, 0)
 	return errno
 }
+
+func dstLseek(fd int32, off int64, whence int32) (int64, uintptr) {
+	pos, _, errno := linux.Syscall6(dstSysLseek, uintptr(fd), uintptr(off), uintptr(whence), 0, 0, 0)
+	return int64(pos), errno
+}

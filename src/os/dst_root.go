@@ -336,7 +336,7 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		if r.disk.diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
-		node = dstFSNewNode(0, perm)
+		node = dstFSNewNode(r.disk, 0, perm)
 		parent.entries[base] = node
 		parent.modTime = time.Now()
 	}
@@ -393,7 +393,7 @@ func dstRootStat(root *Root, name string, lstat bool) (FileInfo, error) {
 	if base == "." {
 		base = path.Base(root.Name())
 	}
-	return &dstFileInfo{name: base, size: int64(len(node.data)), mode: node.mode, modTime: node.modTime, isDir: node.isDir, ident: node}, nil
+	return dstFileInfoForNode(base, node), nil
 }
 
 func dstRootReadlink(root *Root, name string) (string, error) {
@@ -506,7 +506,7 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	if r.disk.diskFullForCreate() {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
 	}
-	parent.entries[base] = dstFSNewNode(ModeDir, perm)
+	parent.entries[base] = dstFSNewNode(r.disk, ModeDir, perm)
 	parent.modTime = time.Now()
 	return nil
 }
@@ -570,7 +570,7 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 			if r.disk.diskFullForCreate() {
 				return &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOSPC}
 			}
-			child = dstFSNewNode(ModeDir, perm)
+			child = dstFSNewNode(r.disk, ModeDir, perm)
 			cur.entries[part] = child
 			cur.modTime = time.Now()
 		} else if !child.isDir {

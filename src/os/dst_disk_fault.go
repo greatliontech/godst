@@ -92,7 +92,7 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		}
 	case diskOpCorruptFile:
 		node := dstFSNodeAt(d.root, name)
-		if node == nil || node.isDir || node.isDevice() || len(node.synced) == 0 {
+		if node == nil || node.isDir || node.isDevice() || node.synced.size == 0 {
 			// Bit rot corrupts durable media. A missing target or a directory is
 			// a no-op as for FailFile; a file whose durable image is empty has no
 			// platter blocks to rot (nothing was ever committed). No fault-RNG
@@ -104,7 +104,7 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		// quantum, and the sneakiest input a checksum must catch. The offset
 		// addresses the durable image (the platter), never the page cache:
 		// live reads keep serving the cached bytes (see dstFSNode.rot).
-		off := dstFaultRandN(int64(len(node.synced)))
+		off := dstFaultRandN(node.synced.size)
 		bit := byte(1) << dstFaultRandN(8)
 		if node.rot == nil {
 			node.rot = make(map[int64]byte)

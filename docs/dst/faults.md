@@ -691,15 +691,19 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   (`os/dst_disk_fault_test.go`), mutation-tested. *Recorded bound:* host-level only — a per-file
   writeback form (bad sectors under one file's blocks) extends along `eioFiles`' representation
   unchanged if a consumer needs it, non-foreclosing.
-- **ENOSPC** — **landed**. Writes/creates on a host's disk fail `ENOSPC` past a budget, injected mid-run
-  by `simulation.LimitDisk(host, bytes)` (and removed by `UnlimitDisk`). A capacity on the host's disk
-  (`dstFSDisk.capped`/`capacity`) caps total regular-file content; a write that would grow the disk past
-  it fills the remaining space and returns **the partial count together with the error — `(n, ENOSPC)`
-  in one call** — and a create/`mkdir` on an already-full disk fails ENOSPC. `Write` (a single backend
+- **ENOSPC** — **landed**. Writes, `fallocate`, and creates on a host's disk fail `ENOSPC` past a
+  4 KB block budget, injected mid-run by `simulation.LimitDisk(host, bytes)` (capping total
+  allocated regular-file blocks at `bytes / 4096`, and removed by `UnlimitDisk`). Sparse
+  `Truncate`-grow allocates `0` blocks (`st_blocks == 0`), in-place overwrites of already-allocated
+  4 KB pages consume `0` additional blocks, and a write into sparse holes or past EOF whose newly
+  allocated 4 KB pages would exceed remaining free blocks fills up to the exact 4 KB block boundary
+  and returns **the partial count together with the error — `(n, ENOSPC)` in one call** — while
+  `fallocate` mode 0 checks unallocated 4 KB pages in `[off, off+len)` all-or-nothing up front, and
+  a create/`mkdir` on a disk with `0` free 4 KB blocks fails `ENOSPC`. `Write` (a single backend
   call) surfaces the combined `(n, ENOSPC)` directly; `WriteAt` reaches the same shape through
   `os.File.WriteAt`'s own retry loop, so the backend's `pwrite` returns partials as `(n, nil)` and the
   loop surfaces ENOSPC on the following zero-byte call (`TestDSTDiskENOSPCPartialFill`,
-  `TestDSTDiskENOSPCStraddleOverQuota`). The one-call surface is the
+  `TestDSTDiskENOSPCStraddleOverQuota`, `TestDSTDiskENOSPCSparseTruncateAndHoleWrite`). The one-call surface is the
   real kernel's as Go exposes it: `write(2)` returns the short count and the *retry* gets `ENOSPC`, but
   `internal/poll.FD.Write` **loops** until error or completion, so a real `os.File.Write` that partially
   fills a disk returns `(n, ENOSPC)` and can never return a bare short count (`io.ErrShortWrite`). The
@@ -708,32 +712,17 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   produce for a regular file, and the SUT's `errors.Is(err, ENOSPC)` recovery path does not fire on
   exactly the write the fault was injected to exercise (and `Write` vs `WriteAt`, which has its own
   loop, would disagree — a state no kernel produces). Space in use is summed on demand from the live
-  tree (`residentLocked`) by unique inode identity — a crash-tear rename image may contain both old and
-  new names for one inode, whose bytes count once — and is **not** tracked incrementally, so a delete or truncate-down frees room for the
+  tree (`residentPagesLocked`) by unique inode identity — a crash-tear rename image may contain both old and
+  new names for one inode, whose blocks count once — and is **not** tracked incrementally, so a delete or truncate-down frees blocks for the
   next write with no accounting in the mutation paths — and never the false ENOSPC a budget-that-ignores-
-  frees would produce (DoF: a full disk; sound because in-place overwrites consume nothing, frees are
-  honored, and the partial-fill matches real short-write semantics). A write whose effective slice
+  frees would produce (DoF: a full disk; sound because sparse holes allocate nothing, in-place overwrites of allocated blocks consume nothing, frees are
+  honored, and the 4 KB partial-fill matches real block-allocation short-write semantics). Non-zero pages dirtied through a `PROT_WRITE` mapping (including after `mprotect` upgrade) fold into the node's allocated 4 KB blocks via `SEEK_DATA`/`SEEK_HOLE`, while reads through `PROT_READ` or `PROT_WRITE` mappings never charge blocks (`TestDSTDiskENOSPCMmapDirtyHoleAndReadImmunity`; recorded `⊆`-real bound: an `mmap` store of `0x00` into an already-zero hole is uncharged). A write whose effective slice
   is empty — a zero-length write at any offset, or one FULLY refused by the cap — has no effect at
-  all, as POSIX gives `write(2)`: no growth to the seek offset, no mtime, no resident-byte charge
-  (a refusal that grew the file would break the capacity invariant with no path to recover the
-  budget; `TestDSTDiskENOSPCRefusedWriteDoesNotGrow`, `TestDSTFSZeroLengthWriteNoEffect`). Per-host victim isolation, frees,
-  partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` (`os/dst_disk_fault_test.go`),
-  mutation-tested. **Recorded modeling boundary — logical bytes, not allocated blocks (sparse
-  files).** The cap counts a file's LOGICAL content length; a real filesystem charges allocated
-  blocks, and a hole allocates nothing (host: a sparse `Truncate`-grow shows `size=N blocks=0`).
-  Probe-verified consequences, both directions: (a) a sparse truncate-grow's hole bytes COUNT
-  against the cap, so the classic WAL/journal sparse-preallocation pattern can hit `ENOSPC` here
-  where a real disk at the same quota has all blocks free (a false-positive window); (b) a write
-  INTO a hole is a no-growth overwrite and is never charged, so filling preallocated holes
-  succeeds where a really-full disk would `ENOSPC` on block allocation (the paired false-negative
-  window); and (c) truncate GROWTH is charged to usage but not itself checked against the cap
-  (fallocate growth, by contrast, IS checked — failing ENOSPC up front is that call's purpose) —
-  the disk silently enters the over-quota state, after which growth and creates fail until enough
-  is freed. Closing the window needs allocation-granular (extent/hole-aware) accounting — charge
-  on materialization, check truncate growth — a capacity-model rebuild, not an accounting-formula
-  tweak; until then LimitDisk models a full disk faithfully for densely-written files only, and a
-  SUT whose durability discipline relies on sparse preallocation is outside the fault's honest
-  surface.
+  all, as POSIX gives `write(2)`: no growth to the seek offset, no mtime, no block charge
+  (a refusal that grew the file or allocated blocks would break the capacity invariant;
+  `TestDSTDiskENOSPCRefusedWriteDoesNotGrow`, `TestDSTFSZeroLengthWriteNoEffect`). Per-host victim isolation, sparse hole fills, `fallocate` hole charging, frees,
+  partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` and `TestDSTFallocateHoleChargeAndDurability`
+  (`os/dst_disk_fault_test.go`, `os/dst_sparse_linux_test.go`), mutation-tested.
 - **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set
   mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
   sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op

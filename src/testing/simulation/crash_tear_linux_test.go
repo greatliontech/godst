@@ -441,18 +441,18 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 						if !os.SameFile(a, b) {
 							t.Fatalf("seed %d: recovered aliases are not one inode", seed)
 						}
-						LimitDisk("h", page+1)
+						LimitDisk("h", 2*page)
 						f, err := os.OpenFile("/b/f", os.O_WRONLY|os.O_APPEND, 0)
 						if err != nil {
 							t.Fatal(err)
 						}
-						if n, err := f.Write([]byte("xy")); n != 1 || !errors.Is(err, syscall.ENOSPC) {
-							t.Fatalf("seed %d: alias-capacity write = %d, %v; want 1, ENOSPC", seed, n, err)
+						if n, err := f.Write(bytes.Repeat([]byte("U"), page+1)); n != page || !errors.Is(err, syscall.ENOSPC) {
+							t.Fatalf("seed %d: alias-capacity write = %d, %v; want %d, ENOSPC", seed, n, err, page)
 						}
 						f.Close()
 						fi, _ := os.Stat("/a/f")
-						if fi.Size() != page+1 {
-							t.Fatalf("seed %d: alias size = %d, want %d", seed, fi.Size(), page+1)
+						if fi.Size() != 2*page {
+							t.Fatalf("seed %d: alias size = %d, want %d", seed, fi.Size(), 2*page)
 						}
 					}
 				})

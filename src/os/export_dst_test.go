@@ -6,6 +6,8 @@
 
 package os
 
+import "unsafe"
+
 // DSTFSNodeState is the white-box inspector for the durability-monotonicity
 // invariant: it reports a simulated node's current vs durable state so tests
 // can assert that mutations never advance the durable image and that sync
@@ -45,10 +47,55 @@ func dstFSNodeStateFull(name string) (cur, synced string, curEntries, syncedEntr
 		}
 		return out
 	}
-	return string(node.data), string(node.synced),
+	return string(node.data), string(node.synced.bytes()),
 		sorted(node.entries), sorted(node.syncedEntries),
 		node.mode, node.syncedMode,
 		node.modTime.UnixNano(), node.syncedModTime.UnixNano(), true
+}
+
+// DSTFSNodeSparseStats reports a regular file's logical and durable sizes,
+// allocated 4 KB block count, and durable non-zero 4 KB page count without
+// densifying sparse holes.
+func DSTFSNodeSparseStats(name string) (size, syncedSize, allocatedPages, syncedNonZeroPages int64, ok bool) {
+	if !dstFSActive() {
+		return 0, 0, 0, 0, false
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil || node == nil || node.isDir || node.isDevice() {
+		return 0, 0, 0, 0, false
+	}
+	return int64(len(node.data)), node.synced.size, node.allocatedPagesLocked(), int64(len(node.synced.pages)), true
+}
+
+// DSTFSNodeDurablePagePtr returns the identity of pg's immutable durable page
+// buffer (0 if pg is a hole) so white-box tests can pin COW page sharing.
+func DSTFSNodeDurablePagePtr(name string, pg int64) (uintptr, bool) {
+	if !dstFSActive() {
+		return 0, false
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	_, _, node, errno := dstFSResolve(name)
+	if errno != nil || node == nil || node.isDir || node.isDevice() {
+		return 0, false
+	}
+	p := node.synced.pages[pg]
+	if p == nil {
+		return 0, true
+	}
+	return uintptr(unsafe.Pointer(p)), true
+}
+
+// DSTBackedNodeCount reports the number of regular file nodes currently
+// holding a live memfd and internal page-cache view in dstFS.backed.
+func DSTBackedNodeCount() int {
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	return len(dstFS.backed)
 }
 
 // DSTRawRename drives the internal renameat(2) ladder (dstRename) directly —

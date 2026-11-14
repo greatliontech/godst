@@ -18,3 +18,7 @@ func dstFtruncate(fd int32, size int64) uintptr {
 		uintptr(uint32(size)), uintptr(uint32(size>>32)), 0, 0)
 	return errno
 }
+
+func dstLseek(fd int32, off int64, whence int32) (int64, uintptr) {
+	return 0, 38 // ENOSYS; 32-bit hosts are refused by dstPageCacheCheckHost
+}

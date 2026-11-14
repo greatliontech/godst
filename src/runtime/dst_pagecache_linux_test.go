@@ -356,3 +356,180 @@ func TestDSTCrashedMappingTouchIsNamed(t *testing.T) {
 		t.Fatalf("the touch of a dead mapping did not abort:\n%s", got)
 	}
 }
+
+// TestDSTPageCacheRetiredSpanReclamationAndCompaction verifies that retired
+// internal views (dstSpanRetired) return their address space to the region's
+// deterministic free list (coalescing adjacent spans and shadowing retired
+// entries on re-carve without losing un-reused tails), while SUT tombstones
+// (dstSpanUnmapped, dstSpanCrashed) are never reused and dstSpans stays bounded
+// across repeated retire/re-carve cycles.
+func TestDSTPageCacheRetiredSpanReclamationAndCompaction(t *testing.T) {
+	regionSize := mustHavePageCacheRegion(t)
+	runtime.DSTPageCacheReset()
+	defer runtime.DSTPageCacheReset()
+
+	fd := runtime.DSTPageCacheNew()
+	defer runtime.DSTPageCacheClose(fd)
+	runtime.DSTPageCacheResize(fd, 4*pcPage)
+
+	// Retire two adjacent 2-page spans flanked by a SUT tombstone; they must
+	// coalesce so a 4-page carve reuses [a, a+4*pcPage) while the SUT tombstone
+	// stays permanently reserved.
+	a := runtime.DSTPageCacheMap(fd, 2*pcPage, runtime.DSTProtRead)
+	b := runtime.DSTPageCacheMap(fd, 2*pcPage, runtime.DSTProtRead)
+	sut := runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
+	runtime.DSTPageCacheUnmap(sut, pcPage, runtime.DSTSpanUnmapped)
+	runtime.DSTPageCacheUnmap(b, 2*pcPage, runtime.DSTSpanRetired)
+	runtime.DSTPageCacheUnmap(a, 2*pcPage, runtime.DSTSpanRetired)
+
+	if st, ok := runtime.DSTMappingFaultAddr(a); !ok || st != runtime.DSTSpanRetired {
+		t.Fatalf("retired span before reuse = (%d, %v), want retired", st, ok)
+	}
+
+	// Re-carve 3 pages out of the 4-page coalesced free span: [a, a+3*pcPage)
+	// becomes live, while the 1-page tail [a+3*pcPage, a+4*pcPage) remains
+	// classified retired, and sut remains unmapped.
+	c := runtime.DSTPageCacheMap(fd, 3*pcPage, runtime.DSTProtRead)
+	if c != a {
+		t.Fatalf("coalesced re-carve = %#x, want lowest fitting base %#x", c, a)
+	}
+	if st, ok := runtime.DSTMappingFaultAddr(a); !ok || st != 0 {
+		t.Fatalf("re-carved prefix = (%d, %v), want live", st, ok)
+	}
+	if st, ok := runtime.DSTMappingFaultAddr(a + 3*pcPage); !ok || st != runtime.DSTSpanRetired {
+		t.Fatalf("un-reused retired tail = (%d, %v), want retired", st, ok)
+	}
+	if st, ok := runtime.DSTMappingFaultAddr(sut); !ok || st != runtime.DSTSpanUnmapped {
+		t.Fatalf("SUT tombstone = (%d, %v), want unmapped", st, ok)
+	}
+	runtime.DSTPageCacheUnmap(c, 3*pcPage, runtime.DSTSpanRetired)
+
+	// Carve and retire > 1.5x the entire region in chunks to prove reclamation
+	// prevents region exhaustion AND dstSpanCompact keeps dstSpans O(1).
+	chunk := regionSize / 4
+	for i := range 8 {
+		m := runtime.DSTPageCacheMap(fd, chunk, runtime.DSTProtRead)
+		if m == 0 {
+			t.Fatalf("iteration %d: retired span reclamation failed to prevent ENOMEM", i)
+		}
+		runtime.DSTPageCacheUnmap(m, chunk, runtime.DSTSpanRetired)
+	}
+	for range 256 {
+		m := runtime.DSTPageCacheMap(fd, 2*pcPage, runtime.DSTProtRead)
+		if m != a {
+			t.Fatalf("repeated carve drifted to %#x, want %#x", m, a)
+		}
+		runtime.DSTPageCacheUnmap(m, 2*pcPage, runtime.DSTSpanRetired)
+	}
+	if got := runtime.DSTSpanCount(); got > 32 {
+		t.Fatalf("dstSpans grew to %d entries across 256 retire cycles, want <= 32 after compaction", got)
+	}
+}
+
+func TestDSTPageCacheNextDataSparseSeek(t *testing.T) {
+	mustHavePageCacheRegion(t)
+	fd := runtime.DSTPageCacheNew()
+	defer runtime.DSTPageCacheClose(fd)
+
+	const total = int64(16) << 30 // 16 GiB sparse memfd
+	runtime.DSTPageCacheResize(fd, total)
+
+	if d, h, ok := runtime.DSTPageCacheNextData(fd, 0, total); ok {
+		t.Fatalf("all-hole memfd reported data [%d, %d)", d, h)
+	}
+
+	// Dirty one page at 8 GiB via a small prefix? No: map up to 8 MiB for speed
+	// and verify multi-GiB hole tail after 4 MiB is skipped in O(1).
+	const dirtyOff = int64(4) << 20
+	rw := runtime.DSTPageCacheMap(fd, uintptr(dirtyOff+pcPage), runtime.DSTProtRead|runtime.DSTProtWrite)
+	defer runtime.DSTPageCacheUnmap(rw, uintptr(dirtyOff+pcPage), runtime.DSTSpanRetired)
+	mappingBytes(rw, uintptr(dirtyOff+pcPage))[dirtyOff] = 0x5a
+
+	d, h, ok := runtime.DSTPageCacheNextData(fd, 0, total)
+	if !ok || d != dirtyOff || h != dirtyOff+pcPage {
+		t.Fatalf("NextData(0) = (%d, %d, %v), want (%d, %d, true)", d, h, ok, dirtyOff, dirtyOff+pcPage)
+	}
+	if d2, h2, ok2 := runtime.DSTPageCacheNextData(fd, h, total); ok2 {
+		t.Fatalf("NextData(%d) = (%d, %d, true), want false across 16 GiB trailing hole", h, d2, h2)
+	}
+}
+
+// TestDSTPageCacheFDBitmapAndFreeListZeroHeapPerturbation pins two cross-run
+// heap-determinism invariants:
+//  1. dstPageCacheFDSet lives off the GC heap (sys.NotInHeap via persistentalloc),
+//     so growing the bitmap across arbitrary host fd numbers allocates 0 GC-heap
+//     objects and preserves existing bits.
+//  2. dstPageCacheResetRegion clears dstMapRegion.free to nil (not [:0]), so two
+//     consecutive runs that fragment the retired-span free list perform the exact
+//     same GC-heap allocations.
+func TestDSTPageCacheFDBitmapAndFreeListZeroHeapPerturbation(t *testing.T) {
+	mustHavePageCacheRegion(t)
+
+	// 1. Force multiple bitmap growths (e.g., fd 64 -> 2048 -> 32768) and verify
+	// 0 GC-heap allocations and exact bit preservation.
+	const (
+		fdLo  = 19000
+		fdMid = 35000
+		fdHi  = 90000
+	)
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	runtime.DSTPageCacheFDRegisterForTest(fdLo, true)
+	runtime.DSTPageCacheFDRegisterForTest(fdMid, true)
+	runtime.DSTPageCacheFDRegisterForTest(fdHi, true)
+	runtime.ReadMemStats(&m1)
+	defer func() {
+		runtime.DSTPageCacheFDRegisterForTest(fdLo, false)
+		runtime.DSTPageCacheFDRegisterForTest(fdMid, false)
+		runtime.DSTPageCacheFDRegisterForTest(fdHi, false)
+	}()
+	if m1.Mallocs != m0.Mallocs || m1.TotalAlloc != m0.TotalAlloc {
+		t.Fatalf("growing dstPageCacheFDs allocated on GC heap: mallocs +%d, bytes +%d",
+			m1.Mallocs-m0.Mallocs, m1.TotalAlloc-m0.TotalAlloc)
+	}
+	for _, fd := range []uintptr{fdLo, fdMid, fdHi} {
+		if !runtime.DSTPageCacheFDReserved(fd) {
+			t.Fatalf("fd %d lost across bitmap growth", fd)
+		}
+	}
+	runtime.DSTPageCacheFDRegisterForTest(fdMid, false)
+	if runtime.DSTPageCacheFDReserved(fdMid) || !runtime.DSTPageCacheFDReserved(fdLo) || !runtime.DSTPageCacheFDReserved(fdHi) {
+		t.Fatalf("clearing fdMid corrupted neighbor bits")
+	}
+
+	// 2. Fragment dstMapRegion.free inside two consecutive identical simulation
+	// runs (non-adjacent retirements pinned below a live tail mapping) and verify
+	// identical GC-heap allocation counts across the run boundary.
+	measureRun := func() (mallocs, bytes uint64) {
+		simulation.Run(77, func() {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			var bases [6]uintptr
+			fd := runtime.DSTPageCacheNew()
+			runtime.DSTPageCacheResize(fd, pcPage)
+			for i := range bases {
+				bases[i] = runtime.DSTPageCacheMap(fd, pcPage, runtime.DSTProtRead)
+			}
+			// Retire non-adjacent spans 0, 2, 4 while span 5 pins dstMapRegion.next,
+			// forcing 3 distinct free-list entries (and slice growth from nil).
+			runtime.DSTPageCacheUnmap(bases[0], pcPage, runtime.DSTSpanRetired)
+			runtime.DSTPageCacheUnmap(bases[2], pcPage, runtime.DSTSpanRetired)
+			runtime.DSTPageCacheUnmap(bases[4], pcPage, runtime.DSTSpanRetired)
+			runtime.ReadMemStats(&after)
+			mallocs = after.Mallocs - before.Mallocs
+			bytes = after.TotalAlloc - before.TotalAlloc
+			runtime.DSTPageCacheUnmap(bases[1], pcPage, runtime.DSTSpanRetired)
+			runtime.DSTPageCacheUnmap(bases[3], pcPage, runtime.DSTSpanRetired)
+			runtime.DSTPageCacheUnmap(bases[5], pcPage, runtime.DSTSpanRetired)
+			runtime.DSTPageCacheClose(fd)
+		})
+		return mallocs, bytes
+	}
+	runtime.DSTPageCacheReset()
+	mRun1, bRun1 := measureRun()
+	mRun2, bRun2 := measureRun()
+	if mRun1 != mRun2 || bRun1 != bRun2 {
+		t.Fatalf("cross-run free-list residue perturbed heap allocations: run1=(%d mallocs, %d B) vs run2=(%d mallocs, %d B)",
+			mRun1, bRun1, mRun2, bRun2)
+	}
+}

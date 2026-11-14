@@ -25,17 +25,6 @@ type dstHostFS struct{ host uint32 }
 //go:linkname dstHostFSFor
 func dstHostFSFor(host uint32) fs.FS { return dstHostFS{host: host} }
 
-func dstFileInfoForNode(name string, node *dstFSNode) *dstFileInfo {
-	return &dstFileInfo{
-		name:    name,
-		size:    int64(len(node.data)),
-		mode:    node.mode,
-		modTime: node.modTime,
-		isDir:   node.isDir,
-		ident:   node,
-	}
-}
-
 func (h dstHostFS) Open(name string) (fs.File, error) {
 	if !fs.ValidPath(name) {
 		return nil, &PathError{Op: "open", Path: name, Err: fs.ErrInvalid}

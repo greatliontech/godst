@@ -191,6 +191,10 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		writable:   writable,
 		fdWritable: file.wr,
 	})
+	file.node.liveMaps++
+	if writable {
+		file.node.everMappedWrite.Store(true)
+	}
 	dstMMapRegistry.mu.Unlock()
 	return data, 0, true
 }
@@ -283,6 +287,10 @@ func dstMunmapLocked(data []byte) (syscall.Errno, bool, *dstFlockPending) {
 		entry := bucket[i]
 		if entry.epoch == dstFSEpoch() && entry.host == host && entry.proc == proc && len(entry.data) == len(data) && len(entry.data) != 0 && &entry.data[0] == &data[0] {
 			dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanUnmapped)
+			if entry.node != nil {
+				entry.node.liveMaps--
+				dstNodeMaybeReleaseLocked(entry.node)
+			}
 			bucket = append(bucket[:i], bucket[i+1:]...)
 			if len(bucket) == 0 {
 				delete(dstMMapRegistry.maps, key)
@@ -346,6 +354,10 @@ func dstMMapReleaseWhere(match func(*dstMMapEntry) bool) []*dstFlockPending {
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && match(entry) {
 				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
+				if entry.node != nil {
+					entry.node.liveMaps--
+					dstNodeMaybeReleaseLocked(entry.node)
+				}
 				dropped = append(dropped, entry.file)
 				continue
 			}
@@ -376,6 +388,7 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 	dstMMapRollLocked()
 	var foundCurrent, foundOther, misaligned bool
 	fdWritable := true // all matched current mappings must be fd-writable for a write upgrade
+	var writeNodes []*dstFSNode
 	for _, bucket := range dstMMapRegistry.maps {
 		for _, entry := range bucket {
 			mapStart, mapEnd, errno := dstMMapRange(entry.data)
@@ -392,6 +405,9 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 			if entry.host == host && entry.proc == proc {
 				foundCurrent = true
 				fdWritable = fdWritable && entry.fdWritable
+				if prot&syscall.PROT_WRITE != 0 && entry.node != nil {
+					writeNodes = append(writeNodes, entry.node)
+				}
 			} else {
 				foundOther = true
 			}
@@ -417,6 +433,9 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		}
 		if !dstPageCacheProtect(start, end-start, int32(prot)) {
 			return syscall.EINVAL, true
+		}
+		for _, n := range writeNodes {
+			n.everMappedWrite.Store(true)
 		}
 		return 0, true
 	}

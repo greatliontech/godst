@@ -447,12 +447,16 @@ func TestDSTFSVirtualFDSyscalls(t *testing.T) {
 func TestDSTFSVirtualFDWritePartialENOSPC(t *testing.T) {
 	simulation.Run(1, func() {
 		onHost("h", func() {
-			simulation.LimitDisk("h", 5)
+			const blk = 4096
+			simulation.LimitDisk("h", blk)
 			f, err := os.Create("/fd")
 			if err != nil {
 				t.Fatalf("Create: %v", err)
 			}
 			fd := int(f.Fd())
+			if _, err := syscall.Seek(fd, blk-5, io.SeekStart); err != nil {
+				t.Fatalf("Seek: %v", err)
+			}
 			if n, err := syscall.Write(fd, []byte("abcdef")); n != 5 || err != nil {
 				t.Fatalf("partial syscall.Write = %d, %v; want 5, nil", n, err)
 			}
@@ -463,8 +467,8 @@ func TestDSTFSVirtualFDWritePartialENOSPC(t *testing.T) {
 				t.Fatalf("Close: %v", err)
 			}
 			b, err := os.ReadFile("/fd")
-			if err != nil || string(b) != "abcde" {
-				t.Fatalf("content after partial syscall.Write = %q, %v; want abcde", b, err)
+			if err != nil || len(b) != blk || string(b[blk-5:]) != "abcde" {
+				t.Fatalf("content after partial syscall.Write len=%d tail=%q, %v; want abcde", len(b), b[max(0, len(b)-5):], err)
 			}
 		})
 	})

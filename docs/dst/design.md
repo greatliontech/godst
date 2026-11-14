@@ -916,7 +916,8 @@ synthetic file identity: `st_dev` derives from the owning host's id and `st_ino`
 assigned at creation from a schedule-deterministic counter — stable across rename and while
 unlinked-but-open — so `(st_dev, st_ino)`-keyed SUTs (the SQLite/LMDB per-file lock-dedup pattern)
 distinguish files; directories report `Nlink` 2 (per-subdirectory increments are not modeled), regular
-files 1. Proc-overlay fds carry no tree node and report zero `(st_dev, st_ino)` — synthetic procfs
+files carry their live hard-link count and report `st_blocks` as `8` 512-byte sectors per allocated
+4 KB page (`0` on sparse holes). Proc-overlay fds carry no tree node and report zero `(st_dev, st_ino)` — synthetic procfs
 stats are not an identity surface (recorded; no SUT keys file identity on procfs entries). A virtual fd never allocates or names a
 host descriptor, and the raw-syscall fence still catches host-resource minting and unsupported
 syscalls before they can reach the host. The **raw boundary dispatches a settled subset**: a SUT that
@@ -925,30 +926,34 @@ directly, never the named wrappers) gets the same modeled behavior for the file 
 `fdatasync`), advisory locking (`flock`), descriptor `close`, the mapping operations (`madvise`,
 `mprotect`, `munmap`), `renameat2`, and `fallocate` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one
 operation, not two. `fallocate` dispatches mode 0 (preallocation, the WAL warmed-segment idiom):
-in the logical-bytes model allocation IS size, so a span past EOF grows the file with zeros,
-checked all-or-nothing against the disk capacity up front (failing `ENOSPC` before any write is
-the call's reason to exist), durable only after a sync like any growth; a span inside the current
-size is a no-op (the recorded logical-bytes/sparse boundary); every other mode — `KEEP_SIZE`,
-`PUNCH_HOLE`, `ZERO_RANGE` — answers `EOPNOTSUPP`, the kernel's shape for a filesystem without the
-capability, so degradation ladders see the errno they were written against. The 32-bit trampoline
-shape (off/len as lo/hi register pairs) is decoded per-arch at the dispatch.
+it preallocates every unallocated 4 KB page in `[offset, offset+len)` and grows the file with zeros
+when `offset+len` exceeds EOF, checked all-or-nothing against the disk's free 4 KB blocks up front
+(failing `ENOSPC` before any write or size change is the call's reason to exist; already-allocated
+pages in the span consume zero additional blocks), durable only after a sync like any file mutation;
+every other mode — `KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE` — answers `EOPNOTSUPP`, the kernel's
+shape for a filesystem without the capability, so degradation ladders see the errno they were
+written against. The 32-bit trampoline shape (off/len as lo/hi register pairs) is decoded per-arch
+at the dispatch.
 
-**s_maxbytes.** The modeled filesystem carries a maximum file size (an eighth of the page-cache
-mapping region — 128 GiB on the wide arches), and every size-growth site answers `EFBIG` at it as
-the vfs does: truncate growth (`inode_newsize_ok`), a fallocate span (checked before the
-filesystem op, so `EFBIG` wins over the capacity's `ENOSPC` when both bind), and the write path
-(`generic_write_checks`: a write starting at or past the bound is `EFBIG` outright; one crossing
-it is clipped and the retry surfaces the partial count with `EFBIG` in one call — the `ENOSPC`
-partial-fill shape with the boundary's errno). Before the bound, a single file's huge growth ran
-into the mapping reserve and died with a runtime fatal no real kernel produces; the bound closes
-that SINGLE-FILE class. Two capacity limits remain, both recorded in the issue register: the
-mapping region is carved, never reclaimed, so an AGGREGATE of near-limit in-bounds files (about
-eight at the bound, fewer under incremental doubling) still reaches the same loud fatal — a
-harness capacity, with no sound errno to answer (a real kernel evicts page cache instead of
-failing; the model has no eviction) — and the durable image is an ordinary copied slice, so
-SYNCING a near-limit sparse file densifies it and dies as an untyped kernel OOM kill, the least
-loud failure shape there is. Near-limit files are otherwise cheap: the page cache is a sparse
-memfd — size is address space, physical pages only where touched. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
+**s_maxbytes and sparse storage.** The modeled filesystem carries a maximum file size (an eighth of
+the page-cache mapping region — 128 GiB on the wide arches), and every size-growth site answers
+`EFBIG` at it as the vfs does: truncate growth (`inode_newsize_ok`), a fallocate span (checked
+before the filesystem op, so `EFBIG` wins over the capacity's `ENOSPC` when both bind), and the
+write path (`generic_write_checks`: a write starting at or past the bound is `EFBIG` outright; one
+crossing it is clipped and the retry surfaces the partial count with `EFBIG` in one call — the
+`ENOSPC` partial-fill shape with the boundary's errno). Before the bound, a single file's huge
+growth ran into the mapping reserve and died with a runtime fatal no real kernel produces; the
+bound closes that single-file class. Near-limit sparse files stay cheap across every lifecycle
+stage: the page cache is a sparse memfd (`SEEK_DATA`/`SEEK_HOLE` skips unbacked holes), the durable
+image is a sparse copy-on-write 4 KB page map (syncing or crash-restoring a 100 GiB sparse file
+never densifies holes, unchanged 4 KB platter pages share immutable buffers across commits, and
+failed-writeback fsyncgate tracking is `O(redirtied)` rather than `O(file_pages)`), and internal
+page-cache views are reclaimed back to the mapping region's free list both on view doubling and
+when a regular file loses its last live link, durable parent entry, open handle, and live SUT
+mapping (closing its host `memfd` at the same instant). Only SUT mappings retain unmapped/crashed
+tombstones in the `2^40`-byte region so stale-slice touches preserve deterministic fault/abort
+diagnostics, leaving simultaneously live views plus SUT mappings/tombstones as the remaining
+aggregate region ceiling. `renameat2` dispatches only its `AT_FDCWD`-relative form (a virtual directory
 fd exists — `os.Open(dir).Fd()` — but the model does not resolve renames relative to it, so a
 dirfd-relative form meets the fence) and routes to the modeled
 rename: flags `0` and `RENAME_NOREPLACE` are modeled — `RENAME_NOREPLACE` refuses ANY positive

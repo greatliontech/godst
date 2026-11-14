@@ -12,4 +12,5 @@ package runtime
 const (
 	dstSysMemfdCreate = 319
 	dstSysFtruncate   = 77
+	dstSysLseek       = 8
 )

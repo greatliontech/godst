@@ -40,15 +40,19 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 	// SQLite/LMDB per-file lock-dedup pattern) require: dev derives from the
 	// owning host's id (+1 so no simulated device is 0), ino is the node's
 	// synthetic inode. Proc-overlay fds carry no tree node and keep (dev, ino)
-	// zero — no SUT keys identity on synthetic procfs stats.
-	treeFile, isTree := entry.backend.(*dstFile)
+	// zero — no SUT keys identity on synthetic procfs stats. All node fields
+	// come from the dstFileInfo snapshot captured under dstFile.enter() so
+	// fstat never races with concurrent close or link/block mutations.
+	_, isTree := entry.backend.(*dstFile)
 	if isTree {
+		dfi := info.(*dstFileInfo)
 		stat.Dev = dstStatDev(stat.Dev, entry.host)
-		stat.Ino = treeFile.node.ino
-		if !treeFile.node.isDir {
+		stat.Ino = dfi.ino
+		stat.Blocks = dfi.blocks
+		if !dfi.isDir {
 			// The live hard-link count; 0 for an unlinked-but-open file,
 			// as fstat(2) reports. Nlink's width is per-arch.
-			stat.Nlink = dstStatNlink(stat.Nlink, treeFile.node.nlink)
+			stat.Nlink = dstStatNlink(stat.Nlink, dfi.nlink)
 		}
 	}
 	// Proc-overlay fds carry no tree node: (st_dev, st_ino) stays zero —
