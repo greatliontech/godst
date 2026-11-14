@@ -7220,6 +7220,9 @@ func updateMaxProcsGoroutine() {
 		// This goroutine is explicitly resumed by sysmon.
 
 		stw := stopTheWorldGC(stwGOMAXPROCS)
+		if dstBuild {
+			dstNoteUpdateMaxProcsSTW()
+		}
 
 		// Still OK to update?
 		lock(&sched.lock)
@@ -7249,6 +7252,11 @@ func updateMaxProcsGoroutine() {
 }
 
 func sysmonUpdateGOMAXPROCS() {
+	if dstBuild {
+		if !dstSysmonUpdateMaxProcsAllowed() {
+			return
+		}
+	}
 	// Synchronize with GOMAXPROCS. See comment on computeMaxProcsLock.
 	lock(&computeMaxProcsLock)
 
@@ -7258,7 +7266,12 @@ func sysmonUpdateGOMAXPROCS() {
 	curr := gomaxprocs
 	unlock(&sched.lock)
 	if dstBuild {
-		if custom || dstActive() {
+		if custom {
+			unlock(&computeMaxProcsLock)
+			return
+		}
+		if dstActive() {
+			dstNoteSysmonMaxProcsActiveSkip()
 			unlock(&computeMaxProcsLock)
 			return
 		}
@@ -7279,6 +7292,9 @@ func sysmonUpdateGOMAXPROCS() {
 	// behalf. If updateGOMAXPROCS.idle is false, then a previous update is
 	// still pending.
 	if updateMaxProcsG.idle.Load() {
+		if dstBuild {
+			dstSysmonUpdateMaxProcsBeforeLock()
+		}
 		lock(&updateMaxProcsG.lock)
 		if dstBuild {
 			if updateMaxProcsG.idle.Load() {
@@ -7287,6 +7303,8 @@ func sysmonUpdateGOMAXPROCS() {
 				var list gList
 				list.push(updateMaxProcsG.g)
 				injectglist(&list)
+			} else {
+				dstNoteSysmonMaxProcsRecheckBail()
 			}
 		} else {
 			updateMaxProcsG.procs = procs
@@ -7296,6 +7314,9 @@ func sysmonUpdateGOMAXPROCS() {
 			injectglist(&list)
 		}
 		unlock(&updateMaxProcsG.lock)
+		if dstBuild {
+			dstSysmonUpdateMaxProcsAfterLock()
+		}
 	}
 }
 

@@ -518,7 +518,7 @@ func gcAssistAlloc(gp *g) {
 		// but avoids any contamination between GC assist and synctest.
 		bubble := gp.bubble
 		if dstBuild {
-			gcInternal := dstEnterGCDisassociate(gp)
+			gcInternal := dstEnterGCAssistDisassociate(gp)
 			gp.bubble = nil
 			defer func() {
 				dstExitGCDisassociate(gp, gcInternal)

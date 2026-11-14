@@ -305,14 +305,9 @@ func testingSimulationCleanupStarted(t *T) bool {
 // failing chunk, stay buffered and are never retried once the error
 // sticks): the framework-stream callers drop it, exactly like the host
 // leg's ignored fmt.Fprintf error — the diagnostic stream has no better
-// channel to report its own failure — and the test-log writer
-// (dstTestlogWriter) returns it, since the test log has one: its
-// buffered writer keeps the
-// error and StopTestLog's flush fails the binary, as the same writer does
-// on the host path, so a log the harness could not deliver whole never
-// reads as complete. The count's witnessed ends are the whole payload and
-// none (a refused descriptor); a failure mid-payload counts the chunks
-// before it.
+// channel to report its own failure. The count's witnessed ends are the
+// whole payload and none (a refused descriptor); a failure mid-payload
+// counts the chunks before it.
 func dstHostStreamWrite(fd int, header, payload []byte) (written int, err error) {
 	old := dstSetHostIO(true)
 	defer dstSetHostIO(old)
@@ -379,56 +374,4 @@ func dstHostStreamWrite(fd int, header, payload []byte) (written int, err error)
 			return written, err
 		}
 	}
-}
-
-// dstTestlogWriter routes the cmd/go test-action log (the
-// -test.testlogfile writer, whose bufio buffer is fed by every
-// os.Open/Getenv the test performs and can FLUSH on any goroutine —
-// including a bubble goroutine, where the raw host write met the
-// fence and crashed any open-heavy dst binary under go test's caching
-// mode). The log is framework plumbing exactly like the -v stream: a
-// host-owned descriptor captured before any run starts, outbound
-// only, feeding no nondeterminism back. In-bubble flushes take the
-// same granted raw-write path as the framework stream; host
-// goroutines write normally. A host write the in-bubble leg cannot
-// complete is returned (writeFromBubble), never dropped: the log's
-// buffered writer keeps the error and StopTestLog's flush fails the
-// binary, exactly as on the host path — a test log a consumer reads as
-// the record of every file and variable the test touched must reach it
-// whole or fail loudly. The residual log.mu schedule coupling (a
-// bubble flush parking on the buffer lock a host goroutine holds
-// across wall-clock work) is recorded in the issue index — it needs
-// the printer-style lock-free treatment, a design of its own.
-type dstTestlogWriter struct {
-	f  *os.File
-	fd int // captured pre-run; File.Fd from a bubble goroutine would fence
-}
-
-func dstWrapTestlogWriter(f *os.File) io.Writer {
-	return &dstTestlogWriter{f: f, fd: int(f.Fd())}
-}
-
-// dstTestlogInBubble is the writer's bubble predicate — dstInSimBubble,
-// behind a variable so a pin can drive Write's in-bubble leg from a host
-// goroutine.
-var dstTestlogInBubble = dstInSimBubble
-
-func (w *dstTestlogWriter) Write(p []byte) (int, error) {
-	if !dstTestlogInBubble() {
-		return w.f.Write(p)
-	}
-	return w.writeFromBubble(p)
-}
-
-// writeFromBubble is the in-bubble leg: the granted raw-write path over
-// the captured descriptor, its host error returned with the bytes
-// delivered before it, spelled as the host path spells a write error
-// (a *os.PathError over the log's name; Name is a field read, safe in a
-// bubble).
-func (w *dstTestlogWriter) writeFromBubble(p []byte) (int, error) {
-	n, err := dstHostStreamWrite(w.fd, nil, p)
-	if err != nil {
-		err = &os.PathError{Op: "write", Path: w.f.Name(), Err: err}
-	}
-	return n, err
 }

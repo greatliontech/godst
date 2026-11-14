@@ -96,4 +96,17 @@ func dstNetHostDead(host uint32) bool                              { return fals
 func dstInSimBubble() bool                                         { return false }
 func dstStepHostClock(host uint32, delta int64) bool               { return false }
 func dstDriftHostClock(host uint32, ppb int64)                     {}
-func dstDiskFaultOp(op, host uint32, arg int64, name string)       {}
+func dstDiskFaultOp(op, host uint32, arg int64, name string) {}
+func dstSnapshotRunDiagnostics() (
+	killMeta [][5]uint64,
+	killSeqs []uint64,
+	killGoPCs []uintptr,
+	killStartPCs []uintptr,
+	killStates []string,
+	droppedKillEvents uint32,
+	stdioMeta [][6]uint64,
+	stdioData []byte,
+	stdioTruncated uint64,
+) {
+	return
+}

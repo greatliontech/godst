@@ -2661,3 +2661,17 @@ func TestDSTNewBaseTimerMirrorsNewTimer(t *testing.T) {
 		t.Fatalf("newBaseTimer no longer mirrors newTimer (plus the dstBase line):\n--- newTimer\n%s\n--- newBaseTimer (dstBase line removed)\n%s", want, base)
 	}
 }
+
+func TestDSTGCAssistMembershipCarry(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTGCAssistMembershipCarry"))
+	if out != "ok" {
+		t.Fatalf("DSTGCAssistMembershipCarry: got %q, want \"ok\"", out)
+	}
+}
+
+func TestDSTSysmonMaxProcsRunActiveGuards(t *testing.T) {
+	out := strings.TrimSpace(runTestProgDST(t, "DSTSysmonMaxProcsRunActiveGuards", "GOMAXPROCS="))
+	if out != "ok" {
+		t.Fatalf("DSTSysmonMaxProcsRunActiveGuards: got %q, want \"ok\"", out)
+	}
+}

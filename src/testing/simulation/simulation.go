@@ -352,23 +352,38 @@ var fips140Mode = func() bool {
 	return false
 }()
 
+// buildModeRefusals lists startup/build modes whose runtime paths bypass the
+// simulation's deterministic controls and must be refused before publishing
+// any run state.
+var buildModeRefusals = [...]struct {
+	active bool
+	reason string
+}{
+	{
+		// FIPS mode keeps a process-global SP 800-90A DRBG that consumes the
+		// simulation's deterministic bytes only as additional input (and seeds
+		// via jitter entropy's bubble-bypassing monotonic-clock read), so
+		// crypto/rand would be silently nondeterministic inside the run.
+		active: fips140Mode,
+		reason: "is unsupported in FIPS 140 mode (GODEBUG fips140=on)",
+	},
+	{
+		// User arenas reserve objects directly from arena chunks, bypassing
+		// both the per-object DST heap trigger and per-process allocation
+		// accounting.
+		active: goexperiment.Arenas,
+		reason: "is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)",
+	},
+}
+
 func enterSimulation(api, buildPanic string) {
 	if !dstBuilt() {
 		panic(buildPanic)
 	}
-	if fips140Mode {
-		// FIPS mode keeps a process-global SP 800-90A DRBG that consumes the
-		// simulation's deterministic bytes only as additional input, so
-		// crypto/rand would be silently nondeterministic inside the run. Fail
-		// loud instead — one GODEBUG is all it takes to be in this mode.
-		panic("testing/simulation: " + api + " is unsupported in FIPS 140 mode (GODEBUG fips140=on)")
-	}
-	if goexperiment.Arenas {
-		// User arenas reserve objects directly from arena chunks, bypassing both
-		// the per-object DST heap trigger and per-process allocation accounting.
-		// Reject before publishing any run state until arenas have one complete
-		// deterministic accounting path.
-		panic("testing/simulation: " + api + " is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)")
+	for _, r := range buildModeRefusals {
+		if r.active {
+			panic("testing/simulation: " + api + " " + r.reason)
+		}
 	}
 	// GOEXPERIMENT=sizespecializedmalloc (the 1.27 default) is admitted: in a
 	// -tags dst build the compiler suppresses specialized emission for every
@@ -517,12 +532,28 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	}
 	enterSimulation("TestWith", "testing/simulation: TestWith requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
+	var finished, ok bool
+	defer func() {
+		diag := formatRunDiagnostics(seed)
+		if diag == "" {
+			return
+		}
+		if !finished || !ok || t.Failed() {
+			t.Log("\n" + diag)
+			return
+		}
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Log("\n" + diag)
+			}
+		})
+	}()
 	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
 	dstSetWedgeLimits(opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds())
-	var ok bool
 	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
+	finished = true
 	if !ok {
 		t.FailNow()
 	}

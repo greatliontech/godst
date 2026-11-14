@@ -975,12 +975,24 @@ func TestDSTFSOpenRoot(t *testing.T) {
 		if err := r.MkdirAll("dot/child", 0o755); err != nil {
 			t.Fatalf("Root.MkdirAll dot: %v", err)
 		}
+		if fi, err = r.Stat("."); err != nil || fi.Name() != "." {
+			t.Fatalf(`Root.Stat(".") = (%v, %v), want name "."`, fi, err)
+		}
 		fi, err = r.Stat("dot/.")
 		if err != nil {
 			t.Fatalf(`Root.Stat("dot/."): %v`, err)
 		}
-		if fi.Name() != "dot" {
-			t.Fatalf(`Root.Stat("dot/.") name = %q, want dot`, fi.Name())
+		if fi.Name() != "." {
+			t.Fatalf(`Root.Stat("dot/.") name = %q, want .`, fi.Name())
+		}
+		if fi, err = r.Stat("dot/child/.."); err != nil || fi.Name() != ".." {
+			t.Fatalf(`Root.Stat("dot/child/..") = (%v, %v), want name ".."`, fi, err)
+		}
+		if fi, err = os.Stat("/root/dot/."); err != nil || fi.Name() != "." {
+			t.Fatalf(`os.Stat("/root/dot/.") = (%v, %v), want name "."`, fi, err)
+		}
+		if fi, err = os.Stat("/root/dot/child/.."); err != nil || fi.Name() != ".." {
+			t.Fatalf(`os.Stat("/root/dot/child/..") = (%v, %v), want name ".."`, fi, err)
 		}
 		if err := r.Rename("dot/child/..", "dot-renamed"); err != nil {
 			t.Fatalf(`Root.Rename("dot/child/..", "dot-renamed"): %v`, err)

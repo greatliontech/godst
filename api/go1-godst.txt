@@ -30,6 +30,7 @@ pkg testing/simulation, func HealHost(string)
 pkg testing/simulation, func HealWriteback(string)
 pkg testing/simulation, func Host(string, HostConfig, func())
 pkg testing/simulation, func HostIP(string) string
+pkg testing/simulation (dst), func HostFS(string) fs.FS
 pkg testing/simulation, func InheritFile(*os.File) (*os.File, error)
 pkg testing/simulation, func Isolate(string)
 pkg testing/simulation, func LimitDisk(string, int64)

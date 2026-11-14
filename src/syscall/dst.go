@@ -196,11 +196,18 @@ func dstTryRead(fd int, p []byte) (n int, err Errno, handled bool) {
 	return dstReadHookFn(fd, p)
 }
 
-func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool) {
-	if !dstHookActive() || dstWriteHookFn == nil {
-		return 0, 0, false
+func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool, syncIO bool) {
+	if !dstHookActive() {
+		return 0, 0, false, false
 	}
-	return dstWriteHookFn(fd, p)
+	if n, handled := dstTryStdioWrite(fd, p); handled {
+		return n, 0, true, false
+	}
+	if dstWriteHookFn == nil {
+		return 0, 0, false, false
+	}
+	n, err, handled = dstWriteHookFn(fd, p)
+	return n, err, handled, true
 }
 
 func dstTryPread(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {

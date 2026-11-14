@@ -222,7 +222,47 @@ func TestSweepChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(outf, []byte(sweepProgram(seed)), 0o644); err != nil {
+	var (
+		stopHammer chan struct{}
+		hammerWG   sync.WaitGroup
+	)
+	if os.Getenv("GO_DST_DETERMINISM_HAMMER_TESTLOG") == "1" {
+		stopHammer = make(chan struct{})
+		probe := t.TempDir() + "/host-probe"
+		if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for range 4 {
+			hammerWG.Add(1)
+			go func() {
+				defer hammerWG.Done()
+				for {
+					select {
+					case <-stopHammer:
+						return
+					default:
+					}
+					if f, err := os.Open(probe); err == nil {
+						f.Close()
+					}
+					_, _ = os.Stat(probe)
+					_ = os.Getenv("GO_DST_DETERMINISM_SEED")
+					_ = os.Getenv("GO_DST_PAD_" + strings.Repeat("P", 4080))
+					_ = os.Getenv("GO_DST_MEGA_" + strings.Repeat("M", 5200))
+					// Yield via a short host timer park so the hammer goroutines
+					// hand back the single P while simulation.Run pins GOMAXPROCS=1
+					// with preemption disabled.
+					time.Sleep(250 * time.Microsecond)
+				}
+			}()
+		}
+	}
+	got := sweepProgram(seed)
+	if stopHammer != nil {
+		close(stopHammer)
+		hammerWG.Wait()
+	}
+	if err := os.WriteFile(outf, []byte(got), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -244,9 +284,10 @@ func TestSameSeedCrossProcessTranscript(t *testing.T) {
 	}
 	dir := t.TempDir()
 	perturbations := []struct {
-		name string
-		env  []string
-		dir  bool
+		name    string
+		env     []string
+		dir     bool
+		testlog bool
 	}{
 		{name: "baseline"},
 		{name: "timezone", env: []string{"TZ=Australia/Lord_Howe"}},
@@ -254,11 +295,18 @@ func TestSameSeedCrossProcessTranscript(t *testing.T) {
 		{name: "cwd", dir: true},
 		{name: "gomaxprocs-1", env: []string{"GOMAXPROCS=1"}},
 		{name: "gomaxprocs-8", env: []string{"GOMAXPROCS=8"}},
+		{name: "testlog-contended", env: []string{"GOMAXPROCS=4", "GO_DST_DETERMINISM_HAMMER_TESTLOG=1"}, testlog: true},
 	}
 	for _, p := range perturbations {
 		t.Run(p.name, func(t *testing.T) {
 			out := dir + "/" + p.name
-			cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestSweepChild$", "-test.count=1")
+			args := []string{"-test.run=^TestSweepChild$", "-test.count=1"}
+			logFile := ""
+			if p.testlog {
+				logFile = dir + "/" + p.name + ".testlog"
+				args = append(args, "-test.testlogfile="+logFile)
+			}
+			cmd := testenv.Command(t, testenv.Executable(t), args...)
 			cmd = testenv.CleanCmdEnv(cmd)
 			cmd.Env = append(cmd.Env,
 				"GO_DST_DETERMINISM_CHILD_OUT="+out,
@@ -277,6 +325,29 @@ func TestSameSeedCrossProcessTranscript(t *testing.T) {
 			}
 			if string(got) != want {
 				t.Errorf("cross-process transcript differs under %s:\n--- in-process ---\n%s\n--- child ---\n%s", p.name, want, got)
+			}
+			if logFile != "" {
+				rawLog, err := os.ReadFile(logFile)
+				if err != nil {
+					t.Fatalf("read testlogfile: %v", err)
+				}
+				const hdr = "# test log\n"
+				if !strings.HasPrefix(string(rawLog), hdr) {
+					t.Fatalf("testlogfile missing header: %q", string(rawLog[:min(len(rawLog), 64)]))
+				}
+				sawBubbleOpen := false
+				for i, line := range strings.Split(strings.TrimSuffix(string(rawLog[len(hdr):]), "\n"), "\n") {
+					op, arg, ok := strings.Cut(line, " ")
+					if !ok || arg == "" || (op != "open" && op != "stat" && op != "getenv" && op != "chdir") {
+						t.Fatalf("malformed testlogfile line %d: %q", i+2, line)
+					}
+					if op == "open" && arg == "/log" {
+						sawBubbleOpen = true
+					}
+				}
+				if !sawBubbleOpen {
+					t.Fatalf("testlogfile recorded no in-bubble /log open")
+				}
 			}
 		})
 	}

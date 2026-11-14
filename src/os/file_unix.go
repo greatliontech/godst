@@ -82,8 +82,13 @@ func (f *File) fd() uintptr {
 	if f == nil {
 		return ^(uintptr(0))
 	}
-	if dstSimEnabled && dstBackendOf(f.file) != nil {
-		return uintptr(dstFD(f.file))
+	if dstSimEnabled {
+		if dstBackendOf(f.file) != nil {
+			return uintptr(dstFD(f.file))
+		}
+		if (f.pfd.Sysfd == 1 || f.pfd.Sysfd == 2) && dstFenceActive() && !dstHostIOActive() {
+			return uintptr(f.pfd.Sysfd)
+		}
 	}
 
 	// If we put the file descriptor into nonblocking mode,

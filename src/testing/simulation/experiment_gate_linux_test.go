@@ -7,6 +7,7 @@
 package simulation
 
 import (
+	"fmt"
 	"internal/platform"
 	"internal/testenv"
 	"os"
@@ -152,19 +153,64 @@ func buildAndRunArenaProbe(t *testing.T) (string, error) {
 	return string(out), err
 }
 
-func TestDSTArenasRefused(t *testing.T) {
-	if testing.Short() {
-		t.Skip("-short: skips GOEXPERIMENT std rebuild")
+// TestDSTBuildModeRefusals pins enterSimulation's buildModeRefusals table:
+// every unsupported startup/build mode refuses before entering the run body
+// and leaves caller state clean for subsequent attempts.
+func TestDSTBuildModeRefusals(t *testing.T) {
+	if os.Getenv("DST_BUILD_MODE_REFUSAL_CHILD") == "fips140" {
+		attempt := func() (panicValue any, entered bool) {
+			defer func() { panicValue = recover() }()
+			RunWith(12345, Options{MemoryLimit: 1}, func() {
+				entered = true
+			})
+			return nil, entered
+		}
+		for i := 1; i <= 2; i++ {
+			panicValue, entered := attempt()
+			fmt.Printf("attempt=%d panic=%v entered=%v\n", i, panicValue, entered)
+		}
+		os.Exit(0)
 	}
-	out, err := buildAndRunArenaProbe(t)
-	if err != nil {
-		t.Fatalf("probe run: %v\n%s", err, out)
+
+	cases := []struct {
+		name      string
+		needBuild bool
+		run       func(t *testing.T) (string, error)
+		refusal   string
+	}{
+		{
+			name: "fips140",
+			run: func(t *testing.T) (string, error) {
+				testenv.MustHaveExec(t)
+				cmd := testenv.CleanCmdEnv(testenv.Command(t, os.Args[0], "-test.run=^TestDSTBuildModeRefusals$", "-test.count=1"))
+				cmd.Env = append(cmd.Env, "DST_BUILD_MODE_REFUSAL_CHILD=fips140", "GODEBUG=fips140=on")
+				out, err := cmd.CombinedOutput()
+				return string(out), err
+			},
+			refusal: "testing/simulation: Run is unsupported in FIPS 140 mode (GODEBUG fips140=on)",
+		},
+		{
+			name:      "arenas",
+			needBuild: true,
+			run:       buildAndRunArenaProbe,
+			refusal:   "testing/simulation: Run is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)",
+		},
 	}
-	const refusal = "testing/simulation: Run is unsupported with GOEXPERIMENT=arenas (arena allocations bypass deterministic heap and process accounting)"
-	want := "attempt=1 panic=" + refusal + " entered=false\n" +
-		"attempt=2 panic=" + refusal + " entered=false\n"
-	if out != want {
-		t.Fatalf("arena entry refusal transcript = %q, want %q", out, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.needBuild && testing.Short() {
+				t.Skip("-short: skips GOEXPERIMENT std rebuild")
+			}
+			out, err := tc.run(t)
+			if err != nil {
+				t.Fatalf("probe run: %v\n%s", err, out)
+			}
+			want := "attempt=1 panic=" + tc.refusal + " entered=false\n" +
+				"attempt=2 panic=" + tc.refusal + " entered=false\n"
+			if out != want {
+				t.Fatalf("%s entry refusal transcript = %q, want %q", tc.name, out, want)
+			}
+		})
 	}
 }
 

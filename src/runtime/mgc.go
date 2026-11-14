@@ -810,7 +810,7 @@ func gcStart(trigger gcTrigger) {
 		mode = gcForceBlockMode
 	}
 	if dstBuild {
-		if dstActive() {
+		if dstUseStopTheWorldGC() {
 			mode = gcForceBlockMode
 		}
 	}

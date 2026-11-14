@@ -45,9 +45,17 @@ func dstBeforeForcedGC()                                                       {
 func dstAfterCycleCaptureForcedGC()                                            {}
 func dstRefuseForeignForcedGC()                                                {}
 func dstGCTriggerHeapTest() bool                                               { return false }
+func dstUseStopTheWorldGC() bool                                               { return false }
 func dstEnterGCDisassociate(*g) bool                                           { return false }
+func dstEnterGCAssistDisassociate(*g) bool                                     { return false }
 func dstExitGCDisassociate(*g, bool)                                           {}
 func dstGCResetLive()                                                          {}
+func dstNoteUpdateMaxProcsSTW()                                                {}
+func dstSysmonUpdateMaxProcsAllowed() bool                                     { return true }
+func dstNoteSysmonMaxProcsActiveSkip()                                         {}
+func dstSysmonUpdateMaxProcsBeforeLock()                                       {}
+func dstSysmonUpdateMaxProcsAfterLock()                                        {}
+func dstNoteSysmonMaxProcsRecheckBail()                                        {}
 func dstEnterSetGCPercent()                                                    {}
 func dstExitSetGCPercent()                                                     {}
 func dstRegisterSpecialStamp(unsafe.Pointer)                                   {}

@@ -15,14 +15,16 @@ func rawsocketcall1(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno)
 //go:nosplit
 //go:linkname socketcall
 func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		if e, handled := dstSocketcallSockopt(call, a0, a1, a2, a3, a4); handled {
-			if e != 0 {
-				return -1, e
+	if dstSimFenced {
+		if dstFenceActive() {
+			if e, handled := dstSocketcallSockopt(call, a0, a1, a2, a3, a4); handled {
+				if e != 0 {
+					return -1, e
+				}
+				return 0, 0
 			}
-			return 0, 0
+			dstSyscallRefuse(SYS_SOCKETCALL)
 		}
-		dstSyscallRefuse(SYS_SOCKETCALL)
 	}
 	return socketcall1(call, a0, a1, a2, a3, a4, a5)
 }
@@ -31,8 +33,10 @@ func socketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
 //go:nosplit
 //go:linkname rawsocketcall
 func rawsocketcall(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, err Errno) {
-	if dstSimFenced && dstFenceActive() {
-		dstSyscallRefuse(SYS_SOCKETCALL)
+	if dstSimFenced {
+		if dstFenceActive() {
+			dstSyscallRefuse(SYS_SOCKETCALL)
+		}
 	}
 	return rawsocketcall1(call, a0, a1, a2, a3, a4, a5)
 }

@@ -1031,6 +1031,16 @@ run epoch and PID through GC discovery and queueing; once PID death is published
 are discarded rather than executed by the root drain. A live sibling with the same logical process id
 retains its own callbacks.
 
+When a `Process` exits normally (body return or panic unwind) while child goroutines of that `pid` are
+still live, the runtime records up to 16 killed goroutines per exit event in canonical ascending `dstSeq`
+order (`gopc`, `startpc`, wait state, plus total count) into an off-heap (`sysAlloc`), runtime-lock-guarded
+per-run diagnostic ledger (`0` Go heap allocations and `0` Level-2 DPOR / race-detector synchronization
+edges inside the bubble). Intentional fault teardowns (`Crash`, `CrashHost`, `Ctl.End`) suppress exit-kill
+recording so expected power-offs never pollute failure reports. When a `Test`, `TestWith`, `WorldTest`, or
+`ExploreTest` schedule fails — including unrecovered SUT panics and `synctest` bubble-deadlock stalls —
+the harness symbolizes and logs the recorded process-exit kill events alongside any captured bubble
+`stdout`/`stderr` (`TestDiagnostics*`); passing runs emit nothing.
+
 Two consequences of pid-keyed goroutine death, both contractual. **A goroutine cannot outlive its
 process.** One that escaped the pid-keyed mark because it was inside a NESTED `Process` body when its
 enclosing invocation died (it carried the inner pid) is permanently parked the moment it leaves that

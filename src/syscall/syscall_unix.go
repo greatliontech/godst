@@ -227,13 +227,15 @@ func Read(fd int, p []byte) (n int, err error) {
 }
 
 func Write(fd int, p []byte) (n int, err error) {
-	if race.Enabled {
-		race.ReleaseMerge(unsafe.Pointer(&ioSync))
-	}
 	if dstSimFenced {
 		// Zero-cost guard, as in Read. faketime's stdio path keeps precedence.
+		// Ungranted bubble stdio writes set syncIO=false so capturing stdout/stderr
+		// never emits a false ioSync release edge that could hide a SUT data race.
 		if !(faketime && (fd == 1 || fd == 2)) {
-			if r0, e1, handled := dstTryWrite(fd, p); handled {
+			if r0, e1, handled, syncIO := dstTryWrite(fd, p); handled {
+				if race.Enabled && syncIO {
+					race.ReleaseMerge(unsafe.Pointer(&ioSync))
+				}
 				n = r0
 				if e1 != 0 {
 					err = errnoErr(e1)
@@ -250,6 +252,9 @@ func Write(fd int, p []byte) (n int, err error) {
 				return
 			}
 		}
+	}
+	if race.Enabled {
+		race.ReleaseMerge(unsafe.Pointer(&ioSync))
 	}
 	if faketime && (fd == 1 || fd == 2) {
 		n = faketimeWrite(fd, p)

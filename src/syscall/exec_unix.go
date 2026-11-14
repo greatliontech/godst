@@ -148,8 +148,10 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 	// ever reaches forkAndExecInChild, so the post-fork child's raw syscalls
 	// (which bypass the Go trampolines via asm) are never mis-fenced. Folds away
 	// in stock builds. See design.md "The interception boundary".
-	if dstSimFenced && dstFenceActive() {
-		return 0, dstErrUnsupported
+	if dstSimFenced {
+		if dstFenceActive() {
+			return 0, dstErrUnsupported
+		}
 	}
 
 	var p [2]int
@@ -284,8 +286,10 @@ func Exec(argv0 string, argv []string, envv []string) (err error) {
 	// The bare execve would also be caught by the RawSyscall trampoline fence,
 	// but refusing here returns the clean error shape and skips the pre-exec
 	// teardown (runtime_BeforeExec, rlimit restore). Folds away in stock builds.
-	if dstSimFenced && dstFenceActive() {
-		return dstErrUnsupported
+	if dstSimFenced {
+		if dstFenceActive() {
+			return dstErrUnsupported
+		}
 	}
 	argv0p, err := BytePtrFromString(argv0)
 	if err != nil {

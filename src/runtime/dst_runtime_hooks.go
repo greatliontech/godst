@@ -140,14 +140,176 @@ func dstGCTriggerHeapTest() bool {
 	}
 }
 
+var (
+	dstAllowConcurrentMarkProbe   bool
+	dstGCAssistDisassociates      atomic.Uint64
+	dstUpdateMaxProcsSTWs         atomic.Uint64
+	dstSysmonMaxProcsActiveSkips  atomic.Uint64
+	dstSysmonMaxProcsRecheckBails atomic.Uint64
+	dstSysmonMaxProcsRaceArm      atomic.Uint32
+	dstSysmonMaxProcsPinnedM      uintptr
+	dstSuppressSysmonMaxProcs     atomic.Bool
+	dstSysmonMaxProcsTestG        atomic.Uintptr
+	dstAssistSink                 any
+)
+
+func dstUseStopTheWorldGC() bool {
+	return dstActive() && !dstAllowConcurrentMarkProbe
+}
+
 func dstEnterGCDisassociate(gp *g) bool {
 	prev := gp.dstGCInternal
 	gp.dstGCInternal = gp.dstSimG
 	return prev
 }
 
+func dstEnterGCAssistDisassociate(gp *g) bool {
+	if gp.dstSimG {
+		dstGCAssistDisassociates.Add(1)
+	}
+	return dstEnterGCDisassociate(gp)
+}
+
 func dstExitGCDisassociate(gp *g, prev bool) {
 	gp.dstGCInternal = prev
+}
+
+func dstNoteUpdateMaxProcsSTW() {
+	dstUpdateMaxProcsSTWs.Add(1)
+}
+
+//go:nowritebarrierrec
+func dstNoteSysmonMaxProcsActiveSkip() {
+	dstSysmonMaxProcsActiveSkips.Add(1)
+}
+
+//go:nowritebarrierrec
+func dstSysmonUpdateMaxProcsAllowed() bool {
+	if !dstSuppressSysmonMaxProcs.Load() {
+		return true
+	}
+	return uintptr(unsafe.Pointer(getg())) == dstSysmonMaxProcsTestG.Load()
+}
+
+//go:nowritebarrierrec
+func dstSysmonUpdateMaxProcsBeforeLock() {
+	if testG := dstSysmonMaxProcsTestG.Load(); testG != 0 && uintptr(unsafe.Pointer(getg())) != testG {
+		return
+	}
+	if !dstSysmonMaxProcsRaceArm.CompareAndSwap(1, 0) {
+		return
+	}
+	// Pin the current M across the race window so the woken helper cannot
+	// complete stopTheWorldGC and re-park before sysmonUpdateGOMAXPROCS
+	// reaches its under-lock idle recheck, even on a loaded multi-core host.
+	mp := acquirem()
+	dstSysmonMaxProcsPinnedM = uintptr(unsafe.Pointer(mp))
+	if !updateMaxProcsG.idle.Load() {
+		dstSysmonMaxProcsPinnedM = 0
+		releasem(mp)
+		throw("dst: updateMaxProcsG unexpectedly non-idle at race hook")
+	}
+	lock(&updateMaxProcsG.lock)
+	if !updateMaxProcsG.idle.Load() {
+		unlock(&updateMaxProcsG.lock)
+		dstSysmonMaxProcsPinnedM = 0
+		releasem(mp)
+		throw("dst: updateMaxProcsG lost idle under lock at race hook")
+	}
+	updateMaxProcsG.procs = gomaxprocs
+	updateMaxProcsG.idle.Store(false)
+	var list gList
+	list.push(updateMaxProcsG.g)
+	injectglist(&list)
+	unlock(&updateMaxProcsG.lock)
+}
+
+//go:nowritebarrierrec
+func dstSysmonUpdateMaxProcsAfterLock() {
+	if mp := dstSysmonMaxProcsPinnedM; mp != 0 && mp == uintptr(unsafe.Pointer(getg().m)) {
+		dstSysmonMaxProcsPinnedM = 0
+		releasem((*m)(unsafe.Pointer(mp)))
+	}
+}
+
+//go:nowritebarrierrec
+func dstNoteSysmonMaxProcsRecheckBail() {
+	dstSysmonMaxProcsRecheckBails.Add(1)
+}
+
+//go:linkname dstGCAssistDisassociatesFP
+func dstGCAssistDisassociatesFP() uint64 { return dstGCAssistDisassociates.Load() }
+
+//go:linkname dstUpdateMaxProcsGStartedFP
+func dstUpdateMaxProcsGStartedFP() bool { return updateMaxProcsG.g != nil }
+
+//go:linkname dstUpdateMaxProcsSTWsFP
+func dstUpdateMaxProcsSTWsFP() uint64 { return dstUpdateMaxProcsSTWs.Load() }
+
+//go:linkname dstSysmonMaxProcsActiveSkipsFP
+func dstSysmonMaxProcsActiveSkipsFP() uint64 { return dstSysmonMaxProcsActiveSkips.Load() }
+
+//go:linkname dstSysmonMaxProcsRecheckBailsFP
+func dstSysmonMaxProcsRecheckBailsFP() uint64 { return dstSysmonMaxProcsRecheckBails.Load() }
+
+//go:linkname dstTestDriveBubbleGCAssist
+func dstTestDriveBubbleGCAssist() bool {
+	gp := getg()
+	if gp.bubble == nil || !gp.dstSimG {
+		return false
+	}
+	if atomic.Load(&gcBlackenEnabled) == 0 {
+		dstAllowConcurrentMarkProbe = true
+		gcStart(gcTrigger{kind: gcTriggerCycle, n: work.cycles.Load() + 1})
+		dstAllowConcurrentMarkProbe = false
+	}
+	if atomic.Load(&gcBlackenEnabled) == 0 {
+		return false
+	}
+	gcController.bgScanCredit.Store(0)
+	gp.gcAssistBytes = -(1 << 20)
+	gp.preempt = true
+	dstAssistSink = make([]byte, 256)
+	dstAssistSink = nil
+	return true
+}
+
+//go:linkname dstTestSetAutoMaxProcsMismatch
+func dstTestSetAutoMaxProcsMismatch() int {
+	def := int(defaultGOMAXPROCS(0))
+	alt := def + 1
+	if alt < 2 {
+		alt = 2
+	}
+	GOMAXPROCS(alt)
+	lock(&sched.lock)
+	sched.customGOMAXPROCS = false
+	unlock(&sched.lock)
+	return alt
+}
+
+//go:linkname dstTestArmSysmonMaxProcsRecheckRace
+func dstTestArmSysmonMaxProcsRecheckRace() {
+	dstSysmonMaxProcsRaceArm.Store(1)
+}
+
+//go:linkname dstTestSuppressSysmonMaxProcs
+func dstTestSuppressSysmonMaxProcs(suppress bool) {
+	if suppress {
+		dstSysmonMaxProcsTestG.Store(uintptr(unsafe.Pointer(getg())))
+		dstSuppressSysmonMaxProcs.Store(true)
+		// Synchronize with any in-flight sysmon tick already inside sysmonlock.
+		lock(&sched.sysmonlock)
+		unlock(&sched.sysmonlock)
+		return
+	}
+	dstSuppressSysmonMaxProcs.Store(false)
+	dstSysmonMaxProcsTestG.Store(0)
+}
+
+//go:linkname dstTestCallSysmonUpdateGOMAXPROCS
+func dstTestCallSysmonUpdateGOMAXPROCS() {
+	sysmonUpdateGOMAXPROCS()
 }
 
 func dstGCResetLive() {

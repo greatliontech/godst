@@ -279,6 +279,34 @@ func hostDown(host uint32) bool {
 	return nodeReg.down[host]
 }
 
+// nodeNames resolves numeric runtime host and process IDs back to their
+// declared names for post-run failure diagnostics. ID 0 is the unnamed root
+// scope ("", "").
+func nodeNames(host, proc uint32) (hostName, procName string) {
+	if host == 0 && proc == 0 {
+		return "", ""
+	}
+	nodeReg.mu.Lock()
+	defer nodeReg.mu.Unlock()
+	if host != 0 {
+		for name, id := range nodeReg.hosts {
+			if id == host {
+				hostName = name
+				break
+			}
+		}
+	}
+	if proc != 0 {
+		for name, id := range nodeReg.procs {
+			if id == proc {
+				procName = name
+				break
+			}
+		}
+	}
+	return hostName, procName
+}
+
 func activeProcSet(proc, host uint32, pid int32) {
 	activeProcs.mu.Lock()
 	if activeProcs.pids == nil {

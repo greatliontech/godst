@@ -85,15 +85,44 @@ var contexts = []*build.Context{
 	{GOOS: "openbsd", GOARCH: "amd64"},
 }
 
+// dstLinuxArchs is the complete set of Linux architectures where -tags dst is
+// supported (design.md, "The interception boundary" → Platform scope).
+var dstLinuxArchs = []string{
+	"386",
+	"amd64",
+	"arm",
+	"arm64",
+	"ppc64",
+	"ppc64le",
+	"riscv64",
+	"s390x",
+}
+
 func contextName(c *build.Context) string {
 	s := c.GOOS + "-" + c.GOARCH
 	if c.CgoEnabled {
 		s += "-cgo"
 	}
+	for _, tag := range c.BuildTags {
+		s += "-" + tag
+	}
 	if c.Dir != "" {
 		s += fmt.Sprintf(" [%s]", c.Dir)
 	}
 	return s
+}
+
+func initContext(c *build.Context) {
+	c.Compiler = build.Default.Compiler
+	baseline, err := buildcfg.ParseGOEXPERIMENT(c.GOOS, c.GOARCH, "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var toolTags []string
+	for _, exp := range baseline.Enabled() {
+		toolTags = append(toolTags, "goexperiment."+exp)
+	}
+	c.ToolTags = toolTags
 }
 
 var internalPkg = regexp.MustCompile(`(^|/)internal($|/)`)
@@ -116,31 +145,65 @@ func Check(t *testing.T) {
 	}
 
 	for _, c := range contexts {
-		c.Compiler = build.Default.Compiler
+		initContext(c)
+	}
 
-		// Include baseline goexperiment.* tool tags.
-		baseline, err := buildcfg.ParseGOEXPERIMENT(c.GOOS, c.GOARCH, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, exp := range baseline.Enabled() {
-			c.ToolTags = append(c.ToolTags, "goexperiment."+exp)
+	type dstContextPair struct {
+		untagged *build.Context
+		tagged   *build.Context
+	}
+	untaggedByName := make(map[string]int, len(contexts))
+	for i, c := range contexts {
+		untaggedByName[contextName(c)] = i
+	}
+	var (
+		extraUntagged []*build.Context
+		dstPairs      []dstContextPair
+	)
+	for _, arch := range dstLinuxArchs {
+		for _, cgo := range []bool{false, true} {
+			u := &build.Context{GOOS: "linux", GOARCH: arch, CgoEnabled: cgo}
+			if idx, ok := untaggedByName[contextName(u)]; ok {
+				u = contexts[idx]
+			} else {
+				initContext(u)
+				extraUntagged = append(extraUntagged, u)
+			}
+			d := &build.Context{GOOS: "linux", GOARCH: arch, CgoEnabled: cgo, BuildTags: []string{"dst"}}
+			initContext(d)
+			dstPairs = append(dstPairs, dstContextPair{untagged: u, tagged: d})
 		}
 	}
 
+	srcDir := filepath.Join(testenv.GOROOT(t), "src")
 	walkers := make([]*Walker, len(contexts))
+	extraWalkers := make([]*Walker, len(extraUntagged))
+	dstWalkers := make([]*Walker, len(dstPairs))
 	var wg sync.WaitGroup
 	for i, context := range contexts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			walkers[i] = NewWalker(context, filepath.Join(testenv.GOROOT(t), "src"))
+			walkers[i] = NewWalker(context, srcDir)
+		}()
+	}
+	for i, context := range extraUntagged {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			extraWalkers[i] = NewWalker(context, srcDir)
+		}()
+	}
+	for i, pair := range dstPairs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dstWalkers[i] = NewWalker(pair.tagged, srcDir)
 		}()
 	}
 	wg.Wait()
 
-	var featureCtx = make(map[string]map[string]bool) // feature -> context name -> true
-	for _, w := range walkers {
+	exportWalker := func(w *Walker) {
 		for _, name := range w.stdPackages {
 			pkg, err := w.import_(name)
 			if _, nogo := err.(*build.NoGoError); nogo {
@@ -151,13 +214,33 @@ func Check(t *testing.T) {
 			}
 			w.export(pkg)
 		}
+	}
 
+	walkerByCtx := make(map[string]*Walker, len(contexts)+len(extraUntagged))
+	var featureCtx = make(map[string]map[string]bool) // feature -> context name -> true
+	for _, w := range walkers {
+		exportWalker(w)
 		ctxName := contextName(w.context)
+		walkerByCtx[ctxName] = w
 		for _, f := range w.Features() {
 			if featureCtx[f] == nil {
 				featureCtx[f] = make(map[string]bool)
 			}
 			featureCtx[f][ctxName] = true
+		}
+	}
+	for _, w := range extraWalkers {
+		exportWalker(w)
+		walkerByCtx[contextName(w.context)] = w
+	}
+	featurePairs := make([]dstFeaturePair, len(dstPairs))
+	for i, pair := range dstPairs {
+		exportWalker(dstWalkers[i])
+		uw := walkerByCtx[contextName(pair.untagged)]
+		featurePairs[i] = dstFeaturePair{
+			ctxName:  contextName(pair.tagged),
+			untagged: uw.Features(),
+			tagged:   dstWalkers[i].Features(),
 		}
 	}
 
@@ -177,12 +260,20 @@ func Check(t *testing.T) {
 	bw := bufio.NewWriter(os.Stdout)
 	defer bw.Flush()
 
-	var required []string
+	var allRequired []string
 	for _, file := range checkFiles {
-		required = append(required, fileFeatures(file, needApproval(file))...)
+		allRequired = append(allRequired, fileFeatures(file, needApproval(file))...)
 	}
 	for _, file := range nextFiles {
-		required = append(required, fileFeatures(file, true)...)
+		allRequired = append(allRequired, fileFeatures(file, true)...)
+	}
+	var required, dstRequired []string
+	for _, f := range allRequired {
+		if isDSTFeature(f) {
+			dstRequired = append(dstRequired, f)
+		} else {
+			required = append(required, f)
+		}
 	}
 	exception := fileFeatures(filepath.Join(testenv.GOROOT(t), "api/except.txt"), false)
 
@@ -192,6 +283,102 @@ func Check(t *testing.T) {
 	if !compareAPI(bw, features, required, exception) {
 		t.Errorf("API differences found")
 	}
+	if !compareDSTAPI(bw, featurePairs, dstRequired, exception) {
+		t.Errorf("DST (-tags dst) API differences found")
+	}
+}
+
+type dstFeaturePair struct {
+	ctxName  string
+	untagged []string
+	tagged   []string
+}
+
+func featureWithContext(f, cname string) string {
+	comma := strings.Index(f, ",")
+	return fmt.Sprintf("%s (%s)%s", f[:comma], cname, f[comma:])
+}
+
+func isDSTFeature(f string) bool {
+	comma := strings.Index(f, ",")
+	if comma < 0 {
+		return false
+	}
+	head := f[:comma]
+	return strings.HasSuffix(head, " (dst)") || strings.HasSuffix(head, "-dst)")
+}
+
+// compareDSTAPI verifies the -tags dst exported surface across paired
+// (untagged, dst) Linux contexts:
+//  1. Every untagged feature must remain present with an identical signature
+//     under -tags dst unless exempted in exception (catching accidental
+//     removals and untagged/tagged twin signature drift).
+//  2. Features present only under -tags dst collapse to "(dst)" when universal
+//     across all paired Linux contexts (or "(<ctxName>)" when arch/cgo-scoped)
+//     and must match dstRequired via compareAPI.
+func compareDSTAPI(w io.Writer, pairs []dstFeaturePair, dstRequired, exception []string) bool {
+	ok := true
+	exceptionSet := set(exception)
+	missingCtx := make(map[string]map[string]bool)
+	dstOnlyCtx := make(map[string]map[string]bool)
+
+	for _, p := range pairs {
+		uSet := set(p.untagged)
+		tSet := set(p.tagged)
+		for _, f := range p.untagged {
+			if tSet[f] {
+				continue
+			}
+			fCtx := featureWithContext(f, p.ctxName)
+			if exceptionSet[f] || exceptionSet[fCtx] || exceptionSet[featureWithContext(f, "dst")] {
+				continue
+			}
+			if missingCtx[f] == nil {
+				missingCtx[f] = make(map[string]bool)
+			}
+			missingCtx[f][p.ctxName] = true
+		}
+		for _, f := range p.tagged {
+			if uSet[f] {
+				continue
+			}
+			if dstOnlyCtx[f] == nil {
+				dstOnlyCtx[f] = make(map[string]bool)
+			}
+			dstOnlyCtx[f][p.ctxName] = true
+		}
+	}
+
+	var missingLines []string
+	for f, cmap := range missingCtx {
+		if len(cmap) == len(pairs) {
+			missingLines = append(missingLines, featureWithContext(f, "dst"))
+			continue
+		}
+		for cname := range cmap {
+			missingLines = append(missingLines, featureWithContext(f, cname))
+		}
+	}
+	slices.Sort(missingLines)
+	for _, line := range missingLines {
+		fmt.Fprintf(w, "-%s\n", line)
+		ok = false
+	}
+
+	var dstFeatures []string
+	for f, cmap := range dstOnlyCtx {
+		if len(cmap) == len(pairs) {
+			dstFeatures = append(dstFeatures, featureWithContext(f, "dst"))
+			continue
+		}
+		for cname := range cmap {
+			dstFeatures = append(dstFeatures, featureWithContext(f, cname))
+		}
+	}
+	if !compareAPI(w, dstFeatures, dstRequired, exception) {
+		ok = false
+	}
+	return ok
 }
 
 // export emits the exported package features.
@@ -436,10 +623,10 @@ func tagKey(dir string, context *build.Context, tags []string) string {
 	// TODO: ReleaseTags (need to load default)
 	key := dir
 
-	// explicit on GOOS and GOARCH as global cache will use "all" cached packages for
-	// an indirect imported package. See https://github.com/golang/go/issues/21181
+	// explicit on GOOS, GOARCH, and BuildTags as global cache will use "all" cached
+	// packages for an indirect imported package. See https://github.com/golang/go/issues/21181
 	// for more detail.
-	tags = append(tags, context.GOOS, context.GOARCH)
+	tags = append(append(tags, context.GOOS, context.GOARCH), context.BuildTags...)
 	slices.Sort(tags)
 
 	for _, tag := range tags {
@@ -494,7 +681,12 @@ func (w *Walker) loadImports() {
 		listSem <- semToken{}
 		defer func() { <-listSem }()
 
-		cmd := exec.Command(goCmd(), "list", "-e", "-deps", "-json", "std")
+		args := []string{"list", "-e", "-deps", "-json"}
+		if len(w.context.BuildTags) > 0 {
+			args = append(args, "-tags="+strings.Join(w.context.BuildTags, ","))
+		}
+		args = append(args, "std")
+		cmd := exec.Command(goCmd(), args...)
 		cmd.Env = listEnv(w.context)
 		if w.context.Dir != "" {
 			cmd.Dir = w.context.Dir
@@ -690,7 +882,7 @@ func (w *Walker) importFrom(fromPath, fromDir string, mode types.ImportMode) (*a
 	if err != nil {
 		ctxt := "<no context>"
 		if w.context != nil {
-			ctxt = fmt.Sprintf("%s-%s", w.context.GOOS, w.context.GOARCH)
+			ctxt = contextName(w.context)
 		}
 		log.Fatalf("error typechecking package %s: %s (%s)", name, err, ctxt)
 	}

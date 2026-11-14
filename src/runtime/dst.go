@@ -225,6 +225,7 @@ func dstActivate(seed uint64) {
 	dstDiscardAbandonedDrainChains()
 	dstResetFinqRunCounters()
 	dstResetCleanupRunCounters()
+	dstResetRunDiagnostics()
 	dstCallbackSeq.Store(0) // per-run registration sequence for the drain's reg-order sort
 	// Cache the internal pooled-struct type descriptors the heap trigger excludes,
 	// BEFORE dstSeed.Store makes dstActive() true — so mallocgc's DST gate never reads a
@@ -2332,13 +2333,13 @@ func dstCrashProcessPid(pid int32) {
 		return
 	}
 	dstUnregisterPid(pid)
-	dstMarkProcessGoroutinesCrashed(pid)
+	dstMarkProcessGoroutines(pid, false)
 }
 
 //go:linkname dstStopProcessThreads
 func dstStopProcessThreads(pid int32) {
 	if pid > 0 {
-		dstMarkProcessGoroutinesCrashed(pid)
+		dstMarkProcessGoroutines(pid, true)
 	}
 }
 
@@ -2542,7 +2543,7 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 	}
 }
 
-func dstMarkProcessGoroutinesCrashed(pid int32) {
+func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
 	bubble := dstSimBubble
 	if bubble == nil {
 		return
@@ -2553,11 +2554,20 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 	var total, running int
 	var waiterCrashed bool
 	var drainCrashed bool
+	var killed [dstMaxKilledPerProcessExit]dstKilledG
+	var killedCount int
+	var killedTotal int
+	var exitHost, exitProc uint32
 	forEachG(func(gp *g) {
 		if !gp.dstSimG || gp.dstPid != pid {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
+		host, proc := gp.dstHost, gp.dstProc
+		seq := gp.dstSeq
+		gopc := gp.gopc
+		startpc := gp.startpc
+		wr := gp.waitreason
 		gp.dstPid = -pid
 		gp.dstHostScope = nil
 		if gp == bubble.waiter {
@@ -2572,6 +2582,20 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 		total++
 		if dstSynctestRunningStatus(gp, status) {
 			running++
+		}
+		if recordExitKills && gp != bubble.gcDrain {
+			if killedTotal == 0 {
+				exitHost, exitProc = host, proc
+			}
+			killedTotal++
+			entry := dstKilledG{
+				seq:        seq,
+				gopc:       gopc,
+				startpc:    startpc,
+				status:     status,
+				waitReason: uint8(wr),
+			}
+			dstInsertKilledG(&killed, &killedCount, entry)
 		}
 	})
 	if total == 0 && !waiterCrashed {
@@ -2600,6 +2624,9 @@ func dstMarkProcessGoroutinesCrashed(pid int32) {
 	}
 	wake := bubble.maybeWakeLocked()
 	unlock(&bubble.mu)
+	if recordExitKills && killedTotal > 0 {
+		dstRecordProcessExitKills(exitHost, exitProc, pid, killed[:killedCount], killedTotal)
+	}
 	if wake != nil {
 		goready(wake, 0)
 	}
@@ -3812,4 +3839,299 @@ func dstTestPushMaxProcs(procs int32) bool {
 //go:linkname dstTestMaxProcsHelperIdle
 func dstTestMaxProcsHelperIdle() bool {
 	return updateMaxProcsG.idle.Load()
+}
+
+// --- Off-heap per-run diagnostics (process-exit killed goroutines & modeled stdio) ---
+//
+// Both diagnostic ledgers live off the Go heap (sysAlloc) and guard mutations
+// with a runtime mutex rather than sync.Mutex, so recording a killed goroutine
+// on Process exit or writing to modeled fd 1/2 inside a bubble allocates 0
+// heap bytes (no perturbation to dstHeapAlloc / Options.MemoryLimit / NumGC)
+// and emits 0 Level-2 DPOR or race-detector synchronization edges. Formatting
+// and PC symbolization happen after the bubble exits, only when a test or
+// explored schedule fails.
+
+const (
+	dstMaxKilledPerProcessExit = 16
+	dstMaxExitKillEvents       = 256
+	dstStdioBufCap             = 256 << 10
+	dstStdioMaxChunks          = 4096
+)
+
+type dstKilledG struct {
+	seq        uint64
+	gopc       uintptr
+	startpc    uintptr
+	status     uint32
+	waitReason uint8
+}
+
+type dstExitKillEvent struct {
+	_      sys.NotInHeap
+	host   uint32
+	proc   uint32
+	pid    int32
+	total  uint32
+	count  uint32
+	killed [dstMaxKilledPerProcessExit]dstKilledG
+}
+
+type dstStdioChunk struct {
+	_    sys.NotInHeap
+	host uint32
+	proc uint32
+	pid  int32
+	fd   uint8
+	off  uint32
+	len  uint32
+}
+
+type dstStdioArena struct {
+	_   sys.NotInHeap
+	buf [dstStdioBufCap]byte
+}
+
+var dstDiagLock mutex
+
+var dstRunDiag struct {
+	killEvents     *[dstMaxExitKillEvents]dstExitKillEvent
+	nkillEvents    uint32
+	droppedKills   uint32
+	stdioChunks    *[dstStdioMaxChunks]dstStdioChunk
+	nstdioChunks   uint32
+	stdioBuf       *dstStdioArena
+	stdioUsed      uint32
+	stdioTruncated uint64
+}
+
+func dstResetRunDiagnostics() {
+	lock(&dstDiagLock)
+	dstRunDiag.nkillEvents = 0
+	dstRunDiag.droppedKills = 0
+	dstRunDiag.nstdioChunks = 0
+	dstRunDiag.stdioUsed = 0
+	dstRunDiag.stdioTruncated = 0
+	unlock(&dstDiagLock)
+}
+
+// dstInsertKilledG maintains the dstMaxKilledPerProcessExit lowest-seq live
+// goroutines in ascending canonical dstSeq order without heap allocation.
+func dstInsertKilledG(buf *[dstMaxKilledPerProcessExit]dstKilledG, n *int, entry dstKilledG) {
+	pos := *n
+	for pos > 0 && entry.seq < buf[pos-1].seq {
+		pos--
+	}
+	if *n < dstMaxKilledPerProcessExit {
+		for j := *n; j > pos; j-- {
+			buf[j] = buf[j-1]
+		}
+		buf[pos] = entry
+		*n++
+		return
+	}
+	if pos >= dstMaxKilledPerProcessExit {
+		return
+	}
+	for j := dstMaxKilledPerProcessExit - 1; j > pos; j-- {
+		buf[j] = buf[j-1]
+	}
+	buf[pos] = entry
+}
+
+func dstRecordProcessExitKills(host, proc uint32, pid int32, killed []dstKilledG, total int) {
+	lock(&dstDiagLock)
+	if dstRunDiag.killEvents == nil {
+		dstRunDiag.killEvents = (*[dstMaxExitKillEvents]dstExitKillEvent)(
+			sysAlloc(unsafe.Sizeof(*dstRunDiag.killEvents), &memstats.other_sys, "dst kill diagnostics"))
+		if dstRunDiag.killEvents == nil {
+			unlock(&dstDiagLock)
+			throw("dst: kill diagnostics allocation failed")
+		}
+	}
+	if dstRunDiag.nkillEvents >= dstMaxExitKillEvents {
+		dstRunDiag.droppedKills++
+		unlock(&dstDiagLock)
+		return
+	}
+	ev := &dstRunDiag.killEvents[dstRunDiag.nkillEvents]
+	dstRunDiag.nkillEvents++
+	ev.host = host
+	ev.proc = proc
+	ev.pid = pid
+	ev.total = uint32(total)
+	ev.count = uint32(len(killed))
+	for i, g := range killed {
+		ev.killed[i] = g
+	}
+	unlock(&dstDiagLock)
+}
+
+// dstBubbleStdioAppend appends an ungranted bubble write to fd 1 or fd 2 into
+// the run's off-heap per-process stdio arena and returns len(p).
+//
+//go:linkname dstBubbleStdioAppend
+func dstBubbleStdioAppend(fd int, p []byte) int {
+	if len(p) == 0 {
+		return 0
+	}
+	if raceenabled {
+		racereadrangepc(unsafe.Pointer(&p[0]), uintptr(len(p)), sys.GetCallerPC(), abi.FuncPCABIInternal(dstBubbleStdioAppend))
+	}
+	if msanenabled {
+		msanread(unsafe.Pointer(&p[0]), uintptr(len(p)))
+	}
+	if asanenabled {
+		asanread(unsafe.Pointer(&p[0]), uintptr(len(p)))
+	}
+	gp := getg()
+	host, proc, pid := gp.dstHost, gp.dstProc, gp.dstPid
+	if pid < 0 {
+		pid = -pid
+	}
+	lock(&dstDiagLock)
+	if dstRunDiag.stdioBuf == nil {
+		dstRunDiag.stdioBuf = (*dstStdioArena)(
+			sysAlloc(unsafe.Sizeof(*dstRunDiag.stdioBuf), &memstats.other_sys, "dst stdio buffer"))
+		dstRunDiag.stdioChunks = (*[dstStdioMaxChunks]dstStdioChunk)(
+			sysAlloc(unsafe.Sizeof(*dstRunDiag.stdioChunks), &memstats.other_sys, "dst stdio chunks"))
+		if dstRunDiag.stdioBuf == nil || dstRunDiag.stdioChunks == nil {
+			unlock(&dstDiagLock)
+			throw("dst: stdio diagnostics allocation failed")
+		}
+	}
+	avail := int(dstStdioBufCap - dstRunDiag.stdioUsed)
+	take := len(p)
+	if take > avail {
+		take = avail
+	}
+	if take > 0 {
+		coalesced := false
+		if dstRunDiag.nstdioChunks > 0 {
+			last := &dstRunDiag.stdioChunks[dstRunDiag.nstdioChunks-1]
+			if last.host == host && last.proc == proc && last.pid == pid &&
+				last.fd == uint8(fd) && last.off+last.len == dstRunDiag.stdioUsed {
+				last.len += uint32(take)
+				coalesced = true
+			}
+		}
+		if !coalesced {
+			if dstRunDiag.nstdioChunks >= dstStdioMaxChunks {
+				take = 0
+			} else {
+				ch := &dstRunDiag.stdioChunks[dstRunDiag.nstdioChunks]
+				dstRunDiag.nstdioChunks++
+				ch.host = host
+				ch.proc = proc
+				ch.pid = pid
+				ch.fd = uint8(fd)
+				ch.off = dstRunDiag.stdioUsed
+				ch.len = uint32(take)
+			}
+		}
+		if take > 0 {
+			memmove(unsafe.Pointer(&dstRunDiag.stdioBuf.buf[dstRunDiag.stdioUsed]), unsafe.Pointer(&p[0]), uintptr(take))
+			dstRunDiag.stdioUsed += uint32(take)
+		}
+	}
+	if take < len(p) {
+		dstRunDiag.stdioTruncated += uint64(len(p) - take)
+	}
+	unlock(&dstDiagLock)
+	return len(p)
+}
+
+// dstSnapshotRunDiagnostics copies out the current run's off-heap killed-goroutine
+// and stdio diagnostic records after the bubble has exited.
+//
+//go:linkname dstSnapshotRunDiagnostics
+func dstSnapshotRunDiagnostics() (
+	killMeta [][5]uint64,
+	killSeqs []uint64,
+	killGoPCs []uintptr,
+	killStartPCs []uintptr,
+	killStates []string,
+	droppedKillEvents uint32,
+	stdioMeta [][6]uint64,
+	stdioData []byte,
+	stdioTruncated uint64,
+) {
+	lock(&dstDiagLock)
+	nk := int(dstRunDiag.nkillEvents)
+	totalGs := 0
+	for i := 0; i < nk; i++ {
+		totalGs += int(dstRunDiag.killEvents[i].count)
+	}
+	nc := int(dstRunDiag.nstdioChunks)
+	nbytes := int(dstRunDiag.stdioUsed)
+	unlock(&dstDiagLock)
+
+	if nk > 0 {
+		killMeta = make([][5]uint64, nk)
+		killSeqs = make([]uint64, 0, totalGs)
+		killGoPCs = make([]uintptr, 0, totalGs)
+		killStartPCs = make([]uintptr, 0, totalGs)
+		killStates = make([]string, 0, totalGs)
+	}
+	if nc > 0 {
+		stdioMeta = make([][6]uint64, nc)
+	}
+	if nbytes > 0 {
+		stdioData = make([]byte, nbytes)
+	}
+
+	lock(&dstDiagLock)
+	droppedKillEvents = dstRunDiag.droppedKills
+	stdioTruncated = dstRunDiag.stdioTruncated
+	nk = min(nk, int(dstRunDiag.nkillEvents))
+	killMeta = killMeta[:nk]
+	for i := 0; i < nk; i++ {
+		ev := &dstRunDiag.killEvents[i]
+		startIdx := uint64(len(killSeqs))
+		cnt := ev.count
+		if rem := cap(killSeqs) - len(killSeqs); int(cnt) > rem {
+			cnt = uint32(rem)
+		}
+		for j := uint32(0); j < cnt; j++ {
+			g := ev.killed[j]
+			killSeqs = append(killSeqs, g.seq)
+			killGoPCs = append(killGoPCs, g.gopc)
+			killStartPCs = append(killStartPCs, g.startpc)
+			state := "runnable"
+			if g.status == _Gwaiting {
+				if s := waitReason(g.waitReason).String(); s != "" {
+					state = s
+				} else {
+					state = "waiting"
+				}
+			}
+			killStates = append(killStates, state)
+		}
+		killMeta[i] = [5]uint64{
+			uint64(ev.host),
+			uint64(ev.proc),
+			uint64(uint32(ev.pid)),
+			uint64(ev.total),
+			startIdx | (uint64(cnt) << 32),
+		}
+	}
+	nc = min(nc, int(dstRunDiag.nstdioChunks))
+	stdioMeta = stdioMeta[:nc]
+	for i := 0; i < nc; i++ {
+		ch := &dstRunDiag.stdioChunks[i]
+		stdioMeta[i] = [6]uint64{
+			uint64(ch.host),
+			uint64(ch.proc),
+			uint64(uint32(ch.pid)),
+			uint64(ch.fd),
+			uint64(ch.off),
+			uint64(ch.len),
+		}
+	}
+	nbytes = min(nbytes, int(dstRunDiag.stdioUsed))
+	stdioData = stdioData[:nbytes]
+	if nbytes > 0 {
+		copy(stdioData, dstRunDiag.stdioBuf.buf[:nbytes])
+	}
+	unlock(&dstDiagLock)
+	return
 }

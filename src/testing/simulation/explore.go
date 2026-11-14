@@ -82,6 +82,8 @@ type Failure struct {
 	// execution, so a failure found under a torn crash reproduces only under one
 	// (DST-FAULT-REPLAY).
 	CrashTear bool
+
+	diagnostics string
 }
 
 // ExploreResult reports an Explore run.
@@ -854,12 +856,17 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult) {
 	start := len(res.Failures)
 	defer func() {
-		// Stamp churn at capture: a failure found while foreign work was
-		// scheduled carries the caveat into its replay token (Failure.ForeignSched).
-		if r.tr.foreignSched {
-			for i := start; i < len(res.Failures); i++ {
+		if len(res.Failures) == start {
+			return
+		}
+		diag := formatRunDiagnosticsBody()
+		for i := start; i < len(res.Failures); i++ {
+			// Stamp churn at capture: a failure found while foreign work was
+			// scheduled carries the caveat into its replay token (Failure.ForeignSched).
+			if r.tr.foreignSched {
 				res.Failures[i].ForeignSched = true
 			}
+			res.Failures[i].diagnostics = diag
 		}
 	}()
 	if r.failed {

@@ -176,8 +176,12 @@ func formatExploreReport(seed uint64, r ExploreResult) (failures, notes []string
 		case f.Deadlock != "":
 			kind = "deadlock: " + f.Deadlock
 		}
-		failures = append(failures, fmt.Sprintf("explore seed %d failure %d/%d (%s): replay with\n\tsimulation.Replay(%d, simulation.Failure{Schedule: %#v, AccessForces: %#v, CrashTear: %v, ForeignSched: %v}, sut)",
-			seed, i+1, len(r.Failures), kind, seed, f.Schedule, f.AccessForces, f.CrashTear, f.ForeignSched))
+		msg := fmt.Sprintf("explore seed %d failure %d/%d (%s): replay with\n\tsimulation.Replay(%d, simulation.Failure{Schedule: %#v, AccessForces: %#v, CrashTear: %v, ForeignSched: %v}, sut)",
+			seed, i+1, len(r.Failures), kind, seed, f.Schedule, f.AccessForces, f.CrashTear, f.ForeignSched)
+		if f.diagnostics != "" {
+			msg += "\n" + f.diagnostics
+		}
+		failures = append(failures, msg)
 	}
 	if r.Exhausted {
 		notes = append(notes, fmt.Sprintf("explore seed %d: exhausted, %d schedules", seed, r.Schedules))

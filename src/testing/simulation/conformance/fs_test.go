@@ -669,7 +669,7 @@ func fsAllowlist() []allowEntry {
 			cite:       `design.md §In-memory deterministic filesystem: "umask is not modeled (recorded stance): created files and directories store the requested mode verbatim"`,
 			applicable: func() bool { return hostUmask&0o777 != 0 },
 			match: func(o op, host, sim outcome) bool {
-				if !o.permFromCreate || host.Err != "" || sim.Err != "" {
+				if strings.HasPrefix(o.name, "root-") || !o.permFromCreate || host.Err != "" || sim.Err != "" {
 					return false
 				}
 				hp, hRest, hok := parseStatePerm(host.State)

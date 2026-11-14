@@ -7,7 +7,7 @@
 package syscall
 
 // Stock build: the interception-boundary fences fold away. dstSimFenced is a
-// constant false, so every `if dstSimFenced && …` branch is dead-code-
+// constant false, so every `if dstSimFenced { … }` branch is dead-code-
 // eliminated and the identifiers below exist only to satisfy the type checker.
 const dstSimFenced = false
 
@@ -19,7 +19,9 @@ var dstErrUnsupported error
 
 func dstTryRead(fd int, p []byte) (n int, err Errno, handled bool) { return 0, 0, false }
 
-func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool) { return 0, 0, false }
+func dstTryWrite(fd int, p []byte) (n int, err Errno, handled bool, syncIO bool) {
+	return 0, 0, false, false
+}
 
 func dstTryPread(fd int, p []byte, offset int64) (n int, err Errno, handled bool) {
 	return 0, 0, false

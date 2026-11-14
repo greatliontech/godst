@@ -100,11 +100,21 @@ func (l *testLog) add(op, name string) {
 	if strings.Contains(name, "\n") || name == "" {
 		return
 	}
+	if dstTestlogEnabled {
+		if dstBubbleTestlogAdd(l, op, name) {
+			return
+		}
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.w == nil {
 		return
+	}
+	if dstTestlogEnabled {
+		if dstHostTestlogAddLocked(l, op, name) {
+			return
+		}
 	}
 	l.w.WriteString(op)
 	l.w.WriteByte(' ')
@@ -126,6 +136,9 @@ func (TestDeps) StartTestLog(w io.Writer) {
 		testlog.SetLogger(&log)
 		log.w.WriteString("# test log\n") // known to cmd/go/internal/test/test.go
 	}
+	if dstTestlogEnabled {
+		dstStartTestLogLocked(&log, w)
+	}
 	log.mu.Unlock()
 }
 
@@ -134,6 +147,11 @@ func (TestDeps) StopTestLog() error {
 	defer log.mu.Unlock()
 	err := log.w.Flush()
 	log.w = nil
+	if dstTestlogEnabled {
+		if berr := dstStopTestLogLocked(&log); err == nil {
+			err = berr
+		}
+	}
 	return err
 }
 

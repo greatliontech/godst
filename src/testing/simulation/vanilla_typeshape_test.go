@@ -27,7 +27,8 @@ import (
 var typeShapePackages = []string{
 	"go/types",
 	"internal/poll", "internal/sync", "net", "os", "os/exec",
-	"os/signal", "os/user", "sync", "syscall", "testing", "time",
+	"os/signal", "os/user", "sync", "syscall", "testing",
+	"testing/internal/testdeps", "time",
 }
 
 // TestUntaggedTypeShapesIdenticalToStock is the type-shape half of the

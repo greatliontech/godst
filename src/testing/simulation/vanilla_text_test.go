@@ -7,6 +7,7 @@
 package simulation
 
 import (
+	"debug/elf"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,7 +65,7 @@ func TestUntaggedTextIdenticalToStock(t *testing.T) {
 	stockBin := filepath.Join(dir, "corpus-stock")
 	build := func(goroot, out string) {
 		t.Helper()
-		cmd := exec.Command(filepath.Join(goroot, "bin", "go"), "build", "-trimpath", "-o", out, ".")
+		cmd := exec.Command(filepath.Join(goroot, "bin", "go"), "test", "-c", "-trimpath", "-o", out, ".")
 		cmd.Dir = corpus
 		cmd.Env = append(os.Environ(),
 			"GOROOT="+goroot, "GOTOOLCHAIN=local", "CGO_ENABLED=0",
@@ -143,9 +144,9 @@ func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	required := []string{
 		"crypto/internal/sysrand", "go/types", "internal/runtime/maps",
 		"internal/sync", "net", "os", "os/signal", "os/user", "runtime",
-		"sync", "syscall", "testing", "time",
+		"sync", "syscall", "testing", "testing/internal/testdeps", "time",
 	}
-	cmd := exec.Command(filepath.Join(fork, "bin", "go"), "list", "-deps", ".")
+	cmd := exec.Command(filepath.Join(fork, "bin", "go"), "list", "-test", "-deps", ".")
 	cmd.Dir = corpus
 	cmd.Env = append(os.Environ(), "GOROOT="+fork, "GOTOOLCHAIN=local", "GO111MODULE=off",
 		"GOARCH="+goarch, "GOOS=linux")
@@ -301,6 +302,7 @@ var rawDstRef = regexp.MustCompile(`([\w/]+\.|\(\*?[\w\[\]]+\)\.)dst\w*[+(]|runt
 
 var (
 	amd64IPRel      = regexp.MustCompile(`-?0x[0-9a-f]+\(IP\)`)
+	amd64SymImm     = regexp.MustCompile(`\$([^\s,+()]+)(?:\+(\d+))?\(SB\)`)
 	amd64HexBranch  = regexp.MustCompile(`^(J[A-Z0-9]+)\s+(0x[0-9a-f]+)$`)
 	arm64ADRP       = regexp.MustCompile(`^(ADRP?)\s+-?\d+\(PC\),\s*(R\d+)$`)
 	arm64AddImm     = regexp.MustCompile(`^(ADD\s+)\$\d+(,\s*R\d+,\s*(R\d+|RSP))$`)
@@ -321,10 +323,94 @@ var arm64BranchOps = map[string]bool{
 }
 
 type symbol struct {
+	name       string
+	lines      []string
+	canon      string
+	dstRaw     []string
+	overlongVZ []uint64
+}
+
+type elfSym struct {
 	name   string
-	lines  []string
-	canon  string
-	dstRaw []string
+	addr   uint64
+	size   uint64
+	isText bool
+	isBSS  bool
+}
+
+type elfSymTable struct {
+	sorted      []elfSym
+	byName      map[string]elfSym
+	textVAddr   uint64
+	textFileOff uint64
+	hasText     bool
+}
+
+func loadELFSyms(t *testing.T, bin string) *elfSymTable {
+	t.Helper()
+	f, err := elf.Open(bin)
+	if err != nil {
+		t.Fatalf("elf open %s: %v", bin, err)
+	}
+	defer f.Close()
+	syms, err := f.Symbols()
+	if err != nil {
+		t.Fatalf("elf symbols %s: %v", bin, err)
+	}
+	tab := &elfSymTable{byName: make(map[string]elfSym, len(syms))}
+	if textSec := f.Section(".text"); textSec != nil {
+		tab.textVAddr = textSec.Addr
+		tab.textFileOff = textSec.Offset
+		tab.hasText = true
+	}
+	for _, s := range syms {
+		if s.Size == 0 || s.Value == 0 || elf.ST_TYPE(s.Info) == elf.STT_SECTION {
+			continue
+		}
+		var isText, isBSS bool
+		if int(s.Section) >= 0 && int(s.Section) < len(f.Sections) {
+			sec := f.Sections[s.Section]
+			isText = sec.Flags&elf.SHF_EXECINSTR != 0
+			isBSS = sec.Type == elf.SHT_NOBITS
+		}
+		es := elfSym{
+			name:   s.Name,
+			addr:   s.Value,
+			size:   s.Size,
+			isText: isText,
+			isBSS:  isBSS,
+		}
+		tab.sorted = append(tab.sorted, es)
+		tab.byName[s.Name] = es
+	}
+	sort.Slice(tab.sorted, func(i, j int) bool {
+		if tab.sorted[i].addr != tab.sorted[j].addr {
+			return tab.sorted[i].addr < tab.sorted[j].addr
+		}
+		return tab.sorted[i].name < tab.sorted[j].name
+	})
+	return tab
+}
+
+func (tab *elfSymTable) lookup(addr uint64) (string, uint64, bool) {
+	if tab == nil || len(tab.sorted) == 0 {
+		return "", 0, false
+	}
+	i := sort.Search(len(tab.sorted), func(i int) bool { return tab.sorted[i].addr > addr })
+	if i == 0 {
+		return "", 0, false
+	}
+	base := tab.sorted[i-1].addr
+	best := -1
+	for j := i - 1; j >= 0 && tab.sorted[j].addr == base; j-- {
+		if addr < tab.sorted[j].addr+tab.sorted[j].size {
+			best = j
+		}
+	}
+	if best >= 0 {
+		return tab.sorted[best].name, tab.sorted[best].addr, true
+	}
+	return "", 0, false
 }
 
 var arm64MemImmMatchers = func() map[string]*regexp.Regexp {
@@ -338,23 +424,84 @@ var arm64MemImmMatchers = func() map[string]*regexp.Regexp {
 
 func disassemble(t *testing.T, goroot, bin, goarch string) map[string]symbol {
 	t.Helper()
+	elfTab := loadELFSyms(t, bin)
 	cmd := exec.Command(filepath.Join(goroot, "bin", "go"), "tool", "objdump", bin)
 	cmd.Env = append(os.Environ(), "GOROOT="+goroot, "GOTOOLCHAIN=local")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("objdump %s: %v", bin, err)
 	}
-	return parseDisassembly(string(out), goarch)
+	syms := parseDisassembly(string(out), goarch, elfTab, nil)
+	if goarch != "amd64" || !elfTab.hasText {
+		return syms
+	}
+	// x86asm in cmd/objdump consumes a spurious ModRM byte after 3-byte
+	// VZEROUPPER (c5 f8 77), shifting subsequent instructions out of phase.
+	// Re-disassemble only affected symbols from a scratch copy with those
+	// exact 3-byte VZEROUPPER encodings replaced by 3 single-byte NOPs,
+	// restoring the VZEROUPPER instruction at its original PC.
+	vzFixed := make(map[uint64]bool)
+	var binBytes []byte
+	for {
+		var affected []string
+		newPCs := 0
+		for name, sym := range syms {
+			if len(sym.overlongVZ) == 0 {
+				continue
+			}
+			affected = append(affected, regexp.QuoteMeta(name))
+			for _, pc := range sym.overlongVZ {
+				if !vzFixed[pc] {
+					vzFixed[pc] = true
+					newPCs++
+				}
+			}
+		}
+		if newPCs == 0 {
+			break
+		}
+		sort.Strings(affected)
+		if binBytes == nil {
+			b, err := os.ReadFile(bin)
+			if err != nil {
+				t.Fatalf("read %s: %v", bin, err)
+			}
+			binBytes = b
+		}
+		patched := slices.Clone(binBytes)
+		for pc := range vzFixed {
+			off := elfTab.textFileOff + (pc - elfTab.textVAddr)
+			if off+3 > uint64(len(patched)) || patched[off] != 0xc5 || patched[off+1] != 0xf8 || patched[off+2] != 0x77 {
+				t.Fatalf("unexpected bytes at VZEROUPPER PC 0x%x in %s", pc, bin)
+			}
+			patched[off], patched[off+1], patched[off+2] = 0x90, 0x90, 0x90
+		}
+		tmp := filepath.Join(t.TempDir(), "vz-resync")
+		if err := os.WriteFile(tmp, patched, 0o600); err != nil {
+			t.Fatalf("write %s: %v", tmp, err)
+		}
+		rcmd := exec.Command(filepath.Join(goroot, "bin", "go"), "tool", "objdump", "-s", "^("+strings.Join(affected, "|")+")$", tmp)
+		rcmd.Env = append(os.Environ(), "GOROOT="+goroot, "GOTOOLCHAIN=local")
+		rout, err := rcmd.Output()
+		if err != nil {
+			t.Fatalf("objdump resync %s: %v", tmp, err)
+		}
+		for name, rsym := range parseDisassembly(string(rout), goarch, elfTab, vzFixed) {
+			syms[name] = rsym
+		}
+	}
+	return syms
 }
 
 type rawIns struct {
-	pc    uint64
-	hasP  bool
-	isNOP bool
-	text  string
+	pc     uint64
+	encLen int
+	hasP   bool
+	isNOP  bool
+	text   string
 }
 
-func parseDisassembly(out, goarch string) map[string]symbol {
+func parseDisassembly(out, goarch string, elfTab *elfSymTable, vzFixed map[uint64]bool) map[string]symbol {
 	syms := make(map[string]symbol)
 	var name string
 	var cur symbol
@@ -363,7 +510,7 @@ func parseDisassembly(out, goarch string) map[string]symbol {
 		if name == "" {
 			return
 		}
-		cur.lines = canonicalizeSymbol(raw, goarch)
+		cur.lines, cur.dstRaw = canonicalizeSymbol(raw, goarch, elfTab, cur.dstRaw)
 		cur.canon = strings.Join(cur.lines, "\n")
 		syms[name] = cur
 		raw = raw[:0]
@@ -382,25 +529,39 @@ func parseDisassembly(out, goarch string) map[string]symbol {
 		if len(f) < 4 || name == "" {
 			continue
 		}
+		enc := f[2]
 		text := strings.Join(f[3:], " ")
 		if text == "?" {
-			if strings.Trim(f[2], "0") == "" {
+			if strings.Trim(enc, "0") == "" {
 				continue
 			}
-			text = "? " + f[2]
+			text = "? " + enc
+		}
+		pc, err := strconv.ParseUint(strings.TrimPrefix(f[1], "0x"), 16, 64)
+		hasP := err == nil
+		if hasP && vzFixed != nil {
+			if vzFixed[pc] {
+				raw = append(raw, rawIns{pc: pc, encLen: 3, hasP: true, text: "VZEROUPPER"})
+				continue
+			}
+			if vzFixed[pc-1] || vzFixed[pc-2] {
+				continue
+			}
+		}
+		if goarch == "amd64" && hasP && text == "VZEROUPPER" && len(enc) > 6 && strings.HasPrefix(enc, "c5f877") {
+			cur.overlongVZ = append(cur.overlongVZ, pc)
 		}
 		if rawDstRef.MatchString(text) {
 			cur.dstRaw = append(cur.dstRaw, text)
 		}
 		isNOP := strings.HasPrefix(text, "NOP") || strings.HasPrefix(text, "NOOP")
-		pc, err := strconv.ParseUint(strings.TrimPrefix(f[1], "0x"), 16, 64)
-		raw = append(raw, rawIns{pc: pc, hasP: err == nil, isNOP: isNOP, text: text})
+		raw = append(raw, rawIns{pc: pc, encLen: len(enc) / 2, hasP: hasP, isNOP: isNOP, text: text})
 	}
 	flush()
 	return syms
 }
 
-func canonicalizeSymbol(raw []rawIns, goarch string) []string {
+func canonicalizeSymbol(raw []rawIns, goarch string, elfTab *elfSymTable, dstRaw []string) ([]string, []string) {
 	lines := make([]string, 0, len(raw))
 	switch goarch {
 	case "amd64":
@@ -414,7 +575,51 @@ func canonicalizeSymbol(raw []rawIns, goarch string) []string {
 					text = fmt.Sprintf("%s PC%+d", m[1], int64(dst-ins.pc))
 				}
 			} else if !strings.HasPrefix(text, "CALL ") && !strings.HasPrefix(text, "JMP ") {
-				text = amd64IPRel.ReplaceAllString(text, "ADDR(IP)")
+				if elfTab != nil {
+					text = amd64SymImm.ReplaceAllStringFunc(text, func(tok string) string {
+						m := amd64SymImm.FindStringSubmatch(tok)
+						if m == nil {
+							return tok
+						}
+						es, ok := elfTab.byName[m[1]]
+						if !ok || es.isText {
+							return tok
+						}
+						var off uint64
+						if m[2] != "" {
+							v, err := strconv.ParseUint(m[2], 10, 64)
+							if err != nil {
+								return tok
+							}
+							off = v
+						}
+						if off > 0 || es.isBSS {
+							return fmt.Sprintf("$0x%x", es.addr+off)
+						}
+						return tok
+					})
+				}
+				text = amd64IPRel.ReplaceAllStringFunc(text, func(tok string) string {
+					if elfTab != nil && ins.hasP && ins.encLen > 0 {
+						dispStr := strings.TrimSuffix(tok, "(IP)")
+						if disp, err := strconv.ParseInt(dispStr, 0, 64); err == nil {
+							target := uint64(int64(ins.pc) + int64(ins.encLen) + disp)
+							if symName, base, ok := elfTab.lookup(target); ok {
+								var resolved string
+								if target == base {
+									resolved = symName + "(SB)"
+								} else {
+									resolved = fmt.Sprintf("%s+%d(SB)", symName, target-base)
+								}
+								if rawDstRef.MatchString(resolved) {
+									dstRaw = append(dstRaw, resolved)
+								}
+								return resolved
+							}
+						}
+					}
+					return "ADDR(IP)"
+				})
 			}
 			lines = append(lines, text)
 		}
@@ -459,7 +664,7 @@ func canonicalizeSymbol(raw []rawIns, goarch string) []string {
 			lines = append(lines, ins.text)
 		}
 	}
-	return lines
+	return lines, dstRaw
 }
 
 func isARM64Branch(text string) bool {
@@ -518,13 +723,16 @@ func canonARM64PageOff(text string, adrpRegs map[string]bool) string {
 }
 
 func TestCanonicalizerRejectsRealMutations(t *testing.T) {
-	wrap := func(arch string, lines ...string) symbol {
+	wrapWithELF := func(arch string, tab *elfSymTable, lines ...string) symbol {
 		var b strings.Builder
 		b.WriteString("TEXT pkg.fn(SB) /src/pkg/fn.go\n")
 		for i, l := range lines {
-			fmt.Fprintf(&b, "  fn.go:%d 0x%x 0000 %s\n", i+1, 0x1000+i*4, l)
+			fmt.Fprintf(&b, "  fn.go:%d 0x%x 00000000 %s\n", i+1, 0x1000+i*4, l)
 		}
-		return parseDisassembly(b.String(), arch)["pkg.fn"]
+		return parseDisassembly(b.String(), arch, tab, nil)["pkg.fn"]
+	}
+	wrap := func(arch string, lines ...string) symbol {
+		return wrapWithELF(arch, nil, lines...)
 	}
 
 	// Legitimate .rodata link-address relocation shifts must match, including
@@ -536,6 +744,43 @@ func TestCanonicalizerRejectsRealMutations(t *testing.T) {
 	if a, b := wrap("arm64", "ADRP 3059712(PC), R1", "ADD $160, R1, R1", "ADRP 8192(PC), R2", "BIC $7, R9, R9", "MOVD (R2), R3"),
 		wrap("arm64", "ADRP 3055616(PC), R1", "ADD $2808, R1, R1", "ADRP 4096(PC), R2", "BIC $7, R9, R9", "MOVD 64(R2), R3"); a.canon != b.canon {
 		t.Fatalf("arm64 ADRP+pageoff relocation shift rejected: %q vs %q", a.canon, b.canon)
+	}
+
+	// Plain 32-bit integer immediates symbolized by x86asm against a shifted BSS
+	// range reconstruct their exact literal value while still rejecting real
+	// immediate mutations.
+	forkTab := &elfSymTable{
+		sorted: []elfSym{{name: "os.Stdin", addr: 0x901320, size: 8, isBSS: true}, {name: "pkg.bigbss", addr: 0x93a600, size: 0x2000000, isBSS: true}},
+		byName: map[string]elfSym{
+			"os.Stdin":   {name: "os.Stdin", addr: 0x901320, size: 8, isBSS: true},
+			"pkg.bigbss": {name: "pkg.bigbss", addr: 0x93a600, size: 0x2000000, isBSS: true},
+		},
+	}
+	stockTab := &elfSymTable{
+		sorted: []elfSym{{name: "os.Stdin", addr: 0x901300, size: 8, isBSS: true}, {name: "pkg.bigbss", addr: 0x93a5e0, size: 0x2000000, isBSS: true}},
+		byName: map[string]elfSym{
+			"os.Stdin":   {name: "os.Stdin", addr: 0x901300, size: 8, isBSS: true},
+			"pkg.bigbss": {name: "pkg.bigbss", addr: 0x93a5e0, size: 0x2000000, isBSS: true},
+		},
+	}
+	if a, b := wrapWithELF("amd64", forkTab, "MOVL $pkg.bigbss+7101331(SB), DX"),
+		wrapWithELF("amd64", stockTab, "MOVL $pkg.bigbss+7101363(SB), DX"); a.canon != b.canon {
+		t.Fatalf("amd64 BSS-interior immediate constant shift rejected: %q vs %q", a.canon, b.canon)
+	}
+	if a, b := wrapWithELF("amd64", forkTab, "MOVL $pkg.bigbss+7101332(SB), DX"),
+		wrapWithELF("amd64", stockTab, "MOVL $pkg.bigbss+7101363(SB), DX"); a.canon == b.canon {
+		t.Fatalf("amd64 BSS-interior immediate mutation masked: %q == %q", a.canon, b.canon)
+	}
+	// IP-relative access at a zero-size section marker (pc=0x1000, encLen=4,
+	// disp=0x90031c -> target=0x901320 = os.Stdin) resolves to os.Stdin(SB)
+	// rather than masking named globals as ADDR(IP).
+	if a, b := wrapWithELF("amd64", forkTab, "MOVQ 0x90031c(IP), DX"),
+		wrapWithELF("amd64", stockTab, "MOVQ os.Stdin(SB), DX"); a.canon != b.canon {
+		t.Fatalf("amd64 zero-size marker global resolution failed: %q vs %q", a.canon, b.canon)
+	}
+	if a, b := wrapWithELF("amd64", forkTab, "MOVQ 0x90031c(IP), DX"),
+		wrapWithELF("amd64", stockTab, "MOVQ os.Stdout(SB), DX"); a.canon == b.canon {
+		t.Fatalf("amd64 zero-size marker global swap masked: %q == %q", a.canon, b.canon)
 	}
 
 	// Real codegen deviations (named globals, struct/stack offsets, immediates,

@@ -107,6 +107,8 @@ func init() {
 	register("DSTCleanupInFlightReleaseDuringRun", DSTCleanupInFlightReleaseDuringRun)
 	register("DSTMemLimit", DSTMemLimit)
 	register("DSTForeignGCActivationStretch", DSTForeignGCActivationStretch)
+	register("DSTGCAssistMembershipCarry", DSTGCAssistMembershipCarry)
+	register("DSTSysmonMaxProcsRunActiveGuards", DSTSysmonMaxProcsRunActiveGuards)
 }
 
 //go:linkname dstRuntimeActive runtime.dstActive
@@ -3661,4 +3663,189 @@ func DSTPCTMainDrawsPriority() {
 	} else {
 		os.Stdout.WriteString("zero\n")
 	}
+}
+
+//go:linkname dstGCAssistDisassociatesFP runtime.dstGCAssistDisassociatesFP
+func dstGCAssistDisassociatesFP() uint64
+
+//go:linkname dstSchedRandPeekFP runtime.dstSchedRandPeekFP
+func dstSchedRandPeekFP() uint64
+
+//go:linkname dstTestDriveBubbleGCAssist runtime.dstTestDriveBubbleGCAssist
+func dstTestDriveBubbleGCAssist() bool
+
+//go:linkname dstUpdateMaxProcsGStartedFP runtime.dstUpdateMaxProcsGStartedFP
+func dstUpdateMaxProcsGStartedFP() bool
+
+//go:linkname dstUpdateMaxProcsSTWsFP runtime.dstUpdateMaxProcsSTWsFP
+func dstUpdateMaxProcsSTWsFP() uint64
+
+//go:linkname dstSysmonMaxProcsActiveSkipsFP runtime.dstSysmonMaxProcsActiveSkipsFP
+func dstSysmonMaxProcsActiveSkipsFP() uint64
+
+//go:linkname dstSysmonMaxProcsRecheckBailsFP runtime.dstSysmonMaxProcsRecheckBailsFP
+func dstSysmonMaxProcsRecheckBailsFP() uint64
+
+//go:linkname dstTestSetAutoMaxProcsMismatch runtime.dstTestSetAutoMaxProcsMismatch
+func dstTestSetAutoMaxProcsMismatch() int
+
+//go:linkname dstTestArmSysmonMaxProcsRecheckRace runtime.dstTestArmSysmonMaxProcsRecheckRace
+func dstTestArmSysmonMaxProcsRecheckRace()
+
+//go:linkname dstTestSuppressSysmonMaxProcs runtime.dstTestSuppressSysmonMaxProcs
+func dstTestSuppressSysmonMaxProcs(suppress bool)
+
+//go:linkname dstTestCallSysmonUpdateGOMAXPROCS runtime.dstTestCallSysmonUpdateGOMAXPROCS
+func dstTestCallSysmonUpdateGOMAXPROCS()
+
+func DSTGCAssistMembershipCarry() {
+	var (
+		drove       bool
+		assistDelta uint64
+		g2MidAssist bool
+		randChanged bool
+	)
+	simulation.Run(42, func() {
+		var g2Ran atomic.Bool
+		done := make(chan struct{})
+		go func() {
+			g2Ran.Store(true)
+			close(done)
+		}()
+		beforeRand := dstSchedRandPeekFP()
+		beforeAssists := dstGCAssistDisassociatesFP()
+		drove = dstTestDriveBubbleGCAssist()
+		assistDelta = dstGCAssistDisassociatesFP() - beforeAssists
+		g2MidAssist = g2Ran.Load()
+		randChanged = dstSchedRandPeekFP() != beforeRand
+		<-done
+	})
+	if !drove || assistDelta == 0 {
+		os.Stdout.WriteString("assist disassociation unreached\n")
+		return
+	}
+	if g2MidAssist {
+		os.Stdout.WriteString("sibling simulation goroutine interleaved mid-assist\n")
+		return
+	}
+	if randChanged {
+		os.Stdout.WriteString("mid-assist yield advanced dstSchedRand\n")
+		return
+	}
+
+	runWorkload := func(withAssist bool) simulation.ExploreResult {
+		return simulation.Explore(42, simulation.Exhaustive, func() bool {
+			ch := make(chan int, 2)
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if withAssist {
+					if !dstTestDriveBubbleGCAssist() {
+						panic("assist probe failed in Explore")
+					}
+				}
+				ch <- 1
+			}()
+			go func() {
+				defer wg.Done()
+				ch <- 2
+			}()
+			wg.Wait()
+			return <-ch+<-ch != 3
+		})
+	}
+	base := runWorkload(false)
+	beforeExploreAssists := dstGCAssistDisassociatesFP()
+	withAssist := runWorkload(true)
+	exploreAssists := dstGCAssistDisassociatesFP() - beforeExploreAssists
+	if exploreAssists == 0 {
+		os.Stdout.WriteString("explore assist disassociation unreached\n")
+		return
+	}
+	if !withAssist.Exhausted || withAssist.ForeignSched || len(withAssist.Failures) != 0 {
+		os.Stdout.WriteString("explore degraded under assist\n")
+		return
+	}
+	if withAssist.Schedules != base.Schedules || withAssist.Footprint.PeakDecisions != base.Footprint.PeakDecisions {
+		os.Stdout.WriteString("explore schedule tree perturbed: schedules=" +
+			strconv.Itoa(withAssist.Schedules) + "/" + strconv.Itoa(base.Schedules) +
+			" peakDecisions=" + strconv.Itoa(withAssist.Footprint.PeakDecisions) + "/" + strconv.Itoa(base.Footprint.PeakDecisions) + "\n")
+		return
+	}
+	os.Stdout.WriteString("ok\n")
+}
+
+func DSTSysmonMaxProcsRunActiveGuards() {
+	if !dstUpdateMaxProcsGStartedFP() {
+		os.Stdout.WriteString("updateMaxProcsG not started\n")
+		return
+	}
+	waitIdle := func() bool {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if dstTestMaxProcsHelperIdle() {
+				return true
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+		return false
+	}
+	defer runtime.SetDefaultGOMAXPROCS()
+	dstTestSuppressSysmonMaxProcs(true)
+	defer dstTestSuppressSysmonMaxProcs(false)
+	if !waitIdle() {
+		os.Stdout.WriteString("helper not idle after suppressing sysmon\n")
+		return
+	}
+
+	// Leg 1: pre-push dstActive() skip with sched.customGOMAXPROCS == false
+	// and gomaxprocs != defaultGOMAXPROCS(0), so neither custom nor procs==curr
+	// can mask a missing dstActive() guard.
+	pinned := dstTestSetAutoMaxProcsMismatch()
+	if !waitIdle() {
+		os.Stdout.WriteString("helper not idle before active skip probe\n")
+		return
+	}
+	dstActivate(7)
+	skips0 := dstSysmonMaxProcsActiveSkipsFP()
+	stws0 := dstUpdateMaxProcsSTWsFP()
+	dstTestCallSysmonUpdateGOMAXPROCS()
+	during := runtime.GOMAXPROCS(0)
+	skipsDelta := dstSysmonMaxProcsActiveSkipsFP() - skips0
+	stwsDelta := dstUpdateMaxProcsSTWsFP() - stws0
+	dstDeactivate()
+	if skipsDelta != 1 {
+		os.Stdout.WriteString("active skip unreached: delta=" + strconv.FormatUint(skipsDelta, 10) + "\n")
+		return
+	}
+	if stwsDelta != 0 {
+		os.Stdout.WriteString("sysmon admitted mid-run STW: delta=" + strconv.FormatUint(stwsDelta, 10) + "\n")
+		return
+	}
+	if during != pinned {
+		os.Stdout.WriteString("gomaxprocs changed mid-run\n")
+		return
+	}
+
+	// Leg 2: under-lock updateMaxProcsG.idle recheck when a competing pusher
+	// wakes the helper between sysmon's outer idle check and updateMaxProcsG.lock.
+	_ = dstTestSetAutoMaxProcsMismatch()
+	if !waitIdle() {
+		os.Stdout.WriteString("helper not idle before recheck race probe\n")
+		return
+	}
+	bails0 := dstSysmonMaxProcsRecheckBailsFP()
+	dstTestArmSysmonMaxProcsRecheckRace()
+	dstTestCallSysmonUpdateGOMAXPROCS()
+	bailsDelta := dstSysmonMaxProcsRecheckBailsFP() - bails0
+	if bailsDelta != 1 {
+		os.Stdout.WriteString("under-lock recheck bail unreached: delta=" + strconv.FormatUint(bailsDelta, 10) + "\n")
+		return
+	}
+	if !waitIdle() {
+		os.Stdout.WriteString("helper did not re-park after raced push\n")
+		return
+	}
+	os.Stdout.WriteString("ok\n")
 }

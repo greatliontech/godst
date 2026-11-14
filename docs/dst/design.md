@@ -1252,10 +1252,18 @@ channels — rather than silently nondeterministic. Enforced by the
 exactness, PIPE_BUF atomicity under concurrency, fd census, leak fences, same-seed transcript
 equality).
 
-**Stdio is not implicitly inherited.** `os.Stdin`/`Stdout`/`Stderr` are ordinary pre-run host files,
-so their methods are fenced inside a run. Code that deliberately needs host stdio calls
-`simulation.InheritFile` inside the run and uses or installs the returned capability; captured or fully
-deterministic stdio instead assigns the package variables to simulated files. Capability writes are
+**Stdio is not implicitly inherited to the host.** `os.Stdin` remains fenced inside a run (reading the
+host terminal is an unseeded input escape). Ungranted bubble writes to standard output and standard error
+(`os.Stdout`/`os.Stderr`, `syscall.Write(1|2, …)`, and `syscall.Syscall(SYS_WRITE, 1|2, …)`) are modeled
+as an off-heap (`sysAlloc`), runtime-lock-guarded per-run diagnostic buffer attributed by
+`(host, process, pid, fd)`: writes allocate `0` Go heap bytes (perturbing neither `Options.MemoryLimit`
+nor the deterministic GC trigger) and emit `0` Level-2 DPOR or race-detector synchronization edges, stay
+completely silent on passing runs (even under `go test -v`), and render automatically through `t.Log` /
+`ExploreTest` failure reports whenever a test or explored schedule fails (`TestDiagnostics*`). Raw
+P-less trampolines (`syscall.RawSyscall(SYS_WRITE, …)`) remain fenced. Code that deliberately needs live
+host stdio calls `simulation.InheritFile` inside the run and uses or installs the returned capability;
+in-run programmatic capture assigns `os.Stdout`/`os.Stderr` to simulated files (`os.Pipe`, simulated
+regular files), whose backend takes precedence over the default `fd 1`/`fd 2` capture. Capability writes are
 outbound, schedule-ordered side effects that feed no nondeterminism back into the run.
 An inherited capability is **node-scoped to the root simulation body** that holds the grant: operated
 from a `Host` or `Process` body it refuses with a distinguishable node-scoped error naming the relay
@@ -1309,8 +1317,9 @@ to the host-lock path. So `-v` streams from inside a run without perturbing the 
 same-seed transcripts are byte-identical with `-v` on, with `-v` off, and under `-v` with a
 host-parallel test hammering the shared printer. The grant is enacted only around these unexported
 framework writes, which SUT code cannot reach — their inputs are strings the framework formatted
-before the grant opens — so a SUT write to `os.Stdout`/`os.Stderr` under `-v` is fenced exactly as
-without it. Enforced by the `TestVerbose*` suite in
+before the grant opens — so an ungranted SUT write to `os.Stdout`/`os.Stderr` under `-v` stays captured
+inside the bubble stdio buffer rather than reaching the host stream, while `os.Stdin` reads and
+`RawSyscall` writes remain fenced. Enforced by the `TestVerbose*` suite in
 `src/testing/simulation/verbose_linux_test.go` (in-bubble streaming, the SUT-fence pin, the
 benchmark arm, the header-adjacency attribution pin under host-parallel contention, and the three
 same-seed transcript-equality pins — `-v` solo, `-v` on-vs-off, and `-v` under contention — whose
@@ -1651,7 +1660,7 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   library's import-policy gate (which package may import which, over every build-tagged file):
   the fork adds imports to std packages, and a violation otherwise surfaces only in the heavy
   `inert-std` leg.
-- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing testing/simulation crypto/rand net os syscall os/exec os/signal`,
+- **`test:dst`** (`go test -tags dst -count=1 -timeout 60m runtime testing testing/internal/testdeps testing/simulation crypto/rand net os syscall os/exec os/signal`,
   non-`-short`): the
   802-program sweep, the race-oracle and auto-instrumentation tests — which build their own
   `-race` testprogs — and the build-mode inertness test all skip under `-short`. The untagged
@@ -1660,9 +1669,11 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   fences land there; the leg exercises their standard suites under `-tags dst` to enforce that the
   fences are inert for non-bubble goroutines (a fence firing outside a run would break these).
   `crypto/rand` enforces that the tagged outside-run entropy path remains allocation-free.
-  `testing` carries the tagged framework-stream and test-log writer pins (`dst_chatty_test.go`,
-  `dst_testlog_test.go` — the in-bubble test-log write returns its host error so the harness's
-  buffered writer fails the binary as on the host path), which build only under `-tags dst`.
+  `testing` and `testing/internal/testdeps` carry the tagged framework-stream and lock-free bubble
+  test-log writer pins (`dst_chatty_test.go`, `testing/internal/testdeps/dst_testlog_test.go` — the
+  in-bubble test-log write bypasses the host `bufio.Mutex` via an atomic descriptor snapshot plus a
+  single-line raw runtime `write1` on both host and bubble paths, latching any host write error for `StopTestLog()`), which build only
+  under `-tags dst` (paired with the `testlog-contended` same-seed leg in `testing/simulation/determinism`).
 - **`test:dst-race`** (`go test -tags dst -race -count=1 -timeout 60m testing/simulation testing/simulation/determinism`): the dst-race
   sync-hook encodings, plus the determinism sweep under instrumentation (race instrumentation must
   not shift the seeded schedule). The suite is `-race`-clean: every SUT that runs under `-race` is race-free —
@@ -1692,7 +1703,7 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   `DST_DIVERSITY_SEEDS=<n>` widens it. Recorded coverage bounds live in the package's doc.go.
 - **`test:conformance`** (`go test -tags dst -count=1 -timeout 30m testing/simulation/conformance`,
   Linux): the differential host-vs-sim conformance harness — seeded op-grammar sequences over the
-  modeled pipe, TCP, and filesystem surfaces, executed against real Linux primitives outside a run
+  modeled pipe, TCP, filesystem, and `os.Root` surfaces, executed against real Linux primitives outside a run
   (build-mode inertness) and inside `simulation.Run`, with normalized outcomes diffed. Its
   allowlist is machine-checked spec: every entry is one divergence THIS document records as
   deliberate, with a citation; an unallowlisted divergence fails the leg with the op sequence as
@@ -1730,13 +1741,12 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   `api/go1.N.txt` corpus plus `api/go1-godst.txt`, godst's own exported std surface (the
   `testing/simulation` package; this document is the behavioral contract, the api file the
   compatibility surface). An unlisted addition or a removed listed symbol fails; additions
-  land in the file deliberately, reviewed like any change set. Scope: `cmd/api` walks
-  untagged contexts only, so the file pins the untagged surface; the tagged surface is pinned
-  by compile-time signature assertions in the package's own tagged tests — the one dst-only
-  export (`HostFS`, invisible to the api file) and `HostIP` (whose tagged twin could drift
-  from the untagged one the api file pins) — and the tagged-context gate gap is a filed
-  issue. In the `test` aggregate,
-  per-PR in ci.yml, and in the matrix.
+  land in the file deliberately, reviewed like any change set. `cmd/api` evaluates both
+  untagged contexts and 16 paired `-tags dst` Linux contexts across all eight supported Linux
+  architectures (`386`, `amd64`, `arm`, `arm64`, `ppc64`, `ppc64le`, `riscv64`, `s390x`, with
+  and without cgo), pinning `-tags dst`-only exports (`HostFS`) directly in `api/go1-godst.txt`
+  and enforcing exact signature parity across every tagged/untagged twin (`dst_api_test.go`).
+  In the `test` aggregate, per-PR in ci.yml, and in the matrix.
 - **`test:inert-diff`** (`TestUntaggedTextIdenticalToStock` + `TestUntaggedTypeShapesIdenticalToStock`,
   `-tags dst`, non-short): the INV-VANILLA and INV-TYPESHAPE differential gates — the probe corpus
   built untagged by this toolchain and by the upstream base toolchain (from `DST_STOCK_GOROOT` or
@@ -1932,7 +1942,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
-| standard streams (stdio) | fenced unless explicitly granted with `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for capture; granted capability syscalls dispatch raw (scheduler-invisible, the P held) so a blocked capability write serializes, never reorders — sysmon's syscall retake stays run-gated for foreign goroutines; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
+| standard streams (stdio) | `os.Stdin` fenced; ungranted `fd 1`/`fd 2` writes (`os.Stdout`/`os.Stderr`, `syscall.Write`, `Syscall(SYS_WRITE)`) captured off-heap per `(host, proc, pid, fd)` with zero heap/schedule perturbation and emitted only on test/explore failure (`RawSyscall` stays fenced); explicit live host stdio granted via `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for in-run capture; granted capability syscalls dispatch raw (scheduler-invisible, the P held) so a blocked capability write serializes, never reorders — sysmon's syscall retake stays run-gated for foreign goroutines; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
 | environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |

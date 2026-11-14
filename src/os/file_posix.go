@@ -63,6 +63,9 @@ func (f *File) write(b []byte) (n int, err error) {
 		if dstf := dstBackendOf(f.file); dstf != nil {
 			return dstf.write(b)
 		}
+		if n, handled := dstTryBubbleStdioWrite(f.file, b); handled {
+			return n, nil
+		}
 	}
 	n, err = f.pfd.Write(b)
 	runtime.KeepAlive(f)

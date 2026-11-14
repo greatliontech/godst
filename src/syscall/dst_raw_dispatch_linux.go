@@ -102,6 +102,22 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 		return dstRawSockopt(trap == dstSysSetsockopt, a1, a2, a3, a4, a5)
 	}
 	switch trap {
+	case SYS_WRITE:
+		// Ungranted bubble writes to standard output/error (fd 1/2) route to
+		// the per-run off-heap stdio buffer rather than escaping to the host
+		// stream or tripping the fence. Granted capability I/O has already
+		// bypassed dstRawDispatch via dstHostIOActive() in Syscall/Syscall6.
+		if a1 != 1 && a1 != 2 {
+			return 0, 0, false
+		}
+		if a3 == 0 {
+			return 0, 0, true
+		}
+		if int(a3) < 0 || a2 == 0 {
+			return 0, EFAULT, true
+		}
+		data := unsafe.Slice((*byte)(unsafe.Pointer(a2)), int(a3))
+		return dstRawStdioWrite(int(a1), data)
 	case SYS_MADVISE, SYS_MPROTECT, SYS_MUNMAP:
 		// A zero-length range names no mapping, so neither its address nor the
 		// operation can establish simulated ownership. Match the named wrappers:
@@ -402,4 +418,19 @@ func dstRawFutex(addr *uint32, op int, val uint32, ts *Timespec) (r1 uintptr, er
 	}
 	dstSyscallRefuse(SYS_FUTEX)
 	return 0, 0, true
+}
+
+//go:linkname dstBubbleStdioAppend runtime.dstBubbleStdioAppend
+func dstBubbleStdioAppend(fd int, p []byte) int
+
+func dstTryStdioWrite(fd int, p []byte) (int, bool) {
+	if (fd != 1 && fd != 2) || dstHostIOActive() {
+		return 0, false
+	}
+	return dstBubbleStdioAppend(fd, p), true
+}
+
+//go:noinline
+func dstRawStdioWrite(fd int, data []byte) (r1 uintptr, err Errno, handled bool) {
+	return uintptr(dstBubbleStdioAppend(fd, data)), 0, true
 }

@@ -15,15 +15,17 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // The -v (chatty) test output stream is the testing FRAMEWORK's own host
 // plumbing: under a run its writes execute on bubble goroutines (t.Log
 // routing, status lines) and carry the framework-stream host-I/O grant, so
-// they pass the stdio fence — while a SUT write to os.Stdout stays fenced
-// exactly as without -v. These are cross-process tests: chatty mode is a
-// property of the test binary's own flags, so a child re-execution of this
-// binary with -test.v is the real -v environment, not a reconstruction.
+// they pass the stdio fence — while ungranted SUT writes to fd 1/2 are
+// captured into the per-run bubble stdio buffer rather than escaping to the
+// host stream. These are cross-process tests: chatty mode is a property of
+// the test binary's own flags, so a child re-execution of this binary with
+// -test.v is the real -v environment, not a reconstruction.
 
 // runVerboseChild re-runs this test binary with -test.v targeting run, with
 // env set, and returns the combined output. The caller asserts on it.
@@ -69,29 +71,56 @@ func TestVerboseLogStreamsFromBubble(t *testing.T) {
 }
 
 // TestVerboseSUTStdioStaysFenced: the framework-stream grant is scoped to the
-// chatty printer — under -v a SUT write to os.Stdout from inside the bubble
-// still panics with the raw-syscall fence shape, and the escape payload never
-// reaches the host stream.
+// chatty printer — under -v, ungranted SUT writes to modeled fd 1/2
+// (os.Stdout/os.Stderr, syscall.Write, syscall.Syscall(SYS_WRITE)) stay
+// buffered inside the simulation rather than leaking onto the host stream on a
+// passing test, while os.Stdin reads and raw-trampoline writes still panic at
+// the interception fence.
 func TestVerboseSUTStdioStaysFenced(t *testing.T) {
 	if os.Getenv("GO_DST_VERBOSE_FENCE_CHILD") == "1" {
 		Test(t, 13, func(t *testing.T) {
 			t.Log("before-sut-write")
-			var v any
-			func() {
-				defer func() { v = recover() }()
-				os.Stdout.Write([]byte("sut-stdout-escape\n"))
-			}()
-			s, ok := v.(string)
-			if !ok || !strings.Contains(s, "unsupported under deterministic simulation") {
-				t.Fatalf("SUT os.Stdout.Write under -v = %v, want the fence panic", v)
+			if n, err := os.Stdout.Write([]byte("sut-stdout-escape\n")); err != nil || n != len("sut-stdout-escape\n") {
+				t.Fatalf("os.Stdout.Write = (%d, %v)", n, err)
 			}
+			if n, err := os.Stderr.Write([]byte("sut-stderr-escape\n")); err != nil || n != len("sut-stderr-escape\n") {
+				t.Fatalf("os.Stderr.Write = (%d, %v)", n, err)
+			}
+			if n, err := syscall.Write(1, []byte("sut-syswrite-escape\n")); err != nil || n != len("sut-syswrite-escape\n") {
+				t.Fatalf("syscall.Write(1) = (%d, %v)", n, err)
+			}
+			rawPayload := []byte("sut-trampoline-escape\n")
+			if r1, _, e := syscall.Syscall(syscall.SYS_WRITE, 1, uintptr(unsafe.Pointer(&rawPayload[0])), uintptr(len(rawPayload))); e != 0 || int(r1) != len(rawPayload) {
+				t.Fatalf("syscall.Syscall(SYS_WRITE, 1) = (%d, %v)", r1, e)
+			}
+
+			expectFence := func(name string, fn func()) {
+				var v any
+				func() {
+					defer func() { v = recover() }()
+					fn()
+				}()
+				s, ok := v.(string)
+				if !ok || !strings.Contains(s, "unsupported under deterministic simulation") {
+					t.Fatalf("%s under -v = %v, want fence panic", name, v)
+				}
+			}
+			expectFence("os.Stdin.Read", func() {
+				var b [1]byte
+				os.Stdin.Read(b[:])
+			})
+			expectFence("RawSyscall(SYS_WRITE, 1)", func() {
+				syscall.RawSyscall(syscall.SYS_WRITE, 1, uintptr(unsafe.Pointer(&rawPayload[0])), uintptr(len(rawPayload)))
+			})
 			t.Log("after-sut-write")
 		})
 		return
 	}
 	out := runVerboseChild(t, "TestVerboseSUTStdioStaysFenced", "GO_DST_VERBOSE_FENCE_CHILD")
-	if strings.Contains(out, "sut-stdout-escape") {
-		t.Errorf("SUT stdout write reached the host stream under -v:\n%s", out)
+	for _, leak := range []string{"sut-stdout-escape", "sut-stderr-escape", "sut-syswrite-escape", "sut-trampoline-escape", "captured bubble stdio"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("SUT buffered stdio leaked onto passing -v host stream (%q):\n%s", leak, out)
+		}
 	}
 	for _, want := range []string{"before-sut-write", "after-sut-write", "--- PASS: TestVerboseSUTStdioStaysFenced"} {
 		if !strings.Contains(out, want) {

@@ -8,6 +8,7 @@ package os
 
 import (
 	"cmp"
+	"internal/filepathlite"
 	"internal/poll"
 	"io"
 	"path"
@@ -1069,17 +1070,14 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if name == "" {
 		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
 	}
-	_, base, node, errno := dstFSResolve(name)
+	_, _, node, errno := dstFSResolve(name)
 	if errno != nil {
 		return nil, true, &PathError{Op: op, Path: name, Err: errno}
 	}
 	if node == nil {
 		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
 	}
-	if dstFSIsRoot(node) {
-		base = "/"
-	}
-	return dstFileInfoForNode(base, node), true, nil
+	return dstFileInfoForNode(filepathlite.Base(name), node), true, nil
 }
 
 // dstTempDir reports the fixed simulated temp directory while a run is

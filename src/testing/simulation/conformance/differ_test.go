@@ -23,6 +23,7 @@ import (
 func fullAllowlist() []allowEntry {
 	var all []allowEntry
 	all = append(all, fsAllowlist()...)
+	all = append(all, rootAllowlist()...)
 	all = append(all, pipeAllowlist()...)
 	all = append(all, tcpAllowlist()...)
 	return all
@@ -120,6 +121,24 @@ func TestDSTConformanceAllowlistMatchesOnlyRecordedShapes(t *testing.T) {
 			hostMiss: outcome{Err: "PathError(write)/ErrDeadlineExceeded", N: 1124}, // sim LOWER: the forbidden direction
 			simMiss:  outcome{Err: "PathError(write)/ErrDeadlineExceeded", N: 1024},
 		},
+		{
+			name:     "root-chown",
+			key:      "root-chown-fenced",
+			op:       op{name: `root-chown(root 0, "f1")`},
+			hostOK:   outcome{N: -1},
+			simOK:    outcome{Err: "PathError(chownat)/dst-unsupported", N: -1, State: "path=f1"},
+			hostMiss: outcome{N: -1},
+			simMiss:  outcome{Err: "PathError(chown)/dst-unsupported", N: -1, State: "path=f1"},
+		},
+		{
+			name:     "root-symlink",
+			key:      "root-symlink-fenced",
+			op:       op{name: `root-symlink(root 0, "f1", "lnk")`},
+			hostOK:   outcome{N: -1},
+			simOK:    outcome{Err: "LinkError(symlinkat)/dst-unsupported", N: -1, State: "old=f1 new=lnk"},
+			hostMiss: outcome{N: -1},
+			simMiss:  outcome{Err: "LinkError(linkat)/dst-unsupported", N: -1, State: "old=f1 new=lnk"},
+		},
 	}
 	// Host-condition-gated rows skip (not fail) where their entry is
 	// inapplicable: the umask fixture assumes 022, and the
@@ -203,6 +222,7 @@ func TestDSTConformanceErrClassIdentity(t *testing.T) {
 		{nil, ""},
 		{io.EOF, "EOF"},
 		{&fs.PathError{Op: "open", Path: "/x", Err: syscall.ENOENT}, "PathError(open)/errno:ENOENT"},
+		{&fs.PathError{Op: "openat", Path: "../x", Err: errors.New("path escapes from parent")}, "PathError(openat)/ErrPathEscapes"},
 		{&fs.PathError{Op: "read", Path: "/x", Err: os.ErrClosed}, "PathError(read)/ErrClosed:file"},
 		{&fs.PathError{Op: "write", Path: "/x", Err: os.ErrDeadlineExceeded}, "PathError(write)/ErrDeadlineExceeded"},
 		{&os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.ENOTDIR}, "LinkError(rename)/errno:ENOTDIR"},
@@ -250,6 +270,9 @@ func TestDSTConformanceGeneratorDeterminism(t *testing.T) {
 		if a, b := opNames(genFSOps(seed, 200)), opNames(genFSOps(seed, 200)); !slices.Equal(a, b) {
 			t.Errorf("fs generator diverged from itself at seed %d", seed)
 		}
+		if a, b := opNames(genRootOps(seed, 200)), opNames(genRootOps(seed, 200)); !slices.Equal(a, b) {
+			t.Errorf("root generator diverged from itself at seed %d", seed)
+		}
 		if a, b := opNames(genPipeOps(seed, 120)), opNames(genPipeOps(seed, 120)); !slices.Equal(a, b) {
 			t.Errorf("pipe generator diverged from itself at seed %d", seed)
 		}
@@ -262,6 +285,9 @@ func TestDSTConformanceGeneratorDeterminism(t *testing.T) {
 	if slices.Equal(opNames(genFSOps(1, 200)), opNames(genFSOps(2, 200))) {
 		t.Error("fs generator emitted identical sequences for different seeds")
 	}
+	if slices.Equal(opNames(genRootOps(1, 200)), opNames(genRootOps(2, 200))) {
+		t.Error("root generator emitted identical sequences for different seeds")
+	}
 }
 
 // The sim leg must be same-seed stable: two runs of the same sequence
@@ -272,6 +298,10 @@ func TestDSTConformanceSimSameSeedStable(t *testing.T) {
 	fsOps := genFSOps(seed, 150)
 	if a, b := runOpsSim(t, seed, fsOps), runOpsSim(t, seed, fsOps); !slices.Equal(a, b) {
 		t.Error("fs sim leg transcript differs across same-seed runs")
+	}
+	rootOps := genRootOps(seed, 150)
+	if a, b := runOpsSim(t, seed, rootOps), runOpsSim(t, seed, rootOps); !slices.Equal(a, b) {
+		t.Error("root sim leg transcript differs across same-seed runs")
 	}
 	pipeOps := genPipeOps(seed, 100)
 	if a, b := runOpsSim(t, seed, pipeOps), runOpsSim(t, seed, pipeOps); !slices.Equal(a, b) {

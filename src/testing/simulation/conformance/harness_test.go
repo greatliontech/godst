@@ -81,18 +81,22 @@ func errClass(err error) string {
 		return ""
 	}
 	prefix := ""
+	inner := err
 	var oe *net.OpError
 	var le *os.LinkError
 	var pe *fs.PathError
 	switch {
 	case errors.As(err, &oe):
 		prefix = "OpError(" + oe.Op + ")/"
+		inner = oe.Err
 	case errors.As(err, &le):
 		prefix = "LinkError(" + le.Op + ")/"
+		inner = le.Err
 	case errors.As(err, &pe):
 		prefix = "PathError(" + pe.Op + ")/"
+		inner = pe.Err
 	}
-	return prefix + baseErrClass(err)
+	return prefix + baseErrClass(inner)
 }
 
 func baseErrClass(err error) string {
@@ -123,7 +127,14 @@ func baseErrClass(err error) string {
 		}
 		return "errno:#" + strconv.Itoa(int(errno))
 	}
-	// Recorded exception: the DST fence shapes carry no exported sentinel.
+	// Recorded exceptions: os's errPathEscapes and the DST fence shapes carry
+	// no exported sentinel.
+	if err.Error() == "path escapes from parent" {
+		return "ErrPathEscapes"
+	}
+	if u := errors.Unwrap(err); u != nil && u.Error() == "path escapes from parent" {
+		return "ErrPathEscapes"
+	}
 	if strings.Contains(err.Error(), "unsupported under deterministic simulation") {
 		return "dst-unsupported"
 	}
@@ -181,6 +192,7 @@ type world struct {
 	root  string
 	sim   bool // the simulated leg (fd-free settle; the host leg polls real fds)
 	files []*os.File
+	roots []*os.Root
 	lns   []net.Listener
 	conns []net.Conn
 }
@@ -196,6 +208,11 @@ func (w *world) close() {
 	for _, f := range w.files {
 		if f != nil {
 			f.Close()
+		}
+	}
+	for _, r := range w.roots {
+		if r != nil {
+			r.Close()
 		}
 	}
 	for _, c := range w.conns {
