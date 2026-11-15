@@ -86,8 +86,11 @@ func TestAPISurfaceUniformOutsideRun(t *testing.T) {
 		{"HealLink", func() { HealLink("a", "b") }},
 		{"IsolateHost", func() { IsolateHost("h") }},
 		{"UnisolateHost", func() { UnisolateHost("h") }},
-		{"ResetLink", func() { ResetLink("a", "b") }},
-		{"ResetProcess", func() { ResetProcess("h", "p") }},
+		{"ConfigureLink", func() { ConfigureLink("a", "b", LinkConfig{Latency: time.Millisecond, Jitter: time.Millisecond, Bandwidth: 1024}) }},
+		{"ConfigureLinkOneWay", func() { ConfigureLinkOneWay("a", "b", LinkConfig{Latency: time.Millisecond}) }},
+		{"UnconfigureLink", func() { UnconfigureLink("a", "b") }},
+		{"ResetLinkConns", func() { ResetLinkConns("a", "b") }},
+		{"ResetProcessConns", func() { ResetProcessConns("h", "p") }},
 		{"SlowDisk", func() { SlowDisk("h", time.Millisecond) }},
 		{"UnslowDisk", func() { UnslowDisk("h") }},
 		{"StepClock", func() { StepClock("h", time.Second) }},
@@ -110,5 +113,23 @@ func TestAPISurfaceUniformOutsideRun(t *testing.T) {
 	rr.Err = errors.New(f.Err)
 	if !rr.Failed() {
 		t.Errorf("ReplayResult{Err: non-nil}.Failed() = false, want true")
+	}
+
+	// 4. Invalid LinkConfig arguments panic uniformly across both !dst and -tags dst
+	// builds even outside an active run, matching DriftClock's range check.
+	for _, tc := range []struct {
+		name string
+		call func()
+		want string
+	}{
+		{"ConfigureLink/neg-lat", func() { ConfigureLink("a", "b", LinkConfig{Latency: -1}) }, "LinkConfig.Latency must be non-negative"},
+		{"ConfigureLink/neg-jit", func() { ConfigureLink("a", "b", LinkConfig{Jitter: -1}) }, "LinkConfig.Jitter must be non-negative"},
+		{"ConfigureLink/neg-bw", func() { ConfigureLink("a", "b", LinkConfig{Bandwidth: -1}) }, "LinkConfig.Bandwidth must be non-negative"},
+		{"ConfigureLinkOneWay/neg-lat", func() { ConfigureLinkOneWay("a", "b", LinkConfig{Latency: -1}) }, "LinkConfig.Latency must be non-negative"},
+	} {
+		panicked, msg := didPanicWith(tc.call)
+		if !panicked || !strings.Contains(msg, tc.want) {
+			t.Errorf("%s outside run: panicked=%v msg=%q, want containing %q", tc.name, panicked, msg, tc.want)
+		}
 	}
 }

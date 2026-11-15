@@ -1138,7 +1138,7 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	var n int
 	var got [8]byte
 	var firstErr, secondErr error
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 100 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		written := make(chan struct{})
 		delivered := make(chan struct{})
@@ -1219,7 +1219,7 @@ func TestDSTCrashHostSparesAppClosedConns(t *testing.T) {
 	var n int
 	var firstErr, secondErr error
 	var got [8]byte
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 100 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		closed := make(chan struct{})
 		dialed := make(chan struct{})
@@ -1361,7 +1361,7 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 	var n int
 	var readErr error
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 100 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		written := make(chan struct{})
 		crashed := make(chan struct{})
@@ -1542,7 +1542,7 @@ func TestDSTCrashHostRebootProcessRestart(t *testing.T) {
 func TestDSTCrashHostMidHandshakeDialTimesOut(t *testing.T) {
 	var dialErr error
 	var elapsed time.Duration
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 50 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		Host("victim", func() {
 			go Process("server", func() {

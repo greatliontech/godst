@@ -228,7 +228,7 @@ func TestDSTNetConcurrentReadersInFlightTail(t *testing.T) {
 	got := make([]string, 2)
 	// 800 bytes/sec => a 4-byte segment occupies the link 5ms; two back-to-back 4-byte
 	// writes deliver at +5ms and +10ms from one ping.
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostBandwidth: 800}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Bandwidth: 800}}}
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})

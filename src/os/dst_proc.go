@@ -195,7 +195,7 @@ func dstProcStatDataAbs(abs string) (data []byte, ident, base string, handled bo
 	// The identity uses the canonical pid form scoped to (epoch, host, boot,
 	// slot, start), so /proc/self/stat and /proc/<own-pid>/stat are one file to
 	// SameFile within one task incarnation while distinct runs, machines,
-	// reboots, and reused pids (Options.PidMax, even within one 10ms USER_HZ
+	// reboots, and reused pids (Options.PIDMax, even within one 10ms USER_HZ
 	// tick) never share a procfs inode.
 	ident = "/proc/" + strconv.Itoa(pid) + "/stat#e" + strconv.FormatUint(dstFSEpoch(), 10) + "#h" + strconv.Itoa(int(host)) + "#b" + strconv.FormatUint(boot, 10) + "#s" + strconv.Itoa(int(slot)) + "#t" + strconv.FormatUint(start, 10)
 	return []byte(dstProcStatContents(pid, start)), ident, "stat", true, nil

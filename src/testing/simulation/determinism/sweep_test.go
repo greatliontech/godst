@@ -31,7 +31,7 @@ import (
 // computed and the order in which its goroutines emitted them, with virtual
 // timestamps — the full decision-relevant record one string can pin.
 func sweepProgram(seed uint64) string {
-	return sweepProgramWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}})
+	return sweepProgramWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 50 * time.Millisecond}}})
 }
 
 // sweepProgramWith is sweepProgram under caller-chosen run options (the
@@ -200,7 +200,7 @@ func TestSameSeedCrossRunTranscript(t *testing.T) {
 // disabled. Mutation: any detector arm that draws from a seeded stream or
 // perturbs a decision diverges the transcripts.
 func TestWedgeDetectorObservationNeutral(t *testing.T) {
-	net := simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}
+	net := simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 50 * time.Millisecond}}
 	for seed := uint64(0); seed < 8; seed++ {
 		armed := sweepProgram(seed) // default options: both arms armed at their default bounds
 		off := sweepProgramWith(seed, simulation.Options{Network: net, WedgeDecisionLimit: -1, WedgeWallLimit: -1})

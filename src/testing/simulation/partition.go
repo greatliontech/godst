@@ -40,6 +40,13 @@ const (
 	partOpCrashProcConns
 )
 
+// Link-policy op codes — must match net's dst_partition.go.
+const (
+	linkOpSetBoth uint32 = iota + 1
+	linkOpSetOneWay
+	linkOpClearBoth
+)
+
 // Partition cuts the network link between hosts a and b (symmetric). Connections
 // between them — in either direction — are blackholed and new dials across the cut
 // block, until HealLink(a, b) (or UnisolateHost on either) restores the link. Like every
@@ -89,23 +96,65 @@ func PartitionRefuse(a, b string) {
 	withBubbleFaultCaller("PartitionRefuse", func() { dstNetPartitionOp(partOpPartitionRefuse, lookupHost(a), lookupHost(b)) })
 }
 
-// ResetLink injects ECONNRESET on every active connection between hosts a and b (in
+// ConfigureLink installs cfg symmetrically on both directions (a→b and b→a)
+// between hosts a and b, overriding Options.Network.CrossHost for that pair.
+// Within cfg, 0 means 0 delay, 0 jitter, or unlimited bandwidth on those
+// directions (enabling fast intra-AZ links inside a slow WAN baseline as well
+// as slow links inside a fast baseline). Overrides take effect dynamically on
+// both new Dial handshakes and subsequent outbound segments (Write, CloseWrite,
+// graceful Close FIN) on already-established connections, and survive both
+// HealLink and CrashHost until cleared by UnconfigureLink or run end.
+// Same-host pairs (a == b) validate host names and cfg bounds while remaining
+// instant and unthrottled. Negative fields or Latency+(Jitter-1) overflow
+// panic before mutating state; outside a run, valid calls are no-ops.
+func ConfigureLink(a, b string, cfg LinkConfig) {
+	withBubbleFaultCaller("ConfigureLink", func() {
+		lat, jit, bw := validateLinkConfig("ConfigureLink", cfg)
+		ha, hb := lookupHost(a), lookupHost(b)
+		dstNetLinkConfigOp(linkOpSetBoth, ha, hb, lat, jit, bw)
+	})
+}
+
+// ConfigureLinkOneWay installs cfg only on the directed link from→to, leaving
+// the reverse direction to→from untouched. UnconfigureLink(from, to) clears
+// overrides in both directions. Same validation, dynamic application, and
+// outside-run rules as ConfigureLink.
+func ConfigureLinkOneWay(from, to string, cfg LinkConfig) {
+	withBubbleFaultCaller("ConfigureLinkOneWay", func() {
+		lat, jit, bw := validateLinkConfig("ConfigureLinkOneWay", cfg)
+		hf, ht := lookupHost(from), lookupHost(to)
+		dstNetLinkConfigOp(linkOpSetOneWay, hf, ht, lat, jit, bw)
+	})
+}
+
+// UnconfigureLink removes any per-link LinkConfig overrides in both directions
+// between hosts a and b so both a→b and b→a revert to Options.Network.CrossHost.
+// Same host-validation and outside-run rules as Partition.
+func UnconfigureLink(a, b string) {
+	withBubbleFaultCaller("UnconfigureLink", func() {
+		ha, hb := lookupHost(a), lookupHost(b)
+		dstNetLinkConfigOp(linkOpClearBoth, ha, hb, 0, 0, 0)
+	})
+}
+
+// ResetLinkConns injects ECONNRESET on every active connection between hosts a and b (in
 // either direction), modeling a transient that tears those flows down — a real RST
 // from a middlebox. Both ends survive and receive the RST as a real kernel would:
 // each drains the bytes already delivered to its receive queue, then reads fail
 // ECONNRESET and writes fail immediately; in-flight buffered bytes are dropped.
-func ResetLink(a, b string) {
-	withBubbleFaultCaller("ResetLink", func() { dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b)) })
+// Per-link LinkConfig overrides are unaffected (use UnconfigureLink to clear link policy).
+func ResetLinkConns(a, b string) {
+	withBubbleFaultCaller("ResetLinkConns", func() { dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b)) })
 }
 
-// ResetProcess injects ECONNRESET on every active connection owned by any live
+// ResetProcessConns injects ECONNRESET on every active connection owned by any live
 // invocation of process proc on host (pass host == "" for a process declared on
 // the unnamed root host) — modeling that process's sockets being torn down as a
 // lighter-weight precursor to CrashProcess. The process itself stays alive, so
 // every end — its own included — drains its delivered bytes before failing
 // ECONNRESET; in-flight bytes are dropped.
-func ResetProcess(host, proc string) {
-	withBubbleFaultCaller("ResetProcess", func() {
+func ResetProcessConns(host, proc string) {
+	withBubbleFaultCaller("ResetProcessConns", func() {
 		var hid uint32
 		if host != "" {
 			hid = lookupHost(host)

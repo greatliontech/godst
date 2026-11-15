@@ -149,7 +149,7 @@ func TestDSTNetBacklogParkPartitionHealCompletes(t *testing.T) {
 func synackPartition(t *testing.T, cut func(), heal func()) (dialErr error, heldDuringCut bool) {
 	t.Helper()
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  100 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 100 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	simulation.RunWith(1, opts, func() {
@@ -297,7 +297,7 @@ func TestDSTNetSYNACKHealObservesReset(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  100 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 100 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	var dialErr error
@@ -340,7 +340,7 @@ func TestDSTNetSYNACKHealObservesReset(t *testing.T) {
 			// No yield between the three ops: the unrelated wake commits the
 			// parked select, then the reset and heal land before the dial runs.
 			simulation.Partition("x", "y")
-			simulation.ResetLink("srv", "cli")
+			simulation.ResetLinkConns("srv", "cli")
 			simulation.HealLink("srv", "cli")
 			select {
 			case dialErr = <-res:

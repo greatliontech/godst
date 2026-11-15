@@ -214,7 +214,7 @@ func TestDSTNetProtocolsDeterministicBuiltInAndBubbleIsolated(t *testing.T) {
 
 func TestDSTNetDialRedialPreservesSockFDAndOpts(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  50 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 50 * time.Millisecond},
 		RetransmitTimeout: 2 * time.Second,
 	}}
 	simulation.RunWith(1, opts, func() {
@@ -335,7 +335,7 @@ func TestDSTNetDialRedialPreservesSockFDAndOpts(t *testing.T) {
 func TestDSTNetListenerCloseBlackholeExploreDPOR(t *testing.T) {
 	netOpts := simulation.Options{
 		Network: simulation.NetworkConfig{
-			CrossHostLatency:  5 * time.Millisecond,
+			CrossHost:         simulation.LinkConfig{Latency: 5 * time.Millisecond},
 			RetransmitTimeout: 200 * time.Millisecond,
 		},
 	}

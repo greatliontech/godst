@@ -328,7 +328,7 @@ func TestDSTCrashProcessSurvivorDrainsDeliveredBytes(t *testing.T) {
 	var n int
 	var got [8]byte
 	var firstErr, secondErr error
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 10 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		delivered := make(chan struct{})
 		written := make(chan struct{})
@@ -401,7 +401,7 @@ func TestDSTCrashProcessSparesAppClosedConns(t *testing.T) {
 	var n int
 	var got [8]byte
 	var firstErr, secondErr error
-	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func(t *testing.T) {
+	TestWith(t, 1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 10 * time.Millisecond}}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		dialed := make(chan struct{})
 		closed := make(chan struct{})

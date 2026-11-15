@@ -152,7 +152,7 @@ publishes them to the bubble, and cleared on return).
 
 Four values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), `NumCPU` (default `8`,
 reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
-real concurrency for the schedule to explore), and `PIDMax` (**pending** initialism rename from `PidMax`; default unbounded). A positive
+real concurrency for the schedule to explore), and `PIDMax` (default unbounded). A positive
 `Options.NumCPU` or `HostConfig.NumCPU` is
 reported exactly; a non-positive value selects the applicable default. The positive range is the target
 architecture's `int` range. A custom positive `PID` must fit in the OS pid field
@@ -194,7 +194,7 @@ The simulated filesystem also owns the procfs identity surface needed for pid-li
 recorded at `Process` admission from the host's uptime clock — coherent with `CLOCK_BOOTTIME` reads,
 reset in meaning by a reboot (a post-reboot process has a small starttime again, the same cross-boot
 collision hazard a real machine has, which the boot-epoch discriminator exists to catch), and carried
-per-incarnation, so a REUSED pid (`Options.PIDMax` — **pending** rename from `PidMax` — or reboot) serves its new process's starttime — the
+per-incarnation, so a REUSED pid (`Options.PIDMax` or reboot) serves its new process's starttime — the
 pid-reuse discriminator clients parse `/proc` for. Two processes started within one 10 ms tick share
 a starttime, the host's own resolution caveat. Completed, unknown, cross-host, pre-reboot, cross-namespace, host, or
 unrepresentable pids are
@@ -386,9 +386,9 @@ no-declared-host connect timeout land with a follow-on (both marked below). The 
 models a TCP socket pair, not a message queue:
 
 Network delay configuration (`LinkConfig{Latency, Jitter, Bandwidth}` on both run-level
-`Options.Network.CrossHost` and dynamic per-link `ConfigureLink` / `ConfigureLinkOneWay`, **pending**
-unification from flat `CrossHost*` fields; see [faults.md](./faults.md)) is validated before publishing
-or mutating state: `0` disables latency, jitter, or bandwidth on that policy, while negative `Latency`,
+`Options.Network.CrossHost` and dynamic per-link `ConfigureLink` / `ConfigureLinkOneWay`; see
+[faults.md](./faults.md)) is validated before publishing
+or mutating state (`TestDSTLinkConfigValidationStateNeutral`): `0` disables latency, jitter, or bandwidth on that policy, while negative `Latency`,
 `Jitter`, or `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` cannot fit in `time.Duration`,
 panics state-neutrally (`UnconfigureLink` restores the `Options.Network.CrossHost` baseline). Runtime
 delay arithmetic that also depends on
@@ -568,7 +568,7 @@ it never wraps a positive delay into an earlier delivery.
   `TestDSTNetUnownedAddressLateDeclaration`).
 - **Peer close FIN read semantics — landed; post-FIN write/reset semantics pending.** Reads after a peer's
   graceful close drain buffered data, then `io.EOF` (landed). FIN is a delayed control event: its
-  arrival starts at `max(now, linkFreeAt)` without advancing `linkFreeAt` (**pending** dynamic link horizon alignment) and pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
+  arrival starts at `max(now, linkFreeAt)` without advancing `linkFreeAt` (`TestDSTNetLinkConfigMidStreamFIFOUnthrottleAndFINHorizon`) and pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
   read deadline fires first; partitions hold a not-yet-arrived FIN like data. The intended write side: the **first
   write after the peer's full close succeeds locally** (the FIN closed the peer's send direction; the
   write is accepted into the send buffer and elicits the peer's RST); the reset then errors
@@ -2244,10 +2244,10 @@ table); the open work is the OOM and scheduling faults and the declarative orche
   host, memory isolated at the process). **Contract settled** in [faults.md](./faults.md) (every axis +
   the shared contract designed up front, so no axis forecloses
   another); implementation is **bottoms-up** — the Host/Process substrate first, faults last (see "Build
-  order"). The net, disk, clock, **process-crash/restart**, **host-crash/reboot**, and **crash-tear**
-  axes are landed and replay-exact; per-link `LinkConfig` (`ConfigureLink` / `ConfigureLinkOneWay` /
-  `UnconfigureLink`), inline `Sometimes` fault-point activation, and the failure-only causal event
-  timeline are specified and **pending**; what remains beyond those is the OOM (allocation-triggered)
+  order"). The net (including dynamic per-link `LinkConfig` via `ConfigureLink` / `ConfigureLinkOneWay` /
+  `UnconfigureLink`), disk, clock, **process-crash/restart**, **host-crash/reboot**, and **crash-tear**
+  axes are landed and replay-exact; inline `Sometimes` fault-point activation and the failure-only causal
+  event timeline are specified and **pending**; what remains beyond those is the OOM (allocation-triggered)
   and scheduling (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a
   seeded `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
 Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →

@@ -1153,7 +1153,7 @@ func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}
 	var n int
 	var buf [8]byte
 	var firstErr, secondErr error
@@ -1204,7 +1204,7 @@ func TestDSTNetCloseAfterDrainingFINs(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}
 	var n int
 	var firstErr, secondErr error
 	var buf [8]byte
@@ -1260,7 +1260,7 @@ func TestDSTNetCloseBeforeDeliveryStillResets(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}
 	var readErr error
 	simulation.RunWith(1, opts, func() {
 		var ln Listener

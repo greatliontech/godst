@@ -714,7 +714,7 @@ func internPIDNS(host uint32, name string) uint32 {
 
 // lookupProc resolves an already-declared process name on host (0 for the
 // unnamed root host) for process-targeting fault APIs (CrashProcess,
-// ResetProcess).
+// ResetProcessConns).
 func lookupProc(host uint32, name string) uint32 {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
@@ -914,7 +914,7 @@ func CrashHost(name string) {
 // Process runs f as the named process — the unit of crash/restart and OS
 // resource isolation. A Process declared inside a Host/HostWith body runs on
 // that host; a Process outside any Host runs on the unnamed root host (host 0,
-// addressed as host == "" in CrashProcess and ResetProcess) without creating an
+// addressed as host == "" in CrashProcess and ResetProcessConns) without creating an
 // implicit machine. Process names are scoped per host, so multiple hosts may
 // concurrently run processes with the same name (e.g. Process("server", ...)).
 // Each invocation receives a fresh per-process pid (os.Getpid) and a fresh

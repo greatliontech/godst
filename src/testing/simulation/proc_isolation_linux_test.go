@@ -35,7 +35,7 @@ func registerUnreachableCleanup(ran *atomic.Bool) {
 
 func TestDSTCrossHostAndRebootPIDProcfsAndNamespaceIsolation(t *testing.T) {
 	var h1CleanupRan, h2CleanupRan atomic.Bool
-	RunWith(1, Options{PidMax: 6}, func() {
+	RunWith(1, Options{PIDMax: 6}, func() {
 		var h1Pid2, h1Pid4, h2Pid2 int
 		var h1NS, h2NS string
 		var h1PreStat os.FileInfo
@@ -549,7 +549,7 @@ func TestDSTPublicAPISurfaceEndToEnd(t *testing.T) {
 			PID:      9,
 			NumCPU:   2,
 			Network: NetworkConfig{
-				CrossHostLatency: 25 * time.Millisecond,
+				CrossHost: LinkConfig{Latency: 25 * time.Millisecond},
 			},
 		},
 	}
@@ -561,7 +561,7 @@ func TestDSTPublicAPISurfaceEndToEnd(t *testing.T) {
 	if f.Err != "intentional sut failure" {
 		t.Fatalf("Failure.Err = %q, want %q", f.Err, "intentional sut failure")
 	}
-	if f.Options.Network.CrossHostLatency != 25*time.Millisecond || f.Options.Hostname != "explore-root" {
+	if f.Options.Network.CrossHost.Latency != 25*time.Millisecond || f.Options.Hostname != "explore-root" {
 		t.Fatalf("Failure.Options not recorded: %+v", f.Options)
 	}
 	rep := Replay(7, f, sut)
@@ -571,7 +571,7 @@ func TestDSTPublicAPISurfaceEndToEnd(t *testing.T) {
 }
 
 func TestDSTSameBootPidMaxReuseDistinctProcStatSameFile(t *testing.T) {
-	opts := Options{PID: 1, PidMax: 2}
+	opts := Options{PID: 1, PIDMax: 2}
 	var run1Stat os.FileInfo
 
 	RunWith(1, opts, func() {
@@ -597,10 +597,10 @@ func TestDSTSameBootPidMaxReuseDistinctProcStatSameFile(t *testing.T) {
 			})
 
 			// Second incarnation on the SAME (h1, boot 1) within the SAME 10ms USER_HZ tick
-			// (virtual t=0, starttime 0): reuses pid 2 under PidMax=2, must NOT SameFile-alias p1.
+			// (virtual t=0, starttime 0): reuses pid 2 under PIDMax=2, must NOT SameFile-alias p1.
 			Process("p2", func() {
 				if pid := os.Getpid(); pid != 2 {
-					t.Fatalf("p2 pid = %d, want 2 (reused under PidMax=2)", pid)
+					t.Fatalf("p2 pid = %d, want 2 (reused under PIDMax=2)", pid)
 				}
 				selfStat, err := os.Stat("/proc/self/stat")
 				if err != nil {

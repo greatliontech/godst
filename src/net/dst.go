@@ -1496,7 +1496,7 @@ func dstAnyListenerConflict(scope, network string, ip IP, keys []string, port in
 // mid-flight is not re-checked, so the connect still completes — the safe direction (the
 // sim succeeds where production might drop the SYN), a narrow race not worth the reload.
 // The same recorded collapse covers fault RESETS: the wire pair registers only after
-// this traversal returns, so a Reset/ResetProcess landing inside the half-RTT matches
+// this traversal returns, so a ResetLinkConns/ResetProcessConns landing inside the half-RTT matches
 // no registered conn and the dial establishes untouched — the injection "missed", an
 // execution ⊆-real (a real RST event can miss a handshake too), never a false failure.
 func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
@@ -1885,16 +1885,13 @@ redial:
 	// unbounded sim-only buffer that masks the bug. The retransmit horizon
 	// value is irrelevant on a same-host wire (never partitioned, so it can
 	// never arm) and is passed uniformly.
-	latency, jitter, bandwidth := int64(0), int64(0), int64(0)
 	capacity, retrans := dstNetSendBufferBytes(), dstNetRetransmitTimeoutNs()
-	if l.host != dialerHost {
-		latency, jitter, bandwidth = dstNetCrossHostLatencyNs(), dstNetCrossHostJitterNs(), dstNetCrossHostBandwidthBps()
-	}
-	// SYN: the first half of the connect round trip travels to the server. A connect
-	// deadline shorter than this traversal fails now, before anything is established —
-	// a zero-RTT connect would instead let a SUT's connect timeout pass under
-	// simulation on a link where it fails in production (unsound).
-	if err := dstConnectSYN(ctx, latency, jitter); err != nil {
+	// SYN: the first half of the connect round trip travels dialerHost→l.host. A
+	// connect deadline shorter than this traversal fails now, before anything is
+	// established — a zero-RTT connect would instead let a SUT's connect timeout
+	// pass under simulation on a link where it fails in production (unsound).
+	synLat, synJit, _ := dstLinkParamsForDir(dialerHost, l.host)
+	if err := dstConnectSYN(ctx, synLat, synJit); err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
 	}
 	// The established connection's socket-option states: the dialer end
@@ -1920,7 +1917,7 @@ redial:
 		if !okServerFD {
 			return
 		}
-		p1, p2 = dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
+		p1, p2 = dstWirePair(capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
 		reset = new(atomic.Bool)
 		resetSync = new(uint64)
 		epoch := dstNetEpoch()
@@ -2089,11 +2086,12 @@ redial:
 				}
 			default:
 			}
-			// SYN-ACK: the acknowledgment travels back before the server child
-			// enters ESTABLISHED and becomes visible to Accept. Context expiry,
-			// listener close, or endpoint teardown before its arrival aborts the
-			// connect and tears down both ends without ever waking Accept.
-			lClosed, err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset, l.done)
+			// SYN-ACK: the acknowledgment travels back l.host→dialerHost before the
+			// server child enters ESTABLISHED and becomes visible to Accept. Context
+			// expiry, listener close, or endpoint teardown before its arrival aborts
+			// the connect and tears down both ends without ever waking Accept.
+			ackLat, ackJit, _ := dstLinkParamsForDir(l.host, dialerHost)
+			lClosed, err := dstConnectSYNACK(ctx, ackLat, ackJit, p1.(*dstWireEnd), reset, l.done)
 			if lClosed && !dstPartitionedDir(l.host, dialerHost) {
 				cleanup()
 				goto refused

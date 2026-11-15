@@ -1887,7 +1887,7 @@ type dstPidKey struct {
 // host for the run; Process pids are live on their owning host for the dynamic
 // extent of their body. Each entry carries the INCARNATION's identity — its
 // owning (host, boot), unique invocation slot, procfs starttime, and pid
-// namespace — so a reused pid (Options.PidMax or host reboot) serves its new
+// namespace — so a reused pid (Options.PIDMax or host reboot) serves its new
 // process's identity, never its predecessor's. The maps are copy-on-write:
 // readers get an immutable snapshot and writers publish a new table.
 type dstPidLiveTable struct {
@@ -1914,7 +1914,7 @@ const (
 	// (design.md, pid namespaces).
 	dstRootPidNS = 1
 	// dstPidWrapFloor is where a bounded allocation wraps to: pid 1 is the
-	// simulated init/ppid, so the allocatable space is [2, PidMax] — the
+	// simulated init/ppid, so the allocatable space is [2, PIDMax] — the
 	// kernel's RESERVED_PIDS floor collapsed to the one reserved identity the
 	// simulation models.
 	dstPidWrapFloor = 2
@@ -1923,9 +1923,9 @@ const (
 	dstUserHZTickNS = 10_000_000
 )
 
-// dstSimPidMax is Options.PidMax: 0 = unbounded monotonic allocation (panic at
+// dstSimPidMax is Options.PIDMax: 0 = unbounded monotonic allocation (panic at
 // pid-field exhaustion), > 0 = kernel pid_max semantics (wrap into
-// [dstPidWrapFloor, PidMax], skip live pids). Set with the rest of the env.
+// [dstPidWrapFloor, PIDMax], skip live pids). Set with the rest of the env.
 var dstSimPidMax atomic.Int32
 
 // Fixed simulated identity returned during a run for the parts testing/simulation
@@ -2190,7 +2190,7 @@ func dstAllocPid() int32 {
 			}
 		}
 	}
-	// Bounded (Options.PidMax): alloc_pid semantics per (host, boot) — scan
+	// Bounded (Options.PIDMax): alloc_pid semantics per (host, boot) — scan
 	// forward from this host boot's last allocation, wrap into
 	// [dstPidWrapFloor, max], skip live pids on this (host, boot) (including
 	// the host's root/init pid dstSimPID). The one caller (Process admission)
@@ -2225,7 +2225,7 @@ func dstAllocPid() int32 {
 	}
 	// Every pid in [dstPidWrapFloor, max] is live on this host: the kernel
 	// answers fork with EAGAIN here; Process has no error return, so fail loud.
-	panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
+	panic("testing/simulation: every pid in [2, PIDMax] is live (the kernel's fork EAGAIN); raise Options.PIDMax or let processes exit")
 }
 
 //go:linkname dstCheckPidAvailable
@@ -2264,7 +2264,7 @@ func dstCheckPidAvailable() {
 	if inRange >= max-dstPidWrapFloor+1 {
 		// Every pid in [dstPidWrapFloor, max] is live on this host: the kernel
 		// answers fork with EAGAIN here; Process has no error return, so fail loud.
-		panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
+		panic("testing/simulation: every pid in [2, PIDMax] is live (the kernel's fork EAGAIN); raise Options.PIDMax or let processes exit")
 	}
 }
 
@@ -3089,10 +3089,11 @@ var dstMemLimit int64
 func dstSetMemLimit(limit int64) { dstMemLimit = limit }
 
 // dstNetCrossHostLatency is the per-run base (always-on) one-way latency in
-// nanoseconds applied to every cross-host simulated TCP connection; 0 (the
+// nanoseconds applied to every cross-host simulated TCP connection unless
+// overridden for a direction via ConfigureLink/ConfigureLinkOneWay; 0 (the
 // default, and same-host/loopback always) means instant delivery — byte-identical
 // to a connection with no latency machinery. Set once before the bubble starts
-// (from Options.Network.CrossHostLatency) and reset to 0 after the run, exactly
+// (from Options.Network.CrossHost.Latency) and reset to 0 after the run, exactly
 // like dstMemLimit, so it is read-only for the run's duration and safe for the
 // simulated network's bubble goroutines to read without synchronization.
 var dstNetCrossHostLatency int64
@@ -3195,6 +3196,30 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32)) { dstNetPartitionHook = fn
 func dstNetPartitionOp(op, a, b uint32) {
 	if dstNetPartitionHook != nil {
 		dstNetPartitionHook(op, a, b)
+	}
+}
+
+// dstNetLinkConfigHook is net's handler for per-link latency/jitter/bandwidth
+// overrides (ConfigureLink / ConfigureLinkOneWay / UnconfigureLink), registered
+// by net at init when built with -tags dst. A nil hook (net not linked) makes
+// the call a no-op.
+var dstNetLinkConfigHook func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)
+
+// dstSetNetLinkConfigHook registers net's link-policy handler. Reached via
+// //go:linkname from net's init.
+//
+//go:linkname dstSetNetLinkConfigHook
+func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)) {
+	dstNetLinkConfigHook = fn
+}
+
+// dstNetLinkConfigOp invokes net's link-policy handler (no-op if net is not linked).
+// Reached via //go:linkname from testing/simulation's link configuration API.
+//
+//go:linkname dstNetLinkConfigOp
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+	if dstNetLinkConfigHook != nil {
+		dstNetLinkConfigHook(op, a, b, latencyNs, jitterNs, bandwidthBps)
 	}
 }
 

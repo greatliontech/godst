@@ -13,7 +13,7 @@ import (
 )
 
 // Connection-reset targeting. The imperative API in testing/simulation
-// (Reset / ResetProcess) drives this through runtime's passthrough into
+// (ResetLinkConns / ResetProcessConns) drives this through runtime's passthrough into
 // dstApplyNetFaultOp, exactly like partition. A reset enumerates the active
 // connections matching the victim — a host-pair (all conns between hosts a and b)
 // or a process (all conns that process owns either end of) — and tears each
@@ -195,8 +195,8 @@ func dstConnDeregister(c *dstConn) {
 }
 
 // dstResetMatching delivers an injected RST to every registered conn end for
-// which match reports true — the ALL-SURVIVORS teardown (Reset host-pair,
-// ResetProcess): no process died, so every matched end is a live kernel
+// which match reports true — the ALL-SURVIVORS teardown (ResetLinkConns,
+// ResetProcessConns): no process died, so every matched end is a live kernel
 // receiving an RST and drains its delivered bytes before failing
 // (dstInjectReset). The victims are collected under the lock and torn down
 // outside it, so the teardown's own deregister does not re-enter the lock.
@@ -496,7 +496,7 @@ func dstResetPair(a, b uint32) {
 }
 
 // dstResetProc injects an RST on every conn that process p owns an end of (as
-// dialer or as the listening/accepting process) — the ResetProcess fault: p is
+// dialer or as the listening/accepting process) — the ResetProcessConns fault: p is
 // ALIVE (only its connections are reset), so every end, p's own included, is a
 // survivor and drains its delivered bytes before failing (dstResetMatching's
 // all-survivors teardown). The crash faults use dstCrashProcConns instead.

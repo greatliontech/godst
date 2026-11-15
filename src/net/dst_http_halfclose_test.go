@@ -18,7 +18,7 @@ import (
 
 func TestDSTNetHTTPEarlyResponseWithUnreadBodyNoRST(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 10 * time.Millisecond,
+		CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond},
 	}}
 	simulation.RunWith(1, opts, func() {
 		addrCh := make(chan string, 1)

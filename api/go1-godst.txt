@@ -12,6 +12,8 @@ pkg testing/simulation, const Random = 0
 pkg testing/simulation, const Random Strategy
 pkg testing/simulation, func BoundedDrift(int64) ClockConfig
 pkg testing/simulation, func BoundedSkew(time.Duration) ClockConfig
+pkg testing/simulation, func ConfigureLink(string, string, LinkConfig)
+pkg testing/simulation, func ConfigureLinkOneWay(string, string, LinkConfig)
 pkg testing/simulation, func CorruptFile(string, string)
 pkg testing/simulation, func CrashHost(string)
 pkg testing/simulation, func CrashProcess(string, string)
@@ -40,8 +42,8 @@ pkg testing/simulation, func PartitionRefuse(string, string)
 pkg testing/simulation, func Process(string, func())
 pkg testing/simulation, func ProcessWith(string, ProcessConfig, func())
 pkg testing/simulation, func Replay(uint64, Failure, func() error) ReplayResult
-pkg testing/simulation, func ResetLink(string, string)
-pkg testing/simulation, func ResetProcess(string, string)
+pkg testing/simulation, func ResetLinkConns(string, string)
+pkg testing/simulation, func ResetProcessConns(string, string)
 pkg testing/simulation, func Run(uint64, func())
 pkg testing/simulation, func RunWith(uint64, Options, func())
 pkg testing/simulation, func Skew(time.Duration) ClockConfig
@@ -50,6 +52,7 @@ pkg testing/simulation, func StartWorld([]HostDecl) *Ctl
 pkg testing/simulation, func StepClock(string, time.Duration)
 pkg testing/simulation, func Test(*testing.T, uint64, func(*testing.T))
 pkg testing/simulation, func TestWith(*testing.T, uint64, Options, func(*testing.T))
+pkg testing/simulation, func UnconfigureLink(string, string)
 pkg testing/simulation, func UnisolateHost(string)
 pkg testing/simulation, func UnlimitDisk(string)
 pkg testing/simulation, func UnslowDisk(string)
@@ -109,10 +112,12 @@ pkg testing/simulation, type HostDecl struct
 pkg testing/simulation, type HostDecl struct, Boot func()
 pkg testing/simulation, type HostDecl struct, Config HostConfig
 pkg testing/simulation, type HostDecl struct, Name string
+pkg testing/simulation, type LinkConfig struct
+pkg testing/simulation, type LinkConfig struct, Bandwidth int64
+pkg testing/simulation, type LinkConfig struct, Jitter time.Duration
+pkg testing/simulation, type LinkConfig struct, Latency time.Duration
 pkg testing/simulation, type NetworkConfig struct
-pkg testing/simulation, type NetworkConfig struct, CrossHostBandwidth int64
-pkg testing/simulation, type NetworkConfig struct, CrossHostJitter time.Duration
-pkg testing/simulation, type NetworkConfig struct, CrossHostLatency time.Duration
+pkg testing/simulation, type NetworkConfig struct, CrossHost LinkConfig
 pkg testing/simulation, type NetworkConfig struct, RetransmitTimeout time.Duration
 pkg testing/simulation, type NetworkConfig struct, SendBuffer int
 pkg testing/simulation, type Options struct
@@ -123,7 +128,7 @@ pkg testing/simulation, type Options struct, MemoryLimit int64
 pkg testing/simulation, type Options struct, Network NetworkConfig
 pkg testing/simulation, type Options struct, NumCPU int
 pkg testing/simulation, type Options struct, PID int
-pkg testing/simulation, type Options struct, PidMax int
+pkg testing/simulation, type Options struct, PIDMax int
 pkg testing/simulation, type Options struct, Steps int
 pkg testing/simulation, type Options struct, Strategy Strategy
 pkg testing/simulation, type Options struct, WedgeDecisionLimit int64

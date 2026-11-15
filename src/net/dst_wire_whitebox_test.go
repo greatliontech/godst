@@ -240,7 +240,7 @@ func TestDSTWireWriteConcurrentInjectRSTLeafLock(t *testing.T) {
 	// 1. Direct leaf-lock check: holding e.out.mu and checking writeAbortedOutLocked
 	// after injectRST or horizonDie must never re-enter e.out.mu or nest e.in.mu.
 	for _, useHorizon := range []bool{false, true} {
-		aConn, bConn := dstWirePair(0, 0, 0, 0, 0, 1, 2, nil, nil)
+		aConn, bConn := dstWirePair(0, 0, 1, 2, nil, nil)
 		a := aConn.(*dstWireEnd)
 		if useHorizon {
 			a.horizonDie()
@@ -262,7 +262,7 @@ func TestDSTWireWriteConcurrentInjectRSTLeafLock(t *testing.T) {
 	// the outside-lock copy window must never self-deadlock on e.out.mu.
 	bigBuf := make([]byte, 2<<20)
 	for iter := range 64 {
-		aConn, bConn := dstWirePair(0, 0, 0, 0, 0, 1, 2, nil, nil)
+		aConn, bConn := dstWirePair(0, 0, 1, 2, nil, nil)
 		a := aConn.(*dstWireEnd)
 		var wg sync.WaitGroup
 		wg.Add(2)

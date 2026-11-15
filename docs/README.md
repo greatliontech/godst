@@ -159,8 +159,10 @@ func TestClusterPartitionAndReboot(t *testing.T) {
 	opts := simulation.Options{
 		CrashTear: true,
 		Network: simulation.NetworkConfig{
-			CrossHostLatency: 5 * time.Millisecond,
-			CrossHostJitter:  2 * time.Millisecond,
+			CrossHost: simulation.LinkConfig{
+				Latency: 5 * time.Millisecond,
+				Jitter:  2 * time.Millisecond,
+			},
 		},
 	}
 
@@ -275,7 +277,7 @@ func TestReplayQueueRegression(t *testing.T) {
 `testing/simulation` deliberately exposes no custom `Advance(d)` or `Tick()` API because Go's standard `time.Sleep(d)` and `testing/synctest.Wait()` already drive the virtual clock directly inside every simulation bubble:
 
 1. **`0ns` CPU execution rule:** All non-blocking Go statements execute in **`0ns` of virtual time**. The virtual clock advances *only* at **durable quiescence** — when every live goroutine in the simulation bubble is durably parked (waiting on channels, `select`, timers/tickers, in-bubble `sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once`, simulated TCP/pipe I/O, `SlowDisk`, or simulated `futex`). Consequently, calling `IsolateHost("n1")` immediately followed by `UnisolateHost("n1")` with no blocking wait in between toggles and clears the fault at the exact same virtual nanosecond before any timer or peer wakes.
-2. **Advancing cluster virtual time (`time.Sleep(d)`):** Calling `time.Sleep(d)` (or waiting on a deadline-bearing operation such as `net.DialTimeout` or `context.WithTimeout`) from your root driver script parks the driver for `d` of universe base virtual time. As soon as runnable work settles, the runtime steps the virtual clock **chronologically** through every intermediate deadline in `[now, now + d]` — firing Raft heartbeat/election tickers, delivering in-flight TCP segments (`CrossHostLatency` + jitter + bandwidth), expiring retransmit/keepalive horizons, and completing `SlowDisk` operations in exact causal timestamp order, all in microseconds of real wall-clock time:
+2. **Advancing cluster virtual time (`time.Sleep(d)`):** Calling `time.Sleep(d)` (or waiting on a deadline-bearing operation such as `net.DialTimeout` or `context.WithTimeout`) from your root driver script parks the driver for `d` of universe base virtual time. As soon as runnable work settles, the runtime steps the virtual clock **chronologically** through every intermediate deadline in `[now, now + d]` — firing Raft heartbeat/election tickers, delivering in-flight TCP segments (`NetworkConfig.CrossHost` / `ConfigureLink` latency + jitter + bandwidth), expiring retransmit/keepalive horizons, and completing `SlowDisk` operations in exact causal timestamp order, all in microseconds of real wall-clock time:
    ```go
    simulation.IsolateHost("n1")
    time.Sleep(3 * time.Second) // 3s of cluster timers, RPC retries, & elections run chronologically
@@ -327,7 +329,7 @@ type Options struct {
 	Steps              int           // PCT step horizon; <= 0 selects default 1000
 	Hostname           string        // Root-host os.Hostname(); "" selects default "sim"
 	PID                int           // Root-host init/driver os.Getpid(); <= 0 selects default 1
-	PidMax             int           // Per-(host, boot) kernel pid_max wrap bound; 0 = unbounded monotonic
+	PIDMax             int           // Per-(host, boot) kernel pid_max wrap bound; 0 = unbounded monotonic
 	NumCPU             int           // Default runtime.NumCPU() for hosts; <= 0 selects default 8
 	MemoryLimit        int64         // Bubble-local heap growth soft GC trigger in bytes; 0 = GOGC default
 	Network            NetworkConfig // Simulated TCP latency, jitter, bandwidth, buffer, and timeout policy
@@ -340,23 +342,28 @@ type Options struct {
 Key `Options` details:
 
 - **Fixed deterministic OS identity:** Inside a bubble, `os.Getppid()` is `1`, `os.Getuid()`/`Geteuid()`/`Getgid()`/`Getegid()` are `7777`, `os.Getgroups()` is `[7777]`, and `os/user.Current()` reports user `"sim"` (`uid=7777`, `gid=7777`, `HomeDir="/home/sim"`). Non-bubble goroutines in the same test binary continue to observe real host identity.
-- **`PidMax`:** When `0` (default), each `(host, boot)` allocates PIDs monotonically starting at `PID + 1` (`2` by default). When `> 0` (must exceed `PID` and fit `int32`), allocation wraps into `[2, PidMax]` and skips live PIDs on that `(host, boot)`, modeling Linux `alloc_pid` wraparound so `/proc/<pid>/stat` starttime discrimination against PID reuse can be tested deterministically. If every PID in `[2, PidMax]` is simultaneously live on a host, `Process` panics (`fork` `EAGAIN` equivalent).
+- **`PIDMax`:** When `0` (default), each `(host, boot)` allocates PIDs monotonically starting at `PID + 1` (`2` by default). When `> 0` (must exceed `PID` and fit `int32`), allocation wraps into `[2, PIDMax]` and skips live PIDs on that `(host, boot)`, modeling Linux `alloc_pid` wraparound so `/proc/<pid>/stat` starttime discrimination against PID reuse can be tested deterministically. If every PID in `[2, PIDMax]` is simultaneously live on a host, `Process` panics (`fork` `EAGAIN` equivalent).
 - **Wedge detection:** Virtual time advances only when all live bubble goroutines are durably blocked. `WedgeDecisionLimit` catches busy-spin loops that yield (`for { runtime.Gosched() }`), and `WedgeWallLimit` catches call-free tight loops (`for !done.Load() {}`) that never enter the scheduler. Neither perturbs healthy schedules.
 - **Refused ambient modes:** `GODEBUG=fips140=on|only|debug` and `GOEXPERIMENT=arenas` panic on entry because they bypass deterministic entropy/allocation hooks.
 
-#### `NetworkConfig`
+#### `NetworkConfig` & `LinkConfig`
 
 ```go
+type LinkConfig struct {
+	Latency   time.Duration // One-way base virtual delay (0 = 0ns delay)
+	Jitter    time.Duration // Max extra seeded per-segment delay in [0, Jitter) (0 = disabled; FIFO preserved)
+	Bandwidth int64         // Per-flow per-direction throughput limit in bytes/sec (0 = unlimited)
+}
+
 type NetworkConfig struct {
-	CrossHostLatency   time.Duration // One-way base virtual delay between distinct hosts (default 0; loopback/same-host always 0)
-	CrossHostJitter    time.Duration // Max extra seeded per-segment delay in [0, CrossHostJitter) (default 0; FIFO preserved)
-	CrossHostBandwidth int64         // Per-flow per-direction throughput limit in bytes/sec (default 0 = unlimited)
-	SendBuffer         int           // Per-direction TCP send buffer in bytes (0 = 1 MiB default, < 0 = unbounded)
-	RetransmitTimeout  time.Duration // Retransmission death horizon for cut/unanswered traffic (0 = 2m default, < 0 = disabled)
+	CrossHost         LinkConfig    // Baseline cross-host link policy (default 0s; loopback/same-host always instant)
+	SendBuffer        int           // Per-direction TCP send buffer in bytes (0 = 1 MiB default, < 0 = unbounded)
+	RetransmitTimeout time.Duration // Retransmission death horizon for cut/unanswered traffic (0 = 2m default, < 0 = disabled)
 }
 ```
 
 - Cross-host `net.Dial` pays a full 1-RTT (`SYN` + `SYN-ACK`) before completing, and `Listener.Accept` yields connections only once `ESTABLISHED`.
+- Specific host pairs can override `NetworkConfig.CrossHost` symmetrically or directionally via `ConfigureLink`, `ConfigureLinkOneWay`, and `UnconfigureLink`. Negative `Latency`, `Jitter`, or `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` overflows `time.Duration`, panics state-neutrally before publishing or mutating run state.
 - All link delays are measured in universe **base virtual time**, unaffected by per-host wall-clock skew.
 
 ---
@@ -472,10 +479,10 @@ func (c *Ctl) End()
 
 All fault functions follow two uniform safety rules:
 
-1. **Scheduled bubble caller required:** During an active run, fault functions must be called from a goroutine inside the simulation bubble (the driver script or a simulated goroutine); calling from a foreign background goroutine panics loudly so wall-clock races never sneak into a run. Outside an active run, all fault functions are safe no-ops.
-2. **Loud victim validation:** Passing an undeclared `host` or `proc` name panics immediately so typo'd fault targets never pass tests vacuously. `CrashProcess(host, proc)` additionally panics if `(host, proc)` has no currently live invocation, whereas `ResetProcess(host, proc)` is a valid 0-connection no-op when a previously declared `(host, proc)` has already exited. For both `CrashProcess` and `ResetProcess`, pass `host == ""` to target a `Process` declared on the unnamed root host.
+1. **Scheduled bubble caller required:** During an active run, fault functions must be called from a goroutine inside the simulation bubble (the driver script or a simulated goroutine); calling from a foreign background goroutine panics loudly so wall-clock races never sneak into a run. Outside an active run, all fault functions are safe no-ops (after validating immediate scalar/struct bounds such as `LinkConfig`, `DriftClock`, `LimitDisk`, and `SlowDisk`).
+2. **Loud victim validation:** Passing an undeclared `host` or `proc` name panics immediately so typo'd fault targets never pass tests vacuously. `CrashProcess(host, proc)` additionally panics if `(host, proc)` has no currently live invocation, whereas `ResetProcessConns(host, proc)` is a valid 0-connection no-op when a previously declared `(host, proc)` has already exited. For both `CrashProcess` and `ResetProcessConns`, pass `host == ""` to target a `Process` declared on the unnamed root host.
 
-#### Network Faults
+#### Network Faults & Per-Link Policy
 
 ```go
 func Partition(a, b string)
@@ -486,16 +493,21 @@ func HealLink(a, b string)
 func IsolateHost(host string)
 func UnisolateHost(host string)
 
-func ResetLink(a, b string)
-func ResetProcess(host, proc string)
+func ConfigureLink(a, b string, cfg LinkConfig)
+func ConfigureLinkOneWay(from, to string, cfg LinkConfig)
+func UnconfigureLink(a, b string)
+
+func ResetLinkConns(a, b string)
+func ResetProcessConns(host, proc string)
 ```
 
 - **`Partition(a, b)`**: symmetric blackhole cut between hosts `a` and `b`. New `Dial`s block (until heal, deadline, or `RetransmitTimeout` `ETIMEDOUT`). Established connections still read bytes delivered *before* the cut, while in-flight and post-cut writes buffer up to `SendBuffer` and flush in FIFO order upon `HealLink(a, b)` (unless `RetransmitTimeout` or keepalive kills the socket first).
 - **`PartitionOneWay(from, to)`**: asymmetric blackhole cut dropping `from → to` while `to → from` continues to flow (new handshakes fail in both directions because TCP requires both `SYN` and `SYN-ACK`).
 - **`PartitionRefuse(a, b)`**: symmetric cut where new `Dial`s fail immediately with `syscall.ECONNREFUSED` ("peer down" RST) unless a blackhole/isolation cut also covers the link (blackhole dominates refuse).
-- **`HealLink(a, b)`**: clears `Partition`, `PartitionOneWay`, and `PartitionRefuse` between `a` and `b` (does not clear `IsolateHost`).
+- **`HealLink(a, b)`**: clears `Partition`, `PartitionOneWay`, and `PartitionRefuse` between `a` and `b` (does not clear `IsolateHost` or per-link `ConfigureLink*` policies).
 - **`IsolateHost(host)` / `UnisolateHost(host)`**: cuts / restores blackhole connectivity between `host` and every other host.
-- **`ResetLink(a, b)` / `ResetProcess(host, proc)`**: injects TCP `RST` on every active connection between `a` and `b` (or owned by live invocations of `(host, proc)`), ordered deterministically by connection registration sequence. Already-delivered bytes drain first, followed by one-shot `ECONNRESET` (subsequent reads `io.EOF`, writes `EPIPE`); in-flight bytes are dropped.
+- **`ConfigureLink(a, b, cfg)` / `ConfigureLinkOneWay(from, to, cfg)` / `UnconfigureLink(a, b)`**: installs a symmetric (`a ↔ b`) or directional (`from → to`) `LinkConfig{Latency, Jitter, Bandwidth}` policy overriding `Options.Network.CrossHost`, or removes overrides in both directions so `a ↔ b` reverts to `Options.Network.CrossHost`. A configured `LinkConfig` replaces the directional triple completely (`0` means `0` delay / `0` jitter / unlimited bandwidth, modeling fast intra-AZ links inside a WAN baseline as well as slow WAN or gray-failure links inside a fast baseline). Overrides apply dynamically to new `Dial` handshakes (`SYN` on `dialer → target`, `SYN-ACK` on `target → dialer`) and subsequent outbound `Write` / `CloseWrite` / graceful `Close` FIN segments on established cross-host connections while preserving `DST-NET-FIFO` and `linkFreeAt` serialization; same-host pairs remain instant and unthrottled, and per-link policies survive both `HealLink` and `CrashHost`.
+- **`ResetLinkConns(a, b)` / `ResetProcessConns(host, proc)`**: injects TCP `RST` on every active connection between `a` and `b` (or owned by live invocations of `(host, proc)`), ordered deterministically by connection registration sequence. Already-delivered bytes drain first, followed by one-shot `ECONNRESET` (subsequent reads `io.EOF`, writes `EPIPE`); in-flight bytes are dropped.
 
 #### Crash & Power-Loss Faults
 
@@ -572,7 +584,7 @@ func Replay(seed uint64, failure Failure, sut func() error) ReplayResult
 
 ```go
 type ExploreOptions struct {
-	Options                  // Embedded run configuration (Network, Hostname, PID, PidMax, NumCPU, MemoryLimit, CrashTear, Wedge*)
+	Options                  // Embedded run configuration (Network, Hostname, PID, PIDMax, NumCPU, MemoryLimit, CrashTear, Wedge*)
 	Mode         ExploreMode // Exhaustive (default) or DPOR
 	MaxSchedules int         // Stop after exploring N schedules (0 = unlimited; sets BudgetHit if reached before exhaustion)
 	MaxSteps     int         // Max scheduling decisions per run (0 = default 1<<14; sets BudgetHit if reached)
@@ -581,7 +593,7 @@ type ExploreOptions struct {
 }
 ```
 
-- `ExploreOptions` embeds `Options`, so explored runs and `Failure` tokens carry your exact `NetworkConfig`, `CrashTear`, `PidMax`, `Hostname`, `PID`, `NumCPU`, `MemoryLimit`, and wedge settings into `Replay` (`Strategy`/`Depth`/`Steps` are validated if set, while `Explore` drives scheduling systematically).
+- `ExploreOptions` embeds `Options`, so explored runs and `Failure` tokens carry your exact `NetworkConfig`, `CrashTear`, `PIDMax`, `Hostname`, `PID`, `NumCPU`, `MemoryLimit`, and wedge settings into `Replay` (`Strategy`/`Depth`/`Steps` are validated if set, while `Explore` drives scheduling systematically).
 - **Important:** For `DPOR` over shared-memory and `sync.Mutex` programs, build with **`-tags dst -race`** so compiler memory-access hooks, atomic operations, and mutex happens-before edges are visible to DPOR (running `DPOR` without `-race` sets `ExploreResult.Uninstrumented = true` and downgrades `Exhausted` whenever concurrency/mutex dependencies cannot be observed).
 
 #### `ExploreResult` & `ExploreFootprint`

@@ -20,8 +20,8 @@ import (
 	"time"
 )
 
-// These tests exercise connection-reset targeting (simulation.Reset host-pair,
-// ResetProcess). Invariants:
+// These tests exercise connection-reset targeting (simulation.ResetLinkConns,
+// ResetProcessConns). Invariants:
 //   - a reset delivers ECONNRESET to BOTH ends of every targeted conn;
 //   - each end is a SURVIVOR (no process died) and receives the RST as a real
 //     kernel would: bytes already DELIVERED to its receive queue drain first
@@ -60,7 +60,7 @@ func TestDSTNetResetPair(t *testing.T) {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			time.Sleep(10 * time.Millisecond) // let the server park in Read
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			_, clientErr = c.Read(make([]byte, 16))
 			<-done
 			c.Close()
@@ -83,7 +83,7 @@ func TestDSTNetResetDropsInFlight(t *testing.T) {
 	}
 	var readErr error
 	var gotData bool
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		simulation.Host("A", func() {
@@ -103,7 +103,7 @@ func TestDSTNetResetDropsInFlight(t *testing.T) {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("msg"))         // in flight: deliverable only 100ms later
-			simulation.ResetLink("A", "B") // reset now, before delivery
+			simulation.ResetLinkConns("A", "B") // reset now, before delivery
 			<-done
 			c.Close()
 		})
@@ -128,7 +128,7 @@ func TestDSTNetResetDropsInFlightEvenAfterDelay(t *testing.T) {
 	}
 	var n int
 	var readErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		resetDone := make(chan struct{})
 		done := make(chan struct{})
@@ -148,7 +148,7 @@ func TestDSTNetResetDropsInFlightEvenAfterDelay(t *testing.T) {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("msg"))             // in flight: deliverable only 100ms later
-			simulation.ResetLink("A", "B")     // reset now, before delivery
+			simulation.ResetLinkConns("A", "B")     // reset now, before delivery
 			time.Sleep(200 * time.Millisecond) // let virtual time pass the would-be deliverAt
 			close(resetDone)
 			<-done
@@ -176,7 +176,7 @@ func TestDSTNetResetUnderPartitionDropsHeldBytes(t *testing.T) {
 	var n int
 	var buf [16]byte
 	var firstErr, secondErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		reset := make(chan struct{})
 		done := make(chan struct{})
@@ -205,7 +205,7 @@ func TestDSTNetResetUnderPartitionDropsHeldBytes(t *testing.T) {
 			// kept it out of A's receive queue. The reset must not deliver
 			// it — not even after the link heals (the heal would flush held
 			// bytes on a LIVE conn; this one died under the cut).
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			simulation.HealLink("A", "B")
 			close(reset)
 			<-done
@@ -234,7 +234,7 @@ func TestDSTNetResetDrainsDeliveredThenResets(t *testing.T) {
 	var n int
 	var buf [16]byte
 	var firstErr, secondErr, writeErr, thirdErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		reset := make(chan struct{})
 		done := make(chan struct{})
@@ -258,7 +258,7 @@ func TestDSTNetResetDrainsDeliveredThenResets(t *testing.T) {
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("msg"))
 			time.Sleep(20 * time.Millisecond) // past the link latency: delivered to A's receive queue
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			close(reset)
 			<-done
 			c.Close()
@@ -304,7 +304,7 @@ func TestDSTNetResetWriteFirstConsumesSkErr(t *testing.T) {
 		simulation.Host("B", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			_, firstWriteErr = c.Write([]byte("one"))
 			_, secondWriteErr = c.Write([]byte("two"))
 			_, readErr = c.Read(make([]byte, 8))
@@ -361,7 +361,7 @@ func TestDSTNetResetInCloseWaitIsEPIPE(t *testing.T) {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			<-closed // the FIN has arrived (zero latency): B is in CLOSE_WAIT
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			n, drainErr = c.Read(buf[:])
 			_, readErr = c.Read(make([]byte, 8))
 			_, writeErr = c.Write([]byte("x"))
@@ -396,7 +396,7 @@ func TestDSTNetResetBeatsInFlightFIN(t *testing.T) {
 	}
 	var n int
 	var firstErr, secondErr, writeErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		dialed := make(chan struct{})
 		closed := make(chan struct{})
@@ -425,7 +425,7 @@ func TestDSTNetResetBeatsInFlightFIN(t *testing.T) {
 			}
 			close(dialed)
 			<-closed
-			simulation.ResetLink("A", "B") // the RST beats the traveling byte and FIN
+			simulation.ResetLinkConns("A", "B") // the RST beats the traveling byte and FIN
 			n, firstErr = c.Read(make([]byte, 8))
 			_, secondErr = c.Read(make([]byte, 8))
 			_, writeErr = c.Write([]byte("y"))
@@ -444,7 +444,7 @@ func TestDSTNetResetBeatsInFlightFIN(t *testing.T) {
 	}
 }
 
-// TestDSTNetResetProcessOwnEndDrains: ResetProcess(p) resets p's connections,
+// TestDSTNetResetProcessOwnEndDrains: ResetProcessConns(host, p) resets p's connections,
 // not p itself — p stays alive, so p's OWN end is a survivor too and drains
 // the bytes already delivered to it before failing ECONNRESET.
 func TestDSTNetResetProcessOwnEndDrains(t *testing.T) {
@@ -454,7 +454,7 @@ func TestDSTNetResetProcessOwnEndDrains(t *testing.T) {
 	var n int
 	var buf [16]byte
 	var firstErr, secondErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		simulation.Host("A", func() {
@@ -473,7 +473,7 @@ func TestDSTNetResetProcessOwnEndDrains(t *testing.T) {
 				p := <-port
 				c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 				time.Sleep(20 * time.Millisecond) // the server's "hi" is delivered to the worker's queue
-				simulation.ResetProcess("B", "worker")
+				simulation.ResetProcessConns("B", "worker")
 				n, firstErr = c.Read(buf[:])
 				_, secondErr = c.Read(make([]byte, 16))
 				close(done)
@@ -482,7 +482,7 @@ func TestDSTNetResetProcessOwnEndDrains(t *testing.T) {
 		})
 	})
 	if n != 2 || string(buf[:2]) != "hi" || firstErr != nil {
-		t.Errorf("worker's first read after ResetProcess = (%d, %q, %v), want (2, %q, nil): the live process drains its delivered bytes", n, buf[:n], firstErr, "hi")
+		t.Errorf("worker's first read after ResetProcessConns = (%d, %q, %v), want (2, %q, nil): the live process drains its delivered bytes", n, buf[:n], firstErr, "hi")
 	}
 	if !errors.Is(secondErr, syscall.ECONNRESET) {
 		t.Errorf("worker's second read = %v, want ECONNRESET", secondErr)
@@ -534,7 +534,7 @@ func TestDSTNetResetBacklogBlockedDialFailsPromptly(t *testing.T) {
 				close(blocked)
 			}()
 			time.Sleep(10 * time.Millisecond) // let the dial park
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			<-blocked
 			for _, c := range conns {
 				c.Close()
@@ -583,7 +583,7 @@ func TestDSTNetResetRacingZeroLatencyDial(t *testing.T) {
 					}
 					close(dialDone)
 				}()
-				simulation.ResetLink("A", "B")
+				simulation.ResetLinkConns("A", "B")
 				<-dialDone
 				close(done)
 			})
@@ -657,7 +657,7 @@ func TestDSTNetResetAfterParkedSendCommits(t *testing.T) {
 					close(parked)
 				}()
 				<-accepted // the parked send has been committed by the dequeue
-				simulation.ResetLink("A", "B")
+				simulation.ResetLinkConns("A", "B")
 				<-dialDone
 				for _, c := range conns {
 					c.Close()
@@ -772,7 +772,7 @@ func TestDSTNetResetBacklogAcceptHandsOutResetChild(t *testing.T) {
 				return
 			}
 			time.Sleep(10 * time.Millisecond) // conn sits queued, never accepted
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			close(reset)
 			<-done
 			c.Close()
@@ -802,7 +802,7 @@ func TestDSTNetResetBacklogDrainsPreAcceptBytes(t *testing.T) {
 	var n int
 	var buf [16]byte
 	var acceptErr, firstErr, secondErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		reset := make(chan struct{})
 		done := make(chan struct{})
@@ -833,7 +833,7 @@ func TestDSTNetResetBacklogDrainsPreAcceptBytes(t *testing.T) {
 			}
 			c.Write([]byte("msg"))
 			time.Sleep(20 * time.Millisecond) // past the link latency: delivered to the queued child's receive queue
-			simulation.ResetLink("A", "B")
+			simulation.ResetLinkConns("A", "B")
 			close(reset)
 			<-done
 			c.Close()
@@ -870,8 +870,8 @@ func TestDSTNetResetFailsBlockedWrite(t *testing.T) {
 	var lateN int
 	var lateErr error
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 10 * time.Millisecond,
-		SendBuffer:       4, // the 8-byte write below blocks after 4 bytes
+		CrossHost:  simulation.LinkConfig{Latency: 10 * time.Millisecond},
+		SendBuffer: 4, // the 8-byte write below blocks after 4 bytes
 	}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
@@ -884,7 +884,7 @@ func TestDSTNetResetFailsBlockedWrite(t *testing.T) {
 				c, _ := ln.Accept()
 				time.Sleep(30 * time.Millisecond) // first 4 bytes delivered; writer parked on the full buffer
 				n1, _ = c.Read(buf[:4])           // drain: frees space, the parked writer commits to its wakeup
-				simulation.ResetLink("A", "B")    // …and the RST lands before the writer resumes (no park between)
+				simulation.ResetLinkConns("A", "B")    // …and the RST lands before the writer resumes (no park between)
 				<-wrote
 				lateN, lateErr = c.Read(buf[4:]) // anything the woken writer pushed post-RST would land here
 				c.Close()
@@ -932,7 +932,7 @@ func TestDSTNetResetKeepsIdentityPastRetransmitHorizon(t *testing.T) {
 	}
 	var firstErr, lateReadErr, lateWriteErr error
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  10 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 10 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}, func() {
 		port := make(chan string, 1)
@@ -991,8 +991,8 @@ func TestDSTNetInjectRSTFreezesReceiveQueue(t *testing.T) {
 	for _, latency := range []time.Duration{10 * time.Millisecond, 0} {
 		var lateN, preN int
 		var lateErr, preErr error
-		simulation.Run(1, func() {
-			a, b := dstWirePair(int64(latency), 0, 0, 0, 0, 1, 2, nil, nil)
+		simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: latency}}}, func() {
+			a, b := dstWirePair(0, 0, 1, 2, nil, nil)
 			ea, eb := a.(*dstWireEnd), b.(*dstWireEnd)
 			if _, err := ea.Write([]byte("pre")); err != nil { // toward b, before ANY injection
 				t.Errorf("latency %v: pre-RST write = %v, want success", latency, err)
@@ -1067,7 +1067,7 @@ func TestDSTNetResetVictim(t *testing.T) {
 			cb, _ := Dial("tcp", simulation.HostIP("B")+":"+pb)
 			cc, _ := Dial("tcp", simulation.HostIP("C")+":"+pc)
 			time.Sleep(10 * time.Millisecond)
-			simulation.ResetLink("A", "B") // only A-B
+			simulation.ResetLinkConns("A", "B") // only A-B
 			cc.Write([]byte("toC"))        // A-C must still deliver
 			<-done
 			cb.Close()
@@ -1082,7 +1082,7 @@ func TestDSTNetResetVictim(t *testing.T) {
 	}
 }
 
-// TestDSTNetResetProcess: ResetProcess(p) tears down every conn process p owns an
+// TestDSTNetResetProcess: ResetProcessConns(host, p) tears down every conn process p owns an
 // end of (DST-FAULT-VICTIM, the process leg — the per-process conn attribution),
 // resetting BOTH ends so the peer's in-flight bytes are dropped too. The worker
 // (dialer) owns the conn; the server end is the worker's peer, so it must reset as
@@ -1093,7 +1093,7 @@ func TestDSTNetResetProcess(t *testing.T) {
 	}
 	var serverErr error
 	var gotData bool
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		simulation.Host("A", func() {
@@ -1114,17 +1114,17 @@ func TestDSTNetResetProcess(t *testing.T) {
 				p := <-port
 				c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 				c.Write([]byte("msg"))                 // in flight (100ms latency)
-				simulation.ResetProcess("B", "worker") // resets BOTH ends -> server drops in-flight
+				simulation.ResetProcessConns("B", "worker") // resets BOTH ends -> server drops in-flight
 				<-done
 				c.Close()
 			})
 		})
 	})
 	if gotData {
-		t.Errorf("server received the worker's in-flight bytes after ResetProcess, want them dropped (both ends must reset)")
+		t.Errorf("server received the worker's in-flight bytes after ResetProcessConns, want them dropped (both ends must reset)")
 	}
 	if !errors.Is(serverErr, syscall.ECONNRESET) {
-		t.Errorf("server read after ResetProcess = %v, want ECONNRESET", serverErr)
+		t.Errorf("server read after ResetProcessConns = %v, want ECONNRESET", serverErr)
 	}
 }
 
@@ -1137,7 +1137,7 @@ func TestDSTNetResetProcessLeavesListenerOpen(t *testing.T) {
 		simulation.Process("worker", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
-			simulation.ResetProcess("", "worker")
+			simulation.ResetProcessConns("", "worker")
 			accepted := make(chan struct{})
 			go func() {
 				c, err := ln.Accept()
@@ -1157,10 +1157,10 @@ func TestDSTNetResetProcessLeavesListenerOpen(t *testing.T) {
 		})
 	})
 	if dialErr != nil {
-		t.Fatalf("Dial after ResetProcess on listener owner = %v, want nil", dialErr)
+		t.Fatalf("Dial after ResetProcessConns on listener owner = %v, want nil", dialErr)
 	}
 	if acceptErr != nil {
-		t.Fatalf("Accept after ResetProcess on listener owner = %v, want nil", acceptErr)
+		t.Fatalf("Accept after ResetProcessConns on listener owner = %v, want nil", acceptErr)
 	}
 }
 
@@ -1190,7 +1190,7 @@ func TestDSTNetResetDeterminism(t *testing.T) {
 				p := <-port
 				c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 				time.Sleep(10 * time.Millisecond)
-				simulation.ResetLink("A", "B")
+				simulation.ResetLinkConns("A", "B")
 				<-done
 				c.Close()
 			})

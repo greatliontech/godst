@@ -17,8 +17,8 @@ import (
 	"testing"
 )
 
-// TestDSTPidMaxWrapAndReuse pins Options.PidMax's alloc_pid semantics: forward
-// scan, wrap into [2, PidMax], and REUSE of a dead process's pid — with the
+// TestDSTPidMaxWrapAndReuse pins Options.PIDMax's alloc_pid semantics: forward
+// scan, wrap into [2, PIDMax], and REUSE of a dead process's pid — with the
 // reused pid serving its new incarnation's starttime, the same-pid-new-start
 // discriminator clients parse /proc for.
 func TestDSTPidMaxWrapAndReuse(t *testing.T) {
@@ -47,12 +47,12 @@ func TestDSTPidMaxWrapAndReuse(t *testing.T) {
 	}
 	var pids1, pids2 []int
 	var first1, reuse1, first2, reuse2 uint64
-	RunWith(21, Options{PidMax: 6}, func() { pids1, first1, reuse1 = body() })
-	RunWith(21, Options{PidMax: 6}, func() { pids2, first2, reuse2 = body() })
+	RunWith(21, Options{PIDMax: 6}, func() { pids1, first1, reuse1 = body() })
+	RunWith(21, Options{PIDMax: 6}, func() { pids2, first2, reuse2 = body() })
 
 	want := []int{2, 3, 4, 5, 6, 2}
 	if fmt.Sprint(pids1) != fmt.Sprint(want) {
-		t.Fatalf("pid sequence = %v, want %v (forward scan, wrap at PidMax, reuse of the dead pid)", pids1, want)
+		t.Fatalf("pid sequence = %v, want %v (forward scan, wrap at PIDMax, reuse of the dead pid)", pids1, want)
 	}
 	if fmt.Sprint(pids2) != fmt.Sprint(pids1) || first2 != first1 || reuse2 != reuse1 {
 		t.Fatalf("replay diverged: pids %v/%v starts %d,%d/%d,%d", pids1, pids2, first1, reuse1, first2, reuse2)
@@ -67,7 +67,7 @@ func TestDSTPidMaxWrapAndReuse(t *testing.T) {
 func TestDSTPidMaxSkipsLivePids(t *testing.T) {
 	var holderPid int
 	var churn []int
-	RunWith(22, Options{PidMax: 4}, func() {
+	RunWith(22, Options{PIDMax: 4}, func() {
 		hold := make(chan struct{})
 		held := make(chan int)
 		go Process("holder", func() {
@@ -102,7 +102,7 @@ func TestDSTPidMaxExhaustionPanics(t *testing.T) {
 	var bodyRan bool
 	var neutralityBroken string
 	var laterHostname string
-	RunWith(23, Options{PidMax: 3}, func() {
+	RunWith(23, Options{PIDMax: 3}, func() {
 		hold := make(chan struct{})
 		ready := make(chan struct{}, 2)
 		exited := make(chan struct{}, 2)
@@ -146,22 +146,22 @@ func TestDSTPidMaxExhaustionPanics(t *testing.T) {
 	}
 }
 
-// TestDSTPidMaxValidation pins the option boundary: negative values, a PidMax
-// not exceeding the root pid, and a pid_t-overflowing PidMax are refused
+// TestDSTPidMaxValidation pins the option boundary: negative values, a PIDMax
+// not exceeding the root pid, and a pid_t-overflowing PIDMax are refused
 // before any state moves.
 func TestDSTPidMaxValidation(t *testing.T) {
 	// On 64-bit int this is 1<<31 (the overflow branch); on 32-bit it wraps
-	// negative (the negative branch) — both must refuse with a PidMax panic.
+	// negative (the negative branch) — both must refuse with a PIDMax panic.
 	overPidT := math.MaxInt32
 	overPidT++
 	for _, tc := range []struct {
 		name string
 		opts Options
 	}{
-		{"negative", Options{PidMax: -1}},
-		{"at root pid", Options{PidMax: 1}},
-		{"below custom root pid", Options{PID: 500, PidMax: 300}},
-		{"pid_t overflow", Options{PidMax: overPidT}},
+		{"negative", Options{PIDMax: -1}},
+		{"at root pid", Options{PIDMax: 1}},
+		{"below custom root pid", Options{PID: 500, PIDMax: 300}},
+		{"pid_t overflow", Options{PIDMax: overPidT}},
 	} {
 		var p any
 		func() {
@@ -169,8 +169,8 @@ func TestDSTPidMaxValidation(t *testing.T) {
 			RunWith(1, tc.opts, func() {})
 		}()
 		msg, _ := p.(string)
-		if !strings.Contains(msg, "PidMax") {
-			t.Fatalf("%s: panic = %v, want a PidMax refusal", tc.name, p)
+		if !strings.Contains(msg, "PIDMax") {
+			t.Fatalf("%s: panic = %v, want a PIDMax refusal", tc.name, p)
 		}
 	}
 }

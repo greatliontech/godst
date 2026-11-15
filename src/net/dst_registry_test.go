@@ -113,7 +113,7 @@ func TestDSTNetAcceptedCloseAndMidSYNACKAbortCleanOwnership(t *testing.T) {
 		var dialErr, readErr error
 		var conn Conn
 		var leakedEstablished, leakedAborted int
-		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
+		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond}}}, func() {
 			port := make(chan string, 1)
 			closed := make(chan struct{})
 			var accepted *dstConn
@@ -228,7 +228,7 @@ func TestDSTNetResetOrderDeterministic(t *testing.T) {
 					conns[i], _ = Dial("tcp", simulation.HostIP("A")+":"+p) // dial i registers with seq ~i
 				}
 				time.Sleep(10 * time.Millisecond) // let all readers block
-				simulation.ResetLink("A", "B")    // resets all n, in registration order
+				simulation.ResetLinkConns("A", "B") // resets all n, in registration order
 				wg.Wait()
 				for _, c := range conns {
 					c.Close()

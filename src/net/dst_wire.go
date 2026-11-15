@@ -131,7 +131,7 @@ type dstStream struct {
 	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
 	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
 	frozen     bool          // the receiving socket died (injected RST or retransmit-horizon death): later pushes are discarded (freezeAtHorizon)
-	lastArrive int64         // latest deliverAt ever queued — the last instant this direction carried a segment (keepalive's activity signal)
+	lastArrive int64         // latest segment or FIN arrival ever queued — the last instant this direction carried sequence-consuming traffic (keepalive's activity signal)
 
 	// deadDropped records that bytes (or a FIN) committed to this stream were
 	// destroyed by the receiver's death — dropped by freezeAtHorizon or
@@ -222,7 +222,11 @@ func (s *dstStream) pushOwnedLocked(data []byte, latencyNs, jitterNs, bandwidthB
 		s.deadDropped = true
 		return true
 	}
-	transmitEnd := dstBaseNanos()
+	// Anchor at max(now, linkFreeAt) even when bandwidthBps == 0 so a segment
+	// sent after a mid-run transition from throttled to unthrottled cannot
+	// start propagating before an already-transmitting throttled segment clears
+	// the wire; advance linkFreeAt only when bandwidthBps > 0.
+	transmitEnd := max(dstBaseNanos(), s.linkFreeAt)
 	if bandwidthBps > 0 {
 		// Serialize transmission at bandwidthBps bytes/sec: this segment starts when
 		// the link is free (or now, whichever is later) and occupies it for
@@ -230,9 +234,6 @@ func (s *dstStream) pushOwnedLocked(data []byte, latencyNs, jitterNs, bandwidthB
 		// transmit time is rounded UP, so even a sub-nanosecond segment costs ≥1ns —
 		// delivery is never faster than B (the sound direction; the round-up adds at
 		// most 1ns per segment).
-		if s.linkFreeAt > transmitEnd {
-			transmitEnd = s.linkFreeAt
-		}
 		transmitEnd = dstDelayAdd(transmitEnd, dstTransmitNanos(int64(len(data)), bandwidthBps))
 		s.linkFreeAt = transmitEnd
 	}
@@ -245,14 +246,14 @@ func (s *dstStream) pushOwnedLocked(data []byte, latencyNs, jitterNs, bandwidthB
 	return false
 }
 
-// arrivedThrough reports the latest segment-arrival instant no later than
-// horizon (the caller's cut-capped arrival horizon), and whether any queued
-// segment (or destroyed bytes, deadDropped) is still undelivered at that
-// horizon — the keepalive prober's two inputs: activity and
-// data-outstanding. lastArrive is a running max, so under a cut the capped
-// value can sit at the horizon rather than the true last pre-cut arrival —
-// at or after it, never before — which only defers a probe (the errs-later,
-// sound direction).
+// arrivedThrough reports the latest segment- or FIN-arrival instant no later
+// than horizon (the caller's cut-capped arrival horizon), and whether any
+// queued segment, unarrived FIN, or destroyed traffic (deadDropped) is still
+// undelivered at that horizon — the keepalive prober's two inputs: activity
+// and sequence-consuming traffic outstanding. lastArrive is a running max, so
+// under a cut the capped value can sit at the horizon rather than the true
+// last pre-cut arrival — at or after it, never before — which only defers a
+// probe (the errs-later, sound direction).
 func (s *dstStream) arrivedThrough(horizon int64) (lastArrive int64, outstanding bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -267,6 +268,9 @@ func (s *dstStream) arrivedThrough(horizon int64) (lastArrive int64, outstanding
 		if s.segs[i].deliverAt > horizon {
 			return last, true
 		}
+	}
+	if s.closed && s.closeAt > horizon {
+		return last, true
 	}
 	return last, false
 }
@@ -332,7 +336,14 @@ func (s *dstStream) closeWrite(latencyNs, jitterNs int64) (dead bool) {
 		return true
 	}
 	s.closed = true
-	s.closeAt = dstDelayAdd(dstDelayAdd(dstBaseNanos(), latencyNs), dstFaultRandN(jitterNs))
+	// Anchor FIN propagation at max(now, linkFreeAt) without advancing
+	// linkFreeAt (zero payload) so FIN never overtakes an occupied throttled
+	// serialization horizon even if latency increases mid-stream.
+	transmitEnd := max(dstBaseNanos(), s.linkFreeAt)
+	s.closeAt = dstDelayAdd(dstDelayAdd(transmitEnd, latencyNs), dstFaultRandN(jitterNs))
+	if s.closeAt > s.lastArrive {
+		s.lastArrive = s.closeAt
+	}
 	dstKernelRaceReleaseMerge(unsafe.Pointer(&s.eofSync))
 	s.bumpReadyLocked()
 	return false
@@ -418,10 +429,7 @@ func (s *dstStream) popBytes(maxBytes int, maxArrival int64) (kbuf []byte, ready
 // unchanged.
 type dstWireEnd struct {
 	out, in             *dstStream // out: this end writes (peer reads); in: this end reads (peer writes)
-	latencyNs           int64
-	jitterNs            int64  // per-segment delivery jitter is drawn from [0,jitterNs)
-	bandwidthBps        int64  // link transmit rate in bytes/sec; 0 = unlimited
-	localHost, peerHost uint32 // this end's host and the peer's, for partition targeting
+	localHost, peerHost uint32     // this end's host and the peer's, for partition and link-policy targeting
 
 	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none; TCP_USER_TIMEOUT overrides per socket — effRetransNs)
 	timedOut  atomic.Bool // the retransmit horizon fired: this end is dead (ETIMEDOUT)
@@ -583,14 +591,14 @@ func (d *dstDeadline) wait() chan struct{} {
 // end's keepalive kick (and arming the prober when keepalive is already
 // enabled) happens here, at establishment — the kernel's keepalive timer arms
 // when the connection does.
-func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32, dialerOpts, serverOpts *dstSockOpts) (Conn, Conn) {
+func dstWirePair(capacity, retransNs int64, dialerHost, listenHost uint32, dialerOpts, serverOpts *dstSockOpts) (Conn, Conn) {
 	dstKernelSectionEnter()
 	defer dstKernelSectionExit()
 	ab, ba := newDstStream(capacity), newDstStream(capacity)
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	born := dstBaseNanos()
 	a := &dstWireEnd{
-		out: ab, in: ba, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
+		out: ab, in: ba, retransNs: retransNs,
 		localHost: dialerHost, peerHost: listenHost,
 		opts: dialerOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
@@ -598,7 +606,7 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 		rdDead: makeDstDeadline(), wrDead: makeDstDeadline(),
 	}
 	b := &dstWireEnd{
-		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
+		out: ba, in: ab, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
 		opts: serverOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
@@ -614,6 +622,10 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 		serverOpts.setKick(b.kaPoke)
 	}
 	return a, b
+}
+
+func (e *dstWireEnd) outLinkParams() (latencyNs, jitterNs, bandwidthBps int64) {
+	return dstLinkParamsForDir(e.localHost, e.peerHost)
 }
 
 // userTimeoutNs is this end's TCP_USER_TIMEOUT (0 = unset; nil opts — a
@@ -670,23 +682,33 @@ func (e *dstWireEnd) effRetransNs() int64 {
 // time; no randomness, no scheduling choices beyond the timers themselves.
 
 // kaActivity is the last-activity instant keepalive idles from: the latest
-// of establishment, the last segment arrival either direction carried
+// of establishment, the last segment or FIN arrival either direction carried
 // (arrival ≈ its ACK), and the last answered probe — each arrival capped at
 // its direction's cut-start (a capped value can sit at the cap rather than
 // the true pre-cut arrival: at or after it, never before, which only defers
-// the probe — errs later). Also reports whether outbound data is
-// outstanding at the same horizon.
+// the probe — errs later). Also reports whether outbound sequence-consuming
+// traffic is held under an outbound cut or dead peer host (the exact cases
+// where the retransmission machinery owns the connection's death).
 func (e *dstWireEnd) kaActivity(now int64) (act int64, outstanding bool) {
 	inHorizon := now
 	if cs, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cs-1 < inHorizon {
 		inHorizon = cs - 1
 	}
 	outHorizon := now
-	if cs, cut, _ := dstPartCutStartDir(e.localHost, e.peerHost); cut && cs-1 < outHorizon {
-		outHorizon = cs - 1
+	outCutStart, outCut, _ := dstPartCutStartDir(e.localHost, e.peerHost)
+	if outCut && outCutStart-1 < outHorizon {
+		outHorizon = outCutStart - 1
 	}
 	inLast, _ := e.in.arrivedThrough(inHorizon)
 	outLast, out := e.out.arrivedThrough(outHorizon)
+	if !outCut && !dstHostDead(e.peerHost) {
+		// Under a return-only cut (peer→local cut while local→peer is live and
+		// the peer host is up), outbound segments still traverse the live forward
+		// link and armHorizon never arms (the documented flow-level model). Keep
+		// keepalive owning the death rather than stranding a blocked Read unarmed
+		// behind non-zero forward link latency.
+		out = false
+	}
 	act = e.bornAt
 	if inLast > act {
 		act = inLast
@@ -1369,6 +1391,10 @@ func (e *dstWireEnd) coarseCloseRead() {
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), true)
+	if e.localHost != e.peerHost {
+		dstCoarseRecord(dstCoarseNetHostID(e.localHost), false)
+		dstCoarseRecord(dstCoarseNetHostID(e.peerHost), false)
+	}
 }
 
 func (e *dstWireEnd) coarseClose() {
@@ -1380,6 +1406,10 @@ func (e *dstWireEnd) coarseClose() {
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.eofSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.wrDead)), true)
+	if e.localHost != e.peerHost {
+		dstCoarseRecord(dstCoarseNetHostID(e.localHost), false)
+		dstCoarseRecord(dstCoarseNetHostID(e.peerHost), false)
+	}
 }
 
 func (e *dstWireEnd) coarseSetDeadline() {
@@ -1811,6 +1841,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 		// kernel locks.
 		segBuf := make([]byte, room)
 		copy(segBuf, b[:room])
+		lat, jit, bw := e.outLinkParams()
 		wrDeadCh := e.wrDead.wait()
 		var outClosed, aborted bool
 		pushed, dead := func() (int, bool) {
@@ -1831,7 +1862,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 					take = take[:avail]
 				}
 			}
-			dead := e.out.pushOwnedLocked(take, e.latencyNs, e.jitterNs, e.bandwidthBps)
+			dead := e.out.pushOwnedLocked(take, lat, jit, bw)
 			if !dead {
 				dstKernelRaceReleaseMerge(unsafe.Pointer(&e.out.raceSync))
 			}
@@ -1940,7 +1971,8 @@ func (e *dstWireEnd) closeWriteAfterCoarse() error {
 			return
 		}
 		e.stampActiveCloser()
-		dead := e.out.closeWrite(e.latencyNs, e.jitterNs)
+		lat, jit, _ := e.outLinkParams()
+		dead := e.out.closeWrite(lat, jit)
 		if dead && !e.isTimedOutKernel() && !e.isRSTArrivedKernel() &&
 			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) &&
 			!dstHostDead(e.peerHost) {
@@ -1989,7 +2021,8 @@ func (e *dstWireEnd) closeAfterCoarse() error {
 		e.stampActiveCloser()
 		// Stop accepting reads/writes locally (localDone) and let the peer drain
 		// what we already sent, then see EOF (closeWrite on our out = peer's in).
-		e.out.closeWrite(e.latencyNs, e.jitterNs)
+		lat, jit, _ := e.outLinkParams()
+		e.out.closeWrite(lat, jit)
 	})
 	return nil
 }

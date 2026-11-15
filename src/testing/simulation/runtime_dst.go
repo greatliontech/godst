@@ -272,6 +272,9 @@ func dstProcAllocBytes(procid uint32) int64
 //go:linkname dstNetPartitionOp runtime.dstNetPartitionOp
 func dstNetPartitionOp(op, a, b uint32)
 
+//go:linkname dstNetLinkConfigOp runtime.dstNetLinkConfigOp
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)
+
 //go:linkname dstNetHostDead runtime.dstNetHostDead
 func dstNetHostDead(host uint32) bool
 

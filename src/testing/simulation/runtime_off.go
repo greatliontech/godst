@@ -103,6 +103,8 @@ func dstMarkHostGoroutinesCrashed(host uint32)                       {}
 func dstProcAllocEnsure(procid uint32)                               {}
 func dstProcAllocBytes(procid uint32) int64                          { return 0 }
 func dstNetPartitionOp(op, a, b uint32)                              {}
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+}
 func dstNetHostDead(host uint32) bool                                { return false }
 func dstInSimBubble() bool                                           { return false }
 func dstStepHostClock(host uint32, delta int64) bool                 { return true }

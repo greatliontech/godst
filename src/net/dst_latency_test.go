@@ -48,7 +48,7 @@ func TestDSTNetSYNACKObservesContextDeadline(t *testing.T) {
 	var conn, acceptedConn Conn
 	var dialErr, acceptErr error
 	var dialDuration time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: latency}}}, func() {
 		port := make(chan string, 1)
 		release := make(chan struct{})
 		acceptDone := make(chan struct{})
@@ -96,7 +96,7 @@ func TestDSTNetSYNACKObservesReset(t *testing.T) {
 	var conn, acceptedConn Conn
 	var dialErr, acceptErr error
 	var dialDuration time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		dialStarted := make(chan struct{})
 		release := make(chan struct{})
@@ -108,7 +108,7 @@ func TestDSTNetSYNACKObservesReset(t *testing.T) {
 			go func() {
 				<-dialStarted
 				time.Sleep(150 * time.Millisecond) // mid SYN-ACK [100ms, 200ms]
-				simulation.ResetLink("A", "B")
+				simulation.ResetLinkConns("A", "B")
 				<-release
 				ln.Close()
 			}()
@@ -148,7 +148,7 @@ func TestDSTNetSYNACKObservesServerProcessExit(t *testing.T) {
 	var conn Conn
 	var dialErr error
 	var dialDuration time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		dialStarted := make(chan struct{})
 		simulation.Host("A", func() {
@@ -184,7 +184,7 @@ func TestDSTNetSYNACKObservesHostCrash(t *testing.T) {
 	var conn Conn
 	var dialErr error
 	var accepted atomic.Bool
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		dialStarted := make(chan struct{})
 		dialDone := make(chan struct{})
@@ -230,7 +230,7 @@ func TestDSTNetSYNACKSurvivesListenerCloseAfterAccept(t *testing.T) {
 	var conn Conn
 	var dialErr error
 	var dialDuration time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		release := make(chan struct{})
 		simulation.Host("A", func() {
@@ -342,7 +342,7 @@ func TestDSTNetFINPaysLinkLatency(t *testing.T) {
 	}
 	const latency = 100 * time.Millisecond
 	var closedAt, eofAt time.Time
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: latency}}}, func() {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
 		serverDone := make(chan struct{})
@@ -401,7 +401,7 @@ func TestDSTNetFINJitterDeterministic(t *testing.T) {
 	}
 	const base, jitter = 20 * time.Millisecond, 40 * time.Millisecond
 	run := func(seed uint64) (delays []time.Duration) {
-		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: base, CrossHostJitter: jitter}}, func() {
+		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: base, Jitter: jitter}}}, func() {
 			for i := 0; i < 10; i++ {
 				var closedAt, eofAt time.Time
 				port := make(chan string, 1)
@@ -493,14 +493,14 @@ func TestDSTNetPartitionHoldsFINAtCutBoundary(t *testing.T) {
 }
 
 // TestDSTNetCrossHostLatency: a cross-host connection delivers each byte exactly
-// CrossHostLatency later (one-way), so a request/response round-trip is twice that
+// CrossHost.Latency later (one-way), so a request/response round-trip is twice that
 // — measured on the deterministic fake clock.
 func TestDSTNetCrossHostLatency(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
 	const L = 50 * time.Millisecond
-	oneWay, rtt := dstPingPong(t, 1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}})
+	oneWay, rtt := dstPingPong(t, 1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}})
 	if oneWay != L {
 		t.Errorf("cross-host one-way delay = %v, want %v", oneWay, L)
 	}
@@ -517,7 +517,7 @@ func TestDSTNetSameHostInstant(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	var writeAt, serverReadAt time.Time
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 50 * time.Millisecond}}}, func() {
 		simulation.Host("solo", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
@@ -558,7 +558,7 @@ func TestDSTNetLatencyFIFO(t *testing.T) {
 	const L = 50 * time.Millisecond
 	var got []string
 	var firstAt, secondAt time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		var base time.Time
@@ -614,7 +614,7 @@ func TestDSTNetLatencyDeterminism(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 37 * time.Millisecond}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 37 * time.Millisecond}}}
 	for seed := uint64(0); seed < 16; seed++ {
 		ow1, rtt1 := dstPingPong(t, seed, opts)
 		ow2, rtt2 := dstPingPong(t, seed, opts)
@@ -629,7 +629,7 @@ func TestDSTNetLatencyDeterminism(t *testing.T) {
 
 // TestDSTNetLatencySkewInvariant: the wire delay is universe BASE time, not
 // host-skewed wall time — so a cross-host link between two hosts whose clocks
-// disagree still delivers exactly CrossHostLatency of base time later (the
+// disagree still delivers exactly CrossHost.Latency of base time later (the
 // property an HLC is tested against). Measured by converting each host's skewed
 // wall reading back to base (subtracting its configured offset); the one-way base
 // delay must be exactly L regardless of the skews, and the client's own-clock
@@ -644,7 +644,7 @@ func TestDSTNetLatencySkewInvariant(t *testing.T) {
 		offB = -20 * time.Millisecond // client host clock skew
 	)
 	var writeWall, serverReadWall, clientRespWall time.Time
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}}, func() {
 		port := make(chan string, 1)
 		simulation.HostWith("A", simulation.HostConfig{Clock: simulation.Skew(offA)}, func() {
 			ln, _ := Listen("tcp", ":0")
@@ -709,7 +709,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 	var baseLatency time.Duration
 	var got string
 	var serverReadWall, startBase time.Time
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}}, func() {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
 		dialed := make(chan struct{})
@@ -778,7 +778,7 @@ func TestDSTNetBaseDelaysIgnoreEndpointDrift(t *testing.T) {
 	}
 	const latency = 100 * time.Millisecond
 	var dialBase, deliveryBase, changedDriftBase, roundedBase, ordinaryBase time.Duration
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: latency}}}, func() {
 		port := make(chan string, 1)
 		startDial := make(chan struct{})
 		dialed := make(chan struct{})
@@ -919,7 +919,7 @@ func TestDSTNetLatencyDeadline(t *testing.T) {
 	const L = 50 * time.Millisecond
 	var shortErr error
 	var longOK bool
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}}, func() {
 		port := make(chan string, 1)
 		srvDone := make(chan struct{})
 		simulation.Host("A", func() {
@@ -967,7 +967,7 @@ func TestDSTNetLatencyDeadline(t *testing.T) {
 	}
 }
 
-// TestDSTNetJitterBounded: with CrossHostJitter set, a cross-host segment's
+// TestDSTNetJitterBounded: with CrossHost.Jitter set, a cross-host segment's
 // one-way delay is the base latency plus a value in [0, jitter) — so it stays
 // within [base, base+jitter) and varies across seeds (the jitter is actually
 // drawn, not a constant).
@@ -977,7 +977,7 @@ func TestDSTNetJitterBounded(t *testing.T) {
 	}
 	const base = 10 * time.Millisecond
 	const jit = 40 * time.Millisecond
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: base, CrossHostJitter: jit}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: base, Jitter: jit}}}
 	seen := map[time.Duration]bool{}
 	for seed := uint64(0); seed < 32; seed++ {
 		oneWay, _ := dstPingPong(t, seed, opts)
@@ -997,7 +997,7 @@ func TestDSTNetJitterDeterminism(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond, CrossHostJitter: 40 * time.Millisecond}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond, Jitter: 40 * time.Millisecond}}}
 	distinct := map[time.Duration]bool{}
 	for seed := uint64(0); seed < 24; seed++ {
 		ow1, rtt1 := dstPingPong(t, seed, opts)
@@ -1022,7 +1022,7 @@ func TestDSTNetJitterFIFO(t *testing.T) {
 	}
 	const N = 12
 	var got []string
-	simulation.RunWith(3, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 5 * time.Millisecond, CrossHostJitter: 50 * time.Millisecond}}, func() {
+	simulation.RunWith(3, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 5 * time.Millisecond, Jitter: 50 * time.Millisecond}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		simulation.Host("A", func() {
@@ -1130,7 +1130,7 @@ func TestDSTNetThrottleRate(t *testing.T) {
 	const chunk = 32 << 10 // 32 KiB
 	const bw = 10 << 20    // 10 MiB/s
 	const lat = 5 * time.Millisecond
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: lat, CrossHostBandwidth: bw}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: lat, Bandwidth: bw}}}
 	span, got := dstThrottledTransfer(t, 1, opts, total, chunk)
 	if got != total {
 		t.Fatalf("received %d/%d bytes", got, total)
@@ -1158,7 +1158,7 @@ func TestDSTNetThrottleDeterminism(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	const total, chunk, bw = 256 << 10, 16 << 10, 4 << 20
-	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 3 * time.Millisecond, CrossHostBandwidth: bw}}
+	opts := simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: 3 * time.Millisecond, Bandwidth: bw}}}
 	wantSpan := time.Duration((int64(total) - int64(chunk)) * int64(time.Second) / int64(bw)) // (total-chunk)/B, exact here
 	for seed := uint64(0); seed < 8; seed++ {
 		s1, g1 := dstThrottledTransfer(t, seed, opts, total, chunk)

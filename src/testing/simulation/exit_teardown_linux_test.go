@@ -382,7 +382,7 @@ func TestDSTProcessExitResetDeliversPreExitBytesThenResets(t *testing.T) {
 	var n int
 	var buf [8]byte
 	var readErr, secondErr error
-	RunWith(1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
+	RunWith(1, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 100 * time.Millisecond}}}, func() {
 		addrCh := make(chan string, 1)
 		readDone := make(chan struct{})
 		Host("srv", func() {

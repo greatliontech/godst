@@ -762,7 +762,7 @@ func TestDSTEmbeddedDBBootEpoch(t *testing.T) {
 // database uses (kill(pid,0), /proc/<pid>/stat field 22, /proc/self/ns/pid).
 //
 // Reuse leg: a writer stamps (pid, starttime) and dies; churn under
-// Options.PidMax hands its pid to an UNRELATED process. The recovering peer's
+// Options.PIDMax hands its pid to an UNRELATED process. The recovering peer's
 // probe finds the pid ALIVE — the trap pid-liveness alone falls into — and the
 // starttime mismatch is what classifies the stamped record stale.
 //
@@ -774,7 +774,7 @@ func TestDSTEmbeddedDBIdentityDivergence(t *testing.T) {
 	var stampedPid, reusedPid int
 	var stampedStart, reusedStart, probedStart uint64
 	var probeAlive bool
-	RunWith(41, Options{PidMax: 5}, func() {
+	RunWith(41, Options{PIDMax: 5}, func() {
 		// One shared machine: the reuse hazard is an intra-machine phenomenon
 		// (pids are compared through one host's shared lock file), and
 		// starttimes are host-uptime-relative — a dedicated implicit host per

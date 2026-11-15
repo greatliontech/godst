@@ -12,7 +12,7 @@ diagnostics").
   timeline; document virtual-time & quiescence driver mechanics (`time.Sleep` vs `synctest.Wait`,
   `0ns` CPU execution rule, `time`/`sync`/`rand` surface) and fix Pattern 2 in `docs/README.md`;
   record user-authorized zero-retrofit future-work deferrals in `docs/issues/`.
-- [ ] 2. Per-link network policy & public API consolidation (`LinkConfig`,
+- [x] 2. Per-link network policy & public API consolidation (`LinkConfig`,
   `NetworkConfig.CrossHost`, `ConfigureLink`, `ConfigureLinkOneWay`, `UnconfigureLink`,
   `ResetLinkConns`, `ResetProcessConns`, `Options.PIDMax`): collapse `NetworkConfig`'s flat
   cross-host fields onto `CrossHost LinkConfig` with unified fail-loud negative/overflow

@@ -243,7 +243,7 @@ func TestDSTNetConnectPaysRTT(t *testing.T) {
 	const L = 50 * time.Millisecond
 	var dialDur time.Duration
 	var dialErr error
-	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
+	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHost: simulation.LinkConfig{Latency: L}}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		simulation.Host("srv", func() {
@@ -522,7 +522,7 @@ func TestDSTNetInFlightBytesCutThenReadTimesOut(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  100 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 100 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	var readErr error
@@ -623,7 +623,7 @@ func TestDSTNetOneWayCutInFlightReadTimesOut(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  100 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 100 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	var readErr error
@@ -665,7 +665,7 @@ func TestDSTNetCutAfterReadBlockedTimesOut(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  100 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 100 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	var readErr error

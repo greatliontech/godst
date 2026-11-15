@@ -174,7 +174,7 @@ type ExploreResult struct {
 }
 
 // ExploreOptions configures ExploreWith. It embeds Options so explored schedules
-// and their Replay runs carry the same simulated identity, PidMax, MemoryLimit,
+// and their Replay runs carry the same simulated identity, PIDMax, MemoryLimit,
 // NetworkConfig, CrashTear, and wedge bounds as RunWith and TestWith (the
 // embedded Strategy/Depth/Steps fields are validated but ignored by Explore's
 // systematic scheduler). The zero value is exhaustive exploration with default

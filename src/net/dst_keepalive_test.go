@@ -1155,3 +1155,169 @@ func TestDSTNetKeepaliveDeterministic(t *testing.T) {
 		t.Error("keepalive death did not occur")
 	}
 }
+
+// TestDSTNetKeepaliveSuppressedByUnackedFIN: an unacknowledged half-close FIN
+// (CloseWrite → FIN_WAIT_1) is sequence-consuming traffic owned by the
+// retransmission horizon, never by a shorter keepalive schedule — both when
+// CloseWrite is called after the cut and when the FIN is caught mid-flight on
+// a configured link latency.
+func TestDSTNetKeepaliveSuppressedByUnackedFIN(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	for _, midFlight := range []bool{false, true} {
+		name := "post-cut"
+		if midFlight {
+			name = "mid-flight"
+		}
+		t.Run(name, func(t *testing.T) {
+			var elapsed time.Duration
+			var readErr error
+			opts := simulation.Options{Network: simulation.NetworkConfig{RetransmitTimeout: 30 * time.Second}}
+			simulation.RunWith(1, opts, func() {
+				port := make(chan string, 1)
+				done := make(chan struct{})
+				dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
+				simulation.Host("B", func() {
+					defer close(done)
+					p := <-port
+					// 6s keepalive budget (idle 5s + 1s×1), far shorter than the 30s horizon.
+					d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 5 * time.Second, Interval: time.Second, Count: 1}}
+					c, err := d.Dial("tcp", simulation.HostIP("A")+":"+p)
+					if err != nil {
+						panic(err)
+					}
+					buf := make([]byte, 1)
+					if _, err := c.Write([]byte("x")); err != nil {
+						panic(err)
+					}
+					if _, err := c.Read(buf); err != nil {
+						panic(err)
+					}
+					cw := c.(interface{ CloseWrite() error })
+					var start time.Time
+					if midFlight {
+						simulation.ConfigureLink("B", "A", simulation.LinkConfig{Latency: 2 * time.Second})
+						if err := cw.CloseWrite(); err != nil {
+							panic(err)
+						}
+						time.Sleep(time.Second) // FIN is in flight (closeAt = +2s) when the cut lands at +1s.
+						simulation.Partition("A", "B")
+						start = time.Now()
+					} else {
+						simulation.Partition("A", "B")
+						start = time.Now()
+						if err := cw.CloseWrite(); err != nil {
+							panic(err)
+						}
+					}
+					_, readErr = c.Read(buf)
+					elapsed = time.Since(start)
+					c.Close()
+				})
+			})
+			if !errors.Is(readErr, syscall.ETIMEDOUT) {
+				t.Fatalf("read = %v, want ETIMEDOUT", readErr)
+			}
+			if elapsed < 29*time.Second || elapsed > 33*time.Second {
+				t.Errorf("FIN_WAIT_1 death after %v, want ~30s (retransmit horizon, not the 6s keepalive schedule)", elapsed)
+			}
+		})
+	}
+}
+
+// TestDSTNetKeepaliveCloseWriteAdvancesActivity: a CloseWrite FIN that arrives
+// before a partition advances the connection's last-activity timestamp (its ACK
+// resets the keepalive idle clock just like data).
+func TestDSTNetKeepaliveCloseWriteAdvancesActivity(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var elapsed time.Duration
+	var readErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		dstKeepaliveServer(port, done, false, ListenConfig{}, nil)
+		simulation.Host("B", func() {
+			defer close(done)
+			p := <-port
+			d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 10 * time.Second, Interval: 2 * time.Second, Count: 2}}
+			c, err := d.Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				panic(err)
+			}
+			simulation.ConfigureLink("B", "A", simulation.LinkConfig{Latency: time.Second})
+			time.Sleep(8 * time.Second)
+			if err := c.(interface{ CloseWrite() error }).CloseWrite(); err != nil { // FIN arrives at t=9s
+				panic(err)
+			}
+			time.Sleep(1500 * time.Millisecond) // t=9.5s: FIN arrived before cut
+			start := time.Now()
+			simulation.Partition("A", "B")
+			buf := make([]byte, 1)
+			_, readErr = c.Read(buf)
+			elapsed = time.Since(start)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Fatalf("read = %v, want ETIMEDOUT", readErr)
+	}
+	// FIN arrived at t=9s → idle expires at t=19s → 2 probes × 2s → death at
+	// t=23s, which is 13.5s after the t=9.5s cut (without FIN activity update,
+	// idle would have expired at t=10s and killed at t=14s = +4.5s).
+	if elapsed < 13*time.Second || elapsed > 15*time.Second {
+		t.Errorf("post-FIN keepalive death %v after cut, want ~13.5s (idle anchored at FIN arrival)", elapsed)
+	}
+}
+
+// TestDSTNetKeepaliveReturnOnlyCutWithForwardLatency: under a one-way cut of
+// only the return direction (peer→local) while the forward link (local→peer)
+// is live with non-zero latency, outbound Write / CloseWrite traffic traverses
+// the live forward link rather than arming the retransmit horizon — so a
+// blocked Read must still arm keepalive and idle from the forward arrival
+// instant instead of stranding unarmed.
+func TestDSTNetKeepaliveReturnOnlyCutWithForwardLatency(t *testing.T) {
+	if !dstNetEnabled {
+		t.Skip("requires -tags dst")
+	}
+	var elapsed time.Duration
+	var readErr error
+	simulation.RunWith(1, simulation.Options{}, func() {
+		port := make(chan string, 1)
+		done := make(chan struct{})
+		dstKeepaliveServer(port, done, false, ListenConfig{}, nil)
+		simulation.Host("B", func() {
+			defer close(done)
+			p := <-port
+			d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 5 * time.Second, Interval: time.Second, Count: 2}}
+			c, err := d.Dial("tcp", simulation.HostIP("A")+":"+p)
+			if err != nil {
+				panic(err)
+			}
+			simulation.ConfigureLinkOneWay("B", "A", simulation.LinkConfig{Latency: 2 * time.Second})
+			simulation.PartitionOneWay("A", "B") // return direction cut; forward B→A remains live
+			time.Sleep(6 * time.Second)          // past initial 5s idle
+			if _, err := c.Write([]byte("ping")); err != nil {
+				panic(err)
+			}
+			if err := c.(interface{ CloseWrite() error }).CloseWrite(); err != nil { // arrives at t=8s
+				panic(err)
+			}
+			start := time.Now() // t=6s
+			buf := make([]byte, 1)
+			_, readErr = c.Read(buf)
+			elapsed = time.Since(start)
+			c.Close()
+		})
+	})
+	if !errors.Is(readErr, syscall.ETIMEDOUT) {
+		t.Fatalf("read = %v, want ETIMEDOUT", readErr)
+	}
+	// Forward data+FIN arrive at t=8s → idle expires at t=13s → probes at
+	// 13s and 14s → kill at t=15s = 9s after Read began at t=6s.
+	if elapsed < 8500*time.Millisecond || elapsed > 10*time.Second {
+		t.Errorf("return-only cut with forward latency died after %v, want ~9s", elapsed)
+	}
+}

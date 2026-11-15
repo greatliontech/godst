@@ -2490,7 +2490,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			done2 := make(chan struct{})
 			go func() {
 				resetState = 77
-				ResetLink("h1", "h2")
+				ResetLinkConns("h1", "h2")
 				close(done1)
 			}()
 			go func() {
@@ -2555,7 +2555,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			resetState = 77
-			ResetLink("h1", "h2")
+			ResetLinkConns("h1", "h2")
 		}()
 		go func() {
 			defer wg.Done()
@@ -2731,7 +2731,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			writeResetState = 88
-			ResetLink("h1", "h2")
+			ResetLinkConns("h1", "h2")
 		}()
 		go func() {
 			defer wg.Done()
@@ -2960,6 +2960,302 @@ func TestDSTKernelMMapReleaseOrderDeterministic(t *testing.T) {
 	for iter := range 16 {
 		if got := runOnce(); got != [2]int{1, 2} {
 			t.Fatalf("iter %d: mmap-retained flock release order = %v, want [1 2]", iter, got)
+		}
+	}
+}
+
+func TestDSTKernelConfigureLinkCoarseDPOR(t *testing.T) {
+	if os.Getenv("DST_CONFIGURE_LINK_NO_HB_HELPER") == "1" {
+		res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 16}, func() error {
+			var unsyncState int
+			var ln net.Listener
+			var addr string
+			Host("h1", func() {
+				var err error
+				ln, err = net.Listen("tcp", ":9510")
+				if err != nil {
+					panic(err)
+				}
+				addr = net.JoinHostPort(HostIP("h1"), "9510")
+			})
+			defer ln.Close()
+			var cli net.Conn
+			Host("h2", func() {
+				var err error
+				cli, err = net.Dial("tcp", addr)
+				if err != nil {
+					panic(err)
+				}
+			})
+			defer cli.Close()
+			var srv net.Conn
+			Host("h1", func() {
+				var err error
+				srv, err = ln.Accept()
+				if err != nil {
+					panic(err)
+				}
+			})
+			defer srv.Close()
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				unsyncState = 42
+				ConfigureLink("h1", "h2", LinkConfig{Latency: 50 * time.Millisecond})
+			}()
+			go func() {
+				defer wg.Done()
+				if _, err := cli.Write([]byte("x")); err != nil {
+					panic(err)
+				}
+				var b [1]byte
+				if _, err := srv.Read(b[:]); err != nil {
+					panic(err)
+				}
+				// ConfigureLink is pure timing policy and must NOT forge a TSan
+				// happens-before edge across goroutines.
+				_ = unsyncState
+			}()
+			wg.Wait()
+			return nil
+		})
+		fmt.Printf("CONFIGURE_LINK_NO_HB_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
+		return
+	}
+
+	for _, opFirst := range []bool{true, false} {
+		var sawFastWrite, sawSlowWrite bool
+		var sawFastClose, sawSlowClose bool
+
+		writeRes := Explore(1, DPOR, func() error {
+			var ln net.Listener
+			var addr string
+			Host("h1", func() {
+				var err error
+				ln, err = net.Listen("tcp", ":9511")
+				if err != nil {
+					panic(err)
+				}
+				addr = net.JoinHostPort(HostIP("h1"), "9511")
+			})
+			defer ln.Close()
+			var cli net.Conn
+			Host("h2", func() {
+				var err error
+				cli, err = net.Dial("tcp", addr)
+				if err != nil {
+					panic(err)
+				}
+			})
+			defer cli.Close()
+			var srv net.Conn
+			Host("h1", func() {
+				var err error
+				srv, err = ln.Accept()
+				if err != nil {
+					panic(err)
+				}
+			})
+			defer srv.Close()
+
+			t0 := time.Now()
+			doneCfg := make(chan struct{})
+			doneWrite := make(chan struct{})
+			runCfg := func() {
+				defer close(doneCfg)
+				ConfigureLink("h1", "h2", LinkConfig{Latency: 50 * time.Millisecond})
+			}
+			runWrite := func() {
+				defer close(doneWrite)
+				if _, err := cli.Write([]byte("abcd")); err != nil {
+					panic(err)
+				}
+			}
+			if opFirst {
+				go runWrite()
+				go runCfg()
+			} else {
+				go runCfg()
+				go runWrite()
+			}
+			<-doneCfg
+			<-doneWrite
+			var buf [4]byte
+			if _, err := io.ReadFull(srv, buf[:]); err != nil {
+				panic(err)
+			}
+			if time.Since(t0) >= 50*time.Millisecond {
+				sawSlowWrite = true
+			} else {
+				sawFastWrite = true
+			}
+			return nil
+		})
+		if len(writeRes.Failures) != 0 || !writeRes.Exhausted || !sawFastWrite || !sawSlowWrite {
+			t.Fatalf("Write vs ConfigureLink opFirst=%v: fast=%v slow=%v Schedules=%d Exhausted=%v Failures=%+v",
+				opFirst, sawFastWrite, sawSlowWrite, writeRes.Schedules, writeRes.Exhausted, writeRes.Failures)
+		}
+
+		closeRes := Explore(1, DPOR, func() error {
+			var ln net.Listener
+			var addr string
+			Host("h1", func() {
+				var err error
+				ln, err = net.Listen("tcp", ":9512")
+				if err != nil {
+					panic(err)
+				}
+				addr = net.JoinHostPort(HostIP("h1"), "9512")
+			})
+			defer ln.Close()
+			var cli net.Conn
+			Host("h2", func() {
+				var err error
+				cli, err = net.Dial("tcp", addr)
+				if err != nil {
+					panic(err)
+				}
+			})
+			var srv net.Conn
+			Host("h1", func() {
+				var err error
+				srv, err = ln.Accept()
+				if err != nil {
+					panic(err)
+				}
+			})
+			defer srv.Close()
+
+			t0 := time.Now()
+			doneCfg := make(chan struct{})
+			doneClose := make(chan struct{})
+			runCfg := func() {
+				defer close(doneCfg)
+				ConfigureLinkOneWay("h2", "h1", LinkConfig{Latency: 50 * time.Millisecond})
+			}
+			runClose := func() {
+				defer close(doneClose)
+				if err := cli.Close(); err != nil {
+					panic(err)
+				}
+			}
+			if opFirst {
+				go runClose()
+				go runCfg()
+			} else {
+				go runCfg()
+				go runClose()
+			}
+			<-doneCfg
+			<-doneClose
+			var buf [1]byte
+			if n, err := srv.Read(buf[:]); n != 0 || err != io.EOF {
+				panic(fmt.Sprintf("srv Read after graceful Close = (%d, %v), want (0, io.EOF)", n, err))
+			}
+			if time.Since(t0) >= 50*time.Millisecond {
+				sawSlowClose = true
+			} else {
+				sawFastClose = true
+			}
+			return nil
+		})
+		if len(closeRes.Failures) != 0 || !closeRes.Exhausted || !sawFastClose || !sawSlowClose {
+			t.Fatalf("Close vs ConfigureLinkOneWay opFirst=%v: fast=%v slow=%v Schedules=%d Exhausted=%v Failures=%+v",
+				opFirst, sawFastClose, sawSlowClose, closeRes.Schedules, closeRes.Exhausted, closeRes.Failures)
+		}
+
+		// Close on h2 with unread inbound bytes racing IsolateHost("h1") (which
+		// records only peerHost h1, not localHost h2) must conflict via coarseClose's
+		// peerHost tracking and explore both ECONNRESET and blackholed timeout.
+		var sawCloseRST, sawCloseTimeout bool
+		peerCloseRes := Explore(1, DPOR, func() error {
+			var ln net.Listener
+			var addr string
+			Host("h1", func() {
+				var err error
+				ln, err = net.Listen("tcp", ":9513")
+				if err != nil {
+					panic(err)
+				}
+				addr = net.JoinHostPort(HostIP("h1"), "9513")
+			})
+			defer ln.Close()
+			var cli net.Conn
+			Host("h2", func() {
+				var err error
+				cli, err = net.Dial("tcp", addr)
+				if err != nil {
+					panic(err)
+				}
+			})
+			var srv net.Conn
+			Host("h1", func() {
+				var err error
+				srv, err = ln.Accept()
+				if err != nil {
+					panic(err)
+				}
+				if _, err := srv.Write([]byte("x")); err != nil {
+					panic(err)
+				}
+			})
+			defer srv.Close()
+			// Let srv's byte arrive and be ACKed in cli's receive queue before the
+			// t=1ms close-vs-isolate race: if IsolateHost("h1") wins, cli's single
+			// close RST is dropped by the cut and srv has no un-ACKed data left to
+			// retransmit after UnisolateHost("h1"), leaving srv half-open to hit its
+			// read deadline; if cli.Close() wins, the RST reaches h1 before the cut.
+			time.Sleep(time.Millisecond)
+
+			doneIso := make(chan struct{})
+			doneClose := make(chan struct{})
+			runIsolate := func() {
+				defer close(doneIso)
+				IsolateHost("h1")
+			}
+			runClose := func() {
+				defer close(doneClose)
+				_ = cli.Close()
+			}
+			if opFirst {
+				go runClose()
+				go runIsolate()
+			} else {
+				go runIsolate()
+				go runClose()
+			}
+			<-doneIso
+			<-doneClose
+			UnisolateHost("h1")
+			_ = srv.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			var buf [1]byte
+			_, err := srv.Read(buf[:])
+			switch {
+			case errors.Is(err, syscall.ECONNRESET):
+				sawCloseRST = true
+			case errors.Is(err, os.ErrDeadlineExceeded):
+				sawCloseTimeout = true
+			default:
+				panic(fmt.Sprintf("unexpected srv.Read err = %v", err))
+			}
+			return nil
+		})
+		if len(peerCloseRes.Failures) != 0 || !peerCloseRes.Exhausted || !sawCloseRST || !sawCloseTimeout {
+			t.Fatalf("Close vs IsolateHost(peerHost) opFirst=%v: rst=%v timeout=%v Schedules=%d Exhausted=%v Failures=%+v",
+				opFirst, sawCloseRST, sawCloseTimeout, peerCloseRes.Schedules, peerCloseRes.Exhausted, peerCloseRes.Failures)
+		}
+	}
+
+	if dstRaceEnabledFP() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDSTKernelConfigureLinkCoarseDPOR$")
+		cmd.Env = append(os.Environ(), "DST_CONFIGURE_LINK_NO_HB_HELPER=1")
+		out, _ := cmd.CombinedOutput()
+		if !strings.Contains(string(out), "CONFIGURE_LINK_NO_HB_RACE_CAUGHT=true") && !strings.Contains(string(out), "DATA RACE") {
+			t.Fatalf("ConfigureLink unexpectedly forged TSan HB:\n%s", out)
 		}
 	}
 }

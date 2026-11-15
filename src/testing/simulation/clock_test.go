@@ -591,9 +591,15 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		{"HealLink", func() { HealLink("declared", "no-such-host") }},
 		{"IsolateHost", func() { IsolateHost("no-such-host") }},
 		{"UnisolateHost", func() { UnisolateHost("no-such-host") }},
-		{"ResetLink", func() { ResetLink("declared", "no-such-host") }},
-		{"ResetProcess", func() { ResetProcess("", "no-such-proc") }},
-		{"ResetProcess/unknown-host", func() { ResetProcess("no-such-host", "p") }},
+		{"ConfigureLink", func() { ConfigureLink("declared", "no-such-host", LinkConfig{Latency: time.Millisecond}) }},
+		{"ConfigureLink/first", func() { ConfigureLink("no-such-host", "declared", LinkConfig{Latency: time.Millisecond}) }},
+		{"ConfigureLinkOneWay", func() { ConfigureLinkOneWay("declared", "no-such-host", LinkConfig{Latency: time.Millisecond}) }},
+		{"ConfigureLinkOneWay/from", func() { ConfigureLinkOneWay("no-such-host", "declared", LinkConfig{Latency: time.Millisecond}) }},
+		{"UnconfigureLink", func() { UnconfigureLink("declared", "no-such-host") }},
+		{"UnconfigureLink/first", func() { UnconfigureLink("no-such-host", "declared") }},
+		{"ResetLinkConns", func() { ResetLinkConns("declared", "no-such-host") }},
+		{"ResetProcessConns", func() { ResetProcessConns("", "no-such-proc") }},
+		{"ResetProcessConns/unknown-host", func() { ResetProcessConns("no-such-host", "p") }},
 		{"FailDisk", func() { FailDisk("no-such-host") }},
 		{"HealDisk", func() { HealDisk("no-such-host") }},
 		{"FailWriteback", func() { FailWriteback("no-such-host") }},
@@ -632,7 +638,11 @@ func TestDSTFaultVictimOutsideRunNoop(t *testing.T) {
 	StepClock("nobody", time.Second)
 	FailDisk("nobody")
 	Partition("nobody", "nobody-else")
-	ResetProcess("nobody", "nobody-proc") // none of these may panic outside a run
+	ConfigureLink("nobody", "nobody-else", LinkConfig{Latency: time.Millisecond})
+	ConfigureLinkOneWay("nobody", "nobody-else", LinkConfig{Latency: time.Millisecond})
+	UnconfigureLink("nobody", "nobody-else")
+	ResetLinkConns("nobody", "nobody-else")
+	ResetProcessConns("nobody", "nobody-proc") // none of these may panic outside a run
 }
 
 // TestDSTClockBoundedDriftSeeded checks BoundedDrift: the clock RATE departure is

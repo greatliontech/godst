@@ -50,8 +50,11 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		{"UnisolateHost", func() { UnisolateHost("h") }},
 		{"PartitionOneWay", func() { PartitionOneWay("h", "g") }},
 		{"PartitionRefuse", func() { PartitionRefuse("h", "g") }},
-		{"ResetLink", func() { ResetLink("h", "g") }},
-		{"ResetProcess", func() { ResetProcess("h", "p") }},
+		{"ConfigureLink", func() { ConfigureLink("h", "g", LinkConfig{Latency: time.Millisecond}) }},
+		{"ConfigureLinkOneWay", func() { ConfigureLinkOneWay("h", "g", LinkConfig{Latency: time.Millisecond}) }},
+		{"UnconfigureLink", func() { UnconfigureLink("h", "g") }},
+		{"ResetLinkConns", func() { ResetLinkConns("h", "g") }},
+		{"ResetProcessConns", func() { ResetProcessConns("h", "p") }},
 		{"FailDisk", func() { FailDisk("h") }},
 		{"HealDisk", func() { HealDisk("h") }},
 		{"FailWriteback", func() { FailWriteback("h") }},
@@ -685,8 +688,11 @@ func TestDSTFaultOutsideRunIsNoop(t *testing.T) {
 	UnisolateHost("a")
 	PartitionOneWay("a", "b")
 	PartitionRefuse("a", "b")
-	ResetLink("a", "b")
-	ResetProcess("a", "p")
+	ConfigureLink("a", "b", LinkConfig{Latency: time.Millisecond})
+	ConfigureLinkOneWay("a", "b", LinkConfig{Latency: time.Millisecond})
+	UnconfigureLink("a", "b")
+	ResetLinkConns("a", "b")
+	ResetProcessConns("a", "p")
 	FailDisk("a")
 	HealDisk("a")
 	FailWriteback("a")

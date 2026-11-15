@@ -139,7 +139,7 @@ type Options struct {
 	// Process gets a fresh, deterministic pid (a restart gets a new one), so distinct
 	// processes have distinct pids. A custom PID must fit in the OS pid_t-sized
 	// runtime identity field; values <= 0 select the default, and oversized values
-	// panic instead of wrapping. With PidMax unset, a run that exhausts that
+	// panic instead of wrapping. With PIDMax unset, a run that exhausts that
 	// finite pid field while allocating Process pids also panics instead of
 	// reusing or wrapping pids.
 	//
@@ -159,18 +159,18 @@ type Options struct {
 	Hostname string
 	PID      int
 
-	// PidMax models the kernel's pid_max for Process pid allocation (default 0 =
-	// unbounded monotonic allocation). A positive PidMax makes allocation scan
-	// forward from the last allocated pid, WRAP into [2, PidMax] (pid 1 is the
+	// PIDMax models the kernel's pid_max for Process pid allocation (default 0 =
+	// unbounded monotonic allocation). A positive PIDMax makes allocation scan
+	// forward from the last allocated pid, WRAP into [2, PIDMax] (pid 1 is the
 	// simulated init/ppid), and skip live pids — alloc_pid's behavior — so pid
-	// REUSE becomes constructible: a small PidMax plus process churn
+	// REUSE becomes constructible: a small PIDMax plus process churn
 	// deterministically hands a dead process's pid to a new one, the
 	// same-pid-new-start-time hazard /proc start-time discrimination exists for.
-	// PidMax must exceed the root pid (a machine's own pid is inside its pid
+	// PIDMax must exceed the root pid (a machine's own pid is inside its pid
 	// space); negative or pid_t-overflowing values panic. A run in which every
-	// pid in [2, PidMax] is simultaneously live panics loud — the kernel answers
+	// pid in [2, PIDMax] is simultaneously live panics loud — the kernel answers
 	// fork with EAGAIN there, and Process has no error return to carry it.
-	PidMax int
+	PIDMax int
 
 	// NumCPU is the default simulated runtime.NumCPU() within a simulation (default
 	// 8; any value <= 0 selects the default), used by every host that does not set
@@ -249,47 +249,47 @@ type Options struct {
 	WedgeWallLimit time.Duration
 }
 
+// LinkConfig configures one-way delivery latency, jitter, and per-flow
+// bandwidth on simulated cross-host network links. It is used both for the
+// run-wide baseline (Options.Network.CrossHost) and for dynamic per-link
+// overrides (ConfigureLink and ConfigureLinkOneWay).
+//
+// Within a LinkConfig, 0 means disabled (0 delay, 0 jitter, or unlimited
+// bandwidth). Negative Latency, Jitter, or Bandwidth, or a positive Jitter
+// where Latency + (Jitter - 1) overflows time.Duration, panics before any
+// simulation or link state is modified.
+type LinkConfig struct {
+	// Latency is the base one-way delivery delay in universe base (virtual)
+	// time. Same-host and loopback connections are always instant.
+	Latency time.Duration
+
+	// Jitter, if > 0, is the maximum extra per-segment delivery delay: each
+	// segment propagates for Latency plus a value drawn from [0, Jitter) by
+	// the dedicated seeded fault RNG (FIFO-preserving and stream-isolated from
+	// goroutine scheduling).
+	Jitter time.Duration
+
+	// Bandwidth, if > 0, is the store-and-forward transmit rate in bytes per
+	// second for each connection direction (per flow): a segment of S bytes
+	// occupies the link for S/Bandwidth before Latency and Jitter apply.
+	Bandwidth int64
+}
+
 // NetworkConfig configures the simulated network for a run.
 type NetworkConfig struct {
-	// CrossHostLatency is the base one-way delivery latency applied to every
-	// simulated TCP connection between two DISTINCT hosts; same-host and loopback
-	// connections are always instant. The zero value is instant cross-host
-	// delivery — byte-identical to a connection with no latency machinery, so it
-	// does not perturb the N=1 collapse or any test that does not set it. Negative
-	// values are also disabled.
+	// CrossHost is the baseline LinkConfig applied to every simulated TCP
+	// connection direction between two distinct hosts unless overridden for
+	// that direction by ConfigureLink or ConfigureLinkOneWay. Same-host and
+	// loopback connections are always instant and unthrottled. The zero value
+	// is instant, jitter-free, unlimited cross-host delivery — byte-identical
+	// to a connection with no latency machinery, so it does not perturb the
+	// N=1 collapse or any test that does not set it.
 	//
-	// It is measured in universe BASE (virtual) time: a per-host clock skew
-	// (HostConfig.Clock) shifts what time.Now reads on a host but never the wire
-	// delay, so two hosts that disagree on wall time still observe the same
-	// latency — the property a clock-skew-tolerant system (e.g. an HLC) is tested
-	// against. Delivery stays in-order (FIFO, as TCP). Per-pair asymmetric
-	// latencies arrive with the targeting API; this is the single base default.
-	CrossHostLatency time.Duration
-
-	// CrossHostJitter, if > 0, is the maximum extra per-segment delivery jitter on
-	// every cross-host connection: each segment is delivered after CrossHostLatency
-	// plus a value drawn from [0, CrossHostJitter) by the dedicated seeded fault
-	// RNG. It is the network-jitter fault — variable link latency — and like the
-	// base latency it is base-time and FIFO-preserving (a later segment never
-	// overtakes an earlier one, so a reliable in-order stream is never reordered).
-	// Deterministic per seed and stream-isolated: enabling it never shifts the
-	// goroutine interleaving. The zero value is no jitter (same-host is always
-	// jitter-free); negative values are also disabled. A run is rejected before
-	// admission if CrossHostLatency plus the largest possible jitter draw cannot
-	// fit in time.Duration. Per-link jitter arrives with the L4 targeting API.
-	CrossHostJitter time.Duration
-
-	// CrossHostBandwidth, if > 0, is the bandwidth limit in BYTES PER SECOND for
-	// each cross-host connection direction (full-duplex, per flow): the link
-	// transmits segments serially at this rate, so a segment of S bytes is held
-	// S/CrossHostBandwidth before it propagates (then CrossHostLatency + jitter
-	// apply). A receiver therefore gets bytes no faster than this rate — the
-	// throttle fault, modeling a finite-capacity link. It is deterministic (no
-	// random draw) and FIFO-preserving. The zero value is unlimited (same-host is
-	// always unlimited); negative values are also unlimited. Shared-link
-	// contention (one budget across a host-pair's flows) is the L4 per-link
-	// refinement; this is per-flow.
-	CrossHostBandwidth int64
+	// Delays are measured in universe base (virtual) time: per-host clock skew
+	// (HostConfig.Clock) shifts what time.Now reads on a host but never wire
+	// propagation, so two hosts that disagree on wall time still observe the
+	// same link latency. Delivery remains strictly in-order (FIFO).
+	CrossHost LinkConfig
 
 	// SendBuffer is the per-direction send-buffer capacity in bytes on every
 	// connection (a TCP socket's send buffer). A Write blocks once this many bytes
@@ -608,32 +608,46 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 		// per-host value into the run. Both 0 and negative mean "use the default".
 		numcpu = defaultNumCPU
 	}
-	pidmax = opts.PidMax
+	pidmax = opts.PIDMax
 	switch {
 	case pidmax < 0:
-		// Unlike PID/NumCPU, a negative PidMax panics rather than selecting the
+		// Unlike PID/NumCPU, a negative PIDMax panics rather than selecting the
 		// default: 0 already means "unbounded", so a negative can only be a bug.
-		panic("testing/simulation: " + api + " Options.PidMax must be positive (0 = unbounded)")
+		panic("testing/simulation: " + api + " Options.PIDMax must be positive (0 = unbounded)")
 	case pidmax == 0:
 	case pidmax <= pid:
-		panic("testing/simulation: " + api + " Options.PidMax must exceed the root pid (a machine's own pid is inside its pid space)")
+		panic("testing/simulation: " + api + " Options.PIDMax must exceed the root pid (a machine's own pid is inside its pid space)")
 	case pidmax > maxPID:
-		panic("testing/simulation: " + api + " Options.PidMax overflows OS pid field")
+		panic("testing/simulation: " + api + " Options.PIDMax overflows OS pid field")
 	}
 	return kind, depth, steps, hostname, pid, numcpu, pidmax
 }
 
-// resolveNetConfig applies the SendBuffer/RetransmitTimeout defaults, returning the
-// values the runtime globals want: sendBuf 0 = unbounded (default 1 MiB when the field
-// is 0, unbounded when it is negative); retransNs 0 = no horizon (default 2 minutes
-// when the field is 0, disabled when it is negative).
-func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwidth, sendBuf, retransNs int64) {
-	latencyNs = max(0, n.CrossHostLatency.Nanoseconds())
-	jitterNs = max(0, n.CrossHostJitter.Nanoseconds())
-	bandwidth = max(0, n.CrossHostBandwidth)
-	if jitterNs > 0 && latencyNs > math.MaxInt64-(jitterNs-1) {
-		panic("testing/simulation: " + api + " Network latency plus jitter overflows time.Duration")
+func validateLinkConfig(api string, cfg LinkConfig) (latencyNs, jitterNs, bandwidth int64) {
+	if cfg.Latency < 0 {
+		panic("testing/simulation: " + api + " LinkConfig.Latency must be non-negative")
 	}
+	if cfg.Jitter < 0 {
+		panic("testing/simulation: " + api + " LinkConfig.Jitter must be non-negative")
+	}
+	if cfg.Bandwidth < 0 {
+		panic("testing/simulation: " + api + " LinkConfig.Bandwidth must be non-negative")
+	}
+	latencyNs = cfg.Latency.Nanoseconds()
+	jitterNs = cfg.Jitter.Nanoseconds()
+	bandwidth = cfg.Bandwidth
+	if jitterNs > 0 && latencyNs > math.MaxInt64-(jitterNs-1) {
+		panic("testing/simulation: " + api + " LinkConfig latency plus jitter overflows time.Duration")
+	}
+	return latencyNs, jitterNs, bandwidth
+}
+
+// resolveNetConfig validates n.CrossHost and applies the SendBuffer/RetransmitTimeout
+// defaults, returning the values the runtime globals want: sendBuf 0 = unbounded
+// (default 1 MiB when the field is 0, unbounded when it is negative); retransNs 0 =
+// no horizon (default 2 minutes when the field is 0, disabled when it is negative).
+func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwidth, sendBuf, retransNs int64) {
+	latencyNs, jitterNs, bandwidth = validateLinkConfig(api+" Options.Network.CrossHost", n.CrossHost)
 	switch {
 	case n.SendBuffer == 0:
 		sendBuf = 1 << 20 // default 1 MiB

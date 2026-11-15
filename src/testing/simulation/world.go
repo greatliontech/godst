@@ -243,8 +243,8 @@ func formatOptionsLiteral(o Options) string {
 	if o.PID != 0 {
 		parts = append(parts, fmt.Sprintf("PID: %d", o.PID))
 	}
-	if o.PidMax != 0 {
-		parts = append(parts, fmt.Sprintf("PidMax: %d", o.PidMax))
+	if o.PIDMax != 0 {
+		parts = append(parts, fmt.Sprintf("PIDMax: %d", o.PIDMax))
 	}
 	if o.NumCPU != 0 {
 		parts = append(parts, fmt.Sprintf("NumCPU: %d", o.NumCPU))
@@ -254,14 +254,18 @@ func formatOptionsLiteral(o Options) string {
 	}
 	if o.Network != (NetworkConfig{}) {
 		var netParts []string
-		if o.Network.CrossHostLatency != 0 {
-			netParts = append(netParts, fmt.Sprintf("CrossHostLatency: %d", o.Network.CrossHostLatency))
-		}
-		if o.Network.CrossHostJitter != 0 {
-			netParts = append(netParts, fmt.Sprintf("CrossHostJitter: %d", o.Network.CrossHostJitter))
-		}
-		if o.Network.CrossHostBandwidth != 0 {
-			netParts = append(netParts, fmt.Sprintf("CrossHostBandwidth: %d", o.Network.CrossHostBandwidth))
+		if o.Network.CrossHost != (LinkConfig{}) {
+			var linkParts []string
+			if o.Network.CrossHost.Latency != 0 {
+				linkParts = append(linkParts, fmt.Sprintf("Latency: %d", o.Network.CrossHost.Latency))
+			}
+			if o.Network.CrossHost.Jitter != 0 {
+				linkParts = append(linkParts, fmt.Sprintf("Jitter: %d", o.Network.CrossHost.Jitter))
+			}
+			if o.Network.CrossHost.Bandwidth != 0 {
+				linkParts = append(linkParts, fmt.Sprintf("Bandwidth: %d", o.Network.CrossHost.Bandwidth))
+			}
+			netParts = append(netParts, "CrossHost: simulation.LinkConfig{"+strings.Join(linkParts, ", ")+"}")
 		}
 		if o.Network.SendBuffer != 0 {
 			netParts = append(netParts, fmt.Sprintf("SendBuffer: %d", o.Network.SendBuffer))

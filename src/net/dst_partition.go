@@ -27,6 +27,9 @@ import (
 //go:linkname dstSetNetPartitionHook runtime.dstSetNetPartitionHook
 func dstSetNetPartitionHook(fn func(op, a, b uint32))
 
+//go:linkname dstSetNetLinkConfigHook runtime.dstSetNetLinkConfigHook
+func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64))
+
 //go:linkname dstSetNetHostDeadHook runtime.dstSetNetHostDeadHook
 func dstSetNetHostDeadHook(fn func(host uint32) bool)
 
@@ -66,6 +69,7 @@ const (
 
 func init() {
 	dstSetNetPartitionHook(dstApplyNetFaultOp)
+	dstSetNetLinkConfigHook(dstApplyLinkConfigOp)
 	dstSetNetHostDeadHook(dstHostDead) // simulation's Process guard queries the same mark dials consult
 	dstSetNetHasProcResourcesHook(dstNetHasProcResources)
 }
@@ -381,4 +385,130 @@ func dstPartWakeCh() <-chan struct{} {
 	defer dstPart.mu.Unlock()
 	dstPartRoll()
 	return dstPart.wake
+}
+
+// Link-policy op codes — net's contract with testing/simulation's
+// ConfigureLink / ConfigureLinkOneWay / UnconfigureLink API, passed through
+// runtime.dstNetLinkConfigOp.
+const (
+	dstLinkOpSetBoth uint32 = iota + 1
+	dstLinkOpSetOneWay
+	dstLinkOpClearBoth
+)
+
+type dstLinkParams struct {
+	latencyNs    int64
+	jitterNs     int64
+	bandwidthBps int64
+}
+
+// dstLinkOverrideEpoch holds dstNetEpoch() (> 0) when dstLinks.dirs contains at
+// least one active directional LinkConfig override for that run, or 0 when no
+// per-link overrides are active. Keying by the run epoch ensures the fast path
+// in dstLinkParamsForDir is immediately lock-free at the start of a subsequent
+// run without waiting for a lazy dstLinksRoll.
+var dstLinkOverrideEpoch atomic.Uint64
+
+// dstHasActiveLinkOverrides reports whether the current run has any active
+// directional LinkConfig override, lock-free and TSan-neutral.
+func dstHasActiveLinkOverrides() bool {
+	dstKernelSectionEnter()
+	e := dstLinkOverrideEpoch.Load()
+	active := e != 0 && e == dstNetEpoch()
+	dstKernelSectionExit()
+	return active
+}
+
+// dstLinks is the per-run directional link-policy table, independent of
+// dstPart so link configurations survive both HealLink and CrashHost until
+// cleared by UnconfigureLink or run end.
+var dstLinks struct {
+	mu    isync.KernelMutex
+	epoch uint64
+	dirs  map[uint64]dstLinkParams // ordered from→to → LinkConfig override
+}
+
+func dstLinksRoll() {
+	if e := dstNetEpoch(); e != dstLinks.epoch || dstLinks.dirs == nil {
+		dstLinks.epoch = e
+		dstLinks.dirs = make(map[uint64]dstLinkParams)
+		dstLinkOverrideEpoch.Store(0)
+	}
+}
+
+func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+	if !dstInSimBubble() {
+		return
+	}
+	dstCoarseRecord(dstCoarseNetHostID(a), true)
+	if b != a {
+		dstCoarseRecord(dstCoarseNetHostID(b), true)
+	}
+	if a == b {
+		// Same-host links are always instant and unthrottled (DST-NET-LATENCY-DET);
+		// keep dirs empty for same-host calls so dstHasActiveLinkOverrides stays false.
+		return
+	}
+	dstLinks.mu.Lock()
+	dstLinksRoll()
+	p := dstLinkParams{
+		latencyNs:    latencyNs,
+		jitterNs:     jitterNs,
+		bandwidthBps: bandwidthBps,
+	}
+	switch op {
+	case dstLinkOpSetBoth:
+		dstLinks.dirs[dstDirKey(a, b)] = p
+		dstLinks.dirs[dstDirKey(b, a)] = p
+	case dstLinkOpSetOneWay:
+		dstLinks.dirs[dstDirKey(a, b)] = p
+	case dstLinkOpClearBoth:
+		delete(dstLinks.dirs, dstDirKey(a, b))
+		delete(dstLinks.dirs, dstDirKey(b, a))
+	}
+	if len(dstLinks.dirs) > 0 {
+		dstLinkOverrideEpoch.Store(dstLinks.epoch)
+	} else {
+		dstLinkOverrideEpoch.Store(0)
+	}
+	dstLinks.mu.Unlock()
+}
+
+// dstLinkParamsForDir resolves the active (latencyNs, jitterNs, bandwidthBps)
+// policy for the directed link from→to: 0 for same-host, a configured per-link
+// override if present, or the run-wide Options.Network.CrossHost baseline.
+// Never emits TSan happens-before edges (timing policy only), while recording
+// Level-2 DPOR coarse reads on both host keys inside a simulation bubble.
+func dstLinkParamsForDir(from, to uint32) (latencyNs, jitterNs, bandwidthBps int64) {
+	if from == to {
+		return 0, 0, 0
+	}
+	if dstInSimBubble() {
+		dstCoarseRecord(dstCoarseNetHostID(from), false)
+		dstCoarseRecord(dstCoarseNetHostID(to), false)
+	}
+	dstKernelSectionEnter()
+	e := dstLinkOverrideEpoch.Load()
+	hasOverrides := e != 0 && e == dstNetEpoch()
+	if !hasOverrides {
+		latencyNs = dstNetCrossHostLatencyNs()
+		jitterNs = dstNetCrossHostJitterNs()
+		bandwidthBps = dstNetCrossHostBandwidthBps()
+	}
+	dstKernelSectionExit()
+	if !hasOverrides {
+		return latencyNs, jitterNs, bandwidthBps
+	}
+	dstLinks.mu.Lock()
+	dstLinksRoll()
+	p, ok := dstLinks.dirs[dstDirKey(from, to)]
+	if !ok {
+		latencyNs = dstNetCrossHostLatencyNs()
+		jitterNs = dstNetCrossHostJitterNs()
+		bandwidthBps = dstNetCrossHostBandwidthBps()
+	} else {
+		latencyNs, jitterNs, bandwidthBps = p.latencyNs, p.jitterNs, p.bandwidthBps
+	}
+	dstLinks.mu.Unlock()
+	return latencyNs, jitterNs, bandwidthBps
 }

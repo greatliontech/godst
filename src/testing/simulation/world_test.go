@@ -213,7 +213,7 @@ func TestDSTWorldDeterministic(t *testing.T) {
 	run := func() string {
 		var log []string
 		boots := 0
-		World(7, Options{Network: NetworkConfig{CrossHostLatency: 3 * time.Millisecond}}, []HostDecl{
+		World(7, Options{Network: NetworkConfig{CrossHost: LinkConfig{Latency: 3 * time.Millisecond}}}, []HostDecl{
 			{Name: "a", Boot: worldEchoBoot(&boots)},
 			{Name: "b", Boot: func() {}},
 		}, func(ctl *Ctl) {
@@ -341,7 +341,11 @@ func TestDSTExploreReportFormat(t *testing.T) {
 	failures, notes := formatExploreReport(42, ExploreResult{
 		Schedules: 7,
 		Failures: []Failure{
-			{Schedule: []uint64{1, 0, 2}, Race: true, ForeignSched: true, Options: Options{CrashTear: true},
+			{Schedule: []uint64{1, 0, 2}, Race: true, ForeignSched: true, Options: Options{
+				PIDMax:    16,
+				CrashTear: true,
+				Network:   NetworkConfig{CrossHost: LinkConfig{Latency: 5 * time.Millisecond, Jitter: 2 * time.Millisecond, Bandwidth: 4096}},
+			},
 				AccessForces: []AccessForce{{Seq: 3, Count: 9, PCKey: 0x40}}},
 			{Schedule: []uint64{0}, Panic: "boom"},
 			{Deadlock: "all goroutines blocked"},
@@ -356,7 +360,7 @@ func TestDSTExploreReportFormat(t *testing.T) {
 		t.Fatalf("failure artifacts = %d, want 3", len(failures))
 	}
 	wantInFailure := [][]string{
-		{"data race", "Schedule: []uint64{0x1, 0x0, 0x2}", "CrashTear: true", "ForeignSched: true", "AccessForces", "simulation.Replay(42"},
+		{"data race", "Schedule: []uint64{0x1, 0x0, 0x2}", "PIDMax: 16", "CrossHost: simulation.LinkConfig{Latency: 5000000, Jitter: 2000000, Bandwidth: 4096}", "CrashTear: true", "ForeignSched: true", "AccessForces", "simulation.Replay(42"},
 		{"panic: boom", "ForeignSched: false"},
 		{"deadlock: all goroutines blocked"},
 	}

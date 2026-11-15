@@ -28,7 +28,7 @@ type dstHalfConn interface {
 
 func TestDSTNetCanceledMidHandshakeDialReleasesBacklog(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  50 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 50 * time.Millisecond},
 		RetransmitTimeout: time.Second,
 	}}
 	simulation.RunWith(1, opts, func() {
@@ -110,7 +110,7 @@ func TestDSTNetCanceledMidHandshakeDialReleasesBacklog(t *testing.T) {
 
 func TestDSTNetAcceptWaitsForSYNACKAcrossOneWayPartition(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  50 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 50 * time.Millisecond},
 		RetransmitTimeout: 500 * time.Millisecond,
 	}}
 
@@ -222,7 +222,7 @@ func TestDSTNetAcceptWaitsForSYNACKAcrossOneWayPartition(t *testing.T) {
 
 func TestDSTNetTCPConnCloseWriteHalfDuplex(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 10 * time.Millisecond,
+		CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond},
 	}}
 	simulation.RunWith(1, opts, func() {
 		addrCh := make(chan string, 1)
@@ -300,7 +300,7 @@ func TestDSTNetTCPConnCloseWriteHalfDuplex(t *testing.T) {
 
 func TestDSTNetTCPConnCloseWritePartitionAndDeadPeer(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  10 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 10 * time.Millisecond},
 		RetransmitTimeout: 300 * time.Millisecond,
 	}}
 
@@ -417,7 +417,7 @@ func TestDSTNetTCPConnCloseWritePartitionAndDeadPeer(t *testing.T) {
 
 func TestDSTNetTCPConnCloseReadSemantics(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 10 * time.Millisecond,
+		CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond},
 	}}
 	simulation.RunWith(1, opts, func() {
 		addrCh := make(chan string, 1)
@@ -515,7 +515,7 @@ func TestDSTNetTCPConnCloseReadSemantics(t *testing.T) {
 
 func TestDSTNetHalfCloseCloseWaitHorizonDeath(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  10 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 10 * time.Millisecond},
 		RetransmitTimeout: 200 * time.Millisecond,
 		SendBuffer:        64,
 	}}
@@ -722,7 +722,7 @@ func TestDSTNetCloseWriteUnreadRSTPartitionAndInFlightFIN(t *testing.T) {
 	// Subcase A: CloseWrite + unread-inbound Close across an active blackhole
 	// partition must suppress both FIN and RST across the cut.
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  10 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 10 * time.Millisecond},
 		RetransmitTimeout: 250 * time.Millisecond,
 	}}, func() {
 		addrCh := make(chan string, 1)
@@ -782,7 +782,7 @@ func TestDSTNetCloseWriteUnreadRSTPartitionAndInFlightFIN(t *testing.T) {
 	// (no partition): peer has not entered CLOSE_WAIT yet, so an immediate Write
 	// before FIN arrival reports one-shot ECONNRESET, then EPIPE.
 	simulation.RunWith(2, simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 100 * time.Millisecond,
+		CrossHost: simulation.LinkConfig{Latency: 100 * time.Millisecond},
 	}}, func() {
 		addrCh := make(chan string, 1)
 		srvConnCh := make(chan dstHalfConn, 1)
@@ -837,7 +837,7 @@ func TestDSTNetCloseWriteUnreadRSTPartitionAndInFlightFIN(t *testing.T) {
 	// before unread-inbound Close: tcp_reset's CLOSE_WAIT arm reports io.EOF / EPIPE
 	// without ECONNRESET.
 	simulation.RunWith(3, simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency: 10 * time.Millisecond,
+		CrossHost: simulation.LinkConfig{Latency: 10 * time.Millisecond},
 	}}, func() {
 		addrCh := make(chan string, 1)
 		srvConnCh := make(chan dstHalfConn, 1)
@@ -887,7 +887,7 @@ func TestDSTNetCloseWriteUnreadRSTPartitionAndInFlightFIN(t *testing.T) {
 
 func TestDSTNetListenerCloseBlackholeSuppressesRSTAcrossAllRaces(t *testing.T) {
 	opts := simulation.Options{Network: simulation.NetworkConfig{
-		CrossHostLatency:  20 * time.Millisecond,
+		CrossHost:         simulation.LinkConfig{Latency: 20 * time.Millisecond},
 		RetransmitTimeout: 200 * time.Millisecond,
 	}}
 
