@@ -7,6 +7,7 @@ package simulation
 import (
 	"errors"
 	"io/fs"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -126,10 +127,22 @@ func TestAPISurfaceUniformOutsideRun(t *testing.T) {
 		{"ConfigureLink/neg-jit", func() { ConfigureLink("a", "b", LinkConfig{Jitter: -1}) }, "LinkConfig.Jitter must be non-negative"},
 		{"ConfigureLink/neg-bw", func() { ConfigureLink("a", "b", LinkConfig{Bandwidth: -1}) }, "LinkConfig.Bandwidth must be non-negative"},
 		{"ConfigureLinkOneWay/neg-lat", func() { ConfigureLinkOneWay("a", "b", LinkConfig{Latency: -1}) }, "LinkConfig.Latency must be non-negative"},
+		{"Sometimes/empty", func() { Sometimes("", 0.5) }, "Sometimes name must be non-empty"},
+		{"Sometimes/neg", func() { Sometimes("p", -0.1) }, "Sometimes prob must be in [0, 1]"},
+		{"Sometimes/gt1", func() { Sometimes("p", 1.1) }, "Sometimes prob must be in [0, 1]"},
+		{"Sometimes/nan", func() { Sometimes("p", math.NaN()) }, "Sometimes prob must be in [0, 1]"},
+		{"Sometimes/pos-inf", func() { Sometimes("p", math.Inf(1)) }, "Sometimes prob must be in [0, 1]"},
+		{"Sometimes/neg-inf", func() { Sometimes("p", math.Inf(-1)) }, "Sometimes prob must be in [0, 1]"},
 	} {
 		panicked, msg := didPanicWith(tc.call)
 		if !panicked || !strings.Contains(msg, tc.want) {
 			t.Errorf("%s outside run: panicked=%v msg=%q, want containing %q", tc.name, panicked, msg, tc.want)
+		}
+	}
+
+	for _, prob := range []float64{0, 0.5, 1} {
+		if Sometimes("outside-probe", prob) {
+			t.Errorf("Sometimes(\"outside-probe\", %v) outside run = true, want false", prob)
 		}
 	}
 }

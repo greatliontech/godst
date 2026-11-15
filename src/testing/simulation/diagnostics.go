@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // formatRunDiagnostics snapshots and renders the current run's failure-only
-// diagnostics (live goroutines killed by normal Process exit and ungranted
-// bubble writes to standard output/error), prefixed with the seed header.
-// Returns "" when the run recorded neither.
+// diagnostics (activated Sometimes fault points, live goroutines killed by
+// normal Process exit, and ungranted bubble writes to standard output/error),
+// prefixed with the seed header. Returns "" when the run recorded none.
 func formatRunDiagnostics(seed uint64) string {
 	body := formatRunDiagnosticsBody()
 	if body == "" {
@@ -22,16 +23,34 @@ func formatRunDiagnostics(seed uint64) string {
 	return fmt.Sprintf("--- simulation diagnostics (seed %d) ---\n%s", seed, body)
 }
 
-// formatRunDiagnosticsBody renders the current run's killed-goroutine and
-// captured bubble stdio sections without an outer seed header so ExploreTest
-// can attach per-schedule diagnostics under each Failure block.
+// formatRunDiagnosticsBody renders the current run's activated-Sometimes,
+// killed-goroutine, and captured bubble stdio sections without an outer seed
+// header so ExploreTest can attach per-schedule diagnostics under each Failure
+// block.
 func formatRunDiagnosticsBody() string {
-	killMeta, killSeqs, killGoPCs, killStartPCs, killStates, droppedKills, stdioMeta, stdioData, stdioTruncated := dstSnapshotRunDiagnostics()
-	if len(killMeta) == 0 && droppedKills == 0 && len(stdioMeta) == 0 && stdioTruncated == 0 {
+	killMeta, killSeqs, killGoPCs, killStartPCs, killStates, droppedKills, stdioMeta, stdioData, stdioTruncated, sometimesNames, sometimesMeta, sometimesOverflow := dstSnapshotRunDiagnostics()
+	if len(killMeta) == 0 && droppedKills == 0 && len(stdioMeta) == 0 && stdioTruncated == 0 && len(sometimesNames) == 0 && sometimesOverflow == 0 {
 		return ""
 	}
 
 	var b strings.Builder
+	if len(sometimesNames) > 0 || sometimesOverflow > 0 {
+		b.WriteString("activated fault points (Sometimes):\n")
+		for i, prefix := range sometimesNames {
+			hits := sometimesMeta[i][0]
+			firstAt := time.Duration(int64(sometimesMeta[i][1]))
+			origLen := int(sometimesMeta[i][2])
+			trunc := ""
+			if origLen > len(prefix) {
+				trunc = fmt.Sprintf(" (truncated from %d bytes)", origLen)
+			}
+			fmt.Fprintf(&b, "  %q%s: %d hit(s) (first at +%s)\n", prefix, trunc, hits, firstAt)
+		}
+		if sometimesOverflow > 0 {
+			fmt.Fprintf(&b, "  ... +%d activation(s) across additional fault point(s) omitted\n", sometimesOverflow)
+		}
+	}
+
 	if len(killMeta) > 0 || droppedKills > 0 {
 		b.WriteString("killed goroutines on process exit:\n")
 		for _, meta := range killMeta {

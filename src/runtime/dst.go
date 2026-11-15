@@ -192,6 +192,12 @@ func dstActivate(seed uint64) {
 	} else {
 		getg().dstrand = 1 // keep a seeded root nonzero (dstReadRandom's unseeded sentinel is dstrand==0)
 	}
+	if r := dstBugRandRoot(seed); r != 0 {
+		getg().dstBugRand = r
+	} else {
+		getg().dstBugRand = 1
+	}
+	getg().dstTimerSeq = 0
 	// Root the caller's host/process identity at the default (0,0); the bubble
 	// main re-roots to (0,0) too (synctestRun), and Host/Process stamp subtrees
 	// from there. Only bubble goroutines are attributed: a goroutine that already
@@ -272,7 +278,17 @@ func dstSetNode(host, proc uint32) (oldHost, oldProc uint32) {
 // chain they inherited even after the declaring goroutine leaves Host.
 type dstHostScope struct {
 	host   uint32
+	boot   uint64
 	parent *dstHostScope
+}
+
+func dstHostScopeBootAlive(scope *dstHostScope) bool {
+	for s := scope; s != nil; s = s.parent {
+		if !dstHostBootAlive(s.host, s.boot) {
+			return false
+		}
+	}
+	return true
 }
 
 // dstPushHostScope stamps an entered Host extent and returns the prior current
@@ -287,6 +303,7 @@ func dstPushHostScope(host, proc uint32) (oldHost, oldProc uint32) {
 		scope = new(dstHostScope)
 	})
 	scope.host = host
+	scope.boot = dstCurrentHostBootCount(host)
 	scope.parent = gp.dstHostScope
 	gp.dstHostScope = scope
 	oldHost, oldProc = gp.dstHost, gp.dstProc
@@ -3359,6 +3376,8 @@ func dstDeactivate() {
 	// is the active run's own). dstDeactivate runs on the activating goroutine
 	// (runLocked's defer), so this is a self-write.
 	getg().dstrand = 0
+	getg().dstBugRand = 0
+	getg().dstTimerSeq = 0
 	dstSimRootG = nil
 	dstSimBubble = nil
 	// Clear the simulation identity of every PARKED member goroutine the run
@@ -3666,6 +3685,79 @@ func dstCgoRefuse() {
 // crypto/rand outputs).
 func dstBubbleMainRoot(seed uint64) uint64 {
 	return dstBubbleRoot(seed ^ 0xB1BB1E00_B1BB1E00)
+}
+
+// dstBugRandRoot and dstBugRandMainRoot derive the dedicated two-root per-g
+// inline fault-point RNG roots (g.dstBugRand) for bubble.root/bubble.gcDrain
+// and bubble.main respectively, salted disjointly from both each other and
+// dstrand so Sometimes evaluations stay stream-isolated across both SUT
+// goroutines and finalizer/cleanup callbacks.
+func dstBugRandRoot(seed uint64) uint64 {
+	return dstBubbleRoot(seed ^ 0x4255475f_524f4f54)
+}
+
+func dstBugRandMainRoot(seed uint64) uint64 {
+	return dstBubbleRoot(seed ^ 0x4255475f_4d41494e)
+}
+
+func dstFnv1a64(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
+}
+
+func dstSometimesSiteEnabled(seed, nameHash uint64) bool {
+	x := dstSplitmix64(seed ^ 0x64737462_75676721 ^ (nameHash * 0x9e3779b97f4a7c15))
+	x = dstSplitmix64(x ^ nameHash)
+	return x&1 == 1
+}
+
+// dstSometimes evaluates a named FoundationDB-style inline fault point for the
+// calling bubble goroutine without perturbing dstrand, dstSchedRand,
+// dstFaultRand, heap accounting, or Level-2 DPOR / race synchronization state.
+// Outside the active simulation bubble (including pre-run/post-run SetFinalizer
+// and AddCleanup workers, foreign goroutines, and foreign synctest bubbles), it
+// returns false with zero side effects, matching modeled stdlib SUT surfaces.
+// Reached from testing/simulation.Sometimes via //go:linkname after argument
+// validation.
+//
+//go:linkname dstSometimes
+func dstSometimes(name string, prob float64) bool {
+	gp := getg()
+	b := gp.bubble
+	if b == nil || b != dstSimBubble || !dstActive() {
+		return false
+	}
+	if prob == 0 {
+		return false
+	}
+	nameHash := dstFnv1a64(name)
+	if prob == 1 {
+		dstRecordSometimesHit(b, name, nameHash)
+		return true
+	}
+	if !dstSometimesSiteEnabled(dstSeed.Load(), nameHash) {
+		return false
+	}
+	if gp.dstBugRand == 0 {
+		gp.dstBugRand = dstBugRandRoot(dstSeed.Load() ^ dstEnsureSeq(gp))
+		if gp.dstBugRand == 0 {
+			gp.dstBugRand = 1
+		}
+	}
+	u := float64(dstBugRandUint64(gp)>>11) * (1.0 / (1 << 53))
+	if u < prob {
+		dstRecordSometimesHit(b, name, nameHash)
+		return true
+	}
+	return false
 }
 
 // dstSetAsyncPreemptOff sets debug.asyncpreemptoff and returns its previous
@@ -4188,6 +4280,8 @@ const (
 	dstMaxExitKillEvents       = 256
 	dstStdioBufCap             = 256 << 10
 	dstStdioMaxChunks          = 4096
+	dstMaxSometimesSites       = 256
+	dstSometimesNameCap        = 128
 )
 
 type dstKilledG struct {
@@ -4223,17 +4317,29 @@ type dstStdioArena struct {
 	buf [dstStdioBufCap]byte
 }
 
+type dstSometimesSite struct {
+	_          sys.NotInHeap
+	nameHash   uint64
+	nameLen    int
+	hitCount   uint64
+	firstAtNs  int64
+	namePrefix [dstSometimesNameCap]byte
+}
+
 var dstDiagLock mutex
 
 var dstRunDiag struct {
-	killEvents     *[dstMaxExitKillEvents]dstExitKillEvent
-	nkillEvents    uint32
-	droppedKills   uint32
-	stdioChunks    *[dstStdioMaxChunks]dstStdioChunk
-	nstdioChunks   uint32
-	stdioBuf       *dstStdioArena
-	stdioUsed      uint32
-	stdioTruncated uint64
+	killEvents        *[dstMaxExitKillEvents]dstExitKillEvent
+	nkillEvents       uint32
+	droppedKills      uint32
+	stdioChunks       *[dstStdioMaxChunks]dstStdioChunk
+	nstdioChunks      uint32
+	stdioBuf          *dstStdioArena
+	stdioUsed         uint32
+	stdioTruncated    uint64
+	sometimesSites    *[dstMaxSometimesSites]dstSometimesSite
+	nsometimesSites   uint32
+	sometimesOverflow uint64
 }
 
 func dstResetRunDiagnostics() {
@@ -4243,6 +4349,58 @@ func dstResetRunDiagnostics() {
 	dstRunDiag.nstdioChunks = 0
 	dstRunDiag.stdioUsed = 0
 	dstRunDiag.stdioTruncated = 0
+	dstRunDiag.nsometimesSites = 0
+	dstRunDiag.sometimesOverflow = 0
+	unlock(&dstDiagLock)
+}
+
+func dstBytesEqualString(a []byte, s string) bool {
+	if len(a) != len(s) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func dstRecordSometimesHit(b *synctestBubble, name string, nameHash uint64) {
+	relNs := b.now - int64(synctestBaseTime)
+	prefixLen := min(len(name), dstSometimesNameCap)
+	lock(&dstDiagLock)
+	if dstRunDiag.sometimesSites == nil {
+		dstRunDiag.sometimesSites = (*[dstMaxSometimesSites]dstSometimesSite)(
+			sysAlloc(unsafe.Sizeof(*dstRunDiag.sometimesSites), &memstats.other_sys, "dst sometimes diagnostics"))
+		if dstRunDiag.sometimesSites == nil {
+			unlock(&dstDiagLock)
+			throw("dst: sometimes diagnostics allocation failed")
+		}
+	}
+	for i := uint32(0); i < dstRunDiag.nsometimesSites; i++ {
+		ent := &dstRunDiag.sometimesSites[i]
+		if ent.nameHash == nameHash && ent.nameLen == len(name) &&
+			dstBytesEqualString(ent.namePrefix[:prefixLen], name[:prefixLen]) {
+			ent.hitCount++
+			unlock(&dstDiagLock)
+			return
+		}
+	}
+	if dstRunDiag.nsometimesSites >= dstMaxSometimesSites {
+		dstRunDiag.sometimesOverflow++
+		unlock(&dstDiagLock)
+		return
+	}
+	ent := &dstRunDiag.sometimesSites[dstRunDiag.nsometimesSites]
+	dstRunDiag.nsometimesSites++
+	ent.nameHash = nameHash
+	ent.nameLen = len(name)
+	ent.hitCount = 1
+	ent.firstAtNs = relNs
+	if prefixLen > 0 {
+		memmove(unsafe.Pointer(&ent.namePrefix[0]), unsafe.Pointer(unsafe.StringData(name)), uintptr(prefixLen))
+	}
 	unlock(&dstDiagLock)
 }
 
@@ -4372,8 +4530,9 @@ func dstBubbleStdioAppend(fd int, p []byte) int {
 	return len(p)
 }
 
-// dstSnapshotRunDiagnostics copies out the current run's off-heap killed-goroutine
-// and stdio diagnostic records after the bubble has exited.
+// dstSnapshotRunDiagnostics copies out the current run's off-heap killed-goroutine,
+// stdio, and activated Sometimes fault-site diagnostic records after the bubble
+// has exited.
 //
 //go:linkname dstSnapshotRunDiagnostics
 func dstSnapshotRunDiagnostics() (
@@ -4386,6 +4545,9 @@ func dstSnapshotRunDiagnostics() (
 	stdioMeta [][6]uint64,
 	stdioData []byte,
 	stdioTruncated uint64,
+	sometimesNames []string,
+	sometimesMeta [][3]uint64,
+	sometimesOverflow uint64,
 ) {
 	lock(&dstDiagLock)
 	nk := int(dstRunDiag.nkillEvents)
@@ -4395,6 +4557,7 @@ func dstSnapshotRunDiagnostics() (
 	}
 	nc := int(dstRunDiag.nstdioChunks)
 	nbytes := int(dstRunDiag.stdioUsed)
+	ns := int(dstRunDiag.nsometimesSites)
 	unlock(&dstDiagLock)
 
 	if nk > 0 {
@@ -4410,10 +4573,17 @@ func dstSnapshotRunDiagnostics() (
 	if nbytes > 0 {
 		stdioData = make([]byte, nbytes)
 	}
+	var sometimesArena []byte
+	if ns > 0 {
+		sometimesNames = make([]string, ns)
+		sometimesMeta = make([][3]uint64, ns)
+		sometimesArena = make([]byte, ns*dstSometimesNameCap)
+	}
 
 	lock(&dstDiagLock)
 	droppedKillEvents = dstRunDiag.droppedKills
 	stdioTruncated = dstRunDiag.stdioTruncated
+	sometimesOverflow = dstRunDiag.sometimesOverflow
 	nk = min(nk, int(dstRunDiag.nkillEvents))
 	killMeta = killMeta[:nk]
 	for i := 0; i < nk; i++ {
@@ -4464,6 +4634,28 @@ func dstSnapshotRunDiagnostics() (
 	if nbytes > 0 {
 		copy(stdioData, dstRunDiag.stdioBuf.buf[:nbytes])
 	}
+	ns = min(ns, int(dstRunDiag.nsometimesSites))
+	sometimesNames = sometimesNames[:ns]
+	sometimesMeta = sometimesMeta[:ns]
+	for i := 0; i < ns; i++ {
+		ent := &dstRunDiag.sometimesSites[i]
+		prefixLen := min(ent.nameLen, dstSometimesNameCap)
+		off := i * dstSometimesNameCap
+		if prefixLen > 0 {
+			copy(sometimesArena[off:off+prefixLen], ent.namePrefix[:prefixLen])
+		}
+		sometimesMeta[i] = [3]uint64{
+			ent.hitCount,
+			uint64(ent.firstAtNs),
+			uint64(ent.nameLen),
+		}
+	}
 	unlock(&dstDiagLock)
+	for i := 0; i < ns; i++ {
+		prefixLen := min(int(sometimesMeta[i][2]), dstSometimesNameCap)
+		if prefixLen > 0 {
+			sometimesNames[i] = unsafe.String(&sometimesArena[i*dstSometimesNameCap], prefixLen)
+		}
+	}
 	return
 }

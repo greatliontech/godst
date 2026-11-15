@@ -304,7 +304,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T))
 ```
 
 - **`Run` / `RunWith`** execute `f` inside a deterministic simulation bubble seeded by `seed`. For the duration of the call, `GOMAXPROCS` is pinned to `1` (attempts to resize via `runtime.GOMAXPROCS` inside the run are ignored and restored on return), asynchronous preemption is disabled, GC runs deterministically stop-the-world with synchronous sweep, and two quiet `sync.Pool` generations are drained before bubble teardown so bubble-stamped objects never leak into subsequent runs.
-- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, any captured in-bubble `stdout`/`stderr` output and abnormal process-exit goroutine kill diagnostics are automatically formatted and logged to `t`.
+- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, any captured in-bubble `stdout`/`stderr` output, abnormal process-exit goroutine kill diagnostics, and activated `Sometimes` fault sites are automatically formatted and logged to `t`.
 
 #### `Strategy`
 
@@ -477,9 +477,9 @@ func (c *Ctl) End()
 
 ### 3.4 Fault Injection API
 
-All fault functions follow two uniform safety rules:
+All external fault-mutator functions (network, crash, disk, and clock faults) follow two uniform safety rules — whereas inline `Sometimes` hooks embedded inside SUT library code return `false` outside the active bubble (see below):
 
-1. **Scheduled bubble caller required:** During an active run, fault functions must be called from a goroutine inside the simulation bubble (the driver script or a simulated goroutine); calling from a foreign background goroutine panics loudly so wall-clock races never sneak into a run. Outside an active run, all fault functions are safe no-ops (after validating immediate scalar/struct bounds such as `LinkConfig`, `DriftClock`, `LimitDisk`, and `SlowDisk`).
+1. **Scheduled bubble caller required:** During an active run, external fault mutators must be called from a goroutine inside the simulation bubble (the driver script or a simulated goroutine); calling from a foreign background goroutine panics loudly so wall-clock races never sneak into a run. Outside an active run, all external fault functions are safe no-ops (after validating immediate scalar/struct bounds such as `LinkConfig`, `DriftClock`, `LimitDisk`, and `SlowDisk`).
 2. **Loud victim validation:** Passing an undeclared `host` or `proc` name panics immediately so typo'd fault targets never pass tests vacuously. `CrashProcess(host, proc)` additionally panics if `(host, proc)` has no currently live invocation, whereas `ResetProcessConns(host, proc)` is a valid 0-connection no-op when a previously declared `(host, proc)` has already exited. For both `CrashProcess` and `ResetProcessConns`, pass `host == ""` to target a `Process` declared on the unnamed root host.
 
 #### Network Faults & Per-Link Policy
@@ -561,6 +561,43 @@ func DriftClock(host string, ppb int64)
 
 - **`StepClock(host, delta)`**: instantaneous forward (`delta > 0`) or backward (`delta < 0`) NTP wall-clock jump on `host`. Relative timers/contexts are unaffected; `time.Since` across the step reflects the wall jump. Panics if the step would take `host`'s wall clock before the Unix epoch.
 - **`DriftClock(host, ppb)`**: continuous mid-run crystal rate change (`rate = 1 + ppb/1e9`, `ppb` in `(-1e9, 1e9]`) without wall discontinuity, remapping all armed timers and tickers on `host` to the new rate (`DriftClock(host, 0)` restores unit rate).
+
+#### Inline Fault-Point Activation (`Sometimes`)
+
+```go
+func Sometimes(name string, prob float64) bool
+```
+
+- **`Sometimes(name, prob)`** evaluates a deterministic two-level rare-event / fault-injection decision inside SUT or harness code (FoundationDB `BUGGIFY` semantics):
+  1. **Argument validation (uniform in both `-tags dst` and untagged builds):** `name` must be non-empty and `prob` must be a finite `float64` in `[0.0, 1.0]` (`NaN`, `< 0`, or `> 1` panics immediately, even outside an active run or at `prob == 0`, so invalid fault-site wiring fails fast in ordinary unit tests).
+  2. **Boundary gates:** Returns `false` with zero RNG draws when `prob == 0`, in untagged (`!dst`) builds, outside an active simulation run, or from a foreign goroutine outside the active bubble.
+  3. **Two-level activation:** In `-tags dst` builds inside the active simulation bubble, level 1 hashes `(seed, name)` statelessly to enable each distinct site name for approximately **50% of seeds** — preventing simultaneous activation of every fault hook from starving deep multi-step state space on every run. Level 2 draws from the calling goroutine's dedicated `dstBugRand` stream (`true` when `prob == 1.0` or the draw `< prob`).
+  4. **Observation neutrality & DPOR commutativity:** `dstBugRand` is completely isolated from `g.dstrand` (`math/rand`, `crypto/rand`, `maphash`, map/`select` order), `dstSchedRand`, and `dstFaultRand`, allocates zero Go heap memory, and emits zero synchronization edges — adding or removing `Sometimes` calls that return `false` never shifts schedules, RNG draws, or `DPOR` equivalence classes.
+  5. **Failure-only active-site diagnostics:** Every site where `Sometimes` returns `true` is recorded in an off-heap 256-slot ledger (`name`, hit count, and first-fired relative virtual timestamp) and rendered automatically only when `Test`, `TestWith`, `WorldTest`, or `ExploreTest` fails (silent on passing runs, even under `-test.v`).
+
+**Stock-Go library wrapper pattern:** Because `testing/simulation` is shipped in the `godst` toolchain, libraries that also compile under stock upstream Go isolate `simulation.Sometimes` behind a tiny two-file build-tag pair:
+
+```go
+// fault_dst.go
+//go:build dst
+
+package mypkg
+
+import "testing/simulation"
+
+func buggify(name string, prob float64) bool {
+	return simulation.Sometimes(name, prob)
+}
+```
+
+```go
+// fault_prod.go
+//go:build !dst
+
+package mypkg
+
+func buggify(string, float64) bool { return false }
+```
 
 ---
 
@@ -663,7 +700,7 @@ func (r ReplayResult) Failed() bool // Returns r.Err != nil || r.Raced
 Unmodified application and library code (`net/http`, `crypto/tls`, custom binary RPC muxes, WALs, B-trees, memory-mapped engines) works out of the box inside a simulation across these modeled surfaces:
 
 - **Time, Synchronization, & Randomness (`time`, `testing/synctest`, `sync`, `math/rand`, `math/rand/v2`, `crypto/rand`, `hash/maphash`):**
-  - `time.Now`, `Sleep`, `After`, `AfterFunc`, `NewTimer`, `NewTicker`, and `context.WithTimeout`/`WithDeadline` run on the simulation bubble's virtual clock with per-host wall skew (`Skew`/`BoundedSkew`), NTP jumps (`StepClock`), and crystal rate drift (`Drift`/`BoundedDrift`/`DriftClock`); `synctest.Wait` settles runnable goroutines at `0ns` virtual-time advance.
+  - `time.Now`, `Sleep`, `After`, `AfterFunc`, `NewTimer`, `NewTicker`, and `context.WithTimeout`/`WithDeadline` run on the simulation bubble's virtual clock with per-host wall skew (`Skew`/`BoundedSkew`), NTP jumps (`StepClock`), and crystal rate drift (`Drift`/`BoundedDrift`/`DriftClock`); `time.AfterFunc` and `context.WithTimeout` callbacks inherit the arming goroutine's `Host`, `Process`, and seeded RNG streams (`dstrand` and `dstBugRand`), and cancel cleanly without running if that host or process crashes/exits before firing; `synctest.Wait` settles runnable goroutines at `0ns` virtual-time advance.
   - Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` returns virtual base time rebased to the calling host's current boot instant (resetting to `0` across `CrashHost` + reboot).
   - In-bubble `sync.Mutex`, `sync.RWMutex`, `sync.WaitGroup`, `sync.Cond`, and `sync.Once` waits are durably tracked with deterministic starvation handoff and Level-2 DPOR happens-before edges.
   - `math/rand`, `math/rand/v2`, `crypto/rand`, `hash/maphash`, `select` case order, and value-keyed map iteration derive from per-goroutine seeded streams (`g.dstrand`) immune to OS thread migration and host load.
@@ -680,7 +717,7 @@ Unmodified application and library code (`net/http`, `crypto/tls`, custom binary
   - Synthetic `/proc/self/ns/pid`, `/proc/<pid>/stat` (deterministic field-22 `starttime` in `USER_HZ` ticks), `/proc/sys/kernel/random/boot_id`, and `syscall.Kill(pid, 0)` liveness probes.
 - **Environment & Stdio Diagnostics:**
   - Per-`(host, process invocation)` copy-on-write `os.Getenv` / `Setenv` / `Unsetenv` / `Clearenv` / `Environ`.
-  - Writes to ungranted `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) inside a bubble are captured off-heap with zero heap or scheduler perturbation and printed automatically only if the test or explored schedule fails.
+  - Writes to ungranted `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) inside a bubble, abnormal process-exit goroutine kills, and activated `Sometimes` fault sites are captured off-heap with zero heap or scheduler perturbation and printed automatically only if the test or explored schedule fails.
 
 ---
 

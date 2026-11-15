@@ -18,6 +18,15 @@ import (
 	"unsafe"
 )
 
+//go:linkname dstKernelEnter runtime.dstKernelEnter
+func dstKernelEnter()
+
+//go:linkname dstKernelExit runtime.dstKernelExit
+func dstKernelExit()
+
+//go:linkname dstSetNode runtime.dstSetNode
+func dstSetNode(host, proc uint32) (oldHost, oldProc uint32)
+
 //go:linkname dstKernelSectionEnter runtime.dstKernelSectionEnter
 func dstKernelSectionEnter()
 
@@ -544,7 +553,7 @@ func dstIsClosedKernelChan(c <-chan struct{}) bool {
 	return closed
 }
 
-func (d *dstDeadline) set(t time.Time) {
+func (d *dstDeadline) set(e *dstWireEnd, t time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.timer != nil {
@@ -559,12 +568,17 @@ func (d *dstDeadline) set(t time.Time) {
 		}
 		return
 	}
+	// Evaluate time.Until(t) in the caller's clock frame (mirroring
+	// internal/poll.setDeadlineImpl, where t = time.Now().Add(d) cancels the
+	// caller's own wall offset), then arm the deadline timer on e.localHost so
+	// the socket host's clock drift and crash lifecycle govern the timer rather
+	// than any transient calling process or foreign host scope.
 	if dur := time.Until(t); dur > 0 {
 		if closed {
 			d.cancel = make(chan struct{})
 		}
 		seq := d.seq
-		d.timer = time.AfterFunc(dur, func() {
+		d.timer = e.kernelAfterFunc(dur, func() {
 			d.mu.Lock()
 			if d.seq == seq && !isClosedChan(d.cancel) {
 				close(d.cancel)
@@ -768,7 +782,21 @@ func (e *dstWireEnd) armKeepalive() {
 	if remaining < 1 {
 		remaining = 1
 	}
-	time.AfterFunc(time.Duration(remaining), e.kaCheck)
+	e.kernelAfterFunc(time.Duration(remaining), e.kaCheck)
+}
+
+// kernelAfterFunc arms a modeled-kernel TCP timer owned by e.localHost rather
+// than any calling user Process, so user Process exit neither cancels shared
+// socket timers nor records kernel timer goroutines as leaked user threads, and
+// re-arming from kaCheck/horizonCheck or socket deadlines preserves e.localHost's
+// clock drift and crash lifecycle.
+func (e *dstWireEnd) kernelAfterFunc(d time.Duration, fn func()) *time.Timer {
+	dstKernelEnter()
+	oldHost, oldProc := dstSetNode(e.localHost, 0)
+	tm := time.AfterFunc(d, fn)
+	dstSetNode(oldHost, oldProc)
+	dstKernelExit()
+	return tm
 }
 
 // kaCheck is one keepalive-timer fire — tcp_keepalive_timer's own per-fire
@@ -858,7 +886,7 @@ func (e *dstWireEnd) kaCheck() {
 		// point, then re-fire at the due instant.
 		e.kaProbesOut = 0
 		e.kaMu.Unlock()
-		time.AfterFunc(time.Duration(due-now), e.kaCheck)
+		e.kernelAfterFunc(time.Duration(due-now), e.kaCheck)
 		return
 	}
 	kill := false
@@ -877,7 +905,7 @@ func (e *dstWireEnd) kaCheck() {
 	}
 	e.kaProbesOut++
 	e.kaMu.Unlock()
-	time.AfterFunc(time.Duration(intvlNs), e.kaCheck)
+	e.kernelAfterFunc(time.Duration(intvlNs), e.kaCheck)
 }
 
 // kaPoke wakes this end's blocked reads so they re-evaluate arming — the
@@ -935,7 +963,7 @@ func (e *dstWireEnd) armHorizon() {
 	e.horizonArmed = true
 	e.horizonAnchor = dstBaseNanos()
 	e.horizonMu.Unlock()
-	time.AfterFunc(time.Duration(horizon), e.horizonCheck)
+	e.kernelAfterFunc(time.Duration(horizon), e.horizonCheck)
 }
 
 // horizonCheck runs at the watchdog's deadline: disarm if the episode ended (heal
@@ -1001,7 +1029,7 @@ func (e *dstWireEnd) horizonCheck() {
 	}
 	e.horizonMu.Unlock()
 	if remaining := e.effRetransNs() - (dstBaseNanos() - anchor); remaining > 0 {
-		time.AfterFunc(time.Duration(remaining), e.horizonCheck)
+		e.kernelAfterFunc(time.Duration(remaining), e.horizonCheck)
 		return
 	}
 	e.horizonMu.Lock()
@@ -2037,8 +2065,8 @@ func (e *dstWireEnd) setDeadlineAfterCoarse(t time.Time) error {
 		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
-	e.rdDead.set(t)
-	e.wrDead.set(t)
+	e.rdDead.set(e, t)
+	e.wrDead.set(e, t)
 	return nil
 }
 
@@ -2052,7 +2080,7 @@ func (e *dstWireEnd) setReadDeadlineAfterCoarse(t time.Time) error {
 		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
-	e.rdDead.set(t)
+	e.rdDead.set(e, t)
 	return nil
 }
 
@@ -2066,6 +2094,6 @@ func (e *dstWireEnd) setWriteDeadlineAfterCoarse(t time.Time) error {
 		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
-	e.wrDead.set(t)
+	e.wrDead.set(e, t)
 	return nil
 }

@@ -18,10 +18,12 @@ const dstBuild = true
 //
 // Field ordering packs dstHost alongside dstProc, dstProcSlot alongside dstPid,
 // dstGCInternal and dstInternalGC alongside dstAccWrite, and dstKernelDepth
-// alongside the trailing bool flags, so dstG is 76 bytes on 32-bit
-// architectures and 96 bytes on 64-bit architectures.
+// alongside the trailing bool flags, so dstG is 92 bytes on 32-bit
+// architectures and 112 bytes on 64-bit architectures.
 type dstG struct {
 	dstrand        uint64        // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
+	dstBugRand     uint64        // deterministic per-g inline fault-point RNG state (testing/simulation.Sometimes); isolated from dstrand
+	dstTimerSeq    uint64        // deterministic per-g func-timer arm counter; forks AfterFunc RNG seeds without advancing dstrand/dstBugRand
 	dstPrio        int64         // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	dstSeq         uint64        // DST stable per-bubble goroutine creation index+1 (0 = unassigned); canonicalizes Random/PCT choices and scheduled replay
 	dstHost        uint32        // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1
@@ -43,6 +45,22 @@ type dstG struct {
 	dstKernelDepth int32         // DST nesting depth of uninterruptible modeled kernel critical sections; suppresses scheduler yields and stack-shrink preemption while > 0
 }
 
+// dstTimerRunCtx stages a firing func-based bubble timer's captured owner
+// identity and forked RNG seeds on the current P across unlockAndRun's unlock
+// sequence.
+type dstTimerRunCtx struct {
+	armed       bool
+	epoch       uint64
+	host        uint32
+	boot        uint64
+	proc        uint32
+	slot        uint32
+	pid         int32
+	funcRand    uint64
+	funcBugRand uint64
+	hostScope   *dstHostScope
+}
+
 // dstP holds the per-P DST state embedded into runtime.p under -tags dst.
 type dstP struct {
 	dstRunqOvf          gQueue
@@ -50,15 +68,25 @@ type dstP struct {
 	dstSpecialStaged    bool
 	dstCleanupSlabBlock *cleanupBlock
 	dstCleanupSlab      *[len(cleanupBlock{}.cleanups)]dstCallbackStamp
+	dstTimerCtx         dstTimerRunCtx
 }
 
 // dstTimer holds the per-timer DST state embedded into runtime.timer under -tags dst.
 type dstTimer struct {
-	dstHost      uint32
-	dstBase      bool
-	dstReg       uint64
-	dstFakeNext  *timer
-	dstWhenShift int64
+	dstHost        uint32
+	dstProc        uint32
+	dstProcSlot    uint32
+	dstPid         int32
+	dstBase        bool
+	dstFuncArmed   bool
+	dstReg         uint64
+	dstEpoch       uint64
+	dstBoot        uint64
+	dstFuncRand    uint64
+	dstFuncBugRand uint64
+	dstHostScope   *dstHostScope
+	dstFakeNext    *timer
+	dstWhenShift   int64
 }
 
 // dstBubble holds the per-bubble DST state embedded into runtime.synctestBubble under -tags dst.

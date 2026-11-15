@@ -15,6 +15,7 @@ type kernelMutex = sync.Mutex
 
 func dstActivate(seed uint64)                                                 {}
 func dstDeactivate()                                                          {}
+func dstSometimes(name string, prob float64) bool                             { return false }
 func dstSetAsyncPreemptOff(off bool) (old bool)                               { return false }
 func dstBuilt() bool                                                          { return false }
 func dstSetSchedStrategy(kind uint8, depth, steps int32)                      {}
@@ -120,6 +121,9 @@ func dstSnapshotRunDiagnostics() (
 	stdioMeta [][6]uint64,
 	stdioData []byte,
 	stdioTruncated uint64,
+	sometimesNames []string,
+	sometimesMeta [][3]uint64,
+	sometimesOverflow uint64,
 ) {
 	return
 }

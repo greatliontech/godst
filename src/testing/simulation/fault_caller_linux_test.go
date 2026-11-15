@@ -119,13 +119,14 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		close(done)
 	})
 	for _, f := range faults {
+		wantAPI, _, _ := strings.Cut(f.name, "/")
 		for _, pos := range []string{f.name, f.name + "/foreign-bubble"} {
 			msg := got[pos]
 			if msg == "" {
 				t.Errorf("%s during an active run did not panic", pos)
 				continue
 			}
-			if !strings.Contains(msg, f.name) || !strings.Contains(msg, "outside the run's bubble") {
+			if !strings.Contains(msg, wantAPI) || !strings.Contains(msg, "outside the run's bubble") {
 				t.Errorf("%s panic = %q, want the caller-position diagnostic naming the API", pos, msg)
 			}
 		}
@@ -703,4 +704,7 @@ func TestDSTFaultOutsideRunIsNoop(t *testing.T) {
 	UnlimitDisk("a")
 	SlowDisk("a", time.Millisecond)
 	CorruptFile("a", "/f")
+	if Sometimes("outside", 0.5) || Sometimes("outside-one", 1) {
+		t.Fatalf("Sometimes outside a run returned true")
+	}
 }

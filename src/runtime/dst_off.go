@@ -90,6 +90,9 @@ func dstSynctestStopGCDrain(*synctestBubble)                                   {
 func dstExploreRecordDeadlock(string, *synctestBubble) bool                    { return false }
 func dstTimeNowWall(int64) (int64, int32)                                      { return 0, 0 }
 func dstTimerModify(*timer, int64, int64) (int64, int64)                       { return 0, 0 }
+func dstTimerStampLocked(*timer)                                               {}
 func dstTimerRand() uint32                                                     { return 0 }
-func dstTimerConsumeWhenShift(*timer, int64) int64                             { return 0 }
+func dstTimerConsumeWhenShift(*timer, int64, *synctestBubble) int64            { return 0 }
+func dstTimerRunCallback(func(any, uintptr, int64), any, uintptr, int64, *synctestBubble) {
+}
 func dstKernelLiftGoStartIgnoreSync(*g) bool                                   { return false }

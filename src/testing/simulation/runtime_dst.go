@@ -20,6 +20,9 @@ func dstActivate(seed uint64)
 //go:linkname dstDeactivate runtime.dstDeactivate
 func dstDeactivate()
 
+//go:linkname dstSometimes runtime.dstSometimes
+func dstSometimes(name string, prob float64) bool
+
 //go:linkname dstSetAsyncPreemptOff runtime.dstSetAsyncPreemptOff
 func dstSetAsyncPreemptOff(off bool) (old bool)
 
@@ -304,4 +307,7 @@ func dstSnapshotRunDiagnostics() (
 	stdioMeta [][6]uint64,
 	stdioData []byte,
 	stdioTruncated uint64,
+	sometimesNames []string,
+	sometimesMeta [][3]uint64,
+	sometimesOverflow uint64,
 )

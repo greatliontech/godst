@@ -18,7 +18,7 @@ func TestSizeof(t *testing.T) {
 	const xreg = unsafe.Sizeof(runtime.XRegPerG{}) // Varies per architecture
 	g32, g64 := uintptr(288), uintptr(448)
 	if runtime.DSTBuild {
-		g32, g64 = 356, 544
+		g32, g64 = 372, 560
 	}
 	var tests = []struct {
 		val    any     // type as a value

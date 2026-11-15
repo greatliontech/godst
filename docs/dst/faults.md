@@ -272,11 +272,12 @@ tolerate*, so it cannot be a single global clock.
   `os.Hostname`/`runtime.NumCPU`; every goroutine of a process observes one `os.Getpid`; distinct
   hosts/processes observe distinct values; same seed + config → identical run-to-run. *violation:*
   `os.Hostname`/`Getpid` returns different values on two goroutines of one host/process (an inheritance
-  gap), or a value drawn from a load-dependent source varies run-to-run, so a SUT that derives node ids
+  gap, including `time.AfterFunc` or `context.WithTimeout` callbacks spawned from `g0`), or a value drawn from a load-dependent source varies run-to-run, so a SUT that derives node ids
   from them diverges across replays. *Enforced:* per-host identity is a deterministic table keyed by
-  `g.dstHost`, per-process pid is `g.dstPid` inherited at `newproc1` and allocated from a seed-ordered
+  `g.dstHost`, per-process pid is `g.dstPid` inherited at `newproc1` (and stamped on func-based bubble timers at `(*timer).modify` so `time.AfterFunc` / `context.WithTimeout` callbacks inherit their arming host, process, and deterministic RNG streams and do not fire after process/host death) and allocated from a seed-ordered
   counter; `TestDSTIdentity{PerHostHostname,PerHostNumCPU,PerProcessPid,Determinism}`
-  (`testing/simulation/identity_test.go`), mutation-tested.
+  (`testing/simulation/identity_test.go`) and `TestDSTAfterFuncIdentityDeterminismAndCrashLiveness`
+  (`testing/simulation/sometimes_test.go`), mutation-tested.
 - **DST-IDENTITY-SOUND (entailed: simulated replaces real).** Under an active run the simulated identity
   fully replaces the real machine's — `os.Hostname`/`Getpid`/`runtime.NumCPU`/`net.Interfaces` never leak
   the developer's box, and `Kill(pid, 0)` never probes host pid liveness. *violation:* a real hostname/pid/
@@ -389,14 +390,14 @@ API compiles to per-host-pair / per-process fault records over the full mesh —
 - `ConfigureLink("h1", "h2", cfg)` / `ConfigureLinkOneWay("h1", "h2", cfg)` / `UnconfigureLink("h1", "h2")` — symmetric or directional per-link `LinkConfig{Latency, Jitter, Bandwidth}` policy overriding `Options.Network.CrossHost` defaults.
 - `ResetLinkConns("h1", "h2")` / `ResetProcessConns("h1", "p2")` — inject TCP `RST` on a link's or `(host, process)`'s open connections.
 - `CrashProcess("h1", "p2")` / `CrashHost("h1")` / `OOM("h1", "p2", budget)` / `Straggle("h1", "p2")` / `StepClock("h1", delta)` / `DriftClock("h1", ppb)`.
-- `Sometimes("site-name", prob)` — deterministic inline SUT fault-point activation (**pending**).
+- `Sometimes("site-name", prob)` — deterministic inline SUT fault-point activation (an inline query rather than an external victim-mutator; see `Inline fault-point activation` below).
 
 Attribution is what makes targeting sound and leak-free: a conn records both endpoints' host + invocation slot, a
 file its host (and open handle its invocation slot), a goroutine its host + logical process + invocation slot — so a host-pair partition or link policy touches exactly that pair's
 cross-host conns, and a process crash exactly that `(host, process)`'s live invocations and resources (DST-FAULT-VICTIM). The host-pair and host-isolation
 targeting (`Partition`/`PartitionRefuse`/`PartitionOneWay`/`HealLink`/`IsolateHost`/`UnisolateHost`/`ConfigureLink`/`ConfigureLinkOneWay`/`UnconfigureLink`),
-the per-process and per-host forms (`CrashProcess`, `ResetProcessConns`; `CrashHost`, `ResetLinkConns`), and the crash/restart axes are **landed**;
-inline `Sometimes`, the group/zone forms, and `OOM`/`Straggle` extend it as those axes land.
+the per-process and per-host forms (`CrashProcess`, `ResetProcessConns`; `CrashHost`, `ResetLinkConns`), the crash/restart axes, and inline `Sometimes` are **landed**;
+the group/zone forms and `OOM`/`Straggle` extend it as those axes land.
 
 **Victim names fail loud.** A fault or configuration API that takes a host name (`StepClock`,
 `DriftClock`, `HostIP`, `HostFS`, `ConfigureLink`, `ConfigureLinkOneWay`, `UnconfigureLink`, the partition/reset/crash/disk targets) **panics on a name no `Host`
@@ -408,13 +409,15 @@ lookup choke point in `testing/simulation` (`lookupHost`/`lookupProc`) that ever
 clock, HostIP/HostFS, partition, reset, crash, disk — shares; outside a run the calls stay documented no-ops.
 `TestDSTFaultVictimUnknownPanics` / `TestDSTFaultVictimOutsideRunNoop`.
 
-**Fault callers fail loud too.** A fault-injection or clock-fault API invoked during an active run
+**Fault callers fail loud too.** Every external fault-injection or clock-fault mutator invoked during an active run
 from a goroutine OUTSIDE the run's bubble panics, naming the API and the fix — it never executes at
 an OS wall-clock instant the seed does not control (crash, partition, disk) and never silently
 no-ops (clock faults, whose caller has no bubble clock to step): both are the same
-silently-tests-nothing class the victim rule kills. Faults are injected from goroutines the
+silently-tests-nothing class the victim rule kills. External faults are injected from goroutines the
 simulation schedules — the run body or goroutines started inside it. Outside a run the calls stay
-documented no-ops. `TestDSTFaultFromNonBubbleGoroutinePanics` / `TestDSTFaultOutsideRunIsNoop`.
+documented no-ops. (Inline `Sometimes` hooks embedded inside SUT library code instead return `false`
+with zero side effect whenever called outside the active bubble, matching modeled stdlib SUT surfaces;
+see `Inline fault-point activation` below.) `TestDSTFaultFromNonBubbleGoroutinePanics` / `TestDSTFaultOutsideRunIsNoop`.
 The DECLARATION APIs (`Host`, `Process`) carry the same guard: they mutate run state too — a
 mid-run `Host` re-declaration is a reboot (host-up relay plus clock re-establishment) and
 `Process` starts SUT goroutines — so a foreign caller during an active run panics identically,
@@ -1206,7 +1209,7 @@ policy at `dstSchedSelect` fed through `RunWith`, now able to name its victim by
 
 ### Inline fault-point activation (`Sometimes`)
 
-Status: **pending** (spec-tier contract). External network, disk, clock, and crash faults exercise a
+Status: **enforced**. External network, disk, clock, and crash faults exercise a
 distributed system from its OS/network boundaries, whereas internal algorithm states — early batch
 flushes, minimum split/compaction thresholds, short buffer sizes, Raft heartbeat jitter, retryable
 backoff branches — sit inside the SUT's own state machines. FoundationDB-style inline fault hooks
@@ -1216,9 +1219,13 @@ degrees of freedom directly to seed sweeps and `Explore` runs without altering p
 - **Validation and outside-run contract.** `name == ""` or `!(prob >= 0 && prob <= 1)` (including `NaN`)
   panics uniformly in **both** untagged (`!dst`) and `-tags dst` builds, inside or outside an active
   simulation run, so invalid site names or probabilities never hide behind build tags or inactive runs.
-  With valid arguments, `Sometimes` returns `false` outside an active simulation run (including all
-  untagged builds) with zero allocation or side effect. Calling `Sometimes` during an active run from a
-  foreign (non-bubble) goroutine panics loudly naming `Sometimes`, matching all other fault APIs.
+  With valid arguments, `Sometimes` returns `false` whenever the caller is outside the active
+  simulation bubble — including all untagged builds, outside an active run, outside-run
+  `runtime.SetFinalizer` / `runtime.AddCleanup` callbacks running on `fing` / `runCleanups`, foreign
+  goroutines, and foreign `synctest` bubbles — with zero RNG draws, zero allocations, and zero
+  diagnostic mutations (unlike external harness mutators such as `Partition` or `CrashHost`, inline
+  `Sometimes` hooks live inside SUT library code paths such as `Close` or cache eviction that may also
+  execute in ordinary background cleanup contexts within the same `-tags dst` test binary).
 - **Consumer stock-Go wrapper discipline.** Downstream libraries that remain buildable with stock
   upstream Go (where `testing/simulation` does not exist) and keep `"testing"` out of production
   binaries wrap `simulation.Sometimes` behind a two-file `//go:build dst` / `//go:build !dst` internal
@@ -1254,10 +1261,13 @@ degrees of freedom directly to seed sweeps and `Explore` runs without altering p
   site entries storing `(nameHash uint64, nameLen int, namePrefix [128]byte)`, hit counts, and
   first-fired relative virtual timestamps `bubble.now - baseOrigin`, deduplicating on `(nameHash,
   nameLen, namePrefix[:min(nameLen, 128)])` and marking truncated names on render whenever `nameLen >
-  128`, plus an overflow counter for additional distinct sites) with `0` Go heap allocations and `0`
+  128`, plus an overflow counter for activations beyond `256` distinct sites) with `0` Go heap allocations and `0`
   TSan / Level-2 DPOR synchronization edges. Passing runs emit nothing; failing `Test`, `TestWith`,
   `WorldTest`, and `ExploreTest` runs render all activated `Sometimes` sites in deterministic
-  first-fired order alongside the failure diagnostics.
+  first-fired order alongside the failure diagnostics (`TestDSTSometimesValidationAndBoundaryGates`,
+  `TestDSTSometimesTwoLevelEnablementAndDistribution`,
+  `TestDSTSometimesObservationNeutralityAndDPORCommutativity`,
+  `TestDSTSometimesFinalizerAndCleanupTwoRootIsolation`, `TestDiagnosticsSometimesActiveSitesOnFailure`).
 
 Collapse-check (`Sometimes`): **sound** when callers guard only legal internal degrees of freedom of the
 SUT (program discipline — identical to writing a configurable threshold parameter); **stream-isolated**
@@ -1277,7 +1287,7 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   the host FS (the kernel would survive it), a clock that runs backward with no NTP step, a timer fired
   before its deadline — a false positive while every documented ordering/durability guarantee still holds.
   *Enforced (jitter + throttle + per-link-policy + partition + clock-step + clock-drift + disk-EIO + disk-ENOSPC +
-  disk-latency + crash classes landed; each further fault class as it lands):* per-fault structural argument + a
+  disk-latency + crash + inline-Sometimes classes landed; each further fault class as it lands):* per-fault structural argument + a
   regression test per fault class that the faulted execution is one the real stack can produce. Jitter is a real link degree of freedom (variable latency) that only
   *delays* — bounded to [0, max), never dropping or reordering a live stream (delivery is head-of-line, in
   order, DST-NET-FIFO): `TestDSTNetJitterBounded` / `TestDSTNetJitterFIFO`. Throttle is finite link
@@ -1328,7 +1338,11 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   crash, which is the whole host/process split), and the failures it surfaces are the real ones of a
   machine losing power: never a torn sibling (`TestDSTCrashHostVictimScoping`), never a resource of the
   dead kernel surviving into the reboot (`TestDSTCrashHostRestartFreshResources`,
-  `TestDSTCrashHostClosesRootProcessResources`).
+  `TestDSTCrashHostClosesRootProcessResources`). **Inline fault points** (`Sometimes`) return a boolean at
+  explicit SUT-authored perturbation hooks (retryable RPC error, transient delay, leader step-down, cache
+  eviction) and always return `false` outside an active simulation run, so every execution where `Sometimes`
+  returns `true` is an execution the SUT itself implements at a real failure or rare-event seam
+  (`TestDSTSometimesValidationAndBoundaryGates`, `TestDSTSometimesTwoLevelEnablementAndDistribution`).
 - **DST-FAULT-REPLAY (clause-explicit: determinism).** Same seed + same fault configuration (declarative
   set or policy) → identical execution, including which faults fired when. *violation:* a fault decision
   drawn from a load-dependent source (wall clock, per-m RNG) varies run-to-run, breaking replay.
@@ -1348,10 +1362,12 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   `ConfigureLinkOneWay` / `UnconfigureLink`) applies explicit directional `(Latency, Jitter,
   Bandwidth)` triples whose jitter draws consume `dstFaultRand` deterministically at schedule-ordered
   send/dial points and whose Level-2 coarse dependencies are tracked on endpoints (`TestDSTNetLinkConfigReplayDeterminism`,
-  `TestDSTKernelConfigureLinkCoarseDPOR`). **Inline fault points** (`Sometimes`, *pending*) combine stateless `(seed, name)`
+  `TestDSTKernelConfigureLinkCoarseDPOR`). **Inline fault points** (`Sometimes`) combine stateless `(seed, name)`
   hashing with the dedicated per-goroutine `g.dstBugRand` fork-tree so identical seeds and schedules
   fire the exact same hooks without perturbing `g.dstrand`, `dstSchedRand`, or `dstFaultRand`, and
-  concurrent goroutines commute under `DPOR`. (Extends to each further fault class's draws as it
+  concurrent goroutines commute under `DPOR` (`TestDSTSometimesTwoLevelEnablementAndDistribution`,
+  `TestDSTSometimesObservationNeutralityAndDPORCommutativity`,
+  `TestDSTSometimesFinalizerAndCleanupTwoRootIsolation`). (Extends to each further fault class's draws as it
   lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process invocation**, a file/tree/port to a **host** — and a fault on
@@ -1420,7 +1436,7 @@ adversarial loop.
   — **done**; disk **EIO** / **ENOSPC** / **latency** / **bit-rot** — **done**; **process crash** (`CrashProcess`, incl. the
   self-crash form) + **restart** over the live host filesystem — **done**; **host crash** (`CrashHost`,
   power loss) + **reboot** onto the restored durable image — **done**;
-  inline SUT fault-point activation (`Sometimes`) — **pending**;
+  inline SUT fault-point activation (`Sometimes`) — **done**;
   scheduling (straggler), OOM (allocation-triggered process crash) — pending.
   Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded

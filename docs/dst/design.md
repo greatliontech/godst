@@ -64,7 +64,9 @@ creation all vary, shifting the application's select/map stream (measured: ~1% d
 load; one churn run diverged 58/60). The fix is a **per-goroutine deterministic RNG** (`g.dstrand`,
 splitmix64) seeded as a **deterministic tree**: the root from the DST seed (via the `testing/simulation`
 API — see Enablement below; each `synctest` bubble re-roots independently),
-each child from its parent at `newproc1`. select poll order and `maps.rand` draw from this per-g
+each child from its parent at `newproc1` (and each func-based bubble timer at `(*timer).modify`, so
+`time.AfterFunc` and `context.WithTimeout` callbacks spawned from `g0` inherit deterministic per-g RNG
+and host/process liveness). select poll order and `maps.rand` draw from this per-g
 stream under DST, so a goroutine's select/map order is a function of its own logical history only —
 immune to m assignment, scheduler draws, and load (measured: 0 divergences, 150/150 under heavy load,
 and 60/60 under GOMAXPROCS=4 M-churn). See `rand.go` `dstrandUint64`.
@@ -1271,11 +1273,11 @@ in-run programmatic capture assigns `os.Stdout`/`os.Stderr` to simulated files (
 regular files), whose backend takes precedence over the default `fd 1`/`fd 2` capture. Capability writes are
 outbound, schedule-ordered side effects that feed no nondeterminism back into the run.
 
-**Failure-only causal event timeline and active fault-site diagnostics (pending).** Alongside the
+**Failure-only causal event timeline and active fault-site diagnostics.** Alongside the
 off-heap `stdout`/`stderr` buffer and process-exit goroutine-kill ledger ([faults.md](./faults.md)),
 each simulation run maintains two additional observation-neutral, off-heap (`sysAlloc`,
 `sys.NotInHeap`), `dstDiagLock`-guarded diagnostic structures:
-1. **Causal event ring buffer (`256` slots + monotonic `totalEvents` sequence counter):** Records
+1. **Causal event ring buffer (`256` slots + monotonic `totalEvents` sequence counter) (pending):** Records
    high-signal state transitions in universe base virtual time (`bubble.now - baseOrigin`) without
    recording steady-state per-`Read`/`Write` segment or file traffic:
    - *Topology & lifecycle:* `Host` / `HostWith` boot and live clock re-declaration, `Process` /
@@ -1291,11 +1293,11 @@ each simulation run maintains two additional observation-neutral, off-heap (`sys
      `ETIMEDOUT`, and `RST` delivery.
    - *Filesystem fault hits (`os`):* `EIO` returned on read/write/sync, `fsyncgate` dirty-page
      writeback drop, and `ENOSPC` short-write or refusal.
-2. **Activated `Sometimes` fault-site table (`256` distinct site slots + overflow counter):** Records
+2. **Activated `Sometimes` fault-site table (`256` distinct site slots + overflow counter) (enforced):** Records
    every named `simulation.Sometimes` site that returned `true` during the run — deduplicating on
    `(nameHash uint64, nameLen int, namePrefix[:min(nameLen, 128)])` and marking truncated names on
-   render when `nameLen > 128` — along with its total hit count and its first-fired relative virtual
-   timestamp ([faults.md](./faults.md), "Inline fault-point activation (`Sometimes`)").
+   render when `nameLen > 128`, plus counting overflow activations beyond `256` distinct sites — along with its total hit count and its first-fired relative virtual
+   timestamp ([faults.md](./faults.md), "Inline fault-point activation (`Sometimes`)", `TestDiagnosticsSometimesActiveSitesOnFailure`).
 
 Producers pass only scalar event codes, integer IDs/arguments, and raw string/path byte slices copied
 via bounded `memmove` into fixed inline byte arrays (marking truncated strings if they exceed the slot
@@ -2245,9 +2247,9 @@ table); the open work is the OOM and scheduling faults and the declarative orche
   the shared contract designed up front, so no axis forecloses
   another); implementation is **bottoms-up** — the Host/Process substrate first, faults last (see "Build
   order"). The net (including dynamic per-link `LinkConfig` via `ConfigureLink` / `ConfigureLinkOneWay` /
-  `UnconfigureLink`), disk, clock, **process-crash/restart**, **host-crash/reboot**, and **crash-tear**
-  axes are landed and replay-exact; inline `Sometimes` fault-point activation and the failure-only causal
-  event timeline are specified and **pending**; what remains beyond those is the OOM (allocation-triggered)
+  `UnconfigureLink`), disk, clock, **process-crash/restart**, **host-crash/reboot**, **crash-tear**, and
+  inline **`Sometimes`** fault-point activation axes are landed and replay-exact; the failure-only causal
+  event timeline is specified and **pending**; what remains beyond that is the OOM (allocation-triggered)
   and scheduling (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a
   seeded `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
 Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →

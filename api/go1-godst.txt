@@ -48,6 +48,7 @@ pkg testing/simulation, func Run(uint64, func())
 pkg testing/simulation, func RunWith(uint64, Options, func())
 pkg testing/simulation, func Skew(time.Duration) ClockConfig
 pkg testing/simulation, func SlowDisk(string, time.Duration)
+pkg testing/simulation, func Sometimes(string, float64) bool
 pkg testing/simulation, func StartWorld([]HostDecl) *Ctl
 pkg testing/simulation, func StepClock(string, time.Duration)
 pkg testing/simulation, func Test(*testing.T, uint64, func(*testing.T))

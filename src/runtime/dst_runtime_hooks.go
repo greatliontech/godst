@@ -23,11 +23,13 @@ func dstCanPreemptG(gp *g) bool {
 	return gp.dstKernelDepth == 0
 }
 
+//go:linkname dstKernelEnter
 //go:nosplit
 func dstKernelEnter() {
 	getg().dstKernelDepth++
 }
 
+//go:linkname dstKernelExit
 //go:nosplit
 func dstKernelExit() {
 	gp := getg()
@@ -442,6 +444,12 @@ func dstNewproc1Init(newg, callergp *g) {
 		newg.dstrand = dstrandUint64(callergp)
 		if newg.dstrand == 0 {
 			newg.dstrand = 1
+		}
+	}
+	if callergp.dstBugRand != 0 {
+		newg.dstBugRand = dstBugRandUint64(callergp)
+		if newg.dstBugRand == 0 {
+			newg.dstBugRand = 1
 		}
 	}
 	newg.dstHost = callergp.dstHost
@@ -890,6 +898,15 @@ func dstrandUint64(gp *g) uint64 {
 }
 
 //go:nosplit
+func dstBugRandUint64(gp *g) uint64 {
+	gp.dstBugRand += 0x9e3779b97f4a7c15
+	z := gp.dstBugRand
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+//go:nosplit
 func dstrandnRaw(gp *g, n uint32) (j uint32, raw uint64) {
 	raw = dstrandUint64(gp)
 	return uint32((uint64(uint32(raw)) * uint64(n)) >> 32), raw
@@ -1107,6 +1124,11 @@ func dstSynctestClaimBubble(gp *g, bubble *synctestBubble) {
 		if bubble.main.dstrand == 0 {
 			bubble.main.dstrand = 1
 		}
+		bubble.main.dstBugRand = dstBugRandMainRoot(dstSeed.Load())
+		if bubble.main.dstBugRand == 0 {
+			bubble.main.dstBugRand = 1
+		}
+		bubble.main.dstTimerSeq = 0
 		bubble.main.dstHost = 0
 		bubble.main.dstHostScope = nil
 		bubble.main.dstProc = 0
@@ -1335,10 +1357,157 @@ func dstTimerRand() uint32 {
 	return cheaprand()
 }
 
-func dstTimerConsumeWhenShift(t *timer, delay int64) int64 {
+func dstTimerIsFuncCallback(t *timer) bool {
+	if t.isChan || t.f == nil {
+		return false
+	}
+	fv := *(**funcval)(unsafe.Pointer(&t.f))
+	grf := goroutineReady
+	grfv := *(**funcval)(unsafe.Pointer(&grf))
+	return fv != nil && fv.fn != grfv.fn
+}
+
+func dstTimerStampLocked(t *timer) {
+	if !dstActive() || !t.isFake || !dstTimerIsFuncCallback(t) {
+		t.dstFuncArmed = false
+		t.dstHostScope = nil
+		return
+	}
+	gp := getg()
+	if dstSimBubble == nil || gp.bubble != dstSimBubble {
+		t.dstFuncArmed = false
+		t.dstHostScope = nil
+		return
+	}
+	t.dstFuncArmed = true
+	t.dstEpoch = dstRunEpoch.Load()
+	t.dstHost = gp.dstHost
+	t.dstBoot = dstCurrentHostBootCount(gp.dstHost)
+	if gp.dstKernelDepth > 0 {
+		t.dstHostScope = nil
+		t.dstProc = 0
+		t.dstProcSlot = 0
+		t.dstPid = 0
+	} else {
+		t.dstHostScope = gp.dstHostScope
+		t.dstProc = gp.dstProc
+		t.dstProcSlot = gp.dstProcSlot
+		t.dstPid = gp.dstPid
+	}
+	gp.dstTimerSeq++
+	seq := gp.dstTimerSeq
+	if gp.dstrand != 0 {
+		r := dstSplitmix64(gp.dstrand ^ (seq * 0x9e3779b97f4a7c15) ^ 0x54494d52_52414e44)
+		if r == 0 {
+			r = 1
+		}
+		t.dstFuncRand = r
+	} else {
+		t.dstFuncRand = 0
+	}
+	if gp.dstBugRand != 0 {
+		r := dstSplitmix64(gp.dstBugRand ^ (seq * 0x9e3779b97f4a7c15) ^ 0x54494d52_42554721)
+		if r == 0 {
+			r = 1
+		}
+		t.dstFuncBugRand = r
+	} else {
+		t.dstFuncBugRand = 0
+	}
+}
+
+func dstTimerCtxAlive(ctx *dstTimerRunCtx) bool {
+	if !dstActive() || ctx.epoch != dstRunEpoch.Load() {
+		return false
+	}
+	if ctx.pid < 0 {
+		return false
+	}
+	if ctx.slot != 0 {
+		if !dstSlotAlive(ctx.slot) {
+			return false
+		}
+	} else if ctx.pid > 0 && dstSimEnvSet && ctx.pid != int32(dstSimPID) {
+		if !dstPidAlive(ctx.host, ctx.pid) {
+			return false
+		}
+	}
+	return dstHostBootAlive(ctx.host, ctx.boot) && dstHostScopeBootAlive(ctx.hostScope)
+}
+
+func dstTimerConsumeWhenShift(t *timer, delay int64, bubble *synctestBubble) int64 {
 	if t.dstWhenShift != 0 {
 		delay += t.dstWhenShift
 		t.dstWhenShift = 0
 	}
+	if bubble != nil && bubble == dstSimBubble && t.dstFuncArmed {
+		pp := getg().m.p.ptr()
+		pp.dstTimerCtx = dstTimerRunCtx{
+			armed:       true,
+			epoch:       t.dstEpoch,
+			host:        t.dstHost,
+			boot:        t.dstBoot,
+			proc:        t.dstProc,
+			slot:        t.dstProcSlot,
+			pid:         t.dstPid,
+			funcRand:    t.dstFuncRand,
+			funcBugRand: t.dstFuncBugRand,
+			hostScope:   t.dstHostScope,
+		}
+		if t.period <= 0 {
+			t.dstHostScope = nil
+		} else {
+			if t.dstFuncRand != 0 {
+				t.dstFuncRand = dstSplitmix64(t.dstFuncRand)
+				if t.dstFuncRand == 0 {
+					t.dstFuncRand = 1
+				}
+			}
+			if t.dstFuncBugRand != 0 {
+				t.dstFuncBugRand = dstSplitmix64(t.dstFuncBugRand)
+				if t.dstFuncBugRand == 0 {
+					t.dstFuncBugRand = 1
+				}
+			}
+		}
+	}
 	return delay
+}
+
+func dstTimerRunCallback(f func(any, uintptr, int64), arg any, seq uintptr, delay int64, bubble *synctestBubble) {
+	if bubble == nil || bubble != dstSimBubble {
+		f(arg, seq, delay)
+		return
+	}
+	pp := getg().m.p.ptr()
+	ctx := pp.dstTimerCtx
+	pp.dstTimerCtx = dstTimerRunCtx{}
+	if !ctx.armed {
+		f(arg, seq, delay)
+		return
+	}
+	dstKernelRaceEnter()
+	alive := dstTimerCtxAlive(&ctx)
+	dstKernelRaceExit()
+	if !alive {
+		return
+	}
+	gp := getg()
+	gp.dstHost = ctx.host
+	gp.dstHostScope = ctx.hostScope
+	gp.dstProc = ctx.proc
+	gp.dstProcSlot = ctx.slot
+	gp.dstPid = ctx.pid
+	gp.dstrand = ctx.funcRand
+	gp.dstBugRand = ctx.funcBugRand
+	defer func() {
+		gp.dstHost = 0
+		gp.dstHostScope = nil
+		gp.dstProc = 0
+		gp.dstProcSlot = 0
+		gp.dstPid = 0
+		gp.dstrand = 0
+		gp.dstBugRand = 0
+	}()
+	f(arg, seq, delay)
 }

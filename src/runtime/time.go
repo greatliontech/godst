@@ -575,6 +575,9 @@ func (t *timer) modify(when, period int64, f func(arg any, seq uintptr, delay in
 		t.arg = arg
 		t.seq = seq
 	}
+	if dstBuild {
+		dstTimerStampLocked(t)
+	}
 
 	wake := false
 	pending := t.when > 0
@@ -1137,7 +1140,7 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 		next = 0
 	}
 	if dstBuild {
-		delay = dstTimerConsumeWhenShift(t, delay)
+		delay = dstTimerConsumeWhenShift(t, delay, bubble)
 	}
 	ts := t.ts
 	t.when = next
@@ -1217,7 +1220,11 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 		}
 	}
 
-	f(arg, seq, delay)
+	if dstBuild {
+		dstTimerRunCallback(f, arg, seq, delay, bubble)
+	} else {
+		f(arg, seq, delay)
+	}
 
 	if t.isChan {
 		unlock(&t.sendLock)

@@ -40,5 +40,9 @@ func DSTFaultAPINoTag() {
 	simulation.CrashHost("nohost")
 	simulation.CrashProcess("nohost", "noproc")
 	simulation.Partition("a", "b")
+	if simulation.Sometimes("notag-probe", 0.5) {
+		os.Stdout.WriteString("unexpected sometimes activation\n")
+		return
+	}
 	os.Stdout.WriteString("fault api no-op\n")
 }

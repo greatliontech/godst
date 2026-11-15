@@ -24,7 +24,7 @@ diagnostics").
   and FIN, `coarseClose` endpoint tracking, `HealLink`/`CrashHost` survival, `api/go1-godst.txt`
   parity); promote spec clauses in `docs/dst/faults.md`, `docs/dst/design.md`, and
   `docs/dst/gc.md` to enforced and update `docs/README.md`.
-- [ ] 3. Inline SUT fault-point activation (`Sometimes(name string, prob float64) bool`) and
+- [x] 3. Inline SUT fault-point activation (`Sometimes(name string, prob float64) bool`) and
   active-site diagnostics: implement uniform `!dst`/`dst` argument validation, two-level
   `(seed, name)` stateless ~50% gate, stream-isolated DPOR-commutative per-goroutine `dstBugRand`
   fork-tree on `dstG` (two-root seeded on `bubble.root`/`bubble.gcDrain` and `bubble.main`),
