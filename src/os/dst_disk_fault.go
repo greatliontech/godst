@@ -19,16 +19,17 @@ import (
 // registers this handler from init so runtime carries no os dependency. The op codes
 // are this package's contract, mirrored by the caller in testing/simulation.
 const (
-	diskOpFailDisk    uint32 = iota + 1 // host-disk EIO on
-	diskOpHealDisk                      // host-disk EIO off
-	diskOpFailFile                      // per-file EIO on (name is the host-absolute path)
-	diskOpHealFile                      // per-file EIO off
-	diskOpLimit                         // ENOSPC: cap the disk at arg total bytes
-	diskOpUnlimit                       // remove the capacity
-	diskOpSlow                          // latency: arg nanoseconds per disk-touching op (0 = none)
-	diskOpCorruptFile                   // bit rot: flip one seeded bit of the file's durable image
-	diskOpFailWriteback                 // writeback EIO on: syncs fail and drop dirty pages; cache-served reads/writes succeed
-	diskOpHealWriteback                 // writeback EIO off
+	diskOpFailDisk      uint32 = iota + 1 // host-disk EIO on
+	diskOpHealDisk                        // host-disk EIO off
+	diskOpFailFile                        // per-file EIO on (name is the host-absolute path)
+	diskOpHealFile                        // per-file EIO off
+	diskOpLimit                           // ENOSPC: cap the disk at arg total bytes
+	diskOpUnlimit                         // remove the capacity
+	diskOpSlow                            // latency: arg nanoseconds per disk-touching op (0 = none)
+	diskOpCorruptFile                     // bit rot: flip one seeded bit of the file's durable image
+	diskOpFailWriteback                   // writeback EIO on: syncs fail and drop dirty pages; cache-served reads/writes succeed
+	diskOpHealWriteback                   // writeback EIO off
+	diskOpUnslow                          // clear slow-disk latency
 )
 
 //go:linkname dstSetDiskFaultHook runtime.dstSetDiskFaultHook
@@ -66,7 +67,7 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 	case diskOpFailFile:
 		dstCoarseRecord(dstCoarseNamespaceForHost(host), false)
 		node := dstFSNodeAt(d.root, name)
-		if node == nil || node.isDir {
+		if node == nil || node.isDir || node.isDevice() {
 			// Per-file EIO is scoped to a regular file's blocks; a directory (and
 			// the root, which an empty path resolves to) is a no-op. This is a
 			// real scoping choice, not a vacuous one: a directory handle's Sync
@@ -104,6 +105,10 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		if arg > 0 {
 			dstDiskSlow.Store(true) // arm the global gate; reset on the next run's roll
 		}
+	case diskOpUnslow:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
+		d.latency.Store(0)
 	case diskOpCorruptFile:
 		dstCoarseRecord(dstCoarseNamespaceForHost(host), false)
 		node := dstFSNodeAt(d.root, name)
@@ -127,8 +132,10 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		if !ok {
 			return
 		}
-		bit := byte(1) << dstFaultRandN(8)
+		shift := dstFaultRandN(8)
+		bit := byte(1) << shift
 		if d.down {
+			dstRecordCausalEvent(dstCausalCorruptFile, 1, host, 0, 0, 0, off, int64(shift), 0, name)
 			node.data[off] ^= bit
 			pg := off / dstPageSize
 			var buf [dstPageSize]byte
@@ -146,6 +153,7 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 			}
 			return
 		}
+		dstRecordCausalEvent(dstCausalCorruptFile, 0, host, 0, 0, 0, off, int64(shift), 0, name)
 		if node.rot == nil {
 			node.rot = make(map[int64]byte)
 		}

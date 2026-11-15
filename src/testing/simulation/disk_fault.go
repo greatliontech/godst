@@ -38,6 +38,7 @@ const (
 	diskOpCorruptFile
 	diskOpFailWriteback
 	diskOpHealWriteback
+	diskOpUnslow
 )
 
 // The victim-naming rule for every fault below: an undeclared host name panics
@@ -164,7 +165,7 @@ func SlowDisk(host string, perOp time.Duration) {
 // UnslowDisk clears the per-operation latency set by SlowDisk on the named
 // host's disk.
 func UnslowDisk(host string) {
-	withBubbleFaultCaller("UnslowDisk", func() { dstDiskFaultOp(diskOpSlow, lookupHost(host), 0, "") })
+	withBubbleFaultCaller("UnslowDisk", func() { dstDiskFaultOp(diskOpUnslow, lookupHost(host), 0, "") })
 }
 
 // CorruptFile flips one bit of one byte of the named host file's DURABLE image —

@@ -304,7 +304,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T))
 ```
 
 - **`Run` / `RunWith`** execute `f` inside a deterministic simulation bubble seeded by `seed`. For the duration of the call, `GOMAXPROCS` is pinned to `1` (attempts to resize via `runtime.GOMAXPROCS` inside the run are ignored and restored on return), asynchronous preemption is disabled, GC runs deterministically stop-the-world with synchronous sweep, and two quiet `sync.Pool` generations are drained before bubble teardown so bubble-stamped objects never leak into subsequent runs.
-- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, any captured in-bubble `stdout`/`stderr` output, abnormal process-exit goroutine kill diagnostics, and activated `Sometimes` fault sites are automatically formatted and logged to `t`.
+- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, the chronological failure-only causal event timeline (up to the last 256 topology, fault, TCP lifecycle/timeout/reset, and filesystem fault-hit transitions), activated `Sometimes` fault sites, abnormal process-exit goroutine kill diagnostics, and captured in-bubble `stdout`/`stderr` output are automatically formatted and logged to `t`.
 
 #### `Strategy`
 
@@ -715,9 +715,9 @@ Unmodified application and library code (`net/http`, `crypto/tls`, custom binary
   - Coherent `syscall.Mmap` / `Munmap` / `Mprotect` / `Madvise` (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_POPULATE_READ`, `MADV_HUGEPAGE`, `MADV_COLD`): `MAP_SHARED` mappings share physical backing pages with the simulated page cache (stores through `[]byte` and `File.Read`/`Write` see each other immediately, and accesses beyond `Truncate` EOF raise real `SIGBUS` / `PROT_NONE` `SIGSEGV` caught and converted into simulated process crash teardown).
   - Simulated shared `futex` (`FUTEX_WAIT` and `FUTEX_WAKE` without `FUTEX_PRIVATE_FLAG` on `MAP_SHARED` file-backed pages) integrated with the virtual clock and process/host crash cleanup.
   - Synthetic `/proc/self/ns/pid`, `/proc/<pid>/stat` (deterministic field-22 `starttime` in `USER_HZ` ticks), `/proc/sys/kernel/random/boot_id`, and `syscall.Kill(pid, 0)` liveness probes.
-- **Environment & Stdio Diagnostics:**
+- **Environment & Failure-Only Diagnostics:**
   - Per-`(host, process invocation)` copy-on-write `os.Getenv` / `Setenv` / `Unsetenv` / `Clearenv` / `Environ`.
-  - Writes to ungranted `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) inside a bubble, abnormal process-exit goroutine kills, and activated `Sometimes` fault sites are captured off-heap with zero heap or scheduler perturbation and printed automatically only if the test or explored schedule fails.
+  - A 256-slot chronological causal event timeline (host/process lifecycle, injected faults & link policies, TCP `Listen`/`Close`/`Dial`/timeout/`RST` transitions, and filesystem `EIO`/`fsyncgate`/`ENOSPC`/`CorruptFile` hits), activated `Sometimes` fault sites, abnormal process-exit goroutine kills, and ungranted bubble writes to `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) are recorded off-heap (`sysAlloc`) with zero heap, RNG, or scheduler perturbation and printed automatically only if the test or explored schedule fails.
 
 ---
 

@@ -166,7 +166,7 @@ func ResetProcessConns(host, proc string) {
 		if p == 0 {
 			return
 		}
-		for _, slot := range activeProcSlots(p) {
+		for _, slot := range activeProcSlotsForReset(hid, p) {
 			dstNetPartitionOp(partOpResetProc, slot, 0)
 		}
 	})

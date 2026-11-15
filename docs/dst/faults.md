@@ -1083,7 +1083,7 @@ recording so expected power-offs never pollute failure reports. When a `Test`, `
 `ExploreTest` schedule fails — including unrecovered SUT panics and `synctest` bubble-deadlock stalls —
 the harness symbolizes and logs the recorded process-exit kill events alongside any captured bubble
 `stdout`/`stderr` (`TestDiagnostics*`), as well as any activated `Sometimes` sites and the failure-only
-causal event timeline (**pending**; see [design.md](./design.md), "Failure-only causal event timeline and active fault-site diagnostics"); passing runs emit nothing.
+causal event timeline (`TestDiagnosticsCausalTimeline*`; see [design.md](./design.md), "Failure-only causal event timeline and active fault-site diagnostics"); passing runs emit nothing.
 
 Two consequences of invocation-keyed goroutine death, both contractual. **A goroutine cannot outlive its
 process.** One that escaped the mark because it was inside a NESTED `Process` body when its

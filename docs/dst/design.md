@@ -1277,11 +1277,11 @@ outbound, schedule-ordered side effects that feed no nondeterminism back into th
 off-heap `stdout`/`stderr` buffer and process-exit goroutine-kill ledger ([faults.md](./faults.md)),
 each simulation run maintains two additional observation-neutral, off-heap (`sysAlloc`,
 `sys.NotInHeap`), `dstDiagLock`-guarded diagnostic structures:
-1. **Causal event ring buffer (`256` slots + monotonic `totalEvents` sequence counter) (pending):** Records
+1. **Causal event ring buffer (`256` slots + monotonic `totalEvents` sequence counter) (enforced):** Records
    high-signal state transitions in universe base virtual time (`bubble.now - baseOrigin`) without
-   recording steady-state per-`Read`/`Write` segment or file traffic:
+   recording steady-state per-`Read`/`Write` segment or file traffic (`TestDiagnosticsCausalTimeline*`):
    - *Topology & lifecycle:* `Host` / `HostWith` boot and live clock re-declaration, `Process` /
-     `ProcessWith` start (`pid`, `PIDNamespace`) and normal/panic exit, `CrashHost` (including
+     `ProcessWith` start (`pid`, `PIDNamespace`) and normal/panic/mapping-fault exit, `CrashHost` (including
      `CrashTear`), and `CrashProcess`.
    - *Injected faults & policies:* `Partition`, `PartitionOneWay`, `PartitionRefuse`, `HealLink`,
      `IsolateHost`, `UnisolateHost`, `ConfigureLink`, `ConfigureLinkOneWay`, `UnconfigureLink`,
@@ -2248,8 +2248,8 @@ table); the open work is the OOM and scheduling faults and the declarative orche
   another); implementation is **bottoms-up** — the Host/Process substrate first, faults last (see "Build
   order"). The net (including dynamic per-link `LinkConfig` via `ConfigureLink` / `ConfigureLinkOneWay` /
   `UnconfigureLink`), disk, clock, **process-crash/restart**, **host-crash/reboot**, **crash-tear**, and
-  inline **`Sometimes`** fault-point activation axes are landed and replay-exact; the failure-only causal
-  event timeline is specified and **pending**; what remains beyond that is the OOM (allocation-triggered)
+  inline **`Sometimes`** fault-point activation axes — together with the off-heap failure-only causal
+  event timeline and active-site diagnostics — are landed and replay-exact; what remains beyond that is the OOM (allocation-triggered)
   and scheduling (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a
   seeded `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
 Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →

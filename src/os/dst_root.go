@@ -318,7 +318,9 @@ func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) 
 				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOENT}
 			}
 			if r.disk.diskFullForCreate() {
-				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOSPC}
+				p := at(part)
+				dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpMkdir, 0, 0, 0, 0, p)
+				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: p, Err: syscall.ENOSPC}
 			}
 			child = dstFSNewNode(r.disk, ModeDir, perm)
 			curDentry.node.attachEntryLocked(part, child)
@@ -435,6 +437,7 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 			return wrap(syscall.ENOENT)
 		}
 		if r.disk.diskFullForCreate() {
+			dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpCreate, 0, 0, 0, 0, name)
 			return wrap(syscall.ENOSPC)
 		}
 		node = dstFSNewNode(r.disk, 0, perm)
@@ -606,6 +609,7 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOENT}
 	}
 	if r.disk.diskFullForCreate() {
+		dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpMkdir, 0, 0, 0, 0, name)
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
 	}
 	parent := parentDentry.node

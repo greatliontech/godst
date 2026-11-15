@@ -295,6 +295,15 @@ func TestDSTDevNullDiskFaultDecoupled(t *testing.T) {
 			if n, err := f.Read(make([]byte, 1)); n != 0 || err != io.EOF {
 				t.Fatalf("Read under failed disk = %d, %v; want 0, io.EOF", n, err)
 			}
+			// Raw 0-byte syscall.Read and syscall.Write hit dstFDZeroRead/dstFDZeroWrite
+			// directly (bypassing os.File's empty-slice fast path) and must also return 0
+			// rather than EIO on /dev/null.
+			if n, err := syscall.Read(int(f.Fd()), nil); n != 0 || err != nil {
+				t.Fatalf("0-byte syscall.Read under failed disk = %d, %v; want 0, nil", n, err)
+			}
+			if n, err := syscall.Write(int(f.Fd()), nil); n != 0 || err != nil {
+				t.Fatalf("0-byte syscall.Write under failed disk = %d, %v; want 0, nil", n, err)
+			}
 			// The disk faults still hold for a regular file on the same host.
 			if _, err := os.OpenFile("/spill", os.O_RDWR|os.O_CREATE, 0o644); !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("regular create on full disk = %v, want ENOSPC", err)

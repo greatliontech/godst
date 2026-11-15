@@ -349,7 +349,7 @@ func dstFDCountResult(n int, err error) (int, syscall.Errno, bool) {
 	return n, 0, true
 }
 
-func dstFDZeroRead(entry dstFDEntry) syscall.Errno {
+func dstFDZeroRead(entry dstFDEntry, op uint8) syscall.Errno {
 	if f, ok := entry.backend.(*dstFile); ok {
 		f.coarseOp(false, false)
 		f.diskDelay()
@@ -363,7 +363,10 @@ func dstFDZeroRead(entry dstFDEntry) syscall.Errno {
 		if f.node.isDir {
 			return syscall.EISDIR
 		}
-		if err := f.diskEIO(); err != nil {
+		if f.node.isDevice() {
+			return 0
+		}
+		if err := f.diskEIOOp(op); err != nil {
 			return dstFDErr(err)
 		}
 		return 0
@@ -372,7 +375,7 @@ func dstFDZeroRead(entry dstFDEntry) syscall.Errno {
 	return dstFDErr(err)
 }
 
-func dstFDZeroWrite(entry dstFDEntry) syscall.Errno {
+func dstFDZeroWrite(entry dstFDEntry, op uint8) syscall.Errno {
 	if f, ok := entry.backend.(*dstFile); ok {
 		f.coarseOp(false, false)
 		f.diskDelay()
@@ -383,7 +386,10 @@ func dstFDZeroWrite(entry dstFDEntry) syscall.Errno {
 		if !f.wr {
 			return syscall.EBADF
 		}
-		if err := f.diskEIO(); err != nil {
+		if f.node.isDevice() {
+			return 0
+		}
+		if err := f.diskEIOOp(op); err != nil {
 			return dstFDErr(err)
 		}
 		return 0
@@ -398,7 +404,7 @@ func dstFDRead(fd int, p []byte) (int, syscall.Errno, bool) {
 		return -1, errno, handled
 	}
 	if len(p) == 0 {
-		if errno := dstFDZeroRead(entry); errno != 0 {
+		if errno := dstFDZeroRead(entry, dstFSOpRead); errno != 0 {
 			return -1, errno, true
 		}
 		return 0, 0, true
@@ -413,10 +419,14 @@ func dstFDWrite(fd int, p []byte) (int, syscall.Errno, bool) {
 		return -1, errno, handled
 	}
 	if len(p) == 0 {
-		if errno := dstFDZeroWrite(entry); errno != 0 {
+		if errno := dstFDZeroWrite(entry, dstFSOpWrite); errno != 0 {
 			return -1, errno, true
 		}
 		return 0, 0, true
+	}
+	if f, ok := entry.backend.(*dstFile); ok {
+		written, err := f.writeOp(p, false)
+		return dstFDCountResult(written, err)
 	}
 	written, err := entry.backend.write(p)
 	return dstFDCountResult(written, err)
@@ -431,7 +441,7 @@ func dstFDPread(fd int, p []byte, off int64) (int, syscall.Errno, bool) {
 		return -1, syscall.EINVAL, true
 	}
 	if len(p) == 0 {
-		if errno := dstFDZeroRead(entry); errno != 0 {
+		if errno := dstFDZeroRead(entry, dstFSOpPread); errno != 0 {
 			return -1, errno, true
 		}
 		return 0, 0, true
@@ -449,7 +459,7 @@ func dstFDPwrite(fd int, p []byte, off int64) (int, syscall.Errno, bool) {
 		return -1, syscall.EINVAL, true
 	}
 	if len(p) == 0 {
-		if errno := dstFDZeroWrite(entry); errno != 0 {
+		if errno := dstFDZeroWrite(entry, dstFSOpPwrite); errno != 0 {
 			return -1, errno, true
 		}
 		return 0, 0, true

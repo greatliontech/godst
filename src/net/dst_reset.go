@@ -603,6 +603,16 @@ func dstConnPeer(c *dstConn) *dstConn {
 // already closed needs nothing (dstConnPeer returns nil).
 func dstResetBothEnds(c *dstConn) {
 	peer := dstConnPeer(c)
+	dstKernelSectionEnter()
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		e.diagState.Or(dstDiagRSTLogged)
+	}
+	if peer != nil {
+		if peerEnd, ok := peer.Conn.(*dstWireEnd); ok {
+			peerEnd.recordRSTDelivered()
+		}
+	}
+	dstKernelSectionExit()
 	if peer != nil {
 		if e, ok := c.Conn.(*dstWireEnd); ok && e.isWriteShutdownKernel() {
 			if peerEnd, ok := peer.Conn.(*dstWireEnd); ok {
@@ -687,6 +697,6 @@ func dstCloseListeners(match func(*dstListener) bool, tear func(*dstConn)) {
 			continue
 		}
 		seen[v.l] = true
-		v.l.closeTearing(tear)
+		v.l.closeTearing(tear, false)
 	}
 }

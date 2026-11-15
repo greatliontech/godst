@@ -442,6 +442,8 @@ type dstWireEnd struct {
 
 	retransNs int64       // send-into-a-dead-peer retransmit horizon (0 = none; TCP_USER_TIMEOUT overrides per socket — effRetransNs)
 	timedOut  atomic.Bool // the retransmit horizon fired: this end is dead (ETIMEDOUT)
+	localPort uint16
+	peerPort  uint16
 
 	// opts is this end's socket-option state (the dialing socket's for the
 	// dialer end, the accept-inherited clone for the server end); bornAt the
@@ -475,6 +477,7 @@ type dstWireEnd struct {
 	// the end, waking blocked reads/writes to observe timedOut.
 	horizonMu     isync.KernelMutex
 	horizonArmed  bool
+	diagState     atomic.Uint32
 	horizonAnchor int64 // base-time the current undeliverable episode was first observed
 	horizonOnce   isync.KernelOnce
 	horizonKill   chan struct{}
@@ -900,7 +903,7 @@ func (e *dstWireEnd) kaCheck() {
 		e.kaEpisode = -1
 		e.kaProbesOut = 0
 		e.kaMu.Unlock()
-		e.horizonDie()
+		e.keepaliveDie()
 		return
 	}
 	e.kaProbesOut++
@@ -1195,7 +1198,33 @@ func (e *dstWireEnd) acquirePeerCloseSync() {
 // death instant is capped at that direction's cut-start, the same
 // arrived-strictly-before-the-cut boundary pop and injectRST use. Wakes every
 // blocked operation on both ends so each re-evaluates.
+const (
+	dstDiagEstablished  uint32 = 1 << 0
+	dstDiagDialReturned uint32 = 1 << 1
+	dstDiagRSTLogged    uint32 = 1 << 2
+)
+
+func (e *dstWireEnd) recordRSTDelivered() {
+	if e.diagState.Load()&dstDiagEstablished != 0 && e.diagState.Or(dstDiagRSTLogged)&dstDiagRSTLogged == 0 {
+		dstRecordCausalEvent(dstCausalNetRSTDelivered, 0, e.localHost, e.peerHost, 0, 0, int64(e.localPort), int64(e.peerPort), 0, "")
+	}
+}
+
+func (e *dstWireEnd) recordBacklogRSTDelivered() {
+	if e.diagState.Load()&dstDiagDialReturned != 0 && e.diagState.Or(dstDiagRSTLogged)&dstDiagRSTLogged == 0 {
+		dstRecordCausalEvent(dstCausalNetRSTDelivered, 0, e.localHost, e.peerHost, 0, 0, int64(e.localPort), int64(e.peerPort), 0, "")
+	}
+}
+
 func (e *dstWireEnd) horizonDie() {
+	e.horizonDieKind(dstCausalNetRetransmitTimeout)
+}
+
+func (e *dstWireEnd) keepaliveDie() {
+	e.horizonDieKind(dstCausalNetKeepaliveTimeout)
+}
+
+func (e *dstWireEnd) horizonDieKind(kind uint8) {
 	dstKernelSectionEnter()
 	defer dstKernelSectionExit()
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
@@ -1215,7 +1244,12 @@ func (e *dstWireEnd) horizonDie() {
 		outHorizon = cutStart - 1
 	}
 	e.out.freezeAtHorizon(outHorizon)
-	e.horizonOnce.Do(func() { close(e.horizonKill) })
+	e.horizonOnce.Do(func() {
+		close(e.horizonKill)
+		if e.diagState.Load()&dstDiagEstablished != 0 {
+			dstRecordCausalEvent(kind, 0, e.localHost, e.peerHost, 0, 0, int64(e.localPort), int64(e.peerPort), 0, "")
+		}
+	})
 	e.out.wake()       // the peer's blocked reader re-evaluates (its held bytes died; probeDeadPeer)
 	e.out.wakeWriter() // this end's blocked writer observes timedOut
 	e.in.wake()        // this end's blocked reader observes timedOut
@@ -1260,6 +1294,7 @@ func (e *dstWireEnd) injectRST() {
 		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.rstSync))
 		e.rstArrived.Store(true)
 		close(e.rstKill)
+		e.recordRSTDelivered()
 	})
 	e.in.wake()        // a reader parked on the ready channel re-evaluates
 	e.out.wakeWriter() // a writer parked on send-buffer space observes the RST

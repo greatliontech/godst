@@ -260,6 +260,7 @@ func mappingFaultProcessTeardown(slot uint32, pid int32) {
 		return
 	}
 	mappingFaultTeardownRuns++
+	dstRecordCausalEvent(causalProcExit, 2, inst.host, 0, inst.proc, inst.pid, 0, 0, 0, "")
 	dstCrashProcessPid(inst.host, inst.slot, inst.pid)
 	dstProcessTeardown(inst.slot)
 	dstNetPartitionOp(partOpCrashProcConns, inst.slot, 0)
@@ -284,15 +285,18 @@ func nodeRegReset() {
 }
 
 // markHostDown records the simulation-owned powered-off state (see
-// nodeReg.down). It tolerates a nil map (a crash fault driven before the first
-// run's nodeRegReset is a documented no-op path).
-func markHostDown(host uint32) {
+// nodeReg.down) and reports whether the host transitioned from up to down. It
+// tolerates a nil map (a crash fault driven before the first run's
+// nodeRegReset is a documented no-op path).
+func markHostDown(host uint32) bool {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
 	if nodeReg.down == nil {
 		nodeReg.down = make(map[uint32]bool)
 	}
+	wasUp := !nodeReg.down[host]
 	nodeReg.down[host] = true
+	return wasUp
 }
 
 // nodeNames resolves numeric runtime host and process IDs back to their
@@ -367,13 +371,14 @@ func activeProcInstances(proc uint32) []procInstance {
 	return append([]procInstance(nil), activeProcs.byProc[proc]...)
 }
 
-func activeProcSlots(proc uint32) []uint32 {
+func activeProcSlotsForReset(host, proc uint32) []uint32 {
 	activeProcs.mu.Lock()
 	insts := activeProcs.byProc[proc]
 	slots := make([]uint32, len(insts))
 	for i, inst := range insts {
 		slots[i] = inst.slot
 	}
+	dstRecordCausalEvent(causalResetProcessConns, 0, host, 0, proc, 0, int64(len(slots)), 0, 0, "")
 	activeProcs.mu.Unlock()
 	return slots
 }
@@ -561,6 +566,11 @@ func hostWith(api, name string, config HostConfig, f func()) {
 				booted = true
 			}
 			setHostIdent(hid, hostname, config.NumCPU)
+			if booted {
+				dstRecordCausalEvent(causalHostBoot, 0, hid, 0, 0, 0, offset, ppb, int64(dstCurrentHostBootCount(hid)), hostname)
+			} else {
+				dstRecordCausalEvent(causalHostClockRedecl, 0, hid, 0, 0, 0, offset, ppb, 0, hostname)
+			}
 			_, curProc := dstCurrentNode()
 			oldH, oldP = dstPushHostScope(hid, curProc)
 			stamped = true
@@ -757,6 +767,7 @@ func crashProcess(hostName, name string) {
 		}
 	}
 	insts = activeProcPopAll(proc)
+	dstRecordCausalEvent(causalCrashProc, 0, hid, 0, proc, insts[0].pid, int64(len(insts)), 0, 0, "")
 	// Kernel teardown order: the threads die first, then exit_files closes fds
 	// (releasing flocks, unmapping (the bytes are the page cache's; nothing to write back)) and the sockets
 	// reset. Killing the goroutines first also closes the window in which a
@@ -865,7 +876,14 @@ func crashHost(name string) {
 	// listener-closed-but-still-alive refusal window. The simulation-owned
 	// powered-off mark (boot-edge detection on the next Host/HostWith
 	// declaration) is set alongside net's — one transition drives both.
-	markHostDown(host)
+	wasUp := markHostDown(host)
+	if wasUp {
+		var tearFlag uint8
+		if crashTearEnabled() {
+			tearFlag = 1
+		}
+		dstRecordCausalEvent(causalCrashHost, tearFlag, host, 0, 0, 0, int64(len(victims)), 0, 0, "")
+	}
 	dstNetPartitionOp(partOpHostDown, host, 0)
 	dstNetPartitionOp(partOpResetHost, host, 0)
 	dstNetPartitionOp(partOpCloseHostListeners, host, 0)
@@ -994,6 +1012,7 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 		// starttime from the TARGET host's uptime clock, read through the
 		// admitting goroutine's (just-set) host identity.
 		dstRegisterPid(simPid, ns)
+		dstRecordCausalEvent(causalProcStart, 0, host, 0, proc, simPid, 0, 0, 0, config.PIDNamespace)
 	})
 	// Registered FIRST so it runs LAST — after the exit-teardown defer below
 	// has completed and released procTeardownMu (parking while holding it
@@ -1041,6 +1060,11 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 		if !ok {
 			return
 		}
+		var exitFlags uint8
+		if dstCallerDeferPanicking() {
+			exitFlags = 1
+		}
+		dstRecordCausalEvent(causalProcExit, exitFlags, inst.host, 0, inst.proc, inst.pid, 0, 0, 0, "")
 		dstStopProcessThreads(inst.host, inst.slot, inst.pid)
 		dstProcessTeardown(inst.slot)
 		dstNetPartitionOp(partOpCloseProcConns, inst.slot, 0)

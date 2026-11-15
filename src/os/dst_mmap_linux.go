@@ -144,7 +144,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	if !file.rd || writable && !file.wr {
 		return nil, syscall.EACCES, true
 	}
-	if err := file.diskEIO(); err != nil {
+	if err := file.diskEIOOp(dstFSOpMmap); err != nil {
 		return nil, dstFDErr(err), true
 	}
 	host, proc := dstFSCurrentNode()

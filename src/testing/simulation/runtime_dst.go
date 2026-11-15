@@ -296,6 +296,18 @@ func dstFakeTimersCountFP() int
 //go:linkname dstDiskFaultOp runtime.dstDiskFaultOp
 func dstDiskFaultOp(op, host uint32, arg int64, name string)
 
+//go:linkname dstRecordCausalEvent runtime.dstRecordCausalEvent
+func dstRecordCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string)
+
+//go:linkname dstCausalSuppressEnter runtime.dstCausalSuppressEnter
+func dstCausalSuppressEnter()
+
+//go:linkname dstCausalSuppressExit runtime.dstCausalSuppressExit
+func dstCausalSuppressExit()
+
+//go:linkname dstCallerDeferPanicking runtime.dstCallerDeferPanicking
+func dstCallerDeferPanicking() bool
+
 //go:linkname dstSnapshotRunDiagnostics runtime.dstSnapshotRunDiagnostics
 func dstSnapshotRunDiagnostics() (
 	killMeta [][5]uint64,
@@ -310,4 +322,7 @@ func dstSnapshotRunDiagnostics() (
 	sometimesNames []string,
 	sometimesMeta [][3]uint64,
 	sometimesOverflow uint64,
+	causalMeta [][9]uint64,
+	causalStrs []string,
+	causalOmitted uint64,
 )

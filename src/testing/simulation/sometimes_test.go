@@ -881,7 +881,7 @@ func TestDSTAfterFuncIdentityDeterminismAndCrashLiveness(t *testing.T) {
 		if err == nil {
 			t.Fatal("host-owned socket did not hit ETIMEDOUT after helper Process exited")
 		}
-		if diag := formatRunDiagnosticsBody(); strings.Contains(diag, "writer-helper") {
+		if diag := formatRunDiagnosticsBody(); strings.Contains(diag, "killed goroutines on process exit:") {
 			t.Fatalf("modeled-kernel TCP timer leaked into process-exit kill diagnostics:\n%s", diag)
 		}
 	})

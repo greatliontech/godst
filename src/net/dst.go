@@ -143,6 +143,27 @@ func dstNetRoll() {
 //go:linkname dstNetCurrentNode runtime.dstCurrentSlot
 func dstNetCurrentNode() (host, proc uint32)
 
+//go:linkname dstRecordCausalEvent runtime.dstRecordCausalEvent
+func dstRecordCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string)
+
+//go:linkname dstRecordCausalCaller runtime.dstRecordCausalCaller
+func dstRecordCausalCaller(kind, flags uint8, hostB uint32, arg0, arg1, arg2 int64, str string)
+
+//go:linkname dstCurrentDiagIdentity runtime.dstCurrentDiagIdentity
+func dstCurrentDiagIdentity() (host, proc uint32, pid int32)
+
+// Causal event kind codes — must match runtime's dstCausalNet* constants.
+const (
+	dstCausalNetListen            uint8 = 40
+	dstCausalNetListenerClose     uint8 = 41
+	dstCausalNetDialEstablished   uint8 = 42
+	dstCausalNetDialRefused       uint8 = 43
+	dstCausalNetDialTimeout       uint8 = 44
+	dstCausalNetRetransmitTimeout uint8 = 45
+	dstCausalNetKeepaliveTimeout  uint8 = 46
+	dstCausalNetRSTDelivered      uint8 = 47
+)
+
 // The simulated network is per HOST (testing/simulation.Host): every listener is
 // scoped to its listening host, so loopback is host-private (two hosts each have
 // their own 127.0.0.1) and the port space is per-host (two hosts can both bind
@@ -848,6 +869,11 @@ func (c *dstConn) consumePendingErr(op string, pending error) error {
 	if pending != nil {
 		dstKernelSectionEnter()
 		already := c.skErrConsumed.Swap(true)
+		if !already && pending == syscall.ECONNRESET {
+			if e, ok := c.Conn.(*dstWireEnd); ok {
+				e.recordRSTDelivered()
+			}
+		}
 		dstKernelSectionExit()
 		if !already {
 			return c.opError(op, pending)
@@ -1255,7 +1281,7 @@ func (l *dstListener) Accept() (Conn, error) {
 				if dstHostDead(c.localHost) || dstPartitionedDir(c.localHost, c.remoteHost) {
 					dstCrashVictimConn(c)
 				} else {
-					c.resetConn()
+					dstResetBacklogConn(c)
 				}
 				return nil, l.opError("accept", errClosed)
 			default:
@@ -1268,7 +1294,21 @@ func (l *dstListener) Accept() (Conn, error) {
 	}
 }
 
-func (l *dstListener) Close() error { return l.closeTearing(nil) }
+func dstResetBacklogConn(c *dstConn) {
+	dstKernelSectionEnter()
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		e.diagState.Or(dstDiagRSTLogged)
+	}
+	if peer := dstConnPeer(c); peer != nil {
+		if peerEnd, ok := peer.Conn.(*dstWireEnd); ok {
+			peerEnd.recordBacklogRSTDelivered()
+		}
+	}
+	dstKernelSectionExit()
+	c.resetConn()
+}
+
+func (l *dstListener) Close() error { return l.closeTearing(nil, true) }
 
 // closeTearing closes the listener; each queued backlog connection whose
 // claim succeeds (acceptState 0→2) is torn down by tear. nil tear is the
@@ -1281,7 +1321,7 @@ func (l *dstListener) Close() error { return l.closeTearing(nil) }
 // freeze instead (its probes meet the CLOSED socket's RST after heal). The
 // crash paths pass their own tear (a powered-off machine emits nothing for
 // ANY backlog conn — dstCloseHostListeners).
-func (l *dstListener) closeTearing(tear func(*dstConn)) error {
+func (l *dstListener) closeTearing(tear func(*dstConn), recordClose bool) error {
 	if !dstInSimBubble() && dstActive() && l.epoch == dstNetEpoch() {
 		return l.opError("close", errClosed)
 	}
@@ -1304,13 +1344,33 @@ func (l *dstListener) closeTearing(tear func(*dstConn)) error {
 			if dstPartitionedDir(c.localHost, c.remoteHost) {
 				dstCrashVictimConn(c)
 			} else {
-				c.resetConn()
+				dstResetBacklogConn(c)
 			}
 		}
 	}
 	close(l.done)
 	dstNet.mu.Lock()
 	dstNetRoll()
+	if recordClose {
+		var addrStr string
+		if len(l.keys) > 0 {
+			k := l.keys[0]
+			for i := 0; i < len(k); i++ {
+				if k[i] == '/' {
+					addrStr = k[i+1:]
+					break
+				}
+			}
+		}
+		callerHost, callerProc, callerPid := dstCurrentDiagIdentity()
+		var proc uint32
+		var pid int32
+		if callerHost == l.host {
+			proc = callerProc
+			pid = callerPid
+		}
+		dstRecordCausalEvent(dstCausalNetListenerClose, 0, l.host, 0, proc, pid, int64(l.addr.Port), 0, 0, addrStr)
+	}
 	for _, k := range l.keys {
 		if dstNet.listeners[k] == l {
 			delete(dstNet.listeners, k)
@@ -1467,6 +1527,7 @@ func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr
 	for _, k := range scoped {
 		dstNet.listeners[k] = l
 	}
+	dstRecordCausalCaller(dstCausalNetListen, 0, 0, int64(portnum), 0, 0, address)
 	return l, nil
 }
 
@@ -1593,7 +1654,38 @@ func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWire
 
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
-func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn Conn, retErr error) {
+func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) {
+	c, err := dstDialConnect(ctx, d, network, address)
+	if err == nil {
+		dstKernelSectionEnter()
+		e := c.Conn.(*dstWireEnd)
+		dstRecordCausalCaller(dstCausalNetDialEstablished, 0, c.remoteHost, int64(e.localPort), int64(e.peerPort), 0, address)
+		dstKernelSectionExit()
+		return c, nil
+	}
+	if opErr, ok := err.(*OpError); ok {
+		dstKernelSectionEnter()
+		callerHost, _, _ := dstCurrentDiagIdentity()
+		targetHost := callerHost
+		if tcpAddr, ok := opErr.Addr.(*TCPAddr); ok {
+			if h, ok := dstHostForRoutableIP(tcpAddr.IP); ok {
+				targetHost = h
+			}
+		}
+		switch opErr.Err {
+		case syscall.ECONNREFUSED:
+			dstRecordCausalCaller(dstCausalNetDialRefused, 0, targetHost, 0, 0, 0, address)
+		case syscall.ETIMEDOUT:
+			dstRecordCausalCaller(dstCausalNetDialTimeout, 1, targetHost, 0, 0, 0, address)
+		case errTimeout:
+			dstRecordCausalCaller(dstCausalNetDialTimeout, 0, targetHost, 0, 0, 0, address)
+		}
+		dstKernelSectionExit()
+	}
+	return nil, err
+}
+
+func dstDialConnect(ctx context.Context, d *Dialer, network, address string) (retConn *dstConn, retErr error) {
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("dial", network)
 	}
@@ -1918,6 +2010,10 @@ redial:
 			return
 		}
 		p1, p2 = dstWirePair(capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
+		p1.(*dstWireEnd).localPort = uint16(localClone.Port)
+		p1.(*dstWireEnd).peerPort = uint16(serverClone.Port)
+		p2.(*dstWireEnd).localPort = uint16(serverClone.Port)
+		p2.(*dstWireEnd).peerPort = uint16(localClone.Port)
 		reset = new(atomic.Bool)
 		resetSync = new(uint64)
 		epoch := dstNetEpoch()
@@ -2143,6 +2239,10 @@ redial:
 					// token into l.accept (guaranteed non-blocking since every
 					// item in l.accept holds one backlogSem slot).
 					slotHeld = false
+					dstKernelSectionEnter()
+					p1.(*dstWireEnd).diagState.Or(dstDiagEstablished)
+					p2.(*dstWireEnd).diagState.Or(dstDiagEstablished)
+					dstKernelSectionExit()
 					l.accept <- ownedServer
 					select {
 					case <-l.done:
@@ -2155,7 +2255,7 @@ redial:
 									if dstHostDead(l.host) || dstPartitionedDir(c.localHost, c.remoteHost) {
 										dstCrashVictimConn(c)
 									} else {
-										c.resetConn()
+										dstResetBacklogConn(c)
 									}
 								}
 							default:
@@ -2167,6 +2267,10 @@ redial:
 						rejected := server.acceptState.Load() == 2
 						dstKernelSectionExit()
 						if rejected && server.isResetKernel() {
+							dstKernelSectionEnter()
+							p1.(*dstWireEnd).diagState.And(^uint32(dstDiagEstablished))
+							p2.(*dstWireEnd).diagState.And(^uint32(dstDiagEstablished))
+							dstKernelSectionExit()
 							dialOpts.setKick(nil)
 							dialer.sockFD = 0
 							dialer.resetConn()
@@ -2175,6 +2279,9 @@ redial:
 						}
 					default:
 					}
+					dstKernelSectionEnter()
+					p1.(*dstWireEnd).diagState.Or(dstDiagDialReturned)
+					dstKernelSectionExit()
 					return dialer, nil
 				}
 				if !ackBlackhole {

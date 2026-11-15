@@ -243,18 +243,30 @@ func TestDiagnosticsSilentOnPassAndIntentionalCrashFaults(t *testing.T) {
 	}
 
 	passOut := runDiagnosticsChild(t, "TestDiagnosticsSilentOnPassAndIntentionalCrashFaults", "GO_DST_DIAG_PASS_CHILD", false, "-test.v")
-	for _, unwanted := range []string{"simulation diagnostics", "killed goroutines on process exit", "captured bubble stdio", "quiet-on-pass"} {
+	for _, unwanted := range []string{"simulation diagnostics", "causal event timeline", "killed goroutines on process exit", "captured bubble stdio", "quiet-on-pass"} {
 		if strings.Contains(passOut, unwanted) {
 			t.Errorf("passing -v test emitted %q:\n%s", unwanted, passOut)
 		}
 	}
 
 	crashOut := runDiagnosticsChild(t, "TestDiagnosticsSilentOnPassAndIntentionalCrashFaults", "GO_DST_DIAG_CRASH_FAULT_CHILD", true)
-	if !strings.Contains(crashOut, `host="n1" proc="daemon"`) {
+	_, killSection, ok := strings.Cut(crashOut, "killed goroutines on process exit:\n")
+	if !ok {
+		t.Fatalf("missing killed-goroutines section:\n%s", crashOut)
+	}
+	if !strings.Contains(killSection, `host="n1" proc="daemon"`) {
 		t.Errorf("missing normal process-exit kill on daemon:\n%s", crashOut)
 	}
-	if strings.Contains(crashOut, `proc="victim"`) || strings.Contains(crashOut, `host="n2"`) {
+	if strings.Contains(killSection, `proc="victim"`) || strings.Contains(killSection, `host="n2"`) {
 		t.Errorf("intentional Crash/CrashHost/Ctl.End polluted exit-kill diagnostics:\n%s", crashOut)
+	}
+	if !strings.Contains(crashOut, "causal event timeline:\n") ||
+		!strings.Contains(crashOut, `CrashProcess [host="n2" proc="victim"`) ||
+		!strings.Contains(crashOut, `CrashHost "n2"`) {
+		t.Errorf("missing intentional CrashProcess/CrashHost in causal event timeline:\n%s", crashOut)
+	}
+	if strings.Contains(crashOut, `CrashHost "n1"`) {
+		t.Errorf("Ctl.End cleanup leaked post-failure CrashHost \"n1\" into causal event timeline:\n%s", crashOut)
 	}
 }
 

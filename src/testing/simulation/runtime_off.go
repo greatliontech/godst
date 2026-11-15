@@ -106,11 +106,16 @@ func dstProcAllocBytes(procid uint32) int64                          { return 0 
 func dstNetPartitionOp(op, a, b uint32)                              {}
 func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
 }
-func dstNetHostDead(host uint32) bool                                { return false }
-func dstInSimBubble() bool                                           { return false }
-func dstStepHostClock(host uint32, delta int64) bool                 { return true }
-func dstDriftHostClock(host uint32, ppb int64)                       {}
-func dstDiskFaultOp(op, host uint32, arg int64, name string)         {}
+func dstNetHostDead(host uint32) bool                        { return false }
+func dstInSimBubble() bool                                   { return false }
+func dstStepHostClock(host uint32, delta int64) bool         { return true }
+func dstDriftHostClock(host uint32, ppb int64)               {}
+func dstDiskFaultOp(op, host uint32, arg int64, name string) {}
+func dstRecordCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string) {
+}
+func dstCausalSuppressEnter()       {}
+func dstCausalSuppressExit()        {}
+func dstCallerDeferPanicking() bool { return false }
 func dstSnapshotRunDiagnostics() (
 	killMeta [][5]uint64,
 	killSeqs []uint64,
@@ -124,6 +129,9 @@ func dstSnapshotRunDiagnostics() (
 	sometimesNames []string,
 	sometimesMeta [][3]uint64,
 	sometimesOverflow uint64,
+	causalMeta [][9]uint64,
+	causalStrs []string,
+	causalOmitted uint64,
 ) {
 	return
 }

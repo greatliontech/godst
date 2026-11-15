@@ -11,10 +11,56 @@ import (
 	"time"
 )
 
+// Causal event kind codes — must match runtime's dstCausal* constants.
+const (
+	causalHostBoot             uint8 = 1
+	causalHostClockRedecl      uint8 = 2
+	causalProcStart            uint8 = 3
+	causalProcExit             uint8 = 4
+	causalCrashHost            uint8 = 5
+	causalCrashProc            uint8 = 6
+	causalPartition            uint8 = 10
+	causalPartitionOneWay      uint8 = 11
+	causalPartitionRefuse      uint8 = 12
+	causalHealLink             uint8 = 13
+	causalIsolateHost          uint8 = 14
+	causalUnisolateHost        uint8 = 15
+	causalConfigureLink        uint8 = 16
+	causalConfigureLinkOneWay  uint8 = 17
+	causalUnconfigureLink      uint8 = 18
+	causalResetLinkConns       uint8 = 19
+	causalResetProcessConns    uint8 = 20
+	causalFailDisk             uint8 = 21
+	causalHealDisk             uint8 = 22
+	causalFailWriteback        uint8 = 23
+	causalHealWriteback        uint8 = 24
+	causalFailFile             uint8 = 25
+	causalHealFile             uint8 = 26
+	causalLimitDisk            uint8 = 27
+	causalUnlimitDisk          uint8 = 28
+	causalSlowDisk             uint8 = 29
+	causalUnslowDisk           uint8 = 30
+	causalCorruptFile          uint8 = 31
+	causalStepClock            uint8 = 32
+	causalDriftClock           uint8 = 33
+	causalNetListen            uint8 = 40
+	causalNetListenerClose     uint8 = 41
+	causalNetDialEstablished   uint8 = 42
+	causalNetDialRefused       uint8 = 43
+	causalNetDialTimeout       uint8 = 44
+	causalNetRetransmitTimeout uint8 = 45
+	causalNetKeepaliveTimeout  uint8 = 46
+	causalNetRSTDelivered      uint8 = 47
+	causalFSEIO                uint8 = 50
+	causalFSFsyncgateDrop      uint8 = 51
+	causalFSENOSPC             uint8 = 52
+)
+
 // formatRunDiagnostics snapshots and renders the current run's failure-only
-// diagnostics (activated Sometimes fault points, live goroutines killed by
-// normal Process exit, and ungranted bubble writes to standard output/error),
-// prefixed with the seed header. Returns "" when the run recorded none.
+// diagnostics (causal event timeline, activated Sometimes fault points, live
+// goroutines killed by normal Process exit, and ungranted bubble writes to
+// standard output/error), prefixed with the seed header. Returns "" when the
+// run recorded none.
 func formatRunDiagnostics(seed uint64) string {
 	body := formatRunDiagnosticsBody()
 	if body == "" {
@@ -23,17 +69,42 @@ func formatRunDiagnostics(seed uint64) string {
 	return fmt.Sprintf("--- simulation diagnostics (seed %d) ---\n%s", seed, body)
 }
 
-// formatRunDiagnosticsBody renders the current run's activated-Sometimes,
-// killed-goroutine, and captured bubble stdio sections without an outer seed
-// header so ExploreTest can attach per-schedule diagnostics under each Failure
-// block.
+// formatRunDiagnosticsBody renders the current run's causal-timeline,
+// activated-Sometimes, killed-goroutine, and captured bubble stdio sections
+// without an outer seed header so ExploreTest can attach per-schedule
+// diagnostics under each Failure block.
 func formatRunDiagnosticsBody() string {
-	killMeta, killSeqs, killGoPCs, killStartPCs, killStates, droppedKills, stdioMeta, stdioData, stdioTruncated, sometimesNames, sometimesMeta, sometimesOverflow := dstSnapshotRunDiagnostics()
-	if len(killMeta) == 0 && droppedKills == 0 && len(stdioMeta) == 0 && stdioTruncated == 0 && len(sometimesNames) == 0 && sometimesOverflow == 0 {
+	killMeta, killSeqs, killGoPCs, killStartPCs, killStates, droppedKills, stdioMeta, stdioData, stdioTruncated, sometimesNames, sometimesMeta, sometimesOverflow, causalMeta, causalStrs, causalOmitted := dstSnapshotRunDiagnostics()
+	if len(causalMeta) == 0 && causalOmitted == 0 && len(killMeta) == 0 && droppedKills == 0 && len(stdioMeta) == 0 && stdioTruncated == 0 && len(sometimesNames) == 0 && sometimesOverflow == 0 {
 		return ""
 	}
 
 	var b strings.Builder
+	if len(causalMeta) > 0 || causalOmitted > 0 {
+		b.WriteString("causal event timeline:\n")
+		if causalOmitted > 0 {
+			fmt.Fprintf(&b, "  ... (%d earlier causal event(s) omitted; showing last %d)\n", causalOmitted, len(causalMeta))
+		}
+		for i, meta := range causalMeta {
+			seq := meta[0]
+			at := time.Duration(int64(meta[1]))
+			kind := uint8(meta[2])
+			flags := uint8(meta[2] >> 8)
+			hostA := uint32(meta[3])
+			hostB := uint32(meta[3] >> 32)
+			proc := uint32(meta[4])
+			pid := int32(uint32(meta[4] >> 32))
+			arg0 := int64(meta[5])
+			arg1 := int64(meta[6])
+			arg2 := int64(meta[7])
+			origLen := int(meta[8])
+			var str string
+			if i < len(causalStrs) {
+				str = causalStrs[i]
+			}
+			fmt.Fprintf(&b, "  #%d +%s: %s\n", seq, at, formatCausalEvent(kind, flags, hostA, hostB, proc, pid, arg0, arg1, arg2, str, origLen))
+		}
+	}
 	if len(sometimesNames) > 0 || sometimesOverflow > 0 {
 		b.WriteString("activated fault points (Sometimes):\n")
 		for i, prefix := range sometimesNames {
@@ -179,5 +250,184 @@ func writeIndentedStdio(b *strings.Builder, s string) {
 		b.WriteString("    ")
 		b.WriteString(line)
 		b.WriteByte('\n')
+	}
+}
+
+func formatCausalHost(host uint32) string {
+	hostName, _ := nodeNames(host, 0)
+	if hostName != "" {
+		return fmt.Sprintf("%q", hostName)
+	}
+	if host == 0 {
+		return "root"
+	}
+	return fmt.Sprintf("host#%d", host)
+}
+
+func formatCausalStr(prefix string, origLen int) string {
+	if origLen > len(prefix) {
+		return fmt.Sprintf("%q (truncated from %d bytes)", prefix, origLen)
+	}
+	return fmt.Sprintf("%q", prefix)
+}
+
+func formatFSOpName(op uint8) string {
+	switch op {
+	case 1:
+		return "read"
+	case 2:
+		return "pread"
+	case 3:
+		return "write"
+	case 4:
+		return "pwrite"
+	case 5:
+		return "fsync"
+	case 6:
+		return "fdatasync"
+	case 7:
+		return "fallocate"
+	case 8:
+		return "mmap"
+	case 9:
+		return "create"
+	case 10:
+		return "mkdir"
+	default:
+		return fmt.Sprintf("op#%d", op)
+	}
+}
+
+func formatCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string, origLen int) string {
+	switch kind {
+	case causalHostBoot:
+		hostName, _ := nodeNames(hostA, 0)
+		var extra strings.Builder
+		if origLen > 0 && (str != hostName || origLen > len(str)) {
+			fmt.Fprintf(&extra, " hostname=%s", formatCausalStr(str, origLen))
+		}
+		if arg0 != 0 {
+			fmt.Fprintf(&extra, " clockOffset=%s", time.Duration(arg0))
+		}
+		if arg1 != 0 {
+			fmt.Fprintf(&extra, " driftPPB=%d", arg1)
+		}
+		return fmt.Sprintf("Host boot %s (boot=%d%s)", formatCausalHost(hostA), arg2, extra.String())
+	case causalHostClockRedecl:
+		hostName, _ := nodeNames(hostA, 0)
+		var extra strings.Builder
+		if origLen > 0 && (str != hostName || origLen > len(str)) {
+			fmt.Fprintf(&extra, " hostname=%s", formatCausalStr(str, origLen))
+		}
+		return fmt.Sprintf("Host clock re-declared %s (clockOffset=%s driftPPB=%d%s)", formatCausalHost(hostA), time.Duration(arg0), arg1, extra.String())
+	case causalProcStart:
+		ns := ""
+		if origLen > 0 {
+			ns = " pidns=" + formatCausalStr(str, origLen)
+		}
+		return fmt.Sprintf("Process start [%s%s]", formatDiagNode(hostA, proc, pid), ns)
+	case causalProcExit:
+		reason := "normal"
+		switch flags {
+		case 1:
+			reason = "panic"
+		case 2:
+			reason = "mapping-fault"
+		}
+		return fmt.Sprintf("Process exit [%s] (reason=%s)", formatDiagNode(hostA, proc, pid), reason)
+	case causalCrashHost:
+		tear := "false"
+		if flags&1 != 0 {
+			tear = "true"
+		}
+		return fmt.Sprintf("CrashHost %s (procs=%d crashTear=%s)", formatCausalHost(hostA), arg0, tear)
+	case causalCrashProc:
+		if arg0 == 1 {
+			return fmt.Sprintf("CrashProcess [%s]", formatDiagNode(hostA, proc, pid))
+		}
+		return fmt.Sprintf("CrashProcess [%s] (instances=%d)", formatDiagNode(hostA, proc, 0), arg0)
+	case causalPartition:
+		return fmt.Sprintf("Partition %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalPartitionOneWay:
+		return fmt.Sprintf("PartitionOneWay %s -> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalPartitionRefuse:
+		return fmt.Sprintf("PartitionRefuse %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalHealLink:
+		return fmt.Sprintf("HealLink %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalIsolateHost:
+		return fmt.Sprintf("IsolateHost %s", formatCausalHost(hostA))
+	case causalUnisolateHost:
+		return fmt.Sprintf("UnisolateHost %s", formatCausalHost(hostA))
+	case causalConfigureLink:
+		return fmt.Sprintf("ConfigureLink %s <-> %s (latency=%s jitter=%s bandwidth=%dB/s)", formatCausalHost(hostA), formatCausalHost(hostB), time.Duration(arg0), time.Duration(arg1), arg2)
+	case causalConfigureLinkOneWay:
+		return fmt.Sprintf("ConfigureLinkOneWay %s -> %s (latency=%s jitter=%s bandwidth=%dB/s)", formatCausalHost(hostA), formatCausalHost(hostB), time.Duration(arg0), time.Duration(arg1), arg2)
+	case causalUnconfigureLink:
+		return fmt.Sprintf("UnconfigureLink %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalResetLinkConns:
+		return fmt.Sprintf("ResetLinkConns %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
+	case causalResetProcessConns:
+		return fmt.Sprintf("ResetProcessConns [%s] (instances=%d)", formatDiagNode(hostA, proc, 0), arg0)
+	case causalFailDisk:
+		return fmt.Sprintf("FailDisk %s", formatCausalHost(hostA))
+	case causalHealDisk:
+		return fmt.Sprintf("HealDisk %s", formatCausalHost(hostA))
+	case causalFailWriteback:
+		return fmt.Sprintf("FailWriteback %s", formatCausalHost(hostA))
+	case causalHealWriteback:
+		return fmt.Sprintf("HealWriteback %s", formatCausalHost(hostA))
+	case causalFailFile:
+		return fmt.Sprintf("FailFile %s path=%s", formatCausalHost(hostA), formatCausalStr(str, origLen))
+	case causalHealFile:
+		return fmt.Sprintf("HealFile %s path=%s", formatCausalHost(hostA), formatCausalStr(str, origLen))
+	case causalLimitDisk:
+		return fmt.Sprintf("LimitDisk %s (bytes=%d)", formatCausalHost(hostA), arg0)
+	case causalUnlimitDisk:
+		return fmt.Sprintf("UnlimitDisk %s", formatCausalHost(hostA))
+	case causalSlowDisk:
+		return fmt.Sprintf("SlowDisk %s (perOp=%s)", formatCausalHost(hostA), time.Duration(arg0))
+	case causalUnslowDisk:
+		return fmt.Sprintf("UnslowDisk %s", formatCausalHost(hostA))
+	case causalCorruptFile:
+		target := "durable"
+		if flags&1 != 0 {
+			target = "offline-platter"
+		}
+		return fmt.Sprintf("CorruptFile %s path=%s (offset=%d bit=%d image=%s)", formatCausalHost(hostA), formatCausalStr(str, origLen), arg0, arg1, target)
+	case causalStepClock:
+		return fmt.Sprintf("StepClock %s (delta=%s)", formatCausalHost(hostA), time.Duration(arg0))
+	case causalDriftClock:
+		return fmt.Sprintf("DriftClock %s (ppb=%d)", formatCausalHost(hostA), arg0)
+	case causalNetListen:
+		return fmt.Sprintf("TCP Listen [%s] addr=%s (port=%d)", formatDiagNode(hostA, proc, pid), formatCausalStr(str, origLen), arg0)
+	case causalNetListenerClose:
+		return fmt.Sprintf("TCP Listener.Close [%s] addr=%s (port=%d)", formatDiagNode(hostA, proc, pid), formatCausalStr(str, origLen), arg0)
+	case causalNetDialEstablished:
+		return fmt.Sprintf("TCP Dial established [%s] :%d -> %s:%d (addr=%s)", formatDiagNode(hostA, proc, pid), arg0, formatCausalHost(hostB), arg1, formatCausalStr(str, origLen))
+	case causalNetDialRefused:
+		return fmt.Sprintf("TCP Dial refused [%s] -> %s (addr=%s)", formatDiagNode(hostA, proc, pid), formatCausalHost(hostB), formatCausalStr(str, origLen))
+	case causalNetDialTimeout:
+		reason := "deadline"
+		if flags&1 != 0 {
+			reason = "retransmit"
+		}
+		return fmt.Sprintf("TCP Dial timeout [%s] -> %s (addr=%s reason=%s)", formatDiagNode(hostA, proc, pid), formatCausalHost(hostB), formatCausalStr(str, origLen), reason)
+	case causalNetRetransmitTimeout:
+		return fmt.Sprintf("TCP retransmit ETIMEDOUT %s:%d -> %s:%d", formatCausalHost(hostA), arg0, formatCausalHost(hostB), arg1)
+	case causalNetKeepaliveTimeout:
+		return fmt.Sprintf("TCP keepalive ETIMEDOUT %s:%d -> %s:%d", formatCausalHost(hostA), arg0, formatCausalHost(hostB), arg1)
+	case causalNetRSTDelivered:
+		return fmt.Sprintf("TCP RST delivered %s:%d <- %s:%d", formatCausalHost(hostA), arg0, formatCausalHost(hostB), arg1)
+	case causalFSEIO:
+		return fmt.Sprintf("FS EIO [%s] op=%s path=%s", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen))
+	case causalFSFsyncgateDrop:
+		return fmt.Sprintf("FS fsyncgate writeback drop [%s] op=%s path=%s", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen))
+	case causalFSENOSPC:
+		if arg1 > 0 {
+			return fmt.Sprintf("FS ENOSPC [%s] op=%s path=%s (written=%d requested=%d)", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen), arg0, arg1)
+		}
+		return fmt.Sprintf("FS ENOSPC [%s] op=%s path=%s", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen))
+	default:
+		return fmt.Sprintf("event#%d", kind)
 	}
 }

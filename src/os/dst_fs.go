@@ -232,6 +232,33 @@ var dstDiskSlow atomic.Bool
 //go:linkname dstFSCurrentNode runtime.dstCurrentSlot
 func dstFSCurrentNode() (host, proc uint32)
 
+//go:linkname dstRecordCausalEvent runtime.dstRecordCausalEvent
+func dstRecordCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string)
+
+//go:linkname dstRecordCausalCaller runtime.dstRecordCausalCaller
+func dstRecordCausalCaller(kind, flags uint8, hostB uint32, arg0, arg1, arg2 int64, str string)
+
+// Causal event kind codes and FS op codes — must match runtime and testing/simulation.
+const (
+	dstCausalCorruptFile     uint8 = 31
+	dstCausalFSEIO           uint8 = 50
+	dstCausalFSFsyncgateDrop uint8 = 51
+	dstCausalFSENOSPC        uint8 = 52
+)
+
+const (
+	dstFSOpRead      uint8 = 1
+	dstFSOpPread     uint8 = 2
+	dstFSOpWrite     uint8 = 3
+	dstFSOpPwrite    uint8 = 4
+	dstFSOpFsync     uint8 = 5
+	dstFSOpFdatasync uint8 = 6
+	dstFSOpFallocate uint8 = 7
+	dstFSOpMmap      uint8 = 8
+	dstFSOpCreate    uint8 = 9
+	dstFSOpMkdir     uint8 = 10
+)
+
 //go:linkname dstSMaxBytesOS runtime.dstSMaxBytesOS
 func dstSMaxBytesOS() int64
 
@@ -816,6 +843,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 		return wrap(syscall.ENOENT)
 	}
 	if disk.diskFullForCreate() {
+		dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpMkdir, 0, 0, 0, 0, name)
 		return wrap(syscall.ENOSPC)
 	}
 	parent := parentDentry.node
@@ -1632,6 +1660,7 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 			return wrap(syscall.ENOENT)
 		}
 		if disk.diskFullForCreate() {
+			dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpCreate, 0, 0, 0, 0, name)
 			return wrap(syscall.ENOSPC)
 		}
 		node = dstFSNewNode(disk, 0, perm)
@@ -1929,25 +1958,27 @@ func dstDiskDelayHere() {
 // or this file's node is under a per-file EIO fault, else nil. Caller holds
 // dstFS.mu. Checked only at the calls a real disk can fail with EIO (read / write /
 // sync), never at an infallible call (seek, in-memory stat) — DST-FAULT-SOUND.
-func (d *dstFile) diskEIO() error {
+func (d *dstFile) diskEIOOp(op uint8) error {
 	if d.disk.eio || d.disk.eioFiles[d.node] {
+		dstRecordCausalCaller(dstCausalFSEIO, op, 0, 0, 0, 0, d.path)
 		return syscall.EIO
 	}
 	return nil
 }
 
-// syncEIO returns syscall.EIO if a sync of this handle must fail: any fault
-// diskEIO reports, or the host's writeback fault (wbFail). Writeback failure
+// syncEIOOp returns syscall.EIO if a sync of this handle must fail: any fault
+// diskEIOOp reports, or the host's writeback fault (wbFail). Writeback failure
 // fails ONLY here — a failing medium under a live page cache still serves
 // buffered reads and writes (the cache needs no device op, and this model
-// never evicts), so the read/write chokes consult diskEIO alone; injecting
+// never evicts), so the read/write chokes consult diskEIOOp alone; injecting
 // EIO there under wbFail would surface an error no real kernel produces at a
 // cache-served call (DST-FAULT-SOUND). Caller holds dstFS.mu.
-func (d *dstFile) syncEIO() error {
+func (d *dstFile) syncEIOOp(op uint8) error {
 	if d.disk.wbFail {
+		dstRecordCausalCaller(dstCausalFSEIO, op, 0, 0, 0, 0, d.path)
 		return syscall.EIO
 	}
-	return d.diskEIO()
+	return d.diskEIOOp(op)
 }
 
 // syncMmapBlocksLocked folds non-zero pages dirtied through a PROT_WRITE
@@ -2129,7 +2160,7 @@ func (d *dstFile) read(b []byte) (n int, err error) {
 			// disk.
 			return io.EOF
 		}
-		if err := d.diskEIO(); err != nil {
+		if err := d.diskEIOOp(dstFSOpRead); err != nil {
 			return err
 		}
 		if d.off >= int64(len(d.node.data)) {
@@ -2170,7 +2201,7 @@ func (d *dstFile) pread(b []byte, off int64) (n int, err error) {
 			// /dev/null: EOF at every offset (host-verified via ReadAt).
 			return io.EOF
 		}
-		if err := d.diskEIO(); err != nil {
+		if err := d.diskEIOOp(dstFSOpPread); err != nil {
 			return err
 		}
 		if off >= int64(len(d.node.data)) {
@@ -2212,7 +2243,11 @@ func (d *dstFile) writePreflight(n int) (done bool, written int, err error) {
 	return false, 0, nil
 }
 
-func (d *dstFile) write(b []byte) (n int, err error) {
+func (d *dstFile) write(b []byte) (int, error) {
+	return d.writeOp(b, true)
+}
+
+func (d *dstFile) writeOp(b []byte, combineShortErr bool) (n int, err error) {
 	d.coarseOp(true, true)
 	d.diskDelay()
 	if done, wn, preErr := d.writePreflight(len(b)); done {
@@ -2246,11 +2281,14 @@ func (d *dstFile) write(b []byte) (n int, err error) {
 		// PARTIAL keeps EIO precedence — its bytes do submit.
 		return 0, syscall.EFBIG
 	}
-	if err := d.diskEIO(); err != nil {
+	if err := d.diskEIOOp(dstFSOpWrite); err != nil {
 		return 0, err
 	}
 	allowed, refuse := d.writeAllowed(pos, int64(len(b)))
 	if allowed == 0 && len(b) > 0 {
+		if refuse == syscall.ENOSPC {
+			dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpWrite, 0, 0, int64(len(b)), 0, d.path)
+		}
 		return 0, refuse
 	}
 	n, werr := d.writeAtLocked(kbuf[:allowed], pos)
@@ -2282,6 +2320,8 @@ func (d *dstFile) write(b []byte) (n int, err error) {
 			// background flusher is free to have attempted (and dropped)
 			// every dirty page of the file during the fault window.
 			d.node.markWritebackDroppedLocked()
+			dstRecordCausalCaller(dstCausalFSEIO, dstFSOpWrite, 0, 0, 0, 0, d.path)
+			dstRecordCausalCaller(dstCausalFSFsyncgateDrop, dstFSOpWrite, 0, 0, 0, 0, d.path)
 			return 0, syscall.EIO
 		}
 		if d.osync {
@@ -2294,7 +2334,7 @@ func (d *dstFile) write(b []byte) (n int, err error) {
 	// short count a real write(2) returns before the retry's ENOSPC — store
 	// the advanced position back to the handle, as ksys_write does.
 	d.off = pos + int64(n)
-	if n < len(b) {
+	if combineShortErr && n < len(b) {
 		// The boundary bound mid-write: the remaining bytes fail with the
 		// binding boundary's errno (ENOSPC for a filled disk, EFBIG at
 		// s_maxbytes), reported together with the partial count in ONE call —
@@ -2302,7 +2342,13 @@ func (d *dstFile) write(b []byte) (n int, err error) {
 		// kernel write and surfaces (n, err). Returning a bare short count
 		// instead would let os.File.Write report io.ErrShortWrite, an error
 		// identity a real regular-file write cannot produce, so the SUT's
-		// errors.Is recovery would miss exactly the faulted write.
+		// errors.Is recovery would miss exactly the faulted write. Raw
+		// syscall.Write (combineShortErr == false) models a single write(2),
+		// returning (n, nil) without surfacing or logging ENOSPC unless a
+		// follow-up call hits allowed == 0.
+		if refuse == syscall.ENOSPC {
+			dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpWrite, 0, int64(n), int64(len(b)), 0, d.path)
+		}
 		return n, refuse
 	}
 	return n, nil
@@ -2337,7 +2383,7 @@ func (d *dstFile) pwrite(b []byte, off int64) (n int, err error) {
 		// so it beats an injected device EIO for the outright case.
 		return 0, syscall.EFBIG
 	}
-	if err := d.diskEIO(); err != nil {
+	if err := d.diskEIOOp(dstFSOpPwrite); err != nil {
 		return 0, err
 	}
 	// pwrite models a SINGLE pwrite(2): os.File.WriteAt loops over it and adds the
@@ -2347,6 +2393,9 @@ func (d *dstFile) pwrite(b []byte, off int64) (n int, err error) {
 	// path, by contrast, needs the combined return — see write.)
 	allowed, refuse := d.writeAllowed(off, int64(len(b)))
 	if allowed == 0 && len(b) > 0 {
+		if refuse == syscall.ENOSPC {
+			dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpPwrite, 0, 0, int64(len(b)), 0, d.path)
+		}
 		return 0, refuse
 	}
 	n, werr := d.writeAtLocked(kbuf[:allowed], off)
@@ -2368,6 +2417,8 @@ func (d *dstFile) pwrite(b []byte, off int64) (n int, err error) {
 			// but not durable, and the failed writeback drops the dirty
 			// pages (fsyncgate) — as in write.
 			d.node.markWritebackDroppedLocked()
+			dstRecordCausalCaller(dstCausalFSEIO, dstFSOpPwrite, 0, 0, 0, 0, d.path)
+			dstRecordCausalCaller(dstCausalFSFsyncgateDrop, dstFSOpPwrite, 0, 0, 0, 0, d.path)
 			return 0, syscall.EIO
 		}
 		if d.osync {
@@ -2644,7 +2695,7 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 		// filesystem op — so EFBIG wins over ENOSPC when both bind.
 		return syscall.EFBIG
 	}
-	if err := d.diskEIO(); err != nil {
+	if err := d.diskEIOOp(dstFSOpFallocate); err != nil {
 		return err
 	}
 	d.node.syncMmapBlocksLocked()
@@ -2652,6 +2703,7 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 	endPg := (newSize-1)/dstPageSize + 1
 	need := dstBlocksUnallocatedIn(d.node.blocks, startPg, endPg)
 	if d.disk.capped.Load() && need > d.disk.freeBlocksLocked() {
+		dstRecordCausalCaller(dstCausalFSENOSPC, dstFSOpFallocate, 0, 0, length, 0, d.path)
 		return syscall.ENOSPC // refused whole: a failed fallocate allocates nothing
 	}
 	if newSize > int64(len(d.node.data)) {
@@ -2684,13 +2736,14 @@ func (d *dstFile) sync() error {
 		// image.
 		return syscall.EINVAL
 	}
-	if err := d.syncEIO(); err != nil {
+	if err := d.syncEIOOp(dstFSOpFsync); err != nil {
 		if !d.node.isDir {
 			// fsyncgate: the failed writeback marks the file's dirty pages
 			// clean without persisting them (see dstFSNode.wbDropped).
 			// Directory entry writeback keeps the full-commit model — a
 			// recorded bound: the drop is modeled for file DATA pages.
 			d.node.markWritebackDroppedLocked()
+			dstRecordCausalCaller(dstCausalFSFsyncgateDrop, dstFSOpFsync, 0, 0, 0, 0, d.path)
 		}
 		return err
 	}
@@ -2711,7 +2764,7 @@ func (d *dstFile) datasync() error {
 		// directory fd — the create/rename-then-fdatasync-the-directory
 		// durability idiom is production-legal). Directory entry writeback
 		// keeps the full-commit model on EIO, as in sync.
-		if err := d.syncEIO(); err != nil {
+		if err := d.syncEIOOp(dstFSOpFdatasync); err != nil {
 			return err
 		}
 		d.node.commitLocked()
@@ -2722,9 +2775,10 @@ func (d *dstFile) datasync() error {
 		// (host-verified).
 		return syscall.EINVAL
 	}
-	if err := d.syncEIO(); err != nil {
+	if err := d.syncEIOOp(dstFSOpFdatasync); err != nil {
 		// fsyncgate, as in sync.
 		d.node.markWritebackDroppedLocked()
+		dstRecordCausalCaller(dstCausalFSFsyncgateDrop, dstFSOpFdatasync, 0, 0, 0, 0, d.path)
 		return err
 	}
 	d.node.commitDataLocked()

@@ -672,7 +672,11 @@ func dstHostDriftPPB(host uint32) int64 {
 //go:linkname dstStepHostClock
 func dstStepHostClock(host uint32, delta int64) bool {
 	gp := getg()
-	if delta == 0 || gp.bubble == nil || gp.bubble != dstSimBubble {
+	if gp.bubble == nil || gp.bubble != dstSimBubble {
+		return true
+	}
+	if delta == 0 {
+		dstRecordCausalEvent(dstCausalStepClock, 0, host, 0, 0, 0, 0, 0, 0, "")
 		return true
 	}
 	dstHostClockEnsure(host)
@@ -686,6 +690,7 @@ func dstStepHostClock(host uint32, delta int64) bool {
 		return false // pre-epoch wall: reject, apply nothing
 	}
 	e.offset.Store(newOff)
+	dstRecordCausalEvent(dstCausalStepClock, 0, host, 0, 0, 0, delta, 0, 0, "")
 	return true
 }
 
@@ -809,6 +814,7 @@ func dstDriftHostClock(host uint32, ppb int64) {
 		ppb = dstMaxDriftPPB
 	}
 	dstHostClockEnsure(host)
+	dstRecordCausalEvent(dstCausalDriftClock, 0, host, 0, 0, 0, ppb, 0, 0, "")
 	e := &dstHostClock.Load().ent[host]
 	ppbOld := e.driftPPB.Load()
 	if ppbOld == ppb {
@@ -3211,6 +3217,22 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32)) { dstNetPartitionHook = fn
 //
 //go:linkname dstNetPartitionOp
 func dstNetPartitionOp(op, a, b uint32) {
+	switch op {
+	case 1: // partOpPartition
+		dstRecordCausalEvent(dstCausalPartition, 0, a, b, 0, 0, 0, 0, 0, "")
+	case 2: // partOpHeal
+		dstRecordCausalEvent(dstCausalHealLink, 0, a, b, 0, 0, 0, 0, 0, "")
+	case 3: // partOpIsolate
+		dstRecordCausalEvent(dstCausalIsolateHost, 0, a, 0, 0, 0, 0, 0, 0, "")
+	case 4: // partOpHealHost
+		dstRecordCausalEvent(dstCausalUnisolateHost, 0, a, 0, 0, 0, 0, 0, 0, "")
+	case 5: // partOpResetPair
+		dstRecordCausalEvent(dstCausalResetLinkConns, 0, a, b, 0, 0, 0, 0, 0, "")
+	case 7: // partOpPartitionOneWay
+		dstRecordCausalEvent(dstCausalPartitionOneWay, 0, a, b, 0, 0, 0, 0, 0, "")
+	case 8: // partOpPartitionRefuse
+		dstRecordCausalEvent(dstCausalPartitionRefuse, 0, a, b, 0, 0, 0, 0, 0, "")
+	}
 	if dstNetPartitionHook != nil {
 		dstNetPartitionHook(op, a, b)
 	}
@@ -3235,6 +3257,14 @@ func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandw
 //
 //go:linkname dstNetLinkConfigOp
 func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+	switch op {
+	case 1: // linkOpSetBoth
+		dstRecordCausalEvent(dstCausalConfigureLink, 0, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, "")
+	case 2: // linkOpSetOneWay
+		dstRecordCausalEvent(dstCausalConfigureLinkOneWay, 0, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, "")
+	case 3: // linkOpClearBoth
+		dstRecordCausalEvent(dstCausalUnconfigureLink, 0, a, b, 0, 0, 0, 0, 0, "")
+	}
 	if dstNetLinkConfigHook != nil {
 		dstNetLinkConfigHook(op, a, b, latencyNs, jitterNs, bandwidthBps)
 	}
@@ -3353,6 +3383,28 @@ func dstSetDiskFaultHook(fn func(op, host uint32, arg int64, path string)) { dst
 //
 //go:linkname dstDiskFaultOp
 func dstDiskFaultOp(op, host uint32, arg int64, path string) {
+	switch op {
+	case 1: // diskOpFailDisk
+		dstRecordCausalEvent(dstCausalFailDisk, 0, host, 0, 0, 0, 0, 0, 0, "")
+	case 2: // diskOpHealDisk
+		dstRecordCausalEvent(dstCausalHealDisk, 0, host, 0, 0, 0, 0, 0, 0, "")
+	case 3: // diskOpFailFile
+		dstRecordCausalEvent(dstCausalFailFile, 0, host, 0, 0, 0, 0, 0, 0, path)
+	case 4: // diskOpHealFile
+		dstRecordCausalEvent(dstCausalHealFile, 0, host, 0, 0, 0, 0, 0, 0, path)
+	case 5: // diskOpLimit
+		dstRecordCausalEvent(dstCausalLimitDisk, 0, host, 0, 0, 0, arg, 0, 0, "")
+	case 6: // diskOpUnlimit
+		dstRecordCausalEvent(dstCausalUnlimitDisk, 0, host, 0, 0, 0, 0, 0, 0, "")
+	case 7: // diskOpSlow
+		dstRecordCausalEvent(dstCausalSlowDisk, 0, host, 0, 0, 0, arg, 0, 0, "")
+	case 9: // diskOpFailWriteback
+		dstRecordCausalEvent(dstCausalFailWriteback, 0, host, 0, 0, 0, 0, 0, 0, "")
+	case 10: // diskOpHealWriteback
+		dstRecordCausalEvent(dstCausalHealWriteback, 0, host, 0, 0, 0, 0, 0, 0, "")
+	case 11: // diskOpUnslow
+		dstRecordCausalEvent(dstCausalUnslowDisk, 0, host, 0, 0, 0, 0, 0, 0, "")
+	}
 	if dstDiskFaultHook != nil {
 		dstDiskFaultHook(op, host, arg, path)
 	}
@@ -4282,6 +4334,53 @@ const (
 	dstStdioMaxChunks          = 4096
 	dstMaxSometimesSites       = 256
 	dstSometimesNameCap        = 128
+	dstMaxCausalEvents         = 256
+	dstCausalStrCap            = 128
+)
+
+// Causal event kind codes — mirrored by testing/simulation, net, and os.
+const (
+	dstCausalHostBoot             uint8 = 1
+	dstCausalHostClockRedecl      uint8 = 2
+	dstCausalProcStart            uint8 = 3
+	dstCausalProcExit             uint8 = 4
+	dstCausalCrashHost            uint8 = 5
+	dstCausalCrashProc            uint8 = 6
+	dstCausalPartition            uint8 = 10
+	dstCausalPartitionOneWay      uint8 = 11
+	dstCausalPartitionRefuse      uint8 = 12
+	dstCausalHealLink             uint8 = 13
+	dstCausalIsolateHost          uint8 = 14
+	dstCausalUnisolateHost        uint8 = 15
+	dstCausalConfigureLink        uint8 = 16
+	dstCausalConfigureLinkOneWay  uint8 = 17
+	dstCausalUnconfigureLink      uint8 = 18
+	dstCausalResetLinkConns       uint8 = 19
+	dstCausalResetProcessConns    uint8 = 20
+	dstCausalFailDisk             uint8 = 21
+	dstCausalHealDisk             uint8 = 22
+	dstCausalFailWriteback        uint8 = 23
+	dstCausalHealWriteback        uint8 = 24
+	dstCausalFailFile             uint8 = 25
+	dstCausalHealFile             uint8 = 26
+	dstCausalLimitDisk            uint8 = 27
+	dstCausalUnlimitDisk          uint8 = 28
+	dstCausalSlowDisk             uint8 = 29
+	dstCausalUnslowDisk           uint8 = 30
+	dstCausalCorruptFile          uint8 = 31
+	dstCausalStepClock            uint8 = 32
+	dstCausalDriftClock           uint8 = 33
+	dstCausalNetListen            uint8 = 40
+	dstCausalNetListenerClose     uint8 = 41
+	dstCausalNetDialEstablished   uint8 = 42
+	dstCausalNetDialRefused       uint8 = 43
+	dstCausalNetDialTimeout       uint8 = 44
+	dstCausalNetRetransmitTimeout uint8 = 45
+	dstCausalNetKeepaliveTimeout  uint8 = 46
+	dstCausalNetRSTDelivered      uint8 = 47
+	dstCausalFSEIO                uint8 = 50
+	dstCausalFSFsyncgateDrop      uint8 = 51
+	dstCausalFSENOSPC             uint8 = 52
 )
 
 type dstKilledG struct {
@@ -4326,6 +4425,23 @@ type dstSometimesSite struct {
 	namePrefix [dstSometimesNameCap]byte
 }
 
+type dstCausalEvent struct {
+	_      sys.NotInHeap
+	seq    uint64
+	atNs   int64
+	arg0   int64
+	arg1   int64
+	arg2   int64
+	hostA  uint32
+	hostB  uint32
+	proc   uint32
+	pid    int32
+	strLen int
+	kind   uint8
+	flags  uint8
+	str    [dstCausalStrCap]byte
+}
+
 var dstDiagLock mutex
 
 var dstRunDiag struct {
@@ -4340,6 +4456,9 @@ var dstRunDiag struct {
 	sometimesSites    *[dstMaxSometimesSites]dstSometimesSite
 	nsometimesSites   uint32
 	sometimesOverflow uint64
+	causalEvents      *[dstMaxCausalEvents]dstCausalEvent
+	totalCausalEvents uint64
+	causalSuppress    uint32
 }
 
 func dstResetRunDiagnostics() {
@@ -4351,7 +4470,147 @@ func dstResetRunDiagnostics() {
 	dstRunDiag.stdioTruncated = 0
 	dstRunDiag.nsometimesSites = 0
 	dstRunDiag.sometimesOverflow = 0
+	dstRunDiag.totalCausalEvents = 0
+	dstRunDiag.causalSuppress = 0
 	unlock(&dstDiagLock)
+}
+
+// dstCausalSuppressEnter temporarily suppresses causal-event recording during
+// harness end-of-world teardown (Ctl.End) so post-script cleanup does not
+// append synthetic CrashHost entries after a failure has already occurred.
+//
+//go:linkname dstCausalSuppressEnter
+func dstCausalSuppressEnter() {
+	lock(&dstDiagLock)
+	dstRunDiag.causalSuppress++
+	unlock(&dstDiagLock)
+}
+
+//go:linkname dstCausalSuppressExit
+func dstCausalSuppressExit() {
+	lock(&dstDiagLock)
+	if dstRunDiag.causalSuppress > 0 {
+		dstRunDiag.causalSuppress--
+	}
+	unlock(&dstDiagLock)
+}
+
+// dstCurrentDiagIdentity returns the calling goroutine's simulated (host,
+// logical proc, positive pid) identity for failure-only diagnostic attribution.
+//
+//go:linkname dstCurrentDiagIdentity
+func dstCurrentDiagIdentity() (host, proc uint32, pid int32) {
+	gp := getg()
+	pid = gp.dstPid
+	if pid < 0 {
+		pid = -pid
+	}
+	return gp.dstHost, gp.dstProc, pid
+}
+
+// dstRecordCausalEvent records one state transition into the active simulation
+// bubble's off-heap 256-slot circular ring buffer. Performing 0 Go heap
+// allocations, 0 RNG draws, and 0 TSan / Level-2 DPOR synchronization edges, it
+// is strictly observation-neutral.
+//
+//go:linkname dstRecordCausalEvent
+func dstRecordCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, arg0, arg1, arg2 int64, str string) {
+	gp := getg()
+	b := gp.bubble
+	if b == nil || b != dstSimBubble || !dstActive() {
+		return
+	}
+	relNs := b.now - int64(synctestBaseTime)
+	prefixLen := min(len(str), dstCausalStrCap)
+	lock(&dstDiagLock)
+	if dstRunDiag.causalSuppress > 0 {
+		unlock(&dstDiagLock)
+		return
+	}
+	if dstRunDiag.causalEvents == nil {
+		dstRunDiag.causalEvents = (*[dstMaxCausalEvents]dstCausalEvent)(
+			sysAlloc(unsafe.Sizeof(*dstRunDiag.causalEvents), &memstats.other_sys, "dst causal diagnostics"))
+		if dstRunDiag.causalEvents == nil {
+			unlock(&dstDiagLock)
+			throw("dst: causal diagnostics allocation failed")
+		}
+	}
+	slot := dstRunDiag.totalCausalEvents % dstMaxCausalEvents
+	dstRunDiag.totalCausalEvents++
+	ev := &dstRunDiag.causalEvents[slot]
+	ev.seq = dstRunDiag.totalCausalEvents
+	ev.atNs = relNs
+	ev.arg0 = arg0
+	ev.arg1 = arg1
+	ev.arg2 = arg2
+	ev.hostA = hostA
+	ev.hostB = hostB
+	ev.proc = proc
+	ev.pid = pid
+	ev.strLen = len(str)
+	ev.kind = kind
+	ev.flags = flags
+	if prefixLen > 0 {
+		memmove(unsafe.Pointer(&ev.str[0]), unsafe.Pointer(unsafe.StringData(str)), uintptr(prefixLen))
+	}
+	unlock(&dstDiagLock)
+}
+
+// dstRecordCausalCaller stamps hostA, logical proc, and positive pid from the
+// calling goroutine's simulated identity and records the causal event.
+//
+//go:linkname dstRecordCausalCaller
+func dstRecordCausalCaller(kind, flags uint8, hostB uint32, arg0, arg1, arg2 int64, str string) {
+	gp := getg()
+	pid := gp.dstPid
+	if pid < 0 {
+		pid = -pid
+	}
+	dstRecordCausalEvent(kind, flags, gp.dstHost, hostB, gp.dstProc, pid, arg0, arg1, arg2, str)
+}
+
+// dstCallerDeferPanicking reports whether the calling deferred function was
+// invoked directly by an unrecovered gopanic unwind (using gorecover's exact
+// stack-frame predicate, without recovering the panic or perturbing stack
+// traces).
+//
+//go:noinline
+//go:linkname dstCallerDeferPanicking
+func dstCallerDeferPanicking() bool {
+	gp := getg()
+	p := gp._panic
+	if p == nil || p.goexit || p.recovered {
+		return false
+	}
+	unwinding := false
+	systemstack(func() {
+		var u unwinder
+		u.init(gp, 0)
+		u.next() // skip systemstack_switch
+		u.next() // skip dstCallerDeferPanicking
+		nonWrapperFrames := 0
+	loop:
+		for ; u.valid(); u.next() {
+			for iu, f := newInlineUnwinder(u.frame.fn, u.symPC()); f.valid(); f = iu.next(f) {
+				sf := iu.srcFunc(f)
+				switch sf.funcID {
+				case abi.FuncIDWrapper:
+					continue
+				case abi.FuncID_gopanic:
+					if u.frame.sp == uintptr(p.startSP) && nonWrapperFrames > 0 {
+						unwinding = true
+					}
+					break loop
+				default:
+					nonWrapperFrames++
+					if nonWrapperFrames > 1 {
+						break loop
+					}
+				}
+			}
+		}
+	})
+	return unwinding
 }
 
 func dstBytesEqualString(a []byte, s string) bool {
@@ -4530,9 +4789,9 @@ func dstBubbleStdioAppend(fd int, p []byte) int {
 	return len(p)
 }
 
-// dstSnapshotRunDiagnostics copies out the current run's off-heap killed-goroutine,
-// stdio, and activated Sometimes fault-site diagnostic records after the bubble
-// has exited.
+// dstSnapshotRunDiagnostics copies out the current run's off-heap causal
+// timeline, killed-goroutine, stdio, and activated Sometimes fault-site
+// diagnostic records after the bubble has exited.
 //
 //go:linkname dstSnapshotRunDiagnostics
 func dstSnapshotRunDiagnostics() (
@@ -4548,6 +4807,9 @@ func dstSnapshotRunDiagnostics() (
 	sometimesNames []string,
 	sometimesMeta [][3]uint64,
 	sometimesOverflow uint64,
+	causalMeta [][9]uint64,
+	causalStrs []string,
+	causalOmitted uint64,
 ) {
 	lock(&dstDiagLock)
 	nk := int(dstRunDiag.nkillEvents)
@@ -4558,6 +4820,7 @@ func dstSnapshotRunDiagnostics() (
 	nc := int(dstRunDiag.nstdioChunks)
 	nbytes := int(dstRunDiag.stdioUsed)
 	ns := int(dstRunDiag.nsometimesSites)
+	nev := int(min(dstRunDiag.totalCausalEvents, uint64(dstMaxCausalEvents)))
 	unlock(&dstDiagLock)
 
 	if nk > 0 {
@@ -4578,6 +4841,12 @@ func dstSnapshotRunDiagnostics() (
 		sometimesNames = make([]string, ns)
 		sometimesMeta = make([][3]uint64, ns)
 		sometimesArena = make([]byte, ns*dstSometimesNameCap)
+	}
+	var causalArena []byte
+	if nev > 0 {
+		causalMeta = make([][9]uint64, nev)
+		causalStrs = make([]string, nev)
+		causalArena = make([]byte, nev*dstCausalStrCap)
 	}
 
 	lock(&dstDiagLock)
@@ -4650,11 +4919,49 @@ func dstSnapshotRunDiagnostics() (
 			uint64(ent.nameLen),
 		}
 	}
+	totalEv := dstRunDiag.totalCausalEvents
+	availEv := int(min(totalEv, uint64(dstMaxCausalEvents)))
+	nev = min(nev, availEv)
+	causalMeta = causalMeta[:nev]
+	causalStrs = causalStrs[:nev]
+	if totalEv > uint64(nev) {
+		causalOmitted = totalEv - uint64(nev)
+	}
+	startSlot := 0
+	if totalEv > uint64(nev) {
+		startSlot = int((totalEv - uint64(nev)) % dstMaxCausalEvents)
+	}
+	for i := 0; i < nev; i++ {
+		slot := (startSlot + i) % dstMaxCausalEvents
+		ev := &dstRunDiag.causalEvents[slot]
+		prefixLen := min(ev.strLen, dstCausalStrCap)
+		off := i * dstCausalStrCap
+		if prefixLen > 0 {
+			copy(causalArena[off:off+prefixLen], ev.str[:prefixLen])
+		}
+		causalMeta[i] = [9]uint64{
+			ev.seq,
+			uint64(ev.atNs),
+			uint64(ev.kind) | (uint64(ev.flags) << 8),
+			uint64(ev.hostA) | (uint64(ev.hostB) << 32),
+			uint64(ev.proc) | (uint64(uint32(ev.pid)) << 32),
+			uint64(ev.arg0),
+			uint64(ev.arg1),
+			uint64(ev.arg2),
+			uint64(ev.strLen),
+		}
+	}
 	unlock(&dstDiagLock)
 	for i := 0; i < ns; i++ {
 		prefixLen := min(int(sometimesMeta[i][2]), dstSometimesNameCap)
 		if prefixLen > 0 {
 			sometimesNames[i] = unsafe.String(&sometimesArena[i*dstSometimesNameCap], prefixLen)
+		}
+	}
+	for i := 0; i < nev; i++ {
+		prefixLen := min(int(causalMeta[i][8]), dstCausalStrCap)
+		if prefixLen > 0 {
+			causalStrs[i] = unsafe.String(&causalArena[i*dstCausalStrCap], prefixLen)
 		}
 	}
 	return

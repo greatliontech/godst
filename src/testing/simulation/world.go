@@ -132,6 +132,8 @@ func (c *Ctl) End() {
 		return
 	}
 	c.ended = true
+	dstCausalSuppressEnter()
+	defer dstCausalSuppressExit()
 	for i := len(c.decls) - 1; i >= 0; i-- {
 		CrashHost(c.decls[i].Name)
 	}
