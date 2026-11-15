@@ -5,7 +5,7 @@
 - **Deterministic scheduling & randomness:** goroutine scheduling, `select` poll order, value-keyed map iteration, `math/rand`, `math/rand/v2`, `hash/maphash`, and `crypto/rand` derive from per-goroutine seeded streams.
 - **Virtual time & per-host clocks:** `time` runs on a `synctest` virtual clock advancing instantly at durable quiescence, with per-host static/seeded clock skew, crystal drift, and mid-run NTP steps.
 - **In-memory TCP network:** per-host loopback (`127.0.0.1` / `localhost`) and routable `10.0.0.<id>` full-mesh TCP with configurable latency, jitter, bandwidth throttling, send-buffer backpressure, half-close (`CloseWrite`/`CloseRead`), keepalive, `TCP_USER_TIMEOUT`, `SO_REUSEADDR`, partitions, and connection resets.
-- **Crash-faithful in-memory storage & VM:** per-host sparse 4 KiB page-cache filesystems (`os`, `os.Root`), `MAP_SHARED`/`MAP_PRIVATE` `mmap` coherent with `read`/`write`, `flock`, `fallocate`, `SEEK_DATA`/`SEEK_HOLE`, `futex`, power-loss durability tears (`CrashHost` + `CrashTear`), `fsyncgate` writeback failures, `ENOSPC` quotas, disk latency, and platter bit-rot.
+- **Crash-faithful in-memory storage & VM:** per-host sparse 4 KiB page-cache filesystems (`os`, `os.Root`), `MAP_SHARED` `mmap` coherent with `read`/`write`, `flock`, `fallocate`, `SEEK_DATA`/`SEEK_HOLE`, shared `futex`, power-loss durability tears (`CrashHost` + `CrashTear`), `fsyncgate` writeback failures, `ENOSPC` quotas, disk latency, and platter bit-rot.
 - **Multi-host / multi-process isolation:** independent per-`(host, boot)` PID spaces, `PIDNamespace` isolation, `/proc/<pid>/stat` + `boot_id`, per-invocation file/socket/environment ownership, and deterministic STW garbage collection.
 - **Systematic schedule exploration:** Level-2 memory-access-granularity preemption and source-DPOR (`Explore`, `ExploreWith`, `ExploreTest`, `Replay`) paired with the `-race` detector as a deterministic data-race oracle.
 
@@ -151,6 +151,7 @@ import (
 	"net"
 	"testing"
 	"testing/simulation"
+	"testing/synctest"
 	"time"
 )
 
@@ -189,18 +190,28 @@ func TestClusterPartitionAndReboot(t *testing.T) {
 	}
 
 	simulation.WorldTest(t, 42, opts, hosts, func(t *testing.T, ctl *simulation.Ctl) {
-		// Isolate n1, verify partition blocks dials, then heal and power-cycle n2.
+		// Let spawned Process goroutines bind :9000 and reach Accept() in 0ns of virtual time.
+		synctest.Wait()
+
+		// Isolate n1 and let virtual time advance across the blackhole cut:
 		simulation.IsolateHost("n1")
+		if c, err := net.DialTimeout("tcp", simulation.HostIP("n1")+":9000", 50*time.Millisecond); err == nil {
+			_ = c.Close()
+			t.Fatal("expected dial to isolated n1 to time out")
+		}
 		simulation.UnisolateHost("n1")
 
 		ctl.RestartHost("n2") // CrashHost("n2") + re-run n2's Boot against durable disk
+		synctest.Wait()       // settle rebooted n2's listener in 0ns
 
-		// Dial n2 by its deterministic routable IP from a client host or root driver:
-		c, err := net.DialTimeout("tcp", simulation.HostIP("n2")+":9000", time.Second)
-		if err != nil {
-			t.Fatalf("dial rebooted n2: %v", err)
+		// Dial healed n1 and rebooted n2 by their deterministic routable IPs:
+		for _, target := range []string{"n1", "n2"} {
+			c, err := net.DialTimeout("tcp", simulation.HostIP(target)+":9000", time.Second)
+			if err != nil {
+				t.Fatalf("dial %s: %v", target, err)
+			}
+			_ = c.Close()
 		}
-		_ = c.Close()
 		// Returning from script automatically calls ctl.End(), powering off n1..n3 cleanly.
 	})
 }
@@ -258,6 +269,20 @@ func TestReplayQueueRegression(t *testing.T) {
 	}
 }
 ```
+
+### Controlling Virtual Time & Quiescence (`time.Sleep` vs `synctest.Wait`)
+
+`testing/simulation` deliberately exposes no custom `Advance(d)` or `Tick()` API because Go's standard `time.Sleep(d)` and `testing/synctest.Wait()` already drive the virtual clock directly inside every simulation bubble:
+
+1. **`0ns` CPU execution rule:** All non-blocking Go statements execute in **`0ns` of virtual time**. The virtual clock advances *only* at **durable quiescence** — when every live goroutine in the simulation bubble is durably parked (waiting on channels, `select`, timers/tickers, in-bubble `sync.Mutex`/`RWMutex`/`WaitGroup`/`Cond`/`Once`, simulated TCP/pipe I/O, `SlowDisk`, or simulated `futex`). Consequently, calling `IsolateHost("n1")` immediately followed by `UnisolateHost("n1")` with no blocking wait in between toggles and clears the fault at the exact same virtual nanosecond before any timer or peer wakes.
+2. **Advancing cluster virtual time (`time.Sleep(d)`):** Calling `time.Sleep(d)` (or waiting on a deadline-bearing operation such as `net.DialTimeout` or `context.WithTimeout`) from your root driver script parks the driver for `d` of universe base virtual time. As soon as runnable work settles, the runtime steps the virtual clock **chronologically** through every intermediate deadline in `[now, now + d]` — firing Raft heartbeat/election tickers, delivering in-flight TCP segments (`CrossHostLatency` + jitter + bandwidth), expiring retransmit/keepalive horizons, and completing `SlowDisk` operations in exact causal timestamp order, all in microseconds of real wall-clock time:
+   ```go
+   simulation.IsolateHost("n1")
+   time.Sleep(3 * time.Second) // 3s of cluster timers, RPC retries, & elections run chronologically
+   simulation.UnisolateHost("n1")
+   ```
+3. **Settling `0ns` work without advancing virtual time (`synctest.Wait()`):** Calling `synctest.Wait()` parks the caller until every other live goroutine in the bubble is durably blocked, advancing **`0ns`** of virtual time. Use `synctest.Wait()` when you want newly spawned `go simulation.Process(...)` goroutines to finish binding listeners, `0ms` loopback pipelines to drain, or immediate `CrashProcess` `RST` notifications to propagate without firing future timers.
+4. **Driver clock domain:** The root test/script goroutine runs on the unnamed root host (`rate = 1`, `skew = 0`), so `time.Sleep(d)` on the driver always measures exact universe base virtual time regardless of `Skew` or `Drift` configured on cluster `Host`s (see [dst/faults.md](dst/faults.md)).
 
 ---
 
@@ -625,16 +650,21 @@ func (r ReplayResult) Failed() bool // Returns r.Err != nil || r.Raced
 
 Unmodified application and library code (`net/http`, `crypto/tls`, custom binary RPC muxes, WALs, B-trees, memory-mapped engines) works out of the box inside a simulation across these modeled surfaces:
 
+- **Time, Synchronization, & Randomness (`time`, `testing/synctest`, `sync`, `math/rand`, `math/rand/v2`, `crypto/rand`, `hash/maphash`):**
+  - `time.Now`, `Sleep`, `After`, `AfterFunc`, `NewTimer`, `NewTicker`, and `context.WithTimeout`/`WithDeadline` run on the simulation bubble's virtual clock with per-host wall skew (`Skew`/`BoundedSkew`), NTP jumps (`StepClock`), and crystal rate drift (`Drift`/`BoundedDrift`/`DriftClock`); `synctest.Wait` settles runnable goroutines at `0ns` virtual-time advance.
+  - Raw Linux `clock_gettime` for `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` returns virtual base time rebased to the calling host's current boot instant (resetting to `0` across `CrashHost` + reboot).
+  - In-bubble `sync.Mutex`, `sync.RWMutex`, `sync.WaitGroup`, `sync.Cond`, and `sync.Once` waits are durably tracked with deterministic starvation handoff and Level-2 DPOR happens-before edges.
+  - `math/rand`, `math/rand/v2`, `crypto/rand`, `hash/maphash`, `select` case order, and value-keyed map iteration derive from per-goroutine seeded streams (`g.dstrand`) immune to OS thread migration and host load.
 - **Networking (`net`):**
   - `net.Dial`, `DialTimeout`, ` (*net.Dialer).DialContext`, `net.Listen`, `(*net.ListenConfig).Listen` over `"tcp"`, `"tcp4"`, `"tcp6"`.
   - Deterministic `"localhost"` resolution (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `LookupHost`, `LookupIP`, `LookupNetIP`, and `ResolveTCPAddr`, plus built-in protocol number resolution (`tcp`/`udp`/`icmp`) without touching host `/etc/protocols` or DNS.
   - Synthetic per-host `net.Interfaces()` / `InterfaceAddrs()` (`lo` `127.0.0.1/8` + `::1/128`, and `eth0` `10.<b>.<c>.<d>/24`).
-  - Simulated connections implement `net.Conn`, `syscall.Conn` (`Dialer.Control`, `ListenConfig.Control`), and structural TCP half-close (`CloseWrite() error` and `CloseRead() error`), with `TCP_NODELAY=1` by default, `SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_USER_TIMEOUT`, `SO_RCVBUF`, `SO_SNDBUF`, and `SO_ERROR`.
+  - Simulated connections implement `net.Conn`, `syscall.Conn` (`Dialer.Control`, `ListenConfig.Control`), and structural TCP half-close (`CloseWrite() error` and `CloseRead() error`), with `TCP_NODELAY=1` by default, `SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT`.
 - **Filesystem, VM, Locking, & Synchronization (`os`, `syscall`, `golang.org/x/sys/unix`):**
-  - Per-host in-memory tree initialized with `/tmp` (`01777`, `os.TempDir() == "/tmp"`) and `/dev/null`, full `os.File` / `os.Root` operations, `O_SYNC` / `O_DSYNC`, and anonymous pipes (`os.Pipe` with 64 KiB buffer and `PIPE_BUF` atomicity).
-  - Linux virtual FDs supporting `syscall.Read`/`Write`/`Pread`/`Pwrite`/`Fsync`/`Fdatasync`/`Ftruncate`/`Fstat`/`Fstatfs`/`Flock`/`Fallocate`/`Seek` (`SEEK_DATA`/`SEEK_HOLE`).
-  - Coherent `syscall.Mmap` / `Munmap` / `Mprotect` / `Madvise` (`MADV_DONTNEED`, `MADV_REMOVE`) / `msync`: `MAP_SHARED` mappings share physical backing pages with the simulated page cache (stores through `[]byte` and `File.Read`/`Write` see each other immediately, and accesses beyond `Truncate` EOF raise real `SIGBUS` / `PROT_NONE` `SIGSEGV` caught and converted into simulated process crash teardown).
-  - Simulated `futex` (`FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, private and shared) integrated with the virtual clock and process/host crash cleanup.
+  - Per-host in-memory tree initialized with `/tmp` (`01777`, `os.TempDir() == "/tmp"`) and `/dev/null`, full `os.File` / `os.Root` operations (including `os.Truncate` and `(*os.File).Truncate`), `O_SYNC` / `O_DSYNC`, and anonymous pipes (`os.Pipe` with 64 KiB buffer and `PIPE_BUF` atomicity).
+  - Linux virtual FDs supporting `syscall.Read`/`Write`/`Pread`/`Pwrite`/`Fsync`/`Fdatasync`/`Fstat`/`Statfs`/`Fstatfs`/`Flock`/`Fallocate`/`Seek` (`SEEK_DATA`/`SEEK_HOLE`).
+  - Coherent `syscall.Mmap` / `Munmap` / `Mprotect` / `Madvise` (`MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_POPULATE_READ`, `MADV_HUGEPAGE`, `MADV_COLD`): `MAP_SHARED` mappings share physical backing pages with the simulated page cache (stores through `[]byte` and `File.Read`/`Write` see each other immediately, and accesses beyond `Truncate` EOF raise real `SIGBUS` / `PROT_NONE` `SIGSEGV` caught and converted into simulated process crash teardown).
+  - Simulated shared `futex` (`FUTEX_WAIT` and `FUTEX_WAKE` without `FUTEX_PRIVATE_FLAG` on `MAP_SHARED` file-backed pages) integrated with the virtual clock and process/host crash cleanup.
   - Synthetic `/proc/self/ns/pid`, `/proc/<pid>/stat` (deterministic field-22 `starttime` in `USER_HZ` ticks), `/proc/sys/kernel/random/boot_id`, and `syscall.Kill(pid, 0)` liveness probes.
 - **Environment & Stdio Diagnostics:**
   - Per-`(host, process invocation)` copy-on-write `os.Getenv` / `Setenv` / `Unsetenv` / `Clearenv` / `Environ`.

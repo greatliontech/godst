@@ -118,7 +118,7 @@ Addressing is per-host (`net/dst.go` — the registry keys are host-scoped; land
 - **Conn attribution** records both the host and process invocation slot of each end (dialer = the `Dial` caller's
   `dstHost`/`dstProcSlot`; server = the `Listen` caller's `dstHost`/`dstProcSlot` — the process invocation that owns the listener and
   accepts on it — stamped on the conn at Dial), so net faults target a host-pair (partition/reset) or a `(host, process)`
-  (`ResetProcess`). Both the **host** half (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
+  (`ResetProcessConns`, **pending** rename from `ResetProcess`). Both the **host** half (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
   `net/dst.go`) and the **process** half (`dstConn.localProc`/`remoteProc` + `dstListener.proc`, carrying `dstProcSlot`) are **landed**.
 - **Arbitrary DNS by hostname is deferred.** `"localhost"` resolves deterministically to loopback; dial peers by assigned IP:port (`simulation.HostIP(name)`); general `hostname → IP` is a planned minimal sim-DNS
   increment (until then arbitrary DNS-by-name stays fenced, as today) — a thin lookup over the host IP assignment,
@@ -178,7 +178,7 @@ tolerate*, so it cannot be a single global clock.
   reported exactly; non-positive values select the applicable default.
   Procfs identity follows the same per-`(host, boot, PIDNamespace)` pid registry: `/proc/<pid>/stat` exposes a deterministic field-22
   starttime (and unique per-`(host, boot, pid, starttime)` file identity) only for live visible simulated pids, and `/proc/self/ns/pid` readlink exposes a deterministic per-`(host, boot)`
-  namespace identity with no host `/proc` passthrough. Exhausting the per-`(host, boot)` PID field (`Options.PidMax` or `math.MaxInt32`) fails before a
+  namespace identity with no host `/proc` passthrough. Exhausting the per-`(host, boot)` PID field (`Options.PIDMax` — **pending** rename from `PidMax` — or `math.MaxInt32`) fails before a
   `Process` declaration interns names, stamps identity, registers liveness, or runs its body.
   Host 0 / unconfigured uses the run defaults (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is
   unchanged.
@@ -386,19 +386,21 @@ API compiles to per-host-pair / per-process fault records over the full mesh —
 
 - `IsolateHost("h3")` / `UnisolateHost("h3")` — cut / restore a host from all others.
 - `Partition("h1", "h2")` / `PartitionRefuse("h1", "h2")` / `PartitionOneWay("h1", "h2")` / `HealLink("h1", "h2")` — cut / heal a host-pair link; future L4 sugar `Partition({"h1","h2"}, {"h3"})`, `Partition(Zone("dc-a"), Zone("dc-b"))` splits groups over the host `zone` label.
-- `ResetLink("h1", "h2")` / `ResetProcess("h1", "p2")` — reset a link's or `(host, process)`'s connections; future L4 `Link("h1","h2").Latency(50*ms)` adds per-link latency policy.
+- `ConfigureLink("h1", "h2", cfg)` / `ConfigureLinkOneWay("h1", "h2", cfg)` / `UnconfigureLink("h1", "h2")` — symmetric or directional per-link `LinkConfig{Latency, Jitter, Bandwidth}` policy overriding `Options.Network.CrossHost` defaults (**pending**).
+- `ResetLinkConns("h1", "h2")` / `ResetProcessConns("h1", "p2")` — inject TCP `RST` on a link's or `(host, process)`'s open connections (**pending** rename from `ResetLink` / `ResetProcess` so TCP connection resets never read as resetting `LinkConfig` or restarting a process).
 - `CrashProcess("h1", "p2")` / `CrashHost("h1")` / `OOM("h1", "p2", budget)` / `Straggle("h1", "p2")` / `StepClock("h1", delta)` / `DriftClock("h1", ppb)`.
+- `Sometimes("site-name", prob)` — deterministic inline SUT fault-point activation (**pending**).
 
 Attribution is what makes targeting sound and leak-free: a conn records both endpoints' host + invocation slot, a
-file its host (and open handle its invocation slot), a goroutine its host + logical process + invocation slot — so a host-pair partition touches exactly that pair's
+file its host (and open handle its invocation slot), a goroutine its host + logical process + invocation slot — so a host-pair partition or link policy touches exactly that pair's
 cross-host conns, and a process crash exactly that `(host, process)`'s live invocations and resources (DST-FAULT-VICTIM). The host-pair and host-isolation
 targeting (`Partition`/`PartitionRefuse`/`PartitionOneWay`/`HealLink`/`IsolateHost`/`UnisolateHost`) is **landed** as the imperative network-partition API;
-the per-process and per-host forms (`CrashProcess`, `ResetProcess`; `CrashHost`, `ResetLink`) and the crash/restart axes are landed;
-the group/zone forms and the `Link`/`OOM`/`Straggle` sugar extend it as those axes land.
+the per-process and per-host forms (`CrashProcess`, `ResetProcess`; `CrashHost`, `ResetLink` — **pending** rename to `ResetProcessConns` / `ResetLinkConns`) and the crash/restart axes are landed;
+per-link `ConfigureLink`/`ConfigureLinkOneWay`/`UnconfigureLink`, inline `Sometimes`, the group/zone forms, and `OOM`/`Straggle` extend it as those axes land.
 
 **Victim names fail loud.** A fault or configuration API that takes a host name (`StepClock`,
-`DriftClock`, `HostIP`, `HostFS`, the partition/reset/crash/disk targets) **panics on a name no `Host`
-declaration has established** (pass `host == ""` to target a `Process` on the unnamed root host in `CrashProcess` and `ResetProcess`) — it never interns a fresh host id as a side effect. A typo'd victim
+`DriftClock`, `HostIP`, `HostFS`, `ConfigureLink`, `ConfigureLinkOneWay`, `UnconfigureLink`, the partition/reset/crash/disk targets) **panics on a name no `Host`
+declaration has established** (pass `host == ""` to target a `Process` on the unnamed root host in `CrashProcess` and `ResetProcessConns` — **pending** rename from `ResetProcess`) — it never interns a fresh host id as a side effect. A typo'd victim
 would otherwise mutate state no goroutine observes: the fault silently tests nothing, the run stays
 green, and the SUT's fault handling goes unexercised — a silent no-op at odds with the fail-loud
 posture everywhere else (undeclared-host panics, the `-tags dst` panic). Enforced at the one name→id
@@ -479,11 +481,15 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   latency policy interposes a deterministic, **fake-clock-driven delivery queue** on the conn
   (`net/dst_wire.go`): written bytes become readable after the delay. The **base latency** — every
   cross-host link's always-on delay even with no fault, load-bearing for HLC where delayed delivery *while
-  clocks differ* is the bug surface — is **landed** as `Options.Network.CrossHostLatency`: a single
+  clocks differ* is the bug surface — is **landed** (collapsing onto `Options.Network.CrossHost` of type
+  `LinkConfig{Latency, Jitter, Bandwidth}`, **pending** replacement of the flat `CrossHostLatency` /
+  `CrossHostJitter` / `CrossHostBandwidth` fields so baseline and per-link policies share one struct and
+  one validation rule): a single
   base-time scalar applied to every distinct-host connection (same-host/loopback instant; default 0, so the
   N=1 collapse and any run that sets no latency are byte-identical), gated in universe base time so per-host
   clock skew never changes the wire delay (DST-NET-FIFO, DST-NET-LATENCY-DET). **Jitter** — the first
-  network *fault* — is **landed** as `Options.Network.CrossHostJitter`: each cross-host segment is delayed
+  network *fault* — is **landed** (`Options.Network.CrossHost.Jitter`, **pending** collapse from
+  `CrossHostJitter`): each cross-host segment is delayed
   by the base latency plus a value drawn from `[0, jitter)` by the dedicated, seeded, stream-isolated fault
   RNG (`dstFaultRand`), so it replays exactly and never perturbs the schedule (DST-FAULT-REPLAY). It only
   *delays*; FIFO is preserved with no clamp because the reader is head-of-line (a smaller later draw bunches
@@ -491,8 +497,27 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   cross-host dial completes after one round trip (SYN + SYN-ACK, each a one-way traversal paying base
   latency + a jitter draw; throttle exempts the zero-payload control segments — see the transport model,
   design.md) — a zero-RTT connect would let a SUT's connect timeout pass under simulation on a link
-  where it fails in production. The per-host-pair **matrix** (asymmetric per-link latency
-  / jitter) is the L4 targeting API (`Link("h1","h2").Latency()`). DoF: a real link has variable latency.
+  where it fails in production. The **per-host-pair directional link matrix** (**pending**) overrides the
+  universe `Options.Network.CrossHost` baseline for specific host pairs via `LinkConfig{Latency, Jitter, Bandwidth}`:
+  `ConfigureLink(a, b, cfg)` installs `cfg` symmetrically on both `a → b` and `b → a`,
+  `ConfigureLinkOneWay(from, to, cfg)` installs `cfg` only on `from → to`, and `UnconfigureLink(a, b)`
+  removes overrides in both directions so `a ↔ b` reverts to `Options.Network.CrossHost`. A configured `LinkConfig`
+  replaces the `(Latency, Jitter, Bandwidth)` triple as a complete directional policy (`0` in a configured
+  `LinkConfig` means `0` delay / `0` jitter / unlimited bandwidth on that direction, enabling fast intra-AZ
+  links inside a high-latency WAN baseline as well as slow WAN links or asymmetric gray-failure links inside
+  a fast baseline). Same-host pairs (`a == b` or `from == to`) still validate declared host names and `cfg`
+  bounds, while remaining instant and unthrottled (`DST-NET-LATENCY-DET`). Negative `Latency`, `Jitter`, or
+  `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` overflows `time.Duration`, panics state-neutrally
+  before any state is published or modified (both on `Options.Network.CrossHost` and on `ConfigureLink*`);
+  outside an active run `ConfigureLink*` and `UnconfigureLink` are documented no-ops. Overrides take
+  effect dynamically on both new `Dial` handshakes (`SYN` consults `dialer → target`; `SYN-ACK` consults
+  `target → dialer`) and subsequent outbound segments (`Write`, `CloseWrite`, graceful `Close` FIN) on
+  already-established cross-host connections, preserving `DST-NET-FIFO` via head-of-line consumption (when
+  latency decreases mid-stream) and `linkFreeAt` serialization (graceful FIN propagation also starts at
+  `max(now, linkFreeAt)` without advancing `linkFreeAt`, so FIN never overtakes an occupied throttled
+  serialization horizon even when latency increases mid-stream). As a property of the inter-host network
+  fabric, per-link configurations survive both `HealLink` and `CrashHost` until cleared by `UnconfigureLink`
+  or run end. DoF: real links have heterogeneous and time-varying per-path latency, jitter, and capacity.
   Sound — it is a fake timer, the contract `time` already virtualizes.
 - **Partition** — between a host-pair (symmetric or one-directional) or isolating a host, over a virtual
   window. *On connect:* a Dial across the partition either **refuses** (`ECONNREFUSED`, peer-down
@@ -567,8 +592,8 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   `net/dst_keepalive_test.go`, `net/dst_crash_silence_test.go`.
 - **Connection reset** — inject a connection reset (an RST, surfacing as the one-shot `ECONNRESET`)
   on a process's or a host-pair's conns.
-  DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.ResetLink(a,b)` (host-pair) and
-  `ResetProcess(host, proc)` (process on `host`), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
+  DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.ResetLinkConns(a, b)` (host-pair) and
+  `ResetProcessConns(host, proc)` (process on `host`, **pending** rename from `ResetLink` / `ResetProcess`), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
   host/invocation-slot attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). An injected reset hits **both
   ends**, and each end receives it as a real kernel delivers an RST (both ends are SURVIVORS — these
@@ -603,7 +628,7 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   across same-seed runs (DST-FAULT-REPLAY). This completes the network axis.
 - **Throttle / bandwidth** — pace delivery so ≤ B bytes cross per virtual time unit (latency
   proportional to bytes, the same fake-timer queue as latency). DoF: finite link bandwidth. **Landed** as
-  `Options.Network.CrossHostBandwidth` (bytes/sec, **per connection-direction**): the wire serializes
+  `Options.Network.CrossHost.Bandwidth` (**pending** collapse from `CrossHostBandwidth`; bytes/sec, **per connection-direction**): the wire serializes
   transmission via a per-direction `linkFreeAt` clock — a segment of S bytes occupies the link `S/B`
   (store-and-forward) before the base latency + jitter propagate it — so a receiver gets bytes no faster
   than B (DST-NET-THROTTLE). Deterministic (no fault-RNG draw) and FIFO-preserving (`linkFreeAt` monotone +
@@ -611,9 +636,15 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   bounded send buffer caps S, and the mul/div is guarded like the clock-drift conversions — a wrapped
   negative transmit time would corrupt `linkFreeAt` and break the rate bound; the guard (`dstTransmitNanos`,
   the `q·1e9 + ceil(r·1e9/B)` split) and the cap (`Options.Network.SendBuffer`) are landed). Default 0 = unlimited;
-  same-host always unlimited. Shared-link contention (one budget
-  across a host-pair's flows) is the L4 per-link refinement; this is per-flow (each direction an
-  independent B-capacity link, so executions stay ⊆ real).
+  same-host always unlimited. Per-direction bandwidth overrides via `ConfigureLink` /
+  `ConfigureLinkOneWay` (`LinkConfig.Bandwidth`, **pending**) use the same `linkFreeAt` store-and-forward
+  clock: a throttled segment starts transmitting at `max(now, linkFreeAt)` and advances `linkFreeAt` by
+  `transmitNanos(S, B)`, while an unthrottled segment (`B == 0` after mid-run `ConfigureLink` or
+  `UnconfigureLink`) and zero-payload graceful FIN (`CloseWrite` / graceful `Close`) start propagation at
+  `max(now, linkFreeAt)` without advancing `linkFreeAt`, so neither unthrottled segments nor FIN ever
+  overtake an already-transmitting throttled segment's serialization horizon.
+  Shared-link contention (one budget across all flows between a host-pair) remains a future refinement;
+  this is per-flow (each direction an independent B-capacity link, so executions stay ⊆ real).
 
 Collapse-check (net axis): **not finer** — each fault is a real TCP-flow event; crucially **no
 drop/reorder/duplicate of bytes on a live stream** (those are not real degrees of freedom of a reliable
@@ -1036,7 +1067,7 @@ close(2), whoever calls it. The in-flight-counts-as-queued collapse is pinned by
 the sim RSTs immediately, which is one of the two orderings a real close-vs-arrival race produces (the
 kernel FINs first and RSTs when the data lands; a peer racing its read can observe either); the
 FIN-then-RST arm is not generated. Both goroutine teardown (slot- and `(host, pid)`-keyed) and OS/network
-resource teardown (per-invocation `slot`-keyed) are strictly per-invocation, while the logical `(host, name)` process id (`g.dstProc`) remains stable across restarts for fault targeting (`CrashProcess`, `ResetProcess`) and cumulative allocation accounting; a same-name restart gets a fresh pid and fresh resource slot and
+resource teardown (per-invocation `slot`-keyed) are strictly per-invocation, while the logical `(host, name)` process id (`g.dstProc`) remains stable across restarts for fault targeting (`CrashProcess`, `ResetProcessConns` — **pending** rename from `ResetProcess`) and cumulative allocation accounting; a same-name restart gets a fresh pid and fresh resource slot and
 does not revive the crashed goroutines. Finalizers and cleanups registered by a `Process` invocation carry its
 `(run epoch, invocation slot, host, boot, PID)` through GC discovery and queueing; once that invocation's slot is unregistered at exit or crash, queued or later-discovered callbacks
 are discarded rather than executed by the root drain, even if the numeric PID is reused on a reboot/wrap or live on another host. Likewise, callbacks registered directly inside a `Host` scope (outside any `Process`) carry `(run epoch, host, boot)`, execute under that host's simulated identity, and are discarded if that host crashes or reboots. A live sibling with the same logical process id
@@ -1050,7 +1081,8 @@ edges inside the bubble). Intentional fault teardowns (`CrashProcess`, `CrashHos
 recording so expected power-offs never pollute failure reports. When a `Test`, `TestWith`, `WorldTest`, or
 `ExploreTest` schedule fails — including unrecovered SUT panics and `synctest` bubble-deadlock stalls —
 the harness symbolizes and logs the recorded process-exit kill events alongside any captured bubble
-`stdout`/`stderr` (`TestDiagnostics*`); passing runs emit nothing.
+`stdout`/`stderr` (`TestDiagnostics*`), as well as any activated `Sometimes` sites and the failure-only
+causal event timeline (**pending**; see [design.md](./design.md), "Failure-only causal event timeline and active fault-site diagnostics"); passing runs emit nothing.
 
 Two consequences of invocation-keyed goroutine death, both contractual. **A goroutine cannot outlive its
 process.** One that escaped the mark because it was inside a NESTED `Process` body when its
@@ -1129,7 +1161,7 @@ the whole sim.
 torn (host reboot) FS and a clean network — the canonical recovery fault, driven by a SUT supervisor or a
 fault policy (`CrashProcess("h", "p", RestartAfter: 3*s)`). A restarted process gets a **freshly allocated pid**
 (a real restart always does; there is **no stable-pid option** — the stable identity is the logical
-`(host, name)` pair, the footgun-free contract). Under `Options.PidMax` the allocation wraps and skips live
+`(host, name)` pair, the footgun-free contract). Under `Options.PIDMax` (**pending** rename from `PidMax`) the allocation wraps and skips live
 pids per `(host, boot)` like the kernel's `alloc_pid`, so a numeral can recur on a machine only through genuine pid REUSE — the
 kernel hazard start-time discrimination exists for, now constructible — never through a stability
 guarantee; `ppid` is `1`/reparented unless a supervision tree is modeled. After `CrashHost` powers
@@ -1173,6 +1205,66 @@ The straggler form Seq 5 deferred for want of this victim contract:
 
 Collapse-check (scheduling axis): identical to Seq 5's — the seam is unchanged; a fault is one more
 policy at `dstSchedSelect` fed through `RunWith`, now able to name its victim by node.
+
+### Inline fault-point activation (`Sometimes`)
+
+Status: **pending** (spec-tier contract). External network, disk, clock, and crash faults exercise a
+distributed system from its OS/network boundaries, whereas internal algorithm states — early batch
+flushes, minimum split/compaction thresholds, short buffer sizes, Raft heartbeat jitter, retryable
+backoff branches — sit inside the SUT's own state machines. FoundationDB-style inline fault hooks
+(`simulation.Sometimes(name string, prob float64) bool`) let SUT code expose those legal internal
+degrees of freedom directly to seed sweeps and `Explore` runs without altering production execution:
+
+- **Validation and outside-run contract.** `name == ""` or `!(prob >= 0 && prob <= 1)` (including `NaN`)
+  panics uniformly in **both** untagged (`!dst`) and `-tags dst` builds, inside or outside an active
+  simulation run, so invalid site names or probabilities never hide behind build tags or inactive runs.
+  With valid arguments, `Sometimes` returns `false` outside an active simulation run (including all
+  untagged builds) with zero allocation or side effect. Calling `Sometimes` during an active run from a
+  foreign (non-bubble) goroutine panics loudly naming `Sometimes`, matching all other fault APIs.
+- **Consumer stock-Go wrapper discipline.** Downstream libraries that remain buildable with stock
+  upstream Go (where `testing/simulation` does not exist) and keep `"testing"` out of production
+  binaries wrap `simulation.Sometimes` behind a two-file `//go:build dst` / `//go:build !dst` internal
+  helper (`false` under `!dst`, `simulation.Sometimes(name, prob)` under `dst`).
+- **Two-level deterministic gate and per-goroutine stream isolation.**
+  - `prob == 0` always returns `false` without enabling the site or advancing any RNG stream.
+  - `prob == 1` is unconditionally enabled for the run and always returns `true` without advancing any
+    RNG stream.
+  - For `0 < prob < 1`, activation uses a two-level FoundationDB gate:
+    1. **Level 1 — Per-run `(seed, name)` enablement:** A stateless 64-bit hash mix of `(runSeed,
+       fnv1a64(name), salt)` independently enables each named site on ~50% of seeds (`mix & 1 == 1`). On
+       seeds where `name` is disabled, every call returns `false` with zero RNG draws, preventing
+       high-frequency hooks inside hot loops from firing on 100% of seeds and masking fault-combination
+       interactions where site A is active while site B is quiescent.
+    2. **Level 2 — Per-goroutine fork-tree draw (`g.dstBugRand`):** On seeds where `name` is enabled,
+       each call draws a uniform `[0, 1)` `float64` (`(u64 >> 11) * 0x1p-53`) from a dedicated
+       per-goroutine splitmix64 stream (`dstBugRand` on `dstG`, zero-size in `!dst` builds) and returns
+       `u < prob`. Matching `dstrand`'s two-root bubble discipline, `dstBugRand` is rooted on `getg()`
+       (`bubble.root`) at `dstActivate` with a dedicated root/drain salt (and cleared on `getg()` at
+       `dstDeactivate`) so `bubble.gcDrain` — spawned before `bubble.main` — and any goroutines started
+       inside finalizers or cleanups inherit an isolated seeded `dstBugRand` subtree, re-rooted on
+       `bubble.main` with a distinct main salt when claiming `bubble.main`, and forked parent→child at
+       `newproc1`.
+  - **Stream isolation and DPOR commutativity:** `g.dstBugRand` is completely disjoint from `g.dstrand`
+    (`math/rand`, `crypto/rand`, `select`, maps), `dstSchedRand` (scheduler), and `dstFaultRand`
+    (network jitter, `CrashTear`, `CorruptFile`). Evaluating a `Sometimes` hook that returns `false`
+    perturbs zero application RNG draws, zero scheduler choices, zero substrate fault draws, and zero
+    heap/GC counters; and because `g.dstBugRand` is per-goroutine rather than a shared global stream,
+    concurrent `Sometimes` evaluations on independent goroutines **commute**, preserving exact schedule
+    soundness and pruning invariants under `Explore` / `DPOR` and `Replay`.
+- **Off-heap active-site ledger.** Whenever `Sometimes` returns `true`, the runtime records the site in
+  an off-heap (`sysAlloc`, `sys.NotInHeap`), `dstDiagLock`-guarded per-run ledger (up to `256` distinct
+  site entries storing `(nameHash uint64, nameLen int, namePrefix [128]byte)`, hit counts, and
+  first-fired relative virtual timestamps `bubble.now - baseOrigin`, deduplicating on `(nameHash,
+  nameLen, namePrefix[:min(nameLen, 128)])` and marking truncated names on render whenever `nameLen >
+  128`, plus an overflow counter for additional distinct sites) with `0` Go heap allocations and `0`
+  TSan / Level-2 DPOR synchronization edges. Passing runs emit nothing; failing `Test`, `TestWith`,
+  `WorldTest`, and `ExploreTest` runs render all activated `Sometimes` sites in deterministic
+  first-fired order alongside the failure diagnostics.
+
+Collapse-check (`Sometimes`): **sound** when callers guard only legal internal degrees of freedom of the
+SUT (program discipline — identical to writing a configurable threshold parameter); **stream-isolated**
+and **DPOR-commutative** via `g.dstBugRand`; **observation-neutral** when returning `false` and off-heap
+when recording `true`.
 
 ### Project invariants (fault orchestration) — recorded spec-tier
 
@@ -1249,7 +1341,13 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   (`FailDisk`/`FailFile`, no fault draw), so the same seed + same fault schedule yields an identical
   outcome sequence: `TestDSTDiskEIODeterminism`; **disk ENOSPC** (`LimitDisk`/`UnlimitDisk`) likewise:
   `TestDSTDiskENOSPCDeterminism`; **disk latency** (`SlowDisk`/`UnslowDisk`, an explicit per-op duration) replays the
-  same virtual delays: `TestDSTDiskLatencyDeterminism`. (Extends to each further fault class's draws as it
+  same virtual delays: `TestDSTDiskLatencyDeterminism`. **Per-link network policy** (`ConfigureLink` /
+  `ConfigureLinkOneWay` / `UnconfigureLink`, *pending*) applies explicit directional `(Latency, Jitter,
+  Bandwidth)` triples whose jitter draws consume `dstFaultRand` deterministically at schedule-ordered
+  send/dial points. **Inline fault points** (`Sometimes`, *pending*) combine stateless `(seed, name)`
+  hashing with the dedicated per-goroutine `g.dstBugRand` fork-tree so identical seeds and schedules
+  fire the exact same hooks without perturbing `g.dstrand`, `dstSchedRand`, or `dstFaultRand`, and
+  concurrent goroutines commute under `DPOR`. (Extends to each further fault class's draws as it
   lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
   owning layer — a goroutine/conn/fd to a **process invocation**, a file/tree/port to a **host** — and a fault on
@@ -1262,7 +1360,7 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   (`net`) asserts `Partition(A,B)` cuts the A-B conn while an A-C conn is untouched, mutation-tested (a
   check that blocks all pairs once any partition exists fails it). The **process leg** is landed with reset
   (`dstConn.localProc`/`remoteProc`; `TestDSTNetResetVictim` asserts an A-B reset spares an A-C conn,
-  `TestDSTNetResetProcess` that `ResetProcess(host, p)` resets exactly `(host, p)`'s conns — both ends). The **clock leg**
+  `TestDSTNetResetProcess` that `ResetProcessConns(host, p)` — **pending** rename from `ResetProcess` — resets exactly `(host, p)`'s conns — both ends). The **clock leg**
   is landed with the step and drift: `StepClock(host)` shifts exactly the named host's per-host offset entry,
   and `Drift(host rate)` sets exactly that host's rate (both keyed by host id), so a fault on hA leaves hB and
   the root untouched — `TestDSTClockStepVictim` and `TestDSTClockDriftVictim` (a rate-2 host A wakes at base
@@ -1282,10 +1380,15 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   kernel-state death by the host id, so `CrashHost(h)` takes exactly
   h's threads, disk, locks, mappings, sockets, and listeners while a sibling host's unsynced bytes, held
   lock, and connections among other hosts survive (`TestDSTCrashHostVictimScoping`,
-  `TestDSTCrashHostClosesRootProcessResources`).
+  `TestDSTCrashHostClosesRootProcessResources`). The **per-link policy leg** (*pending*) keys directional
+  `LinkConfig` overrides by `(fromHost, toHost)` over `dstConn.localHost`/`remoteHost` and `dstDial`
+  endpoints, so `ConfigureLink(A, B, cfg)` and `ConfigureLinkOneWay(A, B, cfg)` affect only traffic on
+  `A ↔ B` (or `A → B`, leaving `B → A` and `A ↔ C` untouched).
 - **DST-FAULT-NONFORECLOSE (entailed: non-foreclosure).** The Host/Process victim contract + the
-  fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash) and the UDP
-  packet-granular follow-on with no different shape. *violation:* an axis (disk/clock/crash/scheduling) or
+  fault-as-seam-policy shape host every axis (net, disk, clock, scheduling, OOM, crash, per-link
+  `LinkConfig`, inline `Sometimes`) and the UDP
+  packet-granular follow-on with no different shape (`LinkConfig` struct value accepts future datagram
+  loss/duplication/reorder fields additively without breaking callers). *violation:* an axis (disk/clock/crash/scheduling) or
   UDP faults need a targeting scheme the Host/Process contract cannot express, forcing a throwaway
   retrofit. *Encoding:* this full-contract design (all axes collapse from one contract); validated as each
   axis lands — a later axis needing a new targeting shape is the demonstrated violation. *Lands: as each
@@ -1308,10 +1411,12 @@ adversarial loop.
   uid / cwd / env, per-**process** allocation accounting. Establishes DST-NODE-ISOLATION and DST-CLOCK-DET. No
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
+  per-link directional policy (`LinkConfig` / `ConfigureLink` / `ConfigureLinkOneWay` / `UnconfigureLink`) — **pending**;
   clock **step** — **done**, **drift** (constant `Drift` + mid-run `DriftClock` + seed-drawn `BoundedDrift`)
-  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**; **process crash** (`CrashProcess`, incl. the
+  — **done**; disk **EIO** / **ENOSPC** / **latency** / **bit-rot** — **done**; **process crash** (`CrashProcess`, incl. the
   self-crash form) + **restart** over the live host filesystem — **done**; **host crash** (`CrashHost`,
   power loss) + **reboot** onto the restored durable image — **done**;
+  inline SUT fault-point activation (`Sometimes`) — **pending**;
   scheduling (straggler), OOM (allocation-triggered process crash) — pending.
   Establishes DST-FAULT-SOUND / -REPLAY / -VICTIM enforcement.
 - **L4 — orchestration.** The declarative `Options.Faults` + the convenience targeting API; seeded

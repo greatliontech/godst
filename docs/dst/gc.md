@@ -252,7 +252,7 @@ The unifying invariant — the load-bearing piece of Tier 2:
 Registration ownership also includes the simulated process invocation's `(run epoch, invocation slot, host, PID)`. That tuple is carried from
 the finalizer/cleanup special into its queued entry, and every drain or async worker discards the entry if its owner
 invocation slot is no longer live in the simulated PID registry, whether discovery happened before or after death. Logical process identity is insufficient because concurrent
-same-name invocations share it, while `(run epoch, PID)` alone is insufficient because numeric PIDs are per-`(host, boot)` and also repeat under `Options.PidMax` reuse within a run. Root and foreign
+same-name invocations share it, while `(run epoch, PID)` alone is insufficient because numeric PIDs are per-`(host, boot)` and also repeat under `Options.PIDMax` (**pending** rename from `PidMax`) reuse within a run. Root and foreign
 registrations retain slot/PID zero and their existing process-level asynchronous semantics. Thus an old
 invocation's callback cannot run under the root drain after exit or attach side effects to a live
 sibling, another host sharing the same numeric PID, or a post-reboot/wrapped PID reuse. While user callback code runs, the drain temporarily carries the owner's `(host, proc, slot, PID)`; exit or

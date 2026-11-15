@@ -152,22 +152,22 @@ publishes them to the bubble, and cleared on return).
 
 Four values are configurable — `Hostname`, `PID` (defaults `"sim"`, `1`), `NumCPU` (default `8`,
 reported independently of the forced `GOMAXPROCS=1` so a SUT that sizes work by `NumCPU` still creates
-real concurrency for the schedule to explore), and `PidMax` (default unbounded). A positive
+real concurrency for the schedule to explore), and `PIDMax` (**pending** initialism rename from `PidMax`; default unbounded). A positive
 `Options.NumCPU` or `HostConfig.NumCPU` is
 reported exactly; a non-positive value selects the applicable default. The positive range is the target
 architecture's `int` range. A custom positive `PID` must fit in the OS pid field
 (`int32`); non-positive values select the default, oversized values panic rather than wrapping. With
-`PidMax` unset (0), pid allocation is monotonic per `(host, boot)` and a run that exhausts the finite pid field while
-allocating `Process` pids panics instead of reusing or wrapping. A positive `PidMax` models each simulated machine's
-kernel `pid_max`: on each `(host, boot)`, allocation scans forward from that boot's last allocated pid, WRAPS into `[2, PidMax]`
+`PIDMax` unset (0), pid allocation is monotonic per `(host, boot)` and a run that exhausts the finite pid field while
+allocating `Process` pids panics instead of reusing or wrapping. A positive `PIDMax` models each simulated machine's
+kernel `pid_max`: on each `(host, boot)`, allocation scans forward from that boot's last allocated pid, WRAPS into `[2, PIDMax]`
 (pid 1 is the simulated init/ppid), and skips live pids on that `(host, boot)` — `alloc_pid`'s behavior — so **pid reuse**
-becomes constructible in-simulation: a small `PidMax` plus process churn deterministically hands a
+becomes constructible in-simulation: a small `PIDMax` plus process churn deterministically hands a
 dead process's pid to a new one (the same-pid-new-start-time hazard start-time discrimination exists
-for), and a host reboot (`CrashHost` followed by `Host`) resets that machine's pid table to a fresh boot starting at `PID + 1` (the cross-boot collision hazard `/proc/sys/kernel/random/boot_id` exists to catch). `PidMax` must exceed the root pid (a real machine's own pid is inside its pid space); a run in
-which every pid in `[2, PidMax]` is simultaneously live on the target host refuses the `Process` loud and
+for), and a host reboot (`CrashHost` followed by `Host`) resets that machine's pid table to a fresh boot starting at `PID + 1` (the cross-boot collision hazard `/proc/sys/kernel/random/boot_id` exists to catch). `PIDMax` must exceed the root pid (a real machine's own pid is inside its pid space); a run in
+which every pid in `[2, PIDMax]` is simultaneously live on the target host refuses the `Process` loud and
 state-neutrally, BEFORE the admission stamps or interns anything — the kernel answers fork with
 `EAGAIN` and a failed fork leaves the parent unchanged; `Process` has no error return to carry it.
-`ExploreWith` embeds `Options` (and `Failure.Options` carries them into `Replay`), so systematic exploration and replay honor `PidMax` and the other identity
+`ExploreWith` embeds `Options` (and `Failure.Options` carries them into `Replay`), so systematic exploration and replay honor `PIDMax` and the other identity
 options identically to `RunWith` and `TestWith`. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
 `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the simulated identity is
 observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
@@ -194,7 +194,7 @@ The simulated filesystem also owns the procfs identity surface needed for pid-li
 recorded at `Process` admission from the host's uptime clock — coherent with `CLOCK_BOOTTIME` reads,
 reset in meaning by a reboot (a post-reboot process has a small starttime again, the same cross-boot
 collision hazard a real machine has, which the boot-epoch discriminator exists to catch), and carried
-per-incarnation, so a REUSED pid (`Options.PidMax` or reboot) serves its new process's starttime — the
+per-incarnation, so a REUSED pid (`Options.PIDMax` — **pending** rename from `PidMax` — or reboot) serves its new process's starttime — the
 pid-reuse discriminator clients parse `/proc` for. Two processes started within one 10 ms tick share
 a starttime, the host's own resolution caveat. Completed, unknown, cross-host, pre-reboot, cross-namespace, host, or
 unrepresentable pids are
@@ -214,7 +214,7 @@ two peer containers or separate machines see of each other. Deliberately NOT mod
 them): namespace hierarchy (an init-namespace parent observing children under translated pid
 numerals) and per-namespace pid numbering on one host (two sibling namespaces on the same host each having their own pid 7) — within one `(host, boot)` pids remain
 one per-machine kernel space, so on a single host boot a numeral names at most one live process, and same-host
-same-numeral-unrelated-process shapes arise through pid REUSE (`PidMax`) or host reboot (`CrashHost`), while distinct hosts maintain independent pid spaces.
+same-numeral-unrelated-process shapes arise through pid REUSE (`PIDMax`) or host reboot (`CrashHost`), while distinct hosts maintain independent pid spaces.
 Unsupported `/proc` paths stay deterministic simulated results (unsupported or not-exist), never host
 passthrough.
 
@@ -385,9 +385,13 @@ retransmission-horizon, and connect-cost legs are landed; the FIN/RST leg and th
 no-declared-host connect timeout land with a follow-on (both marked below). The wire
 models a TCP socket pair, not a message queue:
 
-Network delay configuration is validated before a run publishes simulation state. Nonpositive
-latency, jitter, and bandwidth components are disabled. A latency plus the largest possible jitter
-draw that cannot fit in `time.Duration` is rejected. Runtime delay arithmetic that also depends on
+Network delay configuration (`LinkConfig{Latency, Jitter, Bandwidth}` on both run-level
+`Options.Network.CrossHost` and dynamic per-link `ConfigureLink` / `ConfigureLinkOneWay`, **pending**
+unification from flat `CrossHost*` fields; see [faults.md](./faults.md)) is validated before publishing
+or mutating state: `0` disables latency, jitter, or bandwidth on that policy, while negative `Latency`,
+`Jitter`, or `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` cannot fit in `time.Duration`,
+panics state-neutrally (`UnconfigureLink` restores the `Options.Network.CrossHost` baseline). Runtime
+delay arithmetic that also depends on
 the current base clock or a write's size saturates at the latest representable virtual-time deadline;
 it never wraps a positive delay into an earlier delivery.
 
@@ -564,7 +568,7 @@ it never wraps a positive delay into an earlier delivery.
   `TestDSTNetUnownedAddressLateDeclaration`).
 - **Peer close FIN read semantics — landed; post-FIN write/reset semantics pending.** Reads after a peer's
   graceful close drain buffered data, then `io.EOF` (landed). FIN is a delayed control event: its
-  arrival pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
+  arrival starts at `max(now, linkFreeAt)` without advancing `linkFreeAt` (**pending** dynamic link horizon alignment) and pays the configured one-way base latency plus one deterministic jitter draw, and a shorter
   read deadline fires first; partitions hold a not-yet-arrived FIN like data. The intended write side: the **first
   write after the peer's full close succeeds locally** (the FIN closed the peer's send direction; the
   write is accepted into the send buffer and elicits the peer's RST); the reset then errors
@@ -1266,6 +1270,43 @@ host stdio calls `simulation.InheritFile` inside the run and uses or installs th
 in-run programmatic capture assigns `os.Stdout`/`os.Stderr` to simulated files (`os.Pipe`, simulated
 regular files), whose backend takes precedence over the default `fd 1`/`fd 2` capture. Capability writes are
 outbound, schedule-ordered side effects that feed no nondeterminism back into the run.
+
+**Failure-only causal event timeline and active fault-site diagnostics (pending).** Alongside the
+off-heap `stdout`/`stderr` buffer and process-exit goroutine-kill ledger ([faults.md](./faults.md)),
+each simulation run maintains two additional observation-neutral, off-heap (`sysAlloc`,
+`sys.NotInHeap`), `dstDiagLock`-guarded diagnostic structures:
+1. **Causal event ring buffer (`256` slots + monotonic `totalEvents` sequence counter):** Records
+   high-signal state transitions in universe base virtual time (`bubble.now - baseOrigin`) without
+   recording steady-state per-`Read`/`Write` segment or file traffic:
+   - *Topology & lifecycle:* `Host` / `HostWith` boot and live clock re-declaration, `Process` /
+     `ProcessWith` start (`pid`, `PIDNamespace`) and normal/panic exit, `CrashHost` (including
+     `CrashTear`), and `CrashProcess`.
+   - *Injected faults & policies:* `Partition`, `PartitionOneWay`, `PartitionRefuse`, `HealLink`,
+     `IsolateHost`, `UnisolateHost`, `ConfigureLink`, `ConfigureLinkOneWay`, `UnconfigureLink`,
+     `ResetLinkConns`, `ResetProcessConns`, `FailDisk`, `HealDisk`, `FailWriteback`, `HealWriteback`, `FailFile`,
+     `HealFile`, `LimitDisk`, `UnlimitDisk`, `SlowDisk`, `UnslowDisk`, `CorruptFile` (when a durable
+     4 KiB block bit flips), `StepClock`, and `DriftClock`.
+   - *TCP lifecycle & fault transitions (`net`):* `Listen`, `Listener.Close`, `Dial` established /
+     refused / timed out, and established-socket retransmission-horizon `ETIMEDOUT`, keepalive
+     `ETIMEDOUT`, and `RST` delivery.
+   - *Filesystem fault hits (`os`):* `EIO` returned on read/write/sync, `fsyncgate` dirty-page
+     writeback drop, and `ENOSPC` short-write or refusal.
+2. **Activated `Sometimes` fault-site table (`256` distinct site slots + overflow counter):** Records
+   every named `simulation.Sometimes` site that returned `true` during the run — deduplicating on
+   `(nameHash uint64, nameLen int, namePrefix[:min(nameLen, 128)])` and marking truncated names on
+   render when `nameLen > 128` — along with its total hit count and its first-fired relative virtual
+   timestamp ([faults.md](./faults.md), "Inline fault-point activation (`Sometimes`)").
+
+Producers pass only scalar event codes, integer IDs/arguments, and raw string/path byte slices copied
+via bounded `memmove` into fixed inline byte arrays (marking truncated strings if they exceed the slot
+width) — performing `0` Go heap allocations, `0` `fmt` formatting calls during the run, `0` RNG draws,
+and `0` TSan / Level-2 DPOR synchronization edges, so same-seed schedules, deterministic GC triggers,
+`Options.MemoryLimit`, per-process allocation counters, and `Explore` traces are strictly unchanged.
+Passing runs emit nothing (even under `go test -v`). Whenever `Test`, `TestWith`, `WorldTest`, or
+`ExploreTest` fails (assertion failure, non-nil SUT `error`, `-race` report, unrecovered SUT panic, or
+`synctest` bubble deadlock), `testing/simulation` formats the chronological causal timeline (noting
+`totalEvents - 256` omitted earlier events on wrap) and activated `Sometimes` sites together with
+killed goroutines and captured `stdout`/`stderr`.
 An inherited capability is **node-scoped to the root simulation body** that holds the grant: operated
 from a `Host` or `Process` body it refuses with a distinguishable node-scoped error naming the relay
 idiom — never the closed-file shape, because the capability is not closed and a closed-shape refusal
@@ -2204,9 +2245,11 @@ table); the open work is the OOM and scheduling faults and the declarative orche
   the shared contract designed up front, so no axis forecloses
   another); implementation is **bottoms-up** — the Host/Process substrate first, faults last (see "Build
   order"). The net, disk, clock, **process-crash/restart**, **host-crash/reboot**, and **crash-tear**
-  axes are landed and replay-exact; what remains is the OOM (allocation-triggered) and scheduling
-  (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a seeded
-  `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
+  axes are landed and replay-exact; per-link `LinkConfig` (`ConfigureLink` / `ConfigureLinkOneWay` /
+  `UnconfigureLink`), inline `Sometimes` fault-point activation, and the failure-only causal event
+  timeline are specified and **pending**; what remains beyond those is the OOM (allocation-triggered)
+  and scheduling (straggler) axes, and the L4 layer itself: the declarative `Options.Faults` set, a
+  seeded `Options.FaultPolicy` as an `Explore` dimension, and failure shrinking.
 Ordering: the landed runtime substrate was the precondition for all; the I/O features (network ✅ →
 disk ✅ → pipes ✅) each brought a class of real I/O into the bubble; fault orchestration layers
 exploration power on top now that there is something to fault. Level 2 extends the scheduling axis
