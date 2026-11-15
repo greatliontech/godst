@@ -6,7 +6,12 @@
 
 package simulation
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
+
+type kernelMutex = sync.Mutex
 
 func dstActivate(seed uint64)                                                       {}
 func dstDeactivate()                                                                {}
@@ -14,6 +19,7 @@ func dstSetAsyncPreemptOff(off bool) (old bool)                                 
 func dstBuilt() bool                                                                { return false }
 func dstSetSchedStrategy(kind uint8, depth, steps int32)                            {}
 func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int)       {}
+func dstYieldPoint()                                                                {}
 func dstSetSchedule(prefix []uint64)                                                {}
 func dstSetAccessForce(seq, count []uint64, pc []uintptr)                           {}
 func dstTraceLenFP() int                                                            { return 0 }
@@ -80,6 +86,7 @@ func dstUnregisterPid(pid int32)                                   {}
 func dstCrashProcessPid(pid int32)                                 {}
 func dstStopProcessThreads(pid int32)                              {}
 func dstProcessTeardown(proc uint32)                               {}
+func dstProcessHasResources(proc uint32) bool                      { return false }
 func dstProcessStateTeardown(proc uint32)                          {}
 func dstSetMappingFaultTeardownHook(fn func(proc uint32))          {}
 func dstSetHostDeclaredHook(fn func(host uint32) bool)             {}

@@ -11,14 +11,14 @@ import (
 	"errors"
 	"internal/bytealg"
 	"internal/nettrace"
+	isync "internal/sync"
 	"io"
 	"os"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	_ "unsafe" // for go:linkname
+	"unsafe" // go:linkname + coarse-dependency identities
 )
 
 const dstNetEnabled = true
@@ -48,16 +48,35 @@ func dstInSimBubble() bool
 //go:linkname dstNetEpoch runtime.dstNetEpoch
 func dstNetEpoch() uint64
 
+// Page-0 synthetic coarse dependency keys allocated to net (disjoint from os;
+// see os/dst_fs.go): [1025, 2048] per-host network/partition/port state,
+// [3585, 4095] virtual socket-option descriptors.
+const (
+	dstCoarseNetHostBase = 1025
+	dstCoarseNetHostSpan = 1024
+	dstCoarseSockFDBase  = 3585
+	dstCoarseSockFDSpan  = 511
+)
+
+func dstCoarseNetHostID(host uint32) uintptr {
+	return dstCoarseNetHostBase + uintptr(host)%dstCoarseNetHostSpan
+}
+
+func dstCoarseSockFDID(fd int) uintptr {
+	return dstCoarseSockFDBase + uintptr(uint(fd))%dstCoarseSockFDSpan
+}
+
 // dstNet is the process-global simulated network: a per-run registry of listeners
 // keyed by address. Keyed by the run epoch (dstNetEpoch) so a new run starts with
 // an empty registry, with no explicit teardown hook.
 var dstNet struct {
-	mu             sync.Mutex
-	epoch          uint64
-	listeners      map[string]*dstListener
-	nextPort       map[uint32]int        // host → deterministic ephemeral local port for dialers
-	nextListenPort map[uint32]int        // host → deterministic ephemeral port for listeners bound to :0
-	pendingBinds   map[dstBindKey]uint32 // bind → owning process
+	mu              isync.KernelMutex
+	epoch           uint64
+	listeners       map[string]*dstListener
+	closedListeners map[string]*uint64    // scoped listener key → last-close sync shadow
+	nextPort        map[uint32]int        // host → deterministic ephemeral local port for dialers
+	nextListenPort  map[uint32]int        // host → deterministic ephemeral port for listeners bound to :0
+	pendingBinds    map[dstBindKey]uint32 // bind → owning process
 }
 
 type dstBindKey struct {
@@ -114,6 +133,7 @@ func dstNetRoll() {
 	if e := dstNetEpoch(); e != dstNet.epoch || dstNet.listeners == nil {
 		dstNet.epoch = e
 		dstNet.listeners = make(map[string]*dstListener)
+		dstNet.closedListeners = make(map[string]*uint64)
 		dstNet.nextPort = make(map[uint32]int)
 		dstNet.nextListenPort = make(map[uint32]int)
 		dstNet.pendingBinds = make(map[dstBindKey]uint32)
@@ -548,6 +568,7 @@ type dstConn struct {
 	local, remote Addr
 	closed        atomic.Bool  // this end was Closed by its user
 	reset         *atomic.Bool // connection reset (shared by both ends)
+	resetSync     *uint64     // happens-before word paired with reset (shared by both ends)
 
 	// skErrConsumed is this end's one-shot pending-socket-error latch —
 	// production's sk_err, which the kernel reports ONCE: the first op that
@@ -596,7 +617,97 @@ type dstConn struct {
 	// RST-aborted established child from the accept queue — accept(2) hands
 	// it out and its reads drain delivered bytes, then fail ECONNRESET
 	// (host-probed; see dstInjectReset). Nil on the dialer end.
-	acceptState *atomic.Int32
+	acceptState       *atomic.Int32
+	fallbackCloseSync uint64
+}
+
+func (c *dstConn) closeSyncPtr() *uint64 {
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		return &e.closeSync
+	}
+	return &c.fallbackCloseSync
+}
+
+func (c *dstConn) isClosedAcquire() bool {
+	dstKernelSectionEnter()
+	closed := c.closed.Load()
+	if closed {
+		dstKernelRaceAcquire(unsafe.Pointer(c.closeSyncPtr()))
+	}
+	dstKernelSectionExit()
+	return closed
+}
+
+func (c *dstConn) markClosed() (already bool) {
+	cs := unsafe.Pointer(c.closeSyncPtr())
+	dstKernelSectionEnter()
+	if c.closed.Load() {
+		dstKernelRaceAcquire(cs)
+		dstKernelSectionExit()
+		return true
+	}
+	dstKernelRaceReleaseMerge(cs)
+	already = c.closed.Swap(true)
+	if already {
+		dstKernelRaceAcquire(cs)
+	}
+	dstKernelSectionExit()
+	return already
+}
+
+func dstLoadResetAcquire(reset *atomic.Bool, resetSync *uint64) bool {
+	if reset == nil {
+		return false
+	}
+	dstKernelSectionEnter()
+	r := reset.Load()
+	if r && resetSync != nil {
+		dstKernelRaceAcquire(unsafe.Pointer(resetSync))
+	}
+	dstKernelSectionExit()
+	return r
+}
+
+func (c *dstConn) markReset() {
+	dstKernelSectionEnter()
+	if c.reset != nil {
+		if c.resetSync != nil {
+			dstKernelRaceReleaseMerge(unsafe.Pointer(c.resetSync))
+		}
+		c.reset.Store(true)
+	}
+	dstKernelSectionExit()
+}
+
+func (c *dstConn) isResetKernel() bool {
+	if c.reset == nil {
+		return false
+	}
+	dstKernelSectionEnter()
+	r := c.reset.Load()
+	dstKernelSectionExit()
+	return r
+}
+
+func (c *dstConn) isResetAcquire() bool {
+	if !dstLoadResetAcquire(c.reset, c.resetSync) {
+		return false
+	}
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		e.in.acquireFreezeSync()
+		e.out.acquireFreezeSync()
+	}
+	return true
+}
+
+func (c *dstConn) claimAcceptState(old, new int32) bool {
+	if c.acceptState == nil {
+		return false
+	}
+	dstKernelSectionEnter()
+	ok := c.acceptState.CompareAndSwap(old, new)
+	dstKernelSectionExit()
+	return ok
 }
 
 type dstOwnedConn struct {
@@ -630,8 +741,17 @@ func (c *dstConn) opError(op string, err error) error {
 // read or write reports ECONNRESET (production's RST pending as sk_err), not
 // EOF/closed-pipe; later ops carry the CLOSED-socket identities (consumeSkErr).
 func (c *dstConn) resetConn() {
-	c.reset.Store(true)
-	c.Conn.Close()
+	c.markReset()
+	if e, ok := c.Conn.(*dstWireEnd); ok {
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.eofSync)), true)
+		e.closeAfterCoarse()
+	} else {
+		c.Conn.Close()
+	}
+	dstCoarseRecord(dstCoarseNetHostID(c.localHost), true)
 	dstConnDeregister(c)
 	dstSockFDFree(c.sockFD, c.sockOpts)
 }
@@ -648,7 +768,7 @@ func (c *dstConn) resetConn() {
 func (c *dstConn) consumeSkErr(op string) error {
 	closeWait := false
 	if e, ok := c.Conn.(*dstWireEnd); ok {
-		closeWait = e.rstCloseWait.Load()
+		closeWait = e.isRSTCloseWaitAcquire()
 	}
 	if closeWait {
 		return c.consumePendingErr(op, nil)
@@ -664,8 +784,13 @@ func (c *dstConn) consumeSkErr(op string) error {
 // nil pending error means the identity was already spent or never pended (the
 // CLOSE_WAIT arm): the op reports the CLOSED-socket identity directly.
 func (c *dstConn) consumePendingErr(op string, pending error) error {
-	if pending != nil && !c.skErrConsumed.Swap(true) {
-		return c.opError(op, pending)
+	if pending != nil {
+		dstKernelSectionEnter()
+		already := c.skErrConsumed.Swap(true)
+		dstKernelSectionExit()
+		if !already {
+			return c.opError(op, pending)
+		}
 	}
 	if op == "read" {
 		return io.EOF
@@ -689,7 +814,7 @@ func (c *dstConn) mapConnErr(op string, err error) error {
 		// later reads return io.EOF and later writes EPIPE — the CLOSED-socket
 		// identities.
 		return c.consumePendingErr(op, syscall.ETIMEDOUT)
-	case c.closed.Load():
+	case c.isClosedAcquire():
 		return c.opError(op, errClosed)
 	case err == io.EOF:
 		return io.EOF // graceful peer close (a reset read is mapped in Read)
@@ -715,11 +840,25 @@ func (c *dstConn) Read(b []byte) (int, error) {
 	if c.stale() {
 		return 0, c.opError("read", errClosed)
 	}
-	if c.closed.Load() {
+	e, isWire := c.Conn.(*dstWireEnd)
+	if isWire {
+		e.coarseRead()
+	} else {
+		dstCoarseDep(uintptr(unsafe.Pointer(c.closeSyncPtr())), false)
+	}
+	if c.isClosedAcquire() {
 		return 0, c.opError("read", errClosed)
 	}
-	n, err := c.Conn.Read(b)
-	if err == io.EOF && c.reset.Load() {
+	var (
+		n   int
+		err error
+	)
+	if isWire {
+		n, err = e.readAfterCoarse(b)
+	} else {
+		n, err = c.Conn.Read(b)
+	}
+	if err == io.EOF && c.isResetAcquire() {
 		// The transport drained to EOF on a reset connection: the RST is the
 		// terminal event, surfaced with the one-shot sk_err semantics — the
 		// first post-drain read reports ECONNRESET, later reads io.EOF.
@@ -732,10 +871,24 @@ func (c *dstConn) Write(b []byte) (int, error) {
 	if c.stale() {
 		return 0, c.opError("write", errClosed)
 	}
-	if c.closed.Load() {
+	e, isWire := c.Conn.(*dstWireEnd)
+	if isWire {
+		e.coarseWrite()
+	} else {
+		dstCoarseDep(uintptr(unsafe.Pointer(c.closeSyncPtr())), false)
+	}
+	if c.isClosedAcquire() {
 		return 0, c.opError("write", errClosed)
 	}
-	n, err := c.Conn.Write(b)
+	var (
+		n   int
+		err error
+	)
+	if isWire {
+		n, err = e.writeAfterCoarse(b)
+	} else {
+		n, err = c.Conn.Write(b)
+	}
 	return n, c.mapConnErr("write", err)
 }
 
@@ -743,11 +896,24 @@ func (c *dstConn) Close() error {
 	if !dstInSimBubble() && dstActive() && c.epoch == dstNetEpoch() {
 		return c.opError("close", errClosed)
 	}
-	if c.closed.Swap(true) {
-		return c.opError("close", errClosed)
-	}
 	if c.stale() {
+		if c.closed.Swap(true) {
+			return c.opError("close", errClosed)
+		}
 		return nil
+	}
+	e, isWire := c.Conn.(*dstWireEnd)
+	if isWire {
+		e.coarseClose()
+	} else {
+		dstCoarseDep(uintptr(unsafe.Pointer(c.closeSyncPtr())), true)
+	}
+	dstCoarseRecord(dstCoarseNetHostID(c.localHost), true)
+	if c.sockFD != 0 {
+		dstCoarseRecord(dstCoarseSockFDID(c.sockFD), true)
+	}
+	if c.markClosed() {
+		return c.opError("close", errClosed)
 	}
 	// The kernel's close(2) conditional: an end whose receive queue holds
 	// unread data answers the peer with RST — the peer drains bytes already
@@ -758,12 +924,16 @@ func (c *dstConn) Close() error {
 	// (the recorded collapse: the sim RSTs immediately, one of the two
 	// orderings the real close-vs-arrival race produces). The type assertion
 	// is the same wire-backed transport contract dstCloseProcConns records.
-	if e, ok := c.Conn.(*dstWireEnd); ok && e.unreadInbound() {
+	if isWire && e.unreadInbound() {
 		dstResetBothEnds(c)
 		return nil
 	}
 	c.timeWaitHold()
-	c.Conn.Close()
+	if isWire {
+		e.closeAfterCoarse()
+	} else {
+		c.Conn.Close()
+	}
 	dstConnDeregister(c)
 	dstSockFDFree(c.sockFD, c.sockOpts)
 	return nil
@@ -784,7 +954,7 @@ func (c *dstConn) Close() error {
 // ephemeral allocator never see it. Runs BEFORE c.Conn.Close so remoteDone
 // still reflects only the peer's action.
 func (c *dstConn) timeWaitHold() {
-	if c.reset.Load() {
+	if c.isResetKernel() {
 		return
 	}
 	la, ok := c.local.(*TCPAddr)
@@ -792,7 +962,7 @@ func (c *dstConn) timeWaitHold() {
 		return
 	}
 	e, ok := c.Conn.(*dstWireEnd)
-	if !ok || e.timedOut.Load() || isClosedChan(e.remoteDone) {
+	if !ok || e.isTimedOutKernel() || dstIsClosedKernelChan(e.remoteDone) {
 		return
 	}
 	dstTimeWaitAdd(c.localHost, la.IP, la.Port, c.bindFamily, c.bindWildcard)
@@ -802,16 +972,28 @@ func (c *dstConn) timeWaitHold() {
 // local Close it fails with net.ErrClosed; after a peer close it still succeeds
 // and applies: FIN may be delayed or partition-held,
 // so the local endpoint remains live until terminal state arrives.
-func (c *dstConn) setDeadline(set func(time.Time) error, t time.Time) error {
+func (c *dstConn) setDeadline(coarse func(*dstWireEnd), setWire func(*dstWireEnd, time.Time) error, setFallback func(time.Time) error, t time.Time) error {
 	// Production shape for a set-deadline failure: Source nil, Addr local.
 	closedErr := &OpError{Op: "set", Net: c.network, Source: nil, Addr: dstCloneAddr(c.local), Err: errClosed}
 	if c.stale() {
 		return closedErr
 	}
-	if c.closed.Load() {
+	e, isWire := c.Conn.(*dstWireEnd)
+	if isWire {
+		coarse(e)
+	} else {
+		dstCoarseDep(uintptr(unsafe.Pointer(c.closeSyncPtr())), false)
+	}
+	if c.isClosedAcquire() {
 		return closedErr
 	}
-	if err := set(t); err != nil && !c.closed.Load() {
+	var err error
+	if isWire {
+		err = setWire(e, t)
+	} else {
+		err = setFallback(t)
+	}
+	if err != nil && !c.isClosedAcquire() {
 		// The pipe rejects deadlines once either side is done; only a LOCAL
 		// close is an error in production.
 		return nil
@@ -822,30 +1004,31 @@ func (c *dstConn) setDeadline(set func(time.Time) error, t time.Time) error {
 }
 
 func (c *dstConn) SetDeadline(t time.Time) error {
-	return c.setDeadline(c.Conn.SetDeadline, t)
+	return c.setDeadline((*dstWireEnd).coarseSetDeadline, (*dstWireEnd).setDeadlineAfterCoarse, c.Conn.SetDeadline, t)
 }
 
 func (c *dstConn) SetReadDeadline(t time.Time) error {
-	return c.setDeadline(c.Conn.SetReadDeadline, t)
+	return c.setDeadline((*dstWireEnd).coarseSetReadDeadline, (*dstWireEnd).setReadDeadlineAfterCoarse, c.Conn.SetReadDeadline, t)
 }
 
 func (c *dstConn) SetWriteDeadline(t time.Time) error {
-	return c.setDeadline(c.Conn.SetWriteDeadline, t)
+	return c.setDeadline((*dstWireEnd).coarseSetWriteDeadline, (*dstWireEnd).setWriteDeadlineAfterCoarse, c.Conn.SetWriteDeadline, t)
 }
 
 // dstListener is a simulated Listener. Dial pushes the server end of a new
 // connection onto accept; Accept receives it. A dual-stack wildcard listener
 // (plain "tcp" on a wildcard host) registers under both family keys.
 type dstListener struct {
-	network string
-	epoch   uint64
-	addr    *TCPAddr
-	keys    []string
-	accept  chan *dstOwnedConn
-	done    chan struct{}
-	closed  atomic.Bool
-	host    uint32 // the host that owns this listener (its network identity)
-	proc    uint32 // the process that created this listener (owns its accepted conns)
+	network   string
+	epoch     uint64
+	addr      *TCPAddr
+	keys      []string
+	accept    chan *dstOwnedConn
+	done      chan struct{}
+	closed    atomic.Bool
+	closeSync uint64
+	host      uint32 // the host that owns this listener (its network identity)
+	proc      uint32 // the process that created this listener (owns its accepted conns)
 
 	// sockFD/opts are the listening socket's virtual descriptor and option
 	// state (a ListenConfig.Control callback's writes land here); accepted
@@ -864,14 +1047,52 @@ func (l *dstListener) opError(op string, err error) error {
 
 func (l *dstListener) stale() bool { return !dstInSimBubble() || l.epoch != dstNetEpoch() }
 
+func (l *dstListener) acquireCloseSync() {
+	dstKernelSectionEnter()
+	dstKernelRaceAcquire(unsafe.Pointer(&l.closeSync))
+	dstKernelSectionExit()
+}
+
+func (l *dstListener) isClosedAcquire() bool {
+	dstKernelSectionEnter()
+	closed := l.closed.Load()
+	if closed {
+		dstKernelRaceAcquire(unsafe.Pointer(&l.closeSync))
+	}
+	dstKernelSectionExit()
+	return closed
+}
+
+func (l *dstListener) markClosed() (already bool) {
+	cs := unsafe.Pointer(&l.closeSync)
+	dstKernelSectionEnter()
+	if l.closed.Load() {
+		dstKernelRaceAcquire(cs)
+		dstKernelSectionExit()
+		return true
+	}
+	dstKernelRaceReleaseMerge(cs)
+	already = l.closed.Swap(true)
+	if already {
+		dstKernelRaceAcquire(cs)
+	}
+	dstKernelSectionExit()
+	return already
+}
+
 func (l *dstListener) Accept() (Conn, error) {
 	if l.stale() {
+		return nil, l.opError("accept", errClosed)
+	}
+	dstCoarseDep(uintptr(unsafe.Pointer(l)), true)
+	if l.isClosedAcquire() {
 		return nil, l.opError("accept", errClosed)
 	}
 	// Closed-first: production Accept after Close always fails with ErrClosed,
 	// even if connections were still queued in the backlog (Close reset them).
 	select {
 	case <-l.done:
+		l.acquireCloseSync()
 		return nil, l.opError("accept", errClosed)
 	default:
 	}
@@ -879,7 +1100,7 @@ func (l *dstListener) Accept() (Conn, error) {
 		select {
 		case owned := <-l.accept:
 			c := owned.conn
-			if c.acceptState != nil && !c.acceptState.CompareAndSwap(0, 1) {
+			if c.acceptState != nil && !c.claimAcceptState(0, 1) {
 				// Listener-close reset (or dial-side refusal) while queued;
 				// never hand it out. A FAULT-injected RST leaves the state 0
 				// on purpose — that conn IS handed out (see acceptState).
@@ -894,12 +1115,14 @@ func (l *dstListener) Accept() (Conn, error) {
 			// drain skip it, so the reset is ours to perform.
 			select {
 			case <-l.done:
+				l.acquireCloseSync()
 				c.resetConn()
 				return nil, l.opError("accept", errClosed)
 			default:
 			}
 			return c, nil
 		case <-l.done:
+			l.acquireCloseSync()
 			return nil, l.opError("accept", errClosed)
 		}
 	}
@@ -922,11 +1145,19 @@ func (l *dstListener) closeTearing(tear func(*dstConn)) error {
 	if !dstInSimBubble() && dstActive() && l.epoch == dstNetEpoch() {
 		return l.opError("close", errClosed)
 	}
-	if l.closed.Swap(true) {
-		return l.opError("close", errClosed)
-	}
 	if l.stale() {
+		if l.closed.Swap(true) {
+			return l.opError("close", errClosed)
+		}
 		return nil
+	}
+	dstCoarseDep(dstCoarseNetHostID(l.host), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(l)), true)
+	if l.sockFD != 0 {
+		dstCoarseRecord(dstCoarseSockFDID(l.sockFD), true)
+	}
+	if l.markClosed() {
+		return l.opError("close", errClosed)
 	}
 	if tear == nil {
 		tear = func(c *dstConn) {
@@ -939,9 +1170,16 @@ func (l *dstListener) closeTearing(tear func(*dstConn)) error {
 	}
 	close(l.done)
 	dstNet.mu.Lock()
+	dstNetRoll()
 	for _, k := range l.keys {
 		if dstNet.listeners[k] == l {
 			delete(dstNet.listeners, k)
+			cs := dstNet.closedListeners[k]
+			if cs == nil {
+				cs = new(uint64)
+				dstNet.closedListeners[k] = cs
+			}
+			dstKernelRaceReleaseMerge(unsafe.Pointer(cs))
 		}
 	}
 	dstNet.mu.Unlock()
@@ -950,7 +1188,7 @@ func (l *dstListener) closeTearing(tear func(*dstConn)) error {
 		select {
 		case owned := <-l.accept:
 			c := owned.conn
-			if c.acceptState == nil || c.acceptState.CompareAndSwap(0, 2) {
+			if c.acceptState == nil || c.claimAcceptState(0, 2) {
 				tear(c)
 			}
 		default:
@@ -1037,6 +1275,9 @@ func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr
 		}
 	}
 
+	kaIdle, kaCfg := lc.KeepAlive, lc.KeepAliveConfig
+
+	dstCoarseDep(dstCoarseNetHostID(listeningHost), true)
 	dstNet.mu.Lock()
 	defer dstNet.mu.Unlock()
 	dstNetRoll()
@@ -1046,14 +1287,14 @@ func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr
 		if err != nil {
 			// Production wraps a bind failure with the REQUESTED address
 			// (port 0), not a nil Addr.
-			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: reportIP, Port: 0}, Err: err}
+			return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: &TCPAddr{IP: append(IP(nil), reportIP...), Port: 0}, Err: err}
 		}
 	} else if dual {
 		keys = dstDualKeys(portnum)
 	} else {
 		keys = []string{dstListenerKey(network, ip, portnum, wildcard)}
 	}
-	addr := &TCPAddr{IP: reportIP, Port: portnum}
+	addr := &TCPAddr{IP: append(IP(nil), reportIP...), Port: portnum}
 	if dstAnyListenerConflict(scope, network, ip, keys, portnum, wildcard, dual) ||
 		dstListenConnConflict(listeningHost, network, ip, portnum, wildcard, dual) {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: addr, Err: syscall.EADDRINUSE}
@@ -1076,8 +1317,8 @@ func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr
 		proc:    listeningProc,
 		sockFD:  lfd,
 		opts:    lOpts,
-		kaIdle:  lc.KeepAlive,
-		kaCfg:   lc.KeepAliveConfig,
+		kaIdle:  kaIdle,
+		kaCfg:   kaCfg,
 	}
 	for _, k := range scoped {
 		dstNet.listeners[k] = l
@@ -1137,6 +1378,29 @@ func dstConnectSYN(ctx context.Context, latencyNs, jitterNs int64) error {
 // mechanism (host-probed: a dial parked mid-establishment whose listener
 // closes fails "connection refused"). ECONNRESET is the established-state
 // identity only.
+func dstHandshakeAbortedKernel(e *dstWireEnd, reset *atomic.Bool) bool {
+	if reset != nil {
+		dstKernelSectionEnter()
+		r := reset.Load()
+		dstKernelSectionExit()
+		if r {
+			return true
+		}
+	}
+	return e.isRSTArrivedKernel() || dstIsClosedKernelChan(e.localDone) || dstIsClosedKernelChan(e.remoteDone)
+}
+
+func dstAcquireHandshakeAbort(e *dstWireEnd, reset *atomic.Bool, resetSync *uint64) {
+	dstLoadResetAcquire(reset, resetSync)
+	e.isRSTArrivedAcquire()
+	if dstIsClosedKernelChan(e.localDone) {
+		e.acquireLocalCloseSync()
+	}
+	if dstIsClosedKernelChan(e.remoteDone) {
+		e.acquirePeerCloseSync()
+	}
+}
+
 func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWireEnd, reset *atomic.Bool) error {
 	d := dstLinkDelay(latencyNs, jitterNs)
 	if d <= 0 {
@@ -1155,7 +1419,7 @@ func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWire
 		// from this check, so a pre-select reset routes through rstKill
 		// instead (TestDSTNetResetRacingZeroLatencyDial sweeps those
 		// orderings).
-		if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+		if dstHandshakeAbortedKernel(e, reset) {
 			return syscall.ECONNREFUSED
 		}
 		return nil
@@ -1171,7 +1435,7 @@ func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWire
 	if err := ctx.Err(); err != nil {
 		return mapErr(err)
 	}
-	if reset.Load() || isClosedChan(e.localDone) || isClosedChan(e.remoteDone) {
+	if dstHandshakeAbortedKernel(e, reset) {
 		return syscall.ECONNREFUSED
 	}
 	return nil
@@ -1258,6 +1522,7 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 			bindIP = nil
 		}
 		family := dstAddrFamily(network, localIP)
+		dstCoarseDep(dstCoarseNetHostID(dialerHost), true)
 		dstNet.mu.Lock()
 		dstNetRoll()
 		dialerScope := dstNetScope(dialerHost)
@@ -1321,6 +1586,10 @@ func dstDial(ctx context.Context, d *Dialer, network, address string) (retConn C
 	// episode the loop's blockStart deliberately survives wakes — that
 	// conservative anchor is untouched.)
 redial:
+	dstCoarseDep(dstCoarseNetHostID(dialerHost), true)
+	if targetHost != dialerHost {
+		dstCoarseRecord(dstCoarseNetHostID(targetHost), false)
+	}
 	blockStart := int64(-1) // base-time the dial first blocked; -1 = not yet blocked
 	for {
 		wake := dstPartWakeCh()
@@ -1329,6 +1598,7 @@ redial:
 			break
 		}
 		if refuse {
+			dstAcquirePartFaultSync(dialerHost, targetHost)
 			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 		}
 		if blockStart < 0 {
@@ -1339,6 +1609,7 @@ redial:
 		if retransNs > 0 {
 			remaining := retransNs - (dstBaseNanos() - blockStart)
 			if remaining <= 0 {
+				dstAcquirePartFaultSync(dialerHost, targetHost)
 				return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 			}
 			horizonT = time.NewTimer(time.Duration(remaining))
@@ -1355,15 +1626,29 @@ redial:
 				horizonT.Stop()
 			}
 		case <-horizonC:
+			dstAcquirePartFaultSync(dialerHost, targetHost)
 			return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 		}
 	}
+	if blockStart >= 0 {
+		dstCoarseRecord(dstCoarseNetHostID(dialerHost), true)
+		if targetHost != dialerHost {
+			dstCoarseRecord(dstCoarseNetHostID(targetHost), false)
+		}
+	}
 	scope := dstDialScope(ip, dialerHost)
+	kExact := scope + dstListenerKey(network, ip, portnum, false)
+	kWild := scope + dstListenerKey(network, ip, portnum, true)
 	dstNet.mu.Lock()
 	dstNetRoll()
-	l := dstNet.listeners[scope+dstListenerKey(network, ip, portnum, false)]
+	l := dstNet.listeners[kExact]
 	if l == nil {
-		l = dstNet.listeners[scope+dstListenerKey(network, ip, portnum, true)] // a wildcard listener on this port/family
+		l = dstNet.listeners[kWild] // a wildcard listener on this port/family
+	}
+	var closedExactSync, closedWildSync *uint64
+	if l == nil {
+		closedExactSync = dstNet.closedListeners[kExact]
+		closedWildSync = dstNet.closedListeners[kWild]
 	}
 	if localPort != 0 {
 		// An explicit LocalAddr binds without SO_REUSEADDR: bind(2) fails EADDRINUSE
@@ -1399,8 +1684,9 @@ redial:
 		}
 	}
 	dstNet.mu.Unlock()
-
-	if l == nil {
+	if l != nil {
+		dstCoarseRecord(uintptr(unsafe.Pointer(l)), true)
+	} else {
 		if dstHostDead(targetHost) || (targetHost != dialerHost && !dstHostDeclaredQ(targetHost)) {
 			// Powered off (or never declared) between the clear-path check
 			// and the lookup — a window no cooperative schedule reaches today
@@ -1408,6 +1694,14 @@ redial:
 			// point cannot turn it into a refusal.
 			goto redial
 		}
+		dstKernelSectionEnter()
+		if closedExactSync != nil {
+			dstKernelRaceAcquire(unsafe.Pointer(closedExactSync))
+		}
+		if closedWildSync != nil {
+			dstKernelRaceAcquire(unsafe.Pointer(closedWildSync))
+		}
+		dstKernelSectionExit()
 		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 	}
 	localAddr := &TCPAddr{IP: localIP, Port: localPort}
@@ -1451,22 +1745,40 @@ redial:
 	// enablement standing (the grpc-go recipe). The server end inherits a
 	// clone of the listener's options (accept(2) inheritance) and takes the
 	// ListenConfig resolution the same way.
-	dialOpts.applyGoKeepAlive(d.KeepAlive, d.KeepAliveConfig)
-	serverOpts := l.opts.cloneForChild()
-	serverOpts.applyGoKeepAlive(l.kaIdle, l.kaCfg)
-	serverFD, okServerFD := dstSockFDAlloc(serverOpts)
-	if !okServerFD {
+	dialKAIdle, dialKACfg := d.KeepAlive, d.KeepAliveConfig
+	var (
+		dialer, server *dstConn
+		ownedServer    *dstOwnedConn
+		p1, p2         Conn
+		reset          *atomic.Bool
+		resetSync      *uint64
+	)
+	func() {
+		dstKernelSectionEnter()
+		defer dstKernelSectionExit()
+		localClone := &TCPAddr{IP: append(IP(nil), localAddr.IP...), Port: localAddr.Port, Zone: localAddr.Zone}
+		serverClone := &TCPAddr{IP: append(IP(nil), serverAddr.IP...), Port: serverAddr.Port, Zone: serverAddr.Zone}
+		dialOpts.applyGoKeepAlive(dialKAIdle, dialKACfg)
+		serverOpts := l.opts.cloneForChild()
+		serverOpts.applyGoKeepAlive(l.kaIdle, l.kaCfg)
+		serverFD, okServerFD := dstSockFDAlloc(serverOpts)
+		if !okServerFD {
+			return
+		}
+		p1, p2 = dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
+		reset = new(atomic.Bool)
+		resetSync = new(uint64)
+		epoch := dstNetEpoch()
+		dialer = &dstConn{Conn: p1, epoch: epoch, network: network, local: localClone, remote: serverClone, reset: reset, resetSync: resetSync, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP), sockFD: dialFD, sockOpts: dialOpts}
+		server = &dstConn{Conn: p2, epoch: epoch, network: network, local: serverClone, remote: localClone, reset: reset, resetSync: resetSync, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverClone.IP), sockFD: serverFD, sockOpts: serverOpts}
+		// Publish lifecycle ownership before the server endpoint can enter the
+		// backlog or become visible to Accept. Failed establishment removes both
+		// registrations through the idempotent cleanup below.
+		ownedServer = dstOwnConnPair(dialer, server)
+	}()
+	if ownedServer == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: os.NewSyscallError("socket", syscall.EMFILE)}
 	}
-	p1, p2 := dstWirePair(latency, jitter, bandwidth, capacity, retrans, dialerHost, l.host, dialOpts, serverOpts)
-	reset := new(atomic.Bool)
-	epoch := dstNetEpoch()
-	dialer := &dstConn{Conn: p1, epoch: epoch, network: network, local: localAddr, remote: serverAddr, reset: reset, localHost: dialerHost, remoteHost: l.host, localProc: dialerProc, remoteProc: l.proc, bindWildcard: wildcardBind, bindFamily: dstAddrFamily(network, localIP), sockFD: dialFD, sockOpts: dialOpts}
-	server := &dstConn{Conn: p2, epoch: epoch, network: network, local: serverAddr, remote: localAddr, reset: reset, acceptState: new(atomic.Int32), localHost: l.host, remoteHost: dialerHost, localProc: l.proc, remoteProc: dialerProc, bindFamily: dstAddrFamily(network, serverAddr.IP), sockFD: serverFD, sockOpts: serverOpts}
-	// Publish lifecycle ownership before the server endpoint can enter the
-	// backlog or become visible to Accept. Failed establishment removes both
-	// registrations through the idempotent cleanup below.
-	ownedServer := dstOwnConnPair(dialer, server)
 	cleanup := func() {
 		dialer.resetConn()
 		server.resetConn()
@@ -1512,6 +1824,7 @@ redial:
 				// ECONNREFUSED, the SYN_SENT identity (immediate, the same
 				// recorded timing simplification as the front-door refusal).
 				stopBacklogHorizon()
+				dstAcquirePartFaultSync(dialerHost, l.host)
 				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			}
@@ -1521,27 +1834,34 @@ redial:
 				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
 			case <-backlogHorizonC:
+				dstAcquirePartFaultSync(dialerHost, l.host)
 				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 			case <-partWake:
 				// Partition state changed: re-check the cut.
 			case <-p1.(*dstWireEnd).localDone:
 				stopBacklogHorizon()
+				p1.(*dstWireEnd).acquireLocalCloseSync()
 				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			case <-p1.(*dstWireEnd).remoteDone:
 				stopBacklogHorizon()
-				cleanup()
 				if dstHostDead(l.host) {
+					cleanup()
 					goto redial
 				}
+				p1.(*dstWireEnd).acquirePeerCloseSync()
+				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			case <-p1.(*dstWireEnd).rstKill:
 				stopBacklogHorizon()
-				cleanup()
 				if dstHostDead(l.host) {
+					cleanup()
 					goto redial
 				}
+				p1.(*dstWireEnd).acquireRSTSync()
+				dstLoadResetAcquire(reset, resetSync)
+				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 			}
 			continue
@@ -1552,6 +1872,7 @@ redial:
 			cleanup()
 			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: mapErr(ctx.Err())}
 		case <-backlogHorizonC:
+			dstAcquirePartFaultSync(dialerHost, l.host)
 			cleanup()
 			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 		case <-partWake:
@@ -1565,14 +1886,17 @@ redial:
 		// surfaces (host-probed; see dstConnectSYNACK).
 		case <-p1.(*dstWireEnd).localDone:
 			stopBacklogHorizon()
+			p1.(*dstWireEnd).acquireLocalCloseSync()
 			cleanup()
 			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 		case <-p1.(*dstWireEnd).remoteDone:
 			stopBacklogHorizon()
-			cleanup()
 			if dstHostDead(l.host) {
+				cleanup()
 				goto redial
 			}
+			p1.(*dstWireEnd).acquirePeerCloseSync()
+			cleanup()
 			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 		case <-p1.(*dstWireEnd).rstKill:
 			// A fault-injected RST during the SYN retransmit window (backlog
@@ -1583,10 +1907,13 @@ redial:
 			// host emits no RST, so that path redials into the blackhole and
 			// times out as production does.
 			stopBacklogHorizon()
-			cleanup()
 			if dstHostDead(l.host) {
+				cleanup()
 				goto redial
 			}
+			p1.(*dstWireEnd).acquireRSTSync()
+			dstLoadResetAcquire(reset, resetSync)
+			cleanup()
 			return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 		case l.accept <- ownedServer:
 			stopBacklogHorizon()
@@ -1597,7 +1924,7 @@ redial:
 				// send may have landed after the drain — or the server may have
 				// already Accepted it before we resumed. Claim it: if it is still
 				// queued, refuse the dial; if Accept won, the connection stands.
-				if server.acceptState.CompareAndSwap(0, 2) {
+				if server.claimAcceptState(0, 2) {
 					cleanup()
 					goto refused
 				}
@@ -1606,10 +1933,14 @@ redial:
 			// SYN-ACK: the acknowledgment travels back; context expiry or endpoint
 			// teardown before its arrival aborts the connect and tears down both ends.
 			if err := dstConnectSYNACK(ctx, latency, jitter, p1.(*dstWireEnd), reset); err != nil {
-				cleanup()
 				if dstHostDead(l.host) {
+					cleanup()
 					goto redial
 				}
+				if err == syscall.ECONNREFUSED {
+					dstAcquireHandshakeAbort(p1.(*dstWireEnd), reset, resetSync)
+				}
+				cleanup()
 				return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: err}
 			}
 			// SYN-ACK across a cut: the acknowledgment travels the RETURNING
@@ -1633,16 +1964,19 @@ redial:
 					// the still-in-SYN_SENT connect with ECONNREFUSED — returning
 					// an already-reset conn would surface the established-state
 					// ECONNRESET for a connect(2) that never established.
-					if reset.Load() || isClosedChan(p1.(*dstWireEnd).localDone) || isClosedChan(p1.(*dstWireEnd).remoteDone) {
-						cleanup()
+					if dstHandshakeAbortedKernel(p1.(*dstWireEnd), reset) {
 						if dstHostDead(l.host) {
+							cleanup()
 							goto redial
 						}
+						dstAcquireHandshakeAbort(p1.(*dstWireEnd), reset, resetSync)
+						cleanup()
 						return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 					}
 					return dialer, nil
 				}
 				if !ackBlackhole {
+					dstAcquirePartFaultSync(l.host, dialerHost)
 					cleanup()
 					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 				}
@@ -1654,6 +1988,7 @@ redial:
 				if retransNs > 0 {
 					remaining := retransNs - (dstBaseNanos() - synackBlock)
 					if remaining <= 0 {
+						dstAcquirePartFaultSync(l.host, dialerHost)
 						cleanup()
 						return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 					}
@@ -1672,31 +2007,38 @@ redial:
 						ackHorizonT.Stop()
 					}
 				case <-ackHorizonC:
+					dstAcquirePartFaultSync(l.host, dialerHost)
 					cleanup()
 					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ETIMEDOUT}
 				case <-p1.(*dstWireEnd).localDone:
 					if ackHorizonT != nil {
 						ackHorizonT.Stop()
 					}
+					p1.(*dstWireEnd).acquireLocalCloseSync()
 					cleanup()
 					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 				case <-p1.(*dstWireEnd).remoteDone:
 					if ackHorizonT != nil {
 						ackHorizonT.Stop()
 					}
-					cleanup()
 					if dstHostDead(l.host) {
+						cleanup()
 						goto redial
 					}
+					p1.(*dstWireEnd).acquirePeerCloseSync()
+					cleanup()
 					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 				case <-p1.(*dstWireEnd).rstKill:
 					if ackHorizonT != nil {
 						ackHorizonT.Stop()
 					}
-					cleanup()
 					if dstHostDead(l.host) {
+						cleanup()
 						goto redial
 					}
+					p1.(*dstWireEnd).acquireRSTSync()
+					dstLoadResetAcquire(reset, resetSync)
+					cleanup()
 					return nil, &OpError{Op: "dial", Net: network, Source: localAddr, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 				}
 			}
@@ -1715,5 +2057,6 @@ refused:
 	if dstHostDead(l.host) {
 		goto redial
 	}
+	l.acquireCloseSync()
 	return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: serverAddr, Err: syscall.ECONNREFUSED}
 }

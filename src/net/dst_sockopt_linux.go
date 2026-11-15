@@ -9,7 +9,6 @@ package net
 import (
 	"syscall"
 	"unsafe"
-	_ "unsafe" // for go:linkname
 )
 
 // The numeric (level, option) surface of the simulated option layer: the
@@ -55,6 +54,12 @@ func dstSockoptPutInt(val []byte, v int32) {
 func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 	o := dstSockFDLookup(fd)
 	if o == nil {
+		dstCoarseDep(dstCoarseSockFDID(fd), false)
+		return syscall.EBADF, true
+	}
+	dstCoarseDep(uintptr(unsafe.Pointer(o)), true)
+	dstCoarseRecord(dstCoarseSockFDID(fd), false)
+	if dstSockFDLookup(fd) != o {
 		return syscall.EBADF, true
 	}
 	v, ok := dstSockoptInt(val)
@@ -106,25 +111,36 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 func dstSockGetsockopt(fd, level, opt int, val []byte) (int, syscall.Errno, bool) {
 	o := dstSockFDLookup(fd)
 	if o == nil {
+		dstCoarseDep(dstCoarseSockFDID(fd), false)
 		return 0, syscall.EBADF, true
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	var v int32
-	switch {
-	case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
-		if o.keepAlive {
-			v = 1
+	dstCoarseDep(uintptr(unsafe.Pointer(o)), false)
+	dstCoarseRecord(dstCoarseSockFDID(fd), false)
+	if dstSockFDLookup(fd) != o {
+		return 0, syscall.EBADF, true
+	}
+	v, ok := func() (int32, bool) {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		switch {
+		case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
+			if o.keepAlive {
+				return 1, true
+			}
+			return 0, true
+		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
+			return o.keepIdleSec, true
+		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
+			return o.keepIntvlSec, true
+		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
+			return o.keepCnt, true
+		case level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
+			return int32(o.userTimeoutMs), true
+		default:
+			return 0, false
 		}
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
-		v = o.keepIdleSec
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
-		v = o.keepIntvlSec
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
-		v = o.keepCnt
-	case level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
-		v = int32(o.userTimeoutMs)
-	default:
+	}()
+	if !ok {
 		return 0, syscall.ENOPROTOOPT, true
 	}
 	// The kernel clamps the copy to the option's size and permits a SHORT

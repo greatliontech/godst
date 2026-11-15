@@ -18,6 +18,59 @@ func dstIsCrashedG(gp *g) bool {
 	return gp.dstPid < 0
 }
 
+//go:nosplit
+func dstCanPreemptG(gp *g) bool {
+	return gp.dstKernelDepth == 0
+}
+
+//go:nosplit
+func dstKernelEnter() {
+	getg().dstKernelDepth++
+}
+
+//go:nosplit
+func dstKernelExit() {
+	gp := getg()
+	gp.dstKernelDepth--
+	if gp.dstKernelDepth < 0 {
+		throw("runtime: negative dstKernelDepth")
+	}
+	if gp.dstKernelDepth == 0 && gp.preempt {
+		gp.stackguard0 = stackPreempt
+	}
+}
+
+//go:linkname dstKernelSectionEnter
+//go:nosplit
+func dstKernelSectionEnter() {
+	dstKernelEnter()
+	dstKernelRaceEnter()
+}
+
+//go:linkname dstKernelSectionExit
+//go:nosplit
+func dstKernelSectionExit() {
+	dstKernelRaceExit()
+	dstKernelExit()
+}
+
+//go:linkname internal_sync_runtime_dstKernelSectionEnter internal/sync.runtime_dstKernelSectionEnter
+//go:nosplit
+func internal_sync_runtime_dstKernelSectionEnter() {
+	dstKernelSectionEnter()
+}
+
+//go:linkname internal_sync_runtime_dstKernelSectionExit internal/sync.runtime_dstKernelSectionExit
+//go:nosplit
+func internal_sync_runtime_dstKernelSectionExit() {
+	dstKernelSectionExit()
+}
+
+//go:linkname internal_sync_runtime_SemacquireKernel internal/sync.runtime_SemacquireKernel
+func internal_sync_runtime_SemacquireKernel(addr *uint32) {
+	semacquire1(addr, false, 0, 0, waitReasonSemacquire)
+}
+
 // --- debug.go hooks ---
 
 // dstGOMAXPROCSSTWHook, when non-nil, runs in GOMAXPROCS/SetDefaultGOMAXPROCS
@@ -68,6 +121,10 @@ func dstMallocgcPost(x unsafe.Pointer, elemsize uintptr, typ *_type) {
 			dstHeapAlloc.Add(int64(elemsize))
 			dstProcAllocAdd(cur.dstProc, int64(elemsize))
 		}
+		// Note: gcStart is already schedule-transparent with respect to other
+		// simulation goroutines (dstEnterGCDisassociate sets gp.dstGCInternal,
+		// which firstSystemG resumes ahead of dstSchedSelect), so kernel sections
+		// need not suppress the heap GC trigger.
 		if getg() == cur {
 			if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 				gcStart(t)
@@ -345,7 +402,11 @@ func dstDiscardSpecialStampLocked(sp unsafe.Pointer) {
 
 func dstGoready(gp *g) {
 	if dstActive() && dstSchedKind == dstSchedScheduled {
-		dstRecordReadyEdge(getg(), gp)
+		readier := getg()
+		if readier.dstKernelDepth > 0 || (raceenabled && readier.raceignore != 0) {
+			return
+		}
+		dstRecordReadyEdge(readier, gp)
 	}
 }
 
@@ -359,17 +420,21 @@ func dstAllgadd() {
 
 func dstNewprocReadyEdge(callergp, newg *g) {
 	if dstActive() && dstSchedKind == dstSchedScheduled {
+		if raceenabled && int32(callergp.raceignore) > callergp.dstKernelDepth {
+			return
+		}
 		dstRecordReadyEdge(callergp, newg)
 	}
 }
 
 func dstNewprocPostYield() {
-	if dstActive() && dstSchedKind == dstSchedScheduled && dstPostGoYield {
+	if dstActive() && dstSchedKind == dstSchedScheduled && dstPostGoYield && getg().dstKernelDepth == 0 {
 		dstYieldPoint()
 	}
 }
 
 func dstNewproc1Init(newg, callergp *g) {
+	newg.dstKernelDepth = 0
 	if !dstActive() {
 		return
 	}
@@ -915,7 +980,96 @@ func dstNotifyListNotifyOne(l *notifyList, t uint32) {
 
 //go:linkname internal_sync_dstMutexWaitVirtual internal/sync.runtime_dstMutexWaitVirtual
 func internal_sync_dstMutexWaitVirtual() bool {
-	return getg().bubble != nil
+	return dstActive() && dstInSimBubble()
+}
+
+//go:linkname internal_sync_runtime_dstSemrelease internal/sync.runtime_dstSemrelease
+func internal_sync_runtime_dstSemrelease(addr *uint32, handoff bool, skipframes int) (woke bool, crashed int32, shouldYield bool) {
+	return dstSemrelease1(addr, handoff, skipframes)
+}
+
+//go:linkname internal_sync_runtime_dstSemreleaseYield internal/sync.runtime_dstSemreleaseYield
+func internal_sync_runtime_dstSemreleaseYield() {
+	goyield()
+}
+
+//go:linkname dstSemacquireFP
+func dstSemacquireFP(addr *uint32) {
+	semacquire1(addr, false, 0, 0, waitReasonSyncMutexLock)
+}
+
+//go:linkname dstSemreleaseHandoffFP
+func dstSemreleaseHandoffFP(addr *uint32) {
+	semrelease1(addr, true, 0)
+}
+
+//go:linkname dstSemreleaseDSTHandoffFP
+func dstSemreleaseDSTHandoffFP(addr *uint32) {
+	_, _, shouldYield := dstSemrelease1(addr, true, 0)
+	if shouldYield {
+		goyield()
+	}
+}
+
+//go:linkname sync_runtime_dstSemrelease sync.runtime_dstSemrelease
+func sync_runtime_dstSemrelease(addr *uint32, handoff bool, skipframes int) (woke bool, crashed int32, shouldYield bool) {
+	return dstSemrelease1(addr, handoff, skipframes)
+}
+
+// dstSemrelease1 mirrors semrelease1 while reporting how many crashed waiters
+// were skipped from the semaphore wait queue and whether a live waiter was
+// woken. When handoff is true, direct G handoff yielding is deferred to the
+// caller (via shouldYield) so Mutex.unlockSlow can repair m.state for skipped
+// crashed waiters before the woken waiter observes m.state.
+func dstSemrelease1(addr *uint32, handoff bool, skipframes int) (woke bool, crashed int32, shouldYield bool) {
+	root := semtable.rootFor(addr)
+	atomic.Xadd(addr, 1)
+
+	if root.nwait.Load() == 0 {
+		return false, 0, false
+	}
+
+	lockWithRank(&root.lock, lockRankRoot)
+	if root.nwait.Load() == 0 {
+		unlock(&root.lock)
+		return false, 0, false
+	}
+	s, t0, tailtime := root.dequeue(addr)
+	if s != nil {
+		root.nwait.Add(-1)
+	}
+	for s != nil && dstIsCrashedG(s.g) {
+		crashed++
+		s, t0, tailtime = root.dequeue(addr)
+		if s != nil {
+			root.nwait.Add(-1)
+		}
+	}
+	if crashed > 0 && s == nil {
+		cansemacquire(addr)
+	}
+	unlock(&root.lock)
+	if s != nil {
+		acquiretime := s.acquiretime
+		if acquiretime != 0 {
+			dt0 := t0 - acquiretime
+			dt := dt0
+			if s.waiters != 0 {
+				dtail := t0 - tailtime
+				dt += (dtail + dt0) / 2 * int64(s.waiters)
+			}
+			mutexevent(dt, 3+skipframes)
+		}
+		if s.ticket != 0 {
+			throw("corrupted semaphore ticket")
+		}
+		if handoff && cansemacquire(addr) {
+			s.ticket = 1
+		}
+		readyWithTime(s, 5+skipframes)
+		return true, crashed, s.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0 && dstCanPreemptG(getg())
+	}
+	return false, crashed, false
 }
 
 // --- synctest.go / traceback.go hooks ---
@@ -1104,7 +1258,9 @@ func (bubble *synctestBubble) dstStopGCDrain() {
 func dstTimeNowWall(now int64) (int64, int32) {
 	wall := now
 	if dstActive() {
-		wall = dstSatAdd(wall, dstHostWallAdjust(getg().dstHost, now))
+		if gp := getg(); dstSimBubble != nil && gp.bubble == dstSimBubble {
+			wall = dstSatAdd(wall, dstHostWallAdjust(gp.dstHost, now))
+		}
 	}
 	return wall / (1000 * 1000 * 1000), int32(wall % (1000 * 1000 * 1000))
 }
@@ -1140,13 +1296,27 @@ func newBaseTimer(when, period int64, f func(arg any, seq uintptr, delay int64),
 	return t
 }
 
+//go:linkname dstFakeTimersCountFP
+func dstFakeTimersCountFP() int {
+	lock(&dstFakeTimers.lock)
+	defer unlock(&dstFakeTimers.lock)
+	dstFakeTimersRollLocked()
+	n := 0
+	for t := dstFakeTimers.head.Load(); t != nil; t = t.dstFakeNext {
+		n++
+	}
+	return n
+}
+
 func dstTimerModify(t *timer, when, period int64) (int64, int64) {
 	if dstActive() && t.isFake {
-		t.dstHost = getg().dstHost
-		t.dstWhenShift = 0
-		dstRegisterFakeTimer(t)
-		if !t.dstBase {
-			when, period = dstTimerArmForDrift(when, period)
+		if gp := getg(); dstSimBubble != nil && gp.bubble == dstSimBubble {
+			t.dstHost = gp.dstHost
+			t.dstWhenShift = 0
+			dstRegisterFakeTimer(t)
+			if !t.dstBase {
+				when, period = dstTimerArmForDrift(when, period)
+			}
 		}
 	}
 	return when, period

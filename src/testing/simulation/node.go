@@ -7,7 +7,6 @@ package simulation
 import (
 	"slices"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -28,7 +27,7 @@ import (
 // race on (the table copy). Host/Process declarations are rare — not a hot path — so
 // the lock is free; the table READS (os.Hostname / runtime.NumCPU, in the runtime)
 // stay lock-free atomic loads of the published table.
-var dstHostIdentMu sync.Mutex
+var dstHostIdentMu kernelMutex
 
 func setHostIdent(host uint32, hostname string, numcpu int) {
 	dstHostIdentMu.Lock()
@@ -185,7 +184,7 @@ func (c ClockConfig) driftPPBForHost(hostid uint32) int64 {
 // simulated-network registry). Host and process names are independent namespaces:
 // CrashHost("x") targets a host and Crash("x") a process.
 var nodeReg struct {
-	mu       sync.Mutex
+	mu       kernelMutex
 	hosts    map[string]uint32
 	procs    map[string]uint32
 	nextHost uint32
@@ -204,7 +203,7 @@ var nodeReg struct {
 }
 
 var activeProcs struct {
-	mu   sync.Mutex
+	mu   kernelMutex
 	pids map[uint32][]int32
 	// host records which machine each live process runs on, so a host crash
 	// can enumerate its victims. Process names are a global namespace (one
@@ -223,7 +222,7 @@ var activeProcs struct {
 // runs without park points and the lock is uncontended; the lock exists for
 // Level 2 exploration, whose access-granularity scheduling can yield inside
 // this package's instrumented accesses.
-var procTeardownMu sync.Mutex
+var procTeardownMu kernelMutex
 var mappingFaultTeardownRuns uint64
 
 func init() { dstSetMappingFaultTeardownHook(mappingFaultProcessTeardown) }
@@ -558,6 +557,7 @@ func withBubbleFaultCaller(api string, op func()) {
 		if !dstInSimBubble() {
 			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
 		}
+		dstYieldPoint()
 		op()
 		return
 	}
@@ -565,6 +565,7 @@ func withBubbleFaultCaller(api string, op func()) {
 	if runActive.Load() {
 		callerGate.RUnlock()
 		if dstInSimBubble() {
+			dstYieldPoint()
 			op()
 			return
 		}
@@ -947,16 +948,23 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 		}
 	}()
 	defer func() {
+		// Teardown belongs to the run admitted under callerGate. A pre-run
+		// Process body may span activation, but its stale proc/PID identity must
+		// never apply to that new run.
+		valid := declaredActive && runActive.Load() && dstNetEpoch() == declaredEpoch
+		if valid && activeProcLastInvocation(proc, simPid) && dstProcessHasResources(proc) {
+			// Yield at user depth while still carrying simPid when this exiting
+			// invocation actually owns open kernel resources so DPOR has a
+			// scheduling boundary before kernel-owned exit teardown without
+			// injecting redundant steps into resource-clean process exits.
+			dstYieldPoint()
+		}
 		// Restore identity BEFORE parking on the teardown mutex: a goroutine
 		// waiting here carries its caller's pid, not the dying invocation's,
 		// so a concurrent crash of this logical process cannot mark the parked
 		// waiter (the sema dequeue additionally skips crashed waiters).
 		dstSetProcessPid(oldPid)
 		dstSetNode(oldH, oldP)
-		// Teardown belongs to the run admitted under callerGate. A pre-run
-		// Process body may span activation, but its stale proc/PID identity must
-		// never apply to that new run.
-		valid := declaredActive && runActive.Load() && dstNetEpoch() == declaredEpoch
 		if !valid {
 			return
 		}

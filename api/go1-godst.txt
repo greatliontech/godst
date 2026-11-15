@@ -91,6 +91,9 @@ pkg testing/simulation, type Failure struct, AccessForces []AccessForce
 pkg testing/simulation, type Failure struct, CrashTear bool
 pkg testing/simulation, type Failure struct, Deadlock string
 pkg testing/simulation, type Failure struct, ForeignSched bool
+pkg testing/simulation, type Failure struct, MaxAccesses int
+pkg testing/simulation, type Failure struct, MaxEdges int
+pkg testing/simulation, type Failure struct, MaxSteps int
 pkg testing/simulation, type Failure struct, Panic string
 pkg testing/simulation, type Failure struct, Race bool
 pkg testing/simulation, type Failure struct, Schedule []uint64

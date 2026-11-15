@@ -9,11 +9,11 @@ package os
 import (
 	"errors"
 	"internal/poll"
+	isync "internal/sync"
 	"io"
 	"runtime"
-	"sync"
 	"syscall"
-	_ "unsafe" // for go:linkname
+	"unsafe" // go:linkname + coarse sync
 )
 
 const dstVirtualFDBase = 1 << 30
@@ -82,7 +82,7 @@ type dstFDEntry struct {
 }
 
 var dstFDRegistry struct {
-	mu    sync.Mutex
+	mu    isync.KernelMutex
 	epoch uint64
 	next  int
 	fds   map[int]dstFDEntry
@@ -110,12 +110,24 @@ func dstFD(file *file) int {
 	var closed bool
 	switch b := state.backend.(type) {
 	case *dstFile:
+		if dstFSActive() {
+			dstCoarseRecord(uintptr(unsafe.Pointer(b)), false)
+		}
 		b.mu.Lock()
 		closed = b.closed
+		if closed && b.epoch == dstFSEpoch() {
+			dstKernelRaceAcquire(unsafe.Pointer(&b.closeSync))
+		}
 		b.mu.Unlock()
 	case *dstProcFile:
+		if dstFSActive() {
+			dstCoarseRecord(uintptr(unsafe.Pointer(b)), false)
+		}
 		b.mu.Lock()
 		closed = b.closed
+		if closed {
+			dstKernelRaceAcquire(unsafe.Pointer(&b.closeSync))
+		}
 		b.mu.Unlock()
 	default:
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
@@ -147,6 +159,7 @@ func dstFD(file *file) int {
 	}
 	state.fds[key] = fd
 	dstFDRegistry.fds[fd] = dstFDEntry{backend: state.backend, epoch: epoch, host: host, proc: proc}
+	dstCoarseRecord(dstCoarseFDID(fd), true)
 	// The file, not the derived state pointer, anchors the row across
 	// this whole function (see dstFileStateOf).
 	runtime.KeepAlive(file)
@@ -182,6 +195,7 @@ func dstReleaseFDState(state *dstFileState) {
 	}
 	dstFDRegistry.mu.Unlock()
 	for _, rel := range releases {
+		dstCoarseRecord(dstCoarseFDID(rel.fd), true)
 		dstFlockReleaseFD(rel.entry, rel.fd)
 	}
 }
@@ -202,6 +216,7 @@ func dstReleaseBackendFDs(backend dstFileBackend) {
 	}
 	dstFDRegistry.mu.Unlock()
 	for _, rel := range releases {
+		dstCoarseRecord(dstCoarseFDID(rel.fd), true)
 		dstFlockReleaseFD(rel.entry, rel.fd)
 	}
 }
@@ -214,6 +229,41 @@ func dstReleaseBackendFDs(backend dstFileBackend) {
 // keeps the attribution invariant: no fd of a dead process survives teardown.
 func dstReleaseProcFDs(proc uint32) {
 	dstReleaseFDs(func(e dstFDEntry) bool { return e.proc == proc })
+}
+
+func dstFDHasFlockForProc(proc uint32) bool {
+	type cand struct {
+		fd    int
+		entry dstFDEntry
+	}
+	var cands []cand
+	dstFDRegistry.mu.Lock()
+	dstFDRollLocked()
+	for fd, entry := range dstFDRegistry.fds {
+		if entry.proc == proc {
+			cands = append(cands, cand{fd: fd, entry: entry})
+		}
+	}
+	dstFDRegistry.mu.Unlock()
+	for _, c := range cands {
+		file, ok := c.entry.backend.(*dstFile)
+		if !ok {
+			continue
+		}
+		owner := dstFlockOwner{host: c.entry.host, proc: c.entry.proc, fd: c.fd}
+		file.mu.Lock()
+		node := file.node
+		file.mu.Unlock()
+		if node != nil {
+			dstFS.mu.Lock()
+			_, held := node.flock.holders[owner]
+			dstFS.mu.Unlock()
+			if held {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func dstReleaseFDs(match func(dstFDEntry) bool) {
@@ -232,6 +282,7 @@ func dstReleaseFDs(match func(dstFDEntry) bool) {
 	}
 	dstFDRegistry.mu.Unlock()
 	for _, rel := range releases {
+		dstCoarseRecord(dstCoarseFDID(rel.fd), true)
 		dstFlockReleaseFD(rel.entry, rel.fd)
 	}
 }
@@ -260,6 +311,7 @@ func dstFDLookup(fd int) (entry dstFDEntry, handled bool, errno syscall.Errno) {
 	entry, ok := dstFDRegistry.fds[fd]
 	dstFDRegistry.mu.Unlock()
 	if !ok || entry.epoch != dstFSEpoch() || entry.host != host || entry.proc != proc {
+		dstCoarseDep(dstCoarseFDID(fd), false)
 		return dstFDEntry{}, true, syscall.EBADF
 	}
 	return entry, true, 0
@@ -291,6 +343,7 @@ func dstFDCountResult(n int, err error) (int, syscall.Errno, bool) {
 
 func dstFDZeroRead(entry dstFDEntry) syscall.Errno {
 	if f, ok := entry.backend.(*dstFile); ok {
+		f.coarseOp(false, false)
 		f.diskDelay()
 		if err := f.enter(); err != nil {
 			return dstFDErr(err)
@@ -313,6 +366,7 @@ func dstFDZeroRead(entry dstFDEntry) syscall.Errno {
 
 func dstFDZeroWrite(entry dstFDEntry) syscall.Errno {
 	if f, ok := entry.backend.(*dstFile); ok {
+		f.coarseOp(false, false)
 		f.diskDelay()
 		if err := f.enter(); err != nil {
 			return dstFDErr(err)

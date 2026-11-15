@@ -142,9 +142,10 @@ func firstDiff(a, b []string) string {
 func coverageCheck(t *testing.T, fork, corpus, goarch string) {
 	t.Helper()
 	required := []string{
-		"crypto/internal/sysrand", "go/types", "internal/runtime/maps",
-		"internal/sync", "net", "os", "os/signal", "os/user", "runtime",
-		"sync", "syscall", "testing", "testing/internal/testdeps", "time",
+		"crypto/internal/sysrand", "go/types", "internal/poll",
+		"internal/runtime/maps", "internal/sync", "net", "os", "os/signal",
+		"os/user", "runtime", "sync", "syscall", "testing",
+		"testing/internal/testdeps", "time",
 	}
 	cmd := exec.Command(filepath.Join(fork, "bin", "go"), "list", "-test", "-deps", ".")
 	cmd.Dir = corpus

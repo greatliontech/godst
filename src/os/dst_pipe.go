@@ -8,10 +8,11 @@ package os
 
 import (
 	"internal/poll"
+	isync "internal/sync"
 	"io"
-	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Under deterministic simulation, os.Pipe returns a pair of Files backed by
@@ -52,14 +53,17 @@ const (
 // also why SameFile(rfi, wfi) is true, via the FileInfo identity field).
 // All state is guarded by mu.
 type dstPipe struct {
-	mu      sync.Mutex
-	epoch   uint64        // run the pipe belongs to; see dstPipeEnd.enter
-	buf     []byte        // unread bytes; len(buf) <= dstPipeCap
-	gen     chan struct{} // broadcast: closed and replaced on every state change
-	rclosed bool          // read end closed
-	wclosed bool          // write end closed
-	mode    FileMode      // permission bits (fchmod works on a host pipe fd)
-	ctime   time.Time     // creation time on the bubble clock, for Stat
+	mu        isync.KernelMutex
+	epoch     uint64        // run the pipe belongs to; see dstPipeEnd.enter
+	buf       []byte        // unread bytes; len(buf) <= dstPipeCap
+	gen       chan struct{} // broadcast: closed and replaced on every state change
+	rclosed   bool          // read end closed
+	wclosed   bool          // write end closed
+	mode      FileMode      // permission bits (fchmod works on a host pipe fd)
+	ctime     time.Time     // creation time on the bubble clock, for Stat
+	raceSync  uint64        // per-pipe data happens-before word (writer -> reader)
+	eofSync   uint64        // writer close -> reader io.EOF happens-before word
+	epipeSync uint64        // reader close -> writer syscall.EPIPE happens-before word
 }
 
 // bump wakes every goroutine blocked on the pipe's state. Caller holds mu.
@@ -78,9 +82,10 @@ func (p *dstPipe) bump() {
 var _ dstFileBackend = (*dstPipeEnd)(nil)
 
 type dstPipeEnd struct {
-	p      *dstPipe
-	reader bool
-	rd, wd time.Time // read/write deadlines, guarded by p.mu
+	p         *dstPipe
+	reader    bool
+	rd, wd    time.Time // read/write deadlines, guarded by p.mu
+	closeSync uint64    // per-end close happens-before word (Close -> own-end ErrClosed)
 }
 
 // dstNewPipe builds the simulated pipe pair while a run is active.
@@ -88,11 +93,14 @@ func dstNewPipe() (r, w *File, handled bool) {
 	if !dstFSActive() {
 		return nil, nil, false
 	}
+	now := time.Now()
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	p := &dstPipe{
 		epoch: dstFSEpoch(),
 		gen:   make(chan struct{}),
 		mode:  0o600,
-		ctime: time.Now(),
+		ctime: now,
 	}
 	return dstNewFile(&dstPipeEnd{p: p, reader: true}, "|0"),
 		dstNewFile(&dstPipeEnd{p: p, reader: false}, "|1"), true
@@ -106,19 +114,33 @@ func dstNewPipe() (r, w *File, handled bool) {
 // checked by the operations themselves, which also re-check it after every
 // wait.
 func (e *dstPipeEnd) enter() error {
-	if !dstFSActive() || e.p.epoch != dstFSEpoch() {
+	if !dstFSActive() {
 		return dstErrUnsupportedFS
 	}
 	e.p.mu.Lock()
+	if e.p.epoch != dstFSEpoch() {
+		e.p.mu.Unlock()
+		return dstErrUnsupportedFS
+	}
 	return nil
+}
+
+func (e *dstPipeEnd) coarseCloseRead() {
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	}
 }
 
 // ownClosed reports whether this end has been closed. Caller holds p.mu.
 func (e *dstPipeEnd) ownClosed() bool {
+	closed := e.p.wclosed
 	if e.reader {
-		return e.p.rclosed
+		closed = e.p.rclosed
 	}
-	return e.p.wclosed
+	if closed {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
+	}
+	return closed
 }
 
 // deadline returns the deadline governing the given direction.
@@ -163,115 +185,192 @@ func (e *dstPipeEnd) wait(read bool) {
 	p.mu.Lock()
 }
 
-func (e *dstPipeEnd) read(b []byte) (int, error) {
-	if err := e.enter(); err != nil {
-		return 0, err
-	}
+func (e *dstPipeEnd) read(b []byte) (n int, err error) {
 	p := e.p
-	defer p.mu.Unlock()
-	// Host-probed entry order for reads: the closed-fd check, then the
-	// zero-length early return — ahead of the deadline and access-mode
-	// checks (r.Read(nil) with an expired deadline, and w.Read(nil), are
-	// both (0, nil) on the host; a closed own end is ErrClosed even for
-	// zero-length).
-	if e.ownClosed() {
-		return 0, poll.ErrFileClosing
+	pipeID := uintptr(unsafe.Pointer(p))
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(pipeID, true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.rd)), false)
 	}
-	if len(b) == 0 {
-		return 0, nil
-	}
-	for {
-		// Host-probed loop order: closed fd (re-checked after every wait —
-		// close while blocked), then expired deadline, then the
-		// access-mode check (an expired read deadline on the WRITE end
-		// still wins over EBADF).
+	var kbuf []byte
+	err = func() error {
+		if err := e.enter(); err != nil {
+			return err
+		}
+		defer p.mu.Unlock()
+		// Host-probed entry order for reads: the closed-fd check, then the
+		// zero-length early return — ahead of the deadline and access-mode
+		// checks (r.Read(nil) with an expired deadline, and w.Read(nil), are
+		// both (0, nil) on the host; a closed own end is ErrClosed even for
+		// zero-length).
 		if e.ownClosed() {
-			return 0, poll.ErrFileClosing
+			return poll.ErrFileClosing
 		}
-		if e.deadlineExpired(true) {
-			return 0, poll.ErrDeadlineExceeded
+		if len(b) == 0 {
+			return nil
 		}
-		if !e.reader {
-			return 0, syscall.EBADF
+		for {
+			// Host-probed loop order: closed fd (re-checked after every wait —
+			// close while blocked), then expired deadline, then the
+			// access-mode check (an expired read deadline on the WRITE end
+			// still wins over EBADF).
+			if e.ownClosed() {
+				return poll.ErrFileClosing
+			}
+			if e.deadlineExpired(true) {
+				return poll.ErrDeadlineExceeded
+			}
+			if !e.reader {
+				return syscall.EBADF
+			}
+			if len(p.buf) > 0 {
+				take := min(len(b), len(p.buf))
+				kbuf = make([]byte, take)
+				copy(kbuf, p.buf[:take])
+				p.buf = p.buf[:copy(p.buf, p.buf[take:])]
+				dstKernelRaceAcquire(unsafe.Pointer(&p.raceSync))
+				p.bump() // space freed: wake blocked writers
+				return nil
+			}
+			if p.wclosed {
+				dstKernelRaceAcquire(unsafe.Pointer(&p.raceSync))
+				dstKernelRaceAcquire(unsafe.Pointer(&p.eofSync))
+				return io.EOF
+			}
+			e.wait(true)
 		}
-		if len(p.buf) > 0 {
-			n := copy(b, p.buf)
-			p.buf = p.buf[:copy(p.buf, p.buf[n:])]
-			p.bump() // space freed: wake blocked writers
-			return n, nil
-		}
-		if p.wclosed {
-			return 0, io.EOF
-		}
-		e.wait(true)
+	}()
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
 	}
+	return n, err
 }
 
-func (e *dstPipeEnd) write(b []byte) (int, error) {
-	if err := e.enter(); err != nil {
-		return 0, err
-	}
+func (e *dstPipeEnd) write(b []byte) (n int, err error) {
 	p := e.p
-	defer p.mu.Unlock()
+	pipeID := uintptr(unsafe.Pointer(p))
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(pipeID, true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.wd)), false)
+	}
 	// Host-probed entry order for writes — stricter than reads: closed fd,
 	// then expired deadline, then access mode, and only then the
 	// zero-length early return (w.Write(nil) with an expired write
 	// deadline is ErrDeadlineExceeded and r.Write(nil) is EBADF on the
 	// host), which in turn precedes the EPIPE check (w.Write(nil) with the
 	// read end closed is (0, nil)).
-	if e.ownClosed() {
-		return 0, poll.ErrFileClosing
-	}
-	if e.deadlineExpired(false) {
-		return 0, poll.ErrDeadlineExceeded
-	}
-	if e.reader {
-		return 0, syscall.EBADF
-	}
-	if len(b) == 0 {
-		return 0, nil
-	}
-	n := 0
-	for {
-		// Same host-probed order as read; EPIPE after them. A wake-up that
-		// lands on an error path reports the bytes already transferred
-		// alongside the error (host-probed partial count).
+	done, entryErr := func() (bool, error) {
+		if err := e.enter(); err != nil {
+			return true, err
+		}
+		defer p.mu.Unlock()
 		if e.ownClosed() {
-			return n, poll.ErrFileClosing
+			return true, poll.ErrFileClosing
 		}
 		if e.deadlineExpired(false) {
-			return n, poll.ErrDeadlineExceeded
+			return true, poll.ErrDeadlineExceeded
 		}
 		if e.reader {
-			return n, syscall.EBADF
+			return true, syscall.EBADF
 		}
-		if p.rclosed {
-			return n, syscall.EPIPE
+		if len(b) == 0 {
+			return true, nil
 		}
-		free := dstPipeCap - len(p.buf)
-		if rem := b[n:]; len(rem) <= dstPipeBuf {
-			// PIPE_BUF atomicity: the remainder goes in whole or not at
-			// all, so concurrent small writes never interleave. Applying
-			// this to the <=PIPE_BUF tail of a LARGER write is stronger
-			// than Linux (which trickles such tails) but within what POSIX
-			// permits — a deliberate modeling choice, kept for simplicity.
-			if free >= len(rem) {
-				p.buf = append(p.buf, rem...)
-				p.bump()
-				return len(b), nil
-			}
-		} else if free > 0 {
-			k := min(free, len(rem))
-			p.buf = append(p.buf, rem[:k]...)
-			n += k
-			p.bump() // data available: wake blocked readers
-			if n == len(b) {
-				return n, nil
-			}
-			continue
-		}
-		e.wait(false)
+		return false, nil
+	}()
+	if done {
+		return 0, entryErr
 	}
+	for n < len(b) {
+		remLen := len(b) - n
+		want, waitErr := func() (int, error) {
+			if err := e.enter(); err != nil {
+				return 0, err
+			}
+			defer p.mu.Unlock()
+			for {
+				// Same host-probed order as read; EPIPE after them. A wake-up
+				// that lands on an error path reports the bytes already
+				// transferred alongside the error (host-probed partial count).
+				if e.ownClosed() {
+					return 0, poll.ErrFileClosing
+				}
+				if e.deadlineExpired(false) {
+					return 0, poll.ErrDeadlineExceeded
+				}
+				if e.reader {
+					return 0, syscall.EBADF
+				}
+				if p.rclosed {
+					dstKernelRaceAcquire(unsafe.Pointer(&p.epipeSync))
+					return 0, syscall.EPIPE
+				}
+				free := dstPipeCap - len(p.buf)
+				if remLen <= dstPipeBuf {
+					// PIPE_BUF atomicity: the remainder goes in whole or not at
+					// all, so concurrent small writes never interleave.
+					if free >= remLen {
+						return remLen, nil
+					}
+				} else if free > 0 {
+					return min(free, remLen), nil
+				}
+				e.wait(false)
+			}
+		}()
+		if waitErr != nil {
+			return n, waitErr
+		}
+		// Copy only this chunk outside p.mu so caller slice accesses remain
+		// race- and DPOR-visible per chunk and mapping traps/panics never hold
+		// kernel locks.
+		chunk := make([]byte, want)
+		copy(chunk, b[n:n+want])
+		wrote, postErr := func() (int, error) {
+			if err := e.enter(); err != nil {
+				return 0, err
+			}
+			defer p.mu.Unlock()
+			if e.ownClosed() {
+				return 0, poll.ErrFileClosing
+			}
+			if e.deadlineExpired(false) {
+				return 0, poll.ErrDeadlineExceeded
+			}
+			if e.reader {
+				return 0, syscall.EBADF
+			}
+			if p.rclosed {
+				dstKernelRaceAcquire(unsafe.Pointer(&p.epipeSync))
+				return 0, syscall.EPIPE
+			}
+			free := dstPipeCap - len(p.buf)
+			if remLen <= dstPipeBuf {
+				if free < len(chunk) {
+					return 0, nil // raced with another writer; re-wait
+				}
+				p.buf = append(p.buf, chunk...)
+				dstKernelRaceReleaseMerge(unsafe.Pointer(&p.raceSync))
+				p.bump()
+				return len(chunk), nil
+			}
+			if free == 0 {
+				return 0, nil // raced with another writer; re-wait
+			}
+			k := min(free, len(chunk))
+			p.buf = append(p.buf, chunk[:k]...)
+			dstKernelRaceReleaseMerge(unsafe.Pointer(&p.raceSync))
+			p.bump() // data available: wake blocked readers
+			return k, nil
+		}()
+		n += wrote
+		if postErr != nil {
+			return n, postErr
+		}
+	}
+	return n, nil
 }
 
 // pread/pwrite: a pipe is not seekable, and deadlines deliberately do NOT
@@ -287,6 +386,7 @@ func (e *dstPipeEnd) pwrite(b []byte, off int64) (int, error) {
 }
 
 func (e *dstPipeEnd) seek(offset int64, whence int) (int64, error) {
+	e.coarseCloseRead()
 	if err := e.enter(); err != nil {
 		return 0, err
 	}
@@ -314,6 +414,7 @@ func (e *dstPipeEnd) chdirHandle() error {
 // simpleErr is the shared shape of the always-failing metadata ops: validate
 // the run, report closure, then the fixed errno.
 func (e *dstPipeEnd) simpleErr(errno error) error {
+	e.coarseCloseRead()
 	if err := e.enter(); err != nil {
 		return err
 	}
@@ -325,6 +426,7 @@ func (e *dstPipeEnd) simpleErr(errno error) error {
 }
 
 func (e *dstPipeEnd) readdir(n int) ([]string, []FileInfo, error) {
+	e.coarseCloseRead()
 	if err := e.enter(); err != nil {
 		return nil, nil, err
 	}
@@ -336,6 +438,10 @@ func (e *dstPipeEnd) readdir(n int) ([]string, []FileInfo, error) {
 }
 
 func (e *dstPipeEnd) chmodHandle(mode FileMode) error {
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(uintptr(unsafe.Pointer(e.p)), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	}
 	if err := e.enter(); err != nil {
 		return err
 	}
@@ -348,6 +454,10 @@ func (e *dstPipeEnd) chmodHandle(mode FileMode) error {
 }
 
 func (e *dstPipeEnd) stat() (FileInfo, error) {
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(uintptr(unsafe.Pointer(e.p)), false)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	}
 	if err := e.enter(); err != nil {
 		return nil, err
 	}
@@ -372,6 +482,15 @@ func (e *dstPipeEnd) stat() (FileInfo, error) {
 // setDeadline funnels never wrap) — consistent with every other SetDeadline
 // error shape, which the host also reports unwrapped.
 func (e *dstPipeEnd) setDeadline(rd, wd bool, t time.Time) error {
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(uintptr(unsafe.Pointer(&e.closeSync)), false)
+		if rd {
+			dstCoarseRecord(uintptr(unsafe.Pointer(&e.rd)), true)
+		}
+		if wd {
+			dstCoarseRecord(uintptr(unsafe.Pointer(&e.wd)), true)
+		}
+	}
 	if err := e.enter(); err != nil {
 		return err
 	}
@@ -396,6 +515,11 @@ func (e *dstPipeEnd) setDeadline(rd, wd bool, t time.Time) error {
 // no waiter can exist (the run's goroutines are gone with its bubble).
 func (e *dstPipeEnd) closeFile() error {
 	p := e.p
+	pipeID := uintptr(unsafe.Pointer(p))
+	if dstFSActive() && dstInSimBubble() {
+		dstCoarseDep(pipeID, true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), true)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e.ownClosed() {
@@ -407,6 +531,12 @@ func (e *dstPipeEnd) closeFile() error {
 		p.wclosed = true
 	}
 	if dstFSActive() && p.epoch == dstFSEpoch() {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.closeSync))
+		if e.reader {
+			dstKernelRaceReleaseMerge(unsafe.Pointer(&p.epipeSync))
+		} else {
+			dstKernelRaceReleaseMerge(unsafe.Pointer(&p.eofSync))
+		}
 		p.bump() // readers see EOF, writers EPIPE, blocked ops on this end ErrClosed
 	}
 	return nil

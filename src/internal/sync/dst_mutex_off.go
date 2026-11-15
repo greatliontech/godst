@@ -16,3 +16,13 @@ const dstMutexVirtualStarvation = false
 const dstStarvationWakeThreshold = 0
 
 func runtime_dstMutexWaitVirtual() bool { return false }
+
+func runtime_dstSemrelease(s *uint32, handoff bool, skipframes int) (bool, int32, bool) {
+	return false, 0, false
+}
+
+func runtime_dstSemreleaseYield() {}
+
+func dstRepairNormalAllCrashed(state *int32, crashed int32) int32 { return 0 }
+
+func dstRepairStarvingAllCrashed(m *Mutex, crashed int32) {}

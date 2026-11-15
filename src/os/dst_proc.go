@@ -10,11 +10,11 @@ import (
 	"internal/poll"
 	"internal/strconv"
 	"internal/stringslite"
+	isync "internal/sync"
 	"io"
-	"sync"
 	"syscall"
 	"time"
-	_ "unsafe" // for go:linkname
+	"unsafe" // go:linkname + coarse handle identities
 )
 
 //go:linkname dstPidStarttime runtime.dstPidStarttime
@@ -47,6 +47,8 @@ func dstProcOpenFile(name string, flag int) (*File, bool, error) {
 	if flag&(O_WRONLY|O_RDWR|O_CREATE|O_TRUNC) != 0 {
 		return nil, true, &PathError{Op: "open", Path: name, Err: syscall.EACCES}
 	}
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	return dstNewFile(&dstProcFile{data: data, name: name, base: base, ident: ident}, name), true, nil
 }
 
@@ -66,6 +68,7 @@ func dstProcReadlink(name string) (string, bool, error) {
 	if !dstFSActive() {
 		return "", false, nil
 	}
+	dstCoarsePathDep(name, false)
 	abs := dstProcAbs(name)
 	if abs == "" {
 		return "", false, nil
@@ -352,45 +355,80 @@ func dstProcStackIsLeaf(stack []string) bool {
 var _ dstFileBackend = (*dstProcFile)(nil)
 
 type dstProcFile struct {
-	mu     sync.Mutex
-	data   []byte
-	name   string
-	base   string // leaf base name ("stat", "boot_id") — the FileInfo.Name
-	ident  string
-	off    int64
-	closed bool
+	mu        isync.KernelMutex
+	data      []byte
+	name      string
+	base      string // leaf base name ("stat", "boot_id") — the FileInfo.Name
+	ident     string
+	off       int64
+	closed    bool
+	closeSync uint64
 }
 
-func (f *dstProcFile) read(b []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, poll.ErrFileClosing
+func (f *dstProcFile) coarseDep(write bool) {
+	if !dstFSActive() {
+		return
 	}
-	if len(b) == 0 {
-		return 0, nil
-	}
-	if f.off >= int64(len(f.data)) {
-		return 0, io.EOF
-	}
-	n := copy(b, f.data[f.off:])
-	f.off += int64(n)
-	return n, nil
+	dstCoarseDep(uintptr(unsafe.Pointer(f)), write)
 }
 
-func (f *dstProcFile) pread(b []byte, off int64) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, poll.ErrFileClosing
+func (f *dstProcFile) acquireCloseSyncLocked() {
+	if dstFSActive() {
+		dstKernelRaceAcquire(unsafe.Pointer(&f.closeSync))
 	}
-	if off < 0 {
-		return 0, syscall.EINVAL
+}
+
+func (f *dstProcFile) read(b []byte) (n int, err error) {
+	f.coarseDep(true)
+	var kbuf []byte
+	err = func() error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.closed {
+			f.acquireCloseSyncLocked()
+			return poll.ErrFileClosing
+		}
+		if len(b) == 0 {
+			return nil
+		}
+		if f.off >= int64(len(f.data)) {
+			return io.EOF
+		}
+		avail := min(int64(len(b)), int64(len(f.data))-f.off)
+		kbuf = f.data[f.off : f.off+avail]
+		f.off += avail
+		return nil
+	}()
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
 	}
-	if off >= int64(len(f.data)) {
-		return 0, io.EOF
+	return n, err
+}
+
+func (f *dstProcFile) pread(b []byte, off int64) (n int, err error) {
+	f.coarseDep(false)
+	var kbuf []byte
+	err = func() error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.closed {
+			f.acquireCloseSyncLocked()
+			return poll.ErrFileClosing
+		}
+		if off < 0 {
+			return syscall.EINVAL
+		}
+		if off >= int64(len(f.data)) {
+			return io.EOF
+		}
+		avail := min(int64(len(b)), int64(len(f.data))-off)
+		kbuf = f.data[off : off+avail]
+		return nil
+	}()
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
 	}
-	return copy(b, f.data[off:]), nil
+	return n, err
 }
 
 func (f *dstProcFile) write([]byte) (int, error) {
@@ -443,18 +481,22 @@ func (f *dstProcFile) chmodHandle(FileMode) error {
 }
 
 func (f *dstProcFile) closedError() error {
+	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
+		f.acquireCloseSyncLocked()
 		return poll.ErrFileClosing
 	}
 	return nil
 }
 
 func (f *dstProcFile) seek(offset int64, whence int) (int64, error) {
+	f.coarseDep(true)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
+		f.acquireCloseSyncLocked()
 		return 0, poll.ErrFileClosing
 	}
 	var base int64
@@ -476,28 +518,37 @@ func (f *dstProcFile) seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *dstProcFile) stat() (FileInfo, error) {
+	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
+		f.acquireCloseSyncLocked()
 		return nil, poll.ErrFileClosing
 	}
 	return &dstFileInfo{name: f.base, mode: 0o444, ident: f.ident}, nil
 }
 
 func (f *dstProcFile) closeFile() error {
+	f.coarseDep(true)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
+		f.acquireCloseSyncLocked()
 		return poll.ErrFileClosing
 	}
 	f.closed = true
+	if dstFSActive() {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&f.closeSync))
+	}
 	return nil
 }
 
 func (f *dstProcFile) setDeadline(rd, wd bool, t time.Time) error {
+	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
+		f.acquireCloseSyncLocked()
 		return poll.ErrFileClosing
 	}
 	return poll.ErrNoDeadline

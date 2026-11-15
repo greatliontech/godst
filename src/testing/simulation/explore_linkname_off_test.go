@@ -13,7 +13,6 @@ func dstFilterForceConservativeFP(on bool)                             {}
 func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {}
 func dstAccessYieldFP() uint64                                         { return 0 }
 func dstAccessYieldReset()                                             {}
-func dstYieldPoint()                                                   {}
 func dstSetPostGoYield(enabled bool) bool                              { return false }
 func dstRunningPanicDefersFP() uint32                                  { return 0 }
 func dstCurrentSeqFP() uint64                                          { return 0 }

@@ -1127,11 +1127,15 @@ restart on a machine `CrashHost` powered off is **refused loudly** — a process
 kernel; model the reboot with a `Host` re-declaration first, then restart the processes inside it.
 
 **Soundness boundary (recorded, contractual).** A crash is sound exactly when processes interact *only
-through the simulated network and host filesystem* — the distributed model the whole feature targets. If a
-SUT shares an in-process `sync.Mutex` (or channel, or Go memory) *across* `Process` trees, a crash leaves
-it abandoned and another process may block on it forever — but that coupling is not two processes; it is
+through the simulated network and host filesystem* — the distributed model the whole feature targets. Modeled
+OS, network, environment, and topology tables guard their non-blocking critical sections with uninterruptible
+kernel mutexes so crashing or exiting a process cannot strand kernel locks, and runtime semaphore/mutex/RWMutex/
+WaitGroup wakeups repair state for crashed *waiters*. However, if a
+SUT shares a user-heap `sync.Mutex`/`sync.RWMutex` (or channel, or Go memory) *across* `Process` trees and a
+lock *holder* (or `RWMutex` writer holding `rw.w`) crashes, a crash leaves
+it abandoned and another process may block on it forever — that coupling is not two processes; it is
 out of model (program discipline, the concurrent dual of the explicit host-capability stance, and the reason
-a process is the memory-isolation unit). Within the model a crashed process holds no in-memory resource a
+a process is the memory-isolation unit). Within the model a crashed process holds no user-memory lock a
 sibling waits on, so abandonment is sound. File locks are modeled as per-process fd-owned resources;
 process crash must also release that process's `flock`s — the kernel does on process death — and the
 per-process fd table provides that ownership boundary.

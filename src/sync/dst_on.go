@@ -16,6 +16,9 @@ const dstHookEnabled = true
 //go:linkname runtime_dstSyncAcquire
 func runtime_dstSyncAcquire(id unsafe.Pointer)
 
+//go:linkname runtime_dstSyncObserve
+func runtime_dstSyncObserve(id unsafe.Pointer)
+
 //go:linkname runtime_dstRecordSyncRelease
 func runtime_dstRecordSyncRelease(id unsafe.Pointer)
 
@@ -43,4 +46,40 @@ func dstSyncAcquireHBRWMutexLock(rw *RWMutex) {
 
 func dstSyncAcquireHBRWMutexRLock(rw *RWMutex) {
 	runtime_dstRecordSyncAcquire(unsafe.Pointer(&rw.readerSem))
+}
+
+func dstSyncAcquireOnce(o *Once) {
+	// Share the embedded writer mutex's internal identity so fast-path Once.Do
+	// calls conflict directly with doSlow's Lock/Unlock decisions.
+	runtime_dstSyncAcquire(unsafe.Pointer(&o.m.mu))
+}
+
+func dstSyncReleaseOnce(o *Once) {
+	runtime_dstRecordSyncRelease(unsafe.Pointer(&o.done))
+}
+
+func dstSyncAcquireHBOnce(o *Once) {
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(&o.done))
+}
+
+func dstSyncObserveWaitGroup(wg *WaitGroup) {
+	// Positive Add calls commute with each other (atomic counter add, matching
+	// race.Read(&wg.sema)), while conflicting with Wait's write on &wg.sema.
+	runtime_dstSyncObserve(unsafe.Pointer(&wg.sema))
+}
+
+func dstSyncAcquireWaitGroup(wg *WaitGroup) {
+	runtime_dstSyncAcquire(unsafe.Pointer(&wg.sema))
+}
+
+func dstSyncReleaseWaitGroup(wg *WaitGroup) {
+	runtime_dstRecordSyncRelease(unsafe.Pointer(wg))
+}
+
+func dstSyncAcquireHBWaitGroup(wg *WaitGroup) {
+	runtime_dstRecordSyncAcquire(unsafe.Pointer(wg))
+}
+
+func dstSyncAcquireCond(c *Cond) {
+	runtime_dstSyncAcquire(unsafe.Pointer(&c.notify))
 }

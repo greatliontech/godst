@@ -7,9 +7,9 @@
 package syscall
 
 import (
+	isync "internal/sync"
 	"runtime"
-	"sync"
-	_ "unsafe" // for go:linkname
+	"unsafe"
 )
 
 //go:linkname dstEnvProcessTeardown
@@ -42,6 +42,18 @@ func dstSimEnvProc() (proc uint32, ok bool)
 //go:linkname dstEnvRunEpoch runtime.dstNetEpoch
 func dstEnvRunEpoch() uint64
 
+//go:linkname dstKernelSectionEnter runtime.dstKernelSectionEnter
+func dstKernelSectionEnter()
+
+//go:linkname dstKernelSectionExit runtime.dstKernelSectionExit
+func dstKernelSectionExit()
+
+//go:linkname dstCoarseDep runtime.dstCoarseDep
+func dstCoarseDep(id uintptr, write bool)
+
+//go:linkname dstInSimBubble runtime.dstInSimBubble
+func dstInSimBubble() bool
+
 // Per-process copy-on-write environment (design.md "Environment surface").
 // Under a run each simulated process operates on its own copy of the host
 // environment: a Setenv in one process is never visible to another process or
@@ -59,7 +71,7 @@ func dstEnvRunEpoch() uint64
 // no runtimeSetenv/Unsetenv/Clearenv, so the host process environment is never
 // mutated (that is the isolation).
 var (
-	dstEnvMu     sync.Mutex
+	dstEnvMu     isync.KernelMutex
 	dstEnvEpoch  uint64
 	dstEnvByProc map[uint32]*dstProcEnv
 )
@@ -117,6 +129,9 @@ func dstEnvCurrent() *dstProcEnv {
 // dstNewProcEnvFromHost copies the host environment (deduplicated) into a fresh
 // per-process view and builds its key index, mirroring copyenv.
 func dstNewProcEnvFromHost() *dstProcEnv {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
+
 	copyenv() // dedup the host envs and build the host env map (idempotent)
 
 	envLock.RLock()
@@ -223,8 +238,25 @@ func (pe *dstProcEnv) environ() []string {
 // The dispatch functions env_unix.go calls. Each reports handled=false when no
 // run env is active, so the caller falls through to the host implementation.
 
+// dstEnvPrepare resolves the calling process's environment view and, for
+// in-bubble simulation goroutines, drops the dispatch gate around the coarse
+// per-process dependency announce so same-process env races yield to DPOR
+// without holding dstEnvDispatchGate across a crashable schedule point.
+func dstEnvPrepare(write bool) *dstProcEnv {
+	pe := dstEnvCurrent()
+	if pe == nil {
+		return nil
+	}
+	if dstInSimBubble() {
+		dstEnvDispatchUnlock()
+		dstCoarseDep(uintptr(unsafe.Pointer(pe)), write)
+		dstEnvDispatchLock()
+	}
+	return pe
+}
+
 func dstGetenv(key string) (value string, found, handled bool) {
-	if pe := dstEnvCurrent(); pe != nil {
+	if pe := dstEnvPrepare(false); pe != nil {
 		v, f := pe.getenv(key)
 		return v, f, true
 	}
@@ -232,21 +264,21 @@ func dstGetenv(key string) (value string, found, handled bool) {
 }
 
 func dstSetenv(key, value string) (err error, handled bool) {
-	if pe := dstEnvCurrent(); pe != nil {
+	if pe := dstEnvPrepare(true); pe != nil {
 		return pe.setenv(key, value), true
 	}
 	return nil, false
 }
 
 func dstUnsetenv(key string) (err error, handled bool) {
-	if pe := dstEnvCurrent(); pe != nil {
+	if pe := dstEnvPrepare(true); pe != nil {
 		return pe.unsetenv(key), true
 	}
 	return nil, false
 }
 
 func dstClearenv() (handled bool) {
-	if pe := dstEnvCurrent(); pe != nil {
+	if pe := dstEnvPrepare(true); pe != nil {
 		pe.clearenv()
 		return true
 	}
@@ -254,7 +286,7 @@ func dstClearenv() (handled bool) {
 }
 
 func dstEnviron() (env []string, handled bool) {
-	if pe := dstEnvCurrent(); pe != nil {
+	if pe := dstEnvPrepare(false); pe != nil {
 		return pe.environ(), true
 	}
 	return nil, false

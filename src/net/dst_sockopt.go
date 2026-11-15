@@ -9,9 +9,10 @@ package net
 import (
 	"context"
 	"errors"
-	"sync"
+	isync "internal/sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // The simulated socket-option layer.
@@ -57,7 +58,7 @@ const (
 )
 
 type dstSockOpts struct {
-	mu            sync.Mutex
+	mu            isync.KernelMutex
 	keepAlive     bool   // SO_KEEPALIVE
 	keepIdleSec   int32  // TCP_KEEPIDLE
 	keepIntvlSec  int32  // TCP_KEEPINTVL
@@ -215,7 +216,7 @@ const (
 )
 
 var dstSockFDs struct {
-	mu    sync.Mutex
+	mu    isync.KernelMutex
 	epoch uint64
 	next  int
 	freed []int
@@ -261,14 +262,19 @@ func dstSockFDAlloc(opts *dstSockOpts) (fd int, ok bool) {
 // owner compare makes that unrepresentable: only the socket the registry
 // currently maps the number to may free it.
 func dstSockFDFree(fd int, owner *dstSockOpts) {
+	freed := false
 	dstSockFDs.mu.Lock()
-	defer dstSockFDs.mu.Unlock()
 	dstSockFDRoll()
-	if owner == nil || dstSockFDs.byFD[fd] != owner {
-		return
+	if owner != nil && dstSockFDs.byFD[fd] == owner {
+		delete(dstSockFDs.byFD, fd)
+		dstSockFDs.freed = append(dstSockFDs.freed, fd)
+		freed = true
 	}
-	delete(dstSockFDs.byFD, fd)
-	dstSockFDs.freed = append(dstSockFDs.freed, fd)
+	dstSockFDs.mu.Unlock()
+	if freed {
+		dstCoarseRecord(dstCoarseSockFDID(fd), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(owner)), true)
+	}
 }
 
 func dstSockFDLookup(fd int) *dstSockOpts {
@@ -297,6 +303,7 @@ func (c *dstRawSockConn) opError(op string, err error) error {
 }
 
 func (c *dstRawSockConn) Control(f func(fd uintptr)) error {
+	dstCoarseDep(dstCoarseSockFDID(c.fd), false)
 	if (c.closed != nil && c.closed()) || dstSockFDLookup(c.fd) == nil {
 		return c.opError("raw-control", errClosed)
 	}
@@ -316,7 +323,12 @@ func (c *dstRawSockConn) Write(f func(fd uintptr) bool) error {
 // implementing syscall.Conn as *TCPConn does. Control works (sockopts on the
 // modeled set); Read/Write are refused (see dstRawSockConn).
 func (c *dstConn) SyscallConn() (syscall.RawConn, error) {
-	if c.closed.Load() || c.stale() {
+	if c.stale() {
+		return nil, syscall.EINVAL
+	}
+	dstCoarseDep(dstCoarseSockFDID(c.sockFD), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(c.closeSyncPtr())), false)
+	if c.isClosedAcquire() {
 		return nil, syscall.EINVAL
 	}
 	return &dstRawSockConn{
@@ -324,21 +336,26 @@ func (c *dstConn) SyscallConn() (syscall.RawConn, error) {
 		network: c.network,
 		laddr:   c.local,
 		raddr:   c.remote,
-		closed:  func() bool { return c.closed.Load() || c.stale() },
+		closed:  func() bool { return c.stale() || c.isClosedAcquire() },
 	}, nil
 }
 
 // SyscallConn returns a raw network connection over the simulated listener's
 // socket, implementing syscall.Conn as *TCPListener does.
 func (l *dstListener) SyscallConn() (syscall.RawConn, error) {
-	if l.closed.Load() || l.stale() {
+	if l.stale() {
+		return nil, syscall.EINVAL
+	}
+	dstCoarseDep(dstCoarseSockFDID(l.sockFD), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&l.closeSync)), false)
+	if l.isClosedAcquire() {
 		return nil, syscall.EINVAL
 	}
 	return &dstRawSockConn{
 		fd:      l.sockFD,
 		network: l.network,
 		raddr:   l.addr,
-		closed:  func() bool { return l.closed.Load() || l.stale() },
+		closed:  func() bool { return l.stale() || l.isClosedAcquire() },
 	}, nil
 }
 

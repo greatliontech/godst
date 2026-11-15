@@ -7,7 +7,9 @@
 package os
 
 import (
-	"sync"
+	"cmp"
+	isync "internal/sync"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -42,21 +44,26 @@ type dstFutexKey struct {
 }
 
 type dstFutexWaiter struct {
-	ch   chan struct{} // closed by wake or teardown-free (never sent on)
-	host uint32        // owning host, for host-crash teardown
-	proc uint32        // owning process, for crash/exit teardown
+	ch       chan struct{} // closed by wake or teardown-free (never sent on)
+	host     uint32        // owning host, for host-crash teardown
+	proc     uint32        // owning process, for crash/exit teardown
+	raceSync uint64        // per-waiter TSan and DPOR happens-before word (waker -> woken waiter)
 }
 
 var dstFutex struct {
-	mu    sync.Mutex
-	epoch uint64
-	q     map[dstFutexKey][]*dstFutexWaiter
+	mu       isync.KernelMutex
+	epoch    uint64
+	q        map[dstFutexKey][]*dstFutexWaiter
+	procKeys map[uint32]map[dstFutexKey]struct{}
+	hostKeys map[uint32]map[dstFutexKey]struct{}
 }
 
 func dstFutexRollLocked() {
 	if e := dstFSEpoch(); e != dstFutex.epoch || dstFutex.q == nil {
 		dstFutex.epoch = e
 		dstFutex.q = make(map[dstFutexKey][]*dstFutexWaiter)
+		dstFutex.procKeys = make(map[uint32]map[dstFutexKey]struct{})
+		dstFutex.hostKeys = make(map[uint32]map[dstFutexKey]struct{})
 	}
 }
 
@@ -130,7 +137,7 @@ func dstFutexWait(addr *uint32, val uint32, timeoutNs int64, hasTimeout bool) (s
 	// lost-wake surface itself — announced pre-decision as a READ of the
 	// word's identity (the wake is the write; read pairs commute). A
 	// woken return ACQUIRES the waker's released history below.
-	dstCoarseDep(dstFutexID(key), false, 0)
+	dstCoarseDep(dstFutexID(key), false)
 	host, proc := dstFSCurrentNode()
 	w := &dstFutexWaiter{ch: make(chan struct{}), host: host, proc: proc}
 	// The value check reads the word through the HARNESS page-cache view
@@ -160,18 +167,30 @@ func dstFutexWait(addr *uint32, val uint32, timeoutNs int64, hasTimeout bool) (s
 		return syscall.EAGAIN, true
 	}
 	dstFutex.q[key] = append(dstFutex.q[key], w)
+	pk := dstFutex.procKeys[proc]
+	if pk == nil {
+		pk = make(map[dstFutexKey]struct{})
+		dstFutex.procKeys[proc] = pk
+	}
+	pk[key] = struct{}{}
+	hk := dstFutex.hostKeys[host]
+	if hk == nil {
+		hk = make(map[dstFutexKey]struct{})
+		dstFutex.hostKeys[host] = hk
+	}
+	hk[key] = struct{}{}
 	dstFutex.mu.Unlock()
 	dstFS.mu.Unlock()
 	if !hasTimeout {
 		<-w.ch
-		dstCoarseHB(dstFutexID(key), 1) // woken: acquire the waker's history
+		dstKernelRaceAcquire(unsafe.Pointer(&w.raceSync))
 		return 0, true
 	}
 	timer := time.NewTimer(time.Duration(timeoutNs)) // bubble virtual clock
 	defer timer.Stop()
 	select {
 	case <-w.ch:
-		dstCoarseHB(dstFutexID(key), 1) // woken: acquire the waker's history
+		dstKernelRaceAcquire(unsafe.Pointer(&w.raceSync))
 		return 0, true
 	case <-timer.C:
 	}
@@ -179,11 +198,13 @@ func dstFutexWait(addr *uint32, val uint32, timeoutNs int64, hasTimeout bool) (s
 	// spent a slot on us): report woken, not ETIMEDOUT.
 	dstFutex.mu.Lock()
 	removed := dstFutexRemoveLocked(key, w)
+	if !removed {
+		dstKernelRaceAcquire(unsafe.Pointer(&w.raceSync))
+	}
 	dstFutex.mu.Unlock()
 	if removed {
 		return syscall.ETIMEDOUT, true
 	}
-	dstCoarseHB(dstFutexID(key), 1) // wake won the race: acquire its history
 	return 0, true
 }
 
@@ -192,9 +213,10 @@ func dstFutexWake(addr *uint32, n uint32) (int, syscall.Errno, bool) {
 	if !handled || errno != 0 {
 		return 0, errno, handled
 	}
-	// Coarse DPOR dependency: the wake writes the word's identity and
-	// RELEASES this goroutine's history to whichever waiter it wakes.
-	dstCoarseDep(dstFutexID(key), true, 2)
+	// Coarse DPOR dependency: the wake announces a write-conflict on the
+	// word's identity pre-lock and releases its history atomically under
+	// dstFutex.mu to whichever waiters it wakes.
+	dstCoarseDep(dstFutexID(key), true)
 	dstFutex.mu.Lock()
 	defer dstFutex.mu.Unlock()
 	dstFutexRollLocked()
@@ -209,6 +231,7 @@ func dstFutexWake(addr *uint32, n uint32) (int, syscall.Errno, bool) {
 	}
 	woken := 0
 	for len(q) > 0 && woken < limit {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&q[0].raceSync))
 		close(q[0].ch)
 		q = q[1:]
 		woken++
@@ -244,7 +267,7 @@ func dstFutexRemoveLocked(key dstFutexKey, w *dstFutexWaiter) bool {
 // neither counts them nor spends wake slots on them. The dead goroutine
 // never runs again, so closing its channel is unobservable.
 func dstFutexTeardownProc(proc uint32) {
-	dstFutexTeardown(func(w *dstFutexWaiter) bool { return w.proc == proc })
+	dstFutexTeardown(func(w *dstFutexWaiter) bool { return w.proc == proc }, proc, 0, false)
 }
 
 // dstFutexTeardownHost drops every waiter parked by any process of a
@@ -253,26 +276,76 @@ func dstFutexTeardownProc(proc uint32) {
 // restore, so without this a rebooted host's fresh waiter would sit behind
 // a dead one and a FUTEX_WAKE(1) would starve it.
 func dstFutexTeardownHost(host uint32) {
-	dstFutexTeardown(func(w *dstFutexWaiter) bool { return w.host == host })
+	dstFutexTeardown(func(w *dstFutexWaiter) bool { return w.host == host }, 0, host, true)
 }
 
-func dstFutexTeardown(dead func(*dstFutexWaiter) bool) {
+func dstFutexHasWaitersForProc(proc uint32) bool {
 	dstFutex.mu.Lock()
 	defer dstFutex.mu.Unlock()
 	dstFutexRollLocked()
+	if len(dstFutex.procKeys[proc]) > 0 {
+		return true
+	}
+	for _, q := range dstFutex.q {
+		for _, w := range q {
+			if w.proc == proc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func dstFutexTeardown(dead func(*dstFutexWaiter) bool, proc, host uint32, byHost bool) {
+	dstFutex.mu.Lock()
+	defer dstFutex.mu.Unlock()
+	dstFutexRollLocked()
+	seen := make(map[dstFutexKey]struct{})
+	if byHost {
+		for key := range dstFutex.hostKeys[host] {
+			seen[key] = struct{}{}
+		}
+		delete(dstFutex.hostKeys, host)
+	} else {
+		for key := range dstFutex.procKeys[proc] {
+			seen[key] = struct{}{}
+		}
+		delete(dstFutex.procKeys, proc)
+	}
 	for key, q := range dstFutex.q {
 		kept := q[:0]
+		removed := false
 		for _, w := range q {
 			if dead(w) {
+				removed = true
+				if byHost {
+					delete(dstFutex.procKeys, w.proc)
+				}
 				close(w.ch)
 				continue
 			}
 			kept = append(kept, w)
+		}
+		if removed {
+			seen[key] = struct{}{}
 		}
 		if len(kept) == 0 {
 			delete(dstFutex.q, key)
 		} else {
 			dstFutex.q[key] = kept
 		}
+	}
+	touched := make([]dstFutexKey, 0, len(seen))
+	for key := range seen {
+		touched = append(touched, key)
+	}
+	slices.SortFunc(touched, func(a, b dstFutexKey) int {
+		if c := cmp.Compare(a.node.ino, b.node.ino); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.off, b.off)
+	})
+	for _, key := range touched {
+		dstCoarseRecord(dstFutexID(key), true)
 	}
 }

@@ -27,6 +27,21 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 	owner := dstFlockOwner{host: entry.host, proc: entry.proc, fd: fd}
 	nonblock := how&syscall.LOCK_NB != 0
 	exclusive := op == syscall.LOCK_EX
+	// Coarse DPOR dependency (runtime.dstCoarseDep): flock is THE
+	// cross-process mutual-exclusion decision — which contender wins a
+	// LOCK_EX is outcome-determining, so both orders must be explorable.
+	// Announce both the handle (read, pairing with Close) and the file node
+	// (write) in a single scheduling step before enter() pins the node.
+	if dstFSActive() {
+		file.mu.Lock()
+		peekNode := file.node
+		peekLive := !file.closed && file.epoch == dstFSEpoch()
+		file.mu.Unlock()
+		dstCoarseDep(uintptr(unsafe.Pointer(file)), false)
+		if peekLive && peekNode != nil {
+			dstCoarseRecord(uintptr(unsafe.Pointer(peekNode)), true)
+		}
+	}
 	// Pin the node for the duration of the call: an in-flight flock holds a
 	// reference to the open file description on Linux, so a concurrent close
 	// of the fd neither aborts the wait nor invalidates the lock state the
@@ -37,18 +52,6 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 	}
 	node := file.node
 	file.leave()
-	// Coarse DPOR dependency (runtime.dstCoarseDep): flock is THE
-	// cross-process mutual-exclusion decision — which contender wins a
-	// LOCK_EX is outcome-determining, so both orders must be explorable.
-	// Announced pre-decision as a write-conflict on the file node; an
-	// unlock also RELEASES its happens-before history (the next grantee
-	// acquires it below), mirroring the runtime mutex hooks' shape.
-	flockID := uintptr(unsafe.Pointer(node))
-	if op == syscall.LOCK_UN {
-		dstCoarseDep(flockID, true, 2)
-	} else {
-		dstCoarseDep(flockID, true, 0)
-	}
 	for {
 		if err := file.enter(); err != nil {
 			if !file.flockClosedInRun() {
@@ -62,10 +65,10 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			// already released by the close), and LOCK_UN is a no-op success.
 			dstFS.mu.Lock()
 			if op == syscall.LOCK_UN || node.flock.canLock(owner, exclusive) {
-				dstFS.mu.Unlock()
 				if op != syscall.LOCK_UN {
-					dstCoarseHB(flockID, 1) // granted: acquire the released history
+					dstKernelRaceAcquire(unsafe.Pointer(&node.flock.raceSync))
 				}
+				dstFS.mu.Unlock()
 				return 0, true
 			}
 			if nonblock {
@@ -78,7 +81,7 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			continue
 		}
 		if op == syscall.LOCK_UN {
-			node.flock.unlock(owner)
+			node.flock.unlockNode(node, owner)
 			file.leave()
 			return 0, true
 		}
@@ -88,11 +91,11 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 		// nonblocking conversion has already lost the old lock — EWOULDBLOCK
 		// leaves the caller holding nothing. Retaining the old lock across a
 		// failed conversion would keep executions no real kernel produces.
-		node.flock.removeForConversion(owner, exclusive)
+		node.flock.removeForConversionNode(node, owner, exclusive)
 		if node.flock.canLock(owner, exclusive) {
 			node.flock.lock(owner, exclusive)
+			dstKernelRaceAcquire(unsafe.Pointer(&node.flock.raceSync))
 			file.leave()
-			dstCoarseHB(flockID, 1) // granted: acquire the released history
 			return 0, true
 		}
 		if nonblock {
@@ -163,9 +166,9 @@ func dstFlockReleasePending(p *dstFlockPending) {
 	if p == nil || p.node == nil {
 		return
 	}
-	dstCoarseDep(uintptr(unsafe.Pointer(p.node)), true, 2)
+	dstCoarseDep(uintptr(unsafe.Pointer(p.node)), true)
 	dstFS.mu.Lock()
-	p.node.flock.unlock(p.owner)
+	p.node.flock.unlockNode(p.node, p.owner)
 	dstFS.mu.Unlock()
 }
 
@@ -174,10 +177,11 @@ func dstFlockReleasePending(p *dstFlockPending) {
 func dstFlockRelease(file *dstFile, owner dstFlockOwner) {
 	// Coarse DPOR dependency: a close (or exit) RELEASING a held flock is
 	// as outcome-determining as an explicit LOCK_UN — a contender's
-	// nonblocking attempt lands on either side of it. Announced with the
-	// same write-conflict + release edge, before this function's own
-	// mutation (the announce yields, so it precedes the locks it is
-	// re-taken under). NARROWED to closes whose owner actually holds a
+	// nonblocking attempt lands on either side of it. Announced as a
+	// write-conflict before this function's own mutation (the announce
+	// yields, so it precedes the locks it is re-taken under), with the
+	// release edge recorded atomically under dstFS.mu at unlockNode.
+	// NARROWED to closes whose owner actually holds a
 	// lock: announcing every close would put a write-conflict on every
 	// file teardown and combinatorially inflate exhaustive explorations
 	// that never flock at all (measured: an unbudgeted explore test went
@@ -190,7 +194,7 @@ func dstFlockRelease(file *dstFile, owner dstFlockOwner) {
 		_, held := node.flock.holders[owner]
 		dstFS.mu.Unlock()
 		if held {
-			dstCoarseDep(uintptr(unsafe.Pointer(node)), true, 2)
+			dstCoarseDep(uintptr(unsafe.Pointer(node)), true)
 		}
 	}
 	if node == nil {
@@ -201,9 +205,13 @@ func dstFlockRelease(file *dstFile, owner dstFlockOwner) {
 	}
 	file.mu.Lock()
 	dstFS.mu.Lock()
-	node.flock.unlock(owner)
+	node.flock.unlockNode(node, owner)
 	dstFS.mu.Unlock()
 	file.mu.Unlock()
+}
+
+func (node *dstFSNode) flockReleaseHBLocked() {
+	dstKernelRaceReleaseMerge(unsafe.Pointer(&node.flock.raceSync))
 }
 
 func (s *dstFlockState) canLock(owner dstFlockOwner, exclusive bool) bool {
@@ -222,31 +230,33 @@ func (s *dstFlockState) lock(owner dstFlockOwner, exclusive bool) {
 	if s.holders == nil {
 		s.holders = make(map[dstFlockOwner]bool)
 	}
-	// A conversion's old holding was already dropped by removeForConversion (as
+	// A conversion's old holding was already dropped by removeForConversionNode (as
 	// the kernel deletes before its conflict scan), so this only grants or
 	// re-grants the same type — no waiter can be unblocked by it.
 	s.holders[owner] = exclusive
 }
 
-// removeForConversion drops owner's existing holding when it is of the OTHER
+// removeForConversionNode drops owner's existing holding when it is of the OTHER
 // type than the requested one — the kernel deletes the old flock before its
 // conflict scan, so both the successful atomic conversion and the failed
 // nonblocking conversion (which loses the lock) fall out of this one step. A
 // same-type request is a re-grant and removes nothing. Dropping an exclusive
 // (or shared) holding can make a blocked waiter compatible, hence the broadcast.
-func (s *dstFlockState) removeForConversion(owner dstFlockOwner, wantExclusive bool) {
+func (s *dstFlockState) removeForConversionNode(node *dstFSNode, owner dstFlockOwner, wantExclusive bool) {
 	held, ok := s.holders[owner]
 	if !ok || held == wantExclusive {
 		return
 	}
+	node.flockReleaseHBLocked()
 	delete(s.holders, owner)
 	s.broadcast()
 }
 
-func (s *dstFlockState) unlock(owner dstFlockOwner) {
+func (s *dstFlockState) unlockNode(node *dstFSNode, owner dstFlockOwner) {
 	if _, ok := s.holders[owner]; !ok {
 		return
 	}
+	node.flockReleaseHBLocked()
 	delete(s.holders, owner)
 	s.broadcast()
 }

@@ -12,3 +12,7 @@ package os
 func dstBackendOf(f *file) dstFileBackend {
 	return nil
 }
+
+func dstSysfd(f *file) int {
+	return -1
+}

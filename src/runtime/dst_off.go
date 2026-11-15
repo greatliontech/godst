@@ -26,10 +26,12 @@ const (
 )
 
 func dstActive() bool                                                          { return false }
+func dstInSimBubble() bool                                                     { return false }
 func dstFenceActive() bool                                                     { return false }
 func dstCgoRefuse()                                                            {}
 func dstCallbackWorkersBlocked() bool                                          { return false }
 func dstIsCrashedG(*g) bool                                                    { return false }
+func dstCanPreemptG(*g) bool                                                   { return true }
 func dstDurableMutexWait(*g) bool                                              { return false }
 func dstIsSynctestGCDrainG(*g) bool                                            { return false }
 func dstSyncAcquire(unsafe.Pointer)                                            {}
@@ -90,3 +92,4 @@ func dstTimeNowWall(int64) (int64, int32)                                      {
 func dstTimerModify(*timer, int64, int64) (int64, int64)                       { return 0, 0 }
 func dstTimerRand() uint32                                                     { return 0 }
 func dstTimerConsumeWhenShift(*timer, int64) int64                             { return 0 }
+func dstKernelLiftGoStartIgnoreSync(*g) bool                                   { return false }

@@ -8,7 +8,7 @@ package os
 
 import (
 	"path"
-	_ "unsafe" // for go:linkname
+	"unsafe" // go:linkname + coarse fault identities
 )
 
 // Disk faults over the per-host filesystem seam (docs/dst/faults.md "Disk faults").
@@ -52,14 +52,19 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 	d := dstFSDiskForHost(host)
 	switch op {
 	case diskOpFailDisk:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		d.eio = true
 	case diskOpHealDisk:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		d.eio = false
 	case diskOpFailWriteback:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		d.wbFail = true
 	case diskOpHealWriteback:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		d.wbFail = false
 	case diskOpFailFile:
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), false)
 		node := dstFSNodeAt(d.root, name)
 		if node == nil || node.isDir {
 			// Per-file EIO is scoped to a regular file's blocks; a directory (and
@@ -72,25 +77,35 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 			// anything — but a single targeted file does not.
 			return
 		}
+		dstCoarseNodeRecord(node, true)
 		if d.eioFiles == nil {
 			d.eioFiles = make(map[*dstFSNode]bool)
 		}
 		d.eioFiles[node] = true
 	case diskOpHealFile:
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), false)
 		if node := dstFSNodeAt(d.root, name); node != nil && d.eioFiles != nil {
+			dstCoarseNodeRecord(node, true)
 			delete(d.eioFiles, node)
 		}
 	case diskOpLimit:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
 		d.capped = true
 		d.capacity = arg
 	case diskOpUnlimit:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
 		d.capped = false
 	case diskOpSlow:
+		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
 		d.latency.Store(arg)
 		if arg > 0 {
 			dstDiskSlow.Store(true) // arm the global gate; reset on the next run's roll
 		}
 	case diskOpCorruptFile:
+		dstCoarseRecord(dstCoarseNamespaceForHost(host), false)
 		node := dstFSNodeAt(d.root, name)
 		if node == nil || node.isDir || node.isDevice() || node.synced.size == 0 {
 			// Bit rot corrupts durable media. A missing target or a directory is
@@ -100,6 +115,7 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 			// later fault's stream position.
 			return
 		}
+		dstCoarseNodeRecord(node, true)
 		// One seeded byte, one seeded bit — the canonical silent-corruption
 		// quantum, and the sneakiest input a checksum must catch. The offset
 		// addresses the durable image (the platter), never the page cache:

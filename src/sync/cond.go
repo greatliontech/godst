@@ -66,6 +66,9 @@ func NewCond(l Locker) *Cond {
 //	c.L.Unlock()
 func (c *Cond) Wait() {
 	c.checker.check()
+	if dstHookEnabled {
+		dstSyncAcquireCond(c)
+	}
 	t := runtime_notifyListAdd(&c.notify)
 	c.L.Unlock()
 	runtime_notifyListWait(&c.notify, t)
@@ -81,6 +84,9 @@ func (c *Cond) Wait() {
 // are attempting to lock c.L, they may be awoken before a "waiting" goroutine.
 func (c *Cond) Signal() {
 	c.checker.check()
+	if dstHookEnabled {
+		dstSyncAcquireCond(c)
+	}
 	runtime_notifyListNotifyOne(&c.notify)
 }
 
@@ -92,6 +98,9 @@ func (c *Cond) Signal() {
 // will extend the amount of time that the lock is held.
 func (c *Cond) Broadcast() {
 	c.checker.check()
+	if dstHookEnabled {
+		dstSyncAcquireCond(c)
+	}
 	runtime_notifyListNotifyAll(&c.notify)
 }
 

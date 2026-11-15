@@ -7,8 +7,9 @@
 package net
 
 import (
+	isync "internal/sync"
 	"sort"
-	"sync"
+	"unsafe"
 )
 
 // Connection-reset targeting. The imperative API in testing/simulation
@@ -47,7 +48,7 @@ import (
 // is per-end. resetConn is idempotent when both ends are reset: an atomic
 // flag store, a sync.Once close, a map delete.
 var dstConns struct {
-	mu    sync.Mutex
+	mu    isync.KernelMutex
 	epoch uint64
 	set   map[*dstConn]struct{}
 	seq   uint64 // per-run monotonic registration counter (see dstConn.regSeq)
@@ -206,6 +207,8 @@ func dstConnDeregister(c *dstConn) {
 // whole downstream schedule, would diverge across same-seed runs
 // (DST-FAULT-REPLAY).
 func dstResetMatching(match func(*dstConn) bool) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	for _, c := range dstMatchedVictims(match) {
 		dstInjectReset(c)
 	}
@@ -237,7 +240,7 @@ func dstInjectReset(c *dstConn) {
 		c.resetConn()
 		return
 	}
-	c.reset.Store(true)
+	c.markReset()
 	e.injectRST()
 	dstConnDeregister(c)
 }
@@ -255,6 +258,8 @@ func dstInjectReset(c *dstConn) {
 // identity its earlier teardown already owns.
 // At most one registered conn wraps a given end, so the scan is deterministic.
 func dstDeadPushRST(e Conn) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	dstConns.mu.Lock()
 	var victim *dstConn
 	dstConnsRoll()
@@ -360,6 +365,8 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 // kernel answers its probes with. A conn between two other hosts has
 // neither end on h and is untouched (DST-FAULT-VICTIM).
 func dstResetHost(h uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	// The machine lost power, so its kernel's TIME_WAIT table is gone too: a
 	// hold surviving the crash would refuse a bind the rebooted kernel
 	// allows. A process crash, by contrast, leaves the kernel (and its
@@ -423,6 +430,8 @@ func dstCrashTeardown(victimEnd, survivorEnd func(*dstConn) bool, rstAnswerable 
 // the peer, exactly the visibility this teardown exists to withhold.
 func dstCrashVictimConn(c *dstConn) {
 	if e, ok := c.Conn.(*dstWireEnd); ok {
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+		dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
 		inHorizon := dstBaseNanos()
 		if cs, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cs-1 < inHorizon {
 			inHorizon = cs - 1
@@ -441,7 +450,8 @@ func dstCrashVictimConn(c *dstConn) {
 		e.out.wake()
 		e.out.wakeWriter()
 	}
-	c.closed.Store(true)
+	dstCoarseRecord(dstCoarseNetHostID(c.localHost), true)
+	c.markClosed()
 	dstConnDeregister(c)
 	dstSockFDFree(c.sockFD, c.sockOpts)
 }
@@ -449,6 +459,8 @@ func dstCrashVictimConn(c *dstConn) {
 // dstCloseHostListeners closes every listener on host h — the whole port space
 // dies with the machine, whichever of its processes bound it.
 func dstCloseHostListeners(h uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	dstReleasePendingBinds(func(key dstBindKey, _ uint32) bool { return key.host == h })
 	// The machine is off: its backlog connections go silent at their dialers
 	// like every other conn it held — no kernel exists to reset them.
@@ -484,6 +496,8 @@ func dstResetProc(p uint32) {
 // for — the peer drains and reads EOF exactly as the pre-crash teardown left
 // it, the same boundary the host-crash matcher applies (DST-FAULT-SOUND).
 func dstCrashProcConns(p uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	victimEnd := func(c *dstConn) bool { return c.localProc == p }
 	survivorEnd := func(c *dstConn) bool {
 		if c.localProc == p || c.remoteProc != p {
@@ -512,6 +526,8 @@ func dstCrashProcConns(p uint32) {
 // matching localProc alone covers every end p owns; the victims close in
 // registration-sequence order (DST-FAULT-REPLAY, as dstResetMatching).
 func dstCloseProcConns(p uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	for _, c := range dstMatchedVictims(func(c *dstConn) bool { return c.localProc == p }) {
 		// Every simulated connection is wire-backed (the transport contract),
 		// so the assertion always holds today; a future non-wire Conn wrapper
@@ -574,10 +590,39 @@ func dstResetBothEnds(c *dstConn) {
 }
 
 func dstCloseProcListeners(p uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	dstReleasePendingBinds(func(_ dstBindKey, proc uint32) bool { return proc == p })
 	// The kernel survives a process exit/crash and resets the backlog —
 	// through the cut gate (nil tear), as any kernel-emitted RST.
 	dstCloseListeners(func(l *dstListener) bool { return l.proc == p }, nil)
+}
+
+func dstNetHasProcResources(p uint32) bool {
+	dstConns.mu.Lock()
+	dstConnsRoll()
+	for c := range dstConns.set {
+		if c.localProc == p {
+			dstConns.mu.Unlock()
+			return true
+		}
+	}
+	dstConns.mu.Unlock()
+
+	dstNet.mu.Lock()
+	defer dstNet.mu.Unlock()
+	dstNetRoll()
+	for _, l := range dstNet.listeners {
+		if l.proc == p {
+			return true
+		}
+	}
+	for _, proc := range dstNet.pendingBinds {
+		if proc == p {
+			return true
+		}
+	}
+	return false
 }
 
 func dstReleasePendingBinds(match func(dstBindKey, uint32) bool) {

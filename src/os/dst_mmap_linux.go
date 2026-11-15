@@ -7,7 +7,9 @@
 package os
 
 import (
-	"sync"
+	"cmp"
+	isync "internal/sync"
+	"slices"
 	"syscall"
 	"unsafe"
 )
@@ -58,6 +60,7 @@ type dstMMapEntry struct {
 	// holds outlives its descriptor's close until the mapping is gone
 	// (dstFlockReleaseFD, dstMMapReleaseFile).
 	file  *dstFile
+	seq   uint64
 	epoch uint64
 	host  uint32
 	proc  uint32
@@ -71,14 +74,16 @@ type dstMMapEntry struct {
 }
 
 var dstMMapRegistry struct {
-	mu    sync.Mutex
-	epoch uint64
-	maps  map[*byte][]*dstMMapEntry
+	mu      isync.KernelMutex
+	epoch   uint64
+	nextSeq uint64
+	maps    map[*byte][]*dstMMapEntry
 }
 
 func dstMMapRollLocked() {
 	if e := dstFSEpoch(); e != dstMMapRegistry.epoch || dstMMapRegistry.maps == nil {
 		dstMMapRegistry.epoch = e
+		dstMMapRegistry.nextSeq = 0
 		dstMMapRegistry.maps = make(map[*byte][]*dstMMapEntry)
 	}
 }
@@ -121,17 +126,21 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		return nil, syscall.EINVAL, true
 	}
 	file, ok := entry.backend.(*dstFile)
-	if !ok || file.node == nil || file.node.isDir || file.node.isDevice() {
-		// A device node is ENODEV like a directory: the real /dev/null has no
-		// mmap op (host-verified for MAP_SHARED and MAP_PRIVATE alike).
+	if !ok {
 		return nil, syscall.ENODEV, true
 	}
 
+	file.coarseOp(false, writable)
 	file.diskDelay()
 	if err := file.enter(); err != nil {
 		return nil, dstFDErr(err), true
 	}
 	defer file.leave()
+	if file.node == nil || file.node.isDir || file.node.isDevice() {
+		// A device node is ENODEV like a directory: the real /dev/null has no
+		// mmap op (host-verified for MAP_SHARED and MAP_PRIVATE alike).
+		return nil, syscall.ENODEV, true
+	}
 	if !file.rd || writable && !file.wr {
 		return nil, syscall.EACCES, true
 	}
@@ -178,12 +187,14 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 		dstMMapRegistry.mu.Unlock()
 		return nil, errno, true
 	}
+	dstMMapRegistry.nextSeq++
 	dstMMapRegistry.maps[key] = append(dstMMapRegistry.maps[key], &dstMMapEntry{
 		data:       data,
 		mapBase:    mapBase,
 		mapLen:     mapLen,
 		node:       file.node,
 		file:       file,
+		seq:        dstMMapRegistry.nextSeq,
 		epoch:      dstFSEpoch(),
 		host:       host,
 		proc:       proc,
@@ -262,6 +273,9 @@ func dstMMapReleaseFileLocked(file *dstFile) *dstFlockPending {
 }
 
 func dstMunmap(data []byte) (syscall.Errno, bool) {
+	if len(data) > 0 && dstFSActive() {
+		dstCoarseDep(uintptr(unsafe.Pointer(&data[0])), true)
+	}
 	errno, handled, pending := dstMunmapLocked(data)
 	dstFlockReleasePending(pending)
 	return errno, handled
@@ -337,6 +351,21 @@ func dstMMapReleaseProc(proc uint32) {
 	}
 }
 
+func dstMMapHasPendingFlockForProc(proc uint32) bool {
+	dstMMapRegistry.mu.Lock()
+	defer dstMMapRegistry.mu.Unlock()
+	dstMMapRollLocked()
+	epoch := dstFSEpoch()
+	for _, bucket := range dstMMapRegistry.maps {
+		for _, entry := range bucket {
+			if entry.epoch == epoch && entry.proc == proc && entry.file != nil && entry.file.flockPending.Load() != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // dstMMapReleaseWhere unmaps every mapping of this run that match selects
 // (a crashed process's or host's), and returns the flock releases the
 // dropped mappings were the last reference for — performed by the caller
@@ -348,17 +377,12 @@ func dstMMapReleaseWhere(match func(*dstMMapEntry) bool) []*dstFlockPending {
 	dstMMapRegistry.mu.Lock()
 	defer dstMMapRegistry.mu.Unlock()
 	dstMMapRollLocked()
-	var dropped []*dstFile
+	var matched []*dstMMapEntry
 	for key, bucket := range dstMMapRegistry.maps {
 		out := bucket[:0]
 		for _, entry := range bucket {
 			if entry.epoch == dstFSEpoch() && match(entry) {
-				dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
-				if entry.node != nil {
-					entry.node.liveMaps--
-					dstNodeMaybeReleaseLocked(entry.node)
-				}
-				dropped = append(dropped, entry.file)
+				matched = append(matched, entry)
 				continue
 			}
 			out = append(out, entry)
@@ -369,9 +393,17 @@ func dstMMapReleaseWhere(match func(*dstMMapEntry) bool) []*dstFlockPending {
 			dstMMapRegistry.maps[key] = out
 		}
 	}
+	slices.SortFunc(matched, func(a, b *dstMMapEntry) int {
+		return cmp.Compare(a.seq, b.seq)
+	})
 	var pendings []*dstFlockPending
-	for _, file := range dropped {
-		if p := dstMMapReleaseFileLocked(file); p != nil {
+	for _, entry := range matched {
+		dstPageCacheUnmap(entry.mapBase, entry.mapLen, dstSpanCrashed)
+		if entry.node != nil {
+			entry.node.liveMaps--
+			dstNodeMaybeReleaseLocked(entry.node)
+		}
+		if p := dstMMapReleaseFileLocked(entry.file); p != nil {
 			pendings = append(pendings, p)
 		}
 	}

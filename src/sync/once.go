@@ -64,9 +64,14 @@ func (o *Once) Do(f func()) {
 	// This is why the slow path falls back to a mutex, and why
 	// the o.done.Store must be delayed until after f returns.
 
+	if dstHookEnabled {
+		dstSyncAcquireOnce(o)
+	}
 	if !o.done.Load() {
 		// Outlined slow-path to allow inlining of the fast-path.
 		o.doSlow(f)
+	} else if dstHookEnabled {
+		dstSyncAcquireHBOnce(o)
 	}
 }
 
@@ -75,6 +80,11 @@ func (o *Once) doSlow(f func()) {
 	defer o.m.Unlock()
 	if !o.done.Load() {
 		defer o.done.Store(true)
+		if dstHookEnabled {
+			defer dstSyncReleaseOnce(o)
+		}
 		f()
+	} else if dstHookEnabled {
+		dstSyncAcquireHBOnce(o)
 	}
 }

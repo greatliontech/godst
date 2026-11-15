@@ -8,46 +8,62 @@ package net
 
 import (
 	bigint "math/big"
+	"sync"
 	"testing"
 )
 
-// TestDSTWirePopRemainInFlightTail is the white-box M8-residual pin: pop must report
-// remain=true when the segment left behind after filling b is IN FLIGHT (deliverAt >
-// maxArrival), not only when arrived bytes remain — the read loop re-wakes on remain,
-// and a second reader parked on the empty queue (no timer of its own) is stranded on
-// that in-flight segment otherwise. Manipulates the stream directly (no bubble/clock)
-// so the contract is pinned free of scheduler timing.
-func TestDSTWirePopRemainInFlightTail(t *testing.T) {
-	s := newDstStream(0)
+// TestDSTWirePopInFlightTailAndBroadcastWake pins popBytes's in-flight wait
+// calculation and broadcast generation wakeups: draining an arrived prefix
+// leaves an in-flight tail reporting its positive wait duration alongside a
+// non-nil readyCh, and a subsequent stream wake closes that generation channel
+// for every parked reader at once.
+func TestDSTWirePopInFlightTailAndBroadcastWake(t *testing.T) {
+	s := newDstStream(4)
 	s.segs = []dstSeg{
 		{data: []byte("0000"), deliverAt: 5},  // arrived at horizon 5
 		{data: []byte("1111"), deliverAt: 10}, // in flight at horizon 5
 	}
+	s.buffered = 8
+	spaceCh1 := s.spaceChLocked()
+	spaceCh2 := s.spaceChLocked()
+	if spaceCh1 != spaceCh2 {
+		t.Fatalf("concurrent parked writers got distinct generation channels")
+	}
 	buf := make([]byte, 4)
-	n, remain, eof, wait := s.pop(buf, 5) // horizon 5: only seg0 arrived
+	n, eof, wait := s.pop(buf, 5) // horizon 5: only seg0 arrived
 	if n != 4 || string(buf) != "0000" {
 		t.Fatalf("pop = %d %q, want 4 \"0000\"", n, buf[:n])
 	}
 	if eof || wait != 0 {
 		t.Fatalf("pop eof=%v wait=%v, want false/0", eof, wait)
 	}
-	if !remain {
-		t.Fatalf("pop remain=false with an in-flight tail — the re-wake would not fire and a second reader strands")
+	if !isClosedChan(spaceCh1) || !isClosedChan(spaceCh2) {
+		t.Fatalf("pop did not broadcast space wake to all parked writers")
+	}
+	kbuf, readyCh, eof, wait := s.popBytes(4, 5)
+	if len(kbuf) != 0 || eof || wait != 5 || readyCh == nil {
+		t.Fatalf("popBytes on in-flight tail = (len=%d, readyCh=%v, eof=%v, wait=%v), want (0, non-nil, false, 5ns)", len(kbuf), readyCh != nil, eof, wait)
+	}
+	s.wake()
+	if !isClosedChan(readyCh) {
+		t.Fatalf("wake did not close parked readyCh generation")
 	}
 }
 
-// TestDSTWirePopRemainNothingLeft: pop reports remain=false when the queue is fully
-// drained — the re-wake must NOT fire spuriously forever.
-func TestDSTWirePopRemainNothingLeft(t *testing.T) {
+// TestDSTWirePopDrainsCompletely verifies pop drains a single arrived segment
+// and reports wait < 0 (park until woken) once empty.
+func TestDSTWirePopDrainsCompletely(t *testing.T) {
 	s := newDstStream(0)
 	s.segs = []dstSeg{{data: []byte("00"), deliverAt: 5}}
+	s.buffered = 2
 	buf := make([]byte, 8)
-	n, remain, _, _ := s.pop(buf, 5)
-	if n != 2 {
-		t.Fatalf("pop n=%d, want 2", n)
+	n, eof, wait := s.pop(buf, 5)
+	if n != 2 || eof || wait != 0 {
+		t.Fatalf("pop = (%d, eof=%v, wait=%v), want (2, false, 0)", n, eof, wait)
 	}
-	if remain {
-		t.Fatalf("pop remain=true with an empty queue — spurious re-wake")
+	n, eof, wait = s.pop(buf, 5)
+	if n != 0 || eof || wait >= 0 {
+		t.Fatalf("pop on empty unclosed stream = (%d, eof=%v, wait=%v), want (0, false, <0)", n, eof, wait)
 	}
 }
 
@@ -148,7 +164,7 @@ func TestDSTWireFrozenStreamIsTerminal(t *testing.T) {
 	// The kept pre-death prefix stays drainable (tcp_recvmsg reports pending
 	// data before the socket error).
 	buf := make([]byte, 8)
-	if n, _, eof, _ := s.pop(buf, 10); n != 3 || string(buf[:3]) != "pre" || eof {
+	if n, eof, _ := s.pop(buf, 10); n != 3 || string(buf[:3]) != "pre" || eof {
 		t.Errorf("pop on the frozen stream = (%d, %q, eof=%v), want (3, %q, false)", n, buf[:n], eof, "pre")
 	}
 }
@@ -223,5 +239,53 @@ func TestDSTDelayArithmeticSaturates(t *testing.T) {
 	s.closeWrite(maxI64, 0)
 	if s.closeAt != maxI64 {
 		t.Fatalf("saturated FIN deadline = %d, want %d", s.closeAt, maxI64)
+	}
+}
+
+func TestDSTWireWriteConcurrentInjectRSTLeafLock(t *testing.T) {
+	// 1. Direct leaf-lock check: holding e.out.mu and checking writeAbortedOutLocked
+	// after injectRST or horizonDie must never re-enter e.out.mu or nest e.in.mu.
+	for _, useHorizon := range []bool{false, true} {
+		aConn, bConn := dstWirePair(0, 0, 0, 0, 0, 1, 2, nil, nil)
+		a := aConn.(*dstWireEnd)
+		if useHorizon {
+			a.horizonDie()
+		} else {
+			a.injectRST()
+		}
+		wrDeadCh := a.wrDead.wait()
+		a.out.mu.Lock()
+		aborted := a.writeAbortedOutLocked(wrDeadCh)
+		a.out.mu.Unlock()
+		if !aborted {
+			t.Fatalf("useHorizon=%v: writeAbortedOutLocked = false, want true", useHorizon)
+		}
+		_ = aConn.Close()
+		_ = bConn.Close()
+	}
+
+	// 2. Concurrent Write of a 2 MiB slice racing injectRST / horizonDie across
+	// the outside-lock copy window must never self-deadlock on e.out.mu.
+	bigBuf := make([]byte, 2<<20)
+	for iter := range 64 {
+		aConn, bConn := dstWirePair(0, 0, 0, 0, 0, 1, 2, nil, nil)
+		a := aConn.(*dstWireEnd)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = a.Write(bigBuf)
+		}()
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				a.injectRST()
+			} else {
+				a.horizonDie()
+			}
+		}(iter)
+		wg.Wait()
+		_ = aConn.Close()
+		_ = bConn.Close()
 	}
 }

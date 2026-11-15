@@ -36,7 +36,7 @@ func (dstReapStubBackend) setDeadline(rd, wd bool, t time.Time) error      { ret
 func DSTFileStateReapProbe() (present func() bool) {
 	f := &file{name: "reap-probe"}
 	dstSetFileBackend(f, dstReapStubBackend{})
-	idx, ok := dstStateIndex(f.pfd.Sysfd)
+	idx, ok := dstStateIndex(dstSysfd(f))
 	if !ok {
 		panic("os: reap probe slot not set")
 	}

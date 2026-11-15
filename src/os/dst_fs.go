@@ -10,10 +10,10 @@ import (
 	"cmp"
 	"internal/filepathlite"
 	"internal/poll"
+	isync "internal/sync"
 	"io"
 	"path"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -58,7 +58,7 @@ func dstFSEpoch() uint64
 // node state is guarded by mu; per-handle state by the handle's own mutex, acquired
 // before mu where both are needed.
 var dstFS struct {
-	mu      sync.Mutex
+	mu      isync.KernelMutex
 	epoch   uint64
 	disks   map[uint32]*dstFSDisk // host id -> the host's in-memory tree
 	cwds    map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
@@ -78,7 +78,7 @@ var dstFS struct {
 const dstFSModeMask = ModePerm | ModeSetuid | ModeSetgid | ModeSticky
 
 var dstOpenFiles struct {
-	mu    sync.Mutex
+	mu    isync.KernelMutex
 	epoch uint64
 	files map[*file]dstOpenFileEntry
 	seq   uint64 // per-run registration counter (see dstOpenFileEntry.seq)
@@ -125,8 +125,22 @@ func dstUnregisterOpenFile(f *file) {
 	dstOpenFiles.mu.Unlock()
 }
 
+func dstHasOpenProcFiles(proc uint32) bool {
+	dstOpenFiles.mu.Lock()
+	defer dstOpenFiles.mu.Unlock()
+	dstOpenFilesRollLocked()
+	for _, entry := range dstOpenFiles.files {
+		if entry.proc == proc {
+			return true
+		}
+	}
+	return false
+}
+
 // dstCloseProcFiles closes the files a PROCESS opened (process crash, or exit).
 func dstCloseProcFiles(proc uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.proc == proc })
 	dstCloseProcRoots(proc)
 }
@@ -135,6 +149,8 @@ func dstCloseProcFiles(proc uint32) {
 // opened it (host crash: the kernel that held the open file descriptions is
 // gone). See dstOpenFileEntry for why this cannot key on proc.
 func dstCloseHostFiles(host uint32) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	dstCloseOpenFiles(func(e dstOpenFileEntry) bool { return e.host == host })
 	dstCloseHostRoots(host)
 }
@@ -511,6 +527,11 @@ type dstFSNode struct {
 	// Advisory flock state. This is host file-node state, not durable file
 	// content; fd and process ownership live in the lock owner key.
 	flock dstFlockState
+
+	// Scoped per-node race-detector synchronization word: dataSync orders
+	// writes/truncates before reads of this node's file data without forging
+	// cross-file or universe-global happens-before edges.
+	dataSync uint64
 }
 
 type dstFlockOwner struct {
@@ -520,8 +541,9 @@ type dstFlockOwner struct {
 }
 
 type dstFlockState struct {
-	holders map[dstFlockOwner]bool // true means exclusive, false means shared
-	wait    chan struct{}
+	holders  map[dstFlockOwner]bool // true means exclusive, false means shared
+	wait     chan struct{}
+	raceSync uint64
 }
 
 // dstErrUnsupportedFS is the inner error of every fenced operation; the same
@@ -673,11 +695,11 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "mkdir", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -788,11 +810,11 @@ func dstRemove(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "remove", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -831,11 +853,11 @@ func dstRemoveAll(name string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "removeall", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -881,11 +903,11 @@ func dstLink(oldname, newname string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep2(oldname, newname, true)
+	dstDiskDelayPath2(oldname, newname)
 	if dstProcReserved(oldname) || dstProcReserved(newname) {
 		return true, &LinkError{Op: "link", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -941,11 +963,11 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep2(oldname, newname, true)
+	dstDiskDelayPath2(oldname, newname)
 	if dstProcReserved(oldname) || dstProcReserved(newname) {
 		return true, &LinkError{Op: "rename", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1059,11 +1081,11 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	dstCoarsePathDep(name, false)
+	dstDiskDelayPath(name)
 	if fi, handled, err := dstProcStatName(op, name); handled {
 		return fi, true, err
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1077,6 +1099,7 @@ func dstStatName(op, name string) (FileInfo, bool, error) {
 	if node == nil {
 		return nil, true, &PathError{Op: op, Path: name, Err: syscall.ENOENT}
 	}
+	dstCoarseNodeRecord(node, false)
 	return dstFileInfoForNode(filepathlite.Base(name), node), true, nil
 }
 
@@ -1095,11 +1118,11 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "truncate", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1163,6 +1186,8 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 	}
 	dstNodeSetSizeLocked(node, size)
 	node.modTime = time.Now()
+	dstCoarseNodeRecord(node, true)
+	dstKernelRaceReleaseMerge(unsafe.Pointer(&node.dataSync))
 	return nil
 }
 
@@ -1171,6 +1196,7 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 // durable metadata image moves only on sync. ModTime is untouched: chmod(2)
 // updates ctime only, which is not modeled.
 func (node *dstFSNode) chmodLocked(mode FileMode) {
+	dstCoarseNodeRecord(node, true)
 	node.mode = node.mode&^dstFSModeMask | mode&dstFSModeMask
 }
 
@@ -1179,11 +1205,11 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "chmod", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1204,8 +1230,8 @@ func dstChmod(name string, mode FileMode) (handled bool, err error) {
 
 // chmodHandle implements File.Chmod on a simulated handle.
 func (d *dstFile) chmodHandle(mode FileMode) error {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -1221,11 +1247,11 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarsePathDep(name, true)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return true, &PathError{Op: "chtimes", Path: name, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(true)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1240,6 +1266,7 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 	if node == nil {
 		return wrap(syscall.ENOENT)
 	}
+	dstCoarseNodeRecord(node, true)
 	if !mtime.IsZero() {
 		node.modTime = mtime
 	}
@@ -1252,6 +1279,7 @@ func dstGetwd() (string, bool, error) {
 	if !dstFSActive() {
 		return "", false, nil
 	}
+	dstCoarseDep(dstCoarseCwdID(), false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1262,11 +1290,12 @@ func dstChdir(dir string) (handled bool, err error) {
 	if !dstFSActive() {
 		return false, nil
 	}
+	dstCoarseDep(dstCoarseNamespaceID(), false)
+	dstCoarseRecord(dstCoarseCwdID(), true)
+	dstDiskDelayPath(dir)
 	if dstProcReserved(dir) {
 		return true, &PathError{Op: "chdir", Path: dir, Err: dstErrUnsupportedFS}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1295,7 +1324,7 @@ func dstChdir(dir string) (handled bool, err error) {
 var _ dstFileBackend = (*dstFile)(nil)
 
 type dstFile struct {
-	mu     sync.Mutex
+	mu     isync.KernelMutex
 	node   *dstFSNode
 	disk   *dstFSDisk // the host disk this handle was opened on (for disk faults)
 	path   string
@@ -1304,8 +1333,9 @@ type dstFile struct {
 	rd, wr bool
 	app    bool
 	osync  bool // full O_SYNC
-	odsync bool // O_DSYNC: data and size, but not timestamps
-	closed bool
+	odsync    bool // O_DSYNC: data and size, but not timestamps
+	closed    bool
+	closeSync uint64
 	// epoch is the run this handle belongs to, stamped at creation
 	// (dstNewFile). enter() refuses a handle from a dead run as it refuses a
 	// closed one: the run's nodes were released with the run (their page
@@ -1328,6 +1358,11 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	// A create-mode or O_TRUNC open can mutate the namespace/inode; a plain open
+	// only resolves it. Announced before /proc dispatch so relative paths into
+	// /proc carry the same cwd + namespace read conflict in a single yield.
+	dstCoarsePathDep(name, flag&(O_CREATE|O_TRUNC) != 0)
+	dstDiskDelayPath(name)
 	if f, handled, err := dstProcOpenFile(name, flag); handled {
 		return f, true, err
 	}
@@ -1338,10 +1373,6 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		return wrap(syscall.ENOENT)
 	}
 
-	dstDiskDelayHere()
-	// A create-mode open can mutate the namespace; a plain open only
-	// resolves it.
-	dstCoarseNamespaceDep(flag&(O_CREATE|O_TRUNC) != 0)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1419,14 +1450,14 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	if !dstFSActive() {
 		return nil, false, nil
 	}
+	dstCoarsePathDep(name, false)
+	dstDiskDelayPath(name)
 	if dstProcReserved(name) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: dstErrUnsupportedFS}
 	}
 	wrap := func(e error) (*File, bool, error) {
 		return nil, true, &PathError{Op: "open", Path: name, Err: e}
 	}
-	dstDiskDelayHere()
-	dstCoarseNamespaceDep(false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
@@ -1453,6 +1484,8 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 // deterministically instead of touching a real descriptor
 // (dst_filestate.go).
 func dstNewFile(d dstFileBackend, name string) *File {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	if df, ok := d.(*dstFile); ok {
 		df.epoch = dstFSEpoch()
 		if df.node != nil && !df.node.isDir && !df.node.isDevice() {
@@ -1472,6 +1505,9 @@ func dstNewFile(d dstFileBackend, name string) *File {
 func (d *dstFile) enter() error {
 	d.mu.Lock()
 	if d.closed || d.epoch != dstFSEpoch() {
+		if d.closed && dstFSActive() && d.epoch == dstFSEpoch() {
+			dstKernelRaceAcquire(unsafe.Pointer(&d.closeSync))
+		}
 		d.mu.Unlock()
 		return poll.ErrFileClosing
 	}
@@ -1484,42 +1520,117 @@ func (d *dstFile) leave() {
 	d.mu.Unlock()
 }
 
+//go:linkname dstKernelSectionEnter runtime.dstKernelSectionEnter
+func dstKernelSectionEnter()
+
+//go:linkname dstKernelSectionExit runtime.dstKernelSectionExit
+func dstKernelSectionExit()
+
+//go:linkname dstKernelRaceReleaseMerge runtime.dstKernelRaceReleaseMerge
+func dstKernelRaceReleaseMerge(addr unsafe.Pointer)
+
+//go:linkname dstKernelRaceAcquire runtime.dstKernelRaceAcquire
+func dstKernelRaceAcquire(addr unsafe.Pointer)
+
 //go:linkname dstCoarseDep runtime.dstCoarseDep
-func dstCoarseDep(id uintptr, write bool, hb uintptr)
+func dstCoarseDep(id uintptr, write bool)
 
-//go:linkname dstCoarseHB runtime.dstCoarseHB
-func dstCoarseHB(id uintptr, hb uintptr)
+//go:linkname dstCoarseRecord runtime.dstCoarseRecord
+func dstCoarseRecord(id uintptr, write bool)
 
-// coarseDep announces this handle's file node as a coarse DPOR
-// dependency identity (runtime.dstCoarseDep): a data-plane op on a
-// shared file is how co-located simulated processes conflict, and the
-// announce is what lets a non-race DPOR exploration reorder two
-// processes' ops on one file. write per the op's effect; devices and
-// closed handles announce nothing (no shared object). Called BEFORE
-// enter()/the tree lock — the announce yields, and a yield under a held
-// lock would serialize every host's filesystem behind the scheduler.
-func (d *dstFile) coarseDep(write bool) {
-	d.mu.Lock()
-	node := d.node
-	closed := d.closed
-	d.mu.Unlock()
-	if closed || node == nil || node.isDevice() {
+// Synthetic coarse DPOR dependency identities partition page 0 ([1, 4095]) so
+// every domain stays collision-free against heap/global pointers on both 32-bit
+// and 64-bit targets without allocating or locking:
+//   - [1, 1024]    : per-host filesystem namespace (os)
+//   - [1025, 2048] : per-host network listener/port table (net)
+//   - [2049, 3072] : per-(host, proc) working directory (os)
+//   - [3073, 3584] : virtual OS file descriptors (os)
+//   - [3585, 4095] : simulated socket option descriptors (net)
+const (
+	dstCoarseFSNamespaceBase = 1
+	dstCoarseFSNamespaceSpan = 1024
+	dstCoarseCwdBase         = 2049
+	dstCoarseCwdSpan         = 1024
+	dstCoarseFDBase          = 3073
+	dstCoarseFDSpan          = 512
+)
+
+func dstCoarseNamespaceForHost(host uint32) uintptr {
+	return dstCoarseFSNamespaceBase + uintptr(host)%dstCoarseFSNamespaceSpan
+}
+
+func dstCoarseNamespaceID() uintptr {
+	host, _ := dstFSCurrentNode()
+	return dstCoarseNamespaceForHost(host)
+}
+
+func dstCoarseCwdID() uintptr {
+	host, proc := dstFSCurrentNode()
+	return dstCoarseCwdBase + (uintptr(host)*31+uintptr(proc))%dstCoarseCwdSpan
+}
+
+func dstCoarseFDID(fd int) uintptr {
+	return dstCoarseFDBase + uintptr(uint(fd))%dstCoarseFDSpan
+}
+
+func dstCoarseNodeRecord(node *dstFSNode, write bool) {
+	if node == nil || node.isDevice() {
 		return
 	}
-	dstCoarseDep(uintptr(unsafe.Pointer(node)), write, 0)
+	dstCoarseRecord(uintptr(unsafe.Pointer(node)), write)
+}
+
+func (d *dstFile) coarseHandleOnly(write bool) {
+	if !dstFSActive() {
+		return
+	}
+	dstCoarseDep(uintptr(unsafe.Pointer(d)), write)
+}
+
+// coarseOp announces this open file handle and, when live on a non-device
+// inode, its backing node and host disk in a single scheduling step
+// (dstCoarseDep + dstCoarseRecord). Handle-state mutators (read/write/seek/
+// readdir/close) pass handleWrite=true so concurrent cursor/close operations on
+// one *os.File conflict while independent handles (d1 != d2) and concurrent
+// pread calls on one handle still commute. Called BEFORE enter()/the tree lock.
+func (d *dstFile) coarseOp(handleWrite, nodeWrite bool) {
+	if !dstFSActive() {
+		return
+	}
+	d.mu.Lock()
+	node := d.node
+	disk := d.disk
+	closed := d.closed
+	epochOk := d.epoch == dstFSEpoch()
+	isDevice := node != nil && node.isDevice()
+	d.mu.Unlock()
+	dstCoarseDep(uintptr(unsafe.Pointer(d)), handleWrite)
+	if !closed && epochOk && node != nil && !isDevice {
+		dstCoarseRecord(uintptr(unsafe.Pointer(node)), nodeWrite)
+		if disk != nil {
+			dstCoarseRecord(uintptr(unsafe.Pointer(disk)), false)
+		}
+	}
 }
 
 // dstCoarseNamespaceDep announces the calling host's NAMESPACE as a
-// coarse dependency identity for a named (path) op: path creation,
-// removal, renaming and lookup all contend on the host's directory
-// tree, and one per-host identity is the deliberately COARSE collapse —
-// over-approximating (any two namespace ops with a write conflict) but
-// sound, and cheap where it matters (data-plane ops announce per-node
-// above). The identity is the small integer host id + 1, collision-free
-// against real pointers by construction.
+// coarse dependency identity for a named (path) op.
 func dstCoarseNamespaceDep(write bool) {
-	host, _ := dstFSCurrentNode()
-	dstCoarseDep(uintptr(host)+1, write, 0)
+	dstCoarseDep(dstCoarseNamespaceID(), write)
+}
+
+func dstCoarsePathDep(name string, write bool) {
+	dstCoarseDep(dstCoarseNamespaceID(), write)
+	if len(name) > 0 && name[0] != '/' {
+		dstCoarseRecord(dstCoarseCwdID(), false)
+	}
+}
+
+func dstCoarsePathDep2(a, b string, write bool) {
+	dstCoarseDep(dstCoarseNamespaceID(), write)
+	if (len(a) > 0 && a[0] != '/') || (len(b) > 0 && b[0] != '/') {
+		dstCoarseRecord(dstCoarseCwdID(), false)
+	}
 }
 
 // diskDelay sleeps this handle's disk's per-op latency before a disk-touching op (a
@@ -1530,18 +1641,40 @@ func dstCoarseNamespaceDep(write bool) {
 // device handle (/dev/null is not on the disk): a delay on either would be one a
 // real slow disk never imposes (DST-FAULT-SOUND).
 func (d *dstFile) diskDelay() {
+	dstKernelSectionEnter()
 	if !dstDiskSlow.Load() {
+		dstKernelSectionExit()
 		return
 	}
 	lat := d.disk.latency.Load()
 	if lat <= 0 {
+		dstKernelSectionExit()
 		return
 	}
 	d.mu.Lock()
 	skip := d.closed || (d.node != nil && d.node.isDevice())
 	d.mu.Unlock()
+	dstKernelSectionExit()
 	if !skip {
 		time.Sleep(time.Duration(lat))
+	}
+}
+
+func dstDiskDelayPath(name string) {
+	dstKernelSectionEnter()
+	slow := dstDiskSlow.Load()
+	dstKernelSectionExit()
+	if slow && !dstProcReserved(name) {
+		dstDiskDelayHere()
+	}
+}
+
+func dstDiskDelayPath2(a, b string) {
+	dstKernelSectionEnter()
+	slow := dstDiskSlow.Load()
+	dstKernelSectionExit()
+	if slow && !dstProcReserved(a) && !dstProcReserved(b) {
+		dstDiskDelayHere()
 	}
 }
 
@@ -1550,13 +1683,16 @@ func (d *dstFile) diskDelay() {
 // is only to look up the host's disk (a map read); the sleep happens after releasing
 // it. Gated like diskDelay so an unslowed run pays only the atomic load.
 func dstDiskDelayHere() {
+	dstKernelSectionEnter()
 	if !dstDiskSlow.Load() {
+		dstKernelSectionExit()
 		return
 	}
 	dstFS.mu.Lock()
 	dstFSRoll()
 	lat := dstFSDiskHere().latency.Load()
 	dstFS.mu.Unlock()
+	dstKernelSectionExit()
 	if lat > 0 {
 		time.Sleep(time.Duration(lat))
 	}
@@ -1732,86 +1868,131 @@ func (disk *dstFSDisk) diskFullForCreate() bool {
 	return disk.capped && disk.freeBlocksLocked() == 0
 }
 
-func (d *dstFile) read(b []byte) (int, error) {
+func (d *dstFile) read(b []byte) (n int, err error) {
+	d.coarseOp(true, false)
 	d.diskDelay()
-	d.coarseDep(false)
-	if err := d.enter(); err != nil {
-		return 0, err
+	var kbuf []byte
+	err = func() error {
+		if err := d.enter(); err != nil {
+			return err
+		}
+		defer d.leave()
+		if len(b) == 0 {
+			// Upstream poll.FD.Read returns (0, nil) for empty buffers before
+			// the access-mode and EOF checks; mirror that order exactly.
+			return nil
+		}
+		if !d.rd {
+			return syscall.EBADF
+		}
+		if d.node.isDir {
+			return syscall.EISDIR
+		}
+		if d.node.isDevice() {
+			// /dev/null: always empty — but the wrong-direction EBADF above
+			// still wins, as on the host. No diskEIO: the device is not on the
+			// disk.
+			return io.EOF
+		}
+		if err := d.diskEIO(); err != nil {
+			return err
+		}
+		if d.off >= int64(len(d.node.data)) {
+			dstKernelRaceAcquire(unsafe.Pointer(&d.node.dataSync))
+			return io.EOF
+		}
+		avail := min(int64(len(b)), int64(len(d.node.data))-d.off)
+		kbuf = make([]byte, avail)
+		copy(kbuf, d.node.data[d.off:d.off+avail])
+		d.off += avail
+		dstKernelRaceAcquire(unsafe.Pointer(&d.node.dataSync))
+		return nil
+	}()
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
 	}
-	defer d.leave()
-	if len(b) == 0 {
-		// Upstream poll.FD.Read returns (0, nil) for empty buffers before
-		// the access-mode and EOF checks; mirror that order exactly.
-		return 0, nil
-	}
-	if !d.rd {
-		return 0, syscall.EBADF
-	}
-	if d.node.isDir {
-		return 0, syscall.EISDIR
-	}
-	if d.node.isDevice() {
-		// /dev/null: always empty — but the wrong-direction EBADF above
-		// still wins, as on the host. No diskEIO: the device is not on the
-		// disk.
-		return 0, io.EOF
-	}
-	if err := d.diskEIO(); err != nil {
-		return 0, err
-	}
-	if d.off >= int64(len(d.node.data)) {
-		return 0, io.EOF
-	}
-	n := copy(b, d.node.data[d.off:])
-	d.off += int64(n)
-	return n, nil
+	return n, err
 }
 
-func (d *dstFile) pread(b []byte, off int64) (int, error) {
+func (d *dstFile) pread(b []byte, off int64) (n int, err error) {
+	d.coarseOp(false, false)
 	d.diskDelay()
-	d.coarseDep(false)
-	if err := d.enter(); err != nil {
-		return 0, err
+	var kbuf []byte
+	err = func() error {
+		if err := d.enter(); err != nil {
+			return err
+		}
+		defer d.leave()
+		// No empty-buffer early return (unlike read): pread is reached only from
+		// File.ReadAt's `for len(b) > 0` loop, so b is never empty here.
+		if !d.rd {
+			return syscall.EBADF
+		}
+		if d.node.isDir {
+			return syscall.EISDIR
+		}
+		if d.node.isDevice() {
+			// /dev/null: EOF at every offset (host-verified via ReadAt).
+			return io.EOF
+		}
+		if err := d.diskEIO(); err != nil {
+			return err
+		}
+		if off >= int64(len(d.node.data)) {
+			dstKernelRaceAcquire(unsafe.Pointer(&d.node.dataSync))
+			return io.EOF
+		}
+		avail := min(int64(len(b)), int64(len(d.node.data))-off)
+		if avail > 0 {
+			kbuf = make([]byte, avail)
+			copy(kbuf, d.node.data[off:off+avail])
+		}
+		dstKernelRaceAcquire(unsafe.Pointer(&d.node.dataSync))
+		return nil
+	}()
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
 	}
-	defer d.leave()
-	// No empty-buffer early return (unlike read): pread is reached only from
-	// File.ReadAt's `for len(b) > 0` loop, so b is never empty here.
-	if !d.rd {
-		return 0, syscall.EBADF
-	}
-	if d.node.isDir {
-		return 0, syscall.EISDIR
-	}
-	if d.node.isDevice() {
-		// /dev/null: EOF at every offset (host-verified via ReadAt).
-		return 0, io.EOF
-	}
-	if err := d.diskEIO(); err != nil {
-		return 0, err
-	}
-	if off >= int64(len(d.node.data)) {
-		return 0, io.EOF
-	}
-	return copy(b, d.node.data[off:]), nil
+	return n, err
 }
 
-func (d *dstFile) write(b []byte) (int, error) {
-	d.diskDelay()
-	d.coarseDep(true)
+// writePreflight checks immutable/monotonic handle gates before copying from
+// the caller's slice, so closed/read-only handles and /dev/null never touch or
+// allocate for b.
+func (d *dstFile) writePreflight(n int) (done bool, written int, err error) {
 	if err := d.enter(); err != nil {
-		return 0, err
+		return true, 0, err
 	}
 	defer d.leave()
 	if !d.wr {
-		return 0, syscall.EBADF
+		return true, 0, syscall.EBADF
 	}
 	if d.node.isDevice() {
 		// /dev/null: the write discards its bytes and reports the full
 		// count. No disk coupling (EIO/ENOSPC/latency), no mtime movement,
 		// no O_SYNC commit — the device stores nothing and is not on the
 		// disk (all host-verified, including the unchanged mtime).
-		return len(b), nil
+		return true, n, nil
 	}
+	return false, 0, nil
+}
+
+func (d *dstFile) write(b []byte) (n int, err error) {
+	d.coarseOp(true, true)
+	d.diskDelay()
+	if done, wn, preErr := d.writePreflight(len(b)); done {
+		return wn, preErr
+	}
+	var kbuf []byte
+	if len(b) > 0 {
+		take := min(int64(len(b)), dstSMaxBytes)
+		kbuf = make([]byte, take)
+		copy(kbuf, b[:take])
+	}
+	if err := d.enter(); err != nil {
+		return 0, err
+	}
+	defer d.leave()
 	// The write position is a COPY of the handle offset, mirroring the
 	// kernel: ksys_write hands vfs_write a copy of f_pos and stores it back
 	// only for a non-negative return, so every error exit — EFBIG, EIO, a
@@ -1837,7 +2018,10 @@ func (d *dstFile) write(b []byte) (int, error) {
 	if allowed == 0 && len(b) > 0 {
 		return 0, refuse
 	}
-	n, werr := d.writeAtLocked(b[:allowed], pos)
+	n, werr := d.writeAtLocked(kbuf[:allowed], pos)
+	if n > 0 {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&d.node.dataSync))
+	}
 	if werr != nil {
 		return n, werr
 	}
@@ -1889,21 +2073,22 @@ func (d *dstFile) write(b []byte) (int, error) {
 	return n, nil
 }
 
-func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
+func (d *dstFile) pwrite(b []byte, off int64) (n int, err error) {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
+	if done, wn, preErr := d.writePreflight(len(b)); done {
+		return wn, preErr
+	}
+	var kbuf []byte
+	if len(b) > 0 {
+		take := min(int64(len(b)), dstSMaxBytes)
+		kbuf = make([]byte, take)
+		copy(kbuf, b[:take])
+	}
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
 	defer d.leave()
-	if !d.wr {
-		return 0, syscall.EBADF
-	}
-	if d.node.isDevice() {
-		// /dev/null: discard and report the full count at any offset, as in
-		// write (host-verified via WriteAt).
-		return len(b), nil
-	}
 	if d.app {
 		// Linux pwrite(2), BUGS section: on a file opened O_APPEND, pwrite
 		// APPENDS to the end of the file regardless of the offset.
@@ -1929,7 +2114,10 @@ func (d *dstFile) pwrite(b []byte, off int64) (int, error) {
 	if allowed == 0 && len(b) > 0 {
 		return 0, refuse
 	}
-	n, werr := d.writeAtLocked(b[:allowed], off)
+	n, werr := d.writeAtLocked(kbuf[:allowed], off)
+	if n > 0 {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&d.node.dataSync))
+	}
 	if werr != nil {
 		return n, werr
 	}
@@ -1994,14 +2182,20 @@ func (d *dstFile) writeAtLocked(b []byte, off int64) (int, error) {
 
 func (d *dstFile) seek(offset int64, whence int) (int64, error) {
 	if whence == io.SeekEnd {
-		// SEEK_END reads the shared file size — the one seek form whose
-		// result a peer's concurrent append/truncate determines.
-		d.coarseDep(false)
+		// SEEK_END reads the shared file size (or directory entry count) —
+		// the seek form whose result a peer's concurrent append/truncate/create
+		// determines, while all seeks mutate this handle's cursor.
+		d.coarseOp(true, false)
+	} else {
+		d.coarseHandleOnly(true)
 	}
 	if err := d.enter(); err != nil {
 		return 0, err
 	}
 	defer d.leave()
+	if whence == io.SeekEnd && d.node.isDir {
+		dstCoarseRecord(dstCoarseNamespaceID(), false)
+	}
 	if d.node.isDevice() {
 		// /dev/null: lseek succeeds and the position is pinned at 0 — every
 		// whence, every offset, including negative ones that would be EINVAL
@@ -2072,8 +2266,11 @@ func (d *dstFile) sortedEntryNamesLocked() []string {
 // simulated directory handle: sorted names with a stable cursor for chunked
 // (n > 0) reads; io.EOF at exhaustion for chunked mode, as the host funnel.
 func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
+	d.coarseOp(true, false)
+	if dstFSActive() {
+		dstCoarseRecord(dstCoarseNamespaceID(), false)
+	}
 	d.diskDelay()
-	d.coarseDep(false)
 	if e := d.enter(); e != nil {
 		return nil, nil, e
 	}
@@ -2116,6 +2313,10 @@ func (d *dstFile) readdir(n int) (names []string, infos []FileInfo, err error) {
 
 // chdirHandle implements File.Chdir for a simulated directory handle.
 func (d *dstFile) chdirHandle() error {
+	d.coarseHandleOnly(false)
+	if dstFSActive() {
+		dstCoarseRecord(dstCoarseCwdID(), true)
+	}
 	if e := d.enter(); e != nil {
 		return e
 	}
@@ -2128,8 +2329,8 @@ func (d *dstFile) chdirHandle() error {
 }
 
 func (d *dstFile) truncate(size int64) error {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2173,8 +2374,8 @@ func (d *dstFile) truncate(size int64) error {
 const dstFallocSupportedMask = 0x7B
 
 func (d *dstFile) fallocate(mode int, off, length int64) error {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2233,8 +2434,8 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 // other writer is the host-crash restore, which re-bases the durable image
 // to the platter's post-crash state (dstRestoreNodeLocked).
 func (d *dstFile) sync() error {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2260,8 +2461,8 @@ func (d *dstFile) sync() error {
 }
 
 func (d *dstFile) datasync() error {
+	d.coarseOp(false, true)
 	d.diskDelay()
-	d.coarseDep(true)
 	if err := d.enter(); err != nil {
 		return err
 	}
@@ -2500,7 +2701,7 @@ func (d *dstFile) stat() (FileInfo, error) {
 	// fstat reads shared node state (size, mtime) a peer's write moves —
 	// a coarse read-conflict on the node (no disk delay: fstat stays an
 	// in-core read; the announce is a dependency record, not a device op).
-	d.coarseDep(false)
+	d.coarseOp(false, false)
 	if err := d.enter(); err != nil {
 		return nil, err
 	}
@@ -2515,9 +2716,13 @@ func (d *dstFile) stat() (FileInfo, error) {
 // closed handle reports the (also unwrapped) closed shape first. Pipes are
 // the pollable case — see dst_pipe.go.
 func (d *dstFile) setDeadline(rd, wd bool, t time.Time) error {
+	d.coarseHandleOnly(false)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
+		if dstFSActive() && d.epoch == dstFSEpoch() {
+			dstKernelRaceAcquire(unsafe.Pointer(&d.closeSync))
+		}
 		return poll.ErrFileClosing
 	}
 	return poll.ErrNoDeadline
@@ -2526,12 +2731,19 @@ func (d *dstFile) setDeadline(rd, wd bool, t time.Time) error {
 // closeFile closes the handle. The node stays alive while other handles or
 // directory entries reference it.
 func (d *dstFile) closeFile() error {
+	d.coarseHandleOnly(true)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
+		if dstFSActive() && d.epoch == dstFSEpoch() {
+			dstKernelRaceAcquire(unsafe.Pointer(&d.closeSync))
+		}
 		return poll.ErrFileClosing
 	}
 	d.closed = true
+	if dstFSActive() && d.epoch == dstFSEpoch() {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&d.closeSync))
+	}
 	return nil
 }
 

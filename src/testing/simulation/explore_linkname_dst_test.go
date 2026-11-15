@@ -23,9 +23,6 @@ func dstAccessYieldFP() uint64
 //go:linkname dstAccessYieldReset runtime.dstAccessYieldReset
 func dstAccessYieldReset()
 
-//go:linkname dstYieldPoint runtime.dstYieldPoint
-func dstYieldPoint()
-
 //go:linkname dstSetPostGoYield runtime.dstSetPostGoYield
 func dstSetPostGoYield(enabled bool) bool
 

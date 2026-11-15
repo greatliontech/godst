@@ -17,3 +17,19 @@ func dstSyncReleaseRWMutexRUnlock(rw *RWMutex) {}
 func dstSyncAcquireHBRWMutexLock(rw *RWMutex) {}
 
 func dstSyncAcquireHBRWMutexRLock(rw *RWMutex) {}
+
+func dstSyncAcquireOnce(o *Once) {}
+
+func dstSyncReleaseOnce(o *Once) {}
+
+func dstSyncAcquireHBOnce(o *Once) {}
+
+func dstSyncObserveWaitGroup(wg *WaitGroup) {}
+
+func dstSyncAcquireWaitGroup(wg *WaitGroup) {}
+
+func dstSyncReleaseWaitGroup(wg *WaitGroup) {}
+
+func dstSyncAcquireHBWaitGroup(wg *WaitGroup) {}
+
+func dstSyncAcquireCond(c *Cond) {}

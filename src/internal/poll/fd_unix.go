@@ -81,7 +81,11 @@ func (fd *FD) destroy() error {
 
 	err := fd.SysFile.destroy(fd.Sysfd)
 
-	fd.Sysfd = -1
+	if dstSimEnabled {
+		dstClearSysfd(&fd.Sysfd)
+	} else {
+		fd.Sysfd = -1
+	}
 	runtime_Semrelease(&fd.csema)
 	return err
 }

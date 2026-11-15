@@ -7,16 +7,34 @@
 package net
 
 import (
+	isync "internal/sync"
 	"io"
 	"math"
 	"math/bits"
 	"os"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	_ "unsafe" // for go:linkname
+	"unsafe"
 )
+
+//go:linkname dstKernelSectionEnter runtime.dstKernelSectionEnter
+func dstKernelSectionEnter()
+
+//go:linkname dstKernelSectionExit runtime.dstKernelSectionExit
+func dstKernelSectionExit()
+
+//go:linkname dstKernelRaceReleaseMerge runtime.dstKernelRaceReleaseMerge
+func dstKernelRaceReleaseMerge(addr unsafe.Pointer)
+
+//go:linkname dstKernelRaceAcquire runtime.dstKernelRaceAcquire
+func dstKernelRaceAcquire(addr unsafe.Pointer)
+
+//go:linkname dstCoarseDep runtime.dstCoarseDep
+func dstCoarseDep(id uintptr, write bool)
+
+//go:linkname dstCoarseRecord runtime.dstCoarseRecord
+func dstCoarseRecord(id uintptr, write bool)
 
 //go:linkname dstNetSendBufferBytes runtime.dstNetSendBufferBytes
 func dstNetSendBufferBytes() int64
@@ -103,13 +121,13 @@ type dstSeg struct {
 // head-of-line, bunches the ones behind it), never the ORDER. So a live stream is
 // never reordered (DST-NET-FIFO) without any need to clamp deliverAt.
 type dstStream struct {
-	mu         sync.Mutex
+	mu         isync.KernelMutex
 	segs       []dstSeg
 	linkFreeAt int64         // base-time when the bandwidth-limited link finishes transmitting all queued bytes
 	closed     bool          // writer end closed: the reader drains, then sees EOF
 	closeAt    int64         // base-time the writer closed (the FIN's arrival); valid iff closed
-	ready      chan struct{} // buffered(1) wakeup, pinged on append/close (wakes the READER)
-	space      chan struct{} // buffered(1) wakeup, pinged on pop (wakes a blocked WRITER)
+	readyGen   chan struct{} // lazy broadcast generation closed on append/close/poke (wakes blocked READERS)
+	spaceGen   chan struct{} // lazy broadcast generation closed on pop/teardown (wakes blocked WRITERS)
 	buffered   int64         // bytes written but not yet consumed by the reader — the send-buffer occupancy
 	capacity   int64         // send-buffer capacity in bytes; 0 = unbounded (a write never blocks)
 	frozen     bool          // the receiving socket died (injected RST or retransmit-horizon death): later pushes are discarded (freezeAtHorizon)
@@ -122,30 +140,59 @@ type dstStream struct {
 	// retransmissions into a cut exhaust: heldBeyond keeps reporting them held
 	// even though the segments themselves are gone from the queue.
 	deadDropped bool
+	raceSync    uint64 // per-direction data happens-before word (writer -> reader)
+	eofSync     uint64 // per-direction FIN happens-before word (closeWrite -> drained EOF reader)
+	freezeSync  uint64 // per-direction socket-death happens-before word (freezeAtHorizon -> terminal error observer)
 }
 
 func newDstStream(capacity int64) *dstStream {
 	return &dstStream{
-		ready:    make(chan struct{}, 1),
-		space:    make(chan struct{}, 1),
 		capacity: capacity,
 	}
 }
 
-// wake signals a (possibly) blocked reader without blocking the signaler.
-func (s *dstStream) wake() {
-	select {
-	case s.ready <- struct{}{}:
-	default:
+func (s *dstStream) readyChLocked() <-chan struct{} {
+	if s.readyGen == nil {
+		s.readyGen = make(chan struct{})
+	}
+	return s.readyGen
+}
+
+func (s *dstStream) bumpReadyLocked() {
+	if s.readyGen != nil {
+		close(s.readyGen)
+		s.readyGen = nil
 	}
 }
 
-// wakeWriter signals a (possibly) blocked writer that send-buffer space freed.
-func (s *dstStream) wakeWriter() {
-	select {
-	case s.space <- struct{}{}:
-	default:
+func (s *dstStream) spaceChLocked() <-chan struct{} {
+	if s.spaceGen == nil {
+		s.spaceGen = make(chan struct{})
 	}
+	return s.spaceGen
+}
+
+func (s *dstStream) bumpSpaceLocked() {
+	if s.spaceGen != nil {
+		close(s.spaceGen)
+		s.spaceGen = nil
+	}
+}
+
+// wake broadcasts to any readers parked on readyGen without leaking reverse or
+// peer-to-peer channel happens-before edges.
+func (s *dstStream) wake() {
+	s.mu.Lock()
+	s.bumpReadyLocked()
+	s.mu.Unlock()
+}
+
+// wakeWriter broadcasts to any writers parked on spaceGen without leaking
+// reverse or peer-to-peer channel happens-before edges.
+func (s *dstStream) wakeWriter() {
+	s.mu.Lock()
+	s.bumpSpaceLocked()
+	s.mu.Unlock()
 }
 
 // pushLocked appends a copy of b for delivery from now, with the caller
@@ -162,6 +209,10 @@ func (s *dstStream) wakeWriter() {
 // dead=true when the segment was discarded because the receiving socket is
 // gone (frozen) — the caller surfaces the sender-side consequence.
 func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64) (dead bool) {
+	return s.pushOwnedLocked(append([]byte(nil), b...), latencyNs, jitterNs, bandwidthBps)
+}
+
+func (s *dstStream) pushOwnedLocked(data []byte, latencyNs, jitterNs, bandwidthBps int64) (dead bool) {
 	if s.frozen {
 		// The receiving socket died (an injected RST or a retransmit-horizon
 		// death — a CLOSED socket): a late segment is answered with an RST,
@@ -171,7 +222,6 @@ func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64
 		s.deadDropped = true
 		return true
 	}
-	data := append([]byte(nil), b...)
 	transmitEnd := dstBaseNanos()
 	if bandwidthBps > 0 {
 		// Serialize transmission at bandwidthBps bytes/sec: this segment starts when
@@ -183,7 +233,7 @@ func (s *dstStream) pushLocked(b []byte, latencyNs, jitterNs, bandwidthBps int64
 		if s.linkFreeAt > transmitEnd {
 			transmitEnd = s.linkFreeAt
 		}
-		transmitEnd = dstDelayAdd(transmitEnd, dstTransmitNanos(int64(len(b)), bandwidthBps))
+		transmitEnd = dstDelayAdd(transmitEnd, dstTransmitNanos(int64(len(data)), bandwidthBps))
 		s.linkFreeAt = transmitEnd
 	}
 	at := dstDelayAdd(dstDelayAdd(transmitEnd, latencyNs), dstFaultRandN(jitterNs))
@@ -273,14 +323,14 @@ func dstLinkDelay(latencyNs, jitterNs int64) int64 {
 // resurrect a clean EOF on a dead end.
 func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.frozen {
-		s.mu.Unlock()
 		return
 	}
 	s.closed = true
 	s.closeAt = dstDelayAdd(dstDelayAdd(dstBaseNanos(), latencyNs), dstFaultRandN(jitterNs))
-	s.mu.Unlock()
-	s.wake()
+	dstKernelRaceReleaseMerge(unsafe.Pointer(&s.eofSync))
+	s.bumpReadyLocked()
 }
 
 // pop copies bytes that have ARRIVED (deliverAt <= maxArrival) into b, coalescing
@@ -290,37 +340,53 @@ func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
 // caller's arrival horizon: base-time now normally, or the partition cut-start while
 // cut (so only bytes that reached the receive buffer before the cut are readable).
 //
-// Returns: n>0 with remain=true when ANY segment is still queued after filling b —
-// arrived (b filled first) OR in-flight. The caller re-wakes on remain so a second
-// blocked reader is signaled; the cap-1 ready channel cannot hold a second ping, and
-// a reader parked on an empty queue has no timer of its own, so re-waking on an
-// in-flight remainder too (not just arrived bytes) is what lets it arm a timer for
-// that segment instead of stranding. eof=true when the writer's close has arrived
-// (closeAt <= maxArrival) and no segments remain; otherwise wait is the base-time
-// duration until the head segment arrives (>0), or wait<0 when nothing is pending
-// within the horizon (block until woken).
-func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wait time.Duration) {
+// Returns n>0 when arrived bytes were copied; eof=true when the writer's close has
+// arrived (closeAt <= maxArrival) and no segments remain; otherwise wait is the
+// base-time duration until the head segment or FIN arrives (>0), or wait<0 when
+// nothing is pending within the horizon (block until readyCh closes).
+func (s *dstStream) pop(b []byte, maxArrival int64) (n int, eof bool, wait time.Duration) {
+	kbuf, _, eof, wait := s.popBytes(len(b), maxArrival)
+	if len(kbuf) > 0 {
+		n = copy(b, kbuf)
+	}
+	return n, eof, wait
+}
+
+func (s *dstStream) popBytes(maxBytes int, maxArrival int64) (kbuf []byte, readyCh <-chan struct{}, eof bool, wait time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for len(s.segs) > 0 && n < len(b) {
-		head := &s.segs[0]
-		if head.deliverAt > maxArrival {
-			// Head not yet arrived within the horizon. If we already copied some,
-			// return it (a segment remains → remain=true); else report the wait until
-			// this segment arrives (only meaningful when maxArrival is base-time now —
-			// a partition caps the horizon at cut-start, and the caller blocks on the
-			// heal instead).
-			if n > 0 {
-				return n, true, false, 0
-			}
-			return 0, false, false, time.Duration(head.deliverAt - maxArrival)
+	avail := 0
+	for i := 0; i < len(s.segs) && avail < maxBytes; i++ {
+		if s.segs[i].deliverAt > maxArrival {
+			break
 		}
-		c := copy(b[n:], head.data)
+		avail += min(maxBytes-avail, len(s.segs[i].data))
+	}
+	if avail == 0 {
+		if s.closed && s.closeAt <= maxArrival && len(s.segs) == 0 {
+			dstKernelRaceAcquire(unsafe.Pointer(&s.raceSync))
+			dstKernelRaceAcquire(unsafe.Pointer(&s.eofSync))
+			return nil, nil, true, 0
+		}
+		ch := s.readyChLocked()
+		if len(s.segs) > 0 && maxBytes > 0 && s.segs[0].deliverAt > maxArrival {
+			return nil, ch, false, time.Duration(s.segs[0].deliverAt - maxArrival)
+		}
+		if s.closed && len(s.segs) == 0 && s.closeAt > maxArrival {
+			return nil, ch, false, time.Duration(s.closeAt - maxArrival)
+		}
+		return nil, ch, false, -1
+	}
+	kbuf = make([]byte, avail)
+	n := 0
+	for len(s.segs) > 0 && n < avail {
+		head := &s.segs[0]
+		c := copy(kbuf[n:], head.data)
 		n += c
-		s.buffered -= int64(c) // consumed by the reader: frees the peer's send-buffer space (unread for capacity==0/unbounded, where the writer never consults it)
+		s.buffered -= int64(c) // consumed by the reader: frees the peer's send-buffer space
 		if c < len(head.data) {
 			head.data = head.data[c:]
-			return n, true, false, 0 // b full mid-segment, bytes remain: signal another reader
+			break
 		}
 		s.segs[0] = dstSeg{} // release the delivered buffer (don't retain it in the backing array)
 		s.segs = s.segs[1:]
@@ -328,21 +394,9 @@ func (s *dstStream) pop(b []byte, maxArrival int64) (n int, remain, eof bool, wa
 			s.segs = nil
 		}
 	}
-	if n > 0 {
-		// Re-signal iff any segment remains — arrived (b filled at a boundary) or
-		// in-flight. A woken second reader either grabs arrived bytes (re-waking
-		// again) or arms a timer for the in-flight head; either terminates. A reader
-		// that pops nothing does not re-wake, so there is no spin.
-		terminal := s.closed && s.closeAt <= maxArrival && len(s.segs) == 0
-		return n, len(s.segs) > 0 || terminal, false, 0
-	}
-	if s.closed && s.closeAt <= maxArrival && len(s.segs) == 0 {
-		return 0, false, true, 0
-	}
-	if s.closed && len(s.segs) == 0 && s.closeAt > maxArrival {
-		return 0, false, false, time.Duration(s.closeAt - maxArrival)
-	}
-	return 0, false, false, -1
+	dstKernelRaceAcquire(unsafe.Pointer(&s.raceSync))
+	s.bumpSpaceLocked()
+	return kbuf, nil, false, 0
 }
 
 // dstWireEnd is one endpoint of a dstWire; it implements net.Conn with the same
@@ -374,7 +428,7 @@ type dstWireEnd struct {
 	// episode (-1 = none: the socket is idle-waiting or its probes are being
 	// answered); kaAckAt the last answered-probe instant (an activity
 	// signal, as the probe's ACK resets the kernel's idle clock).
-	kaMu        sync.Mutex
+	kaMu        isync.KernelMutex
 	kaArmed     bool
 	kaEpisode   int64
 	kaAckAt     int64
@@ -390,11 +444,12 @@ type dstWireEnd struct {
 	// heal-then-recut restarts the window (the heal-resets precedent, erring
 	// toward fewer/later ETIMEDOUTs). horizonKill closes when the watchdog kills
 	// the end, waking blocked reads/writes to observe timedOut.
-	horizonMu     sync.Mutex
+	horizonMu     isync.KernelMutex
 	horizonArmed  bool
 	horizonAnchor int64 // base-time the current undeliverable episode was first observed
-	horizonOnce   sync.Once
+	horizonOnce   isync.KernelOnce
 	horizonKill   chan struct{}
+	horizonSync   uint64
 
 	// An RST arrived at this end (fault matcher, crash teardown, or the RST a
 	// dead peer socket answers a live segment with — dstDeadPushRST): reads
@@ -407,8 +462,9 @@ type dstWireEnd struct {
 	// into this queue after the RST — a real CLOSED socket answers such a
 	// late segment with an RST of its own, never queues it.
 	rstArrived atomic.Bool
-	rstOnce    sync.Once
+	rstOnce    isync.KernelOnce
 	rstKill    chan struct{}
+	rstSync    uint64
 
 	// rstCloseWait records that the injected RST arrived with the peer's FIN
 	// already delivered — production CLOSE_WAIT, where tcp_reset pends EPIPE
@@ -417,12 +473,78 @@ type dstWireEnd struct {
 	// consumed by the dstConn wrapper's consumeSkErr.
 	rstCloseWait atomic.Bool
 
-	once       sync.Once
-	localDone  chan struct{}
-	remoteDone chan struct{} // the peer's localDone
+	once          isync.KernelOnce
+	closeSync     uint64
+	peerCloseSync *uint64
+	localDone     chan struct{}
+	remoteDone    chan struct{} // the peer's localDone
 
-	rdDead pipeDeadline
-	wrDead pipeDeadline
+	rdDead dstDeadline
+	wrDead dstDeadline
+}
+
+// dstDeadline tracks a read or write deadline on a dstWireEnd under a leaf
+// KernelMutex so concurrent Read, Write, and SetDeadline calls do not publish
+// internal mutex happens-before edges across callers.
+type dstDeadline struct {
+	mu     isync.KernelMutex
+	timer  *time.Timer
+	cancel chan struct{}
+	seq    uint64
+}
+
+func makeDstDeadline() dstDeadline {
+	return dstDeadline{cancel: make(chan struct{})}
+}
+
+// dstIsClosedKernelChan probes a modeled-kernel close/deadline broadcast
+// channel without announcing a spurious user-channel write-conflict or TSan
+// sync event across unrelated Read/Write callers.
+func dstIsClosedKernelChan(c <-chan struct{}) bool {
+	dstKernelSectionEnter()
+	closed := isClosedChan(c)
+	dstKernelSectionExit()
+	return closed
+}
+
+func (d *dstDeadline) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	d.seq++
+	closed := isClosedChan(d.cancel)
+	if t.IsZero() {
+		if closed {
+			d.cancel = make(chan struct{})
+		}
+		return
+	}
+	if dur := time.Until(t); dur > 0 {
+		if closed {
+			d.cancel = make(chan struct{})
+		}
+		seq := d.seq
+		d.timer = time.AfterFunc(dur, func() {
+			d.mu.Lock()
+			if d.seq == seq && !isClosedChan(d.cancel) {
+				close(d.cancel)
+			}
+			d.mu.Unlock()
+		})
+		return
+	}
+	if !closed {
+		close(d.cancel)
+	}
+}
+
+func (d *dstDeadline) wait() chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cancel
 }
 
 // dstWirePair builds the two ends of a connection between dialerHost
@@ -433,6 +555,8 @@ type dstWireEnd struct {
 // enabled) happens here, at establishment — the kernel's keepalive timer arms
 // when the connection does.
 func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, dialerHost, listenHost uint32, dialerOpts, serverOpts *dstSockOpts) (Conn, Conn) {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
 	ab, ba := newDstStream(capacity), newDstStream(capacity)
 	doneA, doneB := make(chan struct{}), make(chan struct{})
 	born := dstBaseNanos()
@@ -441,15 +565,17 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 		localHost: dialerHost, peerHost: listenHost,
 		opts: dialerOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
-		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
+		rdDead: makeDstDeadline(), wrDead: makeDstDeadline(),
 	}
 	b := &dstWireEnd{
 		out: ba, in: ab, latencyNs: latencyNs, jitterNs: jitterNs, bandwidthBps: bandwidthBps, retransNs: retransNs,
 		localHost: listenHost, peerHost: dialerHost,
 		opts: serverOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
-		rdDead: makePipeDeadline(), wrDead: makePipeDeadline(),
+		rdDead: makeDstDeadline(), wrDead: makeDstDeadline(),
 	}
+	a.peerCloseSync = &b.closeSync
+	b.peerCloseSync = &a.closeSync
 	if dialerOpts != nil {
 		dialerOpts.setKick(a.kaPoke)
 	}
@@ -556,7 +682,7 @@ func (e *dstWireEnd) kaUnanswerable() bool {
 // already expired (the errs-later anchor: an unobserved conn's probes
 // before the arm are not presumed to have failed).
 func (e *dstWireEnd) armKeepalive() {
-	if e.opts == nil || e.timedOut.Load() || e.rstArrived.Load() {
+	if e.opts == nil || e.isTimedOutKernel() || e.isRSTArrivedKernel() {
 		return
 	}
 	enabled, idleNs, _, _, _ := e.opts.kaParams()
@@ -628,7 +754,7 @@ func (e *dstWireEnd) kaCheck() {
 		e.kaProbesOut = 0
 		e.kaMu.Unlock()
 	}
-	if e.opts == nil || e.timedOut.Load() || e.rstArrived.Load() || isClosedChan(e.localDone) {
+	if e.opts == nil || e.isTimedOutKernel() || e.isRSTArrivedKernel() || dstIsClosedKernelChan(e.localDone) {
 		disarm()
 		return
 	}
@@ -745,7 +871,7 @@ func (s *dstStream) heldBeyond(cutStart int64) bool {
 // sound direction).
 func (e *dstWireEnd) armHorizon() {
 	horizon := e.effRetransNs()
-	if horizon <= 0 || e.timedOut.Load() {
+	if horizon <= 0 || e.isTimedOutKernel() {
 		return
 	}
 	e.horizonMu.Lock()
@@ -769,7 +895,7 @@ func (e *dstWireEnd) horizonCheck() {
 	// timeout first, RST later — keeps ETIMEDOUT: read and write consult
 	// timedOut first, matching a kernel that stopped accepting segments
 	// when retransmission exhausted.)
-	if e.timedOut.Load() || e.rstArrived.Load() || isClosedChan(e.localDone) {
+	if e.isTimedOutKernel() || e.isRSTArrivedKernel() || dstIsClosedKernelChan(e.localDone) {
 		e.horizonMu.Lock()
 		e.horizonArmed = false
 		e.horizonMu.Unlock()
@@ -831,6 +957,86 @@ func (e *dstWireEnd) horizonCheck() {
 	e.horizonDie()
 }
 
+func (s *dstStream) acquireFreezeSync() {
+	s.mu.Lock()
+	if s.frozen {
+		dstKernelRaceAcquire(unsafe.Pointer(&s.freezeSync))
+	}
+	s.mu.Unlock()
+}
+
+func (e *dstWireEnd) isTimedOutKernel() bool {
+	dstKernelSectionEnter()
+	v := e.timedOut.Load()
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) acquireHorizonSync() {
+	dstKernelSectionEnter()
+	dstKernelRaceAcquire(unsafe.Pointer(&e.horizonSync))
+	dstKernelSectionExit()
+	e.in.acquireFreezeSync()
+	e.out.acquireFreezeSync()
+}
+
+func (e *dstWireEnd) isTimedOutAcquire() bool {
+	if !e.isTimedOutKernel() {
+		return false
+	}
+	e.acquireHorizonSync()
+	return true
+}
+
+func (e *dstWireEnd) isRSTArrivedKernel() bool {
+	dstKernelSectionEnter()
+	v := e.rstArrived.Load()
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) acquireRSTSync() {
+	dstKernelSectionEnter()
+	dstKernelRaceAcquire(unsafe.Pointer(&e.rstSync))
+	dstKernelSectionExit()
+	e.in.acquireFreezeSync()
+	e.out.acquireFreezeSync()
+}
+
+func (e *dstWireEnd) isRSTArrivedAcquire() bool {
+	if !e.isRSTArrivedKernel() {
+		return false
+	}
+	e.acquireRSTSync()
+	return true
+}
+
+func (e *dstWireEnd) isRSTCloseWaitAcquire() bool {
+	dstKernelSectionEnter()
+	cw := e.rstCloseWait.Load()
+	if cw {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.in.eofSync))
+	}
+	dstKernelSectionExit()
+	return cw
+}
+
+func (e *dstWireEnd) acquireLocalCloseSync() {
+	dstKernelSectionEnter()
+	dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
+	dstKernelSectionExit()
+}
+
+func (e *dstWireEnd) acquirePeerCloseSync() {
+	dstKernelSectionEnter()
+	if e.peerCloseSync != nil {
+		dstKernelRaceAcquire(unsafe.Pointer(e.peerCloseSync))
+	}
+	dstKernelSectionExit()
+	e.in.acquireFreezeSync()
+	e.out.acquireFreezeSync()
+}
+
 // horizonDie kills this end at its retransmit horizon. Retransmission
 // exhaustion runs tcp_write_err → tcp_done: sk_err = ETIMEDOUT pends (the
 // one-shot identity — read/write consult timedOut) and the socket is CLOSED,
@@ -847,6 +1053,14 @@ func (e *dstWireEnd) horizonCheck() {
 // arrived-strictly-before-the-cut boundary pop and injectRST use. Wakes every
 // blocked operation on both ends so each re-evaluates.
 func (e *dstWireEnd) horizonDie() {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+	dstAcquirePartFaultSync(e.localHost, e.peerHost)
+	e.in.acquireFreezeSync()
+	e.out.acquireFreezeSync()
+	dstKernelRaceReleaseMerge(unsafe.Pointer(&e.horizonSync))
 	e.timedOut.Store(true)
 	inHorizon := dstBaseNanos()
 	if cutStart, cut, _ := dstPartCutStartDir(e.peerHost, e.localHost); cut && cutStart-1 < inHorizon {
@@ -881,6 +1095,10 @@ func (e *dstWireEnd) horizonDie() {
 // only bytes that arrived strictly before the cut are in the receive queue;
 // everything the cut holds dies with the connection.
 func (e *dstWireEnd) injectRST() {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
 	// Once-guarded: a second injection (two fault ops racing to the same
 	// conn) must not re-freeze at a later horizon and resurrect bytes the
 	// first RST already killed.
@@ -894,6 +1112,9 @@ func (e *dstWireEnd) injectRST() {
 			// the RST met a CLOSE_WAIT socket (tcp_reset pends EPIPE there).
 			e.rstCloseWait.Store(true)
 		}
+		e.in.acquireFreezeSync()
+		e.out.acquireFreezeSync()
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.rstSync))
 		e.rstArrived.Store(true)
 		close(e.rstKill)
 	})
@@ -928,7 +1149,7 @@ func (e *dstWireEnd) probeDeadPeer(needDropped bool) bool {
 	if !frozen || (needDropped && !dropped) {
 		return false
 	}
-	if e.timedOut.Load() || e.rstArrived.Load() ||
+	if e.isTimedOutKernel() || e.isRSTArrivedKernel() ||
 		dstPartitionedDir(e.localHost, e.peerHost) || dstPartitionedDir(e.peerHost, e.localHost) ||
 		dstHostDead(e.peerHost) {
 		// A DEAD peer host answers nothing (power loss has no kernel to RST
@@ -965,6 +1186,7 @@ func (e *dstWireEnd) probeDeadPeer(needDropped bool) bool {
 func (s *dstStream) freezeAtHorizon(horizon int64) (finArrived bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	dstKernelRaceReleaseMerge(unsafe.Pointer(&s.freezeSync))
 	s.frozen = true
 	live := 0
 	for live < len(s.segs) && s.segs[live].deliverAt <= horizon {
@@ -1011,7 +1233,61 @@ func (e *dstWireEnd) unreadInbound() bool {
 	return e.in.buffered > 0
 }
 
+func (e *dstWireEnd) coarseRead() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.eofSync)), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), false)
+	if e.localHost != e.peerHost {
+		dstCoarseRecord(dstCoarseNetHostID(e.localHost), false)
+		dstCoarseRecord(dstCoarseNetHostID(e.peerHost), false)
+	}
+}
+
+func (e *dstWireEnd) coarseWrite() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	if e.peerCloseSync != nil {
+		dstCoarseRecord(uintptr(unsafe.Pointer(e.peerCloseSync)), false)
+	}
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.wrDead)), false)
+	if e.localHost != e.peerHost {
+		dstCoarseRecord(dstCoarseNetHostID(e.localHost), false)
+		dstCoarseRecord(dstCoarseNetHostID(e.peerHost), false)
+	}
+}
+
+func (e *dstWireEnd) coarseClose() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.closeSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.eofSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.wrDead)), true)
+}
+
+func (e *dstWireEnd) coarseSetDeadline() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.rdDead)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.wrDead)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+}
+
+func (e *dstWireEnd) coarseSetReadDeadline() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.rdDead)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+}
+
+func (e *dstWireEnd) coarseSetWriteDeadline() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.wrDead)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+}
+
 func (e *dstWireEnd) Read(b []byte) (int, error) {
+	e.coarseRead()
+	return e.readAfterCoarse(b)
+}
+
+func (e *dstWireEnd) readAfterCoarse(b []byte) (int, error) {
 	n, err := e.read(b)
 	if err != nil && err != io.EOF && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {
 		err = &OpError{Op: "read", Net: "pipe", Err: err}
@@ -1022,14 +1298,19 @@ func (e *dstWireEnd) Read(b []byte) (int, error) {
 }
 
 func (e *dstWireEnd) read(b []byte) (int, error) {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
+		return 0, io.ErrClosedPipe
+	}
 	if len(b) == 0 {
 		return 0, nil
 	}
 	for {
 		switch {
-		case isClosedChan(e.localDone):
+		case dstIsClosedKernelChan(e.localDone):
+			dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 			return 0, io.ErrClosedPipe
-		case isClosedChan(e.rdDead.wait()):
+		case dstIsClosedKernelChan(e.rdDead.wait()):
 			return 0, os.ErrDeadlineExceeded
 		}
 		// Fetch the partition wake channel BEFORE reading the cut state so a heal
@@ -1057,22 +1338,17 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 				maxArrival = cutStart - 1
 			}
 		}
-		n, remain, eof, wait := e.in.pop(b, maxArrival)
-		if n > 0 {
-			e.in.wakeWriter() // freed send-buffer space: wake the peer's blocked writer
-			if remain {
-				e.in.wake() // a segment remains; re-signal so a second blocked reader wakes
-			}
-			return n, nil
+		kbuf, readyCh, eof, wait := e.in.popBytes(len(b), maxArrival)
+		if len(kbuf) > 0 {
+			return copy(b, kbuf), nil
 		}
 		if eof {
-			e.in.wake() // EOF is persistent: hand the condition to another blocked reader.
 			return 0, io.EOF
 		}
 		// A retransmit-horizon death surfaces only after deliverable data and a
 		// delivered FIN (tcp_recvmsg reports pending data, then the socket
 		// error) — so a killed end still drains what the network carried.
-		if e.timedOut.Load() {
+		if e.isTimedOutAcquire() {
 			return 0, syscall.ETIMEDOUT
 		}
 		// An injected RST follows the same tcp_recvmsg rule: the delivered
@@ -1081,7 +1357,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		// the RST supersedes a still-traveling graceful close. The dstConn
 		// wrapper maps ErrClosedPipe through the one-shot sk_err (consumeSkErr;
 		// the shared reset flag routes the drained-EOF path there too).
-		if e.rstArrived.Load() {
+		if e.isRSTArrivedAcquire() {
 			return 0, io.ErrClosedPipe
 		}
 		// A read parked against a DEAD counterpart socket re-probes at every
@@ -1126,13 +1402,13 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			// Arrived-before-cut bytes exhausted; anything else (in flight, written
 			// after the cut, or a not-yet-arrived FIN) is held. Block until heal, a
 			// deadline, a local close, or the outbound retransmit horizon killing
-			// this end. The ready channel is a wake source here too: it carries
-			// no deliverable bytes under a cut (pop's horizon holds them), but
-			// the option layer's poke rides it (kaPoke) — a keepalive enabled
-			// through a stashed RawConn must reach this parked read to arm the
-			// watchdog, and a spurious wake just re-evaluates and re-parks.
+			// this end. readyCh is a wake source here too: it carries no deliverable
+			// bytes under a cut (pop's horizon holds them), but the option layer's
+			// poke rides it (kaPoke) — a keepalive enabled through a stashed RawConn
+			// must reach this parked read to arm the watchdog, and a spurious wake
+			// just re-evaluates and re-parks.
 			select {
-			case <-e.in.ready:
+			case <-readyCh:
 			case <-wake:
 			case <-e.horizonKill:
 			case <-e.rstKill:
@@ -1151,12 +1427,12 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		}
 		// Note: the peer closing is NOT a wake case here. A graceful peer close
 		// leaves already-written bytes that must still drain at their delivery
-		// times; closeWrite pings in.ready and sets in.closed, so the reader wakes,
+		// times; closeWrite closes readyGen and sets in.closed, so the reader wakes,
 		// delivers the remainder on the clock, then sees EOF via pop. Waking on the
 		// peer's done channel instead would spin (it stays ready) before the buffered
 		// segments' delivery timers fire.
 		select {
-		case <-e.in.ready:
+		case <-readyCh:
 		case <-timerC:
 		case <-wake:
 			// A partition change while parked on a live link: re-evaluate, so a
@@ -1176,6 +1452,11 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 }
 
 func (e *dstWireEnd) Write(b []byte) (int, error) {
+	e.coarseWrite()
+	return e.writeAfterCoarse(b)
+}
+
+func (e *dstWireEnd) writeAfterCoarse(b []byte) (int, error) {
 	n, err := e.write(b)
 	if err != nil && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {
 		err = &OpError{Op: "write", Net: "pipe", Err: err}
@@ -1185,26 +1466,50 @@ func (e *dstWireEnd) Write(b []byte) (int, error) {
 	return n, err
 }
 
-func (e *dstWireEnd) write(b []byte) (int, error) {
+// writeCheck reports any pending terminal error on the send path and acquires
+// the corresponding TSan/DPOR happens-before word.
+// Caller must NOT hold e.in.mu or e.out.mu (acquireFreezeSync locks both).
+func (e *dstWireEnd) writeCheck(outClosed bool) error {
 	switch {
-	case e.timedOut.Load():
-		return 0, syscall.ETIMEDOUT
-	case e.rstArrived.Load():
+	case e.isTimedOutAcquire():
+		return syscall.ETIMEDOUT
+	case e.isRSTArrivedAcquire():
 		// An injected RST already landed: the socket error is pending and a
 		// send fails with it immediately (no drain applies to writes). The
 		// dstConn wrapper maps ErrClosedPipe through the one-shot sk_err.
-		return 0, io.ErrClosedPipe
-	case isClosedChan(e.localDone):
-		return 0, io.ErrClosedPipe
-	case isClosedChan(e.remoteDone):
-		return 0, io.ErrClosedPipe
-	case isClosedChan(e.wrDead.wait()):
-		return 0, os.ErrDeadlineExceeded
+		return io.ErrClosedPipe
+	case outClosed || dstIsClosedKernelChan(e.localDone):
+		e.acquireLocalCloseSync()
+		return io.ErrClosedPipe
+	case dstIsClosedKernelChan(e.remoteDone):
+		e.acquirePeerCloseSync()
+		return io.ErrClosedPipe
+	case dstIsClosedKernelChan(e.wrDead.wait()):
+		return os.ErrDeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+// writeAbortedOutLocked reports whether the send path has an active abort
+// condition while holding e.out.mu as a pure leaf lock (zero nested locks).
+func (e *dstWireEnd) writeAbortedOutLocked(wrDeadCh <-chan struct{}) bool {
+	return e.out.closed ||
+		e.isTimedOutKernel() ||
+		e.isRSTArrivedKernel() ||
+		dstIsClosedKernelChan(e.localDone) ||
+		dstIsClosedKernelChan(e.remoteDone) ||
+		dstIsClosedKernelChan(wrDeadCh)
+}
+
+func (e *dstWireEnd) write(b []byte) (int, error) {
+	if err := e.writeCheck(false); err != nil {
+		return 0, err
 	}
 	// Bounded send buffer with backpressure: the bytes queue for delivery
 	// (transmission + latency + jitter) into a send buffer of capacity e.out.capacity
 	// bytes. A write that would overrun the buffer BLOCKS until the reader drains
-	// enough (the peer consuming bytes frees space, wakeWriter), so a program cannot
+	// enough (the peer consuming bytes frees space, bumpSpaceLocked), so a program cannot
 	// outrun a slow peer with unbounded buffering. capacity 0 = unbounded
 	// (SendBuffer<0, user-chosen): the fast path, a write never blocks.
 	//
@@ -1219,19 +1524,40 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	total := 0
 	cutStart := int64(-1) // base-time the current partition-block began; -1 = not counting
 	for len(b) > 0 {
-		// Re-check the injected-RST state on every chunk, not just at
-		// entry: under access-granularity (Level 2) scheduling the fault op
-		// can interleave between chunk pushes — a real kernel's destroyed
-		// connection can never carry the remaining bytes. (A horizon death
-		// needs no flag re-check here: horizonDie freezes this very stream, so
-		// a racing chunk is discarded under the stream lock — the push seam
-		// enforces it structurally.)
-		if e.rstArrived.Load() {
-			return total, io.ErrClosedPipe
+		// Re-check endpoint state on every chunk, not just at entry: under
+		// access-granularity (Level 2) scheduling a local/peer close, deadline
+		// expiry, retransmit timeout, or injected RST can interleave between
+		// chunk commits or during the caller-slice copy below.
+		if err := e.writeCheck(false); err != nil {
+			return total, err
 		}
-		e.out.mu.Lock()
-		for e.out.capacity > 0 && e.out.buffered >= e.out.capacity {
+		var room int64
+		for {
+			var spaceCh <-chan struct{}
+			wrDeadCh := e.wrDead.wait()
+			e.out.mu.Lock()
+			outClosed := e.out.closed
+			aborted := e.writeAbortedOutLocked(wrDeadCh)
+			avail := int64(len(b))
+			if !aborted && e.out.capacity > 0 {
+				avail = min(avail, e.out.capacity-e.out.buffered)
+			}
+			if !aborted && avail <= 0 {
+				spaceCh = e.out.spaceChLocked()
+			}
 			e.out.mu.Unlock()
+			if err := e.writeCheck(outClosed); err != nil {
+				return total, err
+			}
+			if aborted {
+				// A write deadline sampled as expired under e.out.mu was
+				// concurrently extended before writeCheck ran; re-sample.
+				continue
+			}
+			if avail > 0 {
+				room = avail
+				break
+			}
 			// Fetch the partition wake channel before reading the cut state, so a cut
 			// that begins (or heals) while we block still re-evaluates the horizon.
 			// The probe below reads the cut state too, so it must also follow the
@@ -1248,6 +1574,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			// unchanged: forward-cut bytes die at this end's own horizon
 			// below, and a return-only cut swallows the RST.
 			if e.probeDeadPeer(false) {
+				e.acquireRSTSync()
 				return total, io.ErrClosedPipe
 			}
 			var horizonC <-chan time.Time
@@ -1289,7 +1616,7 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				cutStart = -1 // live peer (or no horizon): persist, reset the cut window
 			}
 			select {
-			case <-e.out.space:
+			case <-spaceCh:
 				// Freed space is window progress (the peer's receiver
 				// drained): re-anchor the stall window — production's
 				// user-timeout clock resets on ACK progress. Errs later
@@ -1302,11 +1629,13 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				if horizonT != nil {
 					horizonT.Stop()
 				}
+				e.acquireRSTSync()
 				return total, io.ErrClosedPipe
 			case <-e.horizonKill:
 				if horizonT != nil {
 					horizonT.Stop()
 				}
+				e.acquireHorizonSync()
 				return total, syscall.ETIMEDOUT
 			case <-horizonC:
 				e.horizonDie()
@@ -1320,44 +1649,69 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 				if horizonT != nil {
 					horizonT.Stop()
 				}
+				e.acquireLocalCloseSync()
 				return total, io.ErrClosedPipe
 			case <-e.remoteDone:
 				if horizonT != nil {
 					horizonT.Stop()
 				}
+				e.acquirePeerCloseSync()
 				return total, io.ErrClosedPipe
 			}
 			if horizonT != nil {
 				horizonT.Stop()
 			}
-			// Re-check the injected-RST state after EVERY wake, before the
-			// buffer is touched again — including the freed-space wake that
-			// exits this loop. A parked writer can have COMMITTED to the
-			// freed-space arm before the RST landed (the peer drains, then
-			// the fault op runs, with the writer runnable but not yet
-			// resumed), so the select choice alone cannot carry the check:
-			// without it the resumed writer pushes post-RST bytes the peer
-			// could then read — a sim-only execution (a real kernel wakes a
-			// blocked sender with the pending socket error, and the
-			// destroyed connection never carries another byte). A horizon
-			// death is covered structurally instead: horizonDie freezes this
-			// stream, so a racing push is discarded at the push seam.
-			if e.rstArrived.Load() {
-				return total, io.ErrClosedPipe
+			// Re-check endpoint state after EVERY wake, before the buffer is
+			// touched again — including the freed-space wake. A parked writer
+			// can commit to <-spaceCh before an RST, close, or deadline lands
+			// while runnable-but-not-yet-resumed, so the select arm alone
+			// cannot carry the check.
+			if err := e.writeCheck(false); err != nil {
+				return total, err
 			}
+		}
+		// Copy this chunk outside e.out.mu so caller slice accesses remain
+		// race- and DPOR-visible per chunk and mapping traps/panics never hold
+		// kernel locks.
+		segBuf := make([]byte, room)
+		copy(segBuf, b[:room])
+		wrDeadCh := e.wrDead.wait()
+		var outClosed, aborted bool
+		pushed, dead := func() (int, bool) {
 			e.out.mu.Lock()
-		}
-		room := int64(len(b))
-		if e.out.capacity > 0 {
-			if avail := e.out.capacity - e.out.buffered; avail < room {
-				room = avail
+			defer e.out.mu.Unlock()
+			outClosed = e.out.closed
+			if e.writeAbortedOutLocked(wrDeadCh) {
+				aborted = true
+				return 0, false
 			}
+			take := segBuf
+			if e.out.capacity > 0 {
+				avail := e.out.capacity - e.out.buffered
+				if avail <= 0 {
+					return 0, false
+				}
+				if int64(len(take)) > avail {
+					take = take[:avail]
+				}
+			}
+			dead := e.out.pushOwnedLocked(take, e.latencyNs, e.jitterNs, e.bandwidthBps)
+			if !dead {
+				dstKernelRaceReleaseMerge(unsafe.Pointer(&e.out.raceSync))
+			}
+			e.out.bumpReadyLocked()
+			return len(take), dead
+		}()
+		if aborted {
+			if err := e.writeCheck(outClosed); err != nil {
+				return total, err
+			}
+			continue
 		}
-		dead := e.out.pushLocked(b[:room], e.latencyNs, e.jitterNs, e.bandwidthBps)
-		roomRemains := e.out.capacity > 0 && e.out.buffered < e.out.capacity
-		e.out.mu.Unlock()
-		e.out.wake()
-		if dead && !e.timedOut.Load() && !e.rstArrived.Load() &&
+		if pushed == 0 {
+			continue // raced with a concurrent writer on the same Conn; re-wait
+		}
+		if dead && !e.isTimedOutKernel() && !e.isRSTArrivedKernel() &&
 			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) &&
 			!dstHostDead(e.peerHost) {
 			// The segment met a dead (CLOSED) peer socket over a live link: the
@@ -1375,15 +1729,8 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 			// direction.
 			dstDeadPushRST(e)
 		}
-		if roomRemains {
-			// Chain-wake another writer blocked on this direction: one drain frees one
-			// cap-1 space token, so a woken writer that leaves room must pass the baton —
-			// mirroring the reader's `remain` re-signal (pop → wake). Without it,
-			// concurrent writers strand with buffer space free (a lost wakeup / hang).
-			e.out.wakeWriter()
-		}
-		total += int(room)
-		b = b[room:]
+		total += pushed
+		b = b[pushed:]
 		cutStart = -1 // progress: reset the cut window
 		if (dstPartAnyCut() && dstPartitionedDir(e.localHost, e.peerHost)) || dstHostDead(e.peerHost) {
 			// The bytes just buffered are undeliverable: a real sender's
@@ -1399,7 +1746,13 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 }
 
 func (e *dstWireEnd) Close() error {
+	e.coarseClose()
+	return e.closeAfterCoarse()
+}
+
+func (e *dstWireEnd) closeAfterCoarse() error {
 	e.once.Do(func() {
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.closeSync))
 		close(e.localDone)
 		// Stop accepting reads/writes locally (localDone) and let the peer drain
 		// what we already sent, then see EOF (closeWrite on our out = peer's in).
@@ -1409,7 +1762,13 @@ func (e *dstWireEnd) Close() error {
 }
 
 func (e *dstWireEnd) SetDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) {
+	e.coarseSetDeadline()
+	return e.setDeadlineAfterCoarse(t)
+}
+
+func (e *dstWireEnd) setDeadlineAfterCoarse(t time.Time) error {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
 	e.rdDead.set(t)
@@ -1418,7 +1777,13 @@ func (e *dstWireEnd) SetDeadline(t time.Time) error {
 }
 
 func (e *dstWireEnd) SetReadDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) {
+	e.coarseSetReadDeadline()
+	return e.setReadDeadlineAfterCoarse(t)
+}
+
+func (e *dstWireEnd) setReadDeadlineAfterCoarse(t time.Time) error {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
 	e.rdDead.set(t)
@@ -1426,7 +1791,13 @@ func (e *dstWireEnd) SetReadDeadline(t time.Time) error {
 }
 
 func (e *dstWireEnd) SetWriteDeadline(t time.Time) error {
-	if isClosedChan(e.localDone) {
+	e.coarseSetWriteDeadline()
+	return e.setWriteDeadlineAfterCoarse(t)
+}
+
+func (e *dstWireEnd) setWriteDeadlineAfterCoarse(t time.Time) error {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
 		return io.ErrClosedPipe
 	}
 	e.wrDead.set(t)

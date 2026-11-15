@@ -6,7 +6,10 @@
 
 package sync
 
-import _ "unsafe"
+import (
+	"sync/atomic"
+	_ "unsafe"
+)
 
 // runtime_dstMutexWaitVirtual reports whether the calling goroutine's mutex
 // wait is measured virtually — true when running inside a DST simulation
@@ -15,6 +18,38 @@ import _ "unsafe"
 //
 //go:linkname runtime_dstMutexWaitVirtual
 func runtime_dstMutexWaitVirtual() bool
+
+//go:linkname runtime_dstSemrelease
+func runtime_dstSemrelease(s *uint32, handoff bool, skipframes int) (woke bool, crashed int32, shouldYield bool)
+
+//go:linkname runtime_dstSemreleaseYield
+func runtime_dstSemreleaseYield()
+
+func dstRepairNormalAllCrashed(state *int32, crashed int32) int32 {
+	rem := (crashed - 1) << mutexWaiterShift
+	for {
+		old := atomic.LoadInt32(state)
+		next := (old - rem) &^ mutexWoken
+		if atomic.CompareAndSwapInt32(state, old, next) {
+			return next
+		}
+	}
+}
+
+//go:noinline
+func dstRepairStarvingAllCrashed(m *Mutex, crashed int32) {
+	rem := crashed << mutexWaiterShift
+	for {
+		old := atomic.LoadInt32(&m.state)
+		next := (old - rem) &^ mutexStarving
+		if atomic.CompareAndSwapInt32(&m.state, old, next) {
+			if next>>mutexWaiterShift != 0 && next&(mutexLocked|mutexWoken|mutexStarving) == 0 {
+				m.unlockSlow(next)
+			}
+			return
+		}
+	}
+}
 
 // dstMutexVirtualStarvation compile-time gates the in-bubble starvation-mode
 // measure in lockSlow: true only in a -tags dst build, false in

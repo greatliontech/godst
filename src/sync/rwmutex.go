@@ -251,8 +251,12 @@ func (rw *RWMutex) Unlock() {
 		fatal("sync: Unlock of unlocked RWMutex")
 	}
 	// Unblock blocked readers, if any.
-	for i := 0; i < int(r); i++ {
-		runtime_Semrelease(&rw.readerSem, false, 0)
+	if dstSemaEnabled {
+		dstRWMutexWakeReaders(rw, r)
+	} else {
+		for i := 0; i < int(r); i++ {
+			runtime_Semrelease(&rw.readerSem, false, 0)
+		}
 	}
 	// Allow other writers to proceed. (DST HB suppressed via raceignore, as in Lock.)
 	rw.w.Unlock()

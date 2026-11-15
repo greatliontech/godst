@@ -14,12 +14,27 @@ func dstSetProcessTeardownHook(fn func(proc uint32))
 //go:linkname dstSetProcessStateTeardownHook runtime.dstSetProcessStateTeardownHook
 func dstSetProcessStateTeardownHook(fn func(proc uint32))
 
+//go:linkname dstSetProcessHasResourcesHook runtime.dstSetProcessHasResourcesHook
+func dstSetProcessHasResourcesHook(fn func(proc uint32) bool)
+
 //go:linkname dstEnvProcessTeardown syscall.dstEnvProcessTeardown
 func dstEnvProcessTeardown(proc uint32)
 
 func init() {
 	dstSetProcessTeardownHook(dstApplyProcessTeardown)
 	dstSetProcessStateTeardownHook(dstApplyProcessStateTeardown)
+	dstSetProcessHasResourcesHook(dstHasProcResources)
+}
+
+func dstHasProcResources(proc uint32) bool {
+	if !dstFSActive() {
+		return false
+	}
+	return dstHasOpenProcFiles(proc) ||
+		dstHasOpenProcRoots(proc) ||
+		dstFDHasFlockForProc(proc) ||
+		dstMMapHasPendingFlockForProc(proc) ||
+		dstFutexHasWaitersForProc(proc)
 }
 
 func dstApplyProcessTeardown(proc uint32) {

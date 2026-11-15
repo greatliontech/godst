@@ -8,10 +8,10 @@ package testing
 
 import (
 	"fmt"
+	isync "internal/sync"
 	"io"
 	"os"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -103,7 +103,7 @@ type dstChattyEntry struct {
 }
 
 var (
-	dstChattyMu      sync.Mutex
+	dstChattyMu      isync.KernelMutex
 	dstChattyNextID  uint64
 	dstChattyEntries atomic.Pointer[[]dstChattyEntry]
 )

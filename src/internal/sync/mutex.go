@@ -270,6 +270,18 @@ func (m *Mutex) unlockSlow(new int32) {
 			// Grab the right to wake someone.
 			new = (old - 1<<mutexWaiterShift) | mutexWoken
 			if atomic.CompareAndSwapInt32(&m.state, old, new) {
+				if dstMutexVirtualStarvation && runtime_dstMutexWaitVirtual() {
+					woke, crashed, _ := runtime_dstSemrelease(&m.sema, false, 2)
+					if crashed == 0 {
+						return
+					}
+					if woke {
+						atomic.AddInt32(&m.state, -(crashed << mutexWaiterShift))
+						return
+					}
+					old = dstRepairNormalAllCrashed(&m.state, crashed)
+					continue
+				}
 				runtime_Semrelease(&m.sema, false, 2)
 				return
 			}
@@ -281,6 +293,20 @@ func (m *Mutex) unlockSlow(new int32) {
 		// Note: mutexLocked is not set, the waiter will set it after wakeup.
 		// But mutex is still considered locked if mutexStarving is set,
 		// so new coming goroutines won't acquire it.
+		if dstMutexVirtualStarvation && runtime_dstMutexWaitVirtual() {
+			woke, crashed, shouldYield := runtime_dstSemrelease(&m.sema, true, 2)
+			if woke || crashed == 0 {
+				if crashed > 0 {
+					atomic.AddInt32(&m.state, -(crashed << mutexWaiterShift))
+				}
+				if shouldYield {
+					runtime_dstSemreleaseYield()
+				}
+				return
+			}
+			dstRepairStarvingAllCrashed(m, crashed)
+			return
+		}
 		runtime_Semrelease(&m.sema, true, 2)
 	}
 }

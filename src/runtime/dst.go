@@ -319,7 +319,7 @@ func dstCurrentNode() (host, proc uint32) {
 //go:nosplit
 func dstVirtualMonotonicNow() (int64, bool) {
 	gp := getg()
-	if gp.bubble == nil {
+	if gp.bubble == nil || gp.bubble != dstSimBubble {
 		return 0, false
 	}
 	// The raw MONOTONIC/BOOTTIME family is a per-host UPTIME clock: base time
@@ -627,7 +627,7 @@ func dstHostDriftPPB(host uint32) int64 {
 //go:linkname dstStepHostClock
 func dstStepHostClock(host uint32, delta int64) bool {
 	gp := getg()
-	if delta == 0 || gp.bubble == nil {
+	if delta == 0 || gp.bubble == nil || gp.bubble != dstSimBubble {
 		return true
 	}
 	dstHostClockEnsure(host)
@@ -755,7 +755,7 @@ func dstRegisterFakeTimer(t *timer) {
 //go:linkname dstDriftHostClock
 func dstDriftHostClock(host uint32, ppb int64) {
 	b := getg().bubble
-	if b == nil {
+	if b == nil || b != dstSimBubble {
 		return
 	}
 	if ppb <= -dstDriftPPBBase {
@@ -911,7 +911,7 @@ func dstRemapHostTimers(host uint32, now, ppbOld, ppbNew int64) {
 //go:linkname dstReestablishHostClock
 func dstReestablishHostClock(host uint32, offset, ppb int64) bool {
 	b := getg().bubble
-	if b == nil {
+	if b == nil || b != dstSimBubble {
 		return true
 	}
 	if ppb <= -dstDriftPPBBase {
@@ -946,7 +946,7 @@ func dstReestablishHostClock(host uint32, offset, ppb int64) bool {
 func dstClockOffsetNow() int64 {
 	gp := getg()
 	b := gp.bubble
-	if b == nil {
+	if b == nil || b != dstSimBubble {
 		return 0
 	}
 	return dstHostWallAdjust(gp.dstHost, b.now)
@@ -965,7 +965,7 @@ func dstClockOffsetNow() int64 {
 func dstTimerArmForDrift(when, period int64) (int64, int64) {
 	gp := getg()
 	b := gp.bubble
-	if b == nil {
+	if b == nil || b != dstSimBubble {
 		return when, period
 	}
 	ppb := dstHostDriftPPB(gp.dstHost)
@@ -2025,7 +2025,7 @@ func dstHostIdentFor(host uint32) (dstHostIdentity, bool) {
 //go:linkname dstBootHost
 func dstBootHost(host uint32) {
 	gp := getg()
-	if host == 0 || gp.bubble == nil {
+	if host == 0 || gp.bubble == nil || gp.bubble != dstSimBubble {
 		return
 	}
 	dstHostClockEnsure(host)
@@ -2045,7 +2045,8 @@ func dstBootHost(host uint32) {
 //go:linkname dstHostBootIdent
 func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool) {
 	seed := dstSeed.Load()
-	if seed == 0 || getg().bubble == nil {
+	gp := getg()
+	if seed == 0 || gp.bubble == nil || gp.bubble != dstSimBubble {
 		return 0, 0, 0, 0, false
 	}
 	host = getg().dstHost
@@ -2796,13 +2797,19 @@ func dstSimEnvProc() (proc uint32, ok bool) { return getg().dstProc, dstSimEnvSe
 
 //go:linkname dstEnvDispatchLock
 func dstEnvDispatchLock() {
+	dstKernelEnter()
 	for !dstEnvDispatchGate.CompareAndSwap(0, 1) {
+		dstKernelExit()
 		Gosched()
+		dstKernelEnter()
 	}
 }
 
 //go:linkname dstEnvDispatchUnlock
-func dstEnvDispatchUnlock() { dstEnvDispatchGate.Store(0) }
+func dstEnvDispatchUnlock() {
+	dstEnvDispatchGate.Store(0)
+	dstKernelExit()
+}
 
 // dstSimUser is read by os/user.Current to return the simulated current user. It
 // returns uid/gid as ints from the single source of truth; os/user formats them.
@@ -2974,6 +2981,30 @@ func dstSetProcessTeardownHook(fn func(proc uint32)) { dstProcessTeardownHook = 
 
 //go:linkname dstSetProcessStateTeardownHook
 func dstSetProcessStateTeardownHook(fn func(proc uint32)) { dstProcessStateTeardownHook = fn }
+
+var dstProcessHasResourcesHook func(proc uint32) bool
+var dstNetHasProcResourcesHook func(proc uint32) bool
+
+//go:linkname dstSetProcessHasResourcesHook
+func dstSetProcessHasResourcesHook(fn func(proc uint32) bool) { dstProcessHasResourcesHook = fn }
+
+//go:linkname dstSetNetHasProcResourcesHook
+func dstSetNetHasProcResourcesHook(fn func(proc uint32) bool) { dstNetHasProcResourcesHook = fn }
+
+// dstProcessHasResources reports whether proc currently owns open kernel
+// resources (files, roots, flocks, sockets, or listeners) whose normal-exit
+// teardown can conflict with surviving peers.
+//
+//go:linkname dstProcessHasResources
+func dstProcessHasResources(proc uint32) bool {
+	if dstProcessHasResourcesHook != nil && dstProcessHasResourcesHook(proc) {
+		return true
+	}
+	if dstNetHasProcResourcesHook != nil && dstNetHasProcResourcesHook(proc) {
+		return true
+	}
+	return false
+}
 
 // dstProcessTeardown invokes os's resource teardown handler. Reached via
 // //go:linkname from testing/simulation's process-teardown path.

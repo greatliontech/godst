@@ -33,26 +33,23 @@ import (
 // the per-run yield magnitude, read via dstAccessYieldFP.
 var dstAccessYieldPoints uint64
 
-// dstLevel2Events counts yield-context Level-2 dependency events —
-// accesses, sync decisions, atomic announces (size != 0) — never
-// dstYieldPoint's size-0 pure scheduling yields. (The restricted-context
-// commit path records without incrementing; every caller able to reach
-// it is race-build-gated today, where the counter is unused.) The DPOR
+// dstLevel2Events counts Level-2 dependency events — accesses, sync
+// decisions, atomic and coarse announces (size != 0) — never
+// dstYieldPoint's size-0 pure scheduling yields. The DPOR
 // completeness downgrade (ExploreResult.Uninstrumented) keys on this:
 // zero events across an exploration in a non-race build means
 // dependencies were invisible, not absent. Monotone; never reset
 // (consumers take deltas).
 var dstLevel2Events uint64
 
-// dstSyncBlindBlocks counts mutex-class semaphore parks of simulation
+// dstSyncBlindBlocks counts mutex- and condvar-class parks of simulation
 // goroutines during scheduled-strategy (Explore) runs in builds WITHOUT
-// the dst-race sync hooks. A sync.Mutex/RWMutex ordering rides HB events
-// only the dst-race build emits; a park here proves the SUT orders
+// the dst-race sync hooks. sync.Mutex/RWMutex/Cond orderings ride decision and
+// HB events only the dst-race build emits; a park here proves the SUT orders
 // through a primitive whose dependencies this build cannot see, so any
 // exhaustion claim over such a run is invisibility, not independence.
-// (WaitGroup and Cond parks are exempt: their wakeups are addr==0
-// transitions the explorer records build-independently, and they carry
-// no outcome-determining order beyond the completion edge.) Two
+// (WaitGroup parks are exempt: their wakeups are addr==0 completion
+// transitions the explorer records build-independently.) Two
 // documented residuals: the uncontended fast path is an uninstrumented
 // atomic and stays invisible (contention is the detectable signal),
 // and a run whose manual announces cover SOME sync objects vouches for
@@ -62,8 +59,8 @@ var dstLevel2Events uint64
 var dstSyncBlindBlocks uint64
 
 // dstNoteSyncBlindBlock feeds dstSyncBlindBlocks from the semaphore
-// park site. Cheap and branch-first: inert unless a scheduled-mode
-// simulation goroutine is parking in a norace build.
+// and notifyList park sites. Cheap and branch-first: inert unless a
+// scheduled-mode simulation goroutine is parking in a norace build.
 //
 //go:nosplit
 func dstNoteSyncBlindBlock(reason waitReason) {
@@ -75,7 +72,7 @@ func dstNoteSyncBlindBlock(reason waitReason) {
 		return
 	}
 	switch reason {
-	case waitReasonSyncMutexLock, waitReasonSyncRWMutexLock, waitReasonSyncRWMutexRLock:
+	case waitReasonSyncMutexLock, waitReasonSyncRWMutexLock, waitReasonSyncRWMutexRLock, waitReasonSyncCondWait:
 		dstSyncBlindBlocks++
 	}
 }
@@ -132,7 +129,7 @@ const (
 // through dstFindRunnable, so the seam never runs a blocked G; soundness is
 // inherited from Seq 5 unchanged.
 //go:nosplit
-func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
+func dstYieldAccess(addr, size uintptr, write bool, filter bool, allowKernel bool, pc uintptr) {
 	gp := getg()
 	// Access-granularity yielding is a Level-2 (scheduled-strategy) mechanism. Under
 	// the Seq-5 Random/PCT strategies the interleaving atoms are the coarse cooperative
@@ -141,13 +138,31 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 	// access under -race (so any -tags dst -race run, not just Explore, reaches here).
 	// Gating to dstSchedScheduled confines access yields to Explore; non-scheduled
 	// strategies are byte-for-byte unaffected.
-	if !dstActive() || dstSchedKind != dstSchedScheduled || !gp.dstSimG {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || !gp.dstSimG || (gp.dstKernelDepth != 0 && !allowKernel) {
 		// Membership, not mere bubble-ness: a FOREIGN synctest bubble's
 		// accesses are not simulation transitions — foreign goroutines never
 		// enter schedules, so their conflicts prune nothing, and recording
 		// them pollutes the access log and consumes seq state
 		// (dstEnsureSeq's chokepoint would refuse them anyway; refusing here
-		// also skips the yield).
+		// also skips the yield). Modeled kernel critical sections
+		// (gp.dstKernelDepth != 0) likewise skip user access logging so shared
+		// kernel tables never create universe-global conflicts across unrelated
+		// processes or goroutines; explicit coarse object announces
+		// (allowKernel == true) still record without yielding when reached
+		// inside kernel-owned teardown critical sections.
+		return
+	}
+	if gp.dstKernelDepth != 0 {
+		// Kernel-owned teardown critical section with allowKernel == true:
+		// yielding inside a KernelMutex is forbidden, and replay-force
+		// promotion can never yield here either, so commit with pc=0, count=0
+		// at the current scheduling step (bounded by the pre-teardown
+		// dstYieldPoint).
+		seq := dstEnsureSeq(gp)
+		if size != 0 {
+			dstLevel2Events++
+		}
+		dstCommitAccess(gp, seq, addr, size, write, 0, 0, false, dstScheduleStep)
 		return
 	}
 	if gp != gp.m.curg || gp.m.locks != 0 {
@@ -161,6 +176,9 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 		// not honored: yielding is unsound in this context regardless, and
 		// promoteAccessForces cannot loop on it (it grows only on a NEW force).
 		seq := dstEnsureSeq(gp)
+		if size != 0 {
+			dstLevel2Events++
+		}
 		gp.dstAccCount++
 		auto := filter && raceenabled
 		key := uintptr(0)
@@ -217,7 +235,7 @@ func dstYieldAccess(addr, size uintptr, write bool, filter bool, pc uintptr) {
 //go:linkname dstAccessYield
 //go:nosplit
 func dstAccessYield(addr unsafe.Pointer, write bool) {
-	dstYieldAccess(uintptr(addr), 1, write, true, sys.GetCallerPC())
+	dstYieldAccess(uintptr(addr), 1, write, true, false, sys.GetCallerPC())
 }
 
 // dstAccessYieldRange is the range/composite form of dstAccessYield. The compiler
@@ -227,7 +245,7 @@ func dstAccessYield(addr unsafe.Pointer, write bool) {
 //go:linkname dstAccessYieldRange
 //go:nosplit
 func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
-	dstYieldAccess(uintptr(addr), size, write, true, sys.GetCallerPC())
+	dstYieldAccess(uintptr(addr), size, write, true, false, sys.GetCallerPC())
 }
 
 // dstSyncAcquire is the Level-2 transition boundary for a synchronization object
@@ -245,7 +263,7 @@ func dstAccessYieldRange(addr unsafe.Pointer, size uintptr, write bool) {
 //go:nosplit
 func dstSyncAcquire(id unsafe.Pointer) {
 	dstSyncAnnounces++
-	dstYieldAccess(uintptr(id), 1, true, false, sys.GetCallerPC())
+	dstYieldAccess(uintptr(id), 1, true, false, false, sys.GetCallerPC())
 }
 
 // dstSyncAnnounces counts dstSyncAcquire calls — manual (or dst-race
@@ -317,7 +335,10 @@ const dstSyncAtomicAux = ^uintptr(1)
 //go:linkname dstAtomicYield
 //go:nosplit
 func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr) {
-	dstYieldAccess(uintptr(addr), size, kind != dstAtomicLoad, false, sys.GetCallerPC())
+	if getg().dstKernelDepth != 0 {
+		return
+	}
+	dstYieldAccess(uintptr(addr), size, kind != dstAtomicLoad, false, false, sys.GetCallerPC())
 	switch kind {
 	case dstAtomicLoad, dstAtomicCAS:
 		dstRecordSyncAcquireID(uintptr(addr), dstSyncAtomicAux)
@@ -344,7 +365,7 @@ func dstAtomicYield(addr unsafe.Pointer, size uintptr, kind uintptr) {
 //go:linkname dstSyncObserve
 //go:nosplit
 func dstSyncObserve(id unsafe.Pointer) {
-	dstYieldAccess(uintptr(id), 1, false, false, sys.GetCallerPC())
+	dstYieldAccess(uintptr(id), 1, false, false, false, sys.GetCallerPC())
 }
 
 // dstSyncCoarseAux keys the coarse cross-process dependency model's
@@ -355,55 +376,52 @@ const dstSyncCoarseAux = ^uintptr(2)
 // dstCoarseDep is the Level-2 transition boundary of the COARSE
 // cross-process dependency model (exploration.md, "Coarse cross-process
 // dependencies"): the simulated OS surfaces the objects real processes
-// conflict through — a filesystem node, a host namespace, a flock'd
-// file, a shared futex word — as announced dependency identities, so a
-// non-race dst build explores multi-process interleavings that plain
-// memory instrumentation (dst-race only) would otherwise carry. write
-// follows the op's effect on the object (a pwrite/unlink/wake is a
-// write-conflict; a pread/stat/wait a read-conflict — read pairs
-// commute); hb optionally records the op's happens-before contribution
-// (1 = acquire, 2 = release) for pruning, exactly as dstAtomicYield
-// records its own. Announced like dstSyncAcquire — always-yield, never
-// the shared-address filter. Self-gated through dstYieldAccess /
-// dstRecordSyncEventID: outside a scheduled-strategy simulation it is
-// a cheap early return.
+// conflict through — a filesystem node, a file handle, a host namespace,
+// a flock'd file, a shared futex word, a pipe or socket endpoint — as
+// announced dependency identities, so a non-race dst build explores
+// multi-process and OS-mediated interleavings that plain memory
+// instrumentation (dst-race only) would otherwise miss. write follows the
+// op's effect on the object (a pwrite/unlink/wake is a write-conflict; a
+// pread/stat/wait a read-conflict — read pairs commute). Announced like
+// dstSyncAcquire — always-yield outside kernel locks, never the
+// shared-address filter, and recorded without yielding when reached inside
+// kernel-owned process/host teardown critical sections (allowKernel=true).
 //
 //go:linkname dstCoarseDep
 //go:nosplit
-func dstCoarseDep(id uintptr, write bool, hb uintptr) {
-	dstYieldAccess(id, 1, write, false, sys.GetCallerPC())
-	switch hb {
-	case 1:
-		dstRecordSyncAcquireID(id, dstSyncCoarseAux)
-	case 2:
-		dstRecordSyncReleaseID(id, dstSyncCoarseAux)
+func dstCoarseDep(id uintptr, write bool) {
+	if id == 0 {
+		return
 	}
+	dstYieldAccess(id, 1, write, false, true, sys.GetCallerPC())
 }
 
-// dstCoarseHB records only the happens-before half of a coarse
-// dependency op whose announce already happened — the post-decision
-// acquire of a granted flock or a woken futex waiter (the announce
-// yielded pre-decision; the acquire is known only after). hb as in
-// dstCoarseDep. No yield.
+// dstCoarseRecord attaches an additional coarse dependency identity to the
+// current scheduling interval without taking a second yield (pc=0, count=0).
+// Multi-key OS operations invoke dstCoarseDep on their primary identity first
+// and dstCoarseRecord on secondary identities so every conflict key lands on
+// the same scheduling step without multiplying yield boundaries.
 //
-//go:linkname dstCoarseHB
+//go:linkname dstCoarseRecord
 //go:nosplit
-func dstCoarseHB(id uintptr, hb uintptr) {
-	switch hb {
-	case 1:
-		dstRecordSyncAcquireID(id, dstSyncCoarseAux)
-	case 2:
-		dstRecordSyncReleaseID(id, dstSyncCoarseAux)
+func dstCoarseRecord(id uintptr, write bool) {
+	gp := getg()
+	if !dstActive() || dstSchedKind != dstSchedScheduled || gp == nil || !gp.dstSimG || id == 0 {
+		return
 	}
+	seq := dstEnsureSeq(gp)
+	dstLevel2Events++
+	dstCommitAccess(gp, seq, id, 1, write, 0, 0, false, dstScheduleStep)
 }
 
 // dstYieldPoint is a cooperative yield with no specific memory access recorded — a
-// pure scheduling point (used by soundness probes). See dstAccessYield.
+// pure scheduling point (used by soundness probes and pre-teardown/fault boundaries).
+// See dstAccessYield.
 //
 //go:linkname dstYieldPoint
 //go:nosplit
 func dstYieldPoint() {
-	dstYieldAccess(0, 0, false, false, sys.GetCallerPC())
+	dstYieldAccess(0, 0, false, false, false, sys.GetCallerPC())
 }
 
 //go:linkname dstAccessYieldFP
@@ -1194,6 +1212,28 @@ func dstRecordSyncEventID(kind uint8, id, aux uintptr) {
 }
 
 func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
+	dstRecordSyncEventForGIDMode(kind, id, aux, gp, false)
+}
+
+// dstRecordUserSyncEvent records an intentional user-visible happens-before
+// event (modeled file/pipe/socket/flock/futex synchronization) even when
+// called inside a KernelMutex critical section (dstKernelDepth > 0), while
+// still honoring any explicit non-kernel RaceDisable() on the calling
+// goroutine so the DPOR HB shadow and TSan stay in lockstep.
+//
+//go:nosplit
+func dstRecordUserSyncEvent(kind uint8, id, aux uintptr) {
+	if !dstActive() || dstSchedKind != dstSchedScheduled || id == 0 {
+		return
+	}
+	gp := getg()
+	if gp == nil || gp != gp.m.curg {
+		return
+	}
+	dstRecordSyncEventForGIDMode(kind, id, aux, gp, true)
+}
+
+func dstRecordSyncEventForGIDMode(kind uint8, id, aux uintptr, gp *g, allowKernel bool) {
 	if !dstActive() || dstSchedKind != dstSchedScheduled {
 		return
 	}
@@ -1210,11 +1250,18 @@ func dstRecordSyncEventForGID(kind uint8, id, aux uintptr, gp *g) {
 	// every race.go acquire/release variant does (the g-credited forms
 	// raceacquireg/racereleaseg also check getg().raceignore, not the passed
 	// g's): an event whose TSan twin is ignored must not enter the shadow, or
-	// the offline clocks disagree with the -race oracle. This single choke
-	// point covers every recorder — the sync-package bridges, chan.go/
-	// select.go (including their g-credited sites), and dstAtomicYield. Announces
-	// and ready/create edges do not flow through here and stay unaffected.
-	if raceenabled && getg().raceignore != 0 {
+	// the offline clocks disagree with the -race oracle. Kernel-internal
+	// operations (allowKernel == false, e.g. broadcast channel closes inside
+	// KernelMutex) are suppressed in both -race and non-race builds via
+	// dstKernelDepth > 0; intentional user-level sync hooks inside KernelMutex
+	// (allowKernel == true) suppress only when a non-kernel RaceDisable is
+	// also active (int32(raceignore) > dstKernelDepth).
+	curg := getg()
+	if !allowKernel {
+		if curg.dstKernelDepth > 0 || (raceenabled && curg.raceignore != 0) {
+			return
+		}
+	} else if raceenabled && int32(curg.raceignore) > curg.dstKernelDepth {
 		return
 	}
 	seq := dstEnsureSeq(gp)

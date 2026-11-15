@@ -2149,8 +2149,8 @@ func TestDSTExploreRaceReplay(t *testing.T) {
 		t.Fatalf("race failure replay token incomplete: schedule=%q forces=%q\n%s", schedule, forces, out)
 	}
 	replay := runBuiltTestProg(t, exe, "DSTExploreRaceReplay", "DSTSEED=1", "DSTREPLAY=1", "DSTSCHEDULE="+schedule, "DSTFORCES="+forces)
-	if exploreField(t, replay, "raced") != "true" {
-		t.Fatalf("race failure replay did not reproduce the race:\nexplore=%s\nreplay=%s", out, replay)
+	if exploreField(t, replay, "raced") != "true" || exploreField(t, replay, "reachedz") != "true" {
+		t.Fatalf("race failure replay did not reproduce the promoted-interval race:\nexplore=%s\nreplay=%s", out, replay)
 	}
 	budget := runBuiltTestProg(t, exe, "DSTExploreBudgetPromotion", "DSTSEED=1")
 	if exploreField(t, budget, "schedules") != "1" || exploreField(t, budget, "runs") != "1" ||
@@ -2323,7 +2323,7 @@ func TestDSTExploreSyncAutoInstrument(t *testing.T) {
 	exe := filepath.Join(t.TempDir(), "tp_race")
 	buildTestProgExplicit(t, exe, "-tags=dst", "-race")
 	out := runBuiltTestProg(t, exe, "DSTExploreSyncAuto", "DSTSEED=1")
-	for _, sut := range []string{"mutex", "chan", "rwmutex", "tryrlockfail", "tryrlockrelease", "trywlockrelease", "trylock", "trylockfail", "trylockrelease", "selectsend", "selectblocksend", "selectnbsend", "selectrecv", "selectblockrecv", "selectnbrecv", "chanclose", "once"} {
+	for _, sut := range []string{"mutex", "chan", "rwmutex", "tryrlockfail", "tryrlockrelease", "trywlockrelease", "trylock", "trylockfail", "trylockrelease", "selectsend", "selectblocksend", "selectnbsend", "selectrecv", "selectblockrecv", "selectnbrecv", "chanclose", "once", "oncefast"} {
 		if exploreField(t, out, sut+"Exhausted") != "true" {
 			t.Fatalf("unmodified %s SUT did not cleanly exhaust under DPOR (budget "+
 				"truncation, not a clean acceptance):\n%s", sut, out)

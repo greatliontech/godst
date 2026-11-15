@@ -442,9 +442,40 @@ func firstRaceFailure(res simulation.ExploreResult) (simulation.Failure, bool) {
 	return first, found
 }
 
+var raceReplayReachedZ bool
+
+// raceReplayPromotedSUT has a conditional data race on z that is unreachable in
+// Pass 1 without replay-promoted access forces: G1's writes a=1 and b=1 are
+// HB-after initialization and stay inline in one scheduling interval until the
+// explorer promotes b=1 to a forced yield boundary, allowing G2 to observe
+// a==1 && b==0 and write z=1 concurrently with G1's read of z.
+func raceReplayPromotedSUT() bool {
+	raceReplayReachedZ = false
+	a, b, z := 0, 0, 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		a = 1
+		b = 1
+		if z == 1 {
+			raceReplayReachedZ = true
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if a == 1 && b == 0 {
+			z = 1
+		}
+	}()
+	wg.Wait()
+	return false
+}
+
 // DSTExploreRaceReplay prints a race failure's full replay token, or replays a token
-// in a fresh process. It uses the auto-instrumented R/W/R SUT because its filtered
-// access stream exercises replay-promoted access forces.
+// in a fresh process. It uses raceReplayPromotedSUT because reaching the conditional
+// race on z requires splitting G1's inline write interval via replay-promoted access
+// forces.
 func DSTExploreRaceReplay() {
 	seed := dstSeedEnv()
 	if os.Getenv("DSTREPLAY") == "1" {
@@ -452,12 +483,13 @@ func DSTExploreRaceReplay() {
 			Schedule:     decodeSchedule(os.Getenv("DSTSCHEDULE")),
 			AccessForces: decodeAccessForces(os.Getenv("DSTFORCES")),
 		}
-		_, raced := simulation.Replay(seed, failure, unmodifiedRWRSUT)
-		os.Stdout.WriteString("racereplay raced=" + strconv.FormatBool(raced) + "\n")
+		_, raced := simulation.Replay(seed, failure, raceReplayPromotedSUT)
+		os.Stdout.WriteString("racereplay raced=" + strconv.FormatBool(raced) +
+			" reachedz=" + strconv.FormatBool(raceReplayReachedZ) + "\n")
 		return
 	}
 
-	failure, ok := firstRaceFailure(simulation.Explore(seed, simulation.DPOR, unmodifiedRWRSUT))
+	failure, ok := firstRaceFailure(simulation.Explore(seed, simulation.DPOR, raceReplayPromotedSUT))
 	if !ok {
 		os.Stdout.WriteString("racereplay races=0 schedule=_ forces=_ forcecount=0\n")
 		return
@@ -1294,9 +1326,8 @@ func autoChanCloseRecvDecisionSUT() bool {
 	return false
 }
 
-// autoOnceOrderSUT pins sync.Once's successful first execution path. Once is covered
-// transitively by its internal Mutex.Lock hook; this SUT prevents that coverage from
-// being accidentally lost.
+// autoOnceOrderSUT pins sync.Once's successful first execution path across two
+// contenders joined via WaitGroup.
 func autoOnceOrderSUT() bool {
 	var once sync.Once
 	winner := 0
@@ -1310,6 +1341,41 @@ func autoOnceOrderSUT() bool {
 		}()
 	}
 	wg.Wait()
+	syncAutoSeen[strconv.Itoa(winner)] = true
+	return false
+}
+
+// autoOnceFastPathSUT pins sync.Once's pre-done.Load decision hook and fast-path
+// happens-before publication when contenders join via independent channels (so
+// WaitGroup cannot mask missing Once hooks) and read state initialized inside Do.
+func autoOnceFastPathSUT() bool {
+	var once sync.Once
+	winner := 0
+	initialized := 0
+	done1 := make(chan struct{})
+	done2 := make(chan struct{})
+	go func() {
+		once.Do(func() {
+			initialized = 42
+			winner = 1
+		})
+		if initialized != 42 {
+			panic("missing Once.Do happens-before")
+		}
+		close(done1)
+	}()
+	go func() {
+		once.Do(func() {
+			initialized = 42
+			winner = 2
+		})
+		if initialized != 42 {
+			panic("missing Once.Do happens-before")
+		}
+		close(done2)
+	}()
+	<-done1
+	<-done2
 	syncAutoSeen[strconv.Itoa(winner)] = true
 	return false
 }
@@ -1362,6 +1428,7 @@ func DSTExploreSyncAuto() {
 	check("selectnbrecv", autoSelectNBRecvOrderSUT)
 	check("chanclose", autoChanCloseRecvDecisionSUT)
 	check("once", autoOnceOrderSUT)
+	check("oncefast", autoOnceFastPathSUT)
 }
 
 // --- Generated-family equivalence validator (DST-L2-3 completeness guard) ------

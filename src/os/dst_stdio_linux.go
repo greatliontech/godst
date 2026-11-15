@@ -15,7 +15,7 @@ func dstTryBubbleStdioWrite(file *file, b []byte) (int, bool) {
 	if file == nil {
 		return 0, false
 	}
-	fd := file.pfd.Sysfd
+	fd := dstSysfd(file)
 	if (fd != 1 && fd != 2) || !dstFenceActive() || dstHostIOActive() {
 		return 0, false
 	}

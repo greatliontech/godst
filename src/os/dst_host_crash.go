@@ -37,6 +37,7 @@ func dstRestoreHostDiskFor(host uint32) {
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
+	dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
 	disk := dstFS.disks[host]
 	if disk == nil {
 		return // the host never touched its filesystem: nothing to restore

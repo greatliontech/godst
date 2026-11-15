@@ -287,6 +287,9 @@ func resumeG(state suspendGState) {
 //
 //go:nosplit
 func canPreemptM(mp *m) bool {
+	if dstBuild && mp.curg != nil && !dstCanPreemptG(mp.curg) {
+		return false
+	}
 	return mp.locks == 0 && mp.mallocing == 0 && mp.preemptoff == "" && mp.p.ptr().status == _Prunning && mp.curg != nil && readgstatus(mp.curg)&^_Gscan != _Gsyscall
 }
 

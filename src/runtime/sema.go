@@ -231,11 +231,16 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		root.nwait.Add(-1)
 	}
 	if dstBuild {
+		crashed := 0
 		for s != nil && dstIsCrashedG(s.g) {
+			crashed++
 			s, t0, tailtime = root.dequeue(addr)
 			if s != nil {
 				root.nwait.Add(-1)
 			}
+		}
+		if crashed > 0 && s == nil {
+			cansemacquire(addr)
 		}
 	}
 	unlock(&root.lock)
@@ -294,6 +299,11 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 			//
 			// We don't handoff directly if we're holding locks or on the
 			// system stack, since it's not safe to enter the scheduler.
+			if dstBuild {
+				if !dstCanPreemptG(getg()) {
+					return
+				}
+			}
 			goyield()
 		}
 	}
@@ -625,6 +635,9 @@ func notifyListWait(l *notifyList, t uint32) {
 		l.tail.next = s
 	}
 	l.tail = s
+	if dstBuild {
+		dstNoteSyncBlindBlock(waitReasonSyncCondWait)
+	}
 	goparkunlock(&l.lock, waitReasonSyncCondWait, traceBlockCondWait, 3)
 	if t0 != 0 {
 		blockevent(s.releasetime-t0, 2)
@@ -753,8 +766,8 @@ func notifyListCheck(sz uintptr) {
 //go:linkname internal_sync_nanotime internal/sync.runtime_nanotime
 func internal_sync_nanotime() int64 {
 	if dstBuild {
-		if bubble := getg().bubble; bubble != nil {
-			return bubble.now
+		if dstInSimBubble() {
+			return getg().bubble.now
 		}
 	}
 	return nanotime()

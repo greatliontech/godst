@@ -7,12 +7,12 @@
 package os
 
 import (
+	rtatomic "internal/runtime/atomic"
+	isync "internal/sync"
 	"runtime"
-	"sync"
 	"sync/atomic"
+	"unsafe"
 	"weak"
-
-	_ "unsafe" // for go:linkname
 )
 
 // The DST per-object state tables hold os.file's simulated backing and
@@ -75,7 +75,7 @@ type dstStateRow[T any, S any] struct {
 type dstStateChunkArr[T any, S any] [dstStateChunk]atomic.Pointer[dstStateRow[T, S]]
 
 type dstStateTable[T any, S any] struct {
-	mu    sync.Mutex
+	mu    isync.KernelMutex
 	spine atomic.Pointer[[]*dstStateChunkArr[T, S]]
 	next  int
 	free  []int
@@ -192,15 +192,25 @@ func dstFileStateStats() (next, free int) {
 	return dstFileStates.next, len(dstFileStates.free)
 }
 
+// dstSysfd atomically loads f.pfd.Sysfd via internal/runtime/atomic so
+// pre-fdmu DST interception checks on host *File handles never race with
+// internal/poll.(*FD).destroy clearing Sysfd to -1 during a concurrent Close,
+// without adding DPOR sync/atomic decision points or spurious TSan acquire
+// edges (preserving stdio Explore neutrality).
+func dstSysfd(f *file) int {
+	return int(rtatomic.Loaduintptr((*uintptr)(unsafe.Pointer(&f.pfd.Sysfd))))
+}
+
 // dstSetFileBackend attaches a simulated backing to a newly built
 // file; dstNewFile calls it before the *File escapes. The row index
 // lands in pfd.Sysfd, below the -1 sentinel.
 func dstSetFileBackend(f *file, b dstFileBackend) {
-	f.pfd.Sysfd = dstStateSlot(dstFileStates.register(f, dstFileState{backend: b}))
+	slot := dstStateSlot(dstFileStates.register(f, dstFileState{backend: b}))
+	rtatomic.Storeuintptr((*uintptr)(unsafe.Pointer(&f.pfd.Sysfd)), uintptr(slot))
 }
 
 func dstFileStateOf(f *file) *dstFileState {
-	idx, ok := dstStateIndex(f.pfd.Sysfd)
+	idx, ok := dstStateIndex(dstSysfd(f))
 	if !ok {
 		return nil
 	}

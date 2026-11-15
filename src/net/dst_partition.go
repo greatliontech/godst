@@ -7,9 +7,9 @@
 package net
 
 import (
-	"sync"
+	isync "internal/sync"
 	"sync/atomic"
-	_ "unsafe" // for go:linkname
+	"unsafe"
 )
 
 // Network partition targeting. The imperative API lives in testing/simulation
@@ -29,6 +29,9 @@ func dstSetNetPartitionHook(fn func(op, a, b uint32))
 
 //go:linkname dstSetNetHostDeadHook runtime.dstSetNetHostDeadHook
 func dstSetNetHostDeadHook(fn func(host uint32) bool)
+
+//go:linkname dstSetNetHasProcResourcesHook runtime.dstSetNetHasProcResourcesHook
+func dstSetNetHasProcResourcesHook(fn func(proc uint32) bool)
 
 // dstHostDeclaredQ reports whether host is a declared simulated host this run
 // (the runtime relay to testing/simulation's intern registry; true when no
@@ -64,6 +67,7 @@ const (
 func init() {
 	dstSetNetPartitionHook(dstApplyNetFaultOp)
 	dstSetNetHostDeadHook(dstHostDead) // simulation's Process guard queries the same mark dials consult
+	dstSetNetHasProcResourcesHook(dstNetHasProcResources)
 }
 
 // dstApplyNetFaultOp dispatches a net-fault targeting op (from testing/simulation
@@ -111,10 +115,15 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 var dstPartAnyCutCount atomic.Int64
 
 // dstPartAnyCut reports whether any cut source is active, lock-free.
-func dstPartAnyCut() bool { return dstPartAnyCutCount.Load() > 0 }
+func dstPartAnyCut() bool {
+	dstKernelSectionEnter()
+	cut := dstPartAnyCutCount.Load() > 0
+	dstKernelSectionExit()
+	return cut
+}
 
 var dstPart struct {
-	mu       sync.Mutex
+	mu       isync.KernelMutex
 	epoch    uint64
 	dirs     map[uint64]dstCut // ordered from→to → cut record
 	isolated map[uint32]int64  // host → cut-start (isolated from all others, both directions)
@@ -125,8 +134,9 @@ var dstPart struct {
 	// injected isolation. Consulted ONLY at dial (a dead kernel answers no
 	// SYN); never in the read-side arrival horizon — bytes a host transmitted
 	// before dying still propagate through the network and deliver.
-	dead map[uint32]struct{}
-	wake chan struct{}
+	dead     map[uint32]struct{}
+	hostSync map[uint32]*uint64
+	wake     chan struct{}
 }
 
 // dstCut composes the active modes on one direction. Each mode retains the time
@@ -161,9 +171,43 @@ func dstPartRoll() {
 		dstPart.dirs = make(map[uint64]dstCut)
 		dstPart.isolated = make(map[uint32]int64)
 		dstPart.dead = make(map[uint32]struct{})
+		dstPart.hostSync = make(map[uint32]*uint64)
 		dstPart.wake = make(chan struct{})
 		dstPartAnyCutCount.Store(0)
 	}
+}
+
+func dstPartHostSyncLocked(h uint32) *uint64 {
+	s := dstPart.hostSync[h]
+	if s == nil {
+		s = new(uint64)
+		dstPart.hostSync[h] = s
+	}
+	return s
+}
+
+func dstAcquirePartFaultSync(a, b uint32) {
+	dstPart.mu.Lock()
+	dstPartRoll()
+	_, dirAB := dstPart.dirs[dstDirKey(a, b)]
+	_, dirBA := dstPart.dirs[dstDirKey(b, a)]
+	if sa := dstPart.hostSync[a]; sa != nil {
+		_, iso := dstPart.isolated[a]
+		_, dead := dstPart.dead[a]
+		if iso || dead || dirAB || dirBA {
+			dstKernelRaceAcquire(unsafe.Pointer(sa))
+		}
+	}
+	if b != a {
+		if sb := dstPart.hostSync[b]; sb != nil {
+			_, iso := dstPart.isolated[b]
+			_, dead := dstPart.dead[b]
+			if iso || dead || dirAB || dirBA {
+				dstKernelRaceAcquire(unsafe.Pointer(sb))
+			}
+		}
+	}
+	dstPart.mu.Unlock()
 }
 
 // dstApplyPartitionOp is the hook runtime invokes for simulation.Partition etc. It
@@ -172,28 +216,40 @@ func dstPartRoll() {
 // (only when it was not already cut by that source, so a redundant re-cut does not
 // move the boundary); a heal removes the source.
 func dstApplyPartitionOp(op, a, b uint32) {
+	dstCoarseRecord(dstCoarseNetHostID(a), true)
+	if b != 0 && b != a {
+		dstCoarseRecord(dstCoarseNetHostID(b), true)
+	}
 	now := dstBaseNanos()
 	dstPart.mu.Lock()
 	dstPartRoll()
 	switch op {
 	case dstPartOpPartition:
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(a)))
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(b)))
 		dstCutDir(a, b, now, false) // symmetric blackhole: both directions
 		dstCutDir(b, a, now, false)
 	case dstPartOpPartitionRefuse:
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(a)))
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(b)))
 		dstCutDir(a, b, now, true) // symmetric refuse: both directions
 		dstCutDir(b, a, now, true)
 	case dstPartOpPartitionOneWay:
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(a)))
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(b)))
 		dstCutDir(a, b, now, false) // asymmetric blackhole: only a→b
 	case dstPartOpHeal:
 		delete(dstPart.dirs, dstDirKey(a, b))
 		delete(dstPart.dirs, dstDirKey(b, a))
 	case dstPartOpIsolate:
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(a)))
 		if _, cut := dstPart.isolated[a]; !cut {
 			dstPart.isolated[a] = now
 		}
 	case dstPartOpHealHost:
 		delete(dstPart.isolated, a)
 	case dstFaultOpHostDown:
+		dstKernelRaceReleaseMerge(unsafe.Pointer(dstPartHostSyncLocked(a)))
 		dstPart.dead[a] = struct{}{}
 	case dstFaultOpHostUp:
 		delete(dstPart.dead, a)

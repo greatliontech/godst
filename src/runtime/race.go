@@ -557,6 +557,16 @@ func racegostart(pc uintptr) uintptr {
 	}
 
 	var racectx uintptr
+	if dstBuild && dstKernelLiftGoStartIgnoreSync(spawng) {
+		// Modeled kernel sections suppress cross-goroutine mutex/channel HB via
+		// RaceDisable(), which sets TSan's ignore_sync flag on spawng. Lift
+		// ignore_sync across __tsan_go_start whenever no non-kernel RaceDisable
+		// is active so the child goroutine inherits spawng's `go`-spawn vector clock.
+		racecall(&__tsan_go_ignore_sync_end, spawng.racectx, 0, 0, 0)
+		racecall(&__tsan_go_start, spawng.racectx, uintptr(unsafe.Pointer(&racectx)), pc, 0)
+		racecall(&__tsan_go_ignore_sync_begin, spawng.racectx, 0, 0, 0)
+		return racectx
+	}
 	racecall(&__tsan_go_start, spawng.racectx, uintptr(unsafe.Pointer(&racectx)), pc, 0)
 	return racectx
 }

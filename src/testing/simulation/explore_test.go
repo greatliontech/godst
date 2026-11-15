@@ -7,6 +7,7 @@ package simulation
 import (
 	"context"
 	"fmt"
+	"internal/race"
 	"internal/synctest"
 	"internal/testenv"
 	"os"
@@ -1676,22 +1677,111 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 	}
 	dstExploreInit(64, 64, 64, 0)
 	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
-		var wg sync.WaitGroup
-		wg.Add(1)
+		done := make(chan struct{})
 		go func() {
-			defer wg.Done()
+			close(done)
 		}()
-		wg.Wait()
+		<-done
 		return false
 	})
+	found := false
 	for i := range tr.edgeFrom {
 		for j := range tr.edgeFrom {
 			if tr.edgeFrom[i] == tr.edgeTo[j] && tr.edgeTo[i] == tr.edgeFrom[j] && tr.edgeStep[i] < tr.edgeStep[j] {
-				return
+				found = true
+				break
 			}
 		}
+		if found {
+			break
+		}
 	}
-	t.Fatalf("goroutine creation did not record a parent->child HB edge before child wake: steps=%v acc=%v from=%v to=%v", tr.edgeStep, tr.edgeAcc, tr.edgeFrom, tr.edgeTo)
+	if !found {
+		t.Fatalf("goroutine creation did not record a parent->child HB edge before child wake: steps=%v acc=%v from=%v to=%v", tr.edgeStep, tr.edgeAcc, tr.edgeFrom, tr.edgeTo)
+	}
+
+	if !dstRaceEnabledFP() {
+		return
+	}
+
+	// Under -tags dst -race, WaitGroup.Done executes Semrelease inside
+	// race.Disable() (suppressing raw goready edges) and records completion HB
+	// via explicit WaitGroup sync release/acquire events instead.
+	x := new(int)
+	addr := uintptr(unsafe.Pointer(x))
+	dstExploreInit(128, 512, 128, 512)
+	_, _, wgTr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			dstAccessYield(unsafe.Pointer(x), true)
+			wg.Done()
+		}()
+		wg.Wait()
+		dstAccessYield(unsafe.Pointer(x), false)
+		return false
+	})
+	write, read := -1, -1
+	for i := range wgTr.accSeq {
+		if wgTr.accAddr[i] != addr {
+			continue
+		}
+		if wgTr.accWrite[i] && write < 0 {
+			write = i
+		}
+		if !wgTr.accWrite[i] {
+			read = i
+		}
+	}
+	if write < 0 || read < 0 || wgTr.accSeq[write] == wgTr.accSeq[read] {
+		t.Fatalf("missing WaitGroup-protected access pair: write=%d read=%d seq=%v", write, read, wgTr.accSeq)
+	}
+	clk, pidx := dporClocks(wgTr)
+	if dporConcurrent(clk, pidx, wgTr, write, read) {
+		t.Fatalf("WaitGroup Done->Wait sync events did not order protected accesses: write=%d read=%d sync=%v", write, read, wgTr.syncKind)
+	}
+
+	// Conversely, a contended goready fired inside race.Disable() (such as
+	// failed RWMutex.TryLock's internal rw.w.Unlock or explicit RaceDisable)
+	// must NOT record a ready HB edge that TSan suppresses.
+	dstExploreInit(128, 512, 128, 512)
+	_, _, ignTr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		var mu sync.Mutex
+		done := make(chan struct{})
+		mu.Lock()
+		go func() {
+			mu.Lock()
+			dstAccessYield(unsafe.Pointer(x), false)
+			mu.Unlock()
+			close(done)
+		}()
+		synctest.Wait()
+		dstAccessYield(unsafe.Pointer(x), true)
+		race.Disable()
+		mu.Unlock()
+		race.Enable()
+		<-done
+		return false
+	})
+	write, read = -1, -1
+	for i := range ignTr.accSeq {
+		if ignTr.accAddr[i] != addr {
+			continue
+		}
+		if ignTr.accWrite[i] && write < 0 {
+			write = i
+		}
+		if !ignTr.accWrite[i] {
+			read = i
+		}
+	}
+	if write < 0 || read < 0 || ignTr.accSeq[write] == ignTr.accSeq[read] {
+		t.Fatalf("missing race-ignored mutex access pair: write=%d read=%d seq=%v", write, read, ignTr.accSeq)
+	}
+	ignClk, ignPidx := dporClocks(ignTr)
+	if !dporConcurrent(ignClk, ignPidx, ignTr, write, read) {
+		t.Fatalf("goready under race.Disable() leaked a spurious HB edge: edges=%v->%v sync=%v", ignTr.edgeFrom, ignTr.edgeTo, ignTr.syncKind)
+	}
 }
 
 func TestExploreRecordsBufferedChannelHB(t *testing.T) {
@@ -2349,9 +2439,11 @@ func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
 	}
 	marker := new(int)
 	addr := uintptr(unsafe.Pointer(marker))
+	var wgAddr uintptr
 	sut := func() bool {
 		var rw sync.RWMutex
 		var wg sync.WaitGroup
+		wgAddr = uintptr(unsafe.Pointer(&wg))
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -2395,7 +2487,7 @@ func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
 		if read >= 0 {
 			seq := tr.accSeq[read]
 			for i, k := range tr.syncKind {
-				if tr.syncSeq[i] == seq {
+				if tr.syncSeq[i] == seq && tr.syncID[i] != wgAddr {
 					t.Fatalf("failed public RWMutex.TryLock recorded DST HB event kind=%d id=%#x for goroutine %d: syncKind=%v syncSeq=%v syncID=%v", k, tr.syncID[i], seq, tr.syncKind, tr.syncSeq, tr.syncID)
 				}
 			}
@@ -3858,7 +3950,7 @@ func main() {
 	if out, err := bcmd.CombinedOutput(); err != nil {
 		t.Fatalf("build probe: %v\n%s", err, out)
 	}
-	chain := `^runtime\.(dstAccessYield|dstAccessYieldRange|dstSyncAcquire|dstAtomicYield|dstSyncObserve|dstCoarseDep|dstCoarseHB|dstYieldPoint|dstYieldAccess|dstEnsureSeq|dstAccessMaybeShared|dstCommitAccess|dstRecordAccess|dstRecordSyncEvent|dstRecordSyncEventID|dstRecordSyncAcquireID|dstRecordSyncReleaseID|goyield)$`
+	chain := `^runtime\.(dstAccessYield|dstAccessYieldRange|dstSyncAcquire|dstAtomicYield|dstSyncObserve|dstCoarseDep|dstCoarseRecord|dstYieldPoint|dstYieldAccess|dstEnsureSeq|dstAccessMaybeShared|dstCommitAccess|dstRecordAccess|dstRecordSyncEvent|dstRecordSyncEventID|dstRecordSyncAcquireID|dstRecordSyncReleaseID|goyield)$`
 	cmd := exec.Command(testenv.GoToolPath(t), "tool", "objdump", "-s", chain, exe)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()

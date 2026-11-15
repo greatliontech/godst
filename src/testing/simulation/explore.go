@@ -82,6 +82,13 @@ type Failure struct {
 	// execution, so a failure found under a torn crash reproduces only under one
 	// (DST-FAULT-REPLAY).
 	CrashTear bool
+	// MaxSteps, MaxAccesses, and MaxEdges record the ExploreOptions trace budgets
+	// under which this failure was discovered so Replay initializes the runtime's
+	// live shared-address filter and trace tables to the identical capacities
+	// (preventing filter-overflow yield-point divergence during Replay).
+	MaxSteps    int
+	MaxAccesses int
+	MaxEdges    int
 
 	diagnostics string
 }
@@ -320,10 +327,18 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 	dstSetWedgeLimits(0, 0) // exploration runs carry the default wedge bounds
 	cfg := exploreConfigFromOptions(opts)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
+	var res ExploreResult
 	if opts.Mode == DPOR {
-		return dporExplore(seed, sut, cfg)
+		res = dporExplore(seed, sut, cfg)
+	} else {
+		res = exhaustiveExplore(seed, sut, cfg)
 	}
-	return exhaustiveExplore(seed, sut, cfg)
+	for i := range res.Failures {
+		res.Failures[i].MaxSteps = opts.MaxSteps
+		res.Failures[i].MaxAccesses = opts.MaxAccesses
+		res.Failures[i].MaxEdges = opts.MaxEdges
+	}
+	return res
 }
 
 // Replay executes sut once under failure's recorded schedule and access-force set.
@@ -344,7 +359,11 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	// torn crash untorn would restore a different disk and not reproduce.
 	setCrashTear(failure.CrashTear)
 	dstSetWedgeLimits(0, 0) // replays carry the default wedge bounds
-	cfg := defaultExploreConfig()
+	cfg := exploreConfigFromOptions(ExploreOptions{
+		MaxSteps:    failure.MaxSteps,
+		MaxAccesses: failure.MaxAccesses,
+		MaxEdges:    failure.MaxEdges,
+	})
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg, failure.ForeignSched)
 	if r.panic != "" {

@@ -369,46 +369,55 @@ mutex is sound and is exactly the interleaving Gap A needs.
   cannot establish (keyed on the runtime's `dstLevel2Events` delta, which counts recorded accesses,
   sync decisions, and atomic announces but never `dstYieldPoint`'s size-0 scheduling yields —
   enforced by `TestDPORUninstrumentedDowngrade`, both builds). The floor has a second, PARTIAL
-  arm: `sync.Mutex`/`RWMutex` orderings ride HB events only the dst-race sync hooks emit, so a
-  simulation goroutine PARKING on one during a norace exploration proves the SUT orders through a
+  arm: `sync.Mutex`/`RWMutex`/`Cond` orderings ride decision and HB events only the dst-race sync hooks
+  emit, so a simulation goroutine PARKING on one during a norace exploration proves the SUT orders through a
   primitive the build cannot see — events firing elsewhere (channels, the coarse model) cannot
   vouch for those orderings, and the same downgrade applies (keyed on the runtime's
-  `dstSyncBlindBlocks` delta from the semaphore park site; enforced by
-  `TestDPORMutexBlindDowngrade`, both builds). The uncontended mutex fast path is an
+  `dstSyncBlindBlocks` delta from the semaphore and `notifyList` park sites; enforced by
+  `TestDPORMutexBlindDowngrade`, both builds). The uncontended mutex/once fast paths are
   uninstrumented atomic and stays invisible — the documented residual: norace DPOR exhaustion
   over mutex-using SUTs is sound only when contention parks at least once or the dst-race build
   is used. Manual-hook SUTs (the sweep's shape)
   fire events and keep their claims; Exhaustive mode is unaffected — its exhaustion claim is over
   the runtime-yield-granularity schedule tree and does not depend on dependency visibility.
   *Coarse cross-process dependencies (build-independent):* the simulated OS announces the objects
-  real PROCESSES conflict through as dependency identities via `runtime.dstCoarseDep` — active in
-  every dst build, race or not, self-gated outside scheduled-strategy runs: (a) a HANDLE (fd) op
-  announces its FILE NODE (read/pread/readdir/fstat/SEEK_END read-conflict — fstat and SEEK_END
-  read the shared size a peer's write moves; write/pwrite/truncate/fallocate/sync/datasync/chmod
-  write-conflict — a sync is a write on the durable image); (b) a NAMED (path) op — the plain
-  form AND the whole `os.Root` family, each wired per-op — announces its HOST NAMESPACE, one
-  deliberately coarse per-host identity (creation/removal/rename/truncate-by-name/chmod/chtimes/
-  link and create-or-O_TRUNC opens write; stat/readlink/readdir-open/chdir/openroot/plain opens
-  read); (c) a flock decision announces its file node as a write-conflict, with the grant
-  ACQUIRING and the unlock — explicit LOCK_UN or the close/exit release path — RELEASING
-  happens-before through the coarse aux (`dstSyncCoarseAux`); (d) a futex wait announces the word
-  identity (node pointer + byte offset — the queue key, so different mappings meet) as a read, a
-  wake as a write that RELEASES, and a woken waiter ACQUIRES. Coarseness is one-directional for
+  real PROCESSES and concurrent callers conflict through as dependency identities via
+  `runtime.dstCoarseDep` and secondary `runtime.dstCoarseRecord` attachments — active in every dst
+  build, race or not, self-gated outside scheduled-strategy runs, and recording without yielding
+  when reached inside kernel-owned process/host teardown critical sections: (a) a HANDLE (fd) op
+  announces its open file description (`*dstFile`, `*dstProcFile`, `*os.Root`, or virtual fd slot —
+  capturing same-handle cursor/close/EBADF orderings) together with its FILE NODE (read/pread/
+  readdir/fstat/SEEK_END read-conflict; write/pwrite/truncate/fallocate/sync/datasync/chmod
+  write-conflict), and named `Stat`/`Truncate`/`Chmod`/`Chtimes` attach post-resolution node
+  records; (b) a NAMED (path) op — the plain form AND the whole `os.Root` family — announces its
+  HOST NAMESPACE (creation/removal/rename/truncate-by-name/chmod/chtimes/link and
+  create-or-O_TRUNC opens write; stat/readlink/readdir-open/chdir/openroot/plain opens read), plus
+  the per-`(host, proc)` working-directory identity whenever a path is relative or `Chdir`/`Getwd`
+  runs; (c) a flock decision announces its handle and file node, with the grant ACQUIRING and the
+  unlock — explicit `LOCK_UN` or the close/exit/crash release path — RELEASING happens-before
+  through `dstSyncCoarseAux`; (d) a futex wait announces the word identity (node pointer + byte
+  offset — the queue key, so different mappings meet) as a read and a wake as a write, with each
+  woken waiter acquiring only its own per-waiter happens-before slot from the wake that dequeued
+  it; (e) modeled pipes, stream sockets (`net.Conn`), listeners/dials/partitions, socket-option
+  descriptors (`setsockopt`/`getsockopt`), and per-process environment tables announce coarse
+  dependencies on their stream, FIN/EOF (`eofSync` distinct from data `raceSync` so pre-buffered
+  reads do not acquire peer `Close` happens-before), close, deadline, listener/host-port, sockopt,
+  and environment state, with modeled file, pipe, socket, flock, and futex synchronization
+  recording user happens-before atomically inside kernel critical sections in both the DPOR HB
+  shadow (`dstSyncCoarseAux`) and TSan while internal kernel mutex/broadcast-channel sync and
+  `goready` edges remain suppressed. Coarseness is one-directional for
   the ANNOUNCE half: extra announced dependencies only ADD explored orderings. The HB half rides
   the same masking floor as the atomic CAS over-claim above: a coarse release that released
   nothing real (an unheld LOCK_UN, a wake that woke nobody, an aliased identity — the futex id
   arithmetic can in principle alias another node's pointer) is never load-bearing for pruning,
   because every coarse HB event rides a same-id WRITE announce, so the reorder is always seeded
   and the per-trace re-analysis drops an edge the reordered trace does not exhibit. *Recorded
-  incompleteness (the honest bounds):* (i) plain shared Go memory between goroutines of ONE
-  process, and atomics on mmap'd pages — the race build's domain; (ii) HANDLE-vs-NAMED
-  cross-identity: a named op's node-state effect (truncate-by-name, chmod-by-name, O_TRUNC's
-  data clear, named-stat's size read) announces at namespace granularity only, so it orders
-  against other NAMED ops but not against a peer's HANDLE ops on the same node — closable by
-  post-resolution node announces if a consumer needs it. `Exhausted` remains, as everywhere, a
-  claim over the visible dependency relation. Enforced by `TestDSTExploreCoarse{FSOrder,
-  FlockWinner,FutexLostWakeWindow,NamespaceOrder,FlockCloseRelease}`
-  (`testing/simulation/explore_coarse_linux_test.go`) — each pins the OUTCOME SET: both orders of
+  incompleteness (the honest bounds):* plain shared Go memory between goroutines of ONE process,
+  and atomics/loads/stores on mmap'd pages, remain the `-tags dst -race` build's domain.
+  `Exhausted` remains, as everywhere, a claim over the visible dependency relation. Enforced by
+  `TestDSTExploreCoarse{FSOrder,FlockWinner,FutexLostWakeWindow,NamespaceOrder,FlockCloseRelease}`
+  (`testing/simulation/explore_coarse_linux_test.go`) and `TestDSTKernelSync*`
+  (`testing/simulation/kernel_sync_linux_test.go`) — each pins the OUTCOME SET: both orders of
   the conflicting pair genuinely ran under non-race DPOR, where each collapsed to one
   falsely-exhausted class before the model; the namespace leg routes through `os.Root`.
 - **Hardening clauses.** Four consequences of the above, made explicit because each was violable in
@@ -423,8 +432,8 @@ mutex is sound and is exactly the interleaving Gap A needs.
      flag exactly as access-log overflow (`Exhausted=false`), AND the overflowing trace's
      source-backtracking degrades to the all-enabled over-approximation (sound: never prunes) rather
      than trusting the under-ordered weak-initials. Enforced by
-     `TestExploreSyncEventOverflowReportsIncomplete` (the `-race` leg — sync-HB events record only
-     under `-race`).
+     `TestExploreSyncEventOverflowReportsIncomplete` (the `-race` leg for auto-instrumented chan/mutex
+     sync-HB events; modeled-kernel coarse sync-HB events record in all dst builds).
   2. **Filter-capacity accounting is address-independent.** Whether the access filter degrades to
      conservative mode must be a function of counts the schedule determines (entries, syncs, procs),
      never of how an entry's byte range straddles pages at its run-local *address* — an
@@ -731,8 +740,10 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    contribution), keyed to the EXECUTING goroutine's `raceignore` exactly as every race.go
    acquire/release variant is (the g-credited `raceacquireg`/`racereleaseg` forms also check
    `getg().raceignore`), so the whole HB shadow honors the same ignore state as the race detector
-   it must agree with; decision announces and ready/create edges do not flow through that funnel
-   and are unaffected. Enforced by `TestDSTSyncHBRaceIgnore` on the recorded event stream itself
+   it must agree with; decision announces do not flow through that funnel and are unaffected,
+   while `dstGoready` suppresses ready edges when `dstKernelDepth > 0` or `raceignore != 0` and
+   `dstNewprocReadyEdge` suppresses goroutine-creation edges when non-kernel `RaceDisable` is
+   active. Enforced by `TestDSTSyncHBRaceIgnore` on the recorded event stream itself
    (outcome-based tests cannot see HB records — they only prune): RaceDisable-bracketed mutex,
    channel, and atomic ops record nothing; RWMutex ops record only the public sem events; the
    contended-Lock and TryLock-success record sites are asserted per call site. The mechanism is also load-bearing for DST-L2-4's
@@ -751,18 +762,23 @@ by the ordering key. (The `cmd/compile`/`cmd/go` work is therefore deferred unti
    non-blocking decisions. Gated by the SAME `dstBuild && raceenabled` / `//go:build dst && race` condition
    as the memory auto-instrumentation (so non-dst, plain-`-race`, and dst-without-race builds are
    hook-inert — DST-L2-4), and confined to the scheduled strategy by the runtime guard. Acceptance:
-   `TestDSTExploreSyncAutoInstrument` — unmodified mutex/channel/RWMutex/select/close/Once SUTs each reach
-   BOTH sync-decision outcomes under DPOR (vs 1 with the corresponding hook neutered). *Coverage:* this
-   covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (decision transitively via `rw.w`),
-   `sync.RWMutex.RLock`/`TryRLock`/`RUnlock`/`Unlock`, blocking and non-blocking `chansend`/`chanrecv`,
-   `closechan`, blocking and non-blocking `selectgo` channel send/recv paths, and `sync.Once`'s first
-   execution path (transitively through its internal `Mutex`). Shared-address filtering for the
+   `TestDSTExploreSyncAutoInstrument` — unmodified mutex/channel/RWMutex/select/close/Once/WaitGroup/Cond
+   SUTs each reach BOTH sync-decision outcomes under DPOR (vs 1 with the corresponding hook neutered).
+   *Coverage:* this covers `sync.Mutex.Lock`/`TryLock`/`Unlock`, `sync.RWMutex.Lock` (decision
+   transitively via `rw.w`), `sync.RWMutex.RLock`/`TryRLock`/`RUnlock`/`Unlock`, blocking and
+   non-blocking `chansend`/`chanrecv`, `closechan`, blocking and non-blocking `selectgo` channel
+   send/recv paths, `sync.Once.Do` (both first-caller and fast-path done-load decisions plus
+   completion happens-before), `sync.WaitGroup.Add`/`Done`/`Wait` (counter-zero completion HB and
+   `Add`/`Wait` conflict decisions), and `sync.Cond.Wait`/`Signal`/`Broadcast` (wait-registration
+   decisions and per-waiter ticket happens-before). Shared-address filtering for the
    auto-instrumentation explosion is implemented in increment 6 and enforced by
    `TestDSTExploreAutoInstrument`.
 2. **Happens-before pruning — recorded events, computed offline** (D2; **VALIDATED [V]**). The runtime
-   records ready/create edges (readier happens-before readied) and, in `-tags dst -race` builds, explicit
-   sync release/acquire events into pre-sized per-bubble buffers under the scheduled strategy only
-   (allocation-free, gated so Random/PCT/non-dst/dst-without-race are unaffected); the DPOR engine builds vector clocks **offline** from those events +
+   records ready/create edges (readier happens-before readied), modeled-kernel coarse sync
+   release/acquire events (`dstSyncCoarseAux`, in all `-tags dst` builds), and, in `-tags dst -race`
+   builds, explicit Go sync release/acquire events into pre-sized per-bubble buffers under the
+   scheduled strategy only (allocation-free, gated so Random/PCT/non-dst builds are unaffected);
+   the DPOR engine builds vector clocks **offline** from those events +
    program order (`dporClocks`/`dporConcurrent` in `explore.go`) and refines the dependency to *concurrent*
    conflicting pairs only. Mutex/channel-serialized conflicts are pruned, including non-waking edges such
    as uncontended mutex `Unlock`→`Lock`, buffered channel slot send→receive and receive→slot-reusing send
@@ -932,10 +948,15 @@ on the same writer-mutex identity as `RWMutex.Lock`, including failed `TryRLock`
 `RWMutex.Unlock`/`RUnlock` announce the same identity before release transitions that can flip racing try
 attempts. Blocking and non-blocking select channel cases announce each candidate channel before taking
 channel locks, `closechan` announces before the closed-state transition that can flip a non-blocking receive,
-and `Once` is covered by its internal mutex.
-`TestDSTExploreSyncAutoInstrument` now covers mutex, channel, RWMutex reader-vs-writer, TryLock,
+`Once.Do` announces on its embedded mutex identity before the `done` fast-path load and publishes/acquires
+happens-before on `done` across both slow- and fast-path returns, `WaitGroup.Add` (`delta > 0`) and `Wait`
+announce decisions on `&wg.sema` while `Done`/`Wait` publish/acquire happens-before on `wg` outside
+`race.Disable()` scopes (matching TSan's commutativity of `Done` decrements), and `Cond.Wait`/`Signal`/`Broadcast`
+announce decisions on the `notifyList` identity.
+`TestDSTExploreSyncAutoInstrument` covers mutex, channel, RWMutex reader-vs-writer, TryLock,
 failed TryLock/TryRLock decisions, release-vs-try decisions, blocking and non-blocking select send/recv,
-close-vs-receive decisions, and Once winner order under `-tags dst -race`.
+close-vs-receive decisions, `Once` winner order (including fast-path contenders), `WaitGroup` `Add`-vs-`Wait`
+misuse and completion HB, and `Cond` lost-wakeup order under `-tags dst -race`.
 Finalizer-timing observation
 stays out of scope until *every* access is recorded; the `dporExplore` dependency loop documents the
 relation.

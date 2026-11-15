@@ -86,8 +86,8 @@ func (f *File) fd() uintptr {
 		if dstBackendOf(f.file) != nil {
 			return uintptr(dstFD(f.file))
 		}
-		if (f.pfd.Sysfd == 1 || f.pfd.Sysfd == 2) && dstFenceActive() && !dstHostIOActive() {
-			return uintptr(f.pfd.Sysfd)
+		if sysfd := dstSysfd(f.file); (sysfd == 1 || sysfd == 2) && dstFenceActive() && !dstHostIOActive() {
+			return uintptr(sysfd)
 		}
 	}
 

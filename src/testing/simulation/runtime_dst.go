@@ -7,9 +7,12 @@
 package simulation
 
 import (
+	isync "internal/sync"
 	"testing"
 	_ "unsafe" // for go:linkname
 )
+
+type kernelMutex = isync.KernelMutex
 
 //go:linkname dstActivate runtime.dstActivate
 func dstActivate(seed uint64)
@@ -28,6 +31,9 @@ func dstSetSchedStrategy(kind uint8, depth, steps int32)
 
 //go:linkname dstExploreInit runtime.dstExploreInit
 func dstExploreInit(maxDecisions, maxEnabledTotal, maxEdges, maxAccesses int)
+
+//go:linkname dstYieldPoint runtime.dstYieldPoint
+func dstYieldPoint()
 
 //go:linkname dstSetSchedule runtime.dstSetSchedule
 func dstSetSchedule(prefix []uint64)
@@ -215,6 +221,9 @@ func dstStopProcessThreads(pid int32)
 //go:linkname dstProcessTeardown runtime.dstProcessTeardown
 func dstProcessTeardown(proc uint32)
 
+//go:linkname dstProcessHasResources runtime.dstProcessHasResources
+func dstProcessHasResources(proc uint32) bool
+
 //go:linkname dstProcessStateTeardown runtime.dstProcessStateTeardown
 func dstProcessStateTeardown(proc uint32)
 
@@ -262,6 +271,9 @@ func dstStepHostClock(host uint32, delta int64) bool
 
 //go:linkname dstDriftHostClock runtime.dstDriftHostClock
 func dstDriftHostClock(host uint32, ppb int64)
+
+//go:linkname dstFakeTimersCountFP runtime.dstFakeTimersCountFP
+func dstFakeTimersCountFP() int
 
 //go:linkname dstDiskFaultOp runtime.dstDiskFaultOp
 func dstDiskFaultOp(op, host uint32, arg int64, name string)

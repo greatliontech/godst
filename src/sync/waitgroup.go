@@ -75,6 +75,13 @@ const waitGroupBubbleFlag = 0x8000_0000
 // new Add calls must happen after all previous Wait calls have returned.
 // See the WaitGroup example.
 func (wg *WaitGroup) Add(delta int) {
+	if dstHookEnabled {
+		if delta > 0 {
+			dstSyncObserveWaitGroup(wg)
+		} else if delta < 0 {
+			dstSyncReleaseWaitGroup(wg)
+		}
+	}
 	if race.Enabled {
 		if delta < 0 {
 			// Synchronize decrements with Wait.
@@ -138,8 +145,12 @@ func (wg *WaitGroup) Add(delta int) {
 		// so we can safely disassociate wg from its current bubble.
 		synctest.Disassociate(wg)
 	}
-	for ; w != 0; w-- {
-		runtime_Semrelease(&wg.sema, false, 0)
+	if dstSemaEnabled {
+		dstWaitGroupWake(&wg.sema, w)
+	} else {
+		for ; w != 0; w-- {
+			runtime_Semrelease(&wg.sema, false, 0)
+		}
 	}
 }
 
@@ -158,6 +169,9 @@ func (wg *WaitGroup) Done() {
 
 // Wait blocks until the [WaitGroup] task counter is zero.
 func (wg *WaitGroup) Wait() {
+	if dstHookEnabled {
+		dstSyncAcquireWaitGroup(wg)
+	}
 	if race.Enabled {
 		race.Disable()
 	}
@@ -170,6 +184,9 @@ func (wg *WaitGroup) Wait() {
 			if race.Enabled {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(wg))
+			}
+			if dstHookEnabled {
+				dstSyncAcquireHBWaitGroup(wg)
 			}
 			if w == 0 && state&waitGroupBubbleFlag != 0 && synctest.IsAssociated(wg) {
 				// Adds must not happen concurrently with wait when counter is 0,
@@ -208,6 +225,9 @@ func (wg *WaitGroup) Wait() {
 			if race.Enabled {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(wg))
+			}
+			if dstHookEnabled {
+				dstSyncAcquireHBWaitGroup(wg)
 			}
 			if isReset {
 				panic("sync: WaitGroup is reused before previous Wait has returned")
