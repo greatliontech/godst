@@ -7,12 +7,17 @@
 package os_test
 
 import (
+	"bytes"
 	"errors"
+	"internal/poll"
 	"math"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/simulation"
+	"time"
+	"unsafe"
 )
 
 // TestDSTFSVirtualFDFstatIdentity: fstat(2)'s (st_dev, st_ino) pair is the file
@@ -715,5 +720,725 @@ func TestDSTFSWriteAtHugeOffsetIsEFBIG(t *testing.T) {
 		if _, err := f.WriteAt([]byte("xx"), math.MaxInt64-1); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("WriteAt near MaxInt64 = %v, want EFBIG", err)
 		}
+	})
+}
+
+func TestDSTFSInodeCwdRootChdirRenameAndUnlink(t *testing.T) {
+	simulation.Run(1, func() {
+		// 1. (*os.File).Chdir() on directories opened via relative or uncleaned os.Root paths.
+		if err := os.MkdirAll("/a/b/c", 0o755); err != nil {
+			t.Fatalf("MkdirAll /a/b/c: %v", err)
+		}
+		if err := os.Chdir("/a"); err != nil {
+			t.Fatalf("Chdir /a: %v", err)
+		}
+		rb, err := os.OpenRoot("b")
+		if err != nil {
+			t.Fatalf("OpenRoot(b): %v", err)
+		}
+		defer rb.Close()
+		dfc, err := rb.Open("c")
+		if err != nil {
+			t.Fatalf("rb.Open(c): %v", err)
+		}
+		if err := dfc.Chdir(); err != nil {
+			t.Fatalf("dfc.Chdir: %v", err)
+		}
+		_ = dfc.Close()
+		if wd, err := os.Getwd(); err != nil || wd != "/a/b/c" {
+			t.Fatalf("Getwd after Root-opened File.Chdir = %q, %v; want /a/b/c", wd, err)
+		}
+		if err := os.WriteFile("here", []byte("ok"), 0o644); err != nil {
+			t.Fatalf("WriteFile relative in /a/b/c: %v", err)
+		}
+		if got, err := os.ReadFile("/a/b/c/here"); err != nil || string(got) != "ok" {
+			t.Fatalf("ReadFile /a/b/c/here = %q, %v; want ok", got, err)
+		}
+
+		rab, err := os.OpenRoot("/a/b")
+		if err != nil {
+			t.Fatalf("OpenRoot(/a/b): %v", err)
+		}
+		defer rab.Close()
+		dfDotDot, err := rab.Open("c/..")
+		if err != nil {
+			t.Fatalf("rab.Open(c/..): %v", err)
+		}
+		if err := dfDotDot.Chdir(); err != nil {
+			t.Fatalf("dfDotDot.Chdir: %v", err)
+		}
+		_ = dfDotDot.Close()
+		if wd, err := os.Getwd(); err != nil || wd != "/a/b" {
+			t.Fatalf("Getwd after Root.Open(c/..).Chdir = %q, %v; want /a/b", wd, err)
+		}
+
+		// 2. Renaming an ancestor of cwd updates Getwd, relative creates, and relative /proc walks.
+		if err := os.Chdir("/a/b/c"); err != nil {
+			t.Fatalf("Chdir /a/b/c: %v", err)
+		}
+		if err := os.Rename("/a/b", "/a/moved"); err != nil {
+			t.Fatalf("Rename /a/b -> /a/moved: %v", err)
+		}
+		if wd, err := os.Getwd(); err != nil || wd != "/a/moved/c" {
+			t.Fatalf("Getwd after ancestor Rename = %q, %v; want /a/moved/c", wd, err)
+		}
+		if err := os.WriteFile("after-move", []byte("tracked"), 0o644); err != nil {
+			t.Fatalf("WriteFile after-move: %v", err)
+		}
+		if got, err := os.ReadFile("/a/moved/c/after-move"); err != nil || string(got) != "tracked" {
+			t.Fatalf("ReadFile /a/moved/c/after-move = %q, %v", got, err)
+		}
+		if bootID, err := os.ReadFile("../../../proc/sys/kernel/random/boot_id"); err != nil || len(bytes.TrimSpace(bootID)) == 0 {
+			t.Fatalf("relative /proc read from renamed cwd = %q, %v", bootID, err)
+		}
+
+		// 3. Unlinked cwd (and unlinked parent chain): Getwd + creators fail ENOENT with Linux precedence,
+		// recreating the old path never teleports the process, and Chdir("..") walks up to live "/".
+		if err := os.MkdirAll("/dead/inner", 0o755); err != nil {
+			t.Fatalf("MkdirAll /dead/inner: %v", err)
+		}
+		rDead, err := os.OpenRoot("/dead/inner")
+		if err != nil {
+			t.Fatalf("OpenRoot /dead/inner: %v", err)
+		}
+		defer rDead.Close()
+		if err := os.Chdir("/dead/inner"); err != nil {
+			t.Fatalf("Chdir /dead/inner: %v", err)
+		}
+		if err := os.RemoveAll("/dead"); err != nil {
+			t.Fatalf("RemoveAll /dead: %v", err)
+		}
+
+		if _, err := os.Getwd(); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Getwd on unlinked cwd = %v, want ENOENT", err)
+		}
+		// Recreate /dead/inner/reborn: process still on dead inode must NOT see it.
+		if err := os.MkdirAll("/dead/inner", 0o755); err != nil {
+			t.Fatalf("recreate /dead/inner: %v", err)
+		}
+		if err := os.WriteFile("/dead/inner/reborn", []byte("new"), 0o644); err != nil {
+			t.Fatalf("WriteFile reborn: %v", err)
+		}
+		if _, err := os.Stat("reborn"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Stat(reborn) from unlinked cwd = %v, want ENOENT (teleported into recreated path)", err)
+		}
+
+		// Creator error-precedence checks on dead directory (host-probed on Linux).
+		if _, err := os.OpenFile("created", os.O_CREATE|os.O_RDWR, 0o644); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("OpenFile(O_CREATE) in dead cwd = %v, want ENOENT", err)
+		}
+		if _, err := os.OpenFile("created/", os.O_CREATE|os.O_RDWR, 0o644); !errors.Is(err, syscall.EISDIR) {
+			t.Fatalf("OpenFile(created/, O_CREATE) in dead cwd = %v, want EISDIR", err)
+		}
+		if err := os.Mkdir("sub", 0o755); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Mkdir in dead cwd = %v, want ENOENT", err)
+		}
+		if err := os.Link("/a/moved/c/here", "lnk"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Link into dead cwd = %v, want ENOENT", err)
+		}
+		if err := os.Rename("/a/moved/c/here", "moved-into-dead"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Rename into dead cwd = %v, want ENOENT", err)
+		}
+		if err := os.Rename("/a/moved/c/here", "moved-into-dead/"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Rename(file, dst/) into dead cwd = %v, want ENOENT", err)
+		}
+		if err := os.WriteFile("/a/moved/c/rsrc", []byte("r"), 0o644); err != nil {
+			t.Fatalf("WriteFile rsrc: %v", err)
+		}
+		rRoot, err := os.OpenRoot("/")
+		if err != nil {
+			t.Fatalf("OpenRoot /: %v", err)
+		}
+		defer rRoot.Close()
+		// Root.Link into an unlinked target directory must also fail ENOENT.
+		if err := rDead.Link("missing", "dst"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("rDead.Link = %v, want ENOENT", err)
+		}
+		if err := os.Mkdir("/rlink", 0o755); err != nil {
+			t.Fatalf("Mkdir /rlink: %v", err)
+		}
+		if err := os.WriteFile("/rlink/src", []byte("s"), 0o644); err != nil {
+			t.Fatalf("WriteFile /rlink/src: %v", err)
+		}
+		if err := os.Mkdir("/rlink/sub", 0o755); err != nil {
+			t.Fatalf("Mkdir /rlink/sub: %v", err)
+		}
+		rLinkRoot, err := os.OpenRoot("/rlink")
+		if err != nil {
+			t.Fatalf("OpenRoot /rlink: %v", err)
+		}
+		defer rLinkRoot.Close()
+		if fi, err := os.Stat("."); err != nil || !fi.IsDir() {
+			t.Fatalf("Stat(.) in dead cwd = %v", err)
+		}
+		if err := os.Chmod(".", 0o700); err != nil {
+			t.Fatalf("Chmod(.) in dead cwd = %v", err)
+		}
+		// Walk up retained d_parent chain: dead inner -> dead /dead -> live /.
+		if err := os.Chdir(".."); err != nil {
+			t.Fatalf("first Chdir(..) from dead inner: %v", err)
+		}
+		if _, err := os.Getwd(); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("Getwd on dead parent /dead = %v, want ENOENT", err)
+		}
+		if err := os.Chdir(".."); err != nil {
+			t.Fatalf("second Chdir(..) to /: %v", err)
+		}
+		if wd, err := os.Getwd(); err != nil || wd != "/" {
+			t.Fatalf("Getwd after escaping dead chain = %q, %v; want /", wd, err)
+		}
+	})
+}
+
+func TestDSTFSFlockBlockingCloseWithLiveSharedMmap(t *testing.T) {
+	simulation.Run(1, func() {
+		if err := os.WriteFile("/lock", make([]byte, 4096), 0o644); err != nil {
+			t.Fatalf("WriteFile /lock: %v", err)
+		}
+
+		fA, err := os.OpenFile("/lock", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("Open fA: %v", err)
+		}
+		defer fA.Close()
+		if err := syscall.Flock(int(fA.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatalf("fA LOCK_EX: %v", err)
+		}
+
+		fB, err := os.OpenFile("/lock", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("Open fB: %v", err)
+		}
+		fdB := int(fB.Fd())
+		mB, err := syscall.Mmap(fdB, 0, 4096, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			t.Fatalf("Mmap fB: %v", err)
+		}
+
+		bLocked := make(chan error, 1)
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			bLocked <- syscall.Flock(fdB, syscall.LOCK_EX)
+		}()
+		<-started
+		// Advance virtual time so the goroutine is durably parked inside dstFDFlock's wait loop.
+		time.Sleep(time.Millisecond)
+
+		// Close fB while Flock is blocked; mB still holds a live MAP_SHARED reference to fB's description.
+		if err := fB.Close(); err != nil {
+			t.Fatalf("fB.Close: %v", err)
+		}
+		// Release fA's lock so fB's blocked Flock wakes and receives the grant.
+		if err := syscall.Flock(int(fA.Fd()), syscall.LOCK_UN); err != nil {
+			t.Fatalf("fA LOCK_UN: %v", err)
+		}
+		if err := <-bLocked; err != nil {
+			t.Fatalf("blocked Flock after concurrent Close + live MAP_SHARED = %v, want nil", err)
+		}
+
+		// A third open description must observe the lock still held until mB is unmapped.
+		fC, err := os.OpenFile("/lock", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("Open fC: %v", err)
+		}
+		defer fC.Close()
+		if err := syscall.Flock(int(fC.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Fatalf("contender LOCK_EX|LOCK_NB while mB live = %v, want EWOULDBLOCK", err)
+		}
+
+		if err := syscall.Munmap(mB); err != nil {
+			t.Fatalf("Munmap mB: %v", err)
+		}
+		if err := syscall.Flock(int(fC.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Fatalf("contender LOCK_EX|LOCK_NB after Munmap(mB) = %v, want nil", err)
+		}
+	})
+}
+
+func TestDSTFSLeakedProcAndTreeHandlesAcrossRuns(t *testing.T) {
+	var (
+		leakedTree     *os.File
+		leakedProc     *os.File
+		leakedRootProc *os.File
+		leakedRoot     *os.Root
+	)
+	simulation.Run(1, func() {
+		tf, err := os.Create("/tree")
+		if err != nil {
+			t.Fatalf("Create /tree: %v", err)
+		}
+		if _, err := tf.WriteString("run1"); err != nil {
+			t.Fatalf("Write /tree: %v", err)
+		}
+		leakedTree = tf
+
+		pf, err := os.Open("/proc/sys/kernel/random/boot_id")
+		if err != nil {
+			t.Fatalf("Open boot_id: %v", err)
+		}
+		leakedProc = pf
+
+		r, err := os.OpenRoot("/")
+		if err != nil {
+			t.Fatalf("OpenRoot /: %v", err)
+		}
+		rpf, err := r.Open("proc/self/stat")
+		if err != nil {
+			t.Fatalf("Root.Open proc/self/stat: %v", err)
+		}
+		leakedRootProc = rpf
+		leakedRoot = r
+	})
+
+	// Post-run: Fd() returns ^uintptr(0) (never panics, never mints) and I/O fails with ErrClosed.
+	for name, f := range map[string]*os.File{
+		"tree":      leakedTree,
+		"proc":      leakedProc,
+		"root-proc": leakedRootProc,
+	} {
+		if got := f.Fd(); got != ^uintptr(0) {
+			t.Fatalf("post-run %s.Fd() = %d, want ^uintptr(0)", name, got)
+		}
+		var buf [8]byte
+		if _, err := f.Read(buf[:]); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("post-run %s.Read = %v, want ErrClosed", name, err)
+		}
+		if _, err := f.ReadAt(buf[:], 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("post-run %s.ReadAt = %v, want ErrClosed", name, err)
+		}
+		if _, err := f.Seek(0, 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("post-run %s.Seek = %v, want ErrClosed", name, err)
+		}
+		if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("post-run %s.Stat = %v, want ErrClosed", name, err)
+		}
+		if err := f.SetDeadline(time.Now()); !errors.Is(err, poll.ErrFileClosing) {
+			t.Fatalf("post-run %s.SetDeadline = %v, want poll.ErrFileClosing", name, err)
+		}
+	}
+	if _, err := leakedRoot.Stat("tree"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("post-run leakedRoot.Stat = %v, want ErrClosed", err)
+	}
+	if err := leakedRoot.Chown("tree", 0, 0); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("post-run leakedRoot.Chown = %v, want ErrClosed", err)
+	}
+	if err := leakedRoot.Lchown("tree", 0, 0); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("post-run leakedRoot.Lchown = %v, want ErrClosed", err)
+	}
+
+	// Run 2: leaked handles still return ^uintptr(0) on Fd() without consuming Run 2's virtual FD sequence,
+	// fail all I/O with ErrClosed (and SetDeadline with unwrapped poll.ErrFileClosing), and return nil on their first Close().
+	simulation.Run(2, func() {
+		for name, f := range map[string]*os.File{
+			"tree":      leakedTree,
+			"proc":      leakedProc,
+			"root-proc": leakedRootProc,
+		} {
+			if got := f.Fd(); got != ^uintptr(0) {
+				t.Fatalf("run2 %s.Fd() = %d, want ^uintptr(0)", name, got)
+			}
+			var buf [8]byte
+			if _, err := f.Read(buf[:]); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("run2 %s.Read = %v, want ErrClosed", name, err)
+			}
+			if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("run2 %s.Stat = %v, want ErrClosed", name, err)
+			}
+			if err := f.SetDeadline(time.Now()); !errors.Is(err, poll.ErrFileClosing) {
+				t.Fatalf("run2 %s.SetDeadline = %v, want poll.ErrFileClosing", name, err)
+			}
+		}
+		if _, err := leakedRoot.Stat("tree"); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("run2 leakedRoot.Stat = %v, want ErrClosed", err)
+		}
+		if err := leakedRoot.Chown("tree", 0, 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("run2 leakedRoot.Chown = %v, want ErrClosed", err)
+		}
+		if err := leakedRoot.Lchown("tree", 0, 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("run2 leakedRoot.Lchown = %v, want ErrClosed", err)
+		}
+
+		fresh, err := os.Create("/fresh")
+		if err != nil {
+			t.Fatalf("Create /fresh: %v", err)
+		}
+		defer fresh.Close()
+		if got := fresh.Fd(); got != 1<<30 {
+			t.Fatalf("fresh Run 2 file Fd() = %d, want %d (leaked Fd() minted in Run 2)", got, 1<<30)
+		}
+
+		for name, f := range map[string]*os.File{
+			"tree":      leakedTree,
+			"proc":      leakedProc,
+			"root-proc": leakedRootProc,
+		} {
+			if err := f.Close(); err != nil {
+				t.Fatalf("first Close() on leaked %s = %v, want nil", name, err)
+			}
+			if err := f.Close(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("second Close() on leaked %s = %v, want ErrClosed", name, err)
+			}
+		}
+		if err := leakedRoot.Close(); err != nil {
+			t.Fatalf("first Close() on leakedRoot = %v, want nil", err)
+		}
+	})
+}
+
+func TestDSTFSStatfsMadviseAndPreRunHostRootFence(t *testing.T) {
+	hostDir := t.TempDir()
+	if err := os.WriteFile(hostDir+"/host.txt", []byte("host-bytes"), 0o644); err != nil {
+		t.Fatalf("host WriteFile: %v", err)
+	}
+	hostRoot, err := os.OpenRoot(hostDir)
+	if err != nil {
+		t.Fatalf("host OpenRoot: %v", err)
+	}
+	defer hostRoot.Close()
+
+	const (
+		ext4Magic        = 0xef53
+		procMagic        = 0x9fa0
+		madvCold         = 20
+		madvPopulateRead = 22
+	)
+
+	var fsH1, fsH2 syscall.Statfs_t
+	simulation.Run(1, func() {
+		// 1. Pre-run host *os.Root is fenced across Close, Stat, Open, and RemoveAll without mutating host state.
+		for name, err := range map[string]error{
+			"Close":          hostRoot.Close(),
+			"RemoveAll(.)":   hostRoot.RemoveAll("."),
+			"RemoveAll(txt)": hostRoot.RemoveAll("host.txt"),
+		} {
+			if err == nil || !strings.Contains(err.Error(), "unsupported under deterministic simulation") {
+				t.Fatalf("in-bubble hostRoot.%s = %v, want unsupported-under-simulation error", name, err)
+			}
+		}
+		if _, err := hostRoot.Stat("host.txt"); err == nil || !strings.Contains(err.Error(), "unsupported under deterministic simulation") {
+			t.Fatalf("in-bubble hostRoot.Stat = %v, want unsupported-under-simulation error", err)
+		}
+		if _, err := hostRoot.Open("host.txt"); err == nil || !strings.Contains(err.Error(), "unsupported under deterministic simulation") {
+			t.Fatalf("in-bubble hostRoot.Open = %v, want unsupported-under-simulation error", err)
+		}
+
+		// 2. Statfs / Fstatfs (named and raw Syscall) across hosts, LimitDisk, and /proc.
+		simulation.Host("h1", simulation.HostConfig{}, func() {
+			simulation.LimitDisk("h1", 64<<10) // 16 * 4096 B blocks
+			f, err := os.OpenFile("/data", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+			if err != nil {
+				t.Fatalf("Create /data: %v", err)
+			}
+			if _, err := f.Write(make([]byte, 12<<10)); err != nil { // 3 blocks
+				t.Fatalf("Write /data: %v", err)
+			}
+			if err := syscall.Fstatfs(int(f.Fd()), &fsH1); err != nil {
+				t.Fatalf("Fstatfs(/data): %v", err)
+			}
+			if fsH1.Type != ext4Magic || fsH1.Bsize != 4096 || fsH1.Frsize != 4096 || fsH1.Namelen != 255 {
+				t.Fatalf("Fstatfs metadata = %+v", fsH1)
+			}
+			if fsH1.Blocks != 16 || fsH1.Bfree != 13 || fsH1.Bavail != 13 {
+				t.Fatalf("capped Fstatfs blocks = (%d, %d, %d), want (16, 13, 13)", fsH1.Blocks, fsH1.Bfree, fsH1.Bavail)
+			}
+
+			var byPath syscall.Statfs_t
+			if err := syscall.Statfs("/data", &byPath); err != nil || byPath != fsH1 {
+				t.Fatalf("Statfs(/data) = %+v, %v; want %+v", byPath, err, fsH1)
+			}
+			// Raw Syscall(SYS_FSTATFS, fd, &buf, 0) path (used by golang.org/x/sys/unix.Fstatfs on 64-bit Linux).
+			var byRaw syscall.Statfs_t
+			if _, _, errno := syscall.Syscall(syscall.SYS_FSTATFS, f.Fd(), uintptr(unsafe.Pointer(&byRaw)), 0); errno != 0 || byRaw != fsH1 {
+				t.Fatalf("raw SYS_FSTATFS = %+v, errno=%v", byRaw, errno)
+			}
+			if err := syscall.Fstatfs(int(f.Fd()), nil); !errors.Is(err, syscall.EFAULT) {
+				t.Fatalf("Fstatfs(nil) = %v, want EFAULT", err)
+			}
+			if err := syscall.Statfs("/no-such-file", &byPath); !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("Statfs(missing) = %v, want ENOENT", err)
+			}
+
+			simulation.LimitDisk("h1", 0)
+			var zeroCap syscall.Statfs_t
+			if err := syscall.Fstatfs(int(f.Fd()), &zeroCap); err != nil || zeroCap.Blocks != 0 || zeroCap.Bfree != 0 {
+				t.Fatalf("LimitDisk(0) Fstatfs = %+v, %v; want Blocks=0 Bfree=0", zeroCap, err)
+			}
+			simulation.UnlimitDisk("h1")
+			var uncapped syscall.Statfs_t
+			if err := syscall.Fstatfs(int(f.Fd()), &uncapped); err != nil || uncapped.Blocks <= 16 || uncapped.Bfree == 0 {
+				t.Fatalf("UnlimitDisk Fstatfs = %+v, %v; want uncapped blocks", uncapped, err)
+			}
+
+			// 3. Madvise accepts MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED alongside existing hints.
+			m, err := syscall.Mmap(int(f.Fd()), 0, 8192, syscall.PROT_READ, syscall.MAP_SHARED)
+			if err != nil {
+				t.Fatalf("Mmap: %v", err)
+			}
+			for _, adv := range []int{
+				syscall.MADV_NORMAL,
+				syscall.MADV_RANDOM,
+				syscall.MADV_SEQUENTIAL,
+				syscall.MADV_WILLNEED,
+				syscall.MADV_HUGEPAGE,
+				madvPopulateRead,
+				madvCold,
+			} {
+				if err := syscall.Madvise(m, adv); err != nil {
+					t.Fatalf("Madvise(%d) = %v, want nil", adv, err)
+				}
+			}
+			if err := syscall.Madvise(m[1:], syscall.MADV_WILLNEED); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("unaligned Madvise = %v, want EINVAL", err)
+			}
+			if err := syscall.Madvise(m, 9999); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("unsupported Madvise = %v, want EINVAL", err)
+			}
+			_ = syscall.Munmap(m)
+
+			deadFD := int(f.Fd())
+			_ = f.Close()
+			if err := syscall.Fstatfs(deadFD, &byPath); !errors.Is(err, syscall.EBADF) {
+				t.Fatalf("closed Fstatfs = %v, want EBADF", err)
+			}
+
+			// /proc Statfs and Fstatfs report PROC_SUPER_MAGIC and zero f_fsid.
+			var procSt, procFst syscall.Statfs_t
+			if err := syscall.Statfs("/proc/sys/kernel/random/boot_id", &procSt); err != nil {
+				t.Fatalf("Statfs(/proc/boot_id): %v", err)
+			}
+			pf, err := os.Open("/proc/sys/kernel/random/boot_id")
+			if err != nil {
+				t.Fatalf("Open(/proc/boot_id): %v", err)
+			}
+			if err := syscall.Fstatfs(int(pf.Fd()), &procFst); err != nil {
+				t.Fatalf("Fstatfs(/proc/boot_id): %v", err)
+			}
+			_ = pf.Close()
+			if procSt.Type != procMagic || procFst != procSt || procSt.Fsid != (syscall.Fsid{}) {
+				t.Fatalf("proc Statfs/Fstatfs = %+v / %+v", procSt, procFst)
+			}
+		})
+
+		simulation.Host("h2", simulation.HostConfig{}, func() {
+			if err := syscall.Statfs("/tmp", &fsH2); err != nil {
+				t.Fatalf("h2 Statfs(/tmp): %v", err)
+			}
+		})
+		if fsH1.Fsid == fsH2.Fsid {
+			t.Fatalf("distinct hosts reported identical f_fsid %+v", fsH1.Fsid)
+		}
+	})
+
+	// Post-run: hostRoot was never closed or mutated by the fenced in-bubble calls.
+	gotHost, err := hostRoot.ReadFile("host.txt")
+	if err != nil || string(gotHost) != "host-bytes" {
+		t.Fatalf("post-run hostRoot.ReadFile(host.txt) = %q, %v; want host-bytes", gotHost, err)
+	}
+}
+
+func TestDSTFSDualAliasDirCrashRecoveryCwdAndRemove(t *testing.T) {
+	syncDirPath := func(t *testing.T, p string) {
+		t.Helper()
+		d, err := os.Open(p)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", p, err)
+		}
+		if err := d.Sync(); err != nil {
+			_ = d.Close()
+			t.Fatalf("Sync(%s): %v", p, err)
+		}
+		_ = d.Close()
+	}
+
+	t.Run("RemoveAllPreservesSurvivingAliasAndDentryCwd", func(t *testing.T) {
+		simulation.Run(1, func() {
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				if err := os.MkdirAll("/a/dir/sub", 0o755); err != nil {
+					t.Fatalf("MkdirAll /a/dir/sub: %v", err)
+				}
+				if err := os.MkdirAll("/b", 0o755); err != nil {
+					t.Fatalf("MkdirAll /b: %v", err)
+				}
+				f, err := os.Create("/a/dir/sub/f")
+				if err != nil {
+					t.Fatalf("Create f: %v", err)
+				}
+				_, _ = f.WriteString("payload")
+				_ = f.Sync()
+				_ = f.Close()
+				for _, d := range []string{"/a/dir/sub", "/a/dir", "/a", "/b", "/"} {
+					syncDirPath(t, d)
+				}
+
+				// Rename /a/dir -> /b/dir and sync /b ONLY so crash recovery restores both /a/dir and /b/dir aliases.
+				if err := os.Rename("/a/dir", "/b/dir"); err != nil {
+					t.Fatalf("Rename /a/dir -> /b/dir: %v", err)
+				}
+				syncDirPath(t, "/b")
+			})
+
+			simulation.CrashHost("h")
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				fiA, err := os.Stat("/a/dir")
+				if err != nil {
+					t.Fatalf("Stat /a/dir: %v", err)
+				}
+				fiB, err := os.Stat("/b/dir")
+				if err != nil {
+					t.Fatalf("Stat /b/dir: %v", err)
+				}
+				if !os.SameFile(fiA, fiB) {
+					t.Fatalf("/a/dir and /b/dir did not recover to the same directory inode")
+				}
+
+				// Path-based Chdir, File.Chdir, Root.Open(".").Chdir, "..", and relative /proc walk distinguish /b/dir from /a/dir.
+				if err := os.Chdir("/b/dir"); err != nil {
+					t.Fatalf("Chdir /b/dir: %v", err)
+				}
+				if wd, err := os.Getwd(); err != nil || wd != "/b/dir" {
+					t.Fatalf("Getwd() at /b/dir = %q, %v; want /b/dir", wd, err)
+				}
+				pf, err := os.Open("../../proc/self/stat")
+				if err != nil {
+					t.Fatalf("Open ../../proc/self/stat from /b/dir: %v", err)
+				}
+				_ = pf.Close()
+				if err := os.Chdir(".."); err != nil {
+					t.Fatalf("Chdir .. from /b/dir: %v", err)
+				}
+				if wd, err := os.Getwd(); err != nil || wd != "/b" {
+					t.Fatalf("Getwd() after .. from /b/dir = %q, %v; want /b", wd, err)
+				}
+
+				df, err := os.Open("/b/dir")
+				if err != nil {
+					t.Fatalf("Open /b/dir: %v", err)
+				}
+				if err := df.Chdir(); err != nil {
+					t.Fatalf("df.Chdir(): %v", err)
+				}
+				_ = df.Close()
+				if wd, err := os.Getwd(); err != nil || wd != "/b/dir" {
+					t.Fatalf("Getwd() after df.Chdir() = %q, %v; want /b/dir", wd, err)
+				}
+
+				if err := os.Chdir("/"); err != nil {
+					t.Fatalf("Chdir /: %v", err)
+				}
+				r, err := os.OpenRoot("/b/dir")
+				if err != nil {
+					t.Fatalf("OpenRoot /b/dir: %v", err)
+				}
+				rf, err := r.Open(".")
+				if err != nil {
+					t.Fatalf("Root.Open(.): %v", err)
+				}
+				if err := rf.Chdir(); err != nil {
+					t.Fatalf("rf.Chdir(): %v", err)
+				}
+				_ = rf.Close()
+				_ = r.Close()
+				if wd, err := os.Getwd(); err != nil || wd != "/b/dir" {
+					t.Fatalf("Getwd() after Root.Open(.).Chdir() = %q, %v; want /b/dir", wd, err)
+				}
+
+				// RemoveAll("/a/dir") empties shared children and unlinks /a/dir while /b/dir stays live!
+				if err := os.RemoveAll("/a/dir"); err != nil {
+					t.Fatalf("RemoveAll /a/dir: %v", err)
+				}
+				if _, err := os.Stat("/a/dir"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat /a/dir after RemoveAll = %v, want ErrNotExist", err)
+				}
+				if wd, err := os.Getwd(); err != nil || wd != "/b/dir" {
+					t.Fatalf("Getwd() at surviving /b/dir after RemoveAll(/a/dir) = %q, %v; want /b/dir", wd, err)
+				}
+				ents, err := os.ReadDir("/b/dir")
+				if err != nil || len(ents) != 0 {
+					t.Fatalf("ReadDir /b/dir = %v, %v; want empty live dir", ents, err)
+				}
+				nf, err := os.Create("/b/dir/after")
+				if err != nil {
+					t.Fatalf("Create /b/dir/after on surviving alias: %v", err)
+				}
+				_ = nf.Close()
+			})
+		})
+	})
+
+	t.Run("SingleRemoveAndCrossRenameCycleGuard", func(t *testing.T) {
+		simulation.Run(2, func() {
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				if err := os.MkdirAll("/a/empty", 0o755); err != nil {
+					t.Fatalf("MkdirAll /a/empty: %v", err)
+				}
+				if err := os.MkdirAll("/b", 0o755); err != nil {
+					t.Fatalf("MkdirAll /b: %v", err)
+				}
+				if err := os.MkdirAll("/x/p/c", 0o755); err != nil {
+					t.Fatalf("MkdirAll /x/p/c: %v", err)
+				}
+				if err := os.MkdirAll("/y", 0o755); err != nil {
+					t.Fatalf("MkdirAll /y: %v", err)
+				}
+				for _, d := range []string{"/a/empty", "/a", "/b", "/x/p/c", "/x/p", "/x", "/y", "/"} {
+					syncDirPath(t, d)
+				}
+
+				if err := os.Rename("/a/empty", "/b/empty"); err != nil {
+					t.Fatalf("Rename /a/empty -> /b/empty: %v", err)
+				}
+				syncDirPath(t, "/b")
+
+				// Unsynced cross-rename sequence that would form a p <-> c cycle if both edges restored blindly.
+				if err := os.Rename("/x/p/c", "/y/c"); err != nil {
+					t.Fatalf("Rename /x/p/c -> /y/c: %v", err)
+				}
+				if err := os.Rename("/x/p", "/y/c/p"); err != nil {
+					t.Fatalf("Rename /x/p -> /y/c/p: %v", err)
+				}
+				syncDirPath(t, "/y/c")
+				syncDirPath(t, "/y")
+			})
+
+			simulation.CrashHost("h")
+			simulation.Host("h", simulation.HostConfig{}, func() {
+				if err := os.Chdir("/a/empty"); err != nil {
+					t.Fatalf("Chdir /a/empty: %v", err)
+				}
+				if err := os.Remove("/a/empty"); err != nil {
+					t.Fatalf("Remove /a/empty: %v", err)
+				}
+				// Cwd at unlinked /a/empty is dead (ENOENT on Getwd/Create), while .. walks to /a and /b/empty stays live.
+				if _, err := os.Getwd(); !errors.Is(err, syscall.ENOENT) {
+					t.Fatalf("Getwd() on unlinked /a/empty dentry = %v, want ENOENT", err)
+				}
+				if _, err := os.Create("dead"); !errors.Is(err, syscall.ENOENT) {
+					t.Fatalf("Create in unlinked /a/empty dentry = %v, want ENOENT", err)
+				}
+				if err := os.Chdir(".."); err != nil {
+					t.Fatalf("Chdir .. from unlinked /a/empty: %v", err)
+				}
+				if wd, err := os.Getwd(); err != nil || wd != "/a" {
+					t.Fatalf("Getwd() after .. from unlinked /a/empty = %q, %v; want /a", wd, err)
+				}
+				nf, err := os.Create("/b/empty/still-live")
+				if err != nil {
+					t.Fatalf("Create in surviving /b/empty: %v", err)
+				}
+				_ = nf.Close()
+
+				// Verify cross-rename recovery remained acyclic and RemoveAll terminates cleanly.
+				if err := os.Chdir("/"); err != nil {
+					t.Fatalf("Chdir /: %v", err)
+				}
+				if err := os.RemoveAll("/x"); err != nil {
+					t.Fatalf("RemoveAll /x: %v", err)
+				}
+				if err := os.RemoveAll("/y"); err != nil {
+					t.Fatalf("RemoveAll /y: %v", err)
+				}
+			})
+		})
 	})
 }

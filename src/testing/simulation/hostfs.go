@@ -20,9 +20,15 @@ func dstHostFSFor(host uint32) fs.FS
 // node (idiom 2). A process reading its OWN disk uses ordinary os calls inside its
 // Host/Process body, exactly as real recovery code does (idiom 1). The view is
 // read-only by construction (it is an fs.FS), so it can never become a cross-host
-// back-channel write. It must be called inside a simulation (it reflects the run's
-// current tree for host name; a host with no filesystem activity reports the empty
-// baseline plus /tmp).
+// back-channel write. It is scoped to the active simulation run (reflecting the
+// run's current tree for host name; a host with no filesystem activity reports the
+// empty baseline plus /dev and /tmp); post-run or cross-run operations on a
+// returned fs.FS fail with fs.ErrClosed, and calling HostFS during an active run
+// from outside the run's bubble panics.
 func HostFS(name string) fs.FS {
-	return dstHostFSFor(lookupHost(name))
+	var out fs.FS
+	withBubbleInspectCaller("HostFS", func() {
+		out = dstHostFSFor(lookupHost(name))
+	})
+	return out
 }

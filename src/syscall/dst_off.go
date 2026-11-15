@@ -13,8 +13,6 @@ const dstSimFenced = false
 
 func dstFenceActive() bool { return false }
 
-func dstPageCacheFDReserved(fd uintptr) bool { return false }
-
 var dstErrUnsupported error
 
 func dstTryRead(fd int, p []byte) (n int, err Errno, handled bool) { return 0, 0, false }

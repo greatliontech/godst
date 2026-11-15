@@ -101,6 +101,40 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 		}
 		return dstRawSockopt(trap == dstSysSetsockopt, a1, a2, a3, a4, a5)
 	}
+	if trap == dstSysStatfs {
+		bufp := a2
+		if goarch.PtrSize == 4 {
+			if a2 != unsafe.Sizeof(Statfs_t{}) {
+				return 0, EINVAL, true
+			}
+			bufp = a3
+		}
+		if a1 == 0 {
+			return 0, EFAULT, true
+		}
+		var buf *Statfs_t
+		if bufp != 0 {
+			buf = (*Statfs_t)(unsafe.Pointer(bufp))
+		}
+		return dstRawStatfs((*byte)(unsafe.Pointer(a1)), buf)
+	}
+	if trap == dstSysFstatfs {
+		if a1 < dstVirtualFDBase || a1 >= dstVirtualFDBase+dstVirtualFDCount {
+			return 0, 0, false
+		}
+		bufp := a2
+		if goarch.PtrSize == 4 {
+			if a2 != unsafe.Sizeof(Statfs_t{}) {
+				return 0, EINVAL, true
+			}
+			bufp = a3
+		}
+		var buf *Statfs_t
+		if bufp != 0 {
+			buf = (*Statfs_t)(unsafe.Pointer(bufp))
+		}
+		return dstRawFstatfs(int(a1), buf)
+	}
 	switch trap {
 	case SYS_WRITE:
 		// Ungranted bubble writes to standard output/error (fd 1/2) route to
@@ -258,6 +292,48 @@ var dstSysSetsockopt, dstSysGetsockopt = func() (uintptr, uintptr) {
 	}
 	panic("dst: sockopt numbers unknown for " + goarch.GOARCH)
 }()
+
+// dstSysStatfs / dstSysFstatfs are statfs(2)/fstatfs(2)'s numbers on 64-bit
+// Linux arches and statfs64(2)/fstatfs64(2)'s numbers on 32-bit arches — the
+// exact traps both syscall.Statfs/Fstatfs and golang.org/x/sys/unix.Statfs/Fstatfs
+// enter Syscall with.
+var dstSysStatfs, dstSysFstatfs = func() (uintptr, uintptr) {
+	switch goarch.GOARCH {
+	case "amd64":
+		return 137, 138
+	case "386":
+		return 268, 269
+	case "arm":
+		return 266, 267
+	case "arm64", "riscv64":
+		return 43, 44
+	case "ppc64", "ppc64le", "s390x":
+		return 99, 100
+	}
+	panic("dst: statfs numbers unknown for " + goarch.GOARCH)
+}()
+
+//go:noinline
+func dstRawStatfs(p *byte, buf *Statfs_t) (r1 uintptr, err Errno, handled bool) {
+	path, ok := dstCString(p)
+	if !ok {
+		return 0, ENAMETOOLONG, true
+	}
+	if e, ok := dstTryStatfs(path, buf); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(dstSysStatfs)
+	return 0, 0, true
+}
+
+//go:noinline
+func dstRawFstatfs(fd int, buf *Statfs_t) (r1 uintptr, err Errno, handled bool) {
+	if e, ok := dstTryFstatfs(fd, buf); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(dstSysFstatfs)
+	return 0, 0, true
+}
 
 // dstRawMapping performs a mapping operation the simulation owns. It never
 // reports handled=false: a bubble goroutine's madvise/mprotect/munmap on a range

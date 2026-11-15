@@ -138,8 +138,7 @@ func dstNodeMaybeReleaseLocked(node *dstFSNode) {
 	node.data = nil
 	node.blocks = nil
 	node.synced = dstDurableImage{}
-	node.wbDroppedPages = 0
-	node.wbRedirtied = nil
+	node.clearWritebackDroppedLocked()
 	node.rot = nil
 }
 

@@ -42,6 +42,7 @@ func dstRestoreHostDiskFor(host uint32) {
 	if disk == nil {
 		return // the host never touched its filesystem: nothing to restore
 	}
+	disk.down = true
 	// One inode can be reachable from two parents after a rename whose parent
 	// directories were never fsynced (each link independently lands), so the walk
 	// tracks what it has restored: the restore mutates nodes in place, and a
@@ -64,6 +65,8 @@ func dstRestoreHostDiskFor(host uint32) {
 		}
 		seenDirs[d] = true
 		d.durableRefs = 0
+		d.dirLinks = 0
+		d.dentries = nil
 		for _, c := range d.entries {
 			zeroDirs(c)
 		}
@@ -73,13 +76,15 @@ func dstRestoreHostDiskFor(host uint32) {
 	}
 	zeroDirs(disk.root)
 	disk.root.durableRefs = 1
+	disk.root.dirLinks = 1
+	disk.rootDentry = &dstFSDentry{node: disk.root, name: "/"}
 	for _, n := range dstFS.backed {
 		if n.disk == disk {
 			n.nlink = 0
 			n.durableRefs = 0
 		}
 	}
-	dstRestoreNodeLocked(disk.root, make(map[*dstFSNode]bool))
+	dstRestoreNodeLocked(disk.root, make(map[*dstFSNode]bool), make(map[*dstFSNode]bool))
 	for i := len(dstFS.backed) - 1; i >= 0; i-- {
 		if n := dstFS.backed[i]; n.disk == disk {
 			dstNodeMaybeReleaseLocked(n)
@@ -95,6 +100,28 @@ func dstRestoreHostDiskFor(host uint32) {
 	}
 }
 
+// dstBootHostDiskFor clears host's powered-off disk flag when the machine boots
+// so subsequent CorruptFile calls resume platter-only masking beneath the new
+// boot's page cache. Reached from testing/simulation.Host by //go:linkname.
+//
+//go:linkname dstBootHostDiskFor
+func dstBootHostDiskFor(host uint32) {
+	if !dstFSActive() {
+		return
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	// Only clear down on an already-live disk of the current run; rolling dstFS
+	// on a filesystem-free Host declaration would reset the runtime page-cache
+	// region beneath white-box runtime mapping tests that never touch os.
+	if dstFS.disks == nil || dstFS.epoch != dstFSEpoch() {
+		return
+	}
+	if disk := dstFS.disks[host]; disk != nil {
+		disk.down = false
+	}
+}
+
 // dstRestoreNodeLocked restores one node and, for a directory, exactly the
 // subtree its durable entry set reaches. Caller holds dstFS.mu.
 //
@@ -105,7 +132,7 @@ func dstRestoreHostDiskFor(host uint32) {
 // on the disk. Its unlinked mark and its emptied entry map must both be undone,
 // or the resurrected node would be a directory that exists but can never gain
 // an entry (the mark makes creation ENOENT) — a state no kernel produces.
-func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
+func dstRestoreNodeLocked(node *dstFSNode, restored, ancestors map[*dstFSNode]bool) {
 	if restored[node] {
 		if !node.isDir {
 			// A second durable parent edge: one more surviving hard link.
@@ -161,8 +188,7 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		node.everMappedWrite.Store(false)
 		// A crash clears the fsyncgate mark: the page cache is rebuilt from
 		// the platter, so nothing is clean-but-stale afterwards.
-		node.wbDroppedPages = 0
-		node.wbRedirtied = nil
+		node.clearWritebackDroppedLocked()
 		// The reboot folds rot into content: the corrupted bytes ARE what the
 		// platter holds now — what recovery reads, and what a checksum must
 		// catch.
@@ -199,8 +225,20 @@ func dstRestoreNodeLocked(node *dstFSNode, restored map[*dstFSNode]bool) {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	ancestors[node] = true
+	defer delete(ancestors, node)
 	for _, name := range names {
-		dstRestoreNodeLocked(node.entries[name], restored)
+		child := node.entries[name]
+		if child.isDir {
+			if ancestors[child] {
+				delete(node.entries, name)
+				delete(node.syncedEntries, name)
+				dstNodeDropDurableRefLocked(child)
+				continue
+			}
+			child.dirLinks++
+		}
+		dstRestoreNodeLocked(child, restored, ancestors)
 	}
 }
 

@@ -276,9 +276,18 @@ func dstProcAbs(name string) string {
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
 	comps, trailing := dstFSComponents(name)
-	root := dstFSDiskHere().root
-	nodeStack := []*dstFSNode{root}
-	stack := make([]string, 0, len(comps))
+	disk := dstFSDiskHere()
+	dentryStack := []*dstFSDentry{disk.rootDentry}
+	var stack []string
+	if name[0] != '/' {
+		dentryStack = dstFSCwdDentryHere().dentryChainLocked(disk.rootDentry)
+		stack = make([]string, 0, len(dentryStack)-1+len(comps))
+		for _, d := range dentryStack[1:] {
+			stack = append(stack, d.name)
+		}
+	} else {
+		stack = make([]string, 0, len(comps))
+	}
 	invalidProc := false
 	for _, c := range comps {
 		if invalidProc {
@@ -300,8 +309,8 @@ func dstProcAbs(name string) string {
 			}
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
-				if len(nodeStack) > 1 {
-					nodeStack = nodeStack[:len(nodeStack)-1]
+				if len(dentryStack) > 1 {
+					dentryStack = dentryStack[:len(dentryStack)-1]
 				}
 			}
 		default:
@@ -315,12 +324,12 @@ func dstProcAbs(name string) string {
 				continue
 			}
 			if len(stack) == 0 || stack[0] != "proc" {
-				cur := nodeStack[len(nodeStack)-1]
-				next := cur.entries[c]
+				cur := dentryStack[len(dentryStack)-1]
+				next := cur.node.entries[c]
 				if next == nil || !next.isDir {
 					return ""
 				}
-				nodeStack = append(nodeStack, next)
+				dentryStack = append(dentryStack, cur.childLocked(c, next))
 			}
 			stack = append(stack, c)
 		}
@@ -361,6 +370,7 @@ type dstProcFile struct {
 	base      string // leaf base name ("stat", "boot_id") — the FileInfo.Name
 	ident     string
 	off       int64
+	epoch     uint64
 	closed    bool
 	closeSync uint64
 }
@@ -372,8 +382,12 @@ func (f *dstProcFile) coarseDep(write bool) {
 	dstCoarseDep(uintptr(unsafe.Pointer(f)), write)
 }
 
+func (f *dstProcFile) liveLocked() bool {
+	return !f.closed && dstFSActive() && f.epoch != 0 && f.epoch == dstFSEpoch()
+}
+
 func (f *dstProcFile) acquireCloseSyncLocked() {
-	if dstFSActive() {
+	if f.closed && dstFSActive() && f.epoch == dstFSEpoch() {
 		dstKernelRaceAcquire(unsafe.Pointer(&f.closeSync))
 	}
 }
@@ -384,7 +398,7 @@ func (f *dstProcFile) read(b []byte) (n int, err error) {
 	err = func() error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.closed {
+		if !f.liveLocked() {
 			f.acquireCloseSyncLocked()
 			return poll.ErrFileClosing
 		}
@@ -411,7 +425,7 @@ func (f *dstProcFile) pread(b []byte, off int64) (n int, err error) {
 	err = func() error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.closed {
+		if !f.liveLocked() {
 			f.acquireCloseSyncLocked()
 			return poll.ErrFileClosing
 		}
@@ -484,7 +498,7 @@ func (f *dstProcFile) closedError() error {
 	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
+	if !f.liveLocked() {
 		f.acquireCloseSyncLocked()
 		return poll.ErrFileClosing
 	}
@@ -495,7 +509,7 @@ func (f *dstProcFile) seek(offset int64, whence int) (int64, error) {
 	f.coarseDep(true)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
+	if !f.liveLocked() {
 		f.acquireCloseSyncLocked()
 		return 0, poll.ErrFileClosing
 	}
@@ -521,7 +535,7 @@ func (f *dstProcFile) stat() (FileInfo, error) {
 	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
+	if !f.liveLocked() {
 		f.acquireCloseSyncLocked()
 		return nil, poll.ErrFileClosing
 	}
@@ -537,7 +551,7 @@ func (f *dstProcFile) closeFile() error {
 		return poll.ErrFileClosing
 	}
 	f.closed = true
-	if dstFSActive() {
+	if dstFSActive() && f.epoch == dstFSEpoch() {
 		dstKernelRaceReleaseMerge(unsafe.Pointer(&f.closeSync))
 	}
 	return nil
@@ -547,7 +561,7 @@ func (f *dstProcFile) setDeadline(rd, wd bool, t time.Time) error {
 	f.coarseDep(false)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
+	if !f.liveLocked() {
 		f.acquireCloseSyncLocked()
 		return poll.ErrFileClosing
 	}

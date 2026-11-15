@@ -21,50 +21,30 @@ const dstVirtualFDCount = 1 << 20
 const dstVirtualSockFDBase = dstVirtualFDBase + dstVirtualFDCount
 const dstVirtualSockFDCount = 1 << 20
 
-// dstSyscallVirtualFDTrap reports whether an fd-carrying trap names
-// a number in the reserved virtual-fd range [dstVirtualFDBase,
-// dstVirtualFDBase+dstVirtualFDCount). The WHOLE range is refused at the raw
-// boundary — issued or not — matching the named-wrapper side, which owns the
-// range outright (an unknown in-range number is EBADF there, never a host fd).
-// A pure range check needs no cross-package issued-fd state, so there is
-// nothing for a racing raw syscall to read stale: the refusal is a function of
-// the number alone. (A genuine host fd in this range would need fs.nr_open
-// raised beyond 2^30 — the reserved range is the simulation's namespace,
-// recorded in the spec.)
-//
-//go:nosplit
-func dstSyscallVirtualFDTrap(trap, fd uintptr) bool {
-	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
-		return false
+type dstStatfsHook func(path string, buf *Statfs_t) (err Errno, handled bool)
+type dstFstatfsHook func(fd int, buf *Statfs_t) (err Errno, handled bool)
+
+var dstStatfsHookFn dstStatfsHook
+var dstFstatfsHookFn dstFstatfsHook
+
+//go:linkname dstSetStatfsHook
+func dstSetStatfsHook(fn dstStatfsHook) { dstStatfsHookFn = fn }
+
+//go:linkname dstSetFstatfsHook
+func dstSetFstatfsHook(fn dstFstatfsHook) { dstFstatfsHookFn = fn }
+
+func dstTryStatfs(path string, buf *Statfs_t) (err Errno, handled bool) {
+	if !dstHookActive() || dstStatfsHookFn == nil {
+		return 0, false
 	}
-	switch trap {
-	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
-		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
-		return true
-	}
-	return dstSyscallVirtualFDArchTrap(trap)
+	return dstStatfsHookFn(path, buf)
 }
 
-// dstSyscallPageCacheFDTrap reports whether an fd-carrying trap
-// names a live harness page-cache descriptor. Those fds are INVISIBLE in the
-// simulated fd namespace: the caller answers EBADF — exactly what a fd the
-// SUT never opened would get — never a panic, because sweeping unknown fd
-// numbers with close is legal production shape (daemonize), and never host
-// I/O, because a passed-through close would kill a live file's cache (fatal
-// at the next resize or mmap) and a freed number reused by a later
-// memfd_create would silently alias another file's bytes.
-//
-//go:nosplit
-func dstSyscallPageCacheFDTrap(trap, fd, a3 uintptr) bool {
-	if !dstPageCacheFDReserved(fd) {
-		return false
+func dstTryFstatfs(fd int, buf *Statfs_t) (err Errno, handled bool) {
+	if !dstHookActive() || dstFstatfsHookFn == nil {
+		return 0, false
 	}
-	switch trap {
-	case SYS_READ, SYS_WRITE, SYS_CLOSE, SYS_LSEEK,
-		SYS_FCNTL, SYS_IOCTL, SYS_PREAD64, SYS_PWRITE64:
-		return true
-	}
-	return dstSyscallPageCacheFDArchTrap(trap, a3)
+	return dstFstatfsHookFn(fd, buf)
 }
 
 // dstSyscallHostClose reports whether a bubble goroutine is closing a real
@@ -79,9 +59,12 @@ func dstSyscallPageCacheFDTrap(trap, fd, a3 uintptr) bool {
 // to legitimately close; every real close is a daemonize-style sweep of a
 // number outside its simulated namespace. Answered EBADF — exactly what a fd
 // it never opened returns — closing the TOCTOU window for the whole host-fd
-// space rather than re-homing one fd class. Virtual-range closes are handled
-// by the named registry (dstFDClose); a RAW close of a virtual number is an
-// escape refused separately (dstSyscallVirtualFDTrap).
+// space rather than re-homing one fd class. Every non-close raw operation on
+// a real fd hits dstSyscallRefuse uniformly so harness-owned descriptor
+// numbers (such as page-cache memfds) are indistinguishable from any other
+// real fd number. Virtual-range closes via Syscall/Syscall6 dispatch through
+// dstRawDispatch; a RawSyscall/RawSyscall6 close of a virtual number falls
+// through to dstSyscallRefuse.
 //
 //go:nosplit
 func dstSyscallHostClose(trap, fd uintptr) bool {

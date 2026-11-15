@@ -37,6 +37,12 @@ func dstSetCloseHook(func(fd int) (err syscall.Errno, handled bool))
 //go:linkname dstSetFstatHook syscall.dstSetFstatHook
 func dstSetFstatHook(func(fd int, stat *syscall.Stat_t) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetStatfsHook syscall.dstSetStatfsHook
+func dstSetStatfsHook(func(path string, buf *syscall.Statfs_t) (err syscall.Errno, handled bool))
+
+//go:linkname dstSetFstatfsHook syscall.dstSetFstatfsHook
+func dstSetFstatfsHook(func(fd int, buf *syscall.Statfs_t) (err syscall.Errno, handled bool))
+
 //go:linkname dstSetSeekHook syscall.dstSetSeekHook
 func dstSetSeekHook(func(fd int, offset int64, whence int) (off int64, err syscall.Errno, handled bool))
 
@@ -65,6 +71,8 @@ func init() {
 	dstSetPwriteHook(dstFDPwrite)
 	dstSetCloseHook(dstFDClose)
 	dstSetFstatHook(dstFDFstat)
+	dstSetStatfsHook(dstStatfs)
+	dstSetFstatfsHook(dstFDFstatfs)
 	dstSetSeekHook(dstFDSeek)
 	dstSetFsyncHook(dstFDFsync)
 	dstSetFdatasyncHook(dstFDFdatasync)
@@ -97,35 +105,37 @@ func dstFDRollLocked() {
 }
 
 func dstFD(file *file) int {
-	if !dstFSActive() {
-		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
-	}
 	state := dstFileStateOf(file)
 	if state == nil {
 		panic("os: Fd on a simulated file: " + dstErrUnsupportedFS.Error())
 	}
 	// Tree files and proc-overlay files both mint virtual fds — the
 	// proc-overlay contract (zero (st_dev, st_ino) through fstat) is only
-	// reachable through here. Other backends (the pipe) keep the fence.
+	// reachable through here. Leaked handles from a finished run return -1
+	// (^uintptr(0) at File.Fd) like closed handles, both between runs and in
+	// later runs, without minting state. Other backends (pipes, inherited
+	// capabilities) keep the fence.
+	active := dstFSActive()
+	epoch := dstFSEpoch()
 	var closed bool
 	switch b := state.backend.(type) {
 	case *dstFile:
-		if dstFSActive() {
+		if active && b.epoch == epoch {
 			dstCoarseRecord(uintptr(unsafe.Pointer(b)), false)
 		}
 		b.mu.Lock()
-		closed = b.closed
-		if closed && b.epoch == dstFSEpoch() {
+		closed = b.closed || !active || b.epoch == 0 || b.epoch != epoch
+		if b.closed && active && b.epoch == epoch {
 			dstKernelRaceAcquire(unsafe.Pointer(&b.closeSync))
 		}
 		b.mu.Unlock()
 	case *dstProcFile:
-		if dstFSActive() {
+		if active && b.epoch == epoch {
 			dstCoarseRecord(uintptr(unsafe.Pointer(b)), false)
 		}
 		b.mu.Lock()
-		closed = b.closed
-		if closed {
+		closed = b.closed || !active || b.epoch == 0 || b.epoch != epoch
+		if b.closed && active && b.epoch == epoch {
 			dstKernelRaceAcquire(unsafe.Pointer(&b.closeSync))
 		}
 		b.mu.Unlock()
@@ -137,7 +147,6 @@ func dstFD(file *file) int {
 		return -1
 	}
 	host, proc := dstFSCurrentNode()
-	epoch := dstFSEpoch()
 	key := dstFDKey{epoch: epoch, host: host, proc: proc}
 	dstFDRegistry.mu.Lock()
 	defer dstFDRegistry.mu.Unlock()
@@ -295,11 +304,10 @@ func dstDropClosedNode(backend dstFileBackend) {
 
 func dstFDLookup(fd int) (entry dstFDEntry, handled bool, errno syscall.Errno) {
 	if fd < dstVirtualFDBase || fd >= dstVirtualFDBase+dstVirtualFDCount {
-		// Harness page-cache fds need no gate here: a non-virtual fd falls
-		// through to the host wrappers, which bottom out in the fenced
-		// Syscall/RawSyscall trampolines — the single chokepoint that answers
-		// EBADF for a bubble goroutine naming a page-cache fd
-		// (dstSyscallPageCacheFDTrap).
+		// Non-virtual fds fall through to the host wrappers, which bottom out in
+		// the fenced Syscall/RawSyscall trampolines — answering EBADF for
+		// SYS_CLOSE (dstSyscallHostClose) and panicking uniformly on every other
+		// raw host-fd operation (dstSyscallRefuse).
 		return dstFDEntry{}, false, 0
 	}
 	if !dstFSActive() {

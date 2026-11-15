@@ -795,9 +795,14 @@ and `rename("file/", "x")` are `ENOTDIR`, and `rename("missing", "existingfile/"
 agreeing; note the portable `os.Rename` preamble Lstats an existing-directory newname first and
 reports the OLDNAME error — `EEXIST` when the old name resolves — before any of this reaches the
 tree, on host and simulation alike.
-The working directory is a PATH, not a node reference: renaming a directory out from
-under the cwd leaves the cwd pointing at the old (now missing) path — a deliberate simple model,
-recorded here as contractual (the host's fchdir-tracked inode semantics are not promised). A
+The working directory is a directory DENTRY reference (the kernel's `fs->pwd` `(vfsmount, dentry)` pair):
+renaming a directory updates its dentry's parent/name so `Getwd()` and relative path resolution follow it,
+`(*os.File).Chdir()` on any open directory handle (including one opened via `os.Root`) sets `cwd` to the
+handle's opened dentry (distinguishing dual-linked directory aliases recovered after an unsynced rename),
+and unlinking that dentry (`Remove`/`RemoveAll` or rename-over) marks it dead — `Getwd()` and entry creation
+(`open` with `O_CREATE`, `mkdir`, `link`, `rename`-into) fail `ENOENT` (never teleporting into a directory
+later created at the old path, while leaving any surviving sibling alias dentry of the inode live), and
+metadata reads of `"."` plus walking `".."` up the retained parent chain keep working as on Linux. A
 `DirEntry` from a listing carries its listing-time `Info` snapshot rather than re-statting lazily
 as the host does. Directory listings (`os.ReadDir`, `File.ReadDir`/`Readdir`/`Readdirnames`, including
 chunked `n > 0` reads against a stable cursor) are **sorted by name** — deterministic, and
@@ -923,9 +928,11 @@ host descriptor, and the raw-syscall fence still catches host-resource minting a
 syscalls before they can reach the host. The **raw boundary dispatches a settled subset**: a SUT that
 reaches the kernel through `golang.org/x/sys/unix` (whose asm enters `syscall.Syscall`/`Syscall6`
 directly, never the named wrappers) gets the same modeled behavior for the file barriers (`fsync`,
-`fdatasync`), advisory locking (`flock`), descriptor `close`, the mapping operations (`madvise`,
-`mprotect`, `munmap`), `renameat2`, and `fallocate` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one
-operation, not two. `fallocate` dispatches mode 0 (preallocation, the WAL warmed-segment idiom):
+`fdatasync`), advisory locking (`flock`), descriptor `close`, filesystem metadata (`statfs`,
+`fstatfs` — reporting `EXT4_SUPER_MAGIC` `0xef53` with 4096-byte blocks, per-host `f_fsid`, and
+`f_blocks`/`f_bfree`/`f_bavail` reflecting `LimitDisk` when capped, or `PROC_SUPER_MAGIC` `0x9fa0` on
+modeled `/proc` leaves), the mapping operations (`madvise`, `mprotect`, `munmap`), `renameat2`, and
+`fallocate` — so `unix.Fdatasync(fd)` and `syscall.Fdatasync(fd)` are one operation, not two. `fallocate` dispatches mode 0 (preallocation, the WAL warmed-segment idiom):
 it preallocates every unallocated 4 KB page in `[offset, offset+len)` and grows the file with zeros
 when `offset+len` exceeds EOF, checked all-or-nothing against the disk's free 4 KB blocks up front
 (failing `ENOSPC` before any write or size change is the call's reason to exist; already-allocated
@@ -990,7 +997,7 @@ post-fork with no P) still refuse. Everything else on a virtual fd — `read`/`w
 `lseek`/`fstat`, whose argument shapes ride the 6-argument form or vary per arch — stays fenced at the
 raw boundary and is reached through `os.File`, whose named wrappers dispatch. A raw operation on a HOST
 fd, on a non-mapping address, or outside this set meets the fence exactly as before. The virtual fd table is per process; close releases the
-descriptor, and `Fd()` on a CLOSED simulated file reports -1 — there is no live descriptor to
+descriptor, and `Fd()` on a CLOSED (or leaked post-run / cross-run) simulated tree or proc file reports -1 — there is no live descriptor to
 name — so a raw syscall naming that -1 meets the raw boundary's fence (the loud unsupported
 refusal) where the host kernel answers `EBADF` for a closed real descriptor: a deliberate
 loud-refusal divergence (in-range `EBADF` is reserved for live-table misses and, at the
@@ -1081,8 +1088,9 @@ beyond the R/W bits are unmodeled, refused as at map time.
 Process teardown unmaps the victim process's mappings — no write-back exists or is needed, since the
 bytes were the page cache's all along, visible to survivors and to a restart; a HOST crash instead
 rewinds the page cache to the durable image (exit and crash move no durability boundary). `Madvise`
-accepts the page-cache hints used by database readers (`MADV_POPULATE_READ`, `MADV_HUGEPAGE`,
-`MADV_COLD`); unsupported advice values fail deterministically. Mapping slices are process-owned
+accepts the page-cache hints used by database readers (`MADV_NORMAL`, `MADV_RANDOM`,
+`MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_POPULATE_READ`, `MADV_HUGEPAGE`, `MADV_COLD`); unsupported
+advice values fail deterministically. Mapping slices are process-owned
 capabilities, not an IPC channel: passing one to another simulated process is outside the model, while
 file writes by any process on the same simulated host update mappings through the shared page cache.
 
@@ -1156,13 +1164,13 @@ so closing the source does not revoke it and the grant extends that description'
 capability closes. Numeric real fds, including the source and the hidden duplicate, are never authority:
 `Fd`/`SyscallConn` are unavailable on the capability, `SyscallConn` and deadline mutation are fenced
 on ungranted host files, and raw real-fd operations are fenced. A `Root`
-opened before the run remains unsupported. Admission holds the source `File`'s operation reference
+opened before the run remains unsupported: every rooted operation (including `Close`) fails with the
+unsupported filesystem error before mutating host `Root` state. Admission holds the source `File`'s operation reference
 across duplication, so an ordinary concurrent `File.Close` cannot retarget the grant; code that mutates
 the source descriptor behind the `File` through foreign assembly or cgo is outside the same API trust
-boundary as every other externally-corrupted `os.File`. Symmetrically, a simulated `File` or `Root` leaked OUT of
+boundary as every other externally-corrupted `os.File`. Symmetrically, a simulated `File` (tree or `/proc` overlay), `Root`, or `HostFS` leaked OUT of
 its run is refused like a closed handle
-(both carry the run epoch; the run's nodes are released with the run — lazily, at the next run's
-first filesystem op) — deterministic and
+(carrying the run epoch, with `Fd()` returning `^uintptr(0)` on leaked tree/proc files without minting descriptors; the run's nodes are released with the run) — deterministic and
 host-isolated, the same discipline applied in reverse, and never a read of a prior run's tree nor a
 dereference of its released page caches (`TestDSTRootLeakedAcrossRuns`). An
 operation pairing a simulated handle with an inherited-file capability behaves as its two halves: the
@@ -1469,30 +1477,26 @@ build probes across all five). Untagged builds remain valid upstream ports every
   request can prove read-only, non-minting behavior for an arbitrary inherited handle. Terminal
   probing therefore requires a modeled terminal capability rather than host passthrough. The reserved virtual-fd number range never reaches
   the host from this raw boundary: `Syscall`/`Syscall6` DISPATCH the settled subset (`fsync`,
-  `fdatasync`, `flock`, `close`, `madvise`, `mprotect`, `munmap` — the surface `golang.org/x/sys/unix`
+  `fdatasync`, `flock`, `close`, `statfs`, `fstatfs`, `madvise`, `mprotect`, `munmap`, `renameat2`,
+  `fallocate`, `futex`, and virtual-socket `setsockopt`/`getsockopt` — the surface `golang.org/x/sys/unix`
   reaches, since its asm enters these trampolines rather than the named wrappers), and every other
   in-range number or operation is refused outright, issued or not. `RawSyscall`/`RawSyscall6` refuse the
   range entirely: they run without a P, where the dispatch's allocation cannot grow the stack (see the
   virtual-fd paragraph in the filesystem section); selected split-safe named
-  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`, virtual-fd
+  Linux wrappers (`syscall.Read`/`Write`/`Close`/`Seek`/`Pread`/`Pwrite`/`Fstat`/`Statfs`/`Fstatfs`, virtual-fd
   `Fsync`/`Fdatasync`, plus the supported `Mmap`/`Munmap`/`Mprotect`/`Madvise` mapping operations)
   dispatch them to the simulated backend. The harness's own page-cache descriptors (the memfds
   backing simulated files) are **invisible in the simulated fd namespace**: a bubble goroutine's
-  close naming one answers `EBADF` at the trampolines — exactly what a fd the
-  process never opened would get, so the daemonize-style close sweep stays the harmless loop it is
-  in production — never host I/O, which would kill a live file's cache (fatal at the next resize or
-  mmap) or, after fd-number reuse, silently alias another file's bytes. On the 64-bit hosts the
-  page cache admits (32-bit hosts are refused before any memfd exists), named fd wrappers bottom out
-  in the same trampolines; non-bubble callers
-  are untouched, like the rest of the fence (`TestDSTMemfdFDIsolation`). A bubble goroutine's close of **any** real
-  (non-virtual) fd number is answered `EBADF` at the trampolines and **never dispatched to the
-  kernel**. The invisibility check alone cannot protect a fd that does not exist yet — the fence
+  close naming **any** real (non-virtual) fd number — memfd or otherwise — answers `EBADF` at the
+  trampolines (`dstSyscallHostClose`) and is **never dispatched to the kernel**, while every
+  non-`SYS_CLOSE` raw real-fd call hits `dstSyscallRefuse` uniformly (never returning `EBADF`
+  selectively on harness memfds, which would leak host-process fd allocation history to bubble code;
+  `TestDSTMemfdFDIsolation`). Refusing close dispatch outright protects both live memfds and fds that
+  do not exist yet — the fence
   check and the kernel entry are not atomic across Ms, so a dispatched close of a then-free
   number races the harness assigning that number to a newborn host fd (a page-cache memfd, or
   the runtime's lazily-created netpoll epoll fd) and can land after the assignment, killing the
-  newborn. Refusing dispatch outright removes bubble-originated *destruction* of host fds
-  entirely — a close that is never dispatched cannot straddle a creation — for the whole host-fd
-  space rather than one fd class. Refusing every other numeric real-fd operation removes the same
+  newborn. Refusing every other numeric real-fd operation removes the same
   check-to-dispatch alias window for reads, writes, seeks, stats, and fcntl: no admitted operation can
   straddle creation of a newborn harness descriptor. `EBADF` for close is sound
   because a bubble goroutine can never *mint* a host fd (the fence refuses open/socket/pipe/dup),

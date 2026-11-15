@@ -204,6 +204,7 @@ func dstFDMmap(fd int, offset int64, length int, prot int, flags int) ([]byte, s
 	})
 	file.node.liveMaps++
 	if writable {
+		file.node.ensureWritebackSnapLocked()
 		file.node.everMappedWrite.Store(true)
 	}
 	dstMMapRegistry.mu.Unlock()
@@ -416,6 +417,8 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		return errno, true
 	}
 	host, proc := dstFSCurrentNode()
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
 	dstMMapRegistry.mu.Lock()
 	dstMMapRollLocked()
 	var foundCurrent, foundOther, misaligned bool
@@ -463,6 +466,9 @@ func dstMprotect(data []byte, prot int) (syscall.Errno, bool) {
 		if prot&syscall.PROT_WRITE != 0 && !fdWritable {
 			return syscall.EACCES, true
 		}
+		for _, n := range writeNodes {
+			n.ensureWritebackSnapLocked()
+		}
 		if !dstPageCacheProtect(start, end-start, int32(prot)) {
 			return syscall.EINVAL, true
 		}
@@ -496,7 +502,8 @@ func dstMadvise(data []byte, advice int) (syscall.Errno, bool) {
 		return syscall.EINVAL, true
 	}
 	switch advice {
-	case dstMadvPopulateRead, syscall.MADV_HUGEPAGE, dstMadvCold:
+	case syscall.MADV_NORMAL, syscall.MADV_RANDOM, syscall.MADV_SEQUENTIAL, syscall.MADV_WILLNEED,
+		dstMadvPopulateRead, syscall.MADV_HUGEPAGE, dstMadvCold:
 		return 0, true
 	}
 	return syscall.EINVAL, true

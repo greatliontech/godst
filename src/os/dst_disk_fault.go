@@ -91,12 +91,12 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 	case diskOpLimit:
 		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
-		d.capped = true
+		d.capped.Store(true)
 		d.capacity = arg
 	case diskOpUnlimit:
 		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
-		d.capped = false
+		d.capped.Store(false)
 	case diskOpSlow:
 		dstCoarseRecord(uintptr(unsafe.Pointer(d)), true)
 		dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
@@ -109,19 +109,43 @@ func dstApplyDiskFaultOp(op, host uint32, arg int64, name string) {
 		node := dstFSNodeAt(d.root, name)
 		if node == nil || node.isDir || node.isDevice() || node.synced.size == 0 {
 			// Bit rot corrupts durable media. A missing target or a directory is
-			// a no-op as for FailFile; a file whose durable image is empty has no
-			// platter blocks to rot (nothing was ever committed). No fault-RNG
-			// draw happens on the no-op paths, so a skipped target never shifts a
-			// later fault's stream position.
+			// a no-op as for FailFile; a file whose durable image has no
+			// allocated platter blocks (empty or all-hole sparse) has nothing
+			// to rot. No fault-RNG draw happens on the no-op paths, so a
+			// skipped target never shifts a later fault's stream position.
 			return
 		}
 		dstCoarseNodeRecord(node, true)
-		// One seeded byte, one seeded bit — the canonical silent-corruption
-		// quantum, and the sneakiest input a checksum must catch. The offset
-		// addresses the durable image (the platter), never the page cache:
-		// live reads keep serving the cached bytes (see dstFSNode.rot).
-		off := dstFaultRandN(node.synced.size)
+		// One seeded byte across the file's durably allocated platter blocks,
+		// one seeded bit — the canonical silent-corruption quantum. On a live
+		// machine the offset addresses the durable platter (node.rot) and live
+		// reads keep serving cached bytes; on a powered-off machine (after
+		// CrashHost, before the next boot) no page cache exists, so the flip
+		// lands directly on the platter image that recovery or offline
+		// inspection will read.
+		off, ok := dstBlocksSampleByteOff(node.synced.blocks, node.synced.size, dstFaultRandN)
+		if !ok {
+			return
+		}
 		bit := byte(1) << dstFaultRandN(8)
+		if d.down {
+			node.data[off] ^= bit
+			pg := off / dstPageSize
+			var buf [dstPageSize]byte
+			if old := node.synced.pages[pg]; old != nil {
+				buf = *old
+			}
+			buf[off%dstPageSize] ^= bit
+			if dstBytesAllZero(buf[:]) {
+				delete(node.synced.pages, pg)
+			} else {
+				if node.synced.pages == nil {
+					node.synced.pages = make(map[int64]dstDurablePage)
+				}
+				node.synced.pages[pg] = &buf
+			}
+			return
+		}
 		if node.rot == nil {
 			node.rot = make(map[int64]byte)
 		}

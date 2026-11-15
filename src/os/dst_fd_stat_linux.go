@@ -6,7 +6,16 @@
 
 package os
 
-import "syscall"
+import (
+	"syscall"
+	"unsafe"
+)
+
+const (
+	dstStatfsExt4Magic  = 0xef53 // EXT4_SUPER_MAGIC
+	dstStatfsProcMagic  = 0x9fa0 // PROC_SUPER_MAGIC
+	dstStatfsTotalFiles = 1 << 20
+)
 
 // dstStatDev converts the simulated host id to the arch's st_dev field width
 // (uint64 on most Linux arches, uint32 on mips) without per-arch files: the
@@ -15,6 +24,10 @@ func dstStatNlink[T ~uint32 | ~uint64](_ T, n int) T { return T(n) }
 
 func dstStatDev[T ~uint32 | ~uint64](_ T, host uint32) T {
 	return T(host) + 1
+}
+
+func dstStatfsVal[T ~int32 | ~uint32 | ~int64](_ T, v int64) T {
+	return T(v)
 }
 
 func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
@@ -83,5 +96,121 @@ func dstFDFstat(fd int, stat *syscall.Stat_t) (syscall.Errno, bool) {
 		stat.Atim = stat.Mtim
 		stat.Ctim = stat.Mtim
 	}
+	return 0, true
+}
+
+func dstFillTreeStatfsLocked(buf *syscall.Statfs_t, host uint32, disk *dstFSDisk) {
+	usedPages, usedInodes := disk.usageLocked(true)
+	var totalPages, freePages uint64
+	if disk.capped.Load() {
+		if disk.capacity > 0 {
+			totalPages = uint64(disk.capacity / dstPageSize)
+		}
+		if usedPages < totalPages {
+			freePages = totalPages - usedPages
+		}
+	} else {
+		defPages := uint64(1) << 25
+		if dstSMaxBytes > 0 {
+			defPages = uint64(dstSMaxBytes / dstPageSize)
+		}
+		totalPages = max(usedPages, defPages)
+		freePages = totalPages - usedPages
+	}
+	totalFiles := max(usedInodes, uint64(dstStatfsTotalFiles))
+	freeFiles := totalFiles - usedInodes
+
+	*buf = syscall.Statfs_t{}
+	buf.Type = dstStatfsVal(buf.Type, dstStatfsExt4Magic)
+	buf.Bsize = dstStatfsVal(buf.Bsize, dstPageSize)
+	buf.Frsize = dstStatfsVal(buf.Frsize, dstPageSize)
+	buf.Namelen = dstStatfsVal(buf.Namelen, 255)
+	buf.Blocks = totalPages
+	buf.Bfree = freePages
+	buf.Bavail = freePages
+	buf.Files = totalFiles
+	buf.Ffree = freeFiles
+	buf.Fsid.X__val[0] = int32(host) + 1
+}
+
+func dstFillProcStatfs(buf *syscall.Statfs_t) {
+	*buf = syscall.Statfs_t{}
+	buf.Type = dstStatfsVal(buf.Type, dstStatfsProcMagic)
+	buf.Bsize = dstStatfsVal(buf.Bsize, dstPageSize)
+	buf.Frsize = dstStatfsVal(buf.Frsize, dstPageSize)
+	buf.Namelen = dstStatfsVal(buf.Namelen, 255)
+}
+
+func dstStatfs(path string, buf *syscall.Statfs_t) (syscall.Errno, bool) {
+	if !dstFSActive() {
+		return 0, false
+	}
+	dstCoarsePathDep(path, false)
+	dstDiskDelayPath(path)
+	if _, _, _, handled, errno := dstProcStatData(path); handled {
+		if errno != nil {
+			if e, ok := errno.(syscall.Errno); ok {
+				return e, true
+			}
+			return syscall.EIO, true
+		}
+		if buf == nil {
+			return syscall.EFAULT, true
+		}
+		dstFillProcStatfs(buf)
+		return 0, true
+	}
+	dstFS.mu.Lock()
+	defer dstFS.mu.Unlock()
+	dstFSRoll()
+	if path == "" {
+		return syscall.ENOENT, true
+	}
+	_, _, node, errno := dstFSResolve(path)
+	if errno != nil {
+		if e, ok := errno.(syscall.Errno); ok {
+			return e, true
+		}
+		return syscall.EIO, true
+	}
+	if node == nil {
+		return syscall.ENOENT, true
+	}
+	if buf == nil {
+		return syscall.EFAULT, true
+	}
+	host, _ := dstFSCurrentNode()
+	disk := dstFSDiskHere()
+	dstCoarseRecord(uintptr(unsafe.Pointer(disk)), false)
+	dstFillTreeStatfsLocked(buf, host, disk)
+	return 0, true
+}
+
+func dstFDFstatfs(fd int, buf *syscall.Statfs_t) (syscall.Errno, bool) {
+	entry, handled, errno := dstFDLookup(fd)
+	if !handled || errno != 0 {
+		return errno, handled
+	}
+	if f, ok := entry.backend.(*dstFile); ok {
+		f.coarseOp(false, false)
+		dstCoarseRecord(dstCoarseNamespaceForHost(entry.host), false)
+		if err := f.enter(); err != nil {
+			return dstFDErr(err), true
+		}
+		defer f.leave()
+		if buf == nil {
+			return syscall.EFAULT, true
+		}
+		dstCoarseRecord(uintptr(unsafe.Pointer(f.disk)), false)
+		dstFillTreeStatfsLocked(buf, entry.host, f.disk)
+		return 0, true
+	}
+	if _, err := entry.backend.stat(); err != nil {
+		return dstFDErr(err), true
+	}
+	if buf == nil {
+		return syscall.EFAULT, true
+	}
+	dstFillProcStatfs(buf)
 	return 0, true
 }

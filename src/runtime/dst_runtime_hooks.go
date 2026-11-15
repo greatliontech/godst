@@ -298,7 +298,7 @@ func dstNoteSysmonMaxProcsRecheckBail() {
 func dstGCAssistDisassociatesFP() uint64 { return dstGCAssistDisassociates.Load() }
 
 //go:linkname dstUpdateMaxProcsGStartedFP
-func dstUpdateMaxProcsGStartedFP() bool { return updateMaxProcsG.g != nil }
+func dstUpdateMaxProcsGStartedFP() bool { return debug.updatemaxprocs != 0 }
 
 //go:linkname dstUpdateMaxProcsSTWsFP
 func dstUpdateMaxProcsSTWsFP() uint64 { return dstUpdateMaxProcsSTWs.Load() }

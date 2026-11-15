@@ -60,9 +60,9 @@ func dstFSEpoch() uint64
 var dstFS struct {
 	mu      isync.KernelMutex
 	epoch   uint64
-	disks   map[uint32]*dstFSDisk // host id -> the host's in-memory tree
-	cwds    map[[2]uint32]string  // (host id, process id) -> that process's working directory into its host tree
-	nextIno uint64                // last synthetic inode number handed out (dstFSAllocIno)
+	disks   map[uint32]*dstFSDisk      // host id -> the host's in-memory tree
+	cwds    map[[2]uint32]*dstFSDentry // (host id, process id) -> that process's working directory dentry
+	nextIno uint64                     // last synthetic inode number handed out (dstFSAllocIno)
 	// backed lists every regular node of the run — each is born with a page
 	// cache — so the run's end can close their descriptors and take back the
 	// mapping region in one stroke (dstNodeReleaseRunLocked).
@@ -213,13 +213,15 @@ func dstCloseOpenFiles(match func(dstOpenFileEntry) bool) {
 // lock; only latency needs the lock-free read.) Set through the runtime relay (see
 // dst_disk_fault.go).
 type dstFSDisk struct {
-	root     *dstFSNode
-	eio      bool                // host-disk EIO: every read/write/sync on this disk fails EIO
-	eioFiles map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
-	wbFail   bool                // writeback EIO: syncs fail (data syncs drop dirty pages); cache-served reads/writes succeed
-	capped   bool                // whether a capacity (full-disk / ENOSPC) limit is set
-	capacity int64               // max total allocated regular-file bytes (capacity/4096 4 KB blocks) when capped
-	latency  atomic.Int64        // slow-disk: per-op delay in nanoseconds (0 = none)
+	root       *dstFSNode
+	rootDentry *dstFSDentry
+	down       bool                // powered-off state between CrashHost and the next Host boot
+	eio        bool                // host-disk EIO: every read/write/sync on this disk fails EIO
+	eioFiles   map[*dstFSNode]bool // per-file EIO: just these nodes fail (a bad sector)
+	wbFail     bool                // writeback EIO: syncs fail (data syncs drop dirty pages); cache-served reads/writes succeed
+	capped     atomic.Bool         // whether a capacity (full-disk / ENOSPC) limit is set
+	capacity   int64               // max total allocated regular-file bytes (capacity/4096 4 KB blocks) when capped
+	latency    atomic.Int64        // slow-disk: per-op delay in nanoseconds (0 = none)
 }
 
 // dstDiskSlow gates the per-op latency delay: true once any host's disk has a latency
@@ -258,7 +260,7 @@ func dstFSRoll() {
 		dstNodeReleaseRunLocked()
 		dstFS.epoch = e
 		dstFS.disks = make(map[uint32]*dstFSDisk)
-		dstFS.cwds = make(map[[2]uint32]string)
+		dstFS.cwds = make(map[[2]uint32]*dstFSDentry)
 		dstFS.nextIno = 1
 		// New run: no host is slow until a SlowDisk fault re-arms the gate (the
 		// per-disk latency resets with the disks above).
@@ -371,11 +373,13 @@ func newDstFSDisk() *dstFSDisk {
 	disk := &dstFSDisk{}
 	root := dstFSNewNode(disk, ModeDir, 0o755)
 	root.durableRefs = 1 // the root inode is permanently anchored on the platter
-	root.entries["tmp"] = dstFSNewNode(disk, ModeDir, ModeSticky|0o777)
+	root.dirLinks = 1
+	root.attachEntryLocked("tmp", dstFSNewNode(disk, ModeDir, ModeSticky|0o777))
 	dev := dstFSNewNode(disk, ModeDir, 0o755)
-	dev.entries["null"] = dstFSNewNode(disk, ModeDevice|ModeCharDevice, 0o666)
-	root.entries["dev"] = dev
+	dev.attachEntryLocked("null", dstFSNewNode(disk, ModeDevice|ModeCharDevice, 0o666))
+	root.attachEntryLocked("dev", dev)
 	disk.root = root
+	disk.rootDentry = &dstFSDentry{node: root, name: "/"}
 	// The mkfs image is part of the durable image: a filesystem is born with
 	// its initial tree ON THE PLATTER, so a host crash preserves root, /tmp,
 	// and /dev/null. Without this commit the tree is born unsynced and the
@@ -392,21 +396,89 @@ func newDstFSDisk() *dstFSDisk {
 	return disk
 }
 
-// dstFSCwdHere returns the calling process's working directory (default "/");
-// dstFSSetCwd sets it. The key is the (host, process) pair — the real process
-// identity — because a process id is not unique across hosts: a Host with no
-// Process runs at process id 0 on every host, and a same-named Process on two hosts
-// shares a process id, yet they are different machines whose cwds must be
-// independent (DST-NODE-ISOLATION). Caller holds dstFS.mu.
-func dstFSCwdHere() string {
-	host, proc := dstFSCurrentNode()
-	if c, ok := dstFS.cwds[[2]uint32{host, proc}]; ok {
-		return c
-	}
-	return "/"
+// dstFSDentry is a directory path edge (Linux struct dentry) binding a parent
+// dentry and entry name to a directory inode. Separating dentries from inodes
+// preserves per-alias parent chains (".." and Getwd) and per-alias unlink
+// survival when crash recovery retains both old and new aliases of a renamed
+// directory (design.md, durability contract).
+type dstFSDentry struct {
+	node     *dstFSNode
+	parent   *dstFSDentry            // nil on disk.rootDentry; retained across unlink for ".."
+	name     string                  // "/" on disk.rootDentry
+	children map[string]*dstFSDentry // live child directory dentries
+	unlinked bool                    // true once this specific alias edge is unlinked
 }
 
-func dstFSSetCwd(cwd string) {
+func (d *dstFSDentry) childLocked(name string, child *dstFSNode) *dstFSDentry {
+	if c := d.children[name]; c != nil && c.node == child && !c.unlinked {
+		return c
+	}
+	c := &dstFSDentry{
+		node:   child,
+		parent: d,
+		name:   name,
+	}
+	if d.children == nil {
+		d.children = make(map[string]*dstFSDentry)
+	}
+	d.children[name] = c
+	child.dentries = append(child.dentries, c)
+	return c
+}
+
+func (d *dstFSDentry) isDeadLocked(root *dstFSDentry) bool {
+	if d == nil || d.node.unlinked {
+		return true
+	}
+	for p := d; p != root; p = p.parent {
+		if p == nil || p.unlinked || p.parent == nil || p.parent.node.entries[p.name] != p.node {
+			return true
+		}
+	}
+	return false
+}
+
+func (cur *dstFSDentry) dentryChainLocked(root *dstFSDentry) []*dstFSDentry {
+	if cur == nil || cur == root {
+		return []*dstFSDentry{root}
+	}
+	var rev []*dstFSDentry
+	for p := cur; p != nil && p != root; p = p.parent {
+		rev = append(rev, p)
+	}
+	stack := make([]*dstFSDentry, 1, 1+len(rev)+4)
+	stack[0] = root
+	for i := len(rev) - 1; i >= 0; i-- {
+		stack = append(stack, rev[i])
+	}
+	return stack
+}
+
+// attachEntryLocked links child into parent under name, tracking live directory
+// parent-edge counts (dirLinks) so unlinking one alias of a crash-recovered
+// dual-alias directory leaves the surviving alias live. Caller holds dstFS.mu.
+func (parent *dstFSNode) attachEntryLocked(name string, child *dstFSNode) {
+	prev := parent.entries[name]
+	parent.entries[name] = child
+	if child.isDir && prev != child {
+		child.dirLinks++
+	}
+}
+
+// dstFSCwdDentryHere returns the calling process's working directory dentry
+// (default disk.rootDentry); dstFSSetCwdDentry sets it. Keyed by (host, process)
+// so co-located processes and root bodies across hosts maintain independent cwds
+// (DST-NODE-ISOLATION). Caller holds dstFS.mu.
+func dstFSCwdDentryHere() *dstFSDentry {
+	disk := dstFSDiskHere()
+	host, proc := dstFSCurrentNode()
+	if c := dstFS.cwds[[2]uint32{host, proc}]; c != nil && c.node.disk == disk {
+		return c
+	}
+	return disk.rootDentry
+}
+
+func dstFSSetCwdDentry(cwd *dstFSDentry) {
 	host, proc := dstFSCurrentNode()
 	dstFS.cwds[[2]uint32{host, proc}] = cwd
 }
@@ -496,6 +568,12 @@ type dstFSNode struct {
 	// dropped pages, which keep their platter bytes. Reset on host crash.
 	wbDroppedPages int64
 	wbRedirtied    map[int64]struct{}
+	// wbSnap captures a sparse COW snapshot of node.data at the failed writeback
+	// (or when a dropped file first gains a writable shared mapping) so stores
+	// through MAP_SHARED PROT_WRITE mappings redirty touched 4 KB pages even
+	// though CPU stores bypass writeAtLocked.
+	wbSnap    dstDurableImage
+	wbHasSnap bool
 
 	// rot is the silent-corruption mark (the CorruptFile fault): XOR masks
 	// keyed by byte offset into the durable image — bit rot sitting on the
@@ -515,6 +593,8 @@ type dstFSNode struct {
 	// Directory state.
 	entries       map[string]*dstFSNode
 	syncedEntries map[string]*dstFSNode
+	dirLinks      int            // live parent-directory edges (1 normally; >1 if crash recovery retained aliases)
+	dentries      []*dstFSDentry // live materialized dentries referencing this directory inode
 
 	mode    FileMode
 	modTime time.Time
@@ -589,6 +669,10 @@ func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode,
 	return dstFSResolveWalk(name, true)
 }
 
+func dstFSResolveDentry(name string) (parentDentry *dstFSDentry, base string, node *dstFSNode, nodeDentry *dstFSDentry, errno error) {
+	return dstFSResolveDentryWalk(name, true)
+}
+
 // dstFSResolveWalk is dstFSResolve with the FINAL component's trailing-slash
 // directory assertion optional. rename(2) needs it suppressed: the kernel
 // checks both paths' trailing slashes against the SOURCE's type only after
@@ -598,22 +682,36 @@ func dstFSResolve(name string) (parent *dstFSNode, base string, node *dstFSNode,
 // (host-probed: rename("missing", "existingfile/") is ENOENT, not ENOTDIR).
 // Intermediate-component walk errors are unaffected.
 func dstFSResolveWalk(name string, assertFinalSlash bool) (parent *dstFSNode, base string, node *dstFSNode, errno error) {
-	root := dstFSDiskHere().root
+	pd, base, node, _, errno := dstFSResolveDentryWalk(name, assertFinalSlash)
+	if pd != nil {
+		parent = pd.node
+	}
+	return parent, base, node, errno
+}
+
+func dstFSResolveDentryWalk(name string, assertFinalSlash bool) (parentDentry *dstFSDentry, base string, node *dstFSNode, nodeDentry *dstFSDentry, errno error) {
+	if name == "" {
+		return nil, "", nil, nil, syscall.ENOENT
+	}
+	disk := dstFSDiskHere()
+	rootDentry := disk.rootDentry
 	comps, trailingSlash := dstFSComponents(name)
 	trailingSlash = trailingSlash && assertFinalSlash
-	// stack holds the directory chain from root; names[i] is stack[i]'s name in its
-	// parent (names[0] is the sentinel "/"). A `..` pops toward root; at root it
-	// stays (POSIX: `/..` == `/`).
-	stack := []*dstFSNode{root}
-	names := []string{"/"}
-	terminalDir := func() (parent *dstFSNode, base string, node *dstFSNode, errno error) {
+	// stack holds the dentry chain from rootDentry. Relative paths start at the
+	// process's working directory dentry chain (fs->pwd); `..` pops toward root,
+	// and at root stays (POSIX: `/..` == `/`).
+	stack := []*dstFSDentry{rootDentry}
+	if name[0] != '/' {
+		stack = dstFSCwdDentryHere().dentryChainLocked(rootDentry)
+	}
+	terminalDir := func() (*dstFSDentry, string, *dstFSNode, *dstFSDentry, error) {
 		// A path ending in `.`/`..` (or all-slashes) resolves to the current dir. A
 		// trailing slash on a directory is fine.
 		cur := stack[len(stack)-1]
 		if len(stack) == 1 {
-			return nil, "/", cur, nil
+			return nil, "/", cur.node, cur, nil
 		}
-		return stack[len(stack)-2], names[len(names)-1], cur, nil
+		return stack[len(stack)-2], cur.name, cur.node, cur, nil
 	}
 	for i, elem := range comps {
 		last := i == len(comps)-1
@@ -626,68 +724,53 @@ func dstFSResolveWalk(name string, assertFinalSlash bool) (parent *dstFSNode, ba
 		case "..":
 			if len(stack) > 1 {
 				stack = stack[:len(stack)-1]
-				names = names[:len(names)-1]
 			}
 			if last {
 				return terminalDir()
 			}
 		default:
 			if last {
-				n := cur.entries[elem]
+				n := cur.node.entries[elem]
 				if trailingSlash && n != nil && !n.isDir {
-					return nil, "", nil, syscall.ENOTDIR
+					return nil, "", nil, nil, syscall.ENOTDIR
 				}
-				return cur, elem, n, nil
+				var nd *dstFSDentry
+				if n != nil && n.isDir {
+					nd = cur.childLocked(elem, n)
+				}
+				return cur, elem, n, nd, nil
 			}
-			n := cur.entries[elem]
+			n := cur.node.entries[elem]
 			if n == nil {
-				return nil, "", nil, syscall.ENOENT
+				return nil, "", nil, nil, syscall.ENOENT
 			}
 			if !n.isDir {
-				return nil, "", nil, syscall.ENOTDIR
+				return nil, "", nil, nil, syscall.ENOTDIR
 			}
-			stack = append(stack, n)
-			names = append(names, elem)
+			stack = append(stack, cur.childLocked(elem, n))
 		}
 	}
 	// No components (root, or all trailing slashes) → the root directory.
 	return terminalDir()
 }
 
-// dstFSComponents joins name against the calling process's working directory (if
-// relative) and splits it into path components WITHOUT collapsing `.`/`..` (those
-// are resolved physically by the walk in dstFSResolve) — only redundant slashes are
-// dropped. It reports whether the path had a trailing slash (which asserts the target
-// is a directory). Caller holds dstFS.mu.
+// dstFSComponents splits name into path components WITHOUT collapsing `.`/`..`
+// (those are resolved physically by the walk in dstFSResolveDentryWalk, starting
+// from root for absolute paths or dstFSCwdDentryHere for relative paths) — only
+// redundant slashes are dropped. It reports whether a non-root path had a
+// trailing slash (which asserts the target is a directory).
 func dstFSComponents(name string) (comps []string, trailingSlash bool) {
-	full := name
-	if len(name) == 0 || name[0] != '/' {
-		full = dstFSCwdHere() + "/" + name
-	}
-	trailingSlash = len(full) > 1 && full[len(full)-1] == '/'
+	trailingSlash = len(name) > 1 && name[len(name)-1] == '/'
 	start := 0
-	for i := 0; i <= len(full); i++ {
-		if i == len(full) || full[i] == '/' {
+	for i := 0; i <= len(name); i++ {
+		if i == len(name) || name[i] == '/' {
 			if i > start {
-				comps = append(comps, full[start:i])
+				comps = append(comps, name[start:i])
 			}
 			start = i + 1
 		}
 	}
 	return comps, trailingSlash
-}
-
-// dstFSAbs resolves name against the calling process's working directory and cleans
-// it LEXICALLY (`path.Clean`) — the canonical path STRING for the stored handle path,
-// the working directory, and rename same-path comparison. Path RESOLUTION against the
-// tree is dstFSResolve's physical walk, not this; the cwd is stored clean and contains
-// no `..`, so joining a clean cwd with a name preserves any `..` in the name for that
-// walk. Caller holds dstFS.mu.
-func dstFSAbs(name string) string {
-	if len(name) > 0 && name[0] == '/' {
-		return path.Clean(name)
-	}
-	return path.Clean(dstFSCwdHere() + "/" + name)
 }
 
 // dstMkdir implements Mkdir on the simulated tree.
@@ -718,7 +801,7 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 	if trimmed == "" {
 		trimmed = name // "/" and all-slash names keep their root resolution
 	}
-	parent, base, node, errno := dstFSResolve(trimmed)
+	parentDentry, base, node, _, errno := dstFSResolveDentry(trimmed)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -726,34 +809,122 @@ func dstMkdir(name string, perm FileMode) (handled bool, err error) {
 		return wrap(syscall.EEXIST)
 	}
 	disk := dstFSDiskHere()
+	if disk.capped.Load() {
+		dstCoarseRecord(uintptr(unsafe.Pointer(disk)), false)
+	}
+	if parentDentry.isDeadLocked(disk.rootDentry) {
+		return wrap(syscall.ENOENT)
+	}
 	if disk.diskFullForCreate() {
 		return wrap(syscall.ENOSPC)
 	}
-	parent.entries[base] = dstFSNewNode(disk, ModeDir, perm)
+	parent := parentDentry.node
+	parent.attachEntryLocked(base, dstFSNewNode(disk, ModeDir, perm))
 	parent.modTime = time.Now()
 	return true, nil
 }
 
-// dstFSMarkUnlinked marks a node removed from the namespace — and, for a
-// directory subtree (RemoveAll), every directory under it — so entry creation
-// through a still-open handle (a captured Root) fails ENOENT as the kernel's
-// does in an rmdir'd directory. The entries clear too: they remain
-// load-bearing for Root-relative lookups (a captured Root addresses the node,
-// and a lookup inside a removed directory must find nothing) — directory
-// LISTINGS through a surviving handle answer ENOENT via the unlinked flag
-// (the kernel's dead-directory refusal), they never see the entries either
-// way. (Unlinked-but-open file CONTENT is untouched: it lives on the node,
-// and open handles keep it per the POSIX contract.) Caller holds dstFS.mu.
+func dstFSUnlinkEntryLocked(parent *dstFSNode, base string, child *dstFSNode) {
+	delete(parent.entries, base)
+	if !child.isDir {
+		dstFSDropLink(child)
+		return
+	}
+	keep := child.dentries[:0]
+	for _, d := range child.dentries {
+		if !d.unlinked && d.parent != nil && d.parent.node == parent && d.name == base {
+			d.unlinked = true
+			if d.parent.children[base] == d {
+				delete(d.parent.children, base)
+			}
+			continue
+		}
+		if !d.unlinked {
+			keep = append(keep, d)
+		}
+	}
+	clear(child.dentries[len(keep):])
+	child.dentries = keep
+	if child.dirLinks > 0 {
+		child.dirLinks--
+	}
+	if child.dirLinks == 0 {
+		dstFSMarkUnlinked(child)
+	}
+}
+
+func dstFSClearDirEntriesLocked(dir *dstFSNode) {
+	if !dir.isDir || len(dir.entries) == 0 {
+		return
+	}
+	dstFSClearDirEntriesSeenLocked(dir, make(map[*dstFSNode]bool))
+}
+
+func dstFSClearDirEntriesSeenLocked(dir *dstFSNode, seen map[*dstFSNode]bool) {
+	if !dir.isDir || seen[dir] {
+		return
+	}
+	seen[dir] = true
+	for name, child := range dir.entries {
+		if child.isDir {
+			dstFSClearDirEntriesSeenLocked(child, seen)
+		}
+		dstFSUnlinkEntryLocked(dir, name, child)
+	}
+}
+
+func dstFSMoveEntryLocked(oldParentDentry *dstFSDentry, oldBase string, oldNode *dstFSNode, newParentDentry *dstFSDentry, newBase string, newNode *dstFSNode) {
+	if newNode != nil {
+		dstFSUnlinkEntryLocked(newParentDentry.node, newBase, newNode)
+	}
+	oldParent := oldParentDentry.node
+	newParent := newParentDentry.node
+	delete(oldParent.entries, oldBase)
+	newParent.entries[newBase] = oldNode
+	if oldNode.isDir {
+		for _, d := range oldNode.dentries {
+			if d.unlinked || d.parent == nil || d.parent.node != oldParent || d.name != oldBase {
+				continue
+			}
+			if d.parent.children[oldBase] == d {
+				delete(d.parent.children, oldBase)
+			}
+			targetParent := newParentDentry
+			preserveSiblingParent := oldParent == newParent && d.parent != oldParentDentry
+			if preserveSiblingParent {
+				targetParent = d.parent
+			}
+			wasPrimary := d.parent == oldParentDentry || preserveSiblingParent
+			d.parent = targetParent
+			d.name = newBase
+			if targetParent.children == nil {
+				targetParent.children = make(map[string]*dstFSDentry)
+			}
+			if wasPrimary || targetParent.children[newBase] == nil {
+				targetParent.children[newBase] = d
+			}
+		}
+	}
+}
+
+// dstFSMarkUnlinked marks a directory inode whose last parent link was removed
+// from the namespace — and every directory under it — so entry creation and
+// readdir through a still-open handle fail ENOENT as the kernel's do in an
+// rmdir'd directory. Unlinked-but-open file CONTENT is untouched: it lives on
+// the node, and open handles keep it per the POSIX contract. Caller holds dstFS.mu.
 func dstFSMarkUnlinked(node *dstFSNode) {
-	if !node.isDir {
+	if !node.isDir || node.unlinked {
 		return
 	}
 	node.unlinked = true
-	for _, child := range node.entries {
-		dstFSDropLink(child)
-		dstFSMarkUnlinked(child)
+	for _, d := range node.dentries {
+		d.unlinked = true
+		if d.parent != nil && d.parent.children[d.name] == d {
+			delete(d.parent.children, d.name)
+		}
 	}
-	clear(node.entries)
+	node.dentries = nil
+	dstFSClearDirEntriesLocked(node)
 	if node.durableRefs == 0 {
 		node.dropSyncedEntriesLocked()
 	}
@@ -838,9 +1009,10 @@ func dstRemove(name string) (handled bool, err error) {
 	if node.isDir && len(node.entries) > 0 {
 		return wrap(syscall.ENOTEMPTY)
 	}
-	dstFSDropLink(node)
-	dstFSMarkUnlinked(node)
-	delete(parent.entries, base)
+	if disk := dstFSDiskHere(); disk.capped.Load() {
+		dstCoarseRecord(uintptr(unsafe.Pointer(disk)), true)
+	}
+	dstFSUnlinkEntryLocked(parent, base, node)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -881,9 +1053,13 @@ func dstRemoveAll(name string) (handled bool, err error) {
 		// Match RemoveAll("/"): refuse to destroy the root.
 		return true, &PathError{Op: "removeall", Path: name, Err: syscall.EBUSY}
 	}
-	dstFSDropLink(node)
-	dstFSMarkUnlinked(node)
-	delete(parent.entries, base)
+	if disk := dstFSDiskHere(); disk.capped.Load() {
+		dstCoarseRecord(uintptr(unsafe.Pointer(disk)), true)
+	}
+	if node.isDir {
+		dstFSClearDirEntriesLocked(node)
+	}
+	dstFSUnlinkEntryLocked(parent, base, node)
 	parent.modTime = time.Now()
 	return true, nil
 }
@@ -925,7 +1101,7 @@ func dstLink(oldname, newname string) (handled bool, err error) {
 	if _, oldSlash := dstFSComponents(oldname); oldSlash && !oldNode.isDir {
 		return wrap(syscall.ENOTDIR)
 	}
-	newParent, newBase, newNode, errno := dstFSResolveWalk(newname, false)
+	newParentDentry, newBase, newNode, _, errno := dstFSResolveDentryWalk(newname, false)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -935,13 +1111,18 @@ func dstLink(oldname, newname string) (handled bool, err error) {
 	if _, newSlash := dstFSComponents(newname); newSlash {
 		return wrap(syscall.ENOENT)
 	}
+	disk := dstFSDiskHere()
+	if newParentDentry.isDeadLocked(disk.rootDentry) {
+		return wrap(syscall.ENOENT)
+	}
 	// LAST, after every new-side answer — host-probed: a directory old
 	// with an existing new is EEXIST, with a slashed or unreachable new
 	// ENOENT; EPERM only when the new side would have succeeded.
 	if oldNode.isDir {
 		return wrap(syscall.EPERM)
 	}
-	newParent.entries[newBase] = oldNode
+	newParent := newParentDentry.node
+	newParent.attachEntryLocked(newBase, oldNode)
 	oldNode.nlink++
 	newParent.modTime = time.Now()
 	return true, nil
@@ -989,12 +1170,12 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 	// newpath successfully (host-probed on ext4 and tmpfs alike). The
 	// final-slash walk assertion is therefore suppressed here and
 	// applied at the source-type stage below.
-	oldParent, oldBase, oldNode, errno := dstFSResolveWalk(oldname, false)
+	oldParentDentry, oldBase, oldNode, _, errno := dstFSResolveDentryWalk(oldname, false)
 	if errno != nil {
 		return wrap(errno)
 	}
 	_, oldTrailingSlash := dstFSComponents(oldname)
-	newParent, newBase, newNode, errno := dstFSResolveWalk(newname, false)
+	newParentDentry, newBase, newNode, _, errno := dstFSResolveDentryWalk(newname, false)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -1026,12 +1207,18 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 		// the slash rule).
 		return wrap(syscall.EEXIST)
 	}
+	disk := dstFSDiskHere()
+	if newNode == nil && newParentDentry != nil && newParentDentry.isDeadLocked(disk.rootDentry) {
+		return wrap(syscall.ENOENT)
+	}
 	if !oldNode.isDir && (oldTrailingSlash || newTrailingSlash) {
 		return wrap(syscall.ENOTDIR)
 	}
 	if newNode == oldNode {
 		return true, nil // same file: POSIX no-op success
 	}
+	oldParent := oldParentDentry.node
+	newParent := newParentDentry.node
 	if oldNode.isDir && dstNodeContains(oldNode, newParent) {
 		return wrap(syscall.EINVAL) // new is inside old
 	}
@@ -1045,15 +1232,10 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 			return wrap(syscall.ENOTEMPTY)
 		}
 	}
-	if newNode != nil {
-		// The replaced target leaves the namespace exactly as a Remove would
-		// (rename-over is atomic replace); an empty replaced directory becomes
-		// unlinked for any Root still holding it.
-		dstFSDropLink(newNode)
-		dstFSMarkUnlinked(newNode)
+	if newNode != nil && disk.capped.Load() {
+		dstCoarseRecord(uintptr(unsafe.Pointer(disk)), true)
 	}
-	delete(oldParent.entries, oldBase)
-	newParent.entries[newBase] = oldNode
+	dstFSMoveEntryLocked(oldParentDentry, oldBase, oldNode, newParentDentry, newBase, newNode)
 	now := time.Now()
 	oldParent.modTime = now
 	newParent.modTime = now
@@ -1061,14 +1243,19 @@ func dstRenameFlags(oldname, newname string, noreplace bool) (handled bool, err 
 }
 
 func dstNodeContains(root, node *dstFSNode) bool {
+	return dstNodeContainsSeen(root, node, make(map[*dstFSNode]bool))
+}
+
+func dstNodeContainsSeen(root, node *dstFSNode, seen map[*dstFSNode]bool) bool {
 	if root == node {
 		return true
 	}
-	if !root.isDir {
+	if !root.isDir || seen[root] {
 		return false
 	}
+	seen[root] = true
 	for _, child := range root.entries {
-		if dstNodeContains(child, node) {
+		if dstNodeContainsSeen(child, node, seen) {
 			return true
 		}
 	}
@@ -1147,6 +1334,9 @@ func dstTruncateName(name string, size int64) (handled bool, err error) {
 		// truncate(2) on a character device is EINVAL (host-verified).
 		return wrap(syscall.EINVAL)
 	}
+	if disk := dstFSDiskHere(); disk.capped.Load() {
+		dstCoarseRecord(uintptr(unsafe.Pointer(disk)), true)
+	}
 	if err := node.truncateLocked(size); err != nil {
 		return wrap(err)
 	}
@@ -1177,8 +1367,7 @@ func (node *dstFSNode) truncateLocked(size int64) error {
 				}
 			}
 			if int64(len(node.wbRedirtied)) == node.wbDroppedPages {
-				node.wbDroppedPages = 0
-				node.wbRedirtied = nil
+				node.clearWritebackDroppedLocked()
 			}
 		}
 		node.syncMmapBlocksLocked()
@@ -1274,16 +1463,39 @@ func dstChtimes(name string, atime, mtime time.Time) (handled bool, err error) {
 	return true, nil
 }
 
-// dstGetwd / dstChdir: the per-bubble working directory.
+// dstGetwd / dstChdir: the per-process working directory dentry.
 func dstGetwd() (string, bool, error) {
 	if !dstFSActive() {
 		return "", false, nil
 	}
 	dstCoarseDep(dstCoarseCwdID(), false)
+	dstCoarseRecord(dstCoarseNamespaceID(), false)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
-	return dstFSCwdHere(), true, nil
+	disk := dstFSDiskHere()
+	root := disk.rootDentry
+	cur := dstFSCwdDentryHere()
+	if cur == root {
+		return "/", true, nil
+	}
+	if cur.isDeadLocked(root) {
+		return "", true, NewSyscallError("getwd", syscall.ENOENT)
+	}
+	var rev []string
+	for p := cur; p != root; p = p.parent {
+		rev = append(rev, p.name)
+	}
+	var n int
+	for _, s := range rev {
+		n += 1 + len(s)
+	}
+	buf := make([]byte, 0, n)
+	for i := len(rev) - 1; i >= 0; i-- {
+		buf = append(buf, '/')
+		buf = append(buf, rev[i]...)
+	}
+	return string(buf), true, nil
 }
 
 func dstChdir(dir string) (handled bool, err error) {
@@ -1303,7 +1515,7 @@ func dstChdir(dir string) (handled bool, err error) {
 	if dir == "" {
 		return wrap(syscall.ENOENT)
 	}
-	_, _, node, errno := dstFSResolve(dir)
+	_, _, node, nodeDentry, errno := dstFSResolveDentry(dir)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -1313,7 +1525,7 @@ func dstChdir(dir string) (handled bool, err error) {
 	if !node.isDir {
 		return wrap(syscall.ENOTDIR)
 	}
-	dstFSSetCwd(dstFSAbs(dir))
+	dstFSSetCwdDentry(nodeDentry)
 	return true, nil
 }
 
@@ -1326,7 +1538,8 @@ var _ dstFileBackend = (*dstFile)(nil)
 type dstFile struct {
 	mu     isync.KernelMutex
 	node   *dstFSNode
-	disk   *dstFSDisk // the host disk this handle was opened on (for disk faults)
+	dentry *dstFSDentry // non-nil on directory handles (for fchdir)
+	disk   *dstFSDisk   // the host disk this handle was opened on (for disk faults)
 	path   string
 	off    int64
 	dirpos int // directory read cursor (sorted-name index)
@@ -1377,10 +1590,11 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
 
-	parent, base, node, errno := dstFSResolve(name)
+	parentDentry, base, node, nodeDentry, errno := dstFSResolveDentry(name)
 	if errno != nil {
 		return wrap(errno)
 	}
+	disk := dstFSDiskHere()
 
 	accWrite := flag&(O_WRONLY|O_RDWR) != 0
 	if node != nil && node.isDir {
@@ -1411,12 +1625,18 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 			// trailing slash on an existing non-dir (ENOTDIR); this is its create leg.
 			return wrap(syscall.EISDIR)
 		}
-		disk := dstFSDiskHere()
+		if disk.capped.Load() {
+			dstCoarseRecord(uintptr(unsafe.Pointer(disk)), false)
+		}
+		if parentDentry.isDeadLocked(disk.rootDentry) {
+			return wrap(syscall.ENOENT)
+		}
 		if disk.diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
 		node = dstFSNewNode(disk, 0, perm)
-		parent.entries[base] = node
+		parent := parentDentry.node
+		parent.attachEntryLocked(base, node)
 		parent.modTime = time.Now()
 	}
 	if flag&O_TRUNC != 0 && !node.isDevice() {
@@ -1425,6 +1645,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 		// on Sync, never on a mutation (the durability contract). On a
 		// character device the kernel ignores O_TRUNC (handle_truncate runs
 		// for regular files only; host-verified error-free).
+		if disk.capped.Load() {
+			dstCoarseRecord(uintptr(unsafe.Pointer(disk)), true)
+		}
 		if err := node.truncateLocked(0); err != nil {
 			return wrap(err)
 		}
@@ -1433,8 +1656,9 @@ func dstOpenFile(name string, flag int, perm FileMode) (f *File, handled bool, e
 	osync, odsync := dstSyncModes(flag)
 	d := &dstFile{
 		node:   node,
-		disk:   dstFSDiskHere(),
-		path:   dstFSAbs(name),
+		dentry: nodeDentry,
+		disk:   disk,
+		path:   name,
 		rd:     flag&O_WRONLY == 0,
 		wr:     accWrite,
 		app:    flag&O_APPEND != 0,
@@ -1464,7 +1688,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	if name == "" {
 		return wrap(syscall.ENOENT)
 	}
-	_, _, node, errno := dstFSResolve(name)
+	_, _, node, nodeDentry, errno := dstFSResolveDentry(name)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -1474,7 +1698,7 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 	if !node.isDir {
 		return wrap(syscall.ENOTDIR)
 	}
-	d := &dstFile{node: node, disk: dstFSDiskHere(), path: dstFSAbs(name), rd: true}
+	d := &dstFile{node: node, dentry: nodeDentry, disk: dstFSDiskHere(), path: name, rd: true}
 	return dstNewFile(d, name), true, nil
 }
 
@@ -1486,11 +1710,14 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 func dstNewFile(d dstFileBackend, name string) *File {
 	dstKernelSectionEnter()
 	defer dstKernelSectionExit()
-	if df, ok := d.(*dstFile); ok {
-		df.epoch = dstFSEpoch()
-		if df.node != nil && !df.node.isDir && !df.node.isDevice() {
-			df.node.openFiles++
+	switch b := d.(type) {
+	case *dstFile:
+		b.epoch = dstFSEpoch()
+		if b.node != nil && !b.node.isDir && !b.node.isDevice() {
+			b.node.openFiles++
 		}
+	case *dstProcFile:
+		b.epoch = dstFSEpoch()
 	}
 	f := &File{&file{name: name}}
 	dstSetFileBackend(f.file, d)
@@ -1504,7 +1731,7 @@ func dstNewFile(d dstFileBackend, name string) *File {
 // order). Callers must call leave (via defer) when it returns nil.
 func (d *dstFile) enter() error {
 	d.mu.Lock()
-	if d.closed || d.epoch != dstFSEpoch() {
+	if d.closed || !dstFSActive() || d.epoch != dstFSEpoch() {
 		if d.closed && dstFSActive() && d.epoch == dstFSEpoch() {
 			dstKernelRaceAcquire(unsafe.Pointer(&d.closeSync))
 		}
@@ -1608,7 +1835,7 @@ func (d *dstFile) coarseOp(handleWrite, nodeWrite bool) {
 	if !closed && epochOk && node != nil && !isDevice {
 		dstCoarseRecord(uintptr(unsafe.Pointer(node)), nodeWrite)
 		if disk != nil {
-			dstCoarseRecord(uintptr(unsafe.Pointer(disk)), false)
+			dstCoarseRecord(uintptr(unsafe.Pointer(disk)), nodeWrite && disk.capped.Load())
 		}
 	}
 }
@@ -1652,7 +1879,7 @@ func (d *dstFile) diskDelay() {
 		return
 	}
 	d.mu.Lock()
-	skip := d.closed || (d.node != nil && d.node.isDevice())
+	skip := d.closed || !dstFSActive() || d.epoch != dstFSEpoch() || (d.node != nil && d.node.isDevice())
 	d.mu.Unlock()
 	dstKernelSectionExit()
 	if !skip {
@@ -1777,24 +2004,32 @@ func (node *dstFSNode) allocatedPagesLocked() int64 {
 // removed-but-open files are omitted (which only ever under-counts space in use
 // — never a false ENOSPC). Caller holds dstFS.mu.
 func (disk *dstFSDisk) residentPagesLocked() int64 {
-	var pages int64
+	pages, _ := disk.usageLocked(false)
+	return int64(pages)
+}
+
+func (disk *dstFSDisk) usageLocked(recordDep bool) (pages, inodes uint64) {
 	seen := make(map[*dstFSNode]bool)
 	var walk func(n *dstFSNode)
 	walk = func(n *dstFSNode) {
-		if seen[n] {
+		if n == nil || seen[n] {
 			return
 		}
 		seen[n] = true
+		inodes++
 		if n.isDir {
 			for _, c := range n.entries {
 				walk(c)
 			}
 			return
 		}
-		pages += n.allocatedPagesLocked()
+		if recordDep {
+			dstCoarseNodeRecord(n, false)
+		}
+		pages += uint64(n.allocatedPagesLocked())
 	}
 	walk(disk.root)
-	return pages
+	return pages, inodes
 }
 
 func (disk *dstFSDisk) freeBlocksLocked() int64 {
@@ -1827,7 +2062,7 @@ func (d *dstFile) writeAllowed(off, n int64) (int64, syscall.Errno) {
 	if room := dstSMaxBytes - off; n > room {
 		n = room
 	}
-	if n <= 0 || !d.disk.capped {
+	if n <= 0 || !d.disk.capped.Load() {
 		return n, refuse
 	}
 	d.node.syncMmapBlocksLocked()
@@ -1865,7 +2100,7 @@ func (d *dstFile) writeAllowed(off, n int64) (int64, syscall.Errno) {
 // diskFullForCreate reports whether a capped disk has zero free 4 KB blocks
 // left (ENOSPC on create/mkdir on a full disk). Caller holds dstFS.mu.
 func (disk *dstFSDisk) diskFullForCreate() bool {
-	return disk.capped && disk.freeBlocksLocked() == 0
+	return disk.capped.Load() && disk.freeBlocksLocked() == 0
 }
 
 func (d *dstFile) read(b []byte) (n int, err error) {
@@ -2321,10 +2556,13 @@ func (d *dstFile) chdirHandle() error {
 		return e
 	}
 	defer d.leave()
+	if d.disk != dstFSDiskHere() {
+		return syscall.EBADF
+	}
 	if !d.node.isDir {
 		return syscall.ENOTDIR
 	}
-	dstFSSetCwd(d.path)
+	dstFSSetCwdDentry(d.dentry)
 	return nil
 }
 
@@ -2413,7 +2651,7 @@ func (d *dstFile) fallocate(mode int, off, length int64) error {
 	startPg := off / dstPageSize
 	endPg := (newSize-1)/dstPageSize + 1
 	need := dstBlocksUnallocatedIn(d.node.blocks, startPg, endPg)
-	if d.disk.capped && need > d.disk.freeBlocksLocked() {
+	if d.disk.capped.Load() && need > d.disk.freeBlocksLocked() {
 		return syscall.ENOSPC // refused whole: a failed fallocate allocates nothing
 	}
 	if newSize > int64(len(d.node.data)) {
@@ -2518,12 +2756,90 @@ func (node *dstFSNode) commitLocked() {
 	node.syncedModTime = node.modTime
 }
 
+// scanDataPagesLocked scans non-hole 4 KB pages of node.data via SEEK_DATA,
+// skipping pages where skip != nil && skip(pg), and constructs a sparse COW
+// page map reusing unchanged pages from node.synced.pages. Caller holds
+// dstFS.mu and has synced mmap blocks.
+func (node *dstFSNode) scanDataPagesLocked(skip func(int64) bool) map[int64]dstDurablePage {
+	size := int64(len(node.data))
+	if node.pc == nil || size == 0 {
+		return nil
+	}
+	old := node.synced
+	var pages map[int64]dstDurablePage
+	for off := int64(0); off < size; {
+		d, h, ok := dstPageCacheNextData(node.pc.fd, off, size)
+		if !ok {
+			break
+		}
+		p0 := d / dstPageSize
+		p1 := (h + dstPageSize - 1) / dstPageSize
+		for pg := p0; pg < p1; pg++ {
+			if skip != nil && skip(pg) {
+				continue
+			}
+			pStart := pg * dstPageSize
+			pEnd := min(pStart+dstPageSize, size)
+			p := dstDurablePageFromSlice(old.pages[pg], node.data[pStart:pEnd])
+			if p == nil {
+				continue
+			}
+			if pages == nil {
+				pages = make(map[int64]dstDurablePage)
+			}
+			pages[pg] = p
+		}
+		off = h
+	}
+	return pages
+}
+
+func (node *dstFSNode) snapshotDataLocked() dstDurableImage {
+	if node.pc == nil {
+		return dstDurableImage{}
+	}
+	node.syncMmapBlocksLocked()
+	size := int64(len(node.data))
+	if size == 0 {
+		return dstDurableImage{}
+	}
+	pages := node.scanDataPagesLocked(nil)
+	maxPages := (size + dstPageSize - 1) / dstPageSize
+	return dstDurableImage{
+		size:   size,
+		pages:  pages,
+		blocks: dstBlocksTruncate(slices.Clone(node.blocks), maxPages),
+	}
+}
+
 func (node *dstFSNode) isPageDroppedLocked(pg int64) bool {
 	if pg >= node.wbDroppedPages {
 		return false
 	}
-	_, redirtied := node.wbRedirtied[pg]
-	return !redirtied
+	if _, redirtied := node.wbRedirtied[pg]; redirtied {
+		return false
+	}
+	if node.wbHasSnap && node.everMappedWrite.Load() {
+		pStart := pg * dstPageSize
+		if pStart >= int64(len(node.data)) {
+			return false
+		}
+		n := int(min(int64(dstPageSize), int64(len(node.data))-pStart))
+		cur := node.data[pStart : pStart+int64(n)]
+		oldValid := int(max(0, min(int64(n), node.wbSnap.size-pStart)))
+		snapPg := node.wbSnap.pages[pg]
+		var unchanged bool
+		if snapPg == nil {
+			unchanged = dstBytesAllZero(cur)
+		} else {
+			unchanged = slices.Equal(cur[:oldValid], snapPg[:oldValid]) && dstBytesAllZero(cur[oldValid:])
+		}
+		if !unchanged {
+			node.dstMarkPageRedirtiedLocked(pg)
+			return false
+		}
+	}
+	return true
 }
 
 func (node *dstFSNode) commitDataLocked() {
@@ -2533,56 +2849,19 @@ func (node *dstFSNode) commitDataLocked() {
 	node.syncMmapBlocksLocked()
 	old := node.synced
 	size := int64(len(node.data))
-	var pages map[int64]dstDurablePage
-	setPage := func(pg int64, p dstDurablePage) {
-		if pages == nil {
-			pages = make(map[int64]dstDurablePage)
-		}
-		pages[pg] = p
-	}
-	for off := int64(0); off < size; {
-		d, h, ok := dstPageCacheNextData(node.pc.fd, off, size)
-		if !ok {
-			break
-		}
-		p0 := d / dstPageSize
-		p1 := (h + dstPageSize - 1) / dstPageSize
-		for pg := p0; pg < p1; pg++ {
-			if node.isPageDroppedLocked(pg) {
-				continue
-			}
-			pStart := pg * dstPageSize
-			pEnd := min(pStart+dstPageSize, size)
-			cur := node.data[pStart:pEnd]
-			if dstBytesAllZero(cur) {
-				continue
-			}
-			if oldPg := old.pages[pg]; oldPg != nil && slices.Equal(oldPg[:len(cur)], cur) && dstBytesAllZero(oldPg[len(cur):]) {
-				setPage(pg, oldPg)
-				continue
-			}
-			var buf [dstPageSize]byte
-			copy(buf[:], cur)
-			setPage(pg, &buf)
-		}
-		off = h
-	}
+	pages := node.scanDataPagesLocked(node.isPageDroppedLocked)
 	if node.wbDroppedPages > 0 {
 		for pg, oldPg := range old.pages {
 			if pg*dstPageSize >= size || !node.isPageDroppedLocked(pg) {
 				continue
 			}
 			limit := int(min(int64(dstPageSize), size-pg*dstPageSize))
-			if dstBytesAllZero(oldPg[:limit]) {
-				continue
+			if clipped := dstDurablePageClipped(oldPg, limit); clipped != nil {
+				if pages == nil {
+					pages = make(map[int64]dstDurablePage)
+				}
+				pages[pg] = clipped
 			}
-			if dstBytesAllZero(oldPg[limit:]) {
-				setPage(pg, oldPg)
-				continue
-			}
-			var buf [dstPageSize]byte
-			copy(buf[:], oldPg[:limit])
-			setPage(pg, &buf)
 		}
 	}
 	var blocks []dstBlockSpan
@@ -2651,12 +2930,47 @@ func (node *dstFSNode) clearRotWrittenBackLocked(old dstDurableImage) {
 	}
 }
 
-// markWritebackDroppedLocked records the fsyncgate mark in O(1): every page in
-// [0, ceil(len(data)/4096)) is dropped until a write event redirties it.
-// Caller holds dstFS.mu.
+func (node *dstFSNode) clearWritebackDroppedLocked() {
+	node.wbDroppedPages = 0
+	node.wbRedirtied = nil
+	node.wbSnap = dstDurableImage{}
+	node.wbHasSnap = false
+}
+
+func (node *dstFSNode) ensureWritebackSnapLocked() {
+	if node.wbDroppedPages > 0 && !node.wbHasSnap {
+		node.wbSnap = node.snapshotDataLocked()
+		node.wbHasSnap = true
+	}
+}
+
+// markWritebackDroppedLocked records the fsyncgate mark: every page in
+// [0, ceil(len(data)/4096)) is dropped until a write or MAP_SHARED store
+// redirties it. Caller holds dstFS.mu.
 func (node *dstFSNode) markWritebackDroppedLocked() {
+	node.syncMmapBlocksLocked()
 	node.wbDroppedPages = (int64(len(node.data)) + dstPageSize - 1) / dstPageSize
 	clear(node.wbRedirtied)
+	if node.wbDroppedPages > 0 && node.everMappedWrite.Load() {
+		node.wbSnap = node.snapshotDataLocked()
+		node.wbHasSnap = true
+	} else {
+		node.wbSnap = dstDurableImage{}
+		node.wbHasSnap = false
+	}
+}
+
+func (node *dstFSNode) dstMarkPageRedirtiedLocked(pg int64) {
+	if pg < 0 || pg >= node.wbDroppedPages {
+		return
+	}
+	if node.wbRedirtied == nil {
+		node.wbRedirtied = make(map[int64]struct{})
+	}
+	node.wbRedirtied[pg] = struct{}{}
+	if int64(len(node.wbRedirtied)) == node.wbDroppedPages {
+		node.clearWritebackDroppedLocked()
+	}
 }
 
 // dstMarkRedirtiedLocked removes the pages [off, off+n) touch from the
@@ -2671,15 +2985,11 @@ func (node *dstFSNode) dstMarkRedirtiedLocked(off, n int64) {
 	if p0 > p1 {
 		return
 	}
-	if node.wbRedirtied == nil {
-		node.wbRedirtied = make(map[int64]struct{})
-	}
 	for pg := p0; pg <= p1; pg++ {
-		node.wbRedirtied[pg] = struct{}{}
-	}
-	if int64(len(node.wbRedirtied)) == node.wbDroppedPages {
-		node.wbDroppedPages = 0
-		node.wbRedirtied = nil
+		node.dstMarkPageRedirtiedLocked(pg)
+		if node.wbDroppedPages == 0 {
+			return
+		}
 	}
 }
 
@@ -2706,7 +3016,7 @@ func (d *dstFile) stat() (FileInfo, error) {
 		return nil, err
 	}
 	defer d.leave()
-	return dstFileInfoForNode(path.Base(d.path), d.node), nil
+	return dstFileInfoForNode(filepathlite.Base(d.path), d.node), nil
 }
 
 // setDeadline implements the deadline half of the backend seam for tree
@@ -2719,8 +3029,8 @@ func (d *dstFile) setDeadline(rd, wd bool, t time.Time) error {
 	d.coarseHandleOnly(false)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed {
-		if dstFSActive() && d.epoch == dstFSEpoch() {
+	if d.closed || !dstFSActive() || d.epoch != dstFSEpoch() {
+		if d.closed && dstFSActive() && d.epoch == dstFSEpoch() {
 			dstKernelRaceAcquire(unsafe.Pointer(&d.closeSync))
 		}
 		return poll.ErrFileClosing
@@ -2755,6 +3065,7 @@ func (d *dstFile) dropClosedNode() {
 		node = d.node
 		epoch = d.epoch
 		d.node = nil
+		d.dentry = nil
 	}
 	d.mu.Unlock()
 	if node == nil || node.isDir || node.isDevice() {

@@ -840,15 +840,12 @@ func TestDSTPooledGBytesExact(t *testing.T) {
 }
 
 // TestDSTMemfdFDIsolation: the harness's page-cache memfds are invisible in
-// the simulated fd namespace — a bubble goroutine gets exactly EBADF for
-// them on every fenced surface (named wrappers, Pread via Syscall6, and
-// RawSyscall — all through the trampolines), a daemonize-style close sweep
-// is the harmless loop it is in
-// production, and resizes and reads of the open simulated file keep working.
-// Mutation: dropping the trampoline check fails at the white-box probe
-// ("got nil, want EBADF" — the probe's own close then host-closes the
-// memfd); dropping the registration prints "no page-cache fd found";
-// answering success instead of EBADF fails the probes on the exact value.
+// the simulated fd namespace — SYS_CLOSE answers EBADF without reaching the
+// kernel (so a daemonize-style close sweep stays harmless and resizes/reads of
+// the open simulated file keep working), while every non-SYS_CLOSE raw host-fd
+// operation (Fstat, Pread, SYS_FCNTL) hits dstSyscallRefuse with the exact same
+// panic on a memfd as on an unallocated real fd number so harness descriptor
+// numbers are never leaked to bubble code.
 func TestDSTMemfdFDIsolation(t *testing.T) {
 	out := runTestProgDST(t, "DSTMemfdFDIsolation", "DSTSEED=12345")
 	if strings.TrimSpace(out) != "done" {
@@ -2670,8 +2667,10 @@ func TestDSTGCAssistMembershipCarry(t *testing.T) {
 }
 
 func TestDSTSysmonMaxProcsRunActiveGuards(t *testing.T) {
-	out := strings.TrimSpace(runTestProgDST(t, "DSTSysmonMaxProcsRunActiveGuards", "GOMAXPROCS="))
-	if out != "ok" {
-		t.Fatalf("DSTSysmonMaxProcsRunActiveGuards: got %q, want \"ok\"", out)
+	for _, maxprocsEnv := range []string{"GOMAXPROCS=", "GOMAXPROCS=1"} {
+		out := strings.TrimSpace(runTestProgDST(t, "DSTSysmonMaxProcsRunActiveGuards", maxprocsEnv, "GODEBUG=updatemaxprocs=1"))
+		if out != "ok" {
+			t.Fatalf("DSTSysmonMaxProcsRunActiveGuards (%s): got %q, want \"ok\"", maxprocsEnv, out)
+		}
 	}
 }

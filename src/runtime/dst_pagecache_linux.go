@@ -367,20 +367,14 @@ func dstPageCacheResetRegion() {
 }
 
 // dstPageCacheFDs is an atomically-published bitmap (*dstPageCacheFDSet) of
-// live page-cache fd numbers, indexed by fd. The simulated process must not be
-// able to reach these descriptors: the syscall boundary consults
-// dstPageCacheFDReserved and answers EBADF for a bubble goroutine, exactly as
-// for a fd the SUT never opened — a passed-through close would kill a live
-// file's cache (fatal at the next resize or mmap), and a freed number reused
-// by a later memfd_create would silently alias another file's bytes. Readers
-// are lock-free (atomic pointer load + atomic word load) and nosplit-safe: the
-// raw syscall boundary runs without a P. Writers serialize on
-// dstPageCacheFDLock, and the memfd_create/closefd syscalls happen INSIDE that
-// lock together with the bit flip: holding a runtime mutex (m.locks > 0)
-// suppresses cooperative preemption, so no other goroutine can run — and
-// sweep-close an unregistered newborn memfd, or catch the gap between
-// unregister and the host close — while a descriptor exists in one state but
-// is recorded in the other.
+// live page-cache fd numbers, indexed by fd, for white-box fd-isolation probes
+// (dstPageCacheFDReserved). At the syscall boundary, SYS_CLOSE on any real fd
+// is uniformly answered EBADF without kernel dispatch (dstSyscallHostClose),
+// while every non-SYS_CLOSE raw real-fd call hits dstSyscallRefuse uniformly so
+// harness memfd numbers are indistinguishable from any other real fd number.
+// Writers serialize on dstPageCacheFDLock, and the memfd_create/closefd
+// syscalls happen INSIDE that lock together with the bit flip (holding a
+// runtime mutex sets m.locks > 0, suppressing cooperative preemption).
 //
 // The bitmap lives off the GC heap via persistentalloc so host-chosen memfd
 // descriptor numbers and cross-run table warmth never perturb dstHeapAlloc

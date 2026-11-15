@@ -11,6 +11,9 @@ import _ "unsafe" // for go:linkname
 //go:linkname dstRestoreHostDiskFor os.dstRestoreHostDiskFor
 func dstRestoreHostDiskFor(host uint32)
 
+//go:linkname dstBootHostDiskFor os.dstBootHostDiskFor
+func dstBootHostDiskFor(host uint32)
+
 //go:linkname dstCloseHostFilesFor os.dstCloseHostFilesFor
 func dstCloseHostFilesFor(host uint32)
 
@@ -26,6 +29,7 @@ func dstSetCrashTear(on bool)
 // the tag boundary at one place.
 
 func restoreHostDisk(host uint32) { dstRestoreHostDiskFor(host) }
+func bootHostDisk(host uint32)    { dstBootHostDiskFor(host) }
 func closeHostFiles(host uint32)  { dstCloseHostFilesFor(host) }
 func setCrashTear(on bool)        { dstSetCrashTear(on) }
 

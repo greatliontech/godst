@@ -1336,36 +1336,63 @@ func DSTMemfdFDIsolation() {
 			out.WriteString("write: " + err.Error() + "\n")
 			return
 		}
-		// White-box: find the open file's memfd and pin the exact refusal
-		// shape on all three fenced surfaces — EBADF, indistinguishable from
-		// a fd the process never opened, never silent success.
+		// White-box: find the open file's memfd and pin that SYS_CLOSE answers
+		// EBADF while non-SYS_CLOSE host-fd calls panic identically on memfd
+		// and on an unallocated real fd number (no memfd-number side channel).
 		memfd := -1
+		otherFD := -1
 		for fd := 3; fd < 64; fd++ {
 			if dstPageCacheFDReservedFP(uintptr(fd)) {
-				memfd = fd
-				break
+				if memfd < 0 {
+					memfd = fd
+				}
+			} else if fd >= 32 && otherFD < 0 {
+				otherFD = fd
 			}
 		}
-		if memfd < 0 {
-			out.WriteString("no page-cache fd found in the swept range\n")
+		if memfd < 0 || otherFD < 0 {
+			out.WriteString("no page-cache or probe fd found in the swept range\n")
 			return
 		}
 		if err := syscall.Close(memfd); err != syscall.EBADF { // named path (Syscall)
 			out.WriteString("named close of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
 			return
 		}
+		if _, _, errno := syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(memfd), 0, 0); errno != syscall.EBADF { // raw path
+			out.WriteString("raw close of the page-cache fd: got " + errStr(errno) + ", want EBADF\n")
+			return
+		}
+		catchPanic := func(fn func()) (msg string) {
+			defer func() {
+				if r := recover(); r != nil {
+					if s, ok := r.(string); ok {
+						msg = s
+					} else {
+						msg = "non-string panic"
+					}
+				}
+			}()
+			fn()
+			return ""
+		}
 		var stat syscall.Stat_t
-		if err := syscall.Fstat(memfd, &stat); err != syscall.EBADF {
-			out.WriteString("named fstat of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
+		pMemFstat := catchPanic(func() { syscall.Fstat(memfd, &stat) })
+		pOthFstat := catchPanic(func() { syscall.Fstat(otherFD, &stat) })
+		if pMemFstat == "" || pMemFstat != pOthFstat {
+			out.WriteString("fstat panic mismatch: memfd=" + pMemFstat + " other=" + pOthFstat + "\n")
 			return
 		}
 		var one [1]byte
-		if _, err := syscall.Pread(memfd, one[:], 0); err != syscall.EBADF { // Syscall6 path
-			out.WriteString("pread of the page-cache fd: got " + errStr(err) + ", want EBADF\n")
+		pMemPread := catchPanic(func() { syscall.Pread(memfd, one[:], 0) })
+		pOthPread := catchPanic(func() { syscall.Pread(otherFD, one[:], 0) })
+		if pMemPread == "" || pMemPread != pOthPread {
+			out.WriteString("pread panic mismatch: memfd=" + pMemPread + " other=" + pOthPread + "\n")
 			return
 		}
-		if _, _, errno := syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(memfd), 0, 0); errno != syscall.EBADF { // raw path
-			out.WriteString("raw close of the page-cache fd: got " + errStr(errno) + ", want EBADF\n")
+		pMemFcntl := catchPanic(func() { syscall.Syscall(syscall.SYS_FCNTL, uintptr(memfd), syscall.F_GETFD, 0) })
+		pOthFcntl := catchPanic(func() { syscall.Syscall(syscall.SYS_FCNTL, uintptr(otherFD), syscall.F_GETFD, 0) })
+		if pMemFcntl == "" || pMemFcntl != pOthFcntl {
+			out.WriteString("fcntl panic mismatch: memfd=" + pMemFcntl + " other=" + pOthFcntl + "\n")
 			return
 		}
 		for fd := 3; fd < 64; fd++ { // named-wrapper sweep

@@ -136,6 +136,47 @@ func dstBlocksUnallocatedIn(spans []dstBlockSpan, startPg, endPg int64) int64 {
 	return (endPg - startPg) - covered
 }
 
+// dstBlocksSampleByteOff draws a byte offset uniformly across the allocated
+// 4 KB spans clamped to [0, size). When no allocated byte exists within size
+// (for example, an empty file or an all-hole sparse file), it returns (0, false)
+// without invoking randN so skipped targets consume zero fault-RNG draws.
+func dstBlocksSampleByteOff(spans []dstBlockSpan, size int64, randN func(int64) int64) (int64, bool) {
+	if size <= 0 {
+		return 0, false
+	}
+	var allocBytes int64
+	for _, s := range spans {
+		lo := s.start * dstPageSize
+		if lo >= size {
+			break
+		}
+		hi := min(s.end*dstPageSize, size)
+		if hi > lo {
+			allocBytes += hi - lo
+		}
+	}
+	if allocBytes <= 0 {
+		return 0, false
+	}
+	idx := randN(allocBytes)
+	for _, s := range spans {
+		lo := s.start * dstPageSize
+		if lo >= size {
+			break
+		}
+		hi := min(s.end*dstPageSize, size)
+		spanBytes := hi - lo
+		if spanBytes <= 0 {
+			continue
+		}
+		if idx < spanBytes {
+			return lo + idx, true
+		}
+		idx -= spanBytes
+	}
+	return 0, false
+}
+
 // dstDurablePage is an immutable 4 KB platter page. Unchanged pages are shared
 // copy-on-write across syncs and crash tears; bytes past the file's end on the
 // final partial page are always zero.
@@ -170,14 +211,53 @@ func dstBytesAllZero(b []byte) bool {
 	return true
 }
 
-// dstDurablePageMatchesSlice reports whether cur equals the durable bytes on
-// [pg*4096, pg*4096+len(cur)), where valid (0 <= valid <= len(cur)) is the
-// portion within synced.size and any tail [valid, len(cur)) is zero-padded.
-func dstDurablePageMatchesSlice(p dstDurablePage, valid int, cur []byte) bool {
+// dstDurablePageFromSlice returns a sparse durable page for cur (0 < len(cur) <= 4096):
+// nil when cur is all-zero, oldPg when oldPg already matches cur with a zero
+// tail (copy-on-write sharing), or a freshly allocated 4 KB page otherwise.
+func dstDurablePageFromSlice(oldPg dstDurablePage, cur []byte) dstDurablePage {
+	if dstBytesAllZero(cur) {
+		return nil
+	}
+	if oldPg != nil && slices.Equal(oldPg[:len(cur)], cur) && dstBytesAllZero(oldPg[len(cur):]) {
+		return oldPg
+	}
+	var buf [dstPageSize]byte
+	copy(buf[:], cur)
+	return &buf
+}
+
+// dstDurablePageClipped clips p to [0, limit) (0 <= limit <= 4096), returning
+// nil when the clipped prefix is all-zero, p unchanged when its tail is already
+// zero, or a copy-on-write clone with [limit, 4096) zeroed otherwise.
+func dstDurablePageClipped(p dstDurablePage, limit int) dstDurablePage {
+	if p == nil || limit <= 0 || dstBytesAllZero(p[:limit]) {
+		return nil
+	}
+	if dstBytesAllZero(p[limit:]) {
+		return p
+	}
+	var buf [dstPageSize]byte
+	copy(buf[:], p[:limit])
+	return &buf
+}
+
+// dstDurablePageMatchesWindow reports whether a page's current page-cache
+// window of length pageLen (0 < pageLen <= 4096) — holding cur on [0, len(cur))
+// and zero-filled on [len(cur), pageLen) — equals the durable page p with
+// durLen valid bytes (0 <= durLen <= pageLen) and zero-filled on [durLen, pageLen).
+func dstDurablePageMatchesWindow(p dstDurablePage, durLen, pageLen int, cur []byte) bool {
+	_ = pageLen
 	if p == nil {
 		return dstBytesAllZero(cur)
 	}
-	return slices.Equal(p[:valid], cur[:valid]) && dstBytesAllZero(cur[valid:])
+	common := min(len(cur), durLen)
+	if !slices.Equal(p[:common], cur[:common]) {
+		return false
+	}
+	if len(cur) > common {
+		return dstBytesAllZero(cur[common:])
+	}
+	return dstBytesAllZero(p[common:durLen])
 }
 
 // dstDurablePageEqualAt reports whether two durable pages agree on [0, n) when
@@ -205,6 +285,29 @@ func dstDurablePageEqualAt(a dstDurablePage, aLen int, b dstDurablePage, bLen in
 		return dstBytesAllZero(b[common:bLen])
 	}
 	return true
+}
+
+// copyAt copies up to len(b) bytes starting at off (0 <= off < img.size) from
+// img without materializing unallocated holes on the heap.
+func (img dstDurableImage) copyAt(b []byte, off int64) int {
+	if off < 0 || off >= img.size || len(b) == 0 {
+		return 0
+	}
+	n := int(min(int64(len(b)), img.size-off))
+	dst := b[:n]
+	for len(dst) > 0 {
+		pg := off / dstPageSize
+		inPage := int(off % dstPageSize)
+		take := min(len(dst), dstPageSize-inPage)
+		if p := img.pages[pg]; p != nil {
+			copy(dst[:take], p[inPage:inPage+take])
+		} else {
+			clear(dst[:take])
+		}
+		dst = dst[take:]
+		off += int64(take)
+	}
+	return n
 }
 
 // bytes materializes a dense copy of img for small-file white-box test

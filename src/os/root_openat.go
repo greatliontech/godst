@@ -39,6 +39,8 @@ func (r *root) Close() error {
 	if dstSimEnabled {
 		if dstRootOf(r) != nil {
 			dstUnregisterRoot(r)
+		} else if dstFenceActive() && !dstHostIOActive() {
+			return &PathError{Op: "close", Path: r.name, Err: dstErrUnsupportedFS}
 		}
 	}
 	r.mu.Lock()
@@ -107,11 +109,7 @@ func rootChmod(r *Root, name string, mode FileMode) error {
 func rootChown(r *Root, name string, uid, gid int) error {
 	if dstSimEnabled {
 		if dstRootActive(r) {
-			if err := r.root.incref(); err != nil {
-				return &PathError{Op: "chownat", Path: name, Err: err}
-			}
-			r.root.decref()
-			return &PathError{Op: "chownat", Path: name, Err: dstErrUnsupportedFS}
+			return dstRootUnsupported(r, "chownat", name)
 		}
 	}
 	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
@@ -126,11 +124,7 @@ func rootChown(r *Root, name string, uid, gid int) error {
 func rootLchown(r *Root, name string, uid, gid int) error {
 	if dstSimEnabled {
 		if dstRootActive(r) {
-			if err := r.root.incref(); err != nil {
-				return &PathError{Op: "lchownat", Path: name, Err: err}
-			}
-			r.root.decref()
-			return &PathError{Op: "lchownat", Path: name, Err: dstErrUnsupportedFS}
+			return dstRootUnsupported(r, "lchownat", name)
 		}
 	}
 	_, err := doInRoot(r, name, 0, nil, func(parent sysfdType, name string, endsInSlash bool) (struct{}, error) {
@@ -293,6 +287,9 @@ func rootRemoveAll(r *Root, name string) error {
 		if dstRootActive(r) {
 			return dstRootRemoveAll(r, name)
 		}
+		if dstFenceActive() && !dstHostIOActive() {
+			return &PathError{Op: "RemoveAll", Path: name, Err: dstErrUnsupportedFS}
+		}
 	}
 	// Consistency with os.RemoveAll: Strip trailing /s from the name,
 	// so RemoveAll("not_a_directory/") succeeds.
@@ -424,6 +421,11 @@ const (
 // If f or openDirFunc return a *PathError, doInRoot will set PathError.Path to the
 // full path which caused the error.
 func doInRoot[T any](r *Root, name string, flags uint, openDirFunc func(parent sysfdType, name string) (sysfdType, error), f func(parent sysfdType, name string, endsInSlash bool) (T, error)) (ret T, err error) {
+	if dstSimEnabled {
+		if dstFenceActive() && !dstHostIOActive() {
+			return ret, dstErrUnsupportedFS
+		}
+	}
 	if err := r.root.incref(); err != nil {
 		return ret, err
 	}

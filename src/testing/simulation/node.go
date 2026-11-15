@@ -484,43 +484,49 @@ func Host(name string, config HostConfig, f func()) {
 		}
 	}()
 	declare := func() {
-		nodeReg.mu.Lock()
-		defer nodeReg.mu.Unlock()
-		hid, exists := nodeReg.hosts[name]
-		if !exists {
-			hid = nodeReg.nextHost + 1
-		}
-		offset := config.Clock.offsetNanos(hid)
-		ppb := config.Clock.driftPPBForHost(hid)
-		hostname := config.Hostname
-		if hostname == "" {
-			hostname = name
-		}
-		if !dstReestablishHostClock(hid, offset, ppb) {
-			panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
-		}
-		if !exists {
-			if nodeReg.hosts == nil {
-				nodeReg.hosts = make(map[string]uint32)
+		var hid uint32
+		var booted bool
+		func() {
+			nodeReg.mu.Lock()
+			defer nodeReg.mu.Unlock()
+			var exists bool
+			hid, exists = nodeReg.hosts[name]
+			if !exists {
+				hid = nodeReg.nextHost + 1
 			}
-			nodeReg.nextHost = hid
-			nodeReg.hosts[name] = hid
-		}
-		// The machine BOOTS on the powered-off→up edge only: its first
-		// declaration, or its first re-declaration after CrashHost. A
-		// re-declaration of a machine that is UP re-establishes the clock but
-		// does not boot — its processes survive, and boot identity (boot_id,
-		// uptime origin) changing under a live process is a state no kernel
-		// shows. After the clock commit, so a rejected declaration stays
-		// state-neutral.
-		if !exists || nodeReg.down[hid] {
-			delete(nodeReg.down, hid)
-			dstBootHost(hid)
-		}
-		setHostIdent(hid, hostname, config.NumCPU)
-		_, curProc := dstCurrentNode()
-		oldH, oldP = dstPushHostScope(hid, curProc)
-		stamped = true
+			offset := config.Clock.offsetNanos(hid)
+			ppb := config.Clock.driftPPBForHost(hid)
+			hostname := config.Hostname
+			if hostname == "" {
+				hostname = name
+			}
+			if !dstReestablishHostClock(hid, offset, ppb) {
+				panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
+			}
+			if !exists {
+				if nodeReg.hosts == nil {
+					nodeReg.hosts = make(map[string]uint32)
+				}
+				nodeReg.nextHost = hid
+				nodeReg.hosts[name] = hid
+			}
+			// The machine BOOTS on the powered-off→up edge only: its first
+			// declaration, or its first re-declaration after CrashHost. A
+			// re-declaration of a machine that is UP re-establishes the clock but
+			// does not boot — its processes survive, and boot identity (boot_id,
+			// uptime origin) changing under a live process is a state no kernel
+			// shows. After the clock commit, so a rejected declaration stays
+			// state-neutral.
+			if !exists || nodeReg.down[hid] {
+				delete(nodeReg.down, hid)
+				dstBootHost(hid)
+				booted = true
+			}
+			setHostIdent(hid, hostname, config.NumCPU)
+			_, curProc := dstCurrentNode()
+			oldH, oldP = dstPushHostScope(hid, curProc)
+			stamped = true
+		}()
 		// Clock commit precedes identity and caller stamping and rejects without
 		// applying any clock or timer change, so every remaining step publishes
 		// an already-valid declaration.
@@ -529,6 +535,9 @@ func Host(name string, config HostConfig, f func()) {
 		// up, then connect), and any dial blocked blackholing on the dead machine
 		// wakes to retry. In-run only: outside a run there is no network state and
 		// Host has no effect beyond running f.
+		if booted && runActive.Load() {
+			bootHostDisk(hid)
+		}
 		if runActive.Load() {
 			dstNetPartitionOp(partOpHostUp, hid, 0)
 		}
@@ -552,27 +561,38 @@ func Host(name string, config HostConfig, f func()) {
 // admitted active bubble caller validates without acquiring the gate and relies
 // on bubble liveness. Moving validation or mutation outside op reintroduces the
 // activation-edge tear. User code and self-crash parking stay outside op.
-func withBubbleFaultCaller(api string, op func()) {
+func withBubbleCaller(api, guidance string, yield bool, op func()) {
+	panicOutOfBubble := func() {
+		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; " + guidance + " from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+	}
+	runInBubble := func() {
+		if yield {
+			dstYieldPoint()
+		}
+		op()
+	}
 	if runActive.Load() {
 		if !dstInSimBubble() {
-			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+			panicOutOfBubble()
 		}
-		dstYieldPoint()
-		op()
+		runInBubble()
 		return
 	}
 	callerGate.RLock()
 	if runActive.Load() {
 		callerGate.RUnlock()
 		if dstInSimBubble() {
-			dstYieldPoint()
-			op()
+			runInBubble()
 			return
 		}
-		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; inject faults from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
+		panicOutOfBubble()
 	}
 	defer callerGate.RUnlock()
 	op()
+}
+
+func withBubbleFaultCaller(api string, op func()) {
+	withBubbleCaller(api, "inject faults", true, op)
 }
 
 // withBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
@@ -588,24 +608,16 @@ func withBubbleFaultCaller(api string, op func()) {
 // moving its first validation or final publication outside op reintroduces the
 // activation-edge tear. User f and Process exit teardown stay outside.
 func withBubbleDeclCaller(api string, op func()) {
-	if runActive.Load() {
-		if !dstInSimBubble() {
-			panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
-		}
-		op()
-		return
-	}
-	callerGate.RLock()
-	if runActive.Load() {
-		callerGate.RUnlock()
-		if dstInSimBubble() {
-			op()
-			return
-		}
-		panic("testing/simulation: " + api + " called during an active run from outside the run's bubble; declare topology from a goroutine the simulation schedules (the run body or a goroutine started inside it)")
-	}
-	defer callerGate.RUnlock()
-	op()
+	withBubbleCaller(api, "declare topology", false, op)
+}
+
+// withBubbleInspectCaller guards inspection APIs (HostFS) with the same
+// caller-position invariant as withBubbleDeclCaller: during an active run the
+// caller must be a goroutine the simulation schedules (never a foreign host
+// goroutine racing the run at wall-clock instants), while outside a run the
+// call holds callerGate across lookup and handle construction.
+func withBubbleInspectCaller(api string, op func()) {
+	withBubbleCaller(api, "inspect hosts", false, op)
 }
 
 // lookupHost resolves an already-declared host name for a fault or inspection API,
@@ -615,9 +627,8 @@ func withBubbleDeclCaller(api string, op func()) {
 // "Targeting", victim names fail loud). Outside a run it returns 0 for an unknown name
 // — the mutating fault ops all discard host 0 / no-bubble calls, preserving their
 // documented outside-a-run no-op — while a name declared by a PREVIOUS run still
-// resolves to that run's id: the value-returning inspectors (HostFS, HostIP) then
-// serve the finished run's view, which is the post-run-inspection reading of the
-// leaked-handle stance (deterministic, host-isolated), not a live contract.
+// resolves to that run's id for pure-identity inspectors (HostIP), whereas HostFS
+// handles are run-epoch-fenced because page-cache memfds are torn down when the run exits.
 func lookupHost(name string) uint32 {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()

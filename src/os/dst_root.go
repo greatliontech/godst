@@ -19,8 +19,9 @@ import (
 )
 
 type dstRoot struct {
-	node *dstFSNode
-	disk *dstFSDisk
+	node   *dstFSNode
+	dentry *dstFSDentry
+	disk   *dstFSDisk
 	// epoch is the run this Root belongs to, stamped at creation.
 	// dstRootEnter refuses a Root from a dead run exactly as dstFile.enter
 	// refuses a dead handle: the run's nodes were released with the run
@@ -147,9 +148,9 @@ func dstRootActive(r *Root) bool {
 	return r != nil && r.root != nil && dstRootOf(r.root) != nil
 }
 
-func dstNewRoot(name string, node *dstFSNode, disk *dstFSDisk) *Root {
+func dstNewRoot(name string, node *dstFSNode, dentry *dstFSDentry, disk *dstFSDisk) *Root {
 	r := &Root{&root{fd: -1, name: name}}
-	r.root.fd = sysfdType(dstStateSlot(dstRootStates.register(r.root, dstRoot{node: node, disk: disk, epoch: dstFSEpoch()})))
+	r.root.fd = sysfdType(dstStateSlot(dstRootStates.register(r.root, dstRoot{node: node, dentry: dentry, disk: disk, epoch: dstFSEpoch()})))
 	dstRegisterRoot(r.root)
 	return r
 }
@@ -170,7 +171,7 @@ func dstOpenRoot(name string) (*Root, bool, error) {
 	if name == "" {
 		return wrap(syscall.ENOENT)
 	}
-	_, _, node, errno := dstFSResolve(name)
+	_, _, node, nodeDentry, errno := dstFSResolveDentry(name)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -180,7 +181,7 @@ func dstOpenRoot(name string) (*Root, bool, error) {
 	if !node.isDir {
 		return wrap(errors.New("not a directory"))
 	}
-	return dstNewRoot(name, node, dstFSDiskHere()), true, nil
+	return dstNewRoot(name, node, nodeDentry, dstFSDiskHere()), true, nil
 }
 
 func dstRootDelay(r *dstRoot) {
@@ -204,7 +205,7 @@ func dstRootEnter(r *Root) (*dstRoot, error) {
 		return nil, err
 	}
 	dst := dstRootOf(r.root)
-	if dst.epoch != dstFSEpoch() {
+	if !dstFSActive() || dst.epoch != dstFSEpoch() {
 		// A Root from a dead run: refused like a closed handle, the identity
 		// a closed Root and a leaked *File both surface (the File's
 		// ErrFileClosing is converted by wrapErr; the Root path has no such
@@ -221,16 +222,26 @@ func dstRootEnter(r *Root) (*dstRoot, error) {
 func dstCoarseRootNamespaceDep(root *Root, r *dstRoot, write bool) {
 	dstCoarseNamespaceDep(write)
 	if r != nil && r.disk != nil {
-		dstCoarseRecord(uintptr(unsafe.Pointer(r.disk)), false)
+		dstCoarseRecord(uintptr(unsafe.Pointer(r.disk)), write && r.disk.capped.Load())
 	}
 	dstCoarseRecord(uintptr(unsafe.Pointer(root.root)), false)
 }
 
+func dstRootUnsupported(root *Root, op, name string) error {
+	r, err := dstRootEnter(root)
+	if err != nil {
+		return &PathError{Op: op, Path: name, Err: err}
+	}
+	defer root.root.decref()
+	dstCoarseRootNamespaceDep(root, r, false)
+	return &PathError{Op: op, Path: name, Err: dstErrUnsupportedFS}
+}
+
 // dstRootWalkLocked walks name inside r component by component, mirroring
-// doInRoot's path-resolution ladder. cur is always a directory (r.node, a
-// verified or newly created child directory, or a ".." pop back to one), and
-// names holds cur's cleaned component path from r.node (len(names) ==
-// len(stack)-1).
+// doInRoot's path-resolution ladder. curDentry is always a directory dentry
+// (r.dentry, a verified or newly created child directory, or a ".." pop back to
+// one), and names holds curDentry's cleaned component path from r.dentry
+// (len(names) == len(stack)-1).
 //
 // When createDirs is false, it resolves the parent and final component without
 // mutating the tree, returning a raw error for the caller to wrap with its own
@@ -240,7 +251,7 @@ func dstCoarseRootNamespaceDep(root *Root, r *dstRoot, write bool) {
 // doInRootNoHandleTerminalSlash rule, and component errors are returned as the
 // *PathError{Op: "openat"|"mkdirat", Path: cleanedPrefix} that doInRoot
 // produces (while whole-path split/escape errors wrap name under Op "mkdirat").
-func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) (parent *dstFSNode, base string, node *dstFSNode, trailingSlash bool, err error) {
+func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) (parentDentry *dstFSDentry, base string, node *dstFSNode, nodeDentry *dstFSDentry, trailingSlash bool, err error) {
 	wrapCreateWhole := func(e error) error {
 		if createDirs {
 			return &PathError{Op: "mkdirat", Path: name, Err: e}
@@ -249,10 +260,10 @@ func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) 
 	}
 	parts, endsInSlash, err := splitPathInRoot(name, nil, nil)
 	if err != nil {
-		return nil, "", nil, false, wrapCreateWhole(err)
+		return nil, "", nil, nil, false, wrapCreateWhole(err)
 	}
-	cur := r.node
-	stack := []*dstFSNode{cur}
+	curDentry := r.dentry
+	stack := []*dstFSDentry{curDentry}
 	var names []string
 	at := func(part string) string { // os may not import strings (go/build deps policy)
 		p := ""
@@ -261,12 +272,12 @@ func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) 
 		}
 		return p + part
 	}
-	terminalDir := func() (*dstFSNode, string, *dstFSNode, bool, error) {
+	terminalDir := func() (*dstFSDentry, string, *dstFSNode, *dstFSDentry, bool, error) {
 		cur := stack[len(stack)-1]
 		if len(stack) == 1 {
-			return nil, ".", cur, endsInSlash, nil
+			return nil, ".", cur.node, cur, endsInSlash, nil
 		}
-		return stack[len(stack)-2], names[len(names)-1], cur, endsInSlash, nil
+		return stack[len(stack)-2], names[len(names)-1], cur.node, cur, endsInSlash, nil
 	}
 	for i, part := range parts {
 		last := i == len(parts)-1
@@ -278,53 +289,65 @@ func dstRootWalkLocked(r *dstRoot, name string, createDirs bool, perm FileMode) 
 			continue
 		case "..":
 			if len(stack) == 1 {
-				return nil, "", nil, false, wrapCreateWhole(errPathEscapes)
+				return nil, "", nil, nil, false, wrapCreateWhole(errPathEscapes)
 			}
 			stack = stack[:len(stack)-1]
 			names = names[:len(names)-1]
-			cur = stack[len(stack)-1]
+			curDentry = stack[len(stack)-1]
 			if last {
 				return terminalDir()
 			}
 			continue
 		}
-		child := cur.entries[part]
+		child := curDentry.node.entries[part]
 		if !createDirs && last {
 			if endsInSlash && child != nil && !child.isDir {
-				return nil, "", nil, false, syscall.ENOTDIR
+				return nil, "", nil, nil, false, syscall.ENOTDIR
 			}
-			return cur, part, child, endsInSlash, nil
+			var childDentry *dstFSDentry
+			if child != nil && child.isDir {
+				childDentry = curDentry.childLocked(part, child)
+			}
+			return curDentry, part, child, childDentry, endsInSlash, nil
 		}
 		if child == nil {
 			if !createDirs {
-				return nil, "", nil, false, syscall.ENOENT
+				return nil, "", nil, nil, false, syscall.ENOENT
 			}
-			if cur.unlinked {
-				return nil, "", nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOENT}
+			if curDentry.isDeadLocked(r.disk.rootDentry) {
+				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOENT}
 			}
 			if r.disk.diskFullForCreate() {
-				return nil, "", nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOSPC}
+				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.ENOSPC}
 			}
 			child = dstFSNewNode(r.disk, ModeDir, perm)
-			cur.entries[part] = child
-			cur.modTime = time.Now()
+			curDentry.node.attachEntryLocked(part, child)
+			curDentry.node.modTime = time.Now()
 		} else if !child.isDir {
 			if !createDirs {
-				return nil, "", nil, false, syscall.ENOTDIR
+				return nil, "", nil, nil, false, syscall.ENOTDIR
 			}
 			if last {
-				return nil, "", nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.EEXIST}
+				return nil, "", nil, nil, false, &PathError{Op: "mkdirat", Path: at(part), Err: syscall.EEXIST}
 			}
-			return nil, "", nil, false, &PathError{Op: "openat", Path: at(part), Err: syscall.ENOTDIR}
+			return nil, "", nil, nil, false, &PathError{Op: "openat", Path: at(part), Err: syscall.ENOTDIR}
 		}
-		cur = child
-		stack = append(stack, cur)
+		curDentry = curDentry.childLocked(part, child)
+		stack = append(stack, curDentry)
 		names = append(names, part)
 	}
 	return terminalDir()
 }
 
 func dstRootResolveLocked(r *dstRoot, name string) (parent *dstFSNode, base string, node *dstFSNode, trailingSlash bool, err error) {
+	pd, base, node, _, trailingSlash, err := dstRootWalkLocked(r, name, false, 0)
+	if pd != nil {
+		parent = pd.node
+	}
+	return parent, base, node, trailingSlash, err
+}
+
+func dstRootResolveDentryLocked(r *dstRoot, name string) (parentDentry *dstFSDentry, base string, node *dstFSNode, nodeDentry *dstFSDentry, trailingSlash bool, err error) {
 	return dstRootWalkLocked(r, name, false, 0)
 }
 
@@ -341,7 +364,7 @@ func dstRootOpenRoot(root *Root, name string) (*Root, error) {
 	if dstRootProcAbsLocked(r, name) != "" {
 		return nil, &PathError{Op: "openat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	_, _, node, _, errno := dstRootResolveLocked(r, name)
+	_, _, node, nodeDentry, _, errno := dstRootResolveDentryLocked(r, name)
 	if errno != nil {
 		return nil, &PathError{Op: "openat", Path: name, Err: errno}
 	}
@@ -351,7 +374,7 @@ func dstRootOpenRoot(root *Root, name string) (*Root, error) {
 	if !node.isDir {
 		return nil, &PathError{Op: "open", Path: joinPath(root.Name(), name), Err: errors.New("not a directory")}
 	}
-	return dstNewRoot(joinPath(root.Name(), name), node, r.disk), nil
+	return dstNewRoot(joinPath(root.Name(), name), node, nodeDentry, r.disk), nil
 }
 
 func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, error) {
@@ -377,7 +400,7 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 		f.inRoot = true
 		return f, nil
 	}
-	parent, base, node, trailingSlash, errno := dstRootResolveLocked(r, name)
+	parentDentry, base, node, nodeDentry, trailingSlash, errno := dstRootResolveDentryLocked(r, name)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -406,16 +429,17 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 			// O_CREATE|O_WRONLY) is "no such file or directory").
 			return wrap(syscall.ENOENT)
 		}
-		if parent.unlinked {
+		if parentDentry.isDeadLocked(r.disk.rootDentry) {
 			// Creation in an rmdir'd directory (addressed through the captured
-			// Root node) is ENOENT, as openat(2) answers on the host.
+			// Root dentry) is ENOENT, as openat(2) answers on the host.
 			return wrap(syscall.ENOENT)
 		}
 		if r.disk.diskFullForCreate() {
 			return wrap(syscall.ENOSPC)
 		}
 		node = dstFSNewNode(r.disk, 0, perm)
-		parent.entries[base] = node
+		parent := parentDentry.node
+		parent.attachEntryLocked(base, node)
 		parent.modTime = time.Now()
 	}
 	if flag&O_TRUNC != 0 && !node.isDevice() {
@@ -431,6 +455,7 @@ func dstRootOpenFile(root *Root, name string, flag int, perm FileMode) (*File, e
 	osync, odsync := dstSyncModes(flag)
 	d := &dstFile{
 		node:   node,
+		dentry: nodeDentry,
 		disk:   r.disk,
 		path:   joinPath(root.Name(), name),
 		rd:     flag&O_WRONLY == 0,
@@ -570,20 +595,21 @@ func dstRootMkdir(root *Root, name string, perm FileMode) error {
 	if trimmed == "" {
 		trimmed = name // all-slash names keep their original resolution
 	}
-	parent, base, node, _, errno := dstRootResolveLocked(r, trimmed)
+	parentDentry, base, node, _, _, errno := dstRootResolveDentryLocked(r, trimmed)
 	if errno != nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: errno}
 	}
-	if node != nil || parent == nil {
+	if node != nil || parentDentry == nil {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.EEXIST}
 	}
-	if parent.unlinked {
+	if parentDentry.isDeadLocked(r.disk.rootDentry) {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOENT}
 	}
 	if r.disk.diskFullForCreate() {
 		return &PathError{Op: "mkdirat", Path: name, Err: syscall.ENOSPC}
 	}
-	parent.entries[base] = dstFSNewNode(r.disk, ModeDir, perm)
+	parent := parentDentry.node
+	parent.attachEntryLocked(base, dstFSNewNode(r.disk, ModeDir, perm))
 	parent.modTime = time.Now()
 	return nil
 }
@@ -601,7 +627,7 @@ func dstRootMkdirAll(root *Root, name string, perm FileMode) error {
 	if dstRootProcAbsLocked(r, name) != "" || dstRootMkdirAllProcReservedLocked(r, name) {
 		return &PathError{Op: "mkdirat", Path: name, Err: dstErrUnsupportedFS}
 	}
-	_, _, _, _, err = dstRootWalkLocked(r, name, true, perm)
+	_, _, _, _, _, err = dstRootWalkLocked(r, name, true, perm)
 	return err
 }
 
@@ -631,9 +657,7 @@ func dstRootRemove(root *Root, name string) error {
 	if node.isDir && len(node.entries) > 0 {
 		return &PathError{Op: "removeat", Path: name, Err: syscall.ENOTEMPTY}
 	}
-	dstFSDropLink(node)
-	dstFSMarkUnlinked(node)
-	delete(parent.entries, base)
+	dstFSUnlinkEntryLocked(parent, base, node)
 	parent.modTime = time.Now()
 	return nil
 }
@@ -673,18 +697,15 @@ func dstRootRemoveAll(root *Root, name string) error {
 		// which unlinks every entry inside the root and then fails
 		// unlinkat(rootfd, ".", AT_REMOVEDIR) with EINVAL.
 		if len(node.entries) > 0 {
-			for k, child := range node.entries {
-				dstFSDropLink(child)
-				dstFSMarkUnlinked(child)
-				delete(node.entries, k)
-			}
+			dstFSClearDirEntriesLocked(node)
 			node.modTime = time.Now()
 		}
 		return &PathError{Op: "RemoveAll", Path: name, Err: syscall.EINVAL}
 	}
-	dstFSDropLink(node)
-	dstFSMarkUnlinked(node)
-	delete(parent.entries, base)
+	if node.isDir {
+		dstFSClearDirEntriesLocked(node)
+	}
+	dstFSUnlinkEntryLocked(parent, base, node)
 	parent.modTime = time.Now()
 	return nil
 }
@@ -720,7 +741,7 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	if dstRootProcAbsLocked(r, oldname) != "" || dstRootProcAbsLocked(r, newname) != "" {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: dstErrUnsupportedFS}
 	}
-	oldParent, oldBase, oldNode, oldTrailingSlash, errno := dstRootResolveLocked(r, oldname)
+	oldParentDentry, oldBase, oldNode, _, oldTrailingSlash, errno := dstRootResolveDentryLocked(r, oldname)
 	if errno != nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: errno}
 	}
@@ -729,7 +750,7 @@ func dstRootRename(root *Root, oldname, newname string) error {
 		// there, before the new path is looked at.
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
 	}
-	newParent, newBase, newNode, newTrailingSlash, errno := dstRootResolveLocked(r, newname)
+	newParentDentry, newBase, newNode, _, newTrailingSlash, errno := dstRootResolveDentryLocked(r, newname)
 	if errno != nil {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: errno}
 	}
@@ -778,9 +799,11 @@ func dstRootRename(root *Root, oldname, newname string) error {
 	if newNode == oldNode {
 		return nil
 	}
-	// newParent is never nil here: only a root-resolving newname yields a
+	// newParentDentry is never nil here: only a root-resolving newname yields a
 	// nil parent, and the root is a directory the preamble above always
 	// answers (EEXIST, ENOENT, or the same-node escape into the dot arm).
+	oldParent := oldParentDentry.node
+	newParent := newParentDentry.node
 	if oldNode.isDir && dstNodeContains(oldNode, newParent) {
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.EINVAL}
 	}
@@ -788,15 +811,10 @@ func dstRootRename(root *Root, oldname, newname string) error {
 		// newNode is a file here (directory targets were EEXIST above).
 		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOTDIR}
 	}
-	// (No unlinked check needed here: a rooted rename's SOURCE must resolve
-	// inside this root, and an unlinked root is empty — the source lookup
-	// already answered ENOENT.)
-	if newNode != nil {
-		dstFSDropLink(newNode)
-		dstFSMarkUnlinked(newNode) // replaced target leaves the namespace (see dstRename)
+	if newNode == nil && newParentDentry.isDeadLocked(r.disk.rootDentry) {
+		return &LinkError{Op: "renameat", Old: oldname, New: newname, Err: syscall.ENOENT}
 	}
-	delete(oldParent.entries, oldBase)
-	newParent.entries[newBase] = oldNode
+	dstFSMoveEntryLocked(oldParentDentry, oldBase, oldNode, newParentDentry, newBase, newNode)
 	now := time.Now()
 	oldParent.modTime = now
 	newParent.modTime = now
@@ -862,7 +880,7 @@ func dstRootLink(root *Root, oldname, newname string) error {
 	// Both doInRoot walks complete before linkat(2) inspects an unslashed
 	// final oldname, so newname's walk/escape/slashed-final errors precede a
 	// missing unslashed oldNode.
-	newParent, newBase, newNode, newTrailingSlash, errno := dstRootResolveLocked(r, newname)
+	newParentDentry, newBase, newNode, _, newTrailingSlash, errno := dstRootResolveDentryLocked(r, newname)
 	if errno != nil {
 		return wrap(errno)
 	}
@@ -875,10 +893,14 @@ func dstRootLink(root *Root, oldname, newname string) error {
 	if newNode != nil {
 		return wrap(syscall.EEXIST)
 	}
+	if newParentDentry.isDeadLocked(r.disk.rootDentry) {
+		return wrap(syscall.ENOENT)
+	}
 	if oldNode.isDir {
 		return wrap(syscall.EPERM)
 	}
-	newParent.entries[newBase] = oldNode
+	newParent := newParentDentry.node
+	newParent.attachEntryLocked(newBase, oldNode)
 	oldNode.nlink++
 	newParent.modTime = time.Now()
 	return nil

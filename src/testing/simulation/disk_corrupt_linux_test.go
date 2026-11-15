@@ -8,8 +8,13 @@ package simulation
 
 import (
 	"bytes"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"runtime"
+	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -463,4 +468,709 @@ func TestDSTDiskCorruptSameBitCancels(t *testing.T) {
 	if !sawCancel || !sawTwo {
 		t.Fatalf("sweep did not reach both outcomes (cancel=%v two=%v): widen the seed range", sawCancel, sawTwo)
 	}
+}
+
+func TestDSTHostFSSparseAndEpochFencing(t *testing.T) {
+	const sparseSize = int64(8) << 30 // 8 GiB sparse file; dense snapshot would OOM
+	const tailOff = sparseSize - 4
+
+	var (
+		leakedFS         fs.FS
+		foreignPanicked  bool
+		foreignOpenErr   error
+		foreignStatErr   error
+		foreignDirErr    error
+	)
+	foreignInspect := make(chan fs.FS, 1)
+	foreignDone := make(chan struct{})
+	go func() {
+		defer close(foreignDone)
+		hfs := <-foreignInspect
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					msg, ok := r.(string)
+					if !ok || !strings.Contains(msg, "outside the run's bubble") {
+						panic(r)
+					}
+					foreignPanicked = true
+				}
+			}()
+			_ = HostFS("h1")
+		}()
+		_, foreignOpenErr = hfs.Open("wal")
+		_, foreignStatErr = fs.Stat(hfs, "wal")
+		_, foreignDirErr = fs.ReadDir(hfs, ".")
+	}()
+
+	Run(1, func() {
+		Host("h1", HostConfig{}, func() {
+			f, err := os.Create("/wal")
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if err := f.Truncate(sparseSize); err != nil {
+				t.Fatalf("Truncate: %v", err)
+			}
+			if _, err := f.WriteAt([]byte("head"), 0); err != nil {
+				t.Fatalf("WriteAt head: %v", err)
+			}
+			if _, err := f.WriteAt([]byte("tail"), tailOff); err != nil {
+				t.Fatalf("WriteAt tail: %v", err)
+			}
+			_ = f.Close()
+		})
+
+		hfs := HostFS("h1")
+		leakedFS = hfs
+
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		fi, err := fs.Stat(hfs, "wal")
+		if err != nil || fi.Size() != sparseSize {
+			t.Fatalf("fs.Stat(HostFS, wal) = %v, size=%d; want nil, %d", err, fi.Size(), sparseSize)
+		}
+		ents, err := fs.ReadDir(hfs, ".")
+		if err != nil || len(ents) == 0 {
+			t.Fatalf("fs.ReadDir(HostFS, .) = %v, len=%d", err, len(ents))
+		}
+		hf, err := hfs.Open("wal")
+		if err != nil {
+			t.Fatalf("HostFS.Open(wal): %v", err)
+		}
+		defer hf.Close()
+		runtime.ReadMemStats(&m1)
+		if delta := int64(m1.TotalAlloc) - int64(m0.TotalAlloc); delta > 16<<20 {
+			t.Fatalf("sparse HostFS Stat/ReadDir/Open allocated %d bytes (> 16 MiB); dense hole copy regressed", delta)
+		}
+
+		ra, ok := hf.(io.ReaderAt)
+		if !ok {
+			t.Fatalf("HostFS file does not implement io.ReaderAt")
+		}
+		sk, ok := hf.(io.Seeker)
+		if !ok {
+			t.Fatalf("HostFS file does not implement io.Seeker")
+		}
+		var buf [4]byte
+		if n, err := ra.ReadAt(buf[:], 0); n != 4 || err != nil || string(buf[:]) != "head" {
+			t.Fatalf("ReadAt(0) = %d, %v, %q; want 4, nil, head", n, err, buf)
+		}
+		if n, err := ra.ReadAt(buf[:], 1<<30); n != 4 || err != nil || buf != [4]byte{} {
+			t.Fatalf("ReadAt(hole) = %d, %v, %v; want zeros", n, err, buf)
+		}
+		if pos, err := sk.Seek(tailOff, io.SeekStart); err != nil || pos != tailOff {
+			t.Fatalf("Seek(tail) = %d, %v", pos, err)
+		}
+		if n, err := io.ReadFull(hf, buf[:]); n != 4 || err != nil || string(buf[:]) != "tail" {
+			t.Fatalf("Read(tail) = %d, %v, %q; want 4, nil, tail", n, err, buf)
+		}
+
+		foreignInspect <- hfs
+		<-foreignDone
+	})
+
+	if !foreignPanicked {
+		t.Fatalf("foreign goroutine HostFS(h1) did not panic during active run")
+	}
+	for name, err := range map[string]error{
+		"foreign Open":    foreignOpenErr,
+		"foreign Stat":    foreignStatErr,
+		"foreign ReadDir": foreignDirErr,
+	} {
+		if !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("%s = %v, want fs.ErrClosed", name, err)
+		}
+	}
+
+	// Post-run: leaked HostFS refuses every method with fs.ErrClosed.
+	if _, err := leakedFS.Open("wal"); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("post-run HostFS.Open = %v, want fs.ErrClosed", err)
+	}
+	if _, err := fs.Stat(leakedFS, "wal"); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("post-run fs.Stat(HostFS) = %v, want fs.ErrClosed", err)
+	}
+	if _, err := fs.ReadDir(leakedFS, "."); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("post-run fs.ReadDir(HostFS) = %v, want fs.ErrClosed", err)
+	}
+
+	// Cross-run: leaked HostFS never aliases Run 2's host at the same ID.
+	Run(2, func() {
+		Host("h1", HostConfig{}, func() {
+			if err := os.WriteFile("/wal", []byte("run2"), 0o644); err != nil {
+				t.Fatalf("run2 WriteFile: %v", err)
+			}
+		})
+		if _, err := leakedFS.Open("wal"); !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("cross-run HostFS.Open = %v, want fs.ErrClosed", err)
+		}
+		if _, err := fs.Stat(leakedFS, "wal"); !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("cross-run fs.Stat(HostFS) = %v, want fs.ErrClosed", err)
+		}
+		if _, err := fs.ReadDir(leakedFS, "."); !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("cross-run fs.ReadDir(HostFS) = %v, want fs.ErrClosed", err)
+		}
+	})
+}
+
+func TestDSTDiskCorruptOfflineHostSurfacesOnReboot(t *testing.T) {
+	want := bytes.Repeat([]byte("platter-sector-"), 64)
+	var firstBoot, secondBoot []byte
+
+	Run(11, func() {
+		Host("h", HostConfig{}, func() {
+			if err := os.WriteFile("/sst", want, 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			syncFile(t, "/sst")
+			syncDir(t, "/")
+		})
+
+		CrashHost("h")
+		// Host "h" is currently powered off; CorruptFile flips a platter bit on the cold disk.
+		CorruptFile("h", "/sst")
+
+		Host("h", HostConfig{}, func() {
+			b, err := os.ReadFile("/sst")
+			if err != nil {
+				t.Fatalf("ReadFile on reboot: %v", err)
+			}
+			firstBoot = b
+		})
+
+		// A subsequent crash without rewriting must keep that exact corrupted platter image.
+		CrashHost("h")
+		Host("h", HostConfig{}, func() {
+			b, err := os.ReadFile("/sst")
+			if err != nil {
+				t.Fatalf("ReadFile on second reboot: %v", err)
+			}
+			secondBoot = b
+		})
+	})
+
+	if _, bits := bitDiff(want, firstBoot); bits != 1 {
+		t.Fatalf("offline CorruptFile surfaced %d flipped bits on reboot, want 1", bits)
+	}
+	if !bytes.Equal(firstBoot, secondBoot) {
+		t.Fatalf("offline CorruptFile platter state changed across second crash without writes")
+	}
+}
+
+func TestDSTDiskCorruptSparseHoleNoOpAndZeroBlockMaterialization(t *testing.T) {
+	realContent := bytes.Repeat([]byte{0x5A}, 4096)
+
+	runCase := func(corruptSparse bool) (realAfter []byte, sparseBlocks int64) {
+		Run(23, func() {
+			Host("h", HostConfig{}, func() {
+				sf, err := os.Create("/sparse")
+				if err != nil {
+					t.Fatalf("Create sparse: %v", err)
+				}
+				if err := sf.Truncate(1 << 30); err != nil {
+					t.Fatalf("Truncate sparse: %v", err)
+				}
+				if err := sf.Sync(); err != nil {
+					t.Fatalf("Sync sparse: %v", err)
+				}
+				_ = sf.Close()
+
+				if err := os.WriteFile("/real", realContent, 0o644); err != nil {
+					t.Fatalf("WriteFile real: %v", err)
+				}
+				syncFile(t, "/real")
+				syncDir(t, "/")
+			})
+
+			LimitDisk("h", 0)
+			if corruptSparse {
+				for range 8 {
+					CorruptFile("h", "/sparse")
+				}
+			}
+			CorruptFile("h", "/real")
+			CrashHost("h")
+
+			Host("h", HostConfig{}, func() {
+				var st syscall.Stat_t
+				f, err := os.Open("/sparse")
+				if err != nil {
+					t.Fatalf("Open sparse after crash: %v", err)
+				}
+				if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+					t.Fatalf("Fstat sparse: %v", err)
+				}
+				_ = f.Close()
+				sparseBlocks = st.Blocks
+
+				b, err := os.ReadFile("/real")
+				if err != nil {
+					t.Fatalf("ReadFile real: %v", err)
+				}
+				realAfter = b
+			})
+		})
+		return realAfter, sparseBlocks
+	}
+
+	withoutSparse, blocks0 := runCase(false)
+	withSparse, blocks1 := runCase(true)
+	if blocks0 != 0 || blocks1 != 0 {
+		t.Fatalf("all-hole sparse file st_blocks = (%d, %d), want (0, 0)", blocks0, blocks1)
+	}
+	if _, bits := bitDiff(realContent, withSparse); bits != 1 {
+		t.Fatalf("real file bit flips = %d, want 1", bits)
+	}
+	if !bytes.Equal(withoutSparse, withSparse) {
+		t.Fatalf("CorruptFile on all-hole sparse file consumed fault-RNG draws and shifted /real corruption")
+	}
+}
+
+func TestDSTDiskCorruptCrashTearShrinkHealsTailRot(t *testing.T) {
+	initial := bytes.Repeat([]byte{0x3C}, 200)
+	overwritten := bytes.Repeat([]byte{0xA5}, 100)
+
+	t.Run("OverwriteAndShrink", func(t *testing.T) {
+		sawTailRotBeforeShrink := false
+		sawUnlandedShrinkWithLandedPage := false
+
+		for seed := uint64(1); seed <= 256; seed++ {
+			// Probe where CorruptFile lands on this seed using a plain untorn crash first.
+			probe := corruptRun(t, seed, initial, false, nil)
+			rotIdxs, bits := bitDiff(initial, probe)
+			if bits != 1 || len(rotIdxs) != 1 || rotIdxs[0] < 100 {
+				continue
+			}
+			rotIdx := rotIdxs[0]
+			sawTailRotBeforeShrink = true
+
+			var got []byte
+			RunWith(seed, Options{CrashTear: true}, func() {
+				Host("h", HostConfig{}, func() {
+					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+					if err != nil {
+						t.Fatalf("Create: %v", err)
+					}
+					if _, err := f.Write(initial); err != nil {
+						t.Fatalf("Write initial: %v", err)
+					}
+					if err := f.Sync(); err != nil {
+						t.Fatalf("Sync initial: %v", err)
+					}
+					syncDir(t, "/")
+
+					CorruptFile("h", "/f")
+
+					// Overwrite [0, 100) and shrink to 100 WITHOUT Sync: ftruncate zeroes [100, 4096) in page cache.
+					if _, err := f.WriteAt(overwritten, 0); err != nil {
+						t.Fatalf("WriteAt overwrite: %v", err)
+					}
+					if err := f.Truncate(100); err != nil {
+						t.Fatalf("Truncate(100): %v", err)
+					}
+					_ = f.Close()
+				})
+
+				CrashHost("h")
+				Host("h", HostConfig{}, func() {
+					b, err := os.ReadFile("/f")
+					if err != nil {
+						t.Fatalf("ReadFile after CrashTear: %v", err)
+					}
+					got = b
+				})
+			})
+
+			// When size draw kept 200 (shrink metadata did not land) AND all 100 overwritten bytes landed
+			// without page-0 tearing inside [0, 200), page 0's 4 KB writeback wrote zeros over [100, 200),
+			// healing the pre-existing platter bit-rot at rotIdx.
+			if len(got) == 200 && bytes.Equal(got[:100], overwritten) {
+				zeros := 0
+				for _, b := range got[100:200] {
+					if b == 0 {
+						zeros++
+					}
+				}
+				if zeros == 100 {
+					sawUnlandedShrinkWithLandedPage = true
+				} else if zeros == 99 && got[rotIdx] != 0 {
+					t.Fatalf("seed %d: dstPageCurrent zeroed [100,200) except stale rot byte %#x at %d", seed, got[rotIdx], rotIdx)
+				}
+			}
+		}
+
+		if !sawTailRotBeforeShrink || !sawUnlandedShrinkWithLandedPage {
+			t.Fatalf("seed sweep coverage incomplete: tailRot=%v unlandedShrinkLandedPage=%v",
+				sawTailRotBeforeShrink, sawUnlandedShrinkWithLandedPage)
+		}
+	})
+
+	t.Run("PureShrinkNoWrite", func(t *testing.T) {
+		sawLandedZeroTail := false
+		sawKeptDurableTail := false
+		sawTornZeroPrefix := false
+
+		for seed := uint64(1); seed <= 256; seed++ {
+			probe := corruptRun(t, seed, initial, false, nil)
+			rotIdxs, bits := bitDiff(initial, probe)
+			if bits != 1 || len(rotIdxs) != 1 || rotIdxs[0] < 100 {
+				continue
+			}
+			rotIdx := rotIdxs[0]
+
+			var got []byte
+			RunWith(seed, Options{CrashTear: true}, func() {
+				Host("h", HostConfig{}, func() {
+					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+					if err != nil {
+						t.Fatalf("Create: %v", err)
+					}
+					if _, err := f.Write(initial); err != nil {
+						t.Fatalf("Write initial: %v", err)
+					}
+					if err := f.Sync(); err != nil {
+						t.Fatalf("Sync initial: %v", err)
+					}
+					syncDir(t, "/")
+
+					CorruptFile("h", "/f")
+
+					// Shrink to 100 with NO Write/WriteAt: bytes [0, 100) match durable,
+					// while [100, 200) were zeroed in page cache by ftruncate.
+					if err := f.Truncate(100); err != nil {
+						t.Fatalf("Truncate(100): %v", err)
+					}
+					_ = f.Close()
+				})
+
+				CrashHost("h")
+				Host("h", HostConfig{}, func() {
+					b, err := os.ReadFile("/f")
+					if err != nil {
+						t.Fatalf("ReadFile after CrashTear: %v", err)
+					}
+					got = b
+				})
+			})
+
+			if len(got) != 200 {
+				if len(got) != 100 || !bytes.Equal(got, initial[:100]) {
+					t.Fatalf("seed %d: shrunk file = len %d, want 100 bytes of 0x3C", seed, len(got))
+				}
+				continue
+			}
+			if !bytes.Equal(got[:100], initial[:100]) {
+				t.Fatalf("seed %d: untouched prefix [0, 100) changed", seed)
+			}
+
+			zeros := 0
+			for zeros < 100 && got[100+zeros] == 0 {
+				zeros++
+			}
+			switch zeros {
+			case 0:
+				if !bytes.Equal(got[100:200], probe[100:200]) || got[rotIdx] != probe[rotIdx] {
+					t.Fatalf("seed %d: durable tail mismatch vs probe", seed)
+				}
+				sawKeptDurableTail = true
+			case 100:
+				sawLandedZeroTail = true
+			default:
+				if !bytes.Equal(got[100+zeros:200], probe[100+zeros:200]) {
+					t.Fatalf("seed %d: torn tail suffix [100+%d, 200) did not match durable platter", seed, zeros)
+				}
+				sawTornZeroPrefix = true
+			}
+		}
+
+		if !sawLandedZeroTail || !sawKeptDurableTail || !sawTornZeroPrefix {
+			t.Fatalf("pure-shrink coverage incomplete: landedZero=%v keptDurable=%v tornZeroPrefix=%v",
+				sawLandedZeroTail, sawKeptDurableTail, sawTornZeroPrefix)
+		}
+	})
+}
+
+func TestDSTDiskWritebackMmapSharedRedirty(t *testing.T) {
+	t.Run("ExistingWritableSharedMmap", func(t *testing.T) {
+		var p0After, p1After byte
+		Run(1, func() {
+			Host("h", HostConfig{}, func() {
+				f, err := os.OpenFile("/db", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+				if err != nil {
+					t.Fatalf("OpenFile: %v", err)
+				}
+				if err := f.Truncate(8192); err != nil {
+					t.Fatalf("Truncate: %v", err)
+				}
+				m, err := syscall.Mmap(int(f.Fd()), 0, 8192, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				if err != nil {
+					t.Fatalf("Mmap: %v", err)
+				}
+				m[0] = 0x11
+				m[4096] = 0x22
+				if err := f.Sync(); err != nil {
+					t.Fatalf("initial Sync: %v", err)
+				}
+				syncDir(t, "/")
+
+				FailWriteback("h")
+				m[0] = 0x33
+				m[4096] = 0x44
+				if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("Sync under FailWriteback = %v, want EIO", err)
+				}
+
+				HealWriteback("h")
+				// Mutate page 0 to 0x00 via MAP_SHARED (including zeroing, which SEEK_DATA alone cannot distinguish),
+				// while leaving page 1 untouched since the EIO drop.
+				m[0] = 0x00
+				if err := f.Sync(); err != nil {
+					t.Fatalf("Sync after HealWriteback + mmap store: %v", err)
+				}
+				_ = syscall.Munmap(m)
+				_ = f.Close()
+			})
+
+			CrashHost("h")
+			Host("h", HostConfig{}, func() {
+				b, err := os.ReadFile("/db")
+				if err != nil {
+					t.Fatalf("ReadFile after CrashHost: %v", err)
+				}
+				p0After, p1After = b[0], b[4096]
+			})
+		})
+		if p0After != 0x00 {
+			t.Fatalf("redirtied MAP_SHARED page 0 after CrashHost = %#x, want 0x00", p0After)
+		}
+		if p1After != 0x22 {
+			t.Fatalf("untouched fsyncgate-dropped page 1 after CrashHost = %#x, want 0x22", p1After)
+		}
+	})
+
+	t.Run("PostEIOMmapAndMprotectUpgrade", func(t *testing.T) {
+		var gotMmap, gotMprotect byte
+		Run(2, func() {
+			Host("h", HostConfig{}, func() {
+				for _, name := range []string{"/late-mmap", "/late-mprotect"} {
+					f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+					if err != nil {
+						t.Fatalf("OpenFile %s: %v", name, err)
+					}
+					if err := f.Truncate(4096); err != nil {
+						t.Fatalf("Truncate %s: %v", name, err)
+					}
+					if _, err := f.WriteAt([]byte{0x10}, 0); err != nil {
+						t.Fatalf("WriteAt initial %s: %v", name, err)
+					}
+					if err := f.Sync(); err != nil {
+						t.Fatalf("Sync initial %s: %v", name, err)
+					}
+					_ = f.Close()
+				}
+				syncDir(t, "/")
+
+				// Neither file has ever been mapped writable when FailWriteback drops dirty page 0.
+				FailWriteback("h")
+				for _, name := range []string{"/late-mmap", "/late-mprotect"} {
+					f, err := os.OpenFile(name, os.O_RDWR, 0)
+					if err != nil {
+						t.Fatalf("reopen %s: %v", name, err)
+					}
+					if _, err := f.WriteAt([]byte{0x20}, 0); err != nil {
+						t.Fatalf("WriteAt EIO %s: %v", name, err)
+					}
+					if err := f.Sync(); !errors.Is(err, syscall.EIO) {
+						t.Fatalf("Sync EIO %s = %v, want EIO", name, err)
+					}
+					_ = f.Close()
+				}
+				HealWriteback("h")
+
+				// File 1: mapped PROT_WRITE after the EIO drop.
+				f1, err := os.OpenFile("/late-mmap", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("open late-mmap: %v", err)
+				}
+				m1, err := syscall.Mmap(int(f1.Fd()), 0, 4096, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				if err != nil {
+					t.Fatalf("Mmap late-mmap: %v", err)
+				}
+				m1[0] = 0x77
+				if err := f1.Sync(); err != nil {
+					t.Fatalf("Sync late-mmap: %v", err)
+				}
+				_ = syscall.Munmap(m1)
+				_ = f1.Close()
+
+				// File 2: mapped PROT_READ then upgraded via Mprotect(PROT_READ|PROT_WRITE) after the EIO drop.
+				f2, err := os.OpenFile("/late-mprotect", os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("open late-mprotect: %v", err)
+				}
+				m2, err := syscall.Mmap(int(f2.Fd()), 0, 4096, syscall.PROT_READ, syscall.MAP_SHARED)
+				if err != nil {
+					t.Fatalf("Mmap late-mprotect: %v", err)
+				}
+				if err := syscall.Mprotect(m2, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
+					t.Fatalf("Mprotect late-mprotect: %v", err)
+				}
+				m2[0] = 0x88
+				if err := f2.Sync(); err != nil {
+					t.Fatalf("Sync late-mprotect: %v", err)
+				}
+				_ = syscall.Munmap(m2)
+				_ = f2.Close()
+			})
+
+			CrashHost("h")
+			Host("h", HostConfig{}, func() {
+				b1, err := os.ReadFile("/late-mmap")
+				if err != nil {
+					t.Fatalf("ReadFile late-mmap: %v", err)
+				}
+				b2, err := os.ReadFile("/late-mprotect")
+				if err != nil {
+					t.Fatalf("ReadFile late-mprotect: %v", err)
+				}
+				gotMmap, gotMprotect = b1[0], b2[0]
+			})
+		})
+		if gotMmap != 0x77 {
+			t.Fatalf("post-EIO Mmap PROT_WRITE byte after CrashHost = %#x, want 0x77", gotMmap)
+		}
+		if gotMprotect != 0x88 {
+			t.Fatalf("post-EIO Mprotect PROT_WRITE byte after CrashHost = %#x, want 0x88", gotMprotect)
+		}
+	})
+}
+
+func TestDSTStatfsAndQuotaExploreDPOR(t *testing.T) {
+	block := bytes.Repeat([]byte{0x5A}, 4096)
+
+	for _, useFstatfs := range []bool{false, true} {
+		name := "StatfsVsFileWrite"
+		if useFstatfs {
+			name = "FstatfsVsFileWrite"
+		}
+		t.Run(name, func(t *testing.T) {
+			sawBefore := false
+			sawAfter := false
+			res := Explore(1, DPOR, func() bool {
+				var (
+					initFree uint64
+					obsFree  uint64
+				)
+				Host("h", HostConfig{}, func() {
+					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+					if err != nil {
+						t.Fatalf("Create /f: %v", err)
+					}
+					dir, err := os.Open("/")
+					if err != nil {
+						t.Fatalf("Open /: %v", err)
+					}
+					dirFD := int(dir.Fd())
+
+					var base syscall.Statfs_t
+					if err := syscall.Statfs("/", &base); err != nil {
+						t.Fatalf("initial Statfs: %v", err)
+					}
+					initFree = base.Bfree
+
+					wCh := make(chan error, 1)
+					sCh := make(chan uint64, 1)
+					go func() {
+						_, err := f.Write(block)
+						wCh <- err
+					}()
+					go func() {
+						var st syscall.Statfs_t
+						var err error
+						if useFstatfs {
+							err = syscall.Fstatfs(dirFD, &st)
+						} else {
+							err = syscall.Statfs("/", &st)
+						}
+						if err != nil {
+							panic(err)
+						}
+						sCh <- st.Bfree
+					}()
+					if err := <-wCh; err != nil {
+						t.Fatalf("Write /f: %v", err)
+					}
+					obsFree = <-sCh
+					_ = dir.Close()
+					_ = f.Close()
+				})
+				switch obsFree {
+				case initFree:
+					sawBefore = true
+				case initFree - 1:
+					sawAfter = true
+				default:
+					t.Fatalf("observed Bfree = %d, want %d or %d", obsFree, initFree, initFree-1)
+				}
+				return false
+			})
+			if len(res.Failures) != 0 || res.Overflow {
+				t.Fatalf("Explore result = %+v", res)
+			}
+			if !sawBefore || !sawAfter {
+				t.Fatalf("DPOR missed Statfs/Write reversal (%s): sawBefore=%v sawAfter=%v (schedules=%d)",
+					name, sawBefore, sawAfter, res.Schedules)
+			}
+		})
+	}
+
+	t.Run("CappedDiskCompetingWrites", func(t *testing.T) {
+		sawAWins := false
+		sawBWins := false
+		res := Explore(1, DPOR, func() bool {
+			var errA, errB error
+			Host("h", HostConfig{}, func() {
+				fa, err := os.OpenFile("/a", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+				if err != nil {
+					t.Fatalf("Create /a: %v", err)
+				}
+				fb, err := os.OpenFile("/b", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+				if err != nil {
+					t.Fatalf("Create /b: %v", err)
+				}
+				LimitDisk("h", 4096)
+
+				chA := make(chan error, 1)
+				chB := make(chan error, 1)
+				go func() {
+					_, e := fa.Write(block)
+					chA <- e
+				}()
+				go func() {
+					_, e := fb.Write(block)
+					chB <- e
+				}()
+				errA = <-chA
+				errB = <-chB
+				_ = fa.Close()
+				_ = fb.Close()
+			})
+			switch {
+			case errA == nil && errors.Is(errB, syscall.ENOSPC):
+				sawAWins = true
+			case errors.Is(errA, syscall.ENOSPC) && errB == nil:
+				sawBWins = true
+			default:
+				t.Fatalf("unexpected quota race outcome: errA=%v errB=%v", errA, errB)
+			}
+			return false
+		})
+		if len(res.Failures) != 0 || res.Overflow {
+			t.Fatalf("Explore result = %+v", res)
+		}
+		if !sawAWins || !sawBWins {
+			t.Fatalf("DPOR missed capped-disk ENOSPC reversal: sawAWins=%v sawBWins=%v (schedules=%d)",
+				sawAWins, sawBWins, res.Schedules)
+		}
+	})
 }

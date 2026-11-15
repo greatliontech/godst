@@ -124,9 +124,11 @@ func DSTTestPCTChangeCount(depth int) int {
 }
 
 // UpdateMaxProcsGStarted reports whether the GOMAXPROCS auto-update helper
-// goroutine exists (it is not started under GODEBUG=updatemaxprocs=0).
+// goroutine is enabled (it is not started under GODEBUG=updatemaxprocs=0).
+// Callers synchronize with the asynchronously spawned helper's initial park via
+// UpdateMaxProcsGIdle rather than reading updateMaxProcsG.g unsynchronized.
 func UpdateMaxProcsGStarted() bool {
-	return updateMaxProcsG.g != nil
+	return debug.updatemaxprocs != 0
 }
 
 // UpdateMaxProcsGIdle reports whether the GOMAXPROCS auto-update helper is

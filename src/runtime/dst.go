@@ -3845,7 +3845,7 @@ func dstTakeStagedSpecialStamps() (epoch uint64, seq uintptr, pid int32) {
 //
 //go:linkname dstTestPushMaxProcs
 func dstTestPushMaxProcs(procs int32) bool {
-	if updateMaxProcsG.g == nil || !updateMaxProcsG.idle.Load() {
+	if !updateMaxProcsG.idle.Load() {
 		return false
 	}
 	lock(&updateMaxProcsG.lock)

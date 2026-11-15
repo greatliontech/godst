@@ -12,6 +12,7 @@ package simulation
 // hostcrash_on.go.
 
 func restoreHostDisk(host uint32) {}
+func bootHostDisk(host uint32)    {}
 func closeHostFiles(host uint32)  {}
 func setCrashTear(on bool)        {}
 

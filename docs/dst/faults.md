@@ -83,16 +83,19 @@ The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process
   host" requirement.
 - **Per-process cwd + fds.** `Chdir`/`Getwd` are per-process (p1 changing cwd must not move p2's, even on
   one host); an open `*os.File` belongs to a process (a process crash closes *its* handles while the file
-  content survives on the host tree). The cwd is a path *into* the host tree.
+  content survives on the host tree). The cwd is a directory node reference in the host tree (following
+  renames and refusing `Getwd` and entry creation with `ENOENT` once unlinked).
 - **N=1 collapse.** One host → one tree, one process → one cwd = today's behavior; existing `TestDSTFS*`
   pass unchanged.
 - **Inspection.** A process reads its own host's disk via ordinary `os` calls inside its `Process`/`Host`
   body (idiom 1 — what real recovery code does on restart, needs no API). For *harness* assertions across
-  hosts (do all replicas agree? did h2 persist the commit?), `simulation.HostFS(name)` returns a
-  **read-only** `io/fs.FS` over a host's current tree — read-only by construction so it can never become a
-  cross-host back-channel write, and side-effect-free on simulation state: inspecting an untouched host
-  builds a throwaway baseline tree but restores the shared inode counter afterward, so the phantom draw
-  never shifts a later file's `st_ino` (`TestDSTHostFSInspectionAllocatesNoInodes`).
+  hosts (do all replicas agree? did h2 persist the commit?), `simulation.HostFS(name)` returns an
+  epoch-fenced, bubble-caller-only **read-only** `io/fs.FS` (implementing `fs.StatFS` and `fs.ReadDirFS`,
+  and snapshotting opened files as sparse copy-on-write page images with zero dense hole allocation) over a
+  host's current tree — read-only by construction so it can never become a cross-host back-channel write,
+  refusing post-run, cross-run, or foreign-goroutine calls, and side-effect-free on simulation state:
+  inspecting an untouched host builds a throwaway baseline tree without advancing the shared inode counter
+  (`TestDSTHostFSInspectionAllocatesNoInodes`).
 
 ### Per-host network address space
 
@@ -642,8 +645,14 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   the failure (a write event, not a content diff: rewriting byte-identical content redirties, so the
   correct rewrite-then-fsync recovery works) reach the platter on the next sync; unrewritten pages
   stay durably stale. Recorded bounds: the drop is modeled for file data pages (directory entry
-  writeback keeps the full-commit model); a store through a SUT mapping is an event the model
-  cannot observe, so it does not redirty a dropped page; and the model never EVICTS a clean-stale
+  writeback keeps the full-commit model); for a file with a writable `MAP_SHARED` mapping (present at
+  `EIO` time or mapped/upgraded via `Mmap`/`Mprotect` afterward), the model snapshots the sparse
+  page-cache image at writeback-drop time so any subsequent CPU store changing a dropped page's bytes
+  permanently redirties that page across later `Sync` calls (recorded `⊆`-real bound: a CPU store
+  through `MAP_SHARED` that writes the exact byte value already present at the moment of the `EIO`
+  without changing the page is unobservable without per-store page-fault trapping and stays dropped,
+  equivalent to the store racing ahead of the failed writeback's `ClearPageDirtyForIo`); and the
+  model never EVICTS a clean-stale
   page — reads keep returning the never-persisted content, one legal Linux schedule (real kernels
   may evict, after which reads return the old platter bytes). A host crash clears the mark (the cache is
   rebuilt from the platter). Enforced by `TestDSTDiskEIOFsyncgate` and the retried-sync leg of
@@ -742,24 +751,30 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   (`os/dst_disk_fault_test.go`), mutation-tested.
 - **Read corruption (bit rot)** — **landed**. Silent media corruption — the fault a checksum exists
   to catch, as distinct from EIO's unreadable sector — injected mid-run by
-  `simulation.CorruptFile(host, path)`: one fault-RNG-drawn bit of one drawn byte of the file's
-  DURABLE image flips (repeated calls accumulate; replays exactly — DST-FAULT-REPLAY — and, as
-  everywhere, the draws are stream-isolated from the schedule). The mask set (`dstFSNode.rot`) is
-  the policy's own state, XOR overlays on platter offsets — no new base representation. The page
+  `simulation.CorruptFile(host, path)`: one fault-RNG-drawn bit of one drawn byte within the file's
+  allocated 4 KB DURABLE blocks (`synced.blocks`) flips (repeated calls accumulate; replays exactly —
+  DST-FAULT-REPLAY — and, as everywhere, the draws are stream-isolated from the schedule). The mask
+  set (`dstFSNode.rot`) is
+  the policy's own state, XOR overlays on platter offsets — no new base representation. When injected
+  while the target host is up, the page
   cache masks the rot exactly as a real kernel's does: live reads keep returning the written bytes
   (the model never evicts), and the corruption surfaces where a real machine discovers latent rot —
   when the platter is next read, at host-crash restore, where the masks fold into the restored
-  content (and compose with the crash tear: a page whose writeback landed took fresh bytes to its
-  sectors, so its rot clears; clean, lost, torn-suffix, and fsyncgate-dropped bytes keep theirs —
+  content (and compose with the crash tear: a page whose writeback landed writes its full zero-padded
+  4 KB page-cache image to its sectors — including any tail zeroed by an unsynced shrink — so its rot
+  clears; clean, lost, torn-suffix, and fsyncgate-dropped bytes keep theirs —
   the landed/lost/torn draws compare against the UNROTTED durable bytes, since rot never puts a
-  clean page in the writeback set). Writeback heals rot page by page (the model's writeback quantum): a successful sync clears
+  clean page in the writeback set). When injected while the target host is already powered off, the
+  platter flip applies directly to the cold reboot image so the next `Host` boot observes it immediately.
+  Writeback heals rot page by page (the model's writeback quantum): a successful sync clears
   the masks of every page whose committed bytes CHANGED, so a full rewrite+sync heals while an
   append's sync does not touch write-once pages' rot (the WAL shape). *Recorded bounds:* the dirty
   proxy is a content diff, so a byte-identical rewrite does not clear its page's rot — equivalent
   to the harness re-injecting after the write, the sound direction; and there is no in-cache
   visibility without a reboot (a cache-miss read of a rotted sector on a LIVE host needs an
   eviction model the FS deliberately does not have — a follow-on if a consumer needs it). No-op on
-  a missing path, a directory or device, or an empty durable image (no platter blocks to rot),
+  a missing path, a directory or device, or a durable image with zero allocated 4 KB blocks (empty
+  or all-hole sparse — never materializing blocks in holes),
   drawing nothing, so a skipped target never shifts a later fault's stream. DoF: real disks rot —
   bits flip on the platter and pass the drive's ECC; the read returns wrong bytes with no error.
   Sound: the flip lives only in durable content a crash legitimately reads back; nothing synced

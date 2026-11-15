@@ -10,13 +10,7 @@ package syscall
 // branch in the trampolines is dead-code-eliminated). These stubs exist only so
 // that dead branch still type-checks.
 
-func dstSyscallVirtualFDTrap(trap, fd uintptr) bool { return false }
-
-func dstSyscallPageCacheFDTrap(trap, fd, a3 uintptr) bool { return false }
-
 func dstSyscallHostClose(trap, fd uintptr) bool { return false }
-
-func dstSyscallFstatTrap() uintptr { return 0 }
 
 func dstHostIOActive() bool { return false }
 

@@ -58,18 +58,40 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 				return dstFDErr(err), true // a leaked dead-run handle stays refused
 			}
 			// The fd was closed elsewhere while we were blocked. Linux keeps
-			// the wait alive on the pinned description and GRANTS when the
-			// lock becomes available; the description's last reference — this
-			// in-flight call — drops at return, releasing the grant at once.
-			// So: grant without recording (the owner's prior locks were
-			// already released by the close), and LOCK_UN is a no-op success.
+			// the wait alive on the pinned open file description and GRANTS
+			// when the lock becomes available. If live MAP_SHARED mappings
+			// still hold references to the open file description, the grant
+			// persists in holders/flockPending until the last Munmap; if no
+			// mappings remain, this in-flight call's reference drops at return
+			// and releases the grant immediately.
 			dstFS.mu.Lock()
-			if op == syscall.LOCK_UN || node.flock.canLock(owner, exclusive) {
-				if op != syscall.LOCK_UN {
-					dstKernelRaceAcquire(unsafe.Pointer(&node.flock.raceSync))
-				}
+			if op == syscall.LOCK_UN {
+				dstMMapRegistry.mu.Lock()
+				file.flockPending.Store(nil)
+				dstMMapRegistry.mu.Unlock()
+				node.flock.unlockNode(node, owner)
 				dstFS.mu.Unlock()
 				return 0, true
+			}
+			node.flock.removeForConversionNode(node, owner, exclusive)
+			if node.flock.canLock(owner, exclusive) {
+				dstMMapRegistry.mu.Lock()
+				dstMMapRollLocked()
+				if dstMMapLiveThroughLocked(file) > 0 {
+					node.flock.lock(owner, exclusive)
+					file.flockPending.Store(&dstFlockPending{node: node, owner: owner})
+				} else {
+					file.flockPending.Store(nil)
+				}
+				dstMMapRegistry.mu.Unlock()
+				dstKernelRaceAcquire(unsafe.Pointer(&node.flock.raceSync))
+				dstFS.mu.Unlock()
+				return 0, true
+			}
+			if _, stillHeld := node.flock.holders[owner]; !stillHeld {
+				dstMMapRegistry.mu.Lock()
+				file.flockPending.Store(nil)
+				dstMMapRegistry.mu.Unlock()
 			}
 			if nonblock {
 				dstFS.mu.Unlock()
@@ -114,7 +136,7 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 func (d *dstFile) flockClosedInRun() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.closed && d.epoch == dstFSEpoch()
+	return dstFSActive() && d.closed && d.epoch == dstFSEpoch()
 }
 
 // dstFlockPending is a flock whose descriptor closed while shared
@@ -134,30 +156,38 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 	// Linux releases a flock with the open file description's LAST
 	// reference, and every shared mapping taken through the description
 	// holds one: a close under live mappings keeps the lock until the last
-	// of them is unmapped (an exiting process drops both). Decided under
-	// the mapping registry's lock so an unmap racing this close cannot
-	// slip between the count and the record and leave the lock held for
-	// good.
-	dstMMapRegistry.mu.Lock()
-	live := dstMMapLiveThroughLocked(file)
-	if live > 0 {
-		file.mu.Lock()
-		node := file.node
-		file.mu.Unlock()
-		held := false
-		if node != nil {
-			dstFS.mu.Lock()
-			_, held = node.flock.holders[owner]
-			dstFS.mu.Unlock()
-		}
-		if held {
+	// of them is unmapped (an exiting process drops both). Acquire dstFS.mu
+	// before dstMMapRegistry.mu (the canonical lock order shared with
+	// dstFDMmap and dstMunmapLocked) so an unmap racing this close cannot
+	// deadlock or slip between the live-mapping count and flockPending.
+	file.mu.Lock()
+	node := file.node
+	epochOk := dstFSActive() && file.epoch == dstFSEpoch()
+	file.mu.Unlock()
+	if node == nil || !epochOk {
+		return
+	}
+	dstFS.mu.Lock()
+	_, held := node.flock.holders[owner]
+	if held {
+		dstMMapRegistry.mu.Lock()
+		dstMMapRollLocked()
+		if dstMMapLiveThroughLocked(file) > 0 {
 			file.flockPending.Store(&dstFlockPending{node: node, owner: owner})
 			dstMMapRegistry.mu.Unlock()
+			dstFS.mu.Unlock()
 			return
 		}
+		dstMMapRegistry.mu.Unlock()
 	}
-	dstMMapRegistry.mu.Unlock()
-	dstFlockRelease(file, owner)
+	dstFS.mu.Unlock()
+	if !held {
+		return
+	}
+	dstCoarseDep(uintptr(unsafe.Pointer(node)), true)
+	dstFS.mu.Lock()
+	node.flock.unlockNode(node, owner)
+	dstFS.mu.Unlock()
 }
 
 // dstFlockReleasePending releases the flock a closed descriptor left on
@@ -170,44 +200,6 @@ func dstFlockReleasePending(p *dstFlockPending) {
 	dstFS.mu.Lock()
 	p.node.flock.unlockNode(p.node, p.owner)
 	dstFS.mu.Unlock()
-}
-
-// dstFlockRelease releases owner's flock on file's node, announcing the
-// release to the explorer first when a lock is actually held.
-func dstFlockRelease(file *dstFile, owner dstFlockOwner) {
-	// Coarse DPOR dependency: a close (or exit) RELEASING a held flock is
-	// as outcome-determining as an explicit LOCK_UN — a contender's
-	// nonblocking attempt lands on either side of it. Announced as a
-	// write-conflict before this function's own mutation (the announce
-	// yields, so it precedes the locks it is re-taken under), with the
-	// release edge recorded atomically under dstFS.mu at unlockNode.
-	// NARROWED to closes whose owner actually holds a
-	// lock: announcing every close would put a write-conflict on every
-	// file teardown and combinatorially inflate exhaustive explorations
-	// that never flock at all (measured: an unbudgeted explore test went
-	// from seconds to minutes).
-	file.mu.Lock()
-	node := file.node
-	file.mu.Unlock()
-	if node != nil {
-		dstFS.mu.Lock()
-		_, held := node.flock.holders[owner]
-		dstFS.mu.Unlock()
-		if held {
-			dstCoarseDep(uintptr(unsafe.Pointer(node)), true)
-		}
-	}
-	if node == nil {
-		// The node was already dropped (a close raced the registry sweep,
-		// or nilled during the announce's yield): the earlier drop's own
-		// release path covered the flock state — nothing left to unlock.
-		return
-	}
-	file.mu.Lock()
-	dstFS.mu.Lock()
-	node.flock.unlockNode(node, owner)
-	dstFS.mu.Unlock()
-	file.mu.Unlock()
 }
 
 func (node *dstFSNode) flockReleaseHBLocked() {

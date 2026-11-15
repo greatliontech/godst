@@ -90,16 +90,9 @@ func dstCloneImageWithRot(synced dstDurableImage, size int64, rot map[int64]byte
 			continue
 		}
 		limit := int(min(int64(dstPageSize), size-pStart))
-		if dstBytesAllZero(p[:limit]) {
-			continue
+		if clipped := dstDurablePageClipped(p, limit); clipped != nil {
+			setPage(pg, clipped)
 		}
-		if dstBytesAllZero(p[limit:]) {
-			setPage(pg, p)
-			continue
-		}
-		var buf [dstPageSize]byte
-		copy(buf[:], p[:limit])
-		setPage(pg, &buf)
 	}
 	for off, mask := range rot {
 		if off >= size || mask == 0 {
@@ -190,9 +183,10 @@ func dstTearFileLocked(node *dstFSNode) dstDurableImage {
 			if curEnd <= start {
 				continue
 			}
+			pageLen := int(end - start)
 			cur := node.data[start:curEnd]
-			durValid := int(max(0, min(curEnd, synced.size)-start))
-			if dstDurablePageMatchesSlice(synced.pages[pg], durValid, cur) {
+			durLen := int(max(0, min(end, synced.size)-start))
+			if dstDurablePageMatchesWindow(synced.pages[pg], durLen, pageLen, cur) {
 				continue
 			}
 			if node.isPageDroppedLocked(pg) {
@@ -203,9 +197,6 @@ func dstTearFileLocked(node *dstFSNode) dstDurableImage {
 				// leave pages[pg] as the durable (+ rot) bytes already cloned
 			case dstPageCurrent:
 				var buf [dstPageSize]byte
-				if old := pages[pg]; old != nil {
-					buf = *old
-				}
 				copy(buf[:len(cur)], cur)
 				if dstBytesAllZero(buf[:]) {
 					delete(pages, pg)
@@ -213,12 +204,14 @@ func dstTearFileLocked(node *dstFSNode) dstDurableImage {
 					setPage(pg, &buf)
 				}
 			case dstPageTorn:
-				split := int(dstFaultRandN(int64(len(cur)) + 1))
+				split := int(dstFaultRandN(int64(pageLen) + 1))
 				var buf [dstPageSize]byte
 				if old := pages[pg]; old != nil {
 					buf = *old
 				}
-				copy(buf[:split], cur[:split])
+				nCopy := min(split, len(cur))
+				copy(buf[:nCopy], cur[:nCopy])
+				clear(buf[nCopy:split])
 				if dstBytesAllZero(buf[:]) {
 					delete(pages, pg)
 				} else {
