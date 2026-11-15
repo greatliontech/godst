@@ -161,6 +161,12 @@ func SlowDisk(host string, perOp time.Duration) {
 	})
 }
 
+// UnslowDisk clears the per-operation latency set by SlowDisk on the named
+// host's disk.
+func UnslowDisk(host string) {
+	withBubbleFaultCaller("UnslowDisk", func() { dstDiskFaultOp(diskOpSlow, lookupHost(host), 0, "") })
+}
+
 // CorruptFile flips one bit of one byte of the named host file's DURABLE image —
 // silent media corruption (bit rot), the fault a checksum exists to catch, as
 // distinct from FailFile's unreadable sector (EIO). The byte offset and the bit

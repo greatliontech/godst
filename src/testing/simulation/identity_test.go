@@ -17,24 +17,21 @@ func hostname() string { h, _ := os.Hostname(); return h }
 
 // TestDSTIdentityPerHostHostname verifies os.Hostname is per-host: an unconfigured
 // host reports its declared name, HostConfig.Hostname overrides, the root (no Host)
-// reports the run default, an implicit host (a bare Process) reports the process
-// name, and co-located processes / child goroutines inherit the host's hostname.
+// reports the run default, a bare Process inherits the root hostname, and co-located
+// processes / child goroutines inherit the host's hostname.
 func TestDSTIdentityPerHostHostname(t *testing.T) {
-	var root, n1, n2, coloc, child, implicit, empty string
+	var root, n1, n2, coloc, child, bare string
 	Run(1, func() {
 		root = hostname()
-		Host("node1", HostConfig{}, func() {
+		Host("node1", func() {
 			n1 = hostname()
 			Process("p", func() { coloc = hostname() }) // co-located: inherits node1
 			done := make(chan struct{})
 			go func() { child = hostname(); close(done) }()
 			<-done
 		})
-		Host("node2", HostConfig{Hostname: "db-primary"}, func() { n2 = hostname() })
-		Process("n3", func() { implicit = hostname() }) // implicit host named after the process
-		// A declared host reports its recorded hostname, even empty — "declared" (the
-		// set bit) is the single source of truth, not a non-empty fallback to root.
-		Host("", HostConfig{}, func() { empty = hostname() })
+		HostWith("node2", HostConfig{Hostname: "db-primary"}, func() { n2 = hostname() })
+		Process("n3", func() { bare = hostname() }) // bare process: inherits root host
 	})
 
 	for _, tc := range []struct{ got, want, what string }{
@@ -43,8 +40,7 @@ func TestDSTIdentityPerHostHostname(t *testing.T) {
 		{n2, "db-primary", "HostConfig.Hostname override"},
 		{coloc, "node1", "co-located process inherits host hostname"},
 		{child, "node1", "child goroutine inherits host hostname"},
-		{implicit, "n3", "implicit host reports the process name"},
-		{empty, "", "declared empty-name host reports empty, not the root default"},
+		{bare, "sim", "bare process inherits root hostname"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.what, tc.got, tc.want)
@@ -59,13 +55,13 @@ func TestDSTIdentityPerHostNumCPU(t *testing.T) {
 	var root, cfg, dflt, child int
 	Run(1, func() {
 		root = runtime.NumCPU()
-		Host("big", HostConfig{NumCPU: 4}, func() {
+		HostWith("big", HostConfig{NumCPU: 4}, func() {
 			cfg = runtime.NumCPU()
 			done := make(chan struct{})
 			go func() { child = runtime.NumCPU(); close(done) }()
 			<-done
 		})
-		Host("plain", HostConfig{}, func() { dflt = runtime.NumCPU() })
+		Host("plain", func() { dflt = runtime.NumCPU() })
 	})
 	if root != 8 {
 		t.Errorf("root NumCPU = %d, want 8 (default)", root)
@@ -124,7 +120,7 @@ func TestDSTIdentitySound(t *testing.T) {
 	var simHost string
 	var simCPU, simPid int
 	Run(1, func() {
-		Host("node-x", HostConfig{NumCPU: 3}, func() {
+		HostWith("node-x", HostConfig{NumCPU: 3}, func() {
 			Process("svc", func() {
 				simHost = hostname()
 				simCPU = runtime.NumCPU()
@@ -154,7 +150,7 @@ func TestDSTIdentityDeterminism(t *testing.T) {
 	run := func() sample {
 		var s sample
 		Run(99, func() {
-			Host("alpha", HostConfig{NumCPU: 2}, func() {
+			HostWith("alpha", HostConfig{NumCPU: 2}, func() {
 				Process("p1", func() {
 					s.hostnames = append(s.hostnames, hostname())
 					s.cpus = append(s.cpus, runtime.NumCPU())
@@ -162,7 +158,7 @@ func TestDSTIdentityDeterminism(t *testing.T) {
 				})
 				Process("p2", func() { s.pids = append(s.pids, os.Getpid()) })
 			})
-			Host("beta", HostConfig{Hostname: "b-host"}, func() {
+			HostWith("beta", HostConfig{Hostname: "b-host"}, func() {
 				s.hostnames = append(s.hostnames, hostname())
 				s.cpus = append(s.cpus, runtime.NumCPU())
 			})

@@ -319,12 +319,12 @@ func dstLocalBindInUse(host uint32, ip IP, port int) bool {
 // dstConnBindInUse is the general conn-side bind probe: does a live conn end on
 // host occupy local port? ip nil means any IP at the port (the wildcard-listen
 // probe); family "" means either family, otherwise "tcp4"/"tcp6" narrows it.
-// dialerEndsOnly counts only dialer-side ends: an ACCEPTED server end inherits
-// the listener's SO_REUSEADDR, so it never blocks a new listener — a server
-// restarted while its old connections drain must be able to re-bind its port —
-// while a dialer's socket carries no SO_REUSEADDR and blocks everything.
+// callerReuseAddr permits sharing the local port when the existing conn end
+// also carries SO_REUSEADDR (as accepted server ends do via accept(2)
+// inheritance, and as explicit SO_REUSEADDR sockets do in Linux's
+// inet_csk_bind_conflict), while any non-SO_REUSEADDR end blocks everything.
 // Deterministic (a set-membership test, no iteration order observed).
-func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnly bool) bool {
+func dstConnBindInUse(host uint32, ip IP, port int, family string, callerReuseAddr bool) bool {
 	dstConns.mu.Lock()
 	defer dstConns.mu.Unlock()
 	dstConnsRoll()
@@ -332,7 +332,7 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 		if c.localHost != host {
 			continue
 		}
-		if dialerEndsOnly && c.acceptState != nil {
+		if callerReuseAddr && c.sockOpts != nil && c.sockOpts.isReuseAddr() {
 			continue
 		}
 		la, ok := c.local.(*TCPAddr)
@@ -350,6 +350,26 @@ func dstConnBindInUse(host uint32, ip IP, port int, family string, dialerEndsOnl
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+func dstFourTupleInUse(host uint32, localIP IP, localPort int, remoteIP IP, remotePort int) bool {
+	dstConns.mu.Lock()
+	defer dstConns.mu.Unlock()
+	dstConnsRoll()
+	for c := range dstConns.set {
+		if c.localHost != host {
+			continue
+		}
+		la, ok1 := c.local.(*TCPAddr)
+		ra, ok2 := c.remote.(*TCPAddr)
+		if !ok1 || !ok2 {
+			continue
+		}
+		if la.Port == localPort && ra.Port == remotePort && la.IP.Equal(localIP) && ra.IP.Equal(remoteIP) {
+			return true
+		}
 	}
 	return false
 }
@@ -583,6 +603,13 @@ func dstConnPeer(c *dstConn) *dstConn {
 // already closed needs nothing (dstConnPeer returns nil).
 func dstResetBothEnds(c *dstConn) {
 	peer := dstConnPeer(c)
+	if peer != nil {
+		if e, ok := c.Conn.(*dstWireEnd); ok && e.isWriteShutdownKernel() {
+			if peerEnd, ok := peer.Conn.(*dstWireEnd); ok {
+				peerEnd.markRSTAfterPeerFIN()
+			}
+		}
+	}
 	c.resetConn()
 	if peer != nil {
 		dstConnDeregister(peer)

@@ -95,7 +95,7 @@ func dstGOMAXPROCSAutoFP() bool {
 }
 
 func dstSimNumCPUForCaller() (int, bool) {
-	if !dstSimEnvSet {
+	if !dstSimIdentityActive() {
 		return 0, false
 	}
 	n := dstSimNumCPU
@@ -447,6 +447,7 @@ func dstNewproc1Init(newg, callergp *g) {
 	newg.dstHost = callergp.dstHost
 	newg.dstHostScope = callergp.dstHostScope
 	newg.dstProc = callergp.dstProc
+	newg.dstProcSlot = callergp.dstProcSlot
 	newg.dstPid = callergp.dstPid
 	newg.dstSimG = newg.bubble != nil && newg.bubble == dstSimBubble
 	dstClearSchedState(newg)
@@ -1109,6 +1110,7 @@ func dstSynctestClaimBubble(gp *g, bubble *synctestBubble) {
 		bubble.main.dstHost = 0
 		bubble.main.dstHostScope = nil
 		bubble.main.dstProc = 0
+		bubble.main.dstProcSlot = 0
 		bubble.main.dstPid = int32(dstSimPID)
 		dstSchedRand = dstSchedRoot(dstSeed.Load())
 		dstFaultRand.Store(dstFaultRoot(dstSeed.Load()))

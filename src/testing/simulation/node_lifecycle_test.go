@@ -25,7 +25,7 @@ func TestDSTNodeRestart(t *testing.T) {
 	var rootBase, wall1, wall2 time.Time
 	Run(1, func() {
 		rootBase = time.Now() // root, unskewed
-		Host("h", HostConfig{Clock: Skew(50 * time.Millisecond), Hostname: "node-x", NumCPU: 3}, func() {
+		HostWith("h", HostConfig{Clock: Skew(50 * time.Millisecond), Hostname: "node-x", NumCPU: 3}, func() {
 			Process("p", func() {
 				memSink = make([]byte, 256<<10)
 				pid1, host1, cpu1, mem1, wall1 = os.Getpid(), hostname(), runtime.NumCPU(), procBytes(), time.Now()
@@ -63,9 +63,9 @@ func TestDSTNodeNested(t *testing.T) {
 	var outerHN, innerHN string
 	var pOuter, pInner, afterPInner nodeIDs
 	Run(1, func() {
-		Host("outer", HostConfig{Hostname: "outer-h"}, func() {
+		HostWith("outer", HostConfig{Hostname: "outer-h"}, func() {
 			outer, outerHN = curNode(), hostname()
-			Host("inner", HostConfig{Hostname: "inner-h"}, func() {
+			HostWith("inner", HostConfig{Hostname: "inner-h"}, func() {
 				inner, innerHN = curNode(), hostname()
 			})
 			afterInner = curNode() // restored to outer
@@ -109,7 +109,7 @@ func TestDSTNodeMidRunJoin(t *testing.T) {
 	var advanced time.Duration
 	Run(1, func() {
 		start := time.Now()
-		Host("early", HostConfig{}, func() {
+		Host("early", func() {
 			earlyHN = hostname()
 			earlyHost, _ = dstCurrentNode()
 			os.WriteFile("/d", []byte("early"), 0o644)
@@ -120,7 +120,7 @@ func TestDSTNodeMidRunJoin(t *testing.T) {
 		<-done
 		advanced = time.Since(start)
 
-		Host("joiner", HostConfig{Hostname: "late-joiner"}, func() {
+		HostWith("joiner", HostConfig{Hostname: "late-joiner"}, func() {
 			joinerHN = hostname()
 			joinerHost, _ = dstCurrentNode()
 			// the joiner's filesystem is its own — it must not see early's /d.

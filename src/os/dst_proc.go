@@ -18,7 +18,7 @@ import (
 )
 
 //go:linkname dstPidStarttime runtime.dstPidStarttime
-func dstPidStarttime(pid int32) (start uint64, ok bool)
+func dstPidStarttime(pid int32) (start uint64, slot uint32, ok bool)
 
 //go:linkname dstHostBootIdent runtime.dstHostBootIdent
 func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool)
@@ -126,7 +126,7 @@ func dstProcLeafExists(trimmed string) bool {
 		if !ok {
 			return false
 		}
-		_, ok = dstPidStarttime(int32(pid))
+		_, _, ok = dstPidStarttime(int32(pid))
 		return ok
 	}
 	if trimmed == "/proc/self/ns/pid" {
@@ -184,21 +184,28 @@ func dstProcStatDataAbs(abs string) (data []byte, ident, base string, handled bo
 	if !ok {
 		return nil, abs, "", true, syscall.ENOENT
 	}
-	start, ok := dstPidStarttime(int32(pid))
+	start, slot, ok := dstPidStarttime(int32(pid))
 	if !ok {
 		return nil, abs, "", true, syscall.ENOENT
 	}
-	// The identity is the CANONICAL pid form, so /proc/self/stat and
-	// /proc/<own-pid>/stat are one file to SameFile, as they are one inode on
-	// the host.
-	return []byte(dstProcStatContents(pid, start)), "/proc/" + strconv.Itoa(pid) + "/stat", "stat", true, nil
+	_, _, host, boot, ok := dstHostBootIdent()
+	if !ok {
+		return nil, abs, "", true, syscall.ENOENT
+	}
+	// The identity uses the canonical pid form scoped to (epoch, host, boot,
+	// slot, start), so /proc/self/stat and /proc/<own-pid>/stat are one file to
+	// SameFile within one task incarnation while distinct runs, machines,
+	// reboots, and reused pids (Options.PidMax, even within one 10ms USER_HZ
+	// tick) never share a procfs inode.
+	ident = "/proc/" + strconv.Itoa(pid) + "/stat#e" + strconv.FormatUint(dstFSEpoch(), 10) + "#h" + strconv.Itoa(int(host)) + "#b" + strconv.FormatUint(boot, 10) + "#s" + strconv.Itoa(int(slot)) + "#t" + strconv.FormatUint(start, 10)
+	return []byte(dstProcStatContents(pid, start)), ident, "stat", true, nil
 }
 
 // dstProcBootIDContents renders the boot_id leaf: the canonical lowercase
 // 8-4-4-4-12 UUID text plus newline, exactly the host kernel's shape, with RFC
 // 4122 version-4 and variant bits set over the deterministic 128-bit material.
-// The SameFile identity is per (host, boot): each boot mounts a fresh procfs
-// instance, and two machines never share one.
+// The SameFile identity is per (epoch, host, boot): each boot mounts a fresh
+// procfs instance, and distinct machines or runs never share one.
 func dstProcBootIDContents(hi, lo uint64, host uint32, boot uint64) (data []byte, ident string) {
 	var b [16]byte
 	for i := 0; i < 8; i++ {
@@ -217,7 +224,7 @@ func dstProcBootIDContents(hi, lo uint64, host uint32, boot uint64) (data []byte
 		out = append(out, hexdig[c>>4], hexdig[c&0xf])
 	}
 	out = append(out, '\n')
-	return out, dstProcBootIDPath + "#h" + strconv.Itoa(int(host)) + "#b" + strconv.FormatUint(boot, 10)
+	return out, dstProcBootIDPath + "#e" + strconv.FormatUint(dstFSEpoch(), 10) + "#h" + strconv.Itoa(int(host)) + "#b" + strconv.FormatUint(boot, 10)
 }
 
 func dstProcStatPID(abs string) (string, bool) {

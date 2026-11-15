@@ -55,7 +55,7 @@ func driftClockReSleep(t *testing.T, ppbOld, ppbNew int64, d, T time.Duration) t
 	Run(1, func() {
 		armed := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(ppbOld)}, func() {
+		HostWith("h", HostConfig{Clock: Drift(ppbOld)}, func() {
 			go func() {
 				close(armed) // about to arm the sleep at base ~0
 				time.Sleep(d)
@@ -127,7 +127,7 @@ func TestDSTClockDriftClockWallContinuity(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2 from declaration
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2 from declaration
 			go func() {
 				<-phase1
 				before = time.Now() // wall after base advanced (drift accumulated)
@@ -164,7 +164,7 @@ func TestDSTClockDriftClockDueTicker(t *testing.T) {
 	Run(1, func() {
 		tick1 := make(chan struct{})
 		tick2 := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				tk := time.NewTicker(100 * time.Millisecond)
 				defer tk.Stop()
@@ -226,7 +226,7 @@ func TestDSTClockDriftClockOverdueTicker(t *testing.T) {
 			Run(1, func() {
 				tick1 := make(chan struct{})
 				tick2 := make(chan struct{})
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					go func() {
 						tk := time.NewTicker(100 * time.Millisecond)
 						defer tk.Stop()
@@ -271,7 +271,7 @@ func TestDSTClockDriftClockOverdueRemapZeroClamp(t *testing.T) {
 		}()
 		Run(1, func() {
 			done := make(chan struct{})
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				go func() {
 					tk := time.NewTicker(period * time.Nanosecond)
 					defer tk.Stop()
@@ -313,7 +313,7 @@ func TestDSTClockDriftClockOverdueDeliveredTimestamp(t *testing.T) {
 			var got, want time.Time
 			Run(1, func() {
 				done := make(chan struct{})
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					go func() {
 						defer close(done)
 						start := time.Now()
@@ -345,7 +345,7 @@ func TestDSTClockDriftClockOverdueTwoChanges(t *testing.T) {
 	var gap time.Duration
 	Run(1, func() {
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				defer close(done)
 				start := time.Now()
@@ -380,7 +380,7 @@ func TestDSTClockDriftClockStoppedTickerStaysStopped(t *testing.T) {
 	resurrected := false
 	Run(1, func() {
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				defer close(done)
 				tk := time.NewTicker(100 * time.Millisecond)
@@ -411,7 +411,7 @@ func TestDSTClockDriftClockOverdueExtremeSlowdown(t *testing.T) {
 	completed := false
 	Run(1, func() {
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				tk := time.NewTicker(100 * time.Millisecond)
 				defer tk.Stop()
@@ -436,7 +436,7 @@ func TestDSTClockDriftClockResync(t *testing.T) {
 		go1 := make(chan struct{})
 		done := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
 			go func() {
 				close(ready)
 				<-go1
@@ -465,7 +465,7 @@ func TestDSTClockDriftClockMultiplePending(t *testing.T) {
 		done1 := make(chan struct{})
 		done2 := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() { armed <- struct{}{}; time.Sleep(1 * time.Second); close(done1) }()
 			go func() { armed <- struct{}{}; time.Sleep(2 * time.Second); close(done2) }()
 		})
@@ -501,7 +501,7 @@ func TestDSTClockDriftClockFromOwnGoroutine(t *testing.T) {
 		doChange := make(chan struct{})
 		done := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() { close(armed); time.Sleep(time.Second); close(done) }() // pending, owned by h
 			go func() { <-doChange; DriftClock("h", 1_000_000_000) }()         // h's own goroutine changes h's rate
 		})
@@ -526,7 +526,7 @@ func TestDSTClockDriftClockTwice(t *testing.T) {
 		armed := make(chan struct{})
 		done := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() { close(armed); time.Sleep(time.Second); close(done) }()
 		})
 		<-armed
@@ -556,7 +556,7 @@ func TestDSTClockDriftClockUnheapedTimer(t *testing.T) {
 		doAwait := make(chan struct{})
 		fired := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() {
 				tmr := time.NewTimer(time.Second) // armed at base 0, UNHEAPED (not yet awaited)
 				close(armed)
@@ -588,7 +588,7 @@ func TestDSTClockDriftClockUnheapedTicker(t *testing.T) {
 		armed := make(chan struct{})
 		doAwait := make(chan struct{})
 		ticks := make(chan struct{}, n)
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() {
 				tk := time.NewTicker(time.Second) // armed, UNHEAPED until awaited
 				defer tk.Stop()
@@ -637,7 +637,7 @@ func TestDSTClockDriftClockAbandonedTimer(t *testing.T) {
 		doDrift := make(chan struct{})
 		fired := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() {
 				tmr := time.NewTimer(time.Second) // armed at base 0
 				close(armed)
@@ -673,10 +673,10 @@ func TestDSTClockDriftClockVictim(t *testing.T) {
 		aDone := make(chan struct{})
 		bDone := make(chan struct{})
 		var start time.Time
-		Host("A", HostConfig{}, func() { // rate 1, will be changed
+		Host("A", func() { // rate 1, will be changed
 			go func() { armed <- struct{}{}; time.Sleep(time.Second); close(aDone) }()
 		})
-		Host("B", HostConfig{}, func() { // rate 1, must be untouched
+		Host("B", func() { // rate 1, must be untouched
 			go func() { armed <- struct{}{}; time.Sleep(time.Second); close(bDone) }()
 		})
 		<-armed
@@ -708,7 +708,7 @@ func TestDSTClockDriftClockWithStep(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		slept := make(chan struct{})
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() {
 				before = time.Now()
 				close(ready)
@@ -802,11 +802,11 @@ func TestDSTClockDriftResetByRedeclare(t *testing.T) {
 	var atRestart, base time.Time
 	var sleepBase time.Duration
 	Run(1, func() {
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
-		time.Sleep(time.Second)                                       // root advances base 1s; host h accumulates +1s of wall departure
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
+		time.Sleep(time.Second)                                           // root advances base 1s; host h accumulates +1s of wall departure
 		base = time.Now()
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() { // restart: zero config = in sync, rate 1
+		Host("h", func() { // restart: zero config = in sync, rate 1
 			atRestart = time.Now()
 			go func() { time.Sleep(time.Second); close(done) }()
 		})
@@ -828,10 +828,10 @@ func TestDSTClockDriftResetByRedeclare(t *testing.T) {
 func TestDSTClockDriftRedeclareSameRate(t *testing.T) {
 	var atRestart, base time.Time
 	Run(1, func() {
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
-		time.Sleep(time.Second)                                       // host accumulates +1s of wall departure
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // rate 2
+		time.Sleep(time.Second)                                           // host accumulates +1s of wall departure
 		base = time.Now()
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { atRestart = time.Now() })
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { atRestart = time.Now() })
 	})
 	if !atRestart.Equal(base) {
 		t.Errorf("same-rate re-declare kept accumulated drift: host reads %v, want base %v (anchor must reset)", atRestart, base)
@@ -850,7 +850,7 @@ func TestDSTClockRedeclareRemapsPendingTimer(t *testing.T) {
 		armed := make(chan struct{})
 		done := make(chan struct{})
 		start := time.Now()
-		Host("h", HostConfig{}, func() { // rate 1
+		Host("h", func() { // rate 1
 			go func() {
 				close(armed)
 				time.Sleep(d)
@@ -858,8 +858,8 @@ func TestDSTClockRedeclareRemapsPendingTimer(t *testing.T) {
 			}()
 		})
 		<-armed
-		time.Sleep(T)                                                 // root: advance base to T with the sleep pending
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // restart at rate 2
+		time.Sleep(T)                                                     // root: advance base to T with the sleep pending
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {}) // restart at rate 2
 		<-done
 		total = time.Since(start)
 	})
@@ -875,15 +875,17 @@ func TestDSTClockRedeclareRemapsPendingTimer(t *testing.T) {
 // depends on which runs came before it in the binary.
 func TestDSTClockTableFreshPerRun(t *testing.T) {
 	Run(1, func() { // run 1: host id 1 gets rate 2
-		Host("a", HostConfig{Clock: Drift(1_000_000_000)}, func() {})
+		HostWith("a", HostConfig{Clock: Drift(1_000_000_000)}, func() {})
 	})
 	var adv time.Duration
-	Run(1, func() { // run 2: Process's implicit host also interns to id 1
+	Run(1, func() { // run 2: Host("b") also interns to id 1
 		start := time.Now()
 		done := make(chan struct{})
-		Process("p", func() {
-			go func() { time.Sleep(time.Second); close(done) }()
-			<-done // body return is process exit: the sleeper must finish inside
+		Host("b", func() {
+			Process("p", func() {
+				go func() { time.Sleep(time.Second); close(done) }()
+				<-done // body return is process exit: the sleeper must finish inside
+			})
 		})
 		adv = time.Since(start)
 	})
@@ -892,20 +894,22 @@ func TestDSTClockTableFreshPerRun(t *testing.T) {
 	}
 }
 
-// TestDSTClockImplicitHostSurvivesProcessRestart: a process restart does not reboot
-// its host — a StepClock applied to a process's implicit host persists across a
-// Process re-invocation (the host stayed up; only a Host re-declaration models the
-// machine reboot and re-establishes the clock).
-func TestDSTClockImplicitHostSurvivesProcessRestart(t *testing.T) {
+// TestDSTClockHostSurvivesProcessRestart: a process restart does not reboot
+// its host — a StepClock applied to a host persists across a Process
+// re-invocation (the host stayed up; only a Host re-declaration re-establishes
+// the clock).
+func TestDSTClockHostSurvivesProcessRestart(t *testing.T) {
 	const step = 250 * time.Millisecond
 	var second, base time.Time
 	Run(1, func() {
-		Process("p", func() {})
-		StepClock("p", step) // step the implicit host's clock
 		base = time.Now()
-		Process("p", func() { second = time.Now() }) // restart on the surviving host
+		Host("h", func() {
+			Process("p", func() {})
+			StepClock("h", step)
+			Process("p", func() { second = time.Now() }) // restart on the surviving host
+		})
 	})
 	if got := second.Sub(base); got != step {
-		t.Errorf("after a process restart the implicit host reads base+%v, want base+%v (a restart must not reset the host clock)", got, step)
+		t.Errorf("after a process restart the host reads base+%v, want base+%v (a restart must not reset the host clock)", got, step)
 	}
 }

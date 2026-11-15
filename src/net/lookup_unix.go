@@ -46,6 +46,11 @@ var readProtocolsOnce = sync.OnceFunc(func() {
 // lookupProtocol looks up IP protocol name in /etc/protocols and
 // returns correspondent protocol number.
 func lookupProtocol(_ context.Context, name string) (int, error) {
+	if dstNetEnabled {
+		if dstInSimBubble() {
+			return dstLookupProtocol(name)
+		}
+	}
 	readProtocolsOnce()
 	return lookupProtocolMap(name)
 }
@@ -112,7 +117,7 @@ func (r *Resolver) lookupTXT(ctx context.Context, name string) ([]string, error)
 	// directly (stock shape, kept so its text stays stock), so this is the
 	// one chokepoint both public entries share. Bare-constant guard.
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			if !isDomainName(name) {
 				return nil, newDNSError(errNoSuchHost, name, "")
 			}

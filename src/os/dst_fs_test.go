@@ -570,7 +570,7 @@ func TestDSTFSVirtualFDRawSyscallStaleFDFenced(t *testing.T) {
 
 func TestDSTFSVirtualFDProcessIsolation(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			opened := make(chan int, 1)
 			release := make(chan struct{})
 			p1err := make(chan error, 1)

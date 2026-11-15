@@ -52,7 +52,7 @@ func sweepProgramWith(seed uint64, opts simulation.Options) string {
 
 		// Host "svc": listener echoing requests upper-cased; per-host fs work
 		// with fsync/rename durability points.
-		go simulation.Host("svc", simulation.HostConfig{Clock: simulation.Skew(25 * time.Millisecond), Hostname: "svc", NumCPU: 2}, func() {
+		go simulation.HostWith("svc", simulation.HostConfig{Clock: simulation.Skew(25 * time.Millisecond), Hostname: "svc", NumCPU: 2}, func() {
 			ln, err := net.Listen("tcp", ":0")
 			if err != nil {
 				panic(err)
@@ -99,7 +99,7 @@ func sweepProgramWith(seed uint64, opts simulation.Options) string {
 			cliWG.Add(1)
 			go func(i int) {
 				defer cliWG.Done()
-				simulation.Host("cli", simulation.HostConfig{Hostname: "cli", NumCPU: 4}, func() {
+				simulation.HostWith("cli", simulation.HostConfig{Hostname: "cli", NumCPU: 4}, func() {
 					t0 := time.Now()
 					c, err := net.Dial("tcp", simulation.HostIP("svc")+":"+p)
 					if err != nil {

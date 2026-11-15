@@ -17,8 +17,11 @@ func dstSetProcessStateTeardownHook(fn func(proc uint32))
 //go:linkname dstSetProcessHasResourcesHook runtime.dstSetProcessHasResourcesHook
 func dstSetProcessHasResourcesHook(fn func(proc uint32) bool)
 
-//go:linkname dstEnvProcessTeardown syscall.dstEnvProcessTeardown
-func dstEnvProcessTeardown(proc uint32)
+//go:linkname dstEnvSlotTeardown syscall.dstEnvSlotTeardown
+func dstEnvSlotTeardown(slot uint32)
+
+//go:linkname dstEnvHostTeardown syscall.dstEnvHostTeardown
+func dstEnvHostTeardown(host uint32)
 
 func init() {
 	dstSetProcessTeardownHook(dstApplyProcessTeardown)
@@ -57,5 +60,5 @@ func dstApplyProcessStateTeardown(proc uint32) {
 		}
 	}
 	dstFS.mu.Unlock()
-	dstEnvProcessTeardown(proc)
+	dstEnvSlotTeardown(proc)
 }

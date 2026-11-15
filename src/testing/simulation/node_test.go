@@ -40,7 +40,7 @@ func TestDSTNodeIdentity(t *testing.T) {
 		})
 		afterP1 = curNode()
 
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			Process("a", func() { h1a = curNode() })
 			Process("b", func() { h1b = curNode() })
 		})
@@ -52,8 +52,8 @@ func TestDSTNodeIdentity(t *testing.T) {
 	if root != (nodeIDs{0, 0}) {
 		t.Errorf("root identity = %+v, want {0 0}", root)
 	}
-	if p1.host == 0 || p1.proc == 0 {
-		t.Errorf("Process p1 identity = %+v, want both nonzero", p1)
+	if p1.host != 0 || p1.proc == 0 {
+		t.Errorf("bare Process p1 identity = %+v, want {0 nonzero}", p1)
 	}
 	if p1child != p1 {
 		t.Errorf("child identity = %+v, want inherited %+v", p1child, p1)
@@ -64,17 +64,17 @@ func TestDSTNodeIdentity(t *testing.T) {
 	if afterH1 != root {
 		t.Errorf("identity after Host returns = %+v, want restored %+v", afterH1, root)
 	}
-	if h1a.host != h1b.host {
-		t.Errorf("co-located processes on different hosts: %+v vs %+v", h1a, h1b)
+	if h1a.host == 0 || h1a.host != h1b.host {
+		t.Errorf("co-located processes on different or zero hosts: %+v vs %+v", h1a, h1b)
 	}
 	if h1a.proc == h1b.proc {
 		t.Errorf("co-located processes share a proc id: %+v vs %+v", h1a, h1b)
 	}
-	if n3.host == 0 || n3.proc == 0 {
-		t.Errorf("bare Process identity = %+v, want both nonzero", n3)
+	if n3.host != 0 || n3.proc == 0 {
+		t.Errorf("bare Process identity = %+v, want {0 nonzero}", n3)
 	}
-	if n3.host == h1a.host {
-		t.Errorf("bare Process shares its implicit host with h1: n3=%+v h1=%+v", n3, h1a)
+	if n3.proc == p1.proc {
+		t.Errorf("distinct bare Processes share proc id: n3=%+v p1=%+v", n3, p1)
 	}
 }
 
@@ -110,8 +110,8 @@ func TestDSTNodeReset(t *testing.T) {
 	if a != b {
 		t.Errorf("per-run interning reset broken: alpha=%+v beta=%+v, want equal fresh ids", a, b)
 	}
-	if a != (nodeIDs{1, 1}) {
-		t.Errorf("first process ids = %+v, want {1 1} (ids start fresh each run)", a)
+	if a != (nodeIDs{0, 1}) {
+		t.Errorf("first bare process ids = %+v, want {0 1} (ids start fresh each run)", a)
 	}
 }
 
@@ -121,7 +121,7 @@ func TestDSTNodeDeterministic(t *testing.T) {
 	run := func() [3]nodeIDs {
 		var got [3]nodeIDs
 		Run(7, func() {
-			Host("h1", HostConfig{}, func() {
+			Host("h1", func() {
 				Process("a", func() { got[0] = curNode() })
 				Process("b", func() { got[1] = curNode() })
 			})
@@ -184,7 +184,7 @@ func TestDSTNodeDeclareBeforeAnyRun(t *testing.T) {
 		nodeReg.mu.Unlock()
 	}()
 	ran := false
-	Host("pre-run-host", HostConfig{}, func() { ran = true })
+	Host("pre-run-host", func() { ran = true })
 	if !ran {
 		t.Fatal("Host outside any run did not run its body")
 	}

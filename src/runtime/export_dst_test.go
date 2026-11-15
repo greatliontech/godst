@@ -279,6 +279,7 @@ func dstTestVisitGFields(gp *g, stamp bool) (residue bool) {
 	visit(gp.dstHost == 0, func() { gp.dstHost = 7 })
 	visit(gp.dstHostScope == nil, func() { gp.dstHostScope = new(dstHostScope) })
 	visit(gp.dstProc == 0, func() { gp.dstProc = 7 })
+	visit(gp.dstProcSlot == 0, func() { gp.dstProcSlot = 7 })
 	visit(gp.dstPid == 0, func() { gp.dstPid = 7 })
 	visit(gp.dstPrio == 0, func() { gp.dstPrio = 7 })
 	visit(gp.dstSeq == 0, func() { gp.dstSeq = 7 })

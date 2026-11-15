@@ -242,7 +242,7 @@ func TestDSTFSVirtualFDMmapRangeOperations(t *testing.T) {
 
 func TestDSTFSVirtualFDMmapCrossProcessWriteUpdates(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/m", []byte("hello"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -330,7 +330,7 @@ func TestDSTFSVirtualFDMunmapRequiresExactMapping(t *testing.T) {
 
 func TestDSTFSVirtualFDMmapWritableShared(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -732,7 +732,7 @@ func TestDSTFSVirtualFDMmapWritableFdatasyncCommitsMappedBytes(t *testing.T) {
 
 func TestDSTFSVirtualFDMmapReadOnlyAndWritableShareRange(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -807,7 +807,7 @@ func TestDSTFSVirtualFDMmapCrossHostCapabilityRejected(t *testing.T) {
 		mapped := make(chan struct{})
 		release := make(chan struct{})
 		p1err := make(chan error, 1)
-		simulation.Host("h1", simulation.HostConfig{}, func() {
+		simulation.Host("h1", func() {
 			if err := os.WriteFile("/lock", make([]byte, 4), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -840,7 +840,7 @@ func TestDSTFSVirtualFDMmapCrossHostCapabilityRejected(t *testing.T) {
 				close(release)
 			}
 		}()
-		simulation.Host("h2", simulation.HostConfig{}, func() {
+		simulation.Host("h2", func() {
 			simulation.Process("p2", func() {
 				if err := syscall.Mprotect(b, syscall.PROT_READ); !errors.Is(err, syscall.EINVAL) {
 					t.Fatalf("cross-host Mprotect = %v, want EINVAL", err)
@@ -1111,7 +1111,7 @@ func TestDSTFSVirtualFDFsyncCommitsDirectoryEntries(t *testing.T) {
 
 func TestDSTFSVirtualFDSyncFrontDoorsFailWithoutCommitting(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			f, err := os.OpenFile("/sync-eio", os.O_CREATE|os.O_RDWR, 0o644)
 			if err != nil {
 				t.Fatalf("OpenFile: %v", err)
@@ -1192,7 +1192,7 @@ func TestDSTFSOpenRootVirtualFDSyscalls(t *testing.T) {
 
 func TestDSTFSVirtualFDFlockExclusiveBlocksUntilClose(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1263,7 +1263,7 @@ func TestDSTFSVirtualFDFlockExclusiveBlocksUntilClose(t *testing.T) {
 
 func TestDSTFSVirtualFDFlockSharedAndFDOwnership(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1368,7 +1368,7 @@ func TestDSTFSVirtualFDFlockSharedAndFDOwnership(t *testing.T) {
 
 func TestDSTFSVirtualFDFlockDowngradeWakesSharedWaiter(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1456,7 +1456,7 @@ func TestDSTFSVirtualFDFlockDowngradeWakesSharedWaiter(t *testing.T) {
 
 func TestDSTFSVirtualFDFlockConcurrentSharedUpgradesMakeProgress(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1517,7 +1517,7 @@ func TestDSTFSVirtualFDFlockScopesByHostAndFileNode(t *testing.T) {
 		locked := make(chan struct{})
 		release := make(chan struct{})
 		p1err := make(chan error, 1)
-		simulation.Host("h1", simulation.HostConfig{}, func() {
+		simulation.Host("h1", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("h1 WriteFile: %v", err)
 			}
@@ -1548,7 +1548,7 @@ func TestDSTFSVirtualFDFlockScopesByHostAndFileNode(t *testing.T) {
 			}
 		}()
 
-		simulation.Host("h2", simulation.HostConfig{}, func() {
+		simulation.Host("h2", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("h2 WriteFile: %v", err)
 			}
@@ -1573,7 +1573,7 @@ func TestDSTFSVirtualFDFlockScopesByHostAndFileNode(t *testing.T) {
 
 func TestDSTFSVirtualFDFlockFollowsFileNodeAcrossRename(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1750,7 +1750,7 @@ func TestDSTFSVirtualFDFlockUnlockWakesBlockedExclusive(t *testing.T) {
 // raw close really invalidates the descriptor.
 func TestDSTFSVirtualFDRawSyscallSemantics(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/db", []byte("old"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1885,7 +1885,7 @@ func TestDSTFSVirtualFDFlockRawTrampolinesFenced(t *testing.T) {
 func TestDSTFSVirtualFDFlockSlowDiskNoDelay(t *testing.T) {
 	const lat = 50 * time.Millisecond
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1979,7 +1979,7 @@ func TestDSTFSMprotectDowngradeIsEnforcedByHardware(t *testing.T) {
 	var victimPID int
 	var killErr error
 	simulation.Test(t, 1, func(t *testing.T) {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			downgraded := make(chan []byte, 1)
 			pid := make(chan int, 1)
 			go simulation.Process("victim", func() {
@@ -2046,7 +2046,7 @@ func faultShapeInProcess(t *testing.T, setup func(t *testing.T) func(), check fu
 	var victimPID int
 	var killErr error
 	simulation.Test(t, 1, func(t *testing.T) {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			touch := setup(t)
 			ready := make(chan int, 1)
 			go simulation.Process("victim", func() {
@@ -2254,7 +2254,7 @@ func TestDSTFSMprotectNoneIsEnforcedByHardware(t *testing.T) {
 // nothing and a fresh lock succeeds immediately.
 func TestDSTFSVirtualFDFlockCloseWhileBlocked(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -2452,12 +2452,12 @@ func TestDSTFSVirtualFDFlockReleasedWithProcessUnderMapping(t *testing.T) {
 		held := make(chan error, 1)
 		exit := make(chan struct{})
 		exited := make(chan struct{})
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("mapped"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
 		})
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			go simulation.Process("holder", func() {
 				defer close(exited)
 				f, err := os.OpenFile("/lock", os.O_RDWR, 0)
@@ -2483,7 +2483,7 @@ func TestDSTFSVirtualFDFlockReleasedWithProcessUnderMapping(t *testing.T) {
 		}
 		probe := func() error {
 			var err error
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				simulation.Process("contender", func() {
 					g, oerr := os.Open("/lock")
 					if oerr != nil {

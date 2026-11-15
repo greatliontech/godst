@@ -100,12 +100,12 @@ func TestDSTKillPidZeroLiveness(t *testing.T) {
 	if rootErr != nil {
 		t.Fatalf("Kill(root pid, 0) = %v, want nil", rootErr)
 	}
-	if nonBubbleRootErr != nil {
-		t.Fatalf("non-bubble Kill(root pid, 0) = %v, want nil", nonBubbleRootErr)
+	if nonBubbleHostErr != nil {
+		t.Fatalf("non-bubble Kill(host real pid, 0) = %v, want nil", nonBubbleHostErr)
 	}
 	for name, err := range map[string]error{
 		"host real pid":              hostErr,
-		"non-bubble host real pid":   nonBubbleHostErr,
+		"non-bubble sim root pid":    nonBubbleRootErr,
 		"unknown pid":                unknownErr,
 		"out-of-range alias pid":     aliasErr,
 		"dead pid":                   deadErr,

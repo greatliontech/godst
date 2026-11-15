@@ -7,6 +7,7 @@
 package simulation
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -29,7 +30,7 @@ func TestDSTExploreReplaysMappingFault(t *testing.T) {
 		// leg-independent and fully exercised without the detector.
 		t.Skip("exhaustive exploration is access-granular under -race")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var died bool
 		// The load sink is PER RUN: a package global written by every
 		// schedule's reader would itself be a cross-run data race under -race,
@@ -37,7 +38,7 @@ func TestDSTExploreReplaysMappingFault(t *testing.T) {
 		// failures whose replay carries access watchpoints — a different, far
 		// slower failure class than the mapping fault this test pins.
 		var sink atomic.Uint32
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			f, err := os.OpenFile("/db", os.O_CREATE|os.O_RDWR, 0o644)
 			if err != nil {
 				panic(err)
@@ -79,7 +80,10 @@ func TestDSTExploreReplaysMappingFault(t *testing.T) {
 			}
 			f.Close()
 		})
-		return died
+		if died {
+			return errors.New("reader died on mapping fault")
+		}
+		return nil
 	}
 
 	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive}, sut)
@@ -92,7 +96,7 @@ func TestDSTExploreReplaysMappingFault(t *testing.T) {
 			continue
 		}
 		subject++
-		if failed, _ := Replay(1, f, sut); failed {
+		if Replay(1, f, sut).Failed() {
 			reproduced++
 		} else {
 			t.Errorf("a recorded mapping-fault failure did not reproduce under Replay")

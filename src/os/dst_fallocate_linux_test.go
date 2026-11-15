@@ -201,7 +201,7 @@ func TestDSTFallocateDurability(t *testing.T) {
 	var synced, unsynced []byte
 	var syncedOK, unsyncedOK bool
 	simulation.RunWith(3, simulation.Options{}, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			go simulation.Process("db", func() {
 				f, err := os.Create("/s")
 				mustOK(t, "create /s", err)
@@ -226,7 +226,7 @@ func TestDSTFallocateDurability(t *testing.T) {
 
 		simulation.CrashHost("h")
 
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("recover", func() {
 				var err error
 				synced, err = os.ReadFile("/s")

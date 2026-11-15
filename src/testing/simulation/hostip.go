@@ -23,5 +23,9 @@ func dstHostRoutableIPString(host uint32) string
 // inside a simulation; it panics on a host name no declaration has established. A string
 // is returned rather than a net.IP so this package does not import net.
 func HostIP(name string) string {
-	return dstHostRoutableIPString(lookupHost(name))
+	var out string
+	withBubbleInspectCaller("HostIP", func() {
+		out = dstHostRoutableIPString(lookupHost(name))
+	})
+	return out
 }

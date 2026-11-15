@@ -175,94 +175,117 @@ func (c ClockConfig) driftPPBForHost(hostid uint32) int64 {
 	return c.driftPPB
 }
 
+type procKey struct {
+	host uint32
+	name string
+}
+
+type hostBootKey struct {
+	host uint32
+	boot uint64
+}
+
+type pidnsKey struct {
+	host uint32
+	boot uint64
+	name string
+}
+
+type procInstance struct {
+	proc uint32
+	host uint32
+	pid  int32
+	slot uint32
+}
+
 // nodeReg interns Host/Process names to the integer ids the runtime carries on each
 // goroutine. Process-global, reset per run (nodeRegReset, called by the run
 // envelope before the bubble starts) so id assignment is a deterministic function
 // of call order within a run — and call order is deterministic because the schedule
 // is. Guarded by a mutex because Host/Process may be called concurrently by bubble
 // goroutines (the same in-bubble-use-of-a-process-global-mutex pattern as net's
-// simulated-network registry). Host and process names are independent namespaces:
-// CrashHost("x") targets a host and Crash("x") a process.
+// simulated-network registry). Host names are run-global; process names are
+// host-scoped ((host, name)): CrashHost("x") targets machine "x" and
+// CrashProcess("x", "p") targets process "p" on machine "x" (or "" for the
+// unnamed root machine).
 var nodeReg struct {
 	mu       kernelMutex
 	hosts    map[string]uint32
-	procs    map[string]uint32
+	procs    map[procKey]uint32
 	nextHost uint32
 	nextProc uint32
+	nextSlot uint32
 	// down is the machines' powered-off state (CrashHost sets, a Host
-	// re-declaration clears). Owned HERE, not by the net layer, so the
-	// powered-off Process refusal and boot semantics (boot count, boot_id,
-	// uptime-clock origin) hold in binaries that never link net; the net
-	// partition table keeps its own down state for dial blackholing.
+	// re-declaration clears). Owned HERE, not by the net layer, so host boot
+	// semantics (boot count, boot_id, uptime-clock origin) hold in binaries that
+	// never link net; the net partition table keeps its own down state for dial
+	// blackholing.
 	down map[uint32]bool
 	// pidns interns ProcessConfig.PIDNamespace names to namespace identities
-	// (the /proc/self/ns/pid inode): first-use order from 2 — identity 1 is
-	// the root namespace, never in the map.
-	pidns  map[string]uint32
-	nextNS uint32
+	// (the /proc/self/ns/pid inode), scoped per (host, boot): first-use order
+	// from 2 on each host boot — identity 1 is each host boot's root namespace,
+	// never in the map.
+	pidns     map[pidnsKey]uint32
+	pidnsNext map[hostBootKey]uint32
 }
 
 var activeProcs struct {
-	mu   kernelMutex
-	pids map[uint32][]int32
-	// host records which machine each live process runs on, so a host crash
-	// can enumerate its victims. Process names are a global namespace (one
-	// name interns to one process id), so a process lives on exactly one host
-	// at a time; a restart on another host overwrites the entry.
-	host map[uint32]uint32
+	mu     kernelMutex
+	byProc map[uint32][]procInstance
+	bySlot map[uint32]procInstance
 }
 
 // procTeardownMu spans a process's liveness bookkeeping and the resource
-// teardown it triggers — exit's last-invocation decision plus the teardown
-// itself, crash's clear-all plus its teardown, and a starting invocation's
-// registration. Without it, a same-name restart interleaved between the
-// "last invocation died" decision and the teardown could register and open
-// resources that the predecessor's teardown then closes — a state a real
-// kernel (per-process fd tables) cannot show. At plain P=1 the exit defer
-// runs without park points and the lock is uncontended; the lock exists for
-// Level 2 exploration, whose access-granularity scheduling can yield inside
-// this package's instrumented accesses.
+// teardown it triggers — exit's pop-and-teardown, crash's clear-all plus its
+// teardown, and a starting invocation's registration. Each Process invocation
+// owns a fresh monotonic slot (g.dstProcSlot) for its OS/net/env resources
+// while sharing the logical proc id (g.dstProc) for cumulative memory
+// accounting. At plain P=1 the exit defer runs without park points and the lock
+// is uncontended; the lock exists for Level 2 exploration, whose
+// access-granularity scheduling can yield inside this package's instrumented
+// accesses.
 var procTeardownMu kernelMutex
 var mappingFaultTeardownRuns uint64
 
 func init() { dstSetMappingFaultTeardownHook(mappingFaultProcessTeardown) }
 
-func mappingFaultProcessTeardown(proc uint32) {
+func mappingFaultProcessTeardown(slot uint32, pid int32) {
+	if pid <= 0 || slot == 0 {
+		return
+	}
 	procTeardownMu.Lock()
 	defer procTeardownMu.Unlock()
-	pids := activeProcPIDs(proc)
-	if len(pids) == 0 {
+	inst, ok := activeProcPopSlot(slot)
+	if !ok {
 		return
 	}
 	mappingFaultTeardownRuns++
-	activeProcClearAll(proc)
-	for _, pid := range pids {
-		dstCrashProcessPid(pid)
-	}
-	dstProcessTeardown(proc)
-	dstNetPartitionOp(partOpCrashProcConns, proc, 0)
-	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+	dstCrashProcessPid(inst.host, inst.slot, inst.pid)
+	dstProcessTeardown(inst.slot)
+	dstNetPartitionOp(partOpCrashProcConns, inst.slot, 0)
+	dstNetPartitionOp(partOpCloseProcListeners, inst.slot, 0)
 }
 
 func nodeRegReset() {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
 	nodeReg.hosts = make(map[string]uint32)
-	nodeReg.procs = make(map[string]uint32)
+	nodeReg.procs = make(map[procKey]uint32)
 	nodeReg.nextHost = 0
 	nodeReg.nextProc = 0
+	nodeReg.nextSlot = 0
 	nodeReg.down = make(map[uint32]bool)
-	nodeReg.pidns = make(map[string]uint32)
-	nodeReg.nextNS = 0
+	nodeReg.pidns = make(map[pidnsKey]uint32)
+	nodeReg.pidnsNext = make(map[hostBootKey]uint32)
 	activeProcs.mu.Lock()
-	activeProcs.pids = make(map[uint32][]int32)
-	activeProcs.host = make(map[uint32]uint32)
+	activeProcs.byProc = make(map[uint32][]procInstance)
+	activeProcs.bySlot = make(map[uint32]procInstance)
 	activeProcs.mu.Unlock()
 }
 
-// markHostDown and hostDown maintain the simulation-owned powered-off state
-// (see nodeReg.down). markHostDown tolerates a nil map (a crash fault driven
-// before the first run's nodeRegReset is a documented no-op path).
+// markHostDown records the simulation-owned powered-off state (see
+// nodeReg.down). It tolerates a nil map (a crash fault driven before the first
+// run's nodeRegReset is a documented no-op path).
 func markHostDown(host uint32) {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
@@ -270,12 +293,6 @@ func markHostDown(host uint32) {
 		nodeReg.down = make(map[uint32]bool)
 	}
 	nodeReg.down[host] = true
-}
-
-func hostDown(host uint32) bool {
-	nodeReg.mu.Lock()
-	defer nodeReg.mu.Unlock()
-	return nodeReg.down[host]
 }
 
 // nodeNames resolves numeric runtime host and process IDs back to their
@@ -296,9 +313,9 @@ func nodeNames(host, proc uint32) (hostName, procName string) {
 		}
 	}
 	if proc != 0 {
-		for name, id := range nodeReg.procs {
+		for k, id := range nodeReg.procs {
 			if id == proc {
-				procName = name
+				procName = k.name
 				break
 			}
 		}
@@ -306,134 +323,124 @@ func nodeNames(host, proc uint32) (hostName, procName string) {
 	return hostName, procName
 }
 
-func activeProcSet(proc, host uint32, pid int32) {
+func activeProcAdd(inst procInstance) {
 	activeProcs.mu.Lock()
-	if activeProcs.pids == nil {
-		activeProcs.pids = make(map[uint32][]int32)
+	if activeProcs.byProc == nil {
+		activeProcs.byProc = make(map[uint32][]procInstance)
 	}
-	if activeProcs.host == nil {
-		activeProcs.host = make(map[uint32]uint32)
+	if activeProcs.bySlot == nil {
+		activeProcs.bySlot = make(map[uint32]procInstance)
 	}
-	activeProcs.pids[proc] = append(activeProcs.pids[proc], pid)
-	activeProcs.host[proc] = host
-	activeProcs.mu.Unlock()
-}
-
-// activeProcLivesElsewhere reports whether the logical process already has a
-// live invocation on a DIFFERENT machine. One logical process lives on exactly
-// one machine at a time: two homes would give a host crash two candidate victim
-// sets, and it would scope by whichever was recorded last — silently sparing a
-// pid on the machine that lost power. Checked before a Process stamps anything,
-// so the refusal mutates no state.
-func activeProcLivesElsewhere(proc, host uint32) bool {
-	activeProcs.mu.Lock()
-	defer activeProcs.mu.Unlock()
-	old, ok := activeProcs.host[proc]
-	return ok && old != host && len(activeProcs.pids[proc]) > 0
-}
-
-func activeProcLastInvocation(proc uint32, pid int32) bool {
-	activeProcs.mu.Lock()
-	defer activeProcs.mu.Unlock()
-	pids := activeProcs.pids[proc]
-	return len(pids) == 1 && pids[0] == pid
-}
-
-// activeProcsOnHost returns the live processes running on host, in process-id
-// order — a deterministic function of declaration order, never the map's
-// iteration order, so a host crash tears its victims down reproducibly
-// (DST-FAULT-REPLAY).
-func activeProcsOnHost(host uint32) []uint32 {
-	activeProcs.mu.Lock()
-	var procs []uint32
-	for proc, h := range activeProcs.host {
-		if h == host && len(activeProcs.pids[proc]) > 0 {
-			procs = append(procs, proc)
-		}
+	activeProcs.byProc[inst.proc] = append(activeProcs.byProc[inst.proc], inst)
+	if inst.slot > 0 {
+		activeProcs.bySlot[inst.slot] = inst
 	}
 	activeProcs.mu.Unlock()
-	slices.Sort(procs)
-	return procs
 }
 
-// activeProcClear removes one invocation's pid and reports whether it was the
-// process's LAST live invocation — the point at which proc-keyed resources can be
-// torn down (concurrent same-name invocations share the logical proc id, so
-// resource teardown must wait for the last; the goroutine half is pid-keyed and
-// per-invocation regardless).
-func activeProcClear(proc uint32, pid int32) (last bool) {
+func activeProcPopSlot(slot uint32) (procInstance, bool) {
 	activeProcs.mu.Lock()
-	pids := activeProcs.pids[proc]
-	for i, p := range pids {
-		if p == pid {
-			pids = append(pids[:i], pids[i+1:]...)
+	defer activeProcs.mu.Unlock()
+	inst, ok := activeProcs.bySlot[slot]
+	if !ok {
+		return procInstance{}, false
+	}
+	delete(activeProcs.bySlot, slot)
+	insts := activeProcs.byProc[inst.proc]
+	for i, cur := range insts {
+		if cur.slot == slot {
+			insts = append(insts[:i], insts[i+1:]...)
 			break
 		}
 	}
-	if len(pids) == 0 {
-		delete(activeProcs.pids, proc)
+	if len(insts) == 0 {
+		delete(activeProcs.byProc, inst.proc)
 	} else {
-		activeProcs.pids[proc] = pids
+		activeProcs.byProc[inst.proc] = insts
 	}
-	activeProcs.mu.Unlock()
-	return len(pids) == 0
+	return inst, true
 }
 
-func activeProcPIDs(proc uint32) []int32 {
+func activeProcInstances(proc uint32) []procInstance {
 	activeProcs.mu.Lock()
 	defer activeProcs.mu.Unlock()
-	return append([]int32(nil), activeProcs.pids[proc]...)
+	return append([]procInstance(nil), activeProcs.byProc[proc]...)
 }
 
-func activeProcClearAll(proc uint32) {
+func activeProcSlots(proc uint32) []uint32 {
 	activeProcs.mu.Lock()
-	delete(activeProcs.pids, proc)
-	delete(activeProcs.host, proc)
+	insts := activeProcs.byProc[proc]
+	slots := make([]uint32, len(insts))
+	for i, inst := range insts {
+		slots[i] = inst.slot
+	}
 	activeProcs.mu.Unlock()
+	return slots
 }
 
-func internHost(name string) uint32 {
-	host, fresh := internHostLocked(name)
-	if fresh && runActive.Load() {
-		// A fresh implicit host is a machine booting mid-run, exactly like an
-		// explicit Host declaration: relay host-up so a dial blackholing on
-		// the (previously unowned, hence unanswering) address wakes and finds
-		// the new kernel. After the intern mutex is released — the relay
-		// takes net's partition-table lock.
-		dstNetPartitionOp(partOpHostUp, host, 0)
+func activeProcPopAll(proc uint32) []procInstance {
+	activeProcs.mu.Lock()
+	defer activeProcs.mu.Unlock()
+	insts := activeProcs.byProc[proc]
+	if len(insts) == 0 {
+		return nil
 	}
-	return host
+	delete(activeProcs.byProc, proc)
+	for _, inst := range insts {
+		delete(activeProcs.bySlot, inst.slot)
+	}
+	return insts
 }
 
-func internHostLocked(name string) (host uint32, fresh bool) {
-	nodeReg.mu.Lock()
-	defer nodeReg.mu.Unlock()
-	if nodeReg.hosts == nil {
-		// Host/Process before the first Run ever: the registry is inert but must not
-		// nil-map-panic (the run envelope's nodeRegReset has never run).
-		nodeReg.hosts = make(map[string]uint32)
+// activeProcInstancesOnHost returns the live process invocations running on
+// host, ordered deterministically by (proc, pid) so a host crash validates and
+// tears its victims down reproducibly (DST-FAULT-REPLAY).
+func activeProcInstancesOnHost(host uint32) []procInstance {
+	activeProcs.mu.Lock()
+	var victims []procInstance
+	for _, insts := range activeProcs.byProc {
+		if len(insts) > 0 && insts[0].host == host {
+			victims = append(victims, insts...)
+		}
 	}
-	if id, ok := nodeReg.hosts[name]; ok {
-		return id, false
+	activeProcs.mu.Unlock()
+	slices.SortFunc(victims, func(a, b procInstance) int {
+		if a.proc != b.proc {
+			if a.proc < b.proc {
+				return -1
+			}
+			return 1
+		}
+		if a.pid < b.pid {
+			return -1
+		}
+		if a.pid > b.pid {
+			return 1
+		}
+		return 0
+	})
+	return victims
+}
+
+func activeProcPopHost(host uint32) []procInstance {
+	victims := activeProcInstancesOnHost(host)
+	if len(victims) == 0 {
+		return nil
 	}
-	host = nodeReg.nextHost + 1
-	// An implicit host has the zero clock configuration. Establish it before
-	// publishing the name so table exhaustion leaves the registry untouched.
-	dstReestablishHostClock(host, 0, 0)
-	nodeReg.nextHost = host
-	nodeReg.hosts[name] = host
-	setHostIdent(host, name, 0)
-	// A fresh host's first declaration is the machine's first boot.
-	dstBootHost(host)
-	return host, true
+	activeProcs.mu.Lock()
+	for _, inst := range victims {
+		delete(activeProcs.bySlot, inst.slot)
+		delete(activeProcs.byProc, inst.proc)
+	}
+	activeProcs.mu.Unlock()
+	return victims
 }
 
 func init() { dstSetHostDeclaredHook(hostDeclared) }
 
 // hostDeclared reports whether id names a declared host of the current run:
 // host 0 (the root) always exists, and declared ids are allocated
-// contiguously from 1 (Host declarations and implicit-host Processes share
-// nodeReg.nextHost), so the declared set is exactly [0, nextHost]. Queried by
+// contiguously from 1, so the declared set is exactly [0, nextHost]. Queried by
 // net through the runtime relay for the unowned-address dial blackhole.
 func hostDeclared(id uint32) bool {
 	nodeReg.mu.Lock()
@@ -441,26 +448,47 @@ func hostDeclared(id uint32) bool {
 	return id <= nodeReg.nextHost
 }
 
-func internProc(name string) uint32 {
+// admitProcAndSlot atomically ensures the logical (host, name) process counter
+// and allocates a fresh per-invocation resource slot. Every refusal check runs
+// before nodeReg is mutated so a rejected Process admission stays state-neutral.
+func admitProcAndSlot(host uint32, name string) (proc, slot uint32) {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
 	if nodeReg.procs == nil {
-		nodeReg.procs = make(map[string]uint32) // see internHost
+		nodeReg.procs = make(map[procKey]uint32)
 	}
-	if id, ok := nodeReg.procs[name]; ok {
-		return id
+	key := procKey{host: host, name: name}
+	proc, exists := nodeReg.procs[key]
+	if !exists {
+		proc = nodeReg.nextProc + 1
 	}
-	nodeReg.nextProc++
-	nodeReg.procs[name] = nodeReg.nextProc
-	return nodeReg.nextProc
+	if nodeReg.nextSlot == ^uint32(0) {
+		panic("testing/simulation: process slot table exhausted")
+	}
+	dstProcAllocEnsure(proc)
+	if !exists {
+		nodeReg.nextProc = proc
+		nodeReg.procs[key] = proc
+	}
+	nodeReg.nextSlot++
+	slot = nodeReg.nextSlot
+	return proc, slot
 }
 
-// Host runs f as the named host with the given configuration. Goroutines f starts
+// Host runs f as the named host with the default (zero) HostConfig: clock in
+// sync with the universe base clock, os.Hostname equal to name, and
+// runtime.NumCPU equal to the run default. It is equivalent to
+// HostWith(name, HostConfig{}, f).
+func Host(name string, f func()) {
+	hostWith("Host", name, HostConfig{}, f)
+}
+
+// HostWith runs f as the named host with the given configuration. Goroutines f starts
 // (and their descendants) belong to host name, sharing its filesystem and network
 // identity and its clock (config.Clock); a Process started within f runs on this
-// host. Host stamps the running goroutine's host identity for the dynamic extent of f
+// host. HostWith stamps the running goroutine's host identity for the dynamic extent of f
 // and restores it on return — it inherits at goroutine creation, so the stamp labels
-// the whole subtree and the subtree's long-lived goroutines outlive the Host call. The
+// the whole subtree and the subtree's long-lived goroutines outlive the HostWith call. The
 // host's clock offset is recorded in a per-host table keyed by that identity, so it
 // likewise applies to the whole subtree and can be moved mid-run by StepClock. Hosts
 // and processes may be declared at any time
@@ -469,13 +497,17 @@ func internProc(name string) uint32 {
 // restart keeps the host's clock. The host's hostname (os.Hostname, default the host
 // name) and NumCPU (runtime.NumCPU) come from config and are recorded for the host
 // for the rest of the run. The zero HostConfig is the plain, in-sync host whose
-// os.Hostname is its name. Calling Host outside a simulation has no effect beyond
-// running f (the recorded identity is read only inside an active run). During an
-// active run Host must be called from a goroutine the simulation schedules (the
-// run body or a goroutine started inside it); a foreign caller panics, like the
-// fault APIs — a mid-run declaration is a reboot, and a reboot at a wall-clock
-// instant the seed does not control would silently diverge replay.
-func Host(name string, config HostConfig, f func()) {
+// os.Hostname is its name. Calling Host or HostWith outside a simulation has no effect beyond
+// running f (the recorded identity is read only inside an active run), except that an
+// empty host name always panics. During an active run Host and HostWith must be called
+// from a goroutine the simulation schedules (the run body or a goroutine started inside
+// it); a foreign caller panics, like the fault APIs — a mid-run declaration is a reboot,
+// and a reboot at a wall-clock instant the seed does not control would silently diverge replay.
+func HostWith(name string, config HostConfig, f func()) {
+	hostWith("HostWith", name, config, f)
+}
+
+func hostWith(api, name string, config HostConfig, f func()) {
 	var oldH, oldP uint32
 	stamped := false
 	defer func() {
@@ -484,6 +516,12 @@ func Host(name string, config HostConfig, f func()) {
 		}
 	}()
 	declare := func() {
+		if name == "" {
+			panic("testing/simulation: " + api + " name must be non-empty")
+		}
+		if !runActive.Load() {
+			return
+		}
 		var hid uint32
 		var booted bool
 		func() {
@@ -501,7 +539,7 @@ func Host(name string, config HostConfig, f func()) {
 				hostname = name
 			}
 			if !dstReestablishHostClock(hid, offset, ppb) {
-				panic("testing/simulation: Host clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
+				panic("testing/simulation: " + api + " clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 			}
 			if !exists {
 				if nodeReg.hosts == nil {
@@ -542,7 +580,7 @@ func Host(name string, config HostConfig, f func()) {
 			dstNetPartitionOp(partOpHostUp, hid, 0)
 		}
 	}
-	withBubbleDeclCaller("Host", declare)
+	withBubbleDeclCaller(api, declare)
 	f()
 }
 
@@ -598,7 +636,7 @@ func withBubbleFaultCaller(api string, op func()) {
 // withBubbleDeclCaller is the declaration APIs' (Host, Process) twin of
 // withBubbleFaultCaller, run as each one's first act — before the intern
 // tables are touched. A mid-run Host re-declaration relays the host-up op (a
-// reboot: HealHost plus clock re-establishment) and Process starts SUT
+// reboot: partOpHostUp plus clock re-establishment) and Process starts SUT
 // goroutines; from a goroutine outside the run's bubble both would mutate run
 // state at a wall-clock instant the seed does not control — the same
 // silent-nondeterminism class the fault guard kills, through a declaration
@@ -621,8 +659,7 @@ func withBubbleInspectCaller(api string, op func()) {
 }
 
 // lookupHost resolves an already-declared host name for a fault or inspection API,
-// panicking during a run on a name no Host (or implicit-host Process) declaration has
-// established — a typo'd victim must fail loud, never intern a fresh host id whose
+// panicking during a run on a name no Host/HostWith declaration has established — a typo'd victim must fail loud, never intern a fresh host id whose
 // state no goroutine observes (a fault that silently tests nothing; docs/dst/faults.md
 // "Targeting", victim names fail loud). Outside a run it returns 0 for an unknown name
 // — the mutating fault ops all discard host 0 / no-bubble calls, preserving their
@@ -642,33 +679,46 @@ func lookupHost(name string) uint32 {
 }
 
 // internPIDNS interns a ProcessConfig.PIDNamespace name to its namespace
-// identity: "" is the root namespace (identity 1, every process's default);
-// named namespaces get deterministic identities in first-use order (2, 3, …),
-// reset per run with the other registries. Deterministic because first-use
-// order is schedule-deterministic.
-func internPIDNS(name string) uint32 {
+// identity on the target host's current boot: "" is the host boot's root
+// namespace (identity 1, every process's default); named namespaces get
+// deterministic identities in first-use order (2, 3, …), scoped by (host, boot)
+// so distinct machines and post-CrashHost reboots never share container
+// namespace inodes, while same-boot process restarts naming the same namespace
+// retain it.
+func internPIDNS(host uint32, name string) uint32 {
 	if name == "" {
 		return 1
+	}
+	key := pidnsKey{
+		host: host,
+		boot: dstCurrentHostBootCount(host),
+		name: name,
 	}
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
 	if nodeReg.pidns == nil {
-		nodeReg.pidns = make(map[string]uint32) // see internHost
+		nodeReg.pidns = make(map[pidnsKey]uint32)
 	}
-	if id, ok := nodeReg.pidns[name]; ok {
+	if nodeReg.pidnsNext == nil {
+		nodeReg.pidnsNext = make(map[hostBootKey]uint32)
+	}
+	if id, ok := nodeReg.pidns[key]; ok {
 		return id
 	}
-	nodeReg.nextNS++
-	id := 1 + nodeReg.nextNS
-	nodeReg.pidns[name] = id
+	hb := hostBootKey{host: key.host, boot: key.boot}
+	nodeReg.pidnsNext[hb]++
+	id := 1 + nodeReg.pidnsNext[hb]
+	nodeReg.pidns[key] = id
 	return id
 }
 
-// lookupProc is lookupHost's process leg (ResetProcess and later process faults).
-func lookupProc(name string) uint32 {
+// lookupProc resolves an already-declared process name on host (0 for the
+// unnamed root host) for process-targeting fault APIs (CrashProcess,
+// ResetProcess).
+func lookupProc(host uint32, name string) uint32 {
 	nodeReg.mu.Lock()
 	defer nodeReg.mu.Unlock()
-	if id, ok := nodeReg.procs[name]; ok {
+	if id, ok := nodeReg.procs[procKey{host: host, name: name}]; ok {
 		return id
 	}
 	if runActive.Load() {
@@ -677,64 +727,78 @@ func lookupProc(name string) uint32 {
 	return 0
 }
 
-func crashProcess(name string) {
-	proc := lookupProc(name)
+func crashProcess(hostName, name string) {
+	var hid uint32
+	if hostName != "" {
+		hid = lookupHost(hostName)
+		if hid == 0 {
+			return
+		}
+	}
+	proc := lookupProc(hid, name)
 	if proc == 0 {
 		return
 	}
 	procTeardownMu.Lock()
 	defer procTeardownMu.Unlock()
-	pids := activeProcPIDs(proc)
-	if len(pids) == 0 {
+	insts := activeProcInstances(proc)
+	if len(insts) == 0 {
 		if runActive.Load() {
 			panic("testing/simulation: process " + strconv.Quote(name) + " is not live")
 		}
 		return
 	}
-	for _, pid := range pids {
-		if dstPidOwnsBubbleMain(pid) {
-			panic("testing/simulation: Crash would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
+	if !runActive.Load() {
+		return
+	}
+	for _, inst := range insts {
+		if dstPidOwnsBubbleMain(inst.slot, inst.pid) {
+			panic("testing/simulation: CrashProcess would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
 		}
 	}
-	activeProcClearAll(proc)
+	insts = activeProcPopAll(proc)
 	// Kernel teardown order: the threads die first, then exit_files closes fds
 	// (releasing flocks, unmapping (the bytes are the page cache's; nothing to write back)) and the sockets
 	// reset. Killing the goroutines first also closes the window in which a
 	// victim could observe its own resources half-torn-down.
-	for _, pid := range pids {
-		dstCrashProcessPid(pid)
+	for _, inst := range insts {
+		dstCrashProcessPid(inst.host, inst.slot, inst.pid)
 	}
-	dstProcessTeardown(proc)
-	dstNetPartitionOp(partOpCrashProcConns, proc, 0)
-	dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+	for _, inst := range insts {
+		dstProcessTeardown(inst.slot)
+		dstNetPartitionOp(partOpCrashProcConns, inst.slot, 0)
+		dstNetPartitionOp(partOpCloseProcListeners, inst.slot, 0)
+	}
 }
 
-// Crash kills the named process — the process-crash fault (docs/dst/faults.md
-// "Crash / restart faults"). Every goroutine of the process's live invocations
-// is descheduled permanently (no defers run — a killed process does not
-// unwind), its pids read dead (Kill(pid, 0) answers ESRCH and the /proc
-// entries disappear), its open simulated files and virtual fds close, fd-owned
-// flocks release, shared mappings unregister (their bytes already are the
-// kernel page-cache pages), its connections RESET — the kernel survives a
-// process crash and answers for the dead sockets: the surviving peer drains
-// the bytes already delivered to it, then observes ECONNRESET (in-flight
-// bytes die; a conn whose victim end was already app-closed is spared, its
-// peer drains to io.EOF; a blackhole cut of the victim→peer direction
-// swallows the RST — the peer sees silence until a heal lets its probes meet
-// the CLOSED socket's RST) — and its listeners close. The host filesystem survives
-// untouched, unsynced writes included: a process crash does not tear the disk;
-// only the host-crash fault restores the durable image. If the calling
-// goroutine itself belongs to the victim (a self-crash — the OOM shape), Crash
-// does not return. A subsequent same-name Process call is the restart: fresh
-// pid, inheriting nothing but host state. Crash panics during a run on an
-// undeclared or not-live process name (a typo'd victim must fail loud, never
-// silently fault nothing), and on a process whose goroutine set includes the
-// run's own main goroutine — a Process declared inline in the run body rather
-// than on a goroutine of its own (`go Process(name, f)`): killing it would
-// leave the simulation with no driver, so the crash is refused before anything
-// is torn down. Crash is a no-op outside a run.
-func Crash(name string) {
-	withBubbleFaultCaller("Crash", func() { crashProcess(name) })
+// CrashProcess kills the named process on host (pass host == "" for a process
+// declared on the unnamed root host) — the process-crash fault
+// (docs/dst/faults.md "Crash / restart faults"). Every goroutine of the
+// process's live invocations on that host is descheduled permanently (no defers
+// run — a killed process does not unwind), its pids read dead (Kill(pid, 0)
+// answers ESRCH and the /proc entries disappear), its open simulated files and
+// virtual fds close, fd-owned flocks release, shared mappings unregister (their
+// bytes already are the kernel page-cache pages), its connections RESET — the
+// kernel survives a process crash and answers for the dead sockets: the
+// surviving peer drains the bytes already delivered to it, then observes
+// ECONNRESET (in-flight bytes die; a conn whose victim end was already
+// app-closed is spared, its peer drains to io.EOF; a blackhole cut of the
+// victim→peer direction swallows the RST — the peer sees silence until a heal
+// lets its probes meet the CLOSED socket's RST) — and its listeners close. The
+// host filesystem survives untouched, unsynced writes included: a process crash
+// does not tear the disk; only the host-crash fault restores the durable image.
+// If the calling goroutine itself belongs to the victim (a self-crash — the OOM
+// shape), CrashProcess does not return. A subsequent same-name Process call on
+// that host is the restart: fresh pid and resource slot, inheriting nothing but
+// host state. CrashProcess panics during a run on an undeclared host, an
+// undeclared or not-live process name on that host (a typo'd victim must fail
+// loud, never silently fault nothing), and on a process whose goroutine set
+// includes the run's own main goroutine — a Process declared inline in the run
+// body rather than on a goroutine of its own (`go Process(name, f)`): killing
+// it would leave the simulation with no driver, so the crash is refused before
+// anything is torn down. CrashProcess is a no-op outside a run.
+func CrashProcess(host, proc string) {
+	withBubbleFaultCaller("CrashProcess", func() { crashProcess(host, proc) })
 	if dstSelfCrashed() {
 		dstParkCrashedSelf()
 	}
@@ -745,7 +809,7 @@ func Crash(name string) {
 // strand every later teardown).
 func crashHost(name string) {
 	host := lookupHost(name)
-	if host == 0 {
+	if host == 0 || !runActive.Load() {
 		return
 	}
 	// Refuse before anything is torn down (a multi-victim fault must not tear
@@ -753,7 +817,7 @@ func crashHost(name string) {
 	// lose power while the driver runs. This also catches a host whose only
 	// activity is the root process (no Process declared), whose goroutines the
 	// pid-keyed kill below would never reach.
-	if runActive.Load() && dstHostOwnsBubbleMain(host) {
+	if dstHostOwnsBubbleMain(host) {
 		panic("testing/simulation: CrashHost would destroy the machine the run's main goroutine runs on — declare crashable hosts and processes on their own goroutines (go Process(name, f) inside Host)")
 	}
 	procTeardownMu.Lock()
@@ -761,18 +825,16 @@ func crashHost(name string) {
 	// pid pre-scan's refusal, or the mark path's backstop — must not strand the
 	// mutex and deadlock every later teardown.
 	defer procTeardownMu.Unlock()
-	victims := activeProcsOnHost(host)
-	for _, proc := range victims {
-		for _, pid := range activeProcPIDs(proc) {
-			if dstPidOwnsBubbleMain(pid) {
-				panic("testing/simulation: CrashHost would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
-			}
+	victims := activeProcInstancesOnHost(host)
+	for _, inst := range victims {
+		if dstPidOwnsBubbleMain(inst.slot, inst.pid) {
+			panic("testing/simulation: CrashHost would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
 		}
 	}
 	// The machine's threads stop. That set is the UNION of two things, because
 	// neither alone is the machine:
 	//
-	//   - every goroutine of a process declared on the host (pid-keyed), which
+	//   - every goroutine of a process declared on the host (slot-keyed), which
 	//     also marks those pids dead for Kill and procfs. This leg matters for a
 	//     goroutine of the host's process that is momentarily stamped with
 	//     ANOTHER host (it entered a nested Host body): it is still a thread of
@@ -781,15 +843,13 @@ func crashHost(name string) {
 	//     contains this host, which catches the ROOT process's goroutines running
 	//     or descended from the machine's Host body even while nested in another
 	//     Host. The root process's own pid stays live — it is the driver, with
-	//     goroutines on other hosts — so the pid-keyed leg cannot reach them. A
+	//     goroutines on other hosts — so the process leg cannot reach them. A
 	//     host is not a process.
 	//
-	for _, proc := range victims {
-		for _, pid := range activeProcPIDs(proc) {
-			dstCrashProcessPid(pid)
-		}
-		activeProcClearAll(proc)
-		dstProcessStateTeardown(proc)
+	victims = activeProcPopHost(host)
+	for _, inst := range victims {
+		dstCrashProcessPid(inst.host, inst.slot, inst.pid)
+		dstProcessStateTeardown(inst.slot)
 	}
 	dstMarkHostGoroutinesCrashed(host)
 	// Kernel order, as in a process crash: the threads stop, then the kernel's
@@ -803,8 +863,8 @@ func crashHost(name string) {
 	// ECONNREFUSED) until a Host re-declaration reboots it. Marked down BEFORE
 	// the listeners close so no teardown ordering can expose a
 	// listener-closed-but-still-alive refusal window. The simulation-owned
-	// powered-off mark (Process refusal, boot-edge detection) is set alongside
-	// net's — one transition drives both.
+	// powered-off mark (boot-edge detection on the next Host/HostWith
+	// declaration) is set alongside net's — one transition drives both.
 	markHostDown(host)
 	dstNetPartitionOp(partOpHostDown, host, 0)
 	dstNetPartitionOp(partOpResetHost, host, 0)
@@ -843,7 +903,7 @@ func crashHost(name string) {
 // clean process-owned resources. Other hosts are untouched — their disks,
 // locks, and connections among themselves survive. CrashHost panics during a
 // run on an undeclared host name, and on a host owning the run's main goroutine
-// (see Crash); it is a no-op outside a run.
+// (see CrashProcess); it is a no-op outside a run.
 func CrashHost(name string) {
 	withBubbleFaultCaller("CrashHost", func() { crashHost(name) })
 	if dstSelfCrashed() {
@@ -851,31 +911,33 @@ func CrashHost(name string) {
 	}
 }
 
-// Process runs f as the named process — the unit of crash/restart and memory
-// isolation. A Process declared inside a Host body runs on that host; a Process
-// outside any Host gets an implicit dedicated host named after the process (the
-// common one-process-per-machine topology, so CrashHost(name) and Crash(name) both
-// address it; its os.Hostname is the process name). Process stamps the running
-// goroutine's process identity (and host, if it allocated an implicit one) and a
-// fresh per-process pid (os.Getpid) for the dynamic extent of f and restores them on
-// return, labeling the whole subtree. The body's return (or panic) is the process's
-// EXIT: goroutines it started that are still running are killed, its open simulated
-// files and virtual fds close (releasing flocks; shared mappings unregister while
-// their page-cache contents survive the exit), its listeners close, and
-// its connections close with the kernel's conditional — an end holding unread
+// Process runs f as the named process — the unit of crash/restart and OS
+// resource isolation. A Process declared inside a Host/HostWith body runs on
+// that host; a Process outside any Host runs on the unnamed root host (host 0,
+// addressed as host == "" in CrashProcess and ResetProcess) without creating an
+// implicit machine. Process names are scoped per host, so multiple hosts may
+// concurrently run processes with the same name (e.g. Process("server", ...)).
+// Each invocation receives a fresh per-process pid (os.Getpid) and a fresh
+// per-invocation OS resource slot (file descriptors, flocks, mappings, working
+// directory, environment variables, listeners, and sockets), while sharing the
+// logical (host, name) process counter for cumulative memory accounting across
+// restarts. The body's return (or panic) is the process's EXIT: goroutines it
+// started that are still running are killed, its open simulated files and
+// virtual fds close (releasing flocks; shared mappings unregister while their
+// page-cache contents survive the exit), its listeners close, and its
+// connections close with the kernel's conditional — an end holding unread
 // received data answers the peer with RST (ECONNRESET; a blackhole cut of the
 // RST's direction swallows it, and the peer's probes meet the CLOSED socket's
-// RST after heal instead), otherwise the peer drains
-// buffered bytes then reads io.EOF — so a
-// process that needs its work observed synchronizes before returning, exactly as a
-// real main must. A process is restarted by calling Process again with the same
-// name — it keeps the logical name but gets a new pid, as a real restart does, and
-// the restart inherits nothing from the exited invocation but the shared host state
-// (filesystem, page cache). During an active run Process must be called from a
-// goroutine the simulation schedules; a foreign caller panics, like the fault
-// APIs — it would start SUT goroutines outside the bubble, unscheduled by the
-// seed (see Host). Process runs in the root pid namespace; ProcessWith places
-// an invocation in a named one.
+// RST after heal instead), otherwise the peer drains buffered bytes then reads
+// io.EOF — so a process that needs its work observed synchronizes before
+// returning, exactly as a real main must. A process is restarted by calling
+// Process again with the same name on that host — it keeps the logical name but
+// gets a new pid and resource slot, inheriting nothing from the exited
+// invocation except the shared host state (filesystem, page cache). An empty
+// process name always panics. During an active run Process must be called from
+// a goroutine the simulation schedules; a foreign caller panics, like the fault
+// APIs. Process runs in the host's root pid namespace; ProcessWith places an
+// invocation in a named one.
 func Process(name string, f func()) {
 	processWith("Process", name, ProcessConfig{}, f)
 }
@@ -883,16 +945,16 @@ func Process(name string, f func()) {
 // ProcessConfig configures one Process invocation. The zero ProcessConfig is
 // Process's own behavior.
 type ProcessConfig struct {
-	// PIDNamespace places the invocation in the named pid namespace. Names
-	// intern per run to deterministic namespace identities (the same name is
-	// the same namespace — containers sharing a pod's pid namespace; a restart
-	// naming the same namespace keeps it); the empty name is the root
-	// namespace every process is in by default. Namespaces are SIBLINGS
-	// partitioning kill/procfs visibility over one global pid space:
-	// cross-namespace, kill(pid, 0) answers ESRCH and /proc/<pid>/stat does
-	// not exist — what peer containers see of each other. Namespace hierarchy
-	// and per-namespace pid numbering are not modeled (design.md, pid
-	// namespaces).
+	// PIDNamespace places the invocation in the named pid namespace on the
+	// current host boot. Names intern per (host, boot) to deterministic
+	// namespace identities (the same name on the same machine boot is the same
+	// namespace — containers sharing a pod's pid namespace; a restart naming
+	// the same namespace keeps it, while distinct hosts and reboots get fresh
+	// namespaces); the empty name is the host boot's root namespace every
+	// process is in by default. Namespaces are SIBLINGS partitioning
+	// kill/procfs visibility over the global pid space: cross-namespace (or
+	// cross-host), kill(pid, 0) answers ESRCH and /proc/<pid>/stat does not
+	// exist — what peer containers and distinct machines see of each other.
 	PIDNamespace string
 }
 
@@ -904,41 +966,30 @@ func ProcessWith(name string, config ProcessConfig, f func()) {
 func processWith(api, name string, config ProcessConfig, f func()) {
 	var declaredActive bool
 	var declaredEpoch uint64
-	var host, proc uint32
-	var oldH, oldP uint32
+	var host, proc, slot uint32
+	var oldH, oldP, oldSlot uint32
 	var simPid, oldPid int32
 	withBubbleDeclCaller(api, func() {
-		declaredActive = runActive.Load()
-		if declaredActive {
-			declaredEpoch = dstNetEpoch()
+		if name == "" {
+			panic("testing/simulation: " + api + " name must be non-empty")
 		}
-		// Admission is one transaction with teardown and competing starts: no
-		// caller can validate against the old liveness map and register later on
-		// a second host.
+		declaredActive = runActive.Load()
+		if !declaredActive {
+			return
+		}
+		declaredEpoch = dstNetEpoch()
+		// Admission is one transaction with teardown and competing starts.
 		procTeardownMu.Lock()
 		defer procTeardownMu.Unlock()
-		dstCheckPidAvailable()
 		host, _ = dstCurrentNode()
-		if host == 0 {
-			host = internHost(name)
-		}
-		proc = internProc(name)
-		if runActive.Load() && activeProcLivesElsewhere(proc, host) {
-			panic("testing/simulation: process " + strconv.Quote(name) + " is already live on another host; a logical process lives on one machine at a time (let it exit before restarting it elsewhere)")
-		}
-		if runActive.Load() && hostDown(host) {
-			// A process cannot run on a powered-off machine. A process restart does
-			// not reboot the host (only a Host re-declaration does — it also
-			// re-establishes the clock). The powered-off state is simulation-owned
-			// (nodeReg.down), so this refusal holds without net linked.
-			panic("testing/simulation: process " + strconv.Quote(name) + "'s host is powered off (CrashHost); model the reboot with a Host re-declaration, then restart its processes inside it")
-		}
-		ns := internPIDNS(config.PIDNamespace)
-		dstProcAllocEnsure(proc)
+		dstCheckPidAvailable()
+		proc, slot = admitProcAndSlot(host, name)
+		ns := internPIDNS(host, config.PIDNamespace)
 		oldH, oldP = dstSetNode(host, proc)
+		oldSlot = dstSetProcSlot(slot)
 		simPid = dstAllocPid()
 		oldPid = dstSetProcessPid(simPid)
-		activeProcSet(proc, host, simPid)
+		activeProcAdd(procInstance{proc: proc, host: host, pid: simPid, slot: slot})
 		// After dstSetNode: the registration stamps the incarnation's
 		// starttime from the TARGET host's uptime clock, read through the
 		// admitting goroutine's (just-set) host identity.
@@ -954,7 +1005,7 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 	// (during a panic unwind too: the enclosing process is dead, so the
 	// unwind is forfeit exactly like a crash victim's defers).
 	defer func() {
-		if runActive.Load() && oldPid > 0 && !dstPidAliveSim(oldPid) {
+		if runActive.Load() && oldSlot > 0 && !dstSlotAliveSim(oldSlot) {
 			dstParkCrashedSelf()
 		}
 	}()
@@ -963,7 +1014,7 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 		// Process body may span activation, but its stale proc/PID identity must
 		// never apply to that new run.
 		valid := declaredActive && runActive.Load() && dstNetEpoch() == declaredEpoch
-		if valid && activeProcLastInvocation(proc, simPid) && dstProcessHasResources(proc) {
+		if valid && dstProcessHasResources(slot) {
 			// Yield at user depth while still carrying simPid when this exiting
 			// invocation actually owns open kernel resources so DPOR has a
 			// scheduling boundary before kernel-owned exit teardown without
@@ -975,38 +1026,26 @@ func processWith(api, name string, config ProcessConfig, f func()) {
 		// so a concurrent crash of this logical process cannot mark the parked
 		// waiter (the sema dequeue additionally skips crashed waiters).
 		dstSetProcessPid(oldPid)
+		dstSetProcSlot(oldSlot)
 		dstSetNode(oldH, oldP)
 		if !valid {
 			return
 		}
-		// The last-invocation decision and the teardown it triggers are one
-		// critical section (procTeardownMu): a same-name restart cannot
-		// register between the two and have its fresh resources closed by the
-		// predecessor's teardown.
+		// Atomically pop this invocation's instance under procTeardownMu: if a
+		// concurrent CrashProcess, CrashHost, or mapping fault already claimed
+		// and tore down slot while this goroutine waited for procTeardownMu,
+		// activeProcPopSlot returns false and exit does nothing.
 		procTeardownMu.Lock()
 		defer procTeardownMu.Unlock()
-		last := activeProcLastInvocation(proc, simPid)
-		// A returning (or panicking) body models process EXIT: the kernel kills
-		// the invocation's remaining threads, then closes its fds — releasing
-		// flocks, unmapping (writable MAP_SHARED bytes persist: page cache
-		// belongs to the kernel) — and closes its sockets gracefully (the peer
-		// drains then reads io.EOF; RST is the crash fault's shape, not exit's).
-		// Without this the pid reads dead (Kill → ESRCH, procfs gone) while the
-		// invocation's goroutines, fds, and locks live on — a half-dead state no
-		// real kernel exhibits. The caller's own pid/node were restored above, so
-		// the pid-keyed goroutine kill never marks the returning goroutine; the
-		// proc-keyed resource half waits for the process's LAST live invocation.
-		// Outside an active run there is nothing to exit — the registries hold a
-		// finished run's leaked state (deterministic, host-isolated, meaningless),
-		// which teardown must not disturb.
-		dstStopProcessThreads(simPid)
-		if last {
-			dstProcessTeardown(proc)
-			dstNetPartitionOp(partOpCloseProcConns, proc, 0)
-			dstNetPartitionOp(partOpCloseProcListeners, proc, 0)
+		inst, ok := activeProcPopSlot(slot)
+		if !ok {
+			return
 		}
-		dstUnregisterPid(simPid)
-		activeProcClear(proc, simPid)
+		dstStopProcessThreads(inst.host, inst.slot, inst.pid)
+		dstProcessTeardown(inst.slot)
+		dstNetPartitionOp(partOpCloseProcConns, inst.slot, 0)
+		dstNetPartitionOp(partOpCloseProcListeners, inst.slot, 0)
+		dstUnregisterPid(inst.host, inst.pid)
 	}()
 	f()
 }

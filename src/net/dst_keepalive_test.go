@@ -37,7 +37,7 @@ const tcpUserTimeout = 18
 // accepts, optionally serves one initial one-byte exchange, then parks until
 // done. It reports the listen port.
 func dstKeepaliveServer(port chan<- string, done <-chan struct{}, exchange bool, lc ListenConfig, acceptedConn chan<- Conn) {
-	simulation.Host("A", simulation.HostConfig{}, func() {
+	simulation.Host("A", func() {
 		ln, err := lc.Listen(context.Background(), "tcp", ":0")
 		if err != nil {
 			panic(err)
@@ -80,12 +80,12 @@ func TestDSTNetControlSockopts(t *testing.T) {
 	}
 	var gotNetwork, gotAddress string
 	var defIdle, defIntvl, defCnt, defKA, setKA, setIdle int
-	var badIdleErr, nodelayErr error
+	var badIdleErr, nodelayOnErr, nodelayOffErr, unmodeledErr error
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, false, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			target := simulation.HostIP("A") + ":" + p
 			d := Dialer{Control: func(network, address string, rc syscall.RawConn) error {
@@ -105,7 +105,9 @@ func TestDSTNetControlSockopts(t *testing.T) {
 					setKA, _ = syscall.GetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
 					setIdle, _ = syscall.GetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE)
 					badIdleErr = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, 0)
-					nodelayErr = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+					nodelayOnErr = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+					nodelayOffErr = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 0)
+					unmodeledErr = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_MAXSEG, 1400)
 				})
 			}, KeepAlive: -1}
 			c, err := d.Dial("tcp", target)
@@ -131,8 +133,14 @@ func TestDSTNetControlSockopts(t *testing.T) {
 	if !errors.Is(badIdleErr, syscall.EINVAL) {
 		t.Errorf("TCP_KEEPIDLE=0 error = %v, want EINVAL", badIdleErr)
 	}
-	if !errors.Is(nodelayErr, syscall.ENOPROTOOPT) {
-		t.Errorf("TCP_NODELAY error = %v, want ENOPROTOOPT (unmodeled options are refused, never silently stored)", nodelayErr)
+	if nodelayOnErr != nil {
+		t.Errorf("TCP_NODELAY=1 error = %v, want nil", nodelayOnErr)
+	}
+	if !errors.Is(nodelayOffErr, syscall.ENOPROTOOPT) {
+		t.Errorf("TCP_NODELAY=0 error = %v, want ENOPROTOOPT", nodelayOffErr)
+	}
+	if !errors.Is(unmodeledErr, syscall.ENOPROTOOPT) {
+		t.Errorf("TCP_MAXSEG error = %v, want ENOPROTOOPT (unmodeled options are refused, never silently stored)", unmodeledErr)
 	}
 }
 
@@ -151,7 +159,7 @@ func TestDSTNetControlContextAndErrors(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, false, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			target := simulation.HostIP("A") + ":" + p
@@ -209,7 +217,7 @@ func TestDSTNetAcceptInheritsListenerSockopts(t *testing.T) {
 			KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 20 * time.Second},
 		}
 		dstKeepaliveServer(port, done, false, lc, accepted)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
@@ -266,7 +274,7 @@ func TestDSTNetGoKeepAliveResolution(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -281,7 +289,7 @@ func TestDSTNetGoKeepAliveResolution(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			target := simulation.HostIP("A") + ":" + p
@@ -348,7 +356,7 @@ func TestDSTNetKeepaliveDeathUnderCut(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAlive: -1, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -407,7 +415,7 @@ func TestDSTNetDefaultKeepaliveDeath(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -422,7 +430,7 @@ func TestDSTNetDefaultKeepaliveDeath(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			target := simulation.HostIP("A") + ":" + p
@@ -466,7 +474,7 @@ func TestDSTNetKeepaliveHealAnswersProbes(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -481,7 +489,7 @@ func TestDSTNetKeepaliveHealAnswersProbes(t *testing.T) {
 				ln.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			d := Dialer{KeepAlive: 10 * time.Second} // idle 10s, intvl 15s, cnt 9: death at 145s
 			c, err := d.Dial("tcp", simulation.HostIP("A")+":"+p)
@@ -491,7 +499,7 @@ func TestDSTNetKeepaliveHealAnswersProbes(t *testing.T) {
 			simulation.Partition("A", "B")
 			go func() {
 				time.Sleep(60 * time.Second) // inside the schedule
-				simulation.Heal("A", "B")
+				simulation.HealLink("A", "B")
 				close(done)
 			}()
 			buf := make([]byte, 2)
@@ -522,7 +530,7 @@ func TestDSTNetUserTimeoutOverridesHorizon(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAlive: -1, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -570,7 +578,7 @@ func TestDSTNetUserTimeoutZeroWindowDeath(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, false, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAlive: -1, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -610,7 +618,7 @@ func TestDSTNetKeepaliveEnabledPostEstablish(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("A")+":"+p)
@@ -729,7 +737,7 @@ func TestDSTNetUserTimeoutBoundsConnect(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			// No Accept: the dial dies in the blackhole before any
 			// connection could reach the backlog.
 			ln, err := Listen("tcp", ":0")
@@ -743,7 +751,7 @@ func TestDSTNetUserTimeoutBoundsConnect(t *testing.T) {
 				ln.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			simulation.Partition("A", "B")
@@ -755,7 +763,7 @@ func TestDSTNetUserTimeoutBoundsConnect(t *testing.T) {
 			start := time.Now()
 			_, dialErr = d.Dial("tcp", simulation.HostIP("A")+":"+p)
 			elapsed = time.Since(start)
-			simulation.Heal("A", "B")
+			simulation.HealLink("A", "B")
 		})
 	})
 	if !errors.Is(dialErr, syscall.ETIMEDOUT) {
@@ -780,7 +788,7 @@ func TestDSTNetKeepaliveReturnOnlyCutDeath(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3}}
@@ -823,7 +831,7 @@ func TestDSTNetKeepaliveSuppressedByOutstandingData(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			// A 6s keepalive budget (idle 5s + 1s×1), far under the 30s horizon.
@@ -866,7 +874,7 @@ func TestDSTNetUserTimeoutBoundsKeepalive(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAlive: -1, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -923,7 +931,7 @@ func TestDSTNetKeepaliveHealRecutRestartsBudget(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			// idle 10s + 5s×3 = a 25s deadline from the first cut.
@@ -941,7 +949,7 @@ func TestDSTNetKeepaliveHealRecutRestartsBudget(t *testing.T) {
 			simulation.Partition("A", "B")
 			go func() {
 				time.Sleep(12 * time.Second)
-				simulation.Heal("A", "B") // clear instant: probes answered
+				simulation.HealLink("A", "B") // clear instant: probes answered
 				time.Sleep(8 * time.Second)
 				simulation.Partition("A", "B") // recut at +20s
 			}()
@@ -978,7 +986,7 @@ func TestDSTNetKeepaliveInboundDataDefersProbes(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				panic(err)
@@ -1003,7 +1011,7 @@ func TestDSTNetKeepaliveInboundDataDefersProbes(t *testing.T) {
 				ln.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			// A schedule that would kill within ~25s if inbound data did
@@ -1048,7 +1056,7 @@ func TestDSTNetKeepaliveActivityResetsProbeCount(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				panic(err)
@@ -1077,7 +1085,7 @@ func TestDSTNetKeepaliveActivityResetsProbeCount(t *testing.T) {
 				ln.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			defer close(done)
 			p := <-port
 			d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3}}
@@ -1117,7 +1125,7 @@ func TestDSTNetKeepaliveDeterministic(t *testing.T) {
 			port := make(chan string, 1)
 			done := make(chan struct{})
 			dstKeepaliveServer(port, done, true, ListenConfig{}, nil)
-			simulation.Host("B", simulation.HostConfig{}, func() {
+			simulation.Host("B", func() {
 				defer close(done)
 				p := <-port
 				d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 7 * time.Second, Interval: 3 * time.Second, Count: 4}}

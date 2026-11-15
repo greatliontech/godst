@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"internal/race"
 	"internal/synctest"
@@ -45,10 +46,10 @@ func TestExploreAccessLogOverflowReportsIncomplete(t *testing.T) {
 	}
 	dstExploreInit(16, 64, 16, 0)
 	x := 0
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		dstAccessYield(unsafe.Pointer(&x), true)
 		x = 1
-		return false
+		return nil
 	})
 	if !tr.overflow {
 		t.Fatalf("access-log overflow did not mark trace incomplete")
@@ -64,10 +65,10 @@ func TestReplayInstallsAccessForces(t *testing.T) {
 	}
 
 	x := 0
-	sut := func() bool {
+	sut := func() error {
 		dstAccessYield(unsafe.Pointer(&x), true)
 		x = 1
-		return false
+		return nil
 	}
 
 	dstExploreInit(64, 64, 64, 64)
@@ -86,9 +87,9 @@ func TestReplayInstallsAccessForces(t *testing.T) {
 	}
 
 	dstAccessYieldReset()
-	failed, raced := Replay(1, Failure{AccessForces: []AccessForce{force}}, sut)
-	if failed || raced {
-		t.Fatalf("replay reported unexpected failure: failed=%v raced=%v", failed, raced)
+	rep := Replay(1, Failure{AccessForces: []AccessForce{force}}, sut)
+	if rep.Failed() {
+		t.Fatalf("replay reported unexpected failure: err=%v raced=%v", rep.Err, rep.Raced)
 	}
 	if got := dstAccessYieldFP(); got <= unforced {
 		t.Fatalf("Replay did not install the forced access yield: unforced=%d forced=%d", unforced, got)
@@ -111,7 +112,7 @@ func TestExploreForeignSpinner(t *testing.T) {
 		// it; TestExploreForeignSchedReported covers the -race behavior).
 		t.Skip("intentionally racy sut; non-race trace regression")
 	}
-	sut := func() bool {
+	sut := func() error {
 		x := 0
 		read := -1
 		var wg sync.WaitGroup
@@ -140,7 +141,10 @@ func TestExploreForeignSpinner(t *testing.T) {
 			runtime.Gosched()
 		}()
 		wg2.Wait()
-		return read == 0
+		if read == 0 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	alone := Explore(1, Exhaustive, sut)
 	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -261,7 +265,7 @@ func TestExploreForeignBubbleSyncChurn(t *testing.T) {
 	if dstRaceEnabledFP() {
 		t.Skip("intentionally racy sut; non-race trace regression (ForeignSched covers -race)")
 	}
-	sut := func() bool {
+	sut := func() error {
 		x := 0
 		read := -1
 		var wg sync.WaitGroup
@@ -280,7 +284,10 @@ func TestExploreForeignBubbleSyncChurn(t *testing.T) {
 			runtime.Gosched()
 		}()
 		wg2.Wait()
-		return read == 0
+		if read == 0 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	alone := Explore(1, Exhaustive, sut)
 	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -386,12 +393,12 @@ func TestExploreDoesNotConsumeForeignBubbleFailure(t *testing.T) {
 				select {}
 			})
 		}()
-		result := Explore(1, Exhaustive, func() bool {
+		result := Explore(1, Exhaustive, func() error {
 			trigger.Store(true)
 			for !done.Load() {
 				runtime.Gosched()
 			}
-			return false
+			return nil
 		})
 		if !propagated.Load() {
 			t.Fatal("foreign bubble failure was consumed")
@@ -456,7 +463,7 @@ func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
 	// foreign arrival at the recording surfaces is proven by causality, not
 	// assumed from scheduling analysis.
 	var foreignProgress atomic.Int64
-	sut := func() bool {
+	sut := func() error {
 		c0 := foreignProgress.Load()
 		for foreignProgress.Load() < c0+2 {
 			runtime.Gosched()
@@ -477,7 +484,10 @@ func TestExploreForeignBubbleSyncChurnRace(t *testing.T) {
 			runtime.Gosched()
 		}()
 		wg2.Wait()
-		return <-ch == 1
+		if <-ch == 1 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	var stop, started atomic.Bool
 	var done sync.WaitGroup
@@ -555,7 +565,7 @@ func TestExploreForeignGCWorkloadInsensitive(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		ch1 := make(chan struct{})
 		ch2 := make(chan struct{})
 		var wg sync.WaitGroup
@@ -575,7 +585,7 @@ func TestExploreForeignGCWorkloadInsensitive(t *testing.T) {
 		runtime.GC()
 		<-ch1
 		wg.Wait()
-		return false
+		return nil
 	}
 	alone := Explore(1, Exhaustive, sut)
 	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -627,11 +637,11 @@ func TestExploreCoalescesSingletonStutter(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		for range 8 {
 			runtime.Gosched()
 		}
-		return false
+		return nil
 	}
 	Explore(1, Exhaustive, sut)
 	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -651,7 +661,7 @@ func TestExploreForeignPriorRootSpinner(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		ch := make(chan struct{}, 1)
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -662,7 +672,7 @@ func TestExploreForeignPriorRootSpinner(t *testing.T) {
 		ch <- struct{}{}
 		runtime.Gosched()
 		wg.Wait()
-		return false
+		return nil
 	}
 	alone := Explore(1, Exhaustive, sut)
 	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -725,7 +735,7 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 	}
 	var mainRan atomic.Bool
 	var drainInterrupted atomic.Bool
-	sut := func() bool {
+	sut := func() error {
 		mainRan.Store(false)
 		ch1 := make(chan struct{}, 1)
 		ch2 := make(chan struct{}, 1)
@@ -755,7 +765,7 @@ func TestExploreForeignSpinnerDrainCallback(t *testing.T) {
 		<-ch1
 		mainRan.Store(true)
 		wg.Wait()
-		return false
+		return nil
 	}
 	Explore(1, Exhaustive, sut) // also initializes the trace buffers
 	_, _, trAlone := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -834,7 +844,7 @@ func TestExploreForeignSchedReported(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		ch := make(chan struct{}, 1)
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -844,7 +854,7 @@ func TestExploreForeignSchedReported(t *testing.T) {
 		}()
 		ch <- struct{}{}
 		wg.Wait()
-		return false
+		return nil
 	}
 	alone := Explore(1, Exhaustive, sut)
 	if alone.ForeignSched || !alone.Exhausted {
@@ -879,13 +889,13 @@ func TestExploreRaceAttributionRequiresForeignFreeRun(t *testing.T) {
 	appendRunFailures(&foreign, []uint64{1}, nil, runResult{
 		raceCount: 2,
 		tr:        exploreTrace{foreignSched: true},
-	})
+	}, Options{})
 	if foreign.UnattributedRaces != 2 || len(foreign.Failures) != 0 {
 		t.Fatalf("foreign race aggregation = unattributed %d, failures %v", foreign.UnattributedRaces, foreign.Failures)
 	}
 
 	var isolated ExploreResult
-	appendRunFailures(&isolated, []uint64{1}, nil, runResult{raceCount: 2})
+	appendRunFailures(&isolated, []uint64{1}, nil, runResult{raceCount: 2}, Options{})
 	if isolated.UnattributedRaces != 0 || len(isolated.Failures) != 2 || !isolated.Failures[0].Race || !isolated.Failures[1].Race {
 		t.Fatalf("isolated race aggregation = unattributed %d, failures %v", isolated.UnattributedRaces, isolated.Failures)
 	}
@@ -932,9 +942,9 @@ func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
 	var got any
 	func() {
 		defer func() { got = recover() }()
-		ExploreWith(1, ExploreOptions{Mode: ExploreMode(99), CrashTear: true}, func() bool {
+		ExploreWith(1, ExploreOptions{Mode: ExploreMode(99), Options: Options{CrashTear: true}}, func() error {
 			called = true
-			return false
+			return nil
 		})
 	}()
 	if got == nil || !strings.Contains(fmt.Sprint(got), "unknown ExploreMode") {
@@ -951,7 +961,7 @@ func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
 		return
 	}
 	invocations := 0
-	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 20}, func() bool {
+	res := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 20}, func() error {
 		invocations++
 		var wg sync.WaitGroup
 		wg.Add(3)
@@ -962,7 +972,7 @@ func TestExploreWithRejectsUnknownModeBeforeActivation(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-		return false
+		return nil
 	})
 	if invocations != 20 || res.Schedules != 20 {
 		t.Fatalf("valid exploration after rejection = invocations %d, schedules %d; want 20, 20", invocations, res.Schedules)
@@ -986,7 +996,7 @@ func TestDPORBudgetedRaceReachesShallowReversals(t *testing.T) {
 		t.Skip("requires -race (the race path's queued walk)")
 	}
 	outcomes := map[int]bool{}
-	sut := func() bool {
+	sut := func() error {
 		var mu sync.Mutex
 		var x, tail int
 		start := make(chan struct{})
@@ -1009,7 +1019,7 @@ func TestDPORBudgetedRaceReachesShallowReversals(t *testing.T) {
 		<-done
 		<-done
 		outcomes[x] = true
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 60}, sut)
 	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
@@ -1037,7 +1047,7 @@ func TestDPORBudgetedRaceCrossesLongRegions(t *testing.T) {
 		t.Skip("requires -race (the race path)")
 	}
 	outcomes := map[int]bool{}
-	sut := func() bool {
+	sut := func() error {
 		var mu sync.Mutex
 		var x, tail int
 		start := make(chan struct{})
@@ -1060,7 +1070,7 @@ func TestDPORBudgetedRaceCrossesLongRegions(t *testing.T) {
 		<-done
 		<-done
 		outcomes[x] = true
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 60}, sut)
 	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
@@ -1088,7 +1098,7 @@ func TestDPORRaceTruncatedTraceHarvestsAnchors(t *testing.T) {
 		t.Skip("requires -race (the queued race walk's truncation clause)")
 	}
 	outcomes := map[int]bool{}
-	sut := func() bool {
+	sut := func() error {
 		var mu sync.Mutex
 		var x, tail int
 		start := make(chan struct{})
@@ -1111,7 +1121,7 @@ func TestDPORRaceTruncatedTraceHarvestsAnchors(t *testing.T) {
 		<-done
 		<-done
 		outcomes[x] = true
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 40, MaxSteps: 200}, sut)
 	t.Logf("schedules=%d exhausted=%v outcomes=%v", res.Schedules, res.Exhausted, outcomes)
@@ -1139,7 +1149,7 @@ func TestExploreResetsScheduledIdentityAcrossRuns(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -1148,7 +1158,7 @@ func TestExploreResetsScheduledIdentityAcrossRuns(t *testing.T) {
 		}()
 		time.Sleep(time.Millisecond)
 		wg.Wait()
-		return false
+		return nil
 	}
 	for i := 0; i < 3; i++ {
 		_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -1174,13 +1184,13 @@ func TestPublicExploreGuardsBeforeTraceInit(t *testing.T) {
 		{
 			name: "ExploreWith",
 			call: func() {
-				ExploreWith(1, ExploreOptions{MaxSchedules: 1}, func() bool { return false })
+				ExploreWith(1, ExploreOptions{MaxSchedules: 1}, func() error { return nil })
 			},
 		},
 		{
 			name: "Replay",
 			call: func() {
-				Replay(1, Failure{}, func() bool { return false })
+				Replay(1, Failure{}, func() error { return nil })
 			},
 		},
 	} {
@@ -1205,10 +1215,10 @@ func TestPublicExploreGuardsBeforeTraceInit(t *testing.T) {
 			}
 
 			x := 0
-			_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+			_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 				dstAccessYield(unsafe.Pointer(&x), true)
 				x++
-				return false
+				return nil
 			})
 			if !tr.overflow {
 				t.Fatalf("%s mutated trace buffers before rejecting overlap", tt.name)
@@ -1676,13 +1686,13 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	dstExploreInit(64, 64, 64, 0)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		done := make(chan struct{})
 		go func() {
 			close(done)
 		}()
 		<-done
-		return false
+		return nil
 	})
 	found := false
 	for i := range tr.edgeFrom {
@@ -1710,7 +1720,7 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 	x := new(int)
 	addr := uintptr(unsafe.Pointer(x))
 	dstExploreInit(128, 512, 128, 512)
-	_, _, wgTr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, wgTr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -1719,7 +1729,7 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 		}()
 		wg.Wait()
 		dstAccessYield(unsafe.Pointer(x), false)
-		return false
+		return nil
 	})
 	write, read := -1, -1
 	for i := range wgTr.accSeq {
@@ -1745,7 +1755,7 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 	// failed RWMutex.TryLock's internal rw.w.Unlock or explicit RaceDisable)
 	// must NOT record a ready HB edge that TSan suppresses.
 	dstExploreInit(128, 512, 128, 512)
-	_, _, ignTr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, ignTr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		var mu sync.Mutex
 		done := make(chan struct{})
 		mu.Lock()
@@ -1761,7 +1771,7 @@ func TestExploreRecordsCreateHBEdge(t *testing.T) {
 		mu.Unlock()
 		race.Enable()
 		<-done
-		return false
+		return nil
 	})
 	write, read = -1, -1
 	for i := range ignTr.accSeq {
@@ -1794,7 +1804,7 @@ func TestExploreRecordsBufferedChannelHB(t *testing.T) {
 	x := new(int)
 	addr := uintptr(unsafe.Pointer(x))
 	dstExploreInit(128, 512, 128, 512)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		ch := make(chan struct{}, 1)
 		var wg sync.WaitGroup
 		dstAccessYield(unsafe.Pointer(x), true)
@@ -1808,7 +1818,7 @@ func TestExploreRecordsBufferedChannelHB(t *testing.T) {
 			_ = *x
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	release, acquire := false, false
 	for _, k := range tr.syncKind {
@@ -1847,12 +1857,12 @@ func TestExploreRecordsBufferedChannelZeroSizeSlotIDs(t *testing.T) {
 		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
 	}
 	dstExploreInit(128, 512, 128, 512)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		ch := make(chan struct{}, 2)
 		ch <- struct{}{}
 		ch <- struct{}{}
 		<-ch
-		return false
+		return nil
 	})
 	releases := map[syncObjectKey]bool{}
 	for i, k := range tr.syncKind {
@@ -1879,7 +1889,7 @@ func TestExploreRendezvousAndCloseDistinctSyncObjects(t *testing.T) {
 		t.Skip("channel HB events are emitted by dst-race sync hooks")
 	}
 	dstExploreInit(256, 1024, 256, 1024)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		ch := make(chan int)
 		done := make(chan struct{})
 		go func() {
@@ -1890,7 +1900,7 @@ func TestExploreRendezvousAndCloseDistinctSyncObjects(t *testing.T) {
 		<-done
 		close(ch)
 		<-ch // closed receive
-		return false
+		return nil
 	})
 	auxByKindRendezvous := false
 	auxZeroRelease := false
@@ -1922,7 +1932,7 @@ func TestExploreRecordsBufferedSlotReuseEdges(t *testing.T) {
 	}
 	dstExploreInit(256, 1024, 256, 1024)
 	var senderSeq, receiverSeq uint64
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		senderSeq = dstCurrentSeqFP()
 		ch := make(chan int, 1)
 		ch <- 1
@@ -1939,7 +1949,7 @@ func TestExploreRecordsBufferedSlotReuseEdges(t *testing.T) {
 		time.Sleep(time.Nanosecond)
 		ch <- 2 // empty-buffer direct handoff to the waiting receiver
 		<-done
-		return false
+		return nil
 	})
 	slotReleases, slotAcquires := 0, 0
 	for i := range tr.syncKind {
@@ -1983,7 +1993,7 @@ func TestExploreRecordsFullBufferedChannelSenderRelease(t *testing.T) {
 	}
 	x := new(int)
 	addr := uintptr(unsafe.Pointer(x))
-	sut := func() bool {
+	sut := func() error {
 		ch := make(chan int, 1)
 		ready := make(chan struct{})
 		ch <- 0
@@ -2001,7 +2011,7 @@ func TestExploreRecordsFullBufferedChannelSenderRelease(t *testing.T) {
 		if got := <-ch; got != 1 {
 			t.Fatalf("second receive got %d, want blocked sender value", got)
 		}
-		return false
+		return nil
 	}
 	dstExploreInit(128, 512, 128, 512)
 	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, sut)
@@ -2037,7 +2047,7 @@ func TestExploreRecordsSelectBufferedChannelHB(t *testing.T) {
 		t.Skip("buffered channel HB events are emitted by dst-race sync hooks")
 	}
 	dstExploreInit(128, 512, 128, 512)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		ch := make(chan int, 1)
 		other := make(chan int)
 		select {
@@ -2048,7 +2058,7 @@ func TestExploreRecordsSelectBufferedChannelHB(t *testing.T) {
 		case <-ch:
 		case <-other:
 		}
-		return false
+		return nil
 	})
 	release := map[syncObjectKey]bool{}
 	for i, k := range tr.syncKind {
@@ -2075,12 +2085,12 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name string
-		sut  func(unsafe.Pointer) func() bool
+		sut  func(unsafe.Pointer) func() error
 	}{
 		{
 			name: "SendToReceive",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2096,14 +2106,14 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 						ch <- struct{}{}
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "ReceiveToSendComplete",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2119,14 +2129,14 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 						<-ch
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "ParkedSenderToReceive",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2142,14 +2152,14 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 						dstAccessYield(marker, false)
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "ParkedReceiverToSendComplete",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2165,7 +2175,7 @@ func TestExploreRecordsUnbufferedChannelHB(t *testing.T) {
 						dstAccessYield(marker, false)
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
@@ -2207,12 +2217,12 @@ func TestExploreRecordsChannelCloseHB(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name string
-		sut  func(unsafe.Pointer) func() bool
+		sut  func(unsafe.Pointer) func() error
 	}{
 		{
 			name: "ReceiveAfterClose",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2227,14 +2237,14 @@ func TestExploreRecordsChannelCloseHB(t *testing.T) {
 						dstAccessYield(marker, false)
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "SelectReceiveAfterClose",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					ch := make(chan struct{})
 					other := make(chan struct{})
 					var wg sync.WaitGroup
@@ -2253,7 +2263,7 @@ func TestExploreRecordsChannelCloseHB(t *testing.T) {
 						dstAccessYield(marker, false)
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
@@ -2264,7 +2274,7 @@ func TestExploreRecordsChannelCloseHB(t *testing.T) {
 	}
 }
 
-func assertChannelHBTrace(t *testing.T, sutForMarker func(unsafe.Pointer) func() bool) (exploreTrace, uint64, uint64) {
+func assertChannelHBTrace(t *testing.T, sutForMarker func(unsafe.Pointer) func() error) (exploreTrace, uint64, uint64) {
 	t.Helper()
 	marker := new(int)
 	addr := uintptr(unsafe.Pointer(marker))
@@ -2303,7 +2313,7 @@ func TestExploreRecordsMutexHB(t *testing.T) {
 	x := new(int)
 	addr := uintptr(unsafe.Pointer(x))
 	dstExploreInit(128, 512, 128, 512)
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		mu.Lock()
 		dstAccessYield(unsafe.Pointer(x), true)
 		*x = 1
@@ -2318,7 +2328,7 @@ func TestExploreRecordsMutexHB(t *testing.T) {
 			mu.Unlock()
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	release, acquire := false, false
 	for _, k := range tr.syncKind {
@@ -2358,12 +2368,12 @@ func TestExploreLiveSyncHBFiltersProtectedAccesses(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name string
-		sut  func(unsafe.Pointer, bool) func() bool
+		sut  func(unsafe.Pointer, bool) func() error
 	}{
 		{
 			name: "Mutex",
-			sut: func(marker unsafe.Pointer, record bool) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer, record bool) func() error {
+				return func() error {
 					var mu sync.Mutex
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2380,14 +2390,14 @@ func TestExploreLiveSyncHBFiltersProtectedAccesses(t *testing.T) {
 						}()
 					}
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "ChannelToken",
-			sut: func(marker unsafe.Pointer, record bool) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer, record bool) func() error {
+				return func() error {
 					ch := make(chan struct{}, 1)
 					ch <- struct{}{}
 					var wg sync.WaitGroup
@@ -2405,7 +2415,7 @@ func TestExploreLiveSyncHBFiltersProtectedAccesses(t *testing.T) {
 						}()
 					}
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
@@ -2440,7 +2450,7 @@ func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
 	marker := new(int)
 	addr := uintptr(unsafe.Pointer(marker))
 	var wgAddr uintptr
-	sut := func() bool {
+	sut := func() error {
 		var rw sync.RWMutex
 		var wg sync.WaitGroup
 		wgAddr = uintptr(unsafe.Pointer(&wg))
@@ -2460,7 +2470,7 @@ func TestExploreRWMutexFailedTryLockDoesNotRecordHB(t *testing.T) {
 			rw.Unlock()
 		}()
 		wg.Wait()
-		return false
+		return nil
 	}
 
 	dstExploreInit(256, 4096, 512, 512)
@@ -2517,12 +2527,12 @@ func TestExploreRecordsRWMutexHB(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name string
-		sut  func(unsafe.Pointer) func() bool
+		sut  func(unsafe.Pointer) func() error
 	}{
 		{
 			name: "UnlockToLock",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					var rw sync.RWMutex
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2540,14 +2550,14 @@ func TestExploreRecordsRWMutexHB(t *testing.T) {
 						rw.Unlock()
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "UnlockToTryLock",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					var rw sync.RWMutex
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2570,14 +2580,14 @@ func TestExploreRecordsRWMutexHB(t *testing.T) {
 						}
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "UnlockToRLock",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					var rw sync.RWMutex
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2595,14 +2605,14 @@ func TestExploreRecordsRWMutexHB(t *testing.T) {
 						rw.RUnlock()
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
 		{
 			name: "RUnlockToLock",
-			sut: func(marker unsafe.Pointer) func() bool {
-				return func() bool {
+			sut: func(marker unsafe.Pointer) func() error {
+				return func() error {
 					var rw sync.RWMutex
 					var wg sync.WaitGroup
 					wg.Add(2)
@@ -2620,7 +2630,7 @@ func TestExploreRecordsRWMutexHB(t *testing.T) {
 						rw.Unlock()
 					}()
 					wg.Wait()
-					return false
+					return nil
 				}
 			},
 		},
@@ -2683,7 +2693,7 @@ func TestExplorePostGoBoundaryNonRace(t *testing.T) {
 	if dstRaceEnabledFP() {
 		t.Skip("non-race post-go boundary regression")
 	}
-	sut := func() bool {
+	sut := func() error {
 		x := 0
 		read := -1
 		var wg sync.WaitGroup
@@ -2694,7 +2704,10 @@ func TestExplorePostGoBoundaryNonRace(t *testing.T) {
 		}()
 		x = 1
 		wg.Wait()
-		return read == 0
+		if read == 0 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	res := Explore(1, Exhaustive, sut)
 	if !res.Exhausted || res.Overflow || res.BudgetHit {
@@ -2703,9 +2716,9 @@ func TestExplorePostGoBoundaryNonRace(t *testing.T) {
 	if len(res.Failures) == 0 {
 		t.Fatalf("Explore missed child-before-parent-write after go statement: schedules=%d", res.Schedules)
 	}
-	failed, raced := Replay(1, res.Failures[0], sut)
-	if !failed || raced {
-		t.Fatalf("post-go failure did not replay as assertion failure: failed=%v raced=%v failure=%#v", failed, raced, res.Failures[0])
+	rep := Replay(1, res.Failures[0], sut)
+	if rep.Err == nil || rep.Raced {
+		t.Fatalf("post-go failure did not replay as assertion failure: err=%v raced=%v failure=%#v", rep.Err, rep.Raced, res.Failures[0])
 	}
 }
 
@@ -2718,7 +2731,7 @@ func TestExplorePostGoBoundaryCanBeDisabled(t *testing.T) {
 	}
 	old := dstSetPostGoYield(false)
 	defer dstSetPostGoYield(old)
-	res := Explore(1, Exhaustive, func() bool {
+	res := Explore(1, Exhaustive, func() error {
 		x := 0
 		read := -1
 		var wg sync.WaitGroup
@@ -2729,7 +2742,10 @@ func TestExplorePostGoBoundaryCanBeDisabled(t *testing.T) {
 		}()
 		x = 1
 		wg.Wait()
-		return read == 0
+		if read == 0 {
+			return errors.New("sut failed")
+		}
+		return nil
 	})
 	if len(res.Failures) != 0 {
 		t.Fatalf("disabled post-go boundary still explored child-before-parent write: %#v", res.Failures)
@@ -2779,7 +2795,7 @@ func TestExploreDrainPanicDiscardsResidualCallbacks(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	want := "finalizer callback boom"
-	sut := func() bool {
+	sut := func() error {
 		makeExploreFinalizerPanic(want)
 		runtime.GC()
 		time.Sleep(time.Millisecond) // drain panics; recorded, drain dead
@@ -2787,7 +2803,7 @@ func TestExploreDrainPanicDiscardsResidualCallbacks(t *testing.T) {
 		makeExploreFinalizerChanTouch(ch)
 		runtime.GC()
 		time.Sleep(time.Millisecond) // dead drain: the queued finalizer must be discarded
-		return false
+		return nil
 	}
 	res := Explore(1, DPOR, sut)
 	if len(res.Failures) != 1 || res.Failures[0].Panic != want {
@@ -2825,7 +2841,7 @@ func TestExploreReportsPanicFailure(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool { panic("boom") }
+	sut := func() error { panic("boom") }
 	res := Explore(1, DPOR, sut)
 	if len(res.Failures) != 1 || res.Failures[0].Panic != "boom" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
 		t.Fatalf("panic was not reported as a replayable failure: %#v", res.Failures)
@@ -2842,7 +2858,7 @@ func TestExploreReportsPanicFailure(t *testing.T) {
 	if !panicked {
 		t.Fatalf("Replay of panic failure did not panic")
 	}
-	res = Explore(1, DPOR, func() bool { panic(emptyPanicError{}) })
+	res = Explore(1, DPOR, func() error { panic(emptyPanicError{}) })
 	if len(res.Failures) != 1 || res.Failures[0].Panic == "" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
 		t.Fatalf("empty-message error panic was not reported as a replayable failure: %#v", res.Failures)
 	}
@@ -2852,7 +2868,7 @@ func TestExploreReportsChildPanicFailure(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -2860,7 +2876,7 @@ func TestExploreReportsChildPanicFailure(t *testing.T) {
 			panic("child boom")
 		}()
 		wg.Wait()
-		return false
+		return nil
 	}
 	res := Explore(1, DPOR, sut)
 	if len(res.Failures) != 1 || res.Failures[0].Panic != "child boom" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
@@ -2893,10 +2909,10 @@ func TestExploreReportsDrainCallbackPanicFailure(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			want := tt.name + " callback boom"
-			sut := func() bool {
+			sut := func() error {
 				tt.make(want)
 				time.Sleep(time.Millisecond)
-				return false
+				return nil
 			}
 			res := Explore(1, DPOR, sut)
 			if len(res.Failures) != 1 || res.Failures[0].Panic != want || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
@@ -2931,7 +2947,7 @@ func TestExploreReportsDrainCallbackPanicBeforeLaterTopPanic(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			want := tt.name + " callback boom"
-			sut := func() bool {
+			sut := func() error {
 				ch := make(chan struct{})
 				tt.make(exploreCallbackSignal{ch: ch, msg: want})
 				<-ch
@@ -2950,7 +2966,7 @@ func TestExploreReportsNestedChildPanicClearsPanicDefers(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	before := dstRunningPanicDefersFP()
-	sut := func() bool {
+	sut := func() error {
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -2959,7 +2975,7 @@ func TestExploreReportsNestedChildPanicClearsPanicDefers(t *testing.T) {
 			panic("outer")
 		}()
 		wg.Wait()
-		return false
+		return nil
 	}
 	res := Explore(1, DPOR, sut)
 	if len(res.Failures) != 1 || res.Failures[0].Panic != "inner" || res.Failures[0].Deadlock != "" || res.Failures[0].Race {
@@ -2974,10 +2990,10 @@ func TestExploreReportsDeadlockFailure(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		ch := make(chan struct{})
 		<-ch
-		return false
+		return nil
 	}
 	res := Explore(1, Exhaustive, sut)
 	if len(res.Failures) != 1 || res.Failures[0].Deadlock == "" || res.Failures[0].Panic != "" || res.Failures[0].Race {
@@ -2995,7 +3011,7 @@ func TestExploreReportsDeadlockFailure(t *testing.T) {
 	if !panicked {
 		t.Fatalf("Replay of deadlock failure did not panic")
 	}
-	clean := Explore(1, Exhaustive, func() bool { return false })
+	clean := Explore(1, Exhaustive, func() error { return nil })
 	if !clean.Exhausted || clean.Overflow || clean.BudgetHit || len(clean.Failures) != 0 {
 		t.Fatalf("deadlocked bubble state affected later Explore run: %#v", clean)
 	}
@@ -3007,7 +3023,7 @@ func TestExploreReportsDeadlockFailure(t *testing.T) {
 // in-process, and an actually-racy SUT would leak a TSan report past the
 // harness under -race (the -tags dst -race suite must stay clean; the race
 // oracle itself is enforced by the subprocess-based oracle tests).
-func budgetedExploreSUT() bool {
+func budgetedExploreSUT() error {
 	var mu sync.Mutex
 	var x int
 	var wg sync.WaitGroup
@@ -3027,7 +3043,7 @@ func budgetedExploreSUT() bool {
 		mu.Unlock()
 	}()
 	wg.Wait()
-	return false
+	return nil
 }
 
 func TestExploreWithScheduleBudgetReportsIncomplete(t *testing.T) {
@@ -3076,7 +3092,7 @@ func TestExploreOptionsBudgetKnobs(t *testing.T) {
 		t.Fatalf("the 32-bit derived-budget clamp did not hold: %+v", cfg)
 	}
 	if ^uint(0)>>32 != 0 {
-		over := int(uint64(1)<<40 & uint64(^uint(0)>>1))
+		over := int(uint64(1) << 40 & uint64(^uint(0)>>1))
 		cfg = exploreConfigFromOptions(ExploreOptions{MaxAccesses: over, MaxEdges: over})
 		if cfg.maxAccesses != exploreBudgetClamp || cfg.maxEdges != exploreBudgetClamp {
 			t.Fatalf("the 64-bit soundness clamp did not hold: %+v", cfg)
@@ -3104,7 +3120,7 @@ func TestExploreAccessBudgetKnobLiftsOverflow(t *testing.T) {
 	if !dstRaceEnabledFP() {
 		t.Skip("requires -race so accesses are recorded")
 	}
-	sut := func() bool {
+	sut := func() error {
 		buf := make([]byte, 4096)
 		var wg sync.WaitGroup
 		for g := 0; g < 2; g++ {
@@ -3117,7 +3133,7 @@ func TestExploreAccessBudgetKnobLiftsOverflow(t *testing.T) {
 			}(g)
 		}
 		wg.Wait()
-		return false
+		return nil
 	}
 	small := ExploreWith(11, ExploreOptions{Mode: DPOR, MaxSchedules: 4, MaxAccesses: 64}, sut)
 	if !small.Overflow {
@@ -3160,7 +3176,7 @@ func TestExploreFilterPageIndexFindsConflicts(t *testing.T) {
 	yields := func(annA, annB func()) uint64 {
 		dstExploreInit(1024, 4096, 1024, 1024)
 		dstAccessYieldReset()
-		runOnce(1, nil, map[accessForce]bool{}, func() bool {
+		runOnce(1, nil, map[accessForce]bool{}, func() error {
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
@@ -3172,7 +3188,7 @@ func TestExploreFilterPageIndexFindsConflicts(t *testing.T) {
 				annB()
 			}()
 			wg.Wait()
-			return false
+			return nil
 		})
 		return dstAccessYieldFP()
 	}
@@ -3258,12 +3274,12 @@ func TestExploreFilterPageIndexExhaustionConservative(t *testing.T) {
 		t.Skip("requires -race so the shared-address filter is active")
 	}
 	buf := make([]byte, 1<<17)
-	sut := func() bool {
+	sut := func() error {
 		for i := 0; i < 3; i++ {
 			dstAccessYieldRange(unsafe.Pointer(&buf[i*8192]), 7*256, true)
 		}
 		dstAccessYield(unsafe.Pointer(&buf[1<<16]), true)
-		return false
+		return nil
 	}
 	yields := func(maxAccesses int) uint64 {
 		dstExploreInit(64, 256, 64, maxAccesses)
@@ -3313,13 +3329,13 @@ func TestExploreSyncEventOverflowReportsIncomplete(t *testing.T) {
 	// the mutation that deletes the fold must FAIL here).
 	dstExploreInit(1<<14, 1<<18, 4, 1<<20)
 	dstAccessYieldReset()
-	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() bool {
+	_, _, tr := runOnce(1, nil, map[accessForce]bool{}, func() error {
 		ch := make(chan int, 1)
 		for i := 0; i < 32; i++ {
 			ch <- i
 			<-ch
 		}
-		return false
+		return nil
 	})
 	if !dstSyncEventOverflowProbe() {
 		t.Fatalf("the SUT did not overflow the sync-event buffer — test is vacuous, raise the op count or lower maxEdges")
@@ -3374,7 +3390,7 @@ func TestExploreFanOutOverflowIsNotBudgetHit(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, func() bool {
+	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, func() error {
 		var wg sync.WaitGroup
 		release := make(chan struct{})
 		for i := 0; i < 300; i++ {
@@ -3386,7 +3402,7 @@ func TestExploreFanOutOverflowIsNotBudgetHit(t *testing.T) {
 		}
 		close(release)
 		wg.Wait()
-		return false
+		return nil
 	})
 	if !res.Overflow {
 		t.Errorf("Overflow = false, want true: the enabled-set fan-out exceeded the internal capacity")
@@ -3410,7 +3426,7 @@ func TestExploreTruncatedFailureReplays(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var wg sync.WaitGroup
 		release := make(chan struct{})
 		for i := 0; i < 300; i++ { // overflow the fan-out capacity mid-ramp
@@ -3422,14 +3438,13 @@ func TestExploreTruncatedFailureReplays(t *testing.T) {
 		}
 		close(release)
 		wg.Wait() // the fan-out shrinks back to 1: resumed recording would gap here
-		return true
+		return errors.New("sut failed")
 	}
 	res := ExploreWith(1, ExploreOptions{MaxSteps: 512}, sut)
 	if len(res.Failures) == 0 {
 		t.Fatal("the failing SUT produced no failure")
 	}
-	failed, _ := Replay(1, res.Failures[0], sut)
-	if !failed {
+	if Replay(1, res.Failures[0], sut).Err == nil {
 		t.Error("replay of the truncated-trace failure did not reproduce the assertion failure")
 	}
 }
@@ -3474,7 +3489,7 @@ func TestExploreDPORTruncatedChildContinuesWalk(t *testing.T) {
 		// documented in exploration.md's truncation clause.
 		t.Skip("intentionally racy sut; pins the non-race DFS continuation")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var b, a int
 		bWas := dporConflict(&b) // shallow conflict: seeds a backtrack first
 		aWas := dporConflict(&a) // deeper conflict
@@ -3494,7 +3509,10 @@ func TestExploreDPORTruncatedChildContinuesWalk(t *testing.T) {
 			close(release)
 			wg.Wait()
 		}
-		return bWas == 1 // the failure is reachable only via b's reversal
+		if bWas == 1 {
+			return errors.New("sut failed")
+		}
+		return nil // the failure is reachable only via b's reversal
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 256}, sut)
 	if !res.Overflow {
@@ -3534,7 +3552,7 @@ func TestExploreDPORTruncatedChildNoExtensionExplosion(t *testing.T) {
 		t.Skip("intentionally racy sut; pins the non-race DFS extension-skip")
 	}
 	const k = 6
-	sut := func() bool {
+	sut := func() error {
 		vars := make([]int, k)
 		for i := range vars {
 			_ = dporConflict(&vars[i]) // k independent recorded conflicts
@@ -3552,7 +3570,7 @@ func TestExploreDPORTruncatedChildNoExtensionExplosion(t *testing.T) {
 		}
 		close(release)
 		wg.Wait()
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 256}, sut)
 	if !res.Overflow {
@@ -3577,7 +3595,7 @@ func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 512}, func() bool {
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSteps: 512}, func() error {
 		var wg sync.WaitGroup
 		release := make(chan struct{})
 		for i := 0; i < 300; i++ {
@@ -3589,7 +3607,7 @@ func TestExploreDPORFanOutOverflowContinues(t *testing.T) {
 		}
 		close(release)
 		wg.Wait()
-		return false
+		return nil
 	})
 	if !res.Overflow {
 		t.Errorf("Overflow = false, want true under a fan-out truncation")
@@ -3613,7 +3631,7 @@ func TestDPORMutexBlindDowngrade(t *testing.T) {
 	if !dstBuilt() {
 		t.Skip("requires -tags dst")
 	}
-	sut := func() bool {
+	sut := func() error {
 		var mu sync.Mutex
 		x := 0
 		// Guarantee a mutex PARK in every run: the holder takes the
@@ -3639,7 +3657,10 @@ func TestDPORMutexBlindDowngrade(t *testing.T) {
 		mu.Unlock()
 		<-done
 		<-done
-		return x != 1
+		if x != 1 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR}, sut)
 	if dstRaceEnabledFP() {
@@ -3669,7 +3690,7 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 		// auto-instrumentation records its atomic events, so the
 		// downgrade must not fire.
 		var x atomic.Int64
-		free := func() bool {
+		free := func() error {
 			done := make(chan struct{}, 2)
 			for i := 0; i < 2; i++ {
 				go func() {
@@ -3679,7 +3700,7 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 			}
 			<-done
 			<-done
-			return false
+			return nil
 		}
 		res := ExploreWith(1, ExploreOptions{Mode: DPOR}, free)
 		if res.Uninstrumented {
@@ -3689,7 +3710,7 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 	}
 	// A hook-free racy SUT: the lost update is real, but without
 	// instrumentation DPOR sees no dependency.
-	bare := func() bool {
+	bare := func() error {
 		x := 0
 		done := make(chan struct{}, 2)
 		for i := 0; i < 2; i++ {
@@ -3702,7 +3723,10 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 		}
 		<-done
 		<-done
-		return x != 2
+		if x != 2 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR}, bare)
 	if !res.Uninstrumented || res.Exhausted {
@@ -3712,13 +3736,16 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 	// A genuinely SEQUENTIAL hook-free SUT — no decision ever holds two
 	// simulation candidates — keeps its exhaustion claim: there was
 	// nothing for the missing instrumentation to miss.
-	seq := func() bool {
+	seq := func() error {
 		x := 0
 		for i := 0; i < 3; i++ {
 			runtime.Gosched()
 			x++
 		}
-		return x != 3
+		if x != 3 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	sres := ExploreWith(1, ExploreOptions{Mode: DPOR}, seq)
 	if sres.Uninstrumented || !sres.Exhausted {
@@ -3727,7 +3754,7 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 
 	// A manual-hook SUT (the 802-sweep's shape): events fire, the
 	// completeness claim stands, Uninstrumented stays false.
-	hooked := func() bool {
+	hooked := func() error {
 		x := 0
 		done := make(chan struct{}, 2)
 		for i := 0; i < 2; i++ {
@@ -3741,7 +3768,10 @@ func TestDPORUninstrumentedDowngrade(t *testing.T) {
 		}
 		<-done
 		<-done
-		return x != 2
+		if x != 2 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 	hres := ExploreWith(1, ExploreOptions{Mode: DPOR}, hooked)
 	if hres.Uninstrumented {
@@ -3790,7 +3820,7 @@ func TestExploreConservativeOwnStackNeverYields(t *testing.T) {
 	dstFilterForceConservativeFP(true)
 	defer dstFilterForceConservativeFP(false)
 	var yields, events uint64
-	sut := func() bool {
+	sut := func() error {
 		done := make(chan struct{}, 1)
 		go func() {
 			v := 7
@@ -3817,7 +3847,7 @@ func TestExploreConservativeOwnStackNeverYields(t *testing.T) {
 			done <- struct{}{}
 		}()
 		<-done
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 8}, sut)
 	if len(res.Failures) != 0 {
@@ -3855,7 +3885,7 @@ func TestExploreSharedMidWindowParkIsScannable(t *testing.T) {
 	}
 	dstFilterForceConservativeFP(true)
 	defer dstFilterForceConservativeFP(false)
-	sut := func() bool {
+	sut := func() error {
 		done := make(chan struct{}, 2)
 		v := 7
 		heapSrc.f = &v
@@ -3878,7 +3908,7 @@ func TestExploreSharedMidWindowParkIsScannable(t *testing.T) {
 		}()
 		<-done
 		<-done
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 40}, sut)
 	if len(res.Failures) != 0 {

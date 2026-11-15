@@ -12,6 +12,14 @@ const dstNetEnabled = false
 
 func dstActive() bool { return false }
 
+func dstInSimBubble() bool { return false }
+
+func dstIsLocalhost(host string) bool { return false }
+
+func dstLookupLocalhostIPAddr(network, host string) ([]IPAddr, bool) { return nil, false }
+
+func dstLookupProtocol(name string) (int, error) { return 0, nil }
+
 func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) { return nil, nil }
 
 func dstListen(lc *ListenConfig, network, address string) (Listener, error) { return nil, nil }

@@ -29,7 +29,7 @@ func TestDSTClockSkewApplied(t *testing.T) {
 	var root, hostA, procA, childA, hostB time.Time
 	Run(1, func() {
 		root = time.Now()
-		Host("hA", HostConfig{Clock: Skew(skewA)}, func() {
+		HostWith("hA", HostConfig{Clock: Skew(skewA)}, func() {
 			hostA = time.Now()
 			Process("p", func() { procA = time.Now() }) // inherits hA's clock
 			done := make(chan struct{})
@@ -39,7 +39,7 @@ func TestDSTClockSkewApplied(t *testing.T) {
 			}()
 			<-done
 		})
-		Host("hB", HostConfig{Clock: Skew(skewB)}, func() {
+		HostWith("hB", HostConfig{Clock: Skew(skewB)}, func() {
 			hostB = time.Now()
 		})
 	})
@@ -74,7 +74,7 @@ func TestDSTClockDurationPreserved(t *testing.T) {
 		Run(1, func() {
 			rootStart := time.Now() // on root (no skew)
 			done := make(chan struct{})
-			Host("h", HostConfig{Clock: Skew(skew)}, func() {
+			HostWith("h", HostConfig{Clock: Skew(skew)}, func() {
 				go func() {
 					start := time.Now()
 					time.Sleep(time.Second)
@@ -106,10 +106,10 @@ func TestDSTClockDeterminism(t *testing.T) {
 	run := func() sample {
 		var s sample
 		Run(99, func() {
-			Host("hA", HostConfig{Clock: Skew(40 * time.Millisecond)}, func() {
+			HostWith("hA", HostConfig{Clock: Skew(40 * time.Millisecond)}, func() {
 				s.a = time.Now()
 			})
-			Host("hB", HostConfig{Clock: BoundedSkew(100 * time.Millisecond)}, func() {
+			HostWith("hB", HostConfig{Clock: BoundedSkew(100 * time.Millisecond)}, func() {
 				s.b = time.Now()
 				start := time.Now()
 				<-time.After(250 * time.Millisecond)
@@ -141,11 +141,11 @@ func TestDSTClockBoundedSeeded(t *testing.T) {
 		var off time.Duration
 		Run(seed, func() {
 			root := time.Now()
-			Host(name, HostConfig{Clock: BoundedSkew(bound)}, func() {
+			HostWith(name, HostConfig{Clock: BoundedSkew(bound)}, func() {
 				off = time.Now().Sub(root)
 			})
 			if checkRestart {
-				Host(name, HostConfig{Clock: BoundedSkew(bound)}, func() {
+				HostWith(name, HostConfig{Clock: BoundedSkew(bound)}, func() {
 					if got := time.Now().Sub(root); got != off {
 						t.Errorf("restart of host %q changed seeded offset: %v != %v (must depend only on seed+host)", name, got, off)
 					}
@@ -179,8 +179,8 @@ func TestDSTClockN1Collapse(t *testing.T) {
 	var rootT, plainHostT, zeroSkewT time.Time
 	Run(1, func() {
 		rootT = time.Now()
-		Host("h", HostConfig{}, func() { plainHostT = time.Now() })
-		Host("h2", HostConfig{Clock: Skew(0)}, func() { zeroSkewT = time.Now() })
+		Host("h", func() { plainHostT = time.Now() })
+		HostWith("h2", HostConfig{Clock: Skew(0)}, func() { zeroSkewT = time.Now() })
 	})
 	if !plainHostT.Equal(rootT) {
 		t.Errorf("HostConfig{} host wall = %v, want root wall %v (zero config must be no skew)", plainHostT, rootT)
@@ -208,7 +208,7 @@ func TestDSTClockStepForward(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				before = time.Now()
 				close(ready)
@@ -242,7 +242,7 @@ func TestDSTClockStepBackward(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				before = time.Now()
 				close(ready)
@@ -277,7 +277,7 @@ func TestDSTClockStepTimerImmune(t *testing.T) {
 	Run(1, func() {
 		armed := make(chan struct{})
 		fired := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				timer := time.After(delay) // armed at base T0
 				close(armed)
@@ -312,11 +312,11 @@ func TestDSTClockStepVictim(t *testing.T) {
 			*d = time.Now().Sub(b)
 			done <- struct{}{}
 		}
-		Host("hA", HostConfig{}, func() {
+		Host("hA", func() {
 			go measure(&aDelta) // two goroutines of hA must move together
 			go measure(&a2Delta)
 		})
-		Host("hB", HostConfig{}, func() {
+		Host("hB", func() {
 			go measure(&bDelta) // hB must not move
 		})
 		<-ready
@@ -347,7 +347,7 @@ func TestDSTClockStepAccumulate(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Skew(base)}, func() {
+		HostWith("h", HostConfig{Clock: Skew(base)}, func() {
 			go func() {
 				before = time.Now()
 				close(ready)
@@ -377,7 +377,7 @@ func TestDSTClockStepDeterminism(t *testing.T) {
 			ready := make(chan struct{})
 			go1 := make(chan struct{})
 			done := make(chan struct{})
-			Host("h", HostConfig{Clock: Skew(40 * time.Millisecond)}, func() {
+			HostWith("h", HostConfig{Clock: Skew(40 * time.Millisecond)}, func() {
 				go func() {
 					close(ready)
 					<-go1
@@ -412,7 +412,7 @@ func stepFrozen(config HostConfig, do func(), before, after *time.Time) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", config, func() {
+		HostWith("h", config, func() {
 			go func() {
 				*before = time.Now()
 				close(ready)
@@ -493,7 +493,7 @@ func TestDSTClockStepWallDurationReflectsStep(t *testing.T) {
 		go1 := make(chan struct{})
 		done := make(chan struct{})
 		var start time.Time
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go func() {
 				start = time.Now()
 				close(ready)
@@ -525,7 +525,7 @@ func TestDSTClockStepResetByRedeclare(t *testing.T) {
 		root = time.Now()
 		readStepped := make(chan struct{})
 		doneStepped := make(chan struct{})
-		Host("h", HostConfig{Clock: Skew(skew)}, func() {
+		HostWith("h", HostConfig{Clock: Skew(skew)}, func() {
 			go func() {
 				<-readStepped
 				stepped = time.Now() // table[h] = skew + step
@@ -536,7 +536,7 @@ func TestDSTClockStepResetByRedeclare(t *testing.T) {
 		close(readStepped)
 		<-doneStepped
 		// Re-declare host h (restart): overwrites its offset back to the configured skew.
-		Host("h", HostConfig{Clock: Skew(skew)}, func() {
+		HostWith("h", HostConfig{Clock: Skew(skew)}, func() {
 			restarted = time.Now()
 		})
 	})
@@ -555,7 +555,7 @@ func TestDSTClockStepOutsideRunNoop(t *testing.T) {
 	var rootT, hostT time.Time
 	Run(1, func() {
 		rootT = time.Now()
-		Host("h", HostConfig{}, func() { hostT = time.Now() })
+		Host("h", func() { hostT = time.Now() })
 	})
 	if !hostT.Equal(rootT) {
 		t.Errorf("StepClock before a run leaked into it: host=%v root=%v (outside-run calls must be no-ops)", hostT, rootT)
@@ -588,11 +588,12 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		{"StepClock", func() { StepClock("no-such-host", time.Second) }},
 		{"DriftClock", func() { DriftClock("no-such-host", 1000) }},
 		{"Partition", func() { Partition("declared", "no-such-host") }},
-		{"Heal", func() { Heal("declared", "no-such-host") }},
-		{"Isolate", func() { Isolate("no-such-host") }},
-		{"HealHost", func() { HealHost("no-such-host") }},
-		{"Reset", func() { Reset("declared", "no-such-host") }},
-		{"ResetProcess", func() { ResetProcess("no-such-proc") }},
+		{"HealLink", func() { HealLink("declared", "no-such-host") }},
+		{"IsolateHost", func() { IsolateHost("no-such-host") }},
+		{"UnisolateHost", func() { UnisolateHost("no-such-host") }},
+		{"ResetLink", func() { ResetLink("declared", "no-such-host") }},
+		{"ResetProcess", func() { ResetProcess("", "no-such-proc") }},
+		{"ResetProcess/unknown-host", func() { ResetProcess("no-such-host", "p") }},
 		{"FailDisk", func() { FailDisk("no-such-host") }},
 		{"HealDisk", func() { HealDisk("no-such-host") }},
 		{"FailWriteback", func() { FailWriteback("no-such-host") }},
@@ -603,6 +604,7 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		{"CorruptFile", func() { CorruptFile("no-such-host", "/f") }},
 		{"UnlimitDisk", func() { UnlimitDisk("no-such-host") }},
 		{"SlowDisk", func() { SlowDisk("no-such-host", time.Millisecond) }},
+		{"UnslowDisk", func() { UnslowDisk("no-such-host") }},
 		{"HostFS", func() { HostFS("no-such-host") }},
 		{"HostIP", func() { HostIP("no-such-host") }},
 	}
@@ -610,7 +612,7 @@ func TestDSTFaultVictimUnknownPanics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var recovered any
 			Run(1, func() {
-				Host("declared", HostConfig{}, func() {})
+				Host("declared", func() {})
 				func() {
 					defer func() { recovered = recover() }()
 					tc.call()
@@ -630,7 +632,7 @@ func TestDSTFaultVictimOutsideRunNoop(t *testing.T) {
 	StepClock("nobody", time.Second)
 	FailDisk("nobody")
 	Partition("nobody", "nobody-else")
-	ResetProcess("nobody") // none of these may panic outside a run
+	ResetProcess("nobody", "nobody-proc") // none of these may panic outside a run
 }
 
 // TestDSTClockBoundedDriftSeeded checks BoundedDrift: the clock RATE departure is
@@ -650,7 +652,7 @@ func TestDSTClockBoundedDriftSeeded(t *testing.T) {
 			measure := func() time.Duration {
 				start := time.Now() // root = base
 				done := make(chan struct{})
-				Host(name, HostConfig{Clock: BoundedDrift(maxPPB)}, func() {
+				HostWith(name, HostConfig{Clock: BoundedDrift(maxPPB)}, func() {
 					go func() { time.Sleep(hostSleep); close(done) }()
 				})
 				<-done

@@ -201,6 +201,7 @@ func dstActivate(seed uint64) {
 	getg().dstHost = 0
 	getg().dstHostScope = nil
 	getg().dstProc = 0
+	getg().dstProcSlot = 0
 	getg().dstPid = int32(dstSimPID) // root pid; dstSetSimEnv ran before activation
 	dstSchedRand = dstSchedRoot(seed)
 	dstSchedPrevSys = false
@@ -315,6 +316,31 @@ func dstCurrentNode() (host, proc uint32) {
 	return gp.dstHost, gp.dstProc
 }
 
+// dstSetProcSlot stamps the calling goroutine's per-invocation process resource
+// and environment slot and returns the previous value. Unlike dstProc (the
+// logical process id shared across restarts and overlapping invocations),
+// dstProcSlot is unique per live Process invocation (0 for root goroutines),
+// allocated monotonically per run and reset on run teardown. Reached via //go:linkname.
+//
+//go:linkname dstSetProcSlot
+func dstSetProcSlot(slot uint32) (old uint32) {
+	gp := getg()
+	old = gp.dstProcSlot
+	gp.dstProcSlot = slot
+	return old
+}
+
+// dstCurrentSlot returns the calling goroutine's DST host and per-invocation
+// process resource slot (0,0 for root goroutines). OS and network resource
+// registries pull this so overlapping invocations of one logical Process never
+// share open files, locks, mappings, sockets, or working directories.
+//
+//go:linkname dstCurrentSlot
+func dstCurrentSlot() (host, slot uint32) {
+	gp := getg()
+	return gp.dstHost, gp.dstProcSlot
+}
+
 //go:linkname dstVirtualMonotonicNow
 //go:nosplit
 func dstVirtualMonotonicNow() (int64, bool) {
@@ -415,6 +441,8 @@ type dstHostClockEntry struct {
 	// each run.
 	bootBase  atomic.Int64  // base-time instant of the host's current boot (uptime origin); 0 = never booted → run epoch
 	bootCount atomic.Uint64 // boots this run; 0 = never booted → reads as boot 1
+	pidNext   atomic.Int32  // per-(host, boot) pid allocator cursor; 0 = uninitialized → int32(dstSimPID)
+	down      atomic.Bool   // powered-off state between CrashHost and the next dstBootHost
 }
 
 type dstHostClockTable struct {
@@ -1842,24 +1870,36 @@ type dstHostIdentTable struct {
 // until the first Host declares identity. Reset to nil at dstSetSimEnv.
 var dstHostIdent atomic.Pointer[dstHostIdentTable]
 
-// dstSimPidNext is the per-process pid allocator: dstAllocPid bumps it, so each
-// Process invocation (including a restart) gets a fresh, deterministic pid. Reset
-// to the root pid (dstSimPID) at dstSetSimEnv, so the first process is root pid + 1.
+// dstSimPidNext is host 0's per-process pid allocator cursor; declared hosts
+// (host > 0) carry their own per-(host, boot) cursor in dstHostClockEntry.pidNext.
+// Reset to the root pid (dstSimPID) at dstSetSimEnv, so the first Process on each
+// host boot gets root pid + 1.
 var dstSimPidNext atomic.Int32
 
+// dstPidKey uniquely names a kernel-visible pid on one simulated machine.
+type dstPidKey struct {
+	host uint32
+	pid  int32
+}
+
 // dstPidLive is the simulated pid registry: presence = live, consulted by
-// syscall.Kill(pid, 0) and the /proc surface. The root pid is live for the run;
-// Process pids are live for the dynamic extent of their body. Each entry
-// carries the INCARNATION's identity — its procfs starttime and its pid
-// namespace — so a reused pid (Options.PidMax) serves its new process's
-// identity, never its predecessor's. The map is copy-on-write: readers get an
-// immutable snapshot and writers publish a new table.
+// syscall.Kill(pid, 0) and the /proc surface. The root pid is live on every
+// host for the run; Process pids are live on their owning host for the dynamic
+// extent of their body. Each entry carries the INCARNATION's identity — its
+// owning (host, boot), unique invocation slot, procfs starttime, and pid
+// namespace — so a reused pid (Options.PidMax or host reboot) serves its new
+// process's identity, never its predecessor's. The maps are copy-on-write:
+// readers get an immutable snapshot and writers publish a new table.
 type dstPidLiveTable struct {
-	live map[int32]dstPidEntry
+	live   map[dstPidKey]dstPidEntry
+	bySlot map[uint32]dstPidKey
 }
 
 // dstPidEntry is one live incarnation's kernel-visible identity.
 type dstPidEntry struct {
+	host  uint32 // owning simulated host id (0 = root/default host)
+	boot  uint64 // owning host's boot count when this process incarnation started
+	slot  uint32 // unique Process invocation slot (0 = root pid)
 	start uint64 // procfs field-22 starttime: USER_HZ (100) ticks since the OWNING host's boot, at process start
 	ns    uint32 // pid-namespace id (dstRootPidNS = the root namespace)
 }
@@ -1952,13 +1992,17 @@ func dstClearSimEnv() {
 // while map operations inside the table do fire race hooks.
 func dstPidLivePublishRace() {
 	if raceenabled {
-		racereleasemerge(unsafe.Pointer(&dstPidLive))
+		if gp := getg(); gp == gp.m.curg && gp.racectx != 0 {
+			racereleasemerge(unsafe.Pointer(&dstPidLive))
+		}
 	}
 }
 
 func dstPidLiveLoadRace() {
 	if raceenabled {
-		raceacquire(unsafe.Pointer(&dstPidLive))
+		if gp := getg(); gp == gp.m.curg && gp.racectx != 0 {
+			raceacquire(unsafe.Pointer(&dstPidLive))
+		}
 	}
 }
 
@@ -1968,7 +2012,11 @@ func dstPidLiveReset(root int32) {
 		// The root process is in the root namespace and started at its
 		// machine's boot: starttime 0 — the run body's machine boots at the
 		// run epoch (the uptime clocks' origin).
-		dstPidLive.Store(&dstPidLiveTable{live: map[int32]dstPidEntry{root: {start: 0, ns: dstRootPidNS}}})
+		dstPidLive.Store(&dstPidLiveTable{
+			live: map[dstPidKey]dstPidEntry{
+				{host: 0, pid: root}: {host: 0, boot: 1, slot: 0, start: 0, ns: dstRootPidNS},
+			},
+		})
 	} else {
 		dstPidLive.Store(nil)
 	}
@@ -2030,8 +2078,39 @@ func dstBootHost(host uint32) {
 	}
 	dstHostClockEnsure(host)
 	e := &dstHostClock.Load().ent[host]
+	e.down.Store(false)
 	e.bootCount.Add(1)
 	e.bootBase.Store(gp.bubble.now)
+	e.pidNext.Store(int32(dstSimPID))
+}
+
+func dstHostBootAlive(host uint32, boot uint64) bool {
+	if host == 0 {
+		return true
+	}
+	if host >= dstMaxSimHosts {
+		return false
+	}
+	if t := dstHostClock.Load(); t != nil && t.ent[host].down.Load() {
+		return false
+	}
+	return dstCurrentHostBootCount(host) == boot
+}
+
+// dstCurrentHostBootCount returns host's current boot count (1 for host 0 or a
+// host before its first recorded boot). Reached via //go:linkname from
+// testing/simulation so per-host kernel namespaces reset across reboots.
+//
+//go:linkname dstCurrentHostBootCount
+func dstCurrentHostBootCount(host uint32) uint64 {
+	if host != 0 && host < dstMaxSimHosts {
+		if t := dstHostClock.Load(); t != nil {
+			if c := t.ent[host].bootCount.Load(); c != 0 {
+				return c
+			}
+		}
+	}
+	return 1
 }
 
 // dstHostBootIdent returns the raw material for the calling goroutine's host's
@@ -2049,15 +2128,8 @@ func dstHostBootIdent() (hi, lo uint64, host uint32, boot uint64, ok bool) {
 	if seed == 0 || gp.bubble == nil || gp.bubble != dstSimBubble {
 		return 0, 0, 0, 0, false
 	}
-	host = getg().dstHost
-	boot = 1
-	if host != 0 {
-		if t := dstHostClock.Load(); t != nil {
-			if c := t.ent[host].bootCount.Load(); c != 0 {
-				boot = c
-			}
-		}
-	}
+	host = gp.dstHost
+	boot = dstCurrentHostBootCount(host)
 	// Domain-separated splitmix64 chain: the constant keeps this derivation
 	// disjoint from the goroutine-randomness tree rooted at the same seed.
 	x := dstSplitmix64(seed ^ 0x626f6f745f696421) // "boot_id!"
@@ -2081,35 +2153,56 @@ func dstSplitmix64(x uint64) uint64 {
 	return x
 }
 
-// dstAllocPid returns the next per-process pid (deterministic: the Process call
-// order is a function of the seed). Reached via //go:linkname.
+// dstPidNextForHost returns the calling host's per-(host, boot) pid allocator
+// cursor, lazily seeding declared hosts from dstSimPID if not yet booted.
+func dstPidNextForHost(host uint32) *atomic.Int32 {
+	if host == 0 {
+		return &dstSimPidNext
+	}
+	dstHostClockEnsure(host)
+	p := &dstHostClock.Load().ent[host].pidNext
+	if p.Load() == 0 && dstSimPID > 0 {
+		p.CompareAndSwap(0, int32(dstSimPID))
+	}
+	return p
+}
+
+// dstAllocPid returns the next per-process pid on the calling goroutine's
+// simulated host and current boot (deterministic: the Process call order is a
+// function of the seed). Reached via //go:linkname.
 //
 //go:linkname dstAllocPid
 func dstAllocPid() int32 {
+	host := getg().dstHost
+	boot := dstCurrentHostBootCount(host)
+	nextPtr := dstPidNextForHost(host)
 	max := dstSimPidMax.Load()
 	if max == 0 {
-		// Unbounded: monotonic, never reused, panic at pid-field exhaustion.
+		// Unbounded: monotonic per (host, boot), never reused within a boot,
+		// panic at pid-field exhaustion.
 		for {
-			old := dstSimPidNext.Load()
+			old := nextPtr.Load()
 			if old == dstMaxSimPID {
 				panic("testing/simulation: simulated pid allocation overflows OS pid field")
 			}
-			if dstSimPidNext.CompareAndSwap(old, old+1) {
+			if nextPtr.CompareAndSwap(old, old+1) {
 				return old + 1
 			}
 		}
 	}
-	// Bounded (Options.PidMax): alloc_pid semantics — scan forward from the
-	// last allocation, wrap into [dstPidWrapFloor, max], skip live pids (the
-	// root pid is in the registry, so it is skipped like any live pid). The
-	// one caller (Process admission) holds procTeardownMu, which also covers
-	// every registry mutation, so a single snapshot is a consistent view.
+	// Bounded (Options.PidMax): alloc_pid semantics per (host, boot) — scan
+	// forward from this host boot's last allocation, wrap into
+	// [dstPidWrapFloor, max], skip live pids on this (host, boot) (including
+	// the host's root/init pid dstSimPID). The one caller (Process admission)
+	// holds procTeardownMu, which also covers every registry mutation, so a
+	// single snapshot is a consistent view.
 	t := dstPidLive.Load()
 	if t != nil {
 		dstPidLiveLoadRace()
 	}
+	root := int32(dstSimPID)
 	span := max - dstPidWrapFloor + 1
-	cand := dstSimPidNext.Load()
+	cand := nextPtr.Load()
 	for i := int32(0); i < span; i++ {
 		cand++
 		if cand > max || cand < dstPidWrapFloor {
@@ -2118,25 +2211,31 @@ func dstAllocPid() int32 {
 		if t == nil {
 			break // no registry: identity-off white-box run, first candidate is free
 		}
-		if _, live := t.live[cand]; !live {
-			dstSimPidNext.Store(cand)
+		if root > 0 && cand == root {
+			continue
+		}
+		if e, ok := t.live[dstPidKey{host: host, pid: cand}]; !ok || e.boot != boot {
+			nextPtr.Store(cand)
 			return cand
 		}
 	}
 	if t == nil {
-		dstSimPidNext.Store(cand)
+		nextPtr.Store(cand)
 		return cand
 	}
-	// Every pid in [dstPidWrapFloor, max] is live: the kernel answers fork
-	// with EAGAIN here; Process has no error return, so fail loud.
+	// Every pid in [dstPidWrapFloor, max] is live on this host: the kernel
+	// answers fork with EAGAIN here; Process has no error return, so fail loud.
 	panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
 }
 
 //go:linkname dstCheckPidAvailable
 func dstCheckPidAvailable() {
+	host := getg().dstHost
+	boot := dstCurrentHostBootCount(host)
+	nextPtr := dstPidNextForHost(host)
 	max := dstSimPidMax.Load()
 	if max == 0 {
-		if dstSimPidNext.Load() == dstMaxSimPID {
+		if nextPtr.Load() == dstMaxSimPID {
 			panic("testing/simulation: simulated pid allocation overflows OS pid field")
 		}
 		return
@@ -2153,23 +2252,28 @@ func dstCheckPidAvailable() {
 	}
 	dstPidLiveLoadRace()
 	inRange := int32(0)
-	for p := range t.live {
-		if p >= dstPidWrapFloor && p <= max {
+	root := int32(dstSimPID)
+	if root >= dstPidWrapFloor && root <= max {
+		inRange++
+	}
+	for k, e := range t.live {
+		if k.host == host && e.boot == boot && k.pid != root && k.pid >= dstPidWrapFloor && k.pid <= max {
 			inRange++
 		}
 	}
 	if inRange >= max-dstPidWrapFloor+1 {
-		// Every pid in [dstPidWrapFloor, max] is live: the kernel answers
-		// fork with EAGAIN here; Process has no error return, so fail loud.
+		// Every pid in [dstPidWrapFloor, max] is live on this host: the kernel
+		// answers fork with EAGAIN here; Process has no error return, so fail loud.
 		panic("testing/simulation: every pid in [2, PidMax] is live (the kernel's fork EAGAIN); raise Options.PidMax or let processes exit")
 	}
 }
 
-// dstRegisterPid marks a simulated pid live, recording its incarnation's
-// identity: its pid namespace and its procfs starttime — the calling
-// goroutine's host's current uptime in USER_HZ ticks (the caller is the
-// admitting Process goroutine, already stamped with the target host). Reached
-// from testing/simulation.Process by //go:linkname.
+// dstRegisterPid marks a simulated pid live on the admitting goroutine's host,
+// recording its incarnation's identity: owning (host, boot), unique invocation
+// slot, pid namespace, and procfs starttime — the host's current uptime in
+// USER_HZ ticks (the caller is the admitting Process goroutine, already stamped
+// with the target host and slot). Reached from testing/simulation.Process by
+// //go:linkname.
 //
 //go:linkname dstRegisterPid
 func dstRegisterPid(pid int32, ns uint32) {
@@ -2179,55 +2283,74 @@ func dstRegisterPid(pid int32, ns uint32) {
 	if ns == 0 {
 		ns = dstRootPidNS
 	}
-	e := dstPidEntry{ns: ns}
+	gp := getg()
+	host := gp.dstHost
+	e := dstPidEntry{
+		host: host,
+		boot: dstCurrentHostBootCount(host),
+		slot: gp.dstProcSlot,
+		ns:   ns,
+	}
 	if up, ok := dstVirtualMonotonicNow(); ok && up > 0 {
 		e.start = uint64(up) / dstUserHZTickNS
 	}
-	dstPidLiveMutate(pid, &e)
+	dstPidLiveMutate(dstPidKey{host: host, pid: pid}, &e)
 }
 
-// dstUnregisterPid marks a simulated pid dead: its registry entry — starttime
-// and namespace included — vanishes with it, as a real /proc entry does.
-// Reached from testing/simulation's exit teardown by //go:linkname.
+// dstUnregisterPid marks a simulated pid dead on host: its registry entry —
+// starttime, slot, and namespace included — vanishes with it, as a real /proc
+// entry does. Reached from testing/simulation's exit and crash teardown by
+// //go:linkname.
 //
 //go:linkname dstUnregisterPid
-func dstUnregisterPid(pid int32) {
+func dstUnregisterPid(host uint32, pid int32) {
 	if pid <= 0 {
 		return
 	}
-	dstPidLiveMutate(pid, nil)
+	dstPidLiveMutate(dstPidKey{host: host, pid: pid}, nil)
 }
 
-// dstPidLiveMutate publishes a new registry table with pid set to *e (or
+// dstPidLiveMutate publishes a new registry table with key set to *e (or
 // removed, e nil) via the copy-on-write CAS loop.
-func dstPidLiveMutate(pid int32, e *dstPidEntry) {
+func dstPidLiveMutate(key dstPidKey, e *dstPidEntry) {
 	for {
 		old := dstPidLive.Load()
 		if old == nil {
 			return
 		}
 		dstPidLiveLoadRace()
-		if cur, ok := old.live[pid]; ok == (e != nil) && (e == nil || cur == *e) {
+		cur, had := old.live[key]
+		if had == (e != nil) && (e == nil || cur == *e) {
 			return
 		}
-		next := make(map[int32]dstPidEntry, len(old.live)+1)
-		for p, pe := range old.live {
-			next[p] = pe
+		nextLive := make(map[dstPidKey]dstPidEntry, len(old.live)+1)
+		for k, pe := range old.live {
+			nextLive[k] = pe
+		}
+		nextBySlot := make(map[uint32]dstPidKey, len(old.bySlot)+1)
+		for s, k := range old.bySlot {
+			nextBySlot[s] = k
+		}
+		if had && cur.slot != 0 {
+			delete(nextBySlot, cur.slot)
 		}
 		if e != nil {
-			next[pid] = *e
+			nextLive[key] = *e
+			if e.slot != 0 {
+				nextBySlot[e.slot] = key
+			}
 		} else {
-			delete(next, pid)
+			delete(nextLive, key)
 		}
 		dstPidLivePublishRace()
-		if dstPidLive.CompareAndSwap(old, &dstPidLiveTable{live: next}) {
+		if dstPidLive.CompareAndSwap(old, &dstPidLiveTable{live: nextLive, bySlot: nextBySlot}) {
 			return
 		}
 	}
 }
 
-// dstPidLookup returns pid's live registry entry.
-func dstPidLookup(pid int32) (dstPidEntry, bool) {
+// dstPidLookup returns (host, pid)'s live registry entry.
+func dstPidLookup(host uint32, pid int32) (dstPidEntry, bool) {
 	if pid <= 0 || !dstSimEnvSet {
 		return dstPidEntry{}, false
 	}
@@ -2236,46 +2359,116 @@ func dstPidLookup(pid int32) (dstPidEntry, bool) {
 		return dstPidEntry{}, false
 	}
 	dstPidLiveLoadRace()
-	e, ok := t.live[pid]
+	e, ok := t.live[dstPidKey{host: host, pid: pid}]
 	return e, ok
 }
 
-// dstPidAlive reports whether pid is live in the current simulated pid
+// dstPidLookupBySlot returns slot's live (key, entry) in the registry.
+func dstPidLookupBySlot(slot uint32) (dstPidKey, dstPidEntry, bool) {
+	if slot == 0 || !dstSimEnvSet {
+		return dstPidKey{}, dstPidEntry{}, false
+	}
+	t := dstPidLive.Load()
+	if t == nil {
+		return dstPidKey{}, dstPidEntry{}, false
+	}
+	dstPidLiveLoadRace()
+	key, ok := t.bySlot[slot]
+	if !ok {
+		return dstPidKey{}, dstPidEntry{}, false
+	}
+	e, ok := t.live[key]
+	return key, e, ok
+}
+
+// dstPidAlive reports whether (host, pid) is live in the current simulated pid
 // registry — INTERNAL harness liveness (teardown, callback ownership, restart
 // admission), deliberately NOT namespace-filtered: a process dies for the
 // harness regardless of who could see it through kill. The ns-scoped probe is
 // dstPidKillAlive.
 //
 //go:linkname dstPidAlive
-func dstPidAlive(pid int32) bool {
-	_, ok := dstPidLookup(pid)
+func dstPidAlive(host uint32, pid int32) bool {
+	if pid > 0 && dstSimEnvSet && pid == int32(dstSimPID) {
+		return true
+	}
+	e, ok := dstPidLookup(host, pid)
+	return ok && e.boot == dstCurrentHostBootCount(host)
+}
+
+// dstSlotAlive reports whether Process invocation slot is still live in the
+// current run's pid registry, unaffected by pid reuse on the same host or
+// identical numerical pids on other hosts.
+//
+//go:linkname dstSlotAlive
+func dstSlotAlive(slot uint32) bool {
+	_, _, ok := dstPidLookupBySlot(slot)
 	return ok
 }
 
-// dstCallerPidNS returns the calling goroutine's pid namespace: its process's
-// registry entry, or the root pid's for root goroutines; the root namespace
-// when neither resolves (identity-off white-box runs).
+// dstCallerPidNS returns the calling goroutine's pid namespace on its current
+// host: its Process invocation's namespace when running on its owning host
+// boot, or the host's root namespace otherwise.
 func dstCallerPidNS() uint32 {
-	pid := getg().dstPid
-	if pid <= 0 {
-		pid = int32(dstSimPID)
+	gp := getg()
+	if gp.dstPid <= 0 || gp.dstProcSlot == 0 {
+		return dstRootPidNS
 	}
-	if e, ok := dstPidLookup(pid); ok {
+	callerHost := gp.dstHost
+	if e, ok := dstPidLookup(callerHost, gp.dstPid); ok &&
+		e.slot == gp.dstProcSlot && e.boot == dstCurrentHostBootCount(callerHost) {
 		return e.ns
 	}
 	return dstRootPidNS
 }
 
+// dstSimIdentityActive reports whether the calling goroutine belongs to the
+// active simulation's bubble with simulated process identity enabled.
+// Non-bubble goroutines (test harness, background runtime workers, or foreign
+// synctest bubbles) read false and retain real host identity and environment.
+func dstSimIdentityActive() bool {
+	return dstSimEnvSet && dstFenceActive()
+}
+
+// dstPidVisibleToCaller resolves pid from the calling bubble goroutine's
+// simulated machine, current boot, and PID namespace. Every host's root/init
+// process (dstSimPID) is live at starttime 0 in that host's root namespace;
+// Process pids are visible only on their owning (host, boot) and namespace.
+func dstPidVisibleToCaller(pid int32) (dstPidEntry, bool) {
+	if pid <= 0 || !dstSimIdentityActive() {
+		return dstPidEntry{}, false
+	}
+	callerHost := getg().dstHost
+	callerBoot := dstCurrentHostBootCount(callerHost)
+	callerNS := dstCallerPidNS()
+	if pid == int32(dstSimPID) {
+		if callerNS != dstRootPidNS {
+			return dstPidEntry{}, false
+		}
+		return dstPidEntry{
+			host:  callerHost,
+			boot:  callerBoot,
+			start: 0,
+			ns:    dstRootPidNS,
+		}, true
+	}
+	e, ok := dstPidLookup(callerHost, pid)
+	if !ok || e.host != callerHost || e.boot != callerBoot || e.ns != callerNS {
+		return dstPidEntry{}, false
+	}
+	return e, true
+}
+
 // dstPidKillAlive is the kill(pid, 0) probe: live AND visible from the
-// caller's pid namespace. Namespaces are siblings partitioning visibility
-// (design.md, pid namespaces), so a live pid in another namespace answers
-// dead — ESRCH — exactly what peer containers see of each other. Reached from
-// syscall.Kill's DST hook by //go:linkname.
+// caller's host, boot, and pid namespace. Namespaces are siblings partitioning
+// visibility (design.md, pid namespaces), and simulated machines have disjoint
+// kernel pid tables, so a live pid on another host or in another namespace
+// answers dead — ESRCH. Reached from syscall.Kill's DST hook by //go:linkname.
 //
 //go:linkname dstPidKillAlive
 func dstPidKillAlive(pid int32) bool {
-	e, ok := dstPidLookup(pid)
-	return ok && e.ns == dstCallerPidNS()
+	_, ok := dstPidVisibleToCaller(pid)
+	return ok
 }
 
 // dstSelfPidNS reports the calling goroutine's pid-namespace identity for the
@@ -2284,22 +2477,30 @@ func dstPidKillAlive(pid int32) bool {
 //
 //go:linkname dstSelfPidNS
 func dstSelfPidNS() (ns uint32, ok bool) {
-	if !dstSimEnvSet {
+	if !dstSimIdentityActive() {
 		return 0, false
 	}
 	return dstCallerPidNS(), true
 }
 
-func dstCallbackPid() int32 {
-	gp := getg().m.curg
-	if dstCallbackEpoch() == 0 || gp == nil || gp.dstProc == 0 || gp.dstPid <= 0 {
-		return 0
+func dstCallbackOwnerHost(st dstCallbackStamp) (uint32, bool) {
+	if st.slot == 0 && st.pid == 0 {
+		if st.host == 0 {
+			return 0, true
+		}
+		if st.epoch != dstRunEpoch.Load() {
+			return 0, false
+		}
+		return st.host, dstHostBootAlive(st.host, st.boot)
 	}
-	return gp.dstPid
-}
-
-func dstCallbackOwnerAlive(epoch uint64, pid int32) bool {
-	return pid == 0 || epoch == dstRunEpoch.Load() && dstPidAlive(pid)
+	if st.epoch != dstRunEpoch.Load() {
+		return 0, false
+	}
+	if st.slot != 0 {
+		key, _, ok := dstPidLookupBySlot(st.slot)
+		return key.host, ok
+	}
+	return st.host, dstPidAlive(st.host, st.pid)
 }
 
 //go:linkname dstCallbacksPendingFP
@@ -2307,40 +2508,42 @@ func dstCallbacksPendingFP() bool {
 	return finPending() || cleanupPending()
 }
 
-// dstPidStarttime reports the procfs field-22 starttime for a live simulated
-// pid VISIBLE from the caller's pid namespace: the incarnation's recorded
-// start instant in USER_HZ ticks since its host's boot. Completed pids have no
-// procfs entry, and a cross-namespace pid is invisible (sibling-container
-// procfs). Reached from os's synthetic /proc support by //go:linkname.
+// dstPidStarttime reports the procfs field-22 starttime and per-run incarnation
+// slot for a live simulated pid VISIBLE from the caller's host, boot, and pid
+// namespace: the incarnation's recorded start instant in USER_HZ ticks since
+// its host's boot and its unique slot (0 for the host's root pid). Completed
+// pids have no procfs entry, and cross-host or cross-namespace pids are
+// invisible. Reached from os's synthetic /proc support by //go:linkname.
 //
 //go:linkname dstPidStarttime
-func dstPidStarttime(pid int32) (start uint64, ok bool) {
-	e, ok := dstPidLookup(pid)
-	if !ok || e.ns != dstCallerPidNS() {
-		return 0, false
+func dstPidStarttime(pid int32) (start uint64, slot uint32, ok bool) {
+	e, ok := dstPidVisibleToCaller(pid)
+	if !ok {
+		return 0, 0, false
 	}
-	return e.start, true
+	return e.start, e.slot, true
 }
 
 // dstCrashProcessPid marks one process invocation dead and removes its goroutine
 // subtree from synctest liveness accounting. The logical process id (dstProc) is
-// stable across restarts, so crash scheduling keys by the per-invocation pid: a
-// restarted process gets a fresh pid and must not be suppressed with the old one.
+// stable across restarts, so crash scheduling keys by the per-invocation slot
+// and (host, pid): a restarted process or a process on another host with the
+// same numerical pid is never suppressed with the victim.
 // Reached from testing/simulation's process-teardown path by //go:linkname.
 //
 //go:linkname dstCrashProcessPid
-func dstCrashProcessPid(pid int32) {
+func dstCrashProcessPid(host, slot uint32, pid int32) {
 	if pid <= 0 {
 		return
 	}
-	dstUnregisterPid(pid)
-	dstMarkProcessGoroutines(pid, false)
+	dstUnregisterPid(host, pid)
+	dstMarkProcessGoroutines(host, slot, pid, false)
 }
 
 //go:linkname dstStopProcessThreads
-func dstStopProcessThreads(pid int32) {
+func dstStopProcessThreads(host, slot uint32, pid int32) {
 	if pid > 0 {
-		dstMarkProcessGoroutines(pid, true)
+		dstMarkProcessGoroutines(host, slot, pid, true)
 	}
 }
 
@@ -2437,21 +2640,27 @@ func dstSynctestRunningStatus(gp *g, status uint32) bool {
 // own goroutine (`Run(f)` calling `Process(name, …)` inline) and that process
 // is crashed; declaring such a process on a child goroutine
 // (`go Process(name, …)`) models a crashable process faithfully.
-func dstCrashKillsBubbleMain(bubble *synctestBubble, pid int32) bool {
+func dstCrashKillsBubbleMain(bubble *synctestBubble, slot uint32, pid int32) bool {
 	main := bubble.main
-	return main != nil && (main.dstPid == pid || main.dstPid == -pid)
+	if main == nil {
+		return false
+	}
+	if slot > 0 {
+		return main.dstProcSlot == slot
+	}
+	return main.dstPid == pid || main.dstPid == -pid
 }
 
-// dstPidOwnsBubbleMain reports whether pid's goroutine set contains the run's
-// main goroutine. Callers pre-scan every victim with it and refuse BEFORE any
-// teardown, so a multi-victim fault (a host crash) cannot tear part of the
-// universe down and only then panic. The mark path keeps its own check as a
-// backstop. Reached from testing/simulation by //go:linkname.
+// dstPidOwnsBubbleMain reports whether a Process invocation's goroutine set
+// contains the run's main goroutine. Callers pre-scan every victim with it and
+// refuse BEFORE any teardown, so a multi-victim fault (a host crash) cannot
+// tear part of the universe down and only then panic. The mark path keeps its
+// own check as a backstop. Reached from testing/simulation by //go:linkname.
 //
 //go:linkname dstPidOwnsBubbleMain
-func dstPidOwnsBubbleMain(pid int32) bool {
+func dstPidOwnsBubbleMain(slot uint32, pid int32) bool {
 	bubble := dstSimBubble
-	return bubble != nil && dstCrashKillsBubbleMain(bubble, pid)
+	return bubble != nil && dstCrashKillsBubbleMain(bubble, slot, pid)
 }
 
 // dstHostOwnsBubbleMain reports whether the run's main goroutine belongs to host
@@ -2496,8 +2705,13 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 	if bubble.main != nil && dstGoroutineBelongsToHost(bubble.main, host) {
 		panic("testing/simulation: CrashHost would kill the run's main goroutine")
 	}
+	if host != 0 && host < dstMaxSimHosts {
+		dstHostClockEnsure(host)
+		dstHostClock.Load().ent[host].down.Store(true)
+	}
 	var total, running int
 	var waiterCrashed bool
+	var drainCrashed bool
 	forEachG(func(gp *g) {
 		if !gp.dstSimG || !dstGoroutineBelongsToHost(gp, host) || gp.dstPid < 0 {
 			return
@@ -2514,6 +2728,9 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 		if gp == bubble.waiter {
 			waiterCrashed = true
 		}
+		if gp == bubble.gcDrain {
+			drainCrashed = true
+		}
 		if status == _Gdead || status == _Gdeadextra {
 			return
 		}
@@ -2522,12 +2739,16 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 			running++
 		}
 	})
-	if total == 0 && !waiterCrashed {
+	if total == 0 && !waiterCrashed && !drainCrashed {
 		return
 	}
 	lock(&bubble.mu)
 	if waiterCrashed {
 		bubble.waiter = nil // see dstMarkProcessGoroutinesCrashed
+	}
+	if drainCrashed {
+		bubble.gcDrain = nil
+		bubble.gcDrainDied = true
 	}
 	bubble.total -= total
 	bubble.running -= running
@@ -2544,13 +2765,13 @@ func dstMarkHostGoroutinesCrashed(host uint32) {
 	}
 }
 
-func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
+func dstMarkProcessGoroutines(owningHost, slot uint32, pid int32, recordExitKills bool) {
 	bubble := dstSimBubble
 	if bubble == nil {
 		return
 	}
-	if dstCrashKillsBubbleMain(bubble, pid) {
-		panic("testing/simulation: Crash would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
+	if dstCrashKillsBubbleMain(bubble, slot, pid) {
+		panic("testing/simulation: CrashProcess would kill the run's main goroutine — declare a crashable process on its own goroutine (go Process(name, f))")
 	}
 	var total, running int
 	var waiterCrashed bool
@@ -2558,9 +2779,17 @@ func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
 	var killed [dstMaxKilledPerProcessExit]dstKilledG
 	var killedCount int
 	var killedTotal int
-	var exitHost, exitProc uint32
+	exitHost := owningHost
+	var exitProc uint32
 	forEachG(func(gp *g) {
-		if !gp.dstSimG || gp.dstPid != pid {
+		if !gp.dstSimG || gp.dstPid < 0 {
+			return
+		}
+		if slot > 0 {
+			if gp.dstProcSlot != slot {
+				return
+			}
+		} else if gp.dstPid != pid {
 			return
 		}
 		status := readgstatus(gp) &^ _Gscan
@@ -2569,7 +2798,11 @@ func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
 		gopc := gp.gopc
 		startpc := gp.startpc
 		wr := gp.waitreason
-		gp.dstPid = -pid
+		if gp.dstPid > 0 {
+			gp.dstPid = -gp.dstPid
+		} else {
+			gp.dstPid = -1
+		}
 		gp.dstHostScope = nil
 		if gp == bubble.waiter {
 			waiterCrashed = true
@@ -2586,7 +2819,10 @@ func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
 		}
 		if recordExitKills && gp != bubble.gcDrain {
 			if killedTotal == 0 {
-				exitHost, exitProc = host, proc
+				if slot == 0 {
+					exitHost = host
+				}
+				exitProc = proc
 			}
 			killedTotal++
 			entry := dstKilledG{
@@ -2599,7 +2835,7 @@ func dstMarkProcessGoroutines(pid int32, recordExitKills bool) {
 			dstInsertKilledG(&killed, &killedCount, entry)
 		}
 	})
-	if total == 0 && !waiterCrashed {
+	if total == 0 && !waiterCrashed && !drainCrashed {
 		return
 	}
 	lock(&bubble.mu)
@@ -2747,53 +2983,68 @@ func dstProcAllocBytes(procid uint32) int64 {
 // by Process and inherited by its subtree; the root pid for proc 0).
 //
 //go:linkname dstSimGetpid
-func dstSimGetpid() (int, bool) { return int(getg().dstPid), dstSimEnvSet }
+func dstSimGetpid() (int, bool) {
+	if !dstSimIdentityActive() {
+		return 0, false
+	}
+	pid := int(getg().dstPid)
+	if pid <= 0 {
+		pid = dstSimPID
+	}
+	return pid, true
+}
 
 // dstSimGethostname returns the calling goroutine's host hostname: its per-host
 // override if the host declared one, else the run default (host 0 / unconfigured).
 //
 //go:linkname dstSimGethostname
 func dstSimGethostname() (string, bool) {
+	if !dstSimIdentityActive() {
+		return "", false
+	}
 	// A declared host (set) reports its recorded hostname; only host 0 / an
 	// undeclared host (dstHostIdentFor returns false) falls back to the run default.
 	// "declared" is the single source of truth (id.set), so an explicitly-empty
 	// hostname is not silently re-routed to the default.
 	if id, ok := dstHostIdentFor(getg().dstHost); ok {
-		return id.hostname, dstSimEnvSet
+		return id.hostname, true
 	}
-	return dstSimHostname, dstSimEnvSet
+	return dstSimHostname, true
 }
 
 //go:linkname dstSimGetppid
-func dstSimGetppid() (int, bool) { return dstSimPPID, dstSimEnvSet }
+func dstSimGetppid() (int, bool) { return dstSimPPID, dstSimIdentityActive() }
 
 //go:linkname dstSimGetuid
-func dstSimGetuid() (int, bool) { return dstSimUID, dstSimEnvSet }
+func dstSimGetuid() (int, bool) { return dstSimUID, dstSimIdentityActive() }
 
 //go:linkname dstSimGetgid
-func dstSimGetgid() (int, bool) { return dstSimGID, dstSimEnvSet }
+func dstSimGetgid() (int, bool) { return dstSimGID, dstSimIdentityActive() }
 
 // Effective uid/gid equal the simulated uid/gid (euid==uid, gid==egid, as in a
 // non-setuid process).
 //
 //go:linkname dstSimGeteuid
-func dstSimGeteuid() (int, bool) { return dstSimUID, dstSimEnvSet }
+func dstSimGeteuid() (int, bool) { return dstSimUID, dstSimIdentityActive() }
 
 //go:linkname dstSimGetegid
-func dstSimGetegid() (int, bool) { return dstSimGID, dstSimEnvSet }
+func dstSimGetegid() (int, bool) { return dstSimGID, dstSimIdentityActive() }
 
-// dstSimEnvProc returns the calling goroutine's simulated process id (g.dstProc)
-// and whether a run's environment is active (dstSimEnvSet). The syscall package
-// pulls it to key its per-process copy-on-write environment view: under a run,
-// os/syscall.Getenv/Setenv/… operate on the calling process's isolated copy of
-// the host environment instead of the shared host env (see design.md
-// "Environment surface"). Like identity, env gates on dstSimEnvSet (process-
-// global while set), not per-goroutine — a non-bubble goroutine reading env
-// during a run sees the root process (dstProc 0) view — and the run epoch
-// (dstNetEpoch) drives the per-run reset of those copies.
+// dstSimEnvKey returns the calling bubble goroutine's simulated (host, slot)
+// environment key and whether the simulation's bubble environment is active.
+// The syscall package pulls it to key its per-(host, process-invocation)
+// copy-on-write environment view so multi-host root goroutines (slot 0) and
+// overlapping Process invocations never share environment mutations, and
+// non-bubble goroutines retain real host environment access.
 //
-//go:linkname dstSimEnvProc
-func dstSimEnvProc() (proc uint32, ok bool) { return getg().dstProc, dstSimEnvSet }
+//go:linkname dstSimEnvKey
+func dstSimEnvKey() (host, slot uint32, ok bool) {
+	if !dstSimIdentityActive() {
+		return 0, 0, false
+	}
+	gp := getg()
+	return gp.dstHost, gp.dstProcSlot, true
+}
 
 //go:linkname dstEnvDispatchLock
 func dstEnvDispatchLock() {
@@ -2816,7 +3067,10 @@ func dstEnvDispatchUnlock() {
 //
 //go:linkname dstSimUser
 func dstSimUser() (uid, gid int, username, name, home string, ok bool) {
-	return dstSimUID, dstSimGID, dstSimUsername, dstSimUserName, dstSimHomeDir, dstSimEnvSet
+	if !dstSimIdentityActive() {
+		return 0, 0, "", "", "", false
+	}
+	return dstSimUID, dstSimGID, dstSimUsername, dstSimUserName, dstSimHomeDir, true
 }
 
 // dstMemLimit is the per-run deterministic bubble-local heap-growth budget
@@ -2971,7 +3225,7 @@ func dstNetHostDead(host uint32) bool {
 // importing os.
 var dstProcessTeardownHook func(proc uint32)
 var dstProcessStateTeardownHook func(proc uint32)
-var dstMappingFaultTeardownHook func(proc uint32)
+var dstMappingFaultTeardownHook func(slot uint32, pid int32)
 
 // dstSetProcessTeardownHook registers os's process resource teardown handler.
 // Reached via //go:linkname from os's init.
@@ -3024,13 +3278,15 @@ func dstProcessStateTeardown(proc uint32) {
 }
 
 //go:linkname dstSetMappingFaultTeardownHook
-func dstSetMappingFaultTeardownHook(fn func(proc uint32)) { dstMappingFaultTeardownHook = fn }
+func dstSetMappingFaultTeardownHook(fn func(slot uint32, pid int32)) {
+	dstMappingFaultTeardownHook = fn
+}
 
-func dstMappingFaultTeardown(proc uint32) bool {
+func dstMappingFaultTeardown(slot uint32, pid int32) bool {
 	if dstMappingFaultTeardownHook == nil {
 		return false
 	}
-	dstMappingFaultTeardownHook(proc)
+	dstMappingFaultTeardownHook(slot, pid)
 	return true
 }
 
@@ -3268,7 +3524,7 @@ func dstFenceActive() bool {
 }
 
 // dstHostDeclaredHook reports whether a simulated host id has been declared
-// this run (a Host declaration or an implicit-host Process). Registered by
+// this run (via Host or HostWith). Registered by
 // testing/simulation's init (which owns the name→id intern registry) and
 // queried by net through dstHostDeclared: a dial to a routable address NO
 // declared host owns must blackhole — nothing answers a SYN to an unowned
@@ -3462,6 +3718,10 @@ func dstGdestroy(gp *g) {
 type dstCallbackStamp struct {
 	seq   uintptr
 	epoch uint64
+	boot  uint64
+	host  uint32
+	proc  uint32
+	slot  uint32
 	pid   int32
 }
 
@@ -3592,11 +3852,27 @@ func dstTestSpecialStampCount() int {
 // happening now: run epoch, per-run registration sequence, owning process
 // invocation. Zero outside a run.
 func dstCallbackStampAtRegistration() dstCallbackStamp {
-	return dstCallbackStamp{
-		seq:   dstNextCallbackSeq(), // the drain sorts its batch by registration order
-		epoch: dstCallbackEpoch(),
-		pid:   dstCallbackPid(),
+	epoch := dstCallbackEpoch()
+	if epoch == 0 {
+		return dstCallbackStamp{}
 	}
+	st := dstCallbackStamp{
+		seq:   dstNextCallbackSeq(), // the drain sorts its batch by registration order
+		epoch: epoch,
+	}
+	if gp := getg().m.curg; gp != nil && gp.dstPid > 0 {
+		if gp.dstProc != 0 {
+			st.host = gp.dstHost
+			st.boot = dstCurrentHostBootCount(gp.dstHost)
+			st.proc = gp.dstProc
+			st.slot = gp.dstProcSlot
+			st.pid = gp.dstPid
+		} else if gp.dstHost != 0 {
+			st.host = gp.dstHost
+			st.boot = dstCurrentHostBootCount(gp.dstHost)
+		}
+	}
+	return st
 }
 
 // dstFinWithStamp pairs a queued finalizer entry with its slab stamps for
@@ -3826,7 +4102,7 @@ func dstStageSpecialStamps(sp unsafe.Pointer) {
 // dstTakeStagedSpecialStamps is the queue side of the staging
 // (queuefinalizer and cleanupQueue.enqueue): returns the staged ownership
 // stamps and clears the stage.
-func dstTakeStagedSpecialStamps() (epoch uint64, seq uintptr, pid int32) {
+func dstTakeStagedSpecialStamps() dstCallbackStamp {
 	pp := getg().m.p.ptr()
 	if pp == nil || !pp.dstSpecialStaged {
 		throw("dstTakeStagedSpecialStamps: nothing staged")
@@ -3834,7 +4110,7 @@ func dstTakeStagedSpecialStamps() (epoch uint64, seq uintptr, pid int32) {
 	st := pp.dstSpecialStamp
 	pp.dstSpecialStamp = dstCallbackStamp{}
 	pp.dstSpecialStaged = false
-	return st.epoch, st.seq, st.pid
+	return st
 }
 
 // dstTestPushMaxProcs hands the GOMAXPROCS auto-update helper an update with

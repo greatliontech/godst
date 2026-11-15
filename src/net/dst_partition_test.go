@@ -32,7 +32,7 @@ func TestDSTNetPartitionDialBlackhole(t *testing.T) {
 	var healedOK bool
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -44,13 +44,13 @@ func TestDSTNetPartitionDialBlackhole(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			simulation.Partition("A", "B")
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			_, blockedErr = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("A")+":"+p)
 			cancel()
-			simulation.Heal("A", "B")
+			simulation.HealLink("A", "B")
 			if c, err := Dial("tcp", simulation.HostIP("A")+":"+p); err == nil {
 				healedOK = true
 				c.Close()
@@ -78,7 +78,7 @@ func TestDSTNetPartitionRecover(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() { // server
+		simulation.Host("A", func() { // server
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -96,7 +96,7 @@ func TestDSTNetPartitionRecover(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() { // client + orchestrator
+		simulation.Host("B", func() { // client + orchestrator
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("before"))
@@ -104,7 +104,7 @@ func TestDSTNetPartitionRecover(t *testing.T) {
 			simulation.Partition("A", "B")
 			c.Write([]byte("during"))          // buffered, blackholed
 			time.Sleep(100 * time.Millisecond) // server's 30ms-deadline read times out
-			simulation.Heal("A", "B")
+			simulation.HealLink("A", "B")
 			<-done
 			c.Close()
 		})
@@ -134,7 +134,7 @@ func TestDSTNetPartitionVictim(t *testing.T) {
 		portC := make(chan string, 1)
 		done := make(chan struct{})
 		serve := func(name string, port chan string, got *string, readErr *error) {
-			simulation.Host(name, simulation.HostConfig{}, func() {
+			simulation.Host(name, func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
 				port <- p
@@ -156,7 +156,7 @@ func TestDSTNetPartitionVictim(t *testing.T) {
 		var bGot string
 		serve("B", portB, &bGot, &abReadErr)
 		serve("C", portC, &acMsg, nil)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			pb, pc := <-portB, <-portC
 			cb, _ := Dial("tcp", simulation.HostIP("B")+":"+pb) // establish both first
 			cc, _ := Dial("tcp", simulation.HostIP("C")+":"+pc)
@@ -188,7 +188,7 @@ func TestDSTNetIsolate(t *testing.T) {
 	var healedOK bool
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -200,13 +200,13 @@ func TestDSTNetIsolate(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("client", simulation.HostConfig{}, func() {
+		simulation.Host("client", func() {
 			p := <-port
-			simulation.Isolate("client")
+			simulation.IsolateHost("client")
 			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 			_, isolatedErr = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("srv")+":"+p)
 			cancel()
-			simulation.HealHost("client")
+			simulation.UnisolateHost("client")
 			if c, err := Dial("tcp", simulation.HostIP("srv")+":"+p); err == nil {
 				healedOK = true
 				c.Close()
@@ -233,7 +233,7 @@ func TestDSTNetIsolateVictim(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		portC := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("C", simulation.HostConfig{}, func() {
+		simulation.Host("C", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			portC <- p
@@ -246,11 +246,11 @@ func TestDSTNetIsolateVictim(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("A", simulation.HostConfig{}, func() {}) // declared: victims fail loud on undeclared names
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {}) // declared: victims fail loud on undeclared names
+		simulation.Host("B", func() {
 			pc := <-portC
 			cc, _ := Dial("tcp", simulation.HostIP("C")+":"+pc)
-			simulation.Isolate("A") // isolate a third host, not on this conn
+			simulation.IsolateHost("A") // isolate a third host, not on this conn
 			cc.Write([]byte("bc"))
 			time.Sleep(50 * time.Millisecond)
 			cc.Close()
@@ -273,7 +273,7 @@ func TestDSTNetPartitionDeterminism(t *testing.T) {
 		simulation.RunWith(seed, simulation.Options{}, func() {
 			port := make(chan string, 1)
 			done := make(chan struct{})
-			simulation.Host("A", simulation.HostConfig{}, func() {
+			simulation.Host("A", func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
 				port <- p
@@ -292,7 +292,7 @@ func TestDSTNetPartitionDeterminism(t *testing.T) {
 					close(done)
 				}()
 			})
-			simulation.Host("B", simulation.HostConfig{}, func() {
+			simulation.Host("B", func() {
 				p := <-port
 				c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 				c.Write([]byte("x"))
@@ -300,7 +300,7 @@ func TestDSTNetPartitionDeterminism(t *testing.T) {
 				simulation.Partition("A", "B")
 				c.Write([]byte("y"))
 				time.Sleep(100 * time.Millisecond)
-				simulation.Heal("A", "B")
+				simulation.HealLink("A", "B")
 				<-done
 				c.Close()
 			})

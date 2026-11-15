@@ -67,11 +67,20 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 		return syscall.EINVAL, true
 	}
 	switch {
+	case level == syscall.SOL_SOCKET && opt == syscall.SO_REUSEADDR:
+		o.setReuseAddr(v != 0)
 	case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
 		o.mu.Lock()
 		o.keepAlive = v != 0
 		o.mu.Unlock()
 		o.kicked()
+	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
+		if v == 0 {
+			// Nagle coalescing is unmodeled (every Write emits a segment
+			// immediately); refuse disabling TCP_NODELAY rather than silently
+			// ignoring it.
+			return syscall.ENOPROTOOPT, true
+		}
 	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
 		if v < 1 || v > dstKeepIdleMaxSec {
 			return syscall.EINVAL, true
@@ -123,11 +132,18 @@ func dstSockGetsockopt(fd, level, opt int, val []byte) (int, syscall.Errno, bool
 		o.mu.Lock()
 		defer o.mu.Unlock()
 		switch {
+		case level == syscall.SOL_SOCKET && opt == syscall.SO_REUSEADDR:
+			if o.reuseAddr {
+				return 1, true
+			}
+			return 0, true
 		case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
 			if o.keepAlive {
 				return 1, true
 			}
 			return 0, true
+		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
+			return 1, true
 		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
 			return o.keepIdleSec, true
 		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:

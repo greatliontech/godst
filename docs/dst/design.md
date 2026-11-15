@@ -157,66 +157,64 @@ real concurrency for the schedule to explore), and `PidMax` (default unbounded).
 reported exactly; a non-positive value selects the applicable default. The positive range is the target
 architecture's `int` range. A custom positive `PID` must fit in the OS pid field
 (`int32`); non-positive values select the default, oversized values panic rather than wrapping. With
-`PidMax` unset (0), pid allocation stays monotonic and a run that exhausts the finite pid field while
-allocating `Process` pids panics instead of reusing or wrapping. A positive `PidMax` models the
-kernel's `pid_max`: allocation scans forward from the last allocated pid, WRAPS into `[2, PidMax]`
-(pid 1 is the simulated init/ppid), and skips live pids — `alloc_pid`'s behavior — so **pid reuse**
+`PidMax` unset (0), pid allocation is monotonic per `(host, boot)` and a run that exhausts the finite pid field while
+allocating `Process` pids panics instead of reusing or wrapping. A positive `PidMax` models each simulated machine's
+kernel `pid_max`: on each `(host, boot)`, allocation scans forward from that boot's last allocated pid, WRAPS into `[2, PidMax]`
+(pid 1 is the simulated init/ppid), and skips live pids on that `(host, boot)` — `alloc_pid`'s behavior — so **pid reuse**
 becomes constructible in-simulation: a small `PidMax` plus process churn deterministically hands a
 dead process's pid to a new one (the same-pid-new-start-time hazard start-time discrimination exists
-for). `PidMax` must exceed the root pid (a real machine's own pid is inside its pid space); a run in
-which every pid in `[2, PidMax]` is simultaneously live refuses the `Process` loud and
+for), and a host reboot (`CrashHost` followed by `Host`) resets that machine's pid table to a fresh boot starting at `PID + 1` (the cross-boot collision hazard `/proc/sys/kernel/random/boot_id` exists to catch). `PidMax` must exceed the root pid (a real machine's own pid is inside its pid space); a run in
+which every pid in `[2, PidMax]` is simultaneously live on the target host refuses the `Process` loud and
 state-neutrally, BEFORE the admission stamps or interns anything — the kernel answers fork with
 `EAGAIN` and a failed fork leaves the parent unchanged; `Process` has no error return to carry it.
-Explore/Replay run with the identity defaults, `PidMax` unbounded included, like the other identity
-options — pid reuse is a `Run`/`Test`-tier input for now. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
+`ExploreWith` embeds `Options` (and `Failure.Options` carries them into `Replay`), so systematic exploration and replay honor `PidMax` and the other identity
+options identically to `RunWith` and `TestWith`. The rest are fixed deterministic constants documented on `Options`: `ppid=1`,
 `uid=gid=euid=egid=7777` (a distinctive value, not the ubiquitous 1000, so the simulated identity is
 observably an override), current user `sim` (uid/gid `7777`, home `/home/sim`).
-`Run`, `RunWith`, `Test`, and `TestWith` fix the identity, so even plain `Run` or `Test` is reproducible here. This
+`Run`, `RunWith`, `Test`, `TestWith`, `Explore`, `ExploreWith`, and `Replay` fix the identity, so every simulation entry point is reproducible here. This
 and the crypto/rand seam below are the only places the fork patches packages other than
 `runtime`/`testing/simulation`, and they are unavoidable: the SUT calls `os.*`/`crypto/rand` directly.
 The white-box `dstActivate` path leaves identity unset (real values), as it is not a user surface.
 
-`syscall.Kill(pid, 0)` is the liveness probe over that simulated identity. During a run it consults only
-the simulated pid registry: the root pid is live for the whole run, each `simulation.Process` pid is live
-for that process body's dynamic extent, and completed or unknown pids return `ESRCH`. The probe is
-namespace-scoped: a live pid whose process is in a DIFFERENT pid namespace than the caller answers
+`syscall.Kill(pid, 0)` is the liveness probe over that simulated identity. For goroutines inside the simulation bubble (`dstFenceActive`), it consults only
+the caller's `(host, boot)` simulated pid registry: the root/init pid (`Options.PID`) is live in the root namespace on every host boot, each `simulation.Process` pid is live on its owning `(host, boot)`
+for that process body's dynamic extent, and completed, cross-host, pre-reboot, or unknown pids return `ESRCH`. The probe is
+namespace-scoped: a live pid whose process is in a DIFFERENT pid namespace on that host than the caller answers
 `ESRCH` too — sibling-container visibility (see the pid-namespace paragraph below); internal harness
-liveness (crash/exit teardown, callback ownership) is not namespace-filtered. `Kill(0, 0)` and
+liveness (crash/exit teardown, callback ownership) keys on the unique per-invocation `slot` and `(host, pid)` without namespace filtering. `Kill(0, 0)` and
 `Kill(-1, 0)` succeed (the caller's own group and self always exist on Linux); other negative pids name
-process groups the simulation does not model — unknown, so `ESRCH`. It never probes a host
-process. The liveness READ gates process-globally like the other identity reads; non-zero signals remain
-fenced until a signal-delivery model is settled — and, being a fence, only for bubble goroutines (a
-non-bubble harness goroutine's `Kill` reaches the host kernel mid-run, per the interception boundary).
+process groups the simulation does not model — unknown, so `ESRCH`. A bubble goroutine never probes a real host
+process; non-bubble harness goroutines retain real host `Kill` access mid-run, per the interception boundary, while non-zero signals from bubble goroutines remain
+fenced until a signal-delivery model is settled.
 Generic raw `SYS_KILL` remains fenced like other unsupported raw syscalls.
 
 The simulated filesystem also owns the procfs identity surface needed for pid-liveness recovery:
-`/proc/<pid>/stat` and `/proc/self/stat` are generated for live simulated pids with a real field-22
+`/proc/<pid>/stat` and `/proc/self/stat` are generated for simulated pids live and visible on the calling goroutine's `(host, boot)` and pid namespace, with a real field-22
 **starttime**: the instant the process started, in USER_HZ (100) ticks since its host's boot,
 recorded at `Process` admission from the host's uptime clock — coherent with `CLOCK_BOOTTIME` reads,
 reset in meaning by a reboot (a post-reboot process has a small starttime again, the same cross-boot
 collision hazard a real machine has, which the boot-epoch discriminator exists to catch), and carried
-per-incarnation, so a REUSED pid (`Options.PidMax`) serves its new process's starttime — the
+per-incarnation, so a REUSED pid (`Options.PidMax` or reboot) serves its new process's starttime — the
 pid-reuse discriminator clients parse `/proc` for. Two processes started within one 10 ms tick share
-a starttime, the host's own resolution caveat. Completed, unknown, cross-namespace, host, or
+a starttime, the host's own resolution caveat. Completed, unknown, cross-host, pre-reboot, cross-namespace, host, or
 unrepresentable pids are
 not visible, and a zero-padded pid is not a procfs name (Linux's `name_to_int` rejects leading zeros).
-`/proc/self/stat` and `/proc/<own-pid>/stat` are one file to `SameFile` (one inode on the host); a
+`/proc/self/stat` and `/proc/<own-pid>/stat` are one file to `SameFile` within one `(host, boot, pid)` incarnation (and distinct across hosts and across reboots); a
 trailing slash on a proc leaf is `ENOTDIR` (the filesystem section's trailing-slash clause).
 
 **Pid namespaces (sibling-container model, enforced).** `/proc/self/ns/pid` readlink returns the
-caller's namespace identity `pid:[<inode>]` — `pid:[1]` for the root namespace every process is in by
+caller's namespace identity `pid:[<inode>]` — `pid:[1]` for the root namespace every process on a host boot is in by
 default. `simulation.ProcessWith(name, ProcessConfig{PIDNamespace: "ns-name"}, f)` places that
-invocation in a NAMED pid namespace: names intern per run to deterministic inodes (2, 3, … in first-use
-order), the same name is the same namespace (containers sharing a pod's pid namespace; a restart
-naming the same namespace keeps it — the pause-container shape), and the empty name is the root
-namespace. Namespaces are modeled as SIBLINGS partitioning visibility over one global pid space:
-cross-namespace, `kill(pid, 0)` answers `ESRCH` and `/proc/<pid>/stat` does not exist — exactly what
-two peer containers see of each other. Deliberately NOT modeled (recorded limits, no client needs
+invocation in a NAMED pid namespace on its `(host, boot)`: names intern per `(host, boot)` to deterministic inodes (`2, 3, …` in first-use
+order on that machine boot), the same name on the same host boot is the same namespace (containers sharing a pod's pid namespace; a process restart on the same boot
+naming the same namespace keeps it — the pause-container shape — while a host reboot starts a fresh `nsfs` table), and the empty name is the host's root
+namespace. Namespaces are modeled as SIBLINGS partitioning visibility over each `(host, boot)`'s pid space:
+cross-namespace (or cross-host), `kill(pid, 0)` answers `ESRCH` and `/proc/<pid>/stat` does not exist — exactly what
+two peer containers or separate machines see of each other. Deliberately NOT modeled (recorded limits, no client needs
 them): namespace hierarchy (an init-namespace parent observing children under translated pid
-numerals) and per-namespace pid numbering (two siblings each having their own pid 7) — pids remain
-one global space, so a numeral names at most one live process run-wide, and the
-same-numeral-unrelated-process shape is constructible only through pid REUSE (`PidMax`), not through
-namespace overlap.
+numerals) and per-namespace pid numbering on one host (two sibling namespaces on the same host each having their own pid 7) — within one `(host, boot)` pids remain
+one per-machine kernel space, so on a single host boot a numeral names at most one live process, and same-host
+same-numeral-unrelated-process shapes arise through pid REUSE (`PidMax`) or host reboot (`CrashHost`), while distinct hosts maintain independent pid spaces.
 Unsupported `/proc` paths stay deterministic simulated results (unsupported or not-exist), never host
 passthrough.
 
@@ -229,8 +227,8 @@ state to detect that a reboot invalidated coordination state established under t
 (run seed, host, boot count): constant across re-reads and across co-located processes, and
 distinct per (host, boot, seed) by 122-bit deterministic derivation — 6 of the 128 bits carry the
 UUID version/variant, so distinctness is overwhelming-probability, not structurally guaranteed,
-exactly as for a real kernel's random boot_id. A machine **boots** at its first declaration in the run (explicit
-`Host` or implicit-host `Process`) and at its first `Host` re-declaration after `CrashHost` powered
+exactly as for a real kernel's random boot_id. A machine **boots** at its first `Host` declaration in the run
+and at its first `Host` re-declaration after `CrashHost` powered
 it off; a `Host` re-declaration of a machine that is UP re-establishes its clock but does **not**
 reboot it — its processes survive that declaration, and a boot_id changing under a live process is a
 state no kernel shows. The value has the RFC 4122 version-4 shape a real boot_id has (a
@@ -270,33 +268,26 @@ host-database read
 
 **Environment surface (enforced).** The
 process environment is per-**process** state on a real machine, so under a run it is per-simulated-
-process state here: `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clearenv` operate on a
-per-process copy-on-write view, initialized from the host environment at `Run` entry. Writes are
-isolated — a `Setenv` in one process is never observable from another process or host (env must not
-be a back-channel two real machines never had; this is the environment leg of DST-NODE-ISOLATION).
-A process invocation's view is discarded on normal exit, explicit process crash, or host crash; a same-name restart copies the
+process-invocation state here: for bubble goroutines (`dstSimIdentityActive`), `os.Getenv`/`LookupEnv`/`Environ`/`Setenv`/`Unsetenv`/`Clearenv` operate on a
+per-`(host, slot)` copy-on-write view (`g.dstHost`, `g.dstProcSlot`), initialized from the host environment snapshot taken at `Run` entry. Writes are
+isolated — a `Setenv` in one `Process` invocation (or by a root goroutine inside one `Host` body, `slot == 0`) is never observable from another `Process` invocation, overlapping same-name sibling, or another `Host` (env must not
+be a back-channel two real machines or processes never had; this is the environment leg of DST-NODE-ISOLATION).
+A `Process` invocation's view is discarded on normal exit, explicit `CrashProcess`, or `CrashHost` (which also resets that host's `(host, 0)` root view); a same-name restart or rebooted host copies the
 run-entry host baseline again, never its predecessor's `Setenv`, `Unsetenv`, or `Clearenv` mutations.
-Reads of *unmodified* variables return host values: those are machine state, exactly like data read
+Reads of *unmodified* variables return the run-entry host baseline values: those are machine state, exactly like data read
 through an explicitly granted host-file capability — deterministic per machine, and cross-machine
 reproducibility of a SUT that branches on them is program discipline. Note
 `os.UserHomeDir` (host `$HOME`) and `user.Current().HomeDir` (`/home/sim`) can therefore disagree
 in-run; acquire identity through `os/user` for coherence. `os.TempDir` stays fixed at the simulated
-`/tmp` (see the filesystem section). The simulated
-identity is also process-global while set: a goroutine outside the simulation that reads identity
-during a run (or in the brief set/clear windows around it) observes simulated values — identity
-gates on the sim-env flag, not per-goroutine. The per-process environment view shares this
-process-global gate but adds a *write* path the read-only identity surface lacks: a `Setenv` by a
-goroutine *outside* the simulation during a run mutates the root process (proc 0) view rather than
-the host, so run determinism additionally requires that no foreign goroutine writes the environment
-mid-run. This holds by construction — a SUT's own goroutines run inside the bubble (deterministically
-ordered), and the harness does not `Setenv` mid-run — and is the write-side analogue of the read-only
-"harmless" argument below.
+`/tmp` (see the filesystem section). Both simulated
+identity and the simulated environment gate on **bubble membership** (`dstSimIdentityActive` = `dstSimEnvSet && dstFenceActive()`):
+a goroutine outside the simulation's bubble (test harness goroutines, background runtime workers, or a foreign `synctest` bubble) retains real host identity and real host environment access during a run and cannot perturb any simulated `(host, slot)` view.
 Environment dispatch is atomic with run activation and deactivation: each API operation holds one
 runtime gate from host-versus-simulated selection through its read or mutation, while publishing or
 clearing the simulated environment takes the same gate. An operation therefore belongs wholly to the
 host or to one run epoch; it cannot choose one world and complete in the other.
-This is a deliberate gating asymmetry: identity is gated on `dstSimEnvSet` (set only by
-`testing/simulation.run`), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
+This is a deliberate gating distinction: identity and environment gate on `dstSimIdentityActive()` (set only by
+`testing/simulation` runs for their own bubble), whereas the RNG/scheduling/crypto-rand seams are gated on `dstActive()` (set
 by `dstActivate` too). So a white-box run sees seeded RNG, scheduling, and crypto/rand but the *real*
 host identity — harmless, because the white-box runtime tests exercise the per-g mechanism under
 `GOMAXPROCS>1` and never read identity. `uid`/`gid`/`ppid` are fixed (not configurable like
@@ -502,12 +493,16 @@ it never wraps a positive delay into an earlier delivery.
   `syscall.Conn`; raw Read/Write are refused). The raw syscalls ride the interception boundary's
   virtual-fd dispatch — including the `golang.org/x/sys/unix` path, whose trampolines jump to
   `syscall.Syscall6`, and the socketcall multiplex on 386/s390x — so a callback's writes are fully
-  observed, deterministic, with kernel errno shapes. The modeled set is `SO_KEEPALIVE`,
+  observed, deterministic, with kernel errno shapes. The modeled set is `SO_REUSEADDR`, `SO_KEEPALIVE`,
+  `TCP_NODELAY` (`TCP_NODELAY=1`, Go's TCP default; disabling it with `TCP_NODELAY=0` is refused `ENOPROTOOPT` because Nagle coalescing is not modeled),
   `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT` (defaults are the
-  simulated kernel's deterministic constants: 7200s/75s/9, the Linux sysctl defaults); an option
+  simulated kernel's deterministic constants: `TCP_NODELAY=1`, keepalive 7200s/75s/9, the Linux sysctl defaults); an option
   outside it fails `ENOPROTOOPT` — the fence philosophy at option granularity, nothing silently
   stored whose behavior the model does not provide. Accepted connections inherit the listener's
-  option state (accept(2) inheritance, tcp(7)). The semantics wire into the death machinery:
+  option state (accept(2) inheritance, tcp(7)). `*dstConn` also implements TCP half-close
+  (`CloseWrite() error` and `CloseRead() error`, modeling `shutdown(SHUT_WR)` — sending FIN while
+  keeping reads open — and `shutdown(SHUT_RD)`), satisfying structural half-close assertions in
+  `io.Copy`, `net/http`, and RPC transports. The semantics wire into the death machinery:
   `TCP_USER_TIMEOUT` overrides the retransmission horizon per socket (including the connect path's
   SYN retransmissions, and bounding a ZERO-WINDOW stall against a live peer — the one per-socket
   exception to persist-forever, `tcp_probe_timer`'s user-timeout arm); these data-path deaths keep
@@ -537,12 +532,10 @@ it never wraps a positive delay into an earlier delivery.
   replay-exactness) and `net/dst_crash_silence_test.go` (the dead-host and reboot arms).
 - **Connect cost.** Establishing a cross-host connection completes after one round trip of the
   link (SYN + SYN-ACK: two one-way traversals, each paying the link's base latency + a jitter draw;
-  throttle exempts the zero-payload control segments) — the SYN half is paid before the server's
-  Accept unblocks and is context-interruptible (a connect deadline shorter than the RTT fails
-  mid-handshake); the SYN-ACK half remains context-interruptible and aborts if either endpoint is
-  reset or torn down before it arrives. It then delays the dialer's return, so the server sees the conn at
-  ½ RTT and the dialer returns at one full RTT (`TestDSTNetConnectPaysRTT`). Same-host connects are
-  instant. Both endpoints become lifecycle-owned before the server endpoint enters the accept backlog,
+  throttle exempts the zero-payload control segments) — both legs are context-interruptible (a connect deadline shorter than the RTT fails
+  mid-handshake) and abort if either endpoint is
+  reset or torn down before the handshake finishes. Only once the SYN-ACK leg completes (`ESTABLISHED`) is the server endpoint enqueued onto the listener's accept backlog (or handed to a waiting `Accept`), matching real TCP where `accept(2)` never returns a `SYN_RECV` child before handshake completion (`TestDSTNetConnectPaysRTT`). Same-host connects are
+  instant. Both endpoints become lifecycle-owned before handshake completion/backlog enqueue,
   so process or host teardown cannot miss a queued or already accepted connection. A dial across a
   **partition** blackholes: it blocks until the link heals, the
   context/deadline expires, or the retransmit horizon fires `ETIMEDOUT`
@@ -558,11 +551,11 @@ it never wraps a positive delay into an earlier delivery.
   and its kernel answers again (`ECONNREFUSED` until a listener is up, then connect)
   (`TestDSTCrashHostDialBlackholes`). The same holds for a dial already mid-handshake when the
   power fails — it re-enters the blackhole wait instead of surfacing the dead listener's teardown
-  as a refusal (`TestDSTCrashHostMidHandshakeDialTimesOut`). The machine-off mark is distinct from a network cut: a
-  `HealHost` cannot make a powered-off machine reachable, and a reboot does not heal an injected
+  as a refusal (`TestDSTCrashHostMidHandshakeDialTimesOut`). The machine-off mark is distinct from a network cut: an
+  `UnisolateHost` cannot make a powered-off machine reachable, and a reboot does not heal an injected
   isolation. A dial to an address **no declared host owns** blackholes the same way and fails
   `ETIMEDOUT` (nothing answers a SYN to an unowned address; an RST needs a live kernel) — the
-  peer-down/unreachable split — until a `Host` (or implicit-host `Process`) declaration boots a
+  peer-down/unreachable split — until a `Host` declaration boots a
   machine at the address, which relays host-up and wakes parked dials exactly as a reboot does
   (`ECONNREFUSED` until a listener is up, then connect). net learns the declared-host set through a
   runtime query hook to testing/simulation's intern registry (the partition-hook pattern); the case
@@ -695,10 +688,8 @@ only the FORWARD direction landing after the SYN traversed does not hold the dia
 completes on receiving the SYN-ACK; the lost final ACK is the server child's failure surface
 (`TestDSTNetSYNACKForwardCutStillCompletes`). A gate that fails the dial (`ETIMEDOUT`, refuse, or
 a reset observed at heal — the heal path re-checks the same deciding observers as the zero-latency
-arm, `TestDSTNetSYNACKHealObservesReset`) resets both ends, including a server end the SUT may
-have ALREADY Accepted — the forced consequence of the recorded ½-RTT collapse (the server sees the
-conn before the handshake completes, where real TCP accepts only established children and its
-SYN_RECV child dies silently); the accepted survivor observes an ordinary reset. Closing a listener
+arm, `TestDSTNetSYNACKHealObservesReset`) resets the half-open connection before it ever reaches the
+listener's accept queue (`Accept` receives only `ESTABLISHED` children after `SYN-ACK` delivery). Closing a listener
 resets the connections still in its accept backlog (production's RST), so a dialer that already
 succeeded observes `ECONNRESET` (the one-shot, on its first failing op) instead of blocking durably
 forever, and `Accept` after `Close`
@@ -708,9 +699,9 @@ accept unblocks with `net.ErrClosed` and its would-be connection is reset with t
 production unblocks pending accepts on close). The nettrace
 `ConnectStart`/`ConnectDone` callbacks fire around a simulated dial, so `httptrace`-instrumented
 clients observe connects as in production. The seam is the exported
-`Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstActive()` so it
-compiles out without `-tags dst`; net's internal lookups stay real (the program does not exercise real
-sockets under DST).
+`Dial`/`DialContext`/`ListenConfig.Listen` (the `os.Getpid` altitude), gated on `dstInSimBubble()` so
+non-bubble goroutines keep real host networking and untagged builds compile it out; in-bubble
+protocol-number lookups use a deterministic built-in table rather than reading host `/etc/protocols`.
 
 **Determinism is free.** Connection/accept/delivery order is just the goroutine schedule, which is
 already deterministic — no new seed, no new RNG. The registry is keyed by a per-run epoch (`dstNetEpoch`,
@@ -726,18 +717,20 @@ byte/message-granular: dropping, reordering, or duplicating bytes on a live stre
 freedom TCP has, so packet-granular drop/reorder/duplicate land with the UDP/`PacketConn` follow-on,
 not this base. See [faults.md](./faults.md).
 
-**Caveat (fidelity).** `Dial` returns the `net.Conn` *interface*; code that type-asserts the concrete
-`*net.TCPConn` (raw fds, `SetNoDelay`) will not get one — but the conns and listeners implement
-`syscall.Conn`, and `Dialer.Control`, `Dialer.ControlContext`, `ListenConfig.Control`, and explicit
-keepalive configuration are MODELED (the socket-option layer and keepalive death law — see "Socket
-options & keepalive" in the transport model): callbacks run against a virtual socket descriptor whose
-sockopts land in per-socket option state, the modeled set carries full death-machinery semantics, and
-an option outside the modeled set fails `ENOPROTOOPT` rather than being silently ignored — the same
+**Caveat (fidelity).** `Dial` returns the `net.Conn` *interface* (plus `CloseWrite() error` and
+`CloseRead() error` half-close methods matching standard structural TCP half-close interfaces); code
+that type-asserts the concrete `*net.TCPConn` (`SetNoDelay` method) will not get one — though
+conns and listeners implement `syscall.Conn` (`TCP_NODELAY` defaults to `1`, matching Go's
+`*net.TCPConn` default, and `SO_REUSEADDR` is modeled alongside keepalive options), and
+`Dialer.Control`, `Dialer.ControlContext`, `ListenConfig.Control`, and explicit keepalive
+configuration are MODELED (the socket-option layer and keepalive death law — see "Socket options &
+keepalive" in the transport model): callbacks run against a virtual socket descriptor whose sockopts
+land in per-socket option state, the modeled set carries full death-machinery semantics, and an
+option outside the modeled set fails `ENOPROTOOPT` rather than being silently ignored — the same
 fail-loud contract at option granularity. Explicit MPTCP enable/use still fails (multipath needs path
 semantics the single-link wire does not have); explicitly disabling MPTCP is accepted because the base
-model is ordinary TCP. DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (a fixed
-synthetic set consistent with this addressing) are follow-on increments. Public DNS resolver APIs and
-service-name port lookups fail under DST rather than touching the host resolver, while literal-IP,
+model is ordinary TCP. Arbitrary DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (landed: synthetic `lo` + `eth0`) have explicit boundaries: `"localhost"` resolves deterministically to loopback (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `LookupHost`, `LookupIP`, `LookupNetIP`, and `ResolveTCPAddr`, while arbitrary DNS names and
+service-name port lookups fail under DST rather than touching the host resolver, and literal-IP,
 numeric-port, and pre-I/O validation fast paths keep their normal no-I/O behavior. Unsupported networks
 at the intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or
 falling through to the real OS: a known-but-unmodeled network (UDP, Unix, IP) carries the same
@@ -1534,9 +1527,9 @@ build probes across all five). Untagged builds remain valid upstream ports every
   arrive — the fence makes the refusal deterministic instead of luck), and `Ignore`/`Reset`/`Stop`
   (which mutate the process-global signal *disposition* via `rt_sigaction` — `Ignore`/`Reset`
   unconditionally, even with no subscribers — so a bubble's `Ignore(SIGINT)` would set the whole
-  host process, harness included, to ignore the signal: a bubble effect leaking into host state).
-  `Ignored` is a host-state *read* that mints and mutates nothing, so like the other ⛔ reads it is
-  program discipline, not fenced.
+  host process, harness included, to ignore the signal: a bubble effect leaking into host state),
+  plus `Ignored` (which reads mutable host-process signal disposition that would vary with external
+  test-process state; non-bubble goroutines call `Ignored` normally).
 - **cgo**: fenced at the call, not the build — `cgocall` from a bubble goroutine while a run is
   active panics with the unsupported shape (mirroring the FIPS gate's enforced-not-documented
   stance). Gating on `iscgo` at run entry would be too coarse: a binary may *link* cgo it never
@@ -1748,8 +1741,8 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   land in the file deliberately, reviewed like any change set. `cmd/api` evaluates both
   untagged contexts and 16 paired `-tags dst` Linux contexts across all eight supported Linux
   architectures (`386`, `amd64`, `arm`, `arm64`, `ppc64`, `ppc64le`, `riscv64`, `s390x`, with
-  and without cgo), pinning `-tags dst`-only exports (`HostFS`) directly in `api/go1-godst.txt`
-  and enforcing exact signature parity across every tagged/untagged twin (`dst_api_test.go`).
+  and without cgo), pinning the uniform `testing/simulation` surface in `api/go1-godst.txt`
+  and enforcing exact export and signature parity across untagged and `-tags dst` builds (`dst_api_test.go`, `TestAPISurfaceUniformOutsideRun`).
   In the `test` aggregate, per-PR in ci.yml, and in the matrix.
 - **`test:inert-diff`** (`TestUntaggedTextIdenticalToStock` + `TestUntaggedTypeShapesIdenticalToStock`,
   `-tags dst`, non-short): the INV-VANILLA and INV-TYPESHAPE differential gates — the probe corpus
@@ -1947,16 +1940,16 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
 | standard streams (stdio) | `os.Stdin` fenced; ungranted `fd 1`/`fd 2` writes (`os.Stdout`/`os.Stderr`, `syscall.Write`, `Syscall(SYS_WRITE)`) captured off-heap per `(host, proc, pid, fd)` with zero heap/schedule perturbation and emitted only on test/explore failure (`RawSyscall` stays fenced); explicit live host stdio granted via `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for in-run capture; granted capability syscalls dispatch raw (scheduler-invisible, the P held) so a blocked capability write serializes, never reorders — sysmon's syscall retake stays run-gated for foreign goroutines; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
-| environment (`os.Getenv`/`Setenv`/`Environ`) | per-process COW env view (isolation enforced; unmodified reads are host-derived machine state) | ✅ |
+| environment (`os.Getenv`/`Setenv`/`Environ`) | per-`(host, invocation slot)` COW env view (isolation enforced across hosts, reboots, and overlapping invocations; non-bubble goroutines read/mutate real host env; unmodified initial reads inherit host env) | ✅ |
 | faults: net (latency/jitter/throttle/partition/reset), disk (EIO/ENOSPC/latency), clock (skew/step/drift) | policies at the existing seams over the Host/Process victim contract (see [faults.md](./faults.md)) | ✅ |
 | faults: crash tear (torn/lost unsynced writes and names on power loss) | page-granular durable/current selection drawn from the fault RNG (`Options.CrashTear`) | ✅ |
-| faults: process crash + restart | pid-keyed goroutine death + proc-keyed resource teardown (see [faults.md](./faults.md)) | ✅ |
+| faults: process crash + restart | slot- and `(host, pid)`-keyed goroutine death + per-invocation slot resource teardown (see [faults.md](./faults.md)) | ✅ |
 | faults: host crash (power loss) + reboot | host-keyed goroutine and kernel-state death + durable-image restore (see [faults.md](./faults.md)) | ✅ |
 | faults: seeded clock drift (`Drift`/`BoundedDrift` declared, `DriftClock` mid-run) | per-host rate over the base clock (see [faults.md](./faults.md)) | ✅ |
 | faults: OOM kill, scheduling (straggler) | fault-orchestration layer (see [faults.md](./faults.md)) | ⏳ |
 | raw `syscall` / `golang.org/x/sys` | fenced for bubble goroutines: numeric real fds carry no authority; explicit inherited-file capabilities are typed `os.File` values with no raw descriptor surface; close of a real fd is answered `EBADF`, never dispatched | ✅ |
 | processes (`os/exec`, `os.StartProcess`, `syscall.ForkExec`/`Exec`) | fenced (loud "unsupported under deterministic simulation") | ✅ |
-| signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`) | fenced for bubble goroutines (subscribe + host-disposition mutation) | ✅ |
+| signals (`os/signal.Notify`/`NotifyContext`/`Ignore`/`Reset`/`Stop`/`Ignored`) | fenced for bubble goroutines (subscribe + host-disposition mutation/read) | ✅ |
 | `os.Executable` | fenced (a host path naming nothing in the simulated namespace) | ✅ |
 | cgo | fenced at `cgocall` for bubble goroutines (a binary may link cgo it never calls in-run) | ✅ |
 | runtime introspection (`NumGoroutine`, `runtime/metrics`, `ReadMemStats`, `Stack(all)`) | process-wide, history/wall-time-dependent readings (see "The interception boundary") | ⛔ (program discipline) |
@@ -2054,7 +2047,7 @@ later steps add, never rewrite.
   design") for the validated seam and framing (the residual it addresses is seed-*invariance*, i.e. one explored
   interleaving — not nondeterminism). **5a** seeded interleaving diversity (get-side selection at the
   `findRunnable` seam from a per-bubble scheduling RNG; default strategy = seeded-random); **5b** the
-  strategy hook at the same choice point (random → PCT, exposed via `RunWith(Options, f)`). **5c** sound
+  strategy hook at the same choice point (random → PCT, exposed via `RunWith(seed, Options, f)`). **5c** sound
   scheduling faults (delay/deprioritize a runnable G) folds into the fault-orchestration feature below.
   Turns reproducibility into *directed* exploration. The seeded path's decision distribution is
   MEASURED, not assumed (exploration.md, "Measured seeded-path diversity"): per-site choice entropy
@@ -2139,9 +2132,9 @@ later steps add, never rewrite.
   with simulated addresses, so unmodified networked code is reproducible without modeling the network
   itself. Determinism rides the scheduler (no new seed plumbing); the registry is keyed by a per-run
   epoch so it resets between runs. The reliable, in-order base for network faults. See the "In-memory
-  deterministic network" section above; tested by `TestDSTNet`. Caveat: only the `net.Conn` interface — code type-asserting
-  `*net.TCPConn` (raw fds, `SetNoDelay`) does not get one. DNS/service-name ports/UDP/Unix are
-  follow-ons (`net.Interfaces` is landed — the synthetic `lo`+`eth0` set); public DNS and service-name
+  deterministic network" section above; tested by `TestDSTNet`. Caveat: `net.Conn` with `CloseWrite`/`CloseRead` half-close and `syscall.Conn` sockopts (`TCP_NODELAY=1`, `SO_REUSEADDR`, keepalive) — code type-asserting concrete
+  `*net.TCPConn` does not get one. Arbitrary DNS/service-name ports/UDP/Unix are
+  follow-ons (`net.Interfaces` is landed — the synthetic `lo`+`eth0` set, and `"localhost"` resolves deterministically to loopback); arbitrary DNS and service-name
   lookups fail under DST rather than touching host resolver state.
 
 - **Disk (in-memory deterministic filesystem). LANDED (second I/O feature).** Under DST the exported
@@ -2196,7 +2189,8 @@ table); the open work is the OOM and scheduling faults and the declarative orche
     landed read side and the recorded divergence.
   - **Sim-DNS.** Dial-by-hostname: a minimal `hostname → routable IP` lookup over the declared-host
     assignment (faults.md, per-host address space) — a relay from net to testing/simulation's
-    intern registry, like the declared-host query hook. Until it lands, DNS-by-name stays fenced;
+    intern registry, like the declared-host query hook (`"localhost"` already resolves
+    deterministically to loopback). Until it lands, arbitrary DNS-by-name stays fenced;
     its error identities (NXDOMAIN shape, resolver API scope) are the increment's design work.
   - **UDP / `PacketConn`.** The datagram transport, which is also what unlocks the packet-granular
     fault axis (drop/reorder/duplicate — degrees of freedom a reliable in-order stream does not
@@ -2221,7 +2215,7 @@ itself and depends only on the landed Seq-5 seam + `-race`.
 ## Decisions (settled)
 
 - **Control surface: a public `testing/simulation` API** (not GODEBUG, not internal). `GODEBUG=dstseed` is
-  removed. Seq 5 (strategy/faults) extends this same public API (`RunWith(Options, f)`).
+  removed. Seq 5 (strategy/faults) extends this same public API (`RunWith(seed, Options, f)`).
 - **Bubble-scoped**: the per-g seed/control re-roots per `synctest` bubble (order-immune
   reproduction). Process-level enablers (`GOMAXPROCS=1`, async/sysmon preemption off) are enforced by
   `simulation.Run` for the duration of a call.

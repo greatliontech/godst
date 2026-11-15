@@ -654,6 +654,11 @@ func dstMappingFaultAddr(addr uintptr) (state uint8, found bool) {
 func dstMappingFault(addr uintptr) {
 	gp := getg()
 	pid := gp.dstPid
+	slot := gp.dstProcSlot
+	host := gp.dstHost
+	if key, _, ok := dstPidLookupBySlot(slot); ok {
+		host = key.host
+	}
 	if pid <= 0 {
 		print("dst: fault at ", hex(addr), " inside a simulated mapping (live or unmapped), outside any simulated process\n")
 		throw("dst: mapping fault outside a simulated process")
@@ -670,12 +675,12 @@ func dstMappingFault(addr uintptr) {
 	// the same check and panics; here a panic would be recoverable, and this
 	// fault is not.) dstSimBubble is the bubble the crash machinery itself
 	// marks against, so the guard must ask about that one.
-	if dstCrashKillsBubbleMain(dstSimBubble, pid) {
+	if dstCrashKillsBubbleMain(dstSimBubble, slot, pid) {
 		print("dst: fault at ", hex(addr), " inside a simulated mapping\n")
 		throw("dst: a mapping fault crashed the process running the simulation body")
 	}
-	if !dstMappingFaultTeardown(gp.dstProc) {
-		dstCrashProcessPid(pid)
+	if !dstMappingFaultTeardown(slot, pid) {
+		dstCrashProcessPid(host, slot, pid)
 	}
 	dstParkCrashedSelf()
 	throw("dst: a process crashed by a mapping fault resumed")

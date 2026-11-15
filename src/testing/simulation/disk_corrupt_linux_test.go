@@ -41,7 +41,7 @@ func corruptRun(t *testing.T, seed uint64, content []byte, tear bool, between fu
 	t.Helper()
 	var got []byte
 	RunWith(seed, Options{CrashTear: tear}, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				if err := os.WriteFile("/f", content, 0o644); err != nil {
 					t.Errorf("write: %v", err)
@@ -68,7 +68,7 @@ func corruptRun(t *testing.T, seed uint64, content []byte, tear bool, between fu
 
 		// The cache masks the platter: a live read after the corruption still
 		// returns the written bytes, on every run of every arm.
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			b, err := os.ReadFile("/f")
 			if err != nil {
 				t.Fatalf("live read: %v", err)
@@ -79,12 +79,12 @@ func corruptRun(t *testing.T, seed uint64, content []byte, tear bool, between fu
 		})
 
 		if between != nil {
-			Host("h", HostConfig{}, func() { between(t) })
+			Host("h", func() { between(t) })
 		}
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				b, err := os.ReadFile("/f")
 				if err != nil {
@@ -220,7 +220,7 @@ func TestDSTDiskCorruptVictimIsolation(t *testing.T) {
 	content := bytes.Repeat([]byte("V"), 4096)
 	var gotG, gotSib []byte
 	RunWith(7, Options{}, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				for _, p := range []string{"/f", "/sib"} {
 					if err := os.WriteFile(p, content, 0o644); err != nil {
@@ -248,7 +248,7 @@ func TestDSTDiskCorruptVictimIsolation(t *testing.T) {
 		CorruptFile("h", "/empty")        // no-op: an empty durable image has no platter blocks
 
 		// The rot rides the file, not the path.
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			if err := os.Rename("/f", "/g"); err != nil {
 				t.Fatalf("rename: %v", err)
 			}
@@ -257,7 +257,7 @@ func TestDSTDiskCorruptVictimIsolation(t *testing.T) {
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				var err error
 				if gotG, err = os.ReadFile("/g"); err != nil {
@@ -383,7 +383,7 @@ func TestDSTDiskCorruptAccumulates(t *testing.T) {
 	content := bytes.Repeat([]byte("K"), 2*4096)
 	var got []byte
 	RunWith(11, Options{}, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				if err := os.WriteFile("/f", content, 0o644); err != nil {
 					t.Errorf("write: %v", err)
@@ -400,7 +400,7 @@ func TestDSTDiskCorruptAccumulates(t *testing.T) {
 		CorruptFile("h", "/f")
 		CorruptFile("h", "/f")
 		CrashHost("h")
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				b, err := os.ReadFile("/f")
 				if err != nil {
@@ -429,7 +429,7 @@ func TestDSTDiskCorruptSameBitCancels(t *testing.T) {
 	for seed := uint64(1); seed <= 64; seed++ {
 		var got []byte
 		RunWith(seed, Options{}, func() {
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				go Process("db", func() {
 					if err := os.WriteFile("/f", content, 0o644); err != nil {
 						t.Errorf("write: %v", err)
@@ -446,7 +446,7 @@ func TestDSTDiskCorruptSameBitCancels(t *testing.T) {
 			CorruptFile("h", "/f")
 			CorruptFile("h", "/f")
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				Process("recover", func() {
 					b, err := os.ReadFile("/f")
 					if err != nil {
@@ -475,11 +475,11 @@ func TestDSTHostFSSparseAndEpochFencing(t *testing.T) {
 	const tailOff = sparseSize - 4
 
 	var (
-		leakedFS         fs.FS
-		foreignPanicked  bool
-		foreignOpenErr   error
-		foreignStatErr   error
-		foreignDirErr    error
+		leakedFS        fs.FS
+		foreignPanicked bool
+		foreignOpenErr  error
+		foreignStatErr  error
+		foreignDirErr   error
 	)
 	foreignInspect := make(chan fs.FS, 1)
 	foreignDone := make(chan struct{})
@@ -504,7 +504,7 @@ func TestDSTHostFSSparseAndEpochFencing(t *testing.T) {
 	}()
 
 	Run(1, func() {
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			f, err := os.Create("/wal")
 			if err != nil {
 				t.Fatalf("Create: %v", err)
@@ -596,7 +596,7 @@ func TestDSTHostFSSparseAndEpochFencing(t *testing.T) {
 
 	// Cross-run: leaked HostFS never aliases Run 2's host at the same ID.
 	Run(2, func() {
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			if err := os.WriteFile("/wal", []byte("run2"), 0o644); err != nil {
 				t.Fatalf("run2 WriteFile: %v", err)
 			}
@@ -618,7 +618,7 @@ func TestDSTDiskCorruptOfflineHostSurfacesOnReboot(t *testing.T) {
 	var firstBoot, secondBoot []byte
 
 	Run(11, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			if err := os.WriteFile("/sst", want, 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -630,7 +630,7 @@ func TestDSTDiskCorruptOfflineHostSurfacesOnReboot(t *testing.T) {
 		// Host "h" is currently powered off; CorruptFile flips a platter bit on the cold disk.
 		CorruptFile("h", "/sst")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			b, err := os.ReadFile("/sst")
 			if err != nil {
 				t.Fatalf("ReadFile on reboot: %v", err)
@@ -640,7 +640,7 @@ func TestDSTDiskCorruptOfflineHostSurfacesOnReboot(t *testing.T) {
 
 		// A subsequent crash without rewriting must keep that exact corrupted platter image.
 		CrashHost("h")
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			b, err := os.ReadFile("/sst")
 			if err != nil {
 				t.Fatalf("ReadFile on second reboot: %v", err)
@@ -662,7 +662,7 @@ func TestDSTDiskCorruptSparseHoleNoOpAndZeroBlockMaterialization(t *testing.T) {
 
 	runCase := func(corruptSparse bool) (realAfter []byte, sparseBlocks int64) {
 		Run(23, func() {
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				sf, err := os.Create("/sparse")
 				if err != nil {
 					t.Fatalf("Create sparse: %v", err)
@@ -691,7 +691,7 @@ func TestDSTDiskCorruptSparseHoleNoOpAndZeroBlockMaterialization(t *testing.T) {
 			CorruptFile("h", "/real")
 			CrashHost("h")
 
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				var st syscall.Stat_t
 				f, err := os.Open("/sparse")
 				if err != nil {
@@ -746,7 +746,7 @@ func TestDSTDiskCorruptCrashTearShrinkHealsTailRot(t *testing.T) {
 
 			var got []byte
 			RunWith(seed, Options{CrashTear: true}, func() {
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 					if err != nil {
 						t.Fatalf("Create: %v", err)
@@ -772,7 +772,7 @@ func TestDSTDiskCorruptCrashTearShrinkHealsTailRot(t *testing.T) {
 				})
 
 				CrashHost("h")
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					b, err := os.ReadFile("/f")
 					if err != nil {
 						t.Fatalf("ReadFile after CrashTear: %v", err)
@@ -820,7 +820,7 @@ func TestDSTDiskCorruptCrashTearShrinkHealsTailRot(t *testing.T) {
 
 			var got []byte
 			RunWith(seed, Options{CrashTear: true}, func() {
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 					if err != nil {
 						t.Fatalf("Create: %v", err)
@@ -844,7 +844,7 @@ func TestDSTDiskCorruptCrashTearShrinkHealsTailRot(t *testing.T) {
 				})
 
 				CrashHost("h")
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					b, err := os.ReadFile("/f")
 					if err != nil {
 						t.Fatalf("ReadFile after CrashTear: %v", err)
@@ -894,7 +894,7 @@ func TestDSTDiskWritebackMmapSharedRedirty(t *testing.T) {
 	t.Run("ExistingWritableSharedMmap", func(t *testing.T) {
 		var p0After, p1After byte
 		Run(1, func() {
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				f, err := os.OpenFile("/db", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 				if err != nil {
 					t.Fatalf("OpenFile: %v", err)
@@ -932,7 +932,7 @@ func TestDSTDiskWritebackMmapSharedRedirty(t *testing.T) {
 			})
 
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				b, err := os.ReadFile("/db")
 				if err != nil {
 					t.Fatalf("ReadFile after CrashHost: %v", err)
@@ -951,7 +951,7 @@ func TestDSTDiskWritebackMmapSharedRedirty(t *testing.T) {
 	t.Run("PostEIOMmapAndMprotectUpgrade", func(t *testing.T) {
 		var gotMmap, gotMprotect byte
 		Run(2, func() {
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				for _, name := range []string{"/late-mmap", "/late-mprotect"} {
 					f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 					if err != nil {
@@ -1024,7 +1024,7 @@ func TestDSTDiskWritebackMmapSharedRedirty(t *testing.T) {
 			})
 
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				b1, err := os.ReadFile("/late-mmap")
 				if err != nil {
 					t.Fatalf("ReadFile late-mmap: %v", err)
@@ -1056,12 +1056,12 @@ func TestDSTStatfsAndQuotaExploreDPOR(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			sawBefore := false
 			sawAfter := false
-			res := Explore(1, DPOR, func() bool {
+			res := Explore(1, DPOR, func() error {
 				var (
 					initFree uint64
 					obsFree  uint64
 				)
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 					if err != nil {
 						t.Fatalf("Create /f: %v", err)
@@ -1112,7 +1112,7 @@ func TestDSTStatfsAndQuotaExploreDPOR(t *testing.T) {
 				default:
 					t.Fatalf("observed Bfree = %d, want %d or %d", obsFree, initFree, initFree-1)
 				}
-				return false
+				return nil
 			})
 			if len(res.Failures) != 0 || res.Overflow {
 				t.Fatalf("Explore result = %+v", res)
@@ -1127,9 +1127,9 @@ func TestDSTStatfsAndQuotaExploreDPOR(t *testing.T) {
 	t.Run("CappedDiskCompetingWrites", func(t *testing.T) {
 		sawAWins := false
 		sawBWins := false
-		res := Explore(1, DPOR, func() bool {
+		res := Explore(1, DPOR, func() error {
 			var errA, errB error
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				fa, err := os.OpenFile("/a", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 				if err != nil {
 					t.Fatalf("Create /a: %v", err)
@@ -1163,7 +1163,7 @@ func TestDSTStatfsAndQuotaExploreDPOR(t *testing.T) {
 			default:
 				t.Fatalf("unexpected quota race outcome: errA=%v errB=%v", errA, errB)
 			}
-			return false
+			return nil
 		})
 		if len(res.Failures) != 0 || res.Overflow {
 			t.Fatalf("Explore result = %+v", res)

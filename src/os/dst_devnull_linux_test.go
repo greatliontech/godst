@@ -280,7 +280,7 @@ func TestDSTDevNullRawDescriptor(t *testing.T) {
 // whose disk died.
 func TestDSTDevNullDiskFaultDecoupled(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.LimitDisk("h", 0)
 			simulation.FailDisk("h")
 			simulation.FailFile("h", os.DevNull)
@@ -311,7 +311,7 @@ func TestDSTDevNullSurvivesHostCrash(t *testing.T) {
 	for _, tear := range []bool{false, true} {
 		t.Run(map[bool]string{false: "untorn", true: "torn"}[tear], func(t *testing.T) {
 			simulation.RunWith(1, simulation.Options{CrashTear: tear}, func() {
-				simulation.Host("h", simulation.HostConfig{}, func() {
+				simulation.Host("h", func() {
 					f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 					if err != nil {
 						t.Fatalf("pre-crash open: %v", err)
@@ -320,7 +320,7 @@ func TestDSTDevNullSurvivesHostCrash(t *testing.T) {
 					f.Close()
 				})
 				simulation.CrashHost("h")
-				simulation.Host("h", simulation.HostConfig{}, func() {
+				simulation.Host("h", func() {
 					f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 					if err != nil {
 						t.Fatalf("post-reboot open: %v", err)
@@ -381,12 +381,12 @@ func TestDSTDevNullUnlinkAndRecreate(t *testing.T) {
 // other per-host tree fact.
 func TestDSTDevNullPerHost(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("hA", simulation.HostConfig{}, func() {
+		simulation.Host("hA", func() {
 			if err := os.Chmod(os.DevNull, 0o600); err != nil {
 				t.Fatalf("chmod on hA: %v", err)
 			}
 		})
-		simulation.Host("hB", simulation.HostConfig{}, func() {
+		simulation.Host("hB", func() {
 			fi, err := os.Stat(os.DevNull)
 			if err != nil {
 				t.Fatalf("stat on hB: %v", err)

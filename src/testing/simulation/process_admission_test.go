@@ -17,7 +17,7 @@ func TestDSTProcessSameHostConcurrentAdmissionRemainsAllowed(t *testing.T) {
 	release := make(chan struct{})
 	var first, second int
 	Run(1, func() {
-		Host("H", HostConfig{}, func() {
+		Host("H", func() {
 			for range 2 {
 				go Process("p", func() {
 					pids <- os.Getpid()
@@ -35,19 +35,15 @@ func TestDSTProcessSameHostConcurrentAdmissionRemainsAllowed(t *testing.T) {
 
 func TestDSTProcessCrossHostAdmissionAtomicDPOR(t *testing.T) {
 	// Access-level race instrumentation creates a large equivalent tail after
-	// admission. Bound the walk explicitly; every visited schedule checks the
-	// complete admission and crash invariant, and BudgetHit reports the cap.
-	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64, MaxSteps: 256}, func() bool {
+	// admission. Bound the walk explicitly; every visited schedule checks that
+	// concurrent same-name Process declarations on distinct hosts succeed with
+	// independent host-scoped identities and crash domains.
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64, MaxSteps: 256}, func() error {
 		start := make(chan struct{})
 		ready := make(chan struct{}, 2)
 		results := make(chan string, 2)
 		attempt := func(host string) {
-			go Host(host, HostConfig{}, func() {
-				defer func() {
-					if recover() != nil {
-						results <- "refused"
-					}
-				}()
+			go Host(host, func() {
 				ready <- struct{}{}
 				<-start
 				Process("p", func() {
@@ -62,27 +58,28 @@ func TestDSTProcessCrossHostAdmissionAtomicDPOR(t *testing.T) {
 		<-ready
 		close(start)
 		first, second := <-results, <-results
-		winner := first
-		if winner == "refused" {
-			winner = second
+		if !((first == "A" && second == "B") || (first == "B" && second == "A")) {
+			panic("same-name process admission across two hosts did not admit both")
 		}
-		if winner == "refused" || first != "refused" && second != "refused" {
-			panic("same-name process admission did not produce exactly one winner and one refusal")
+		procA := lookupProc(lookupHost("A"), "p")
+		procB := lookupProc(lookupHost("B"), "p")
+		if procA == 0 || procB == 0 || procA == procB {
+			panic("same-name processes across hosts shared or dropped logical proc IDs")
 		}
-		proc := internProc("p")
-		pids := activeProcPIDs(proc)
-		activeProcs.mu.Lock()
-		host := activeProcs.host[proc]
-		activeProcs.mu.Unlock()
-		if len(pids) != 1 || host != lookupHost(winner) {
-			panic("refused process start published liveness or winner host was lost")
+		instsA := activeProcInstances(procA)
+		instsB := activeProcInstances(procB)
+		if len(instsA) != 1 || len(instsB) != 1 || instsA[0].slot == instsB[0].slot {
+			panic("cross-host same-name processes did not get distinct live instances and slots")
 		}
-		CrashHost("A")
+		CrashProcess("A", "p")
+		if len(activeProcInstances(procA)) != 0 || len(activeProcInstances(procB)) != 1 {
+			panic("CrashProcess(\"A\", \"p\") disturbed host B's process")
+		}
 		CrashHost("B")
-		if len(activeProcPIDs(proc)) != 0 {
-			panic("crashing both candidate hosts spared the admitted process")
+		if len(activeProcInstances(procB)) != 0 {
+			panic("CrashHost(\"B\") spared host B's process")
 		}
-		return false
+		return nil
 	})
 	if len(res.Failures) != 0 {
 		t.Fatalf("cross-host admission exploration found failures: %#v", res.Failures)

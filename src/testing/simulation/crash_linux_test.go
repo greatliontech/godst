@@ -34,7 +34,7 @@ func TestDSTCrashAndRestartOverLiveHostFS(t *testing.T) {
 	var progressAtCrash, progressAfter int32
 	var restartData string
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			started := make(chan int, 1)
 			srvErr := make(chan error, 2)
 			addrCh := make(chan string, 1)
@@ -83,7 +83,7 @@ func TestDSTCrashAndRestartOverLiveHostFS(t *testing.T) {
 				runtime.Gosched()
 			}
 
-			Crash("victim")
+			CrashProcess("h", "victim")
 
 			killErr = syscall.Kill(victimPID, 0)
 			_, statErr = os.Stat("/proc/" + strconv.Itoa(victimPID) + "/stat")
@@ -170,7 +170,7 @@ func TestDSTCrashProcessBlockedInSynctestWait(t *testing.T) {
 		for range 5 {
 			runtime.Gosched()
 		}
-		Crash("waiter")
+		CrashProcess("", "waiter")
 		// The run must still reach quiescence and complete.
 		completed = true
 	})
@@ -193,7 +193,7 @@ func TestDSTCrashSelf(t *testing.T) {
 		go Process("victim", func() {
 			defer deferRan.Store(true)
 			started <- os.Getpid()
-			Crash("victim")
+			CrashProcess("", "victim")
 			afterCrashRan.Store(true)
 		})
 		pid = <-started
@@ -263,14 +263,14 @@ func TestDSTCrashKillingTheRunMainPanics(t *testing.T) {
 								refusalValues = append(refusalValues, r)
 							}
 						}()
-						Crash("inline")
+						CrashProcess("", "inline")
 					}()
 				}
 				killErr = syscall.Kill(mainPID, 0)
 				_, procfsErr = os.ReadFile("/proc/" + strconv.Itoa(mainPID) + "/stat")
 				_, writeErr = f.Write([]byte("alive"))
 				listenerCloseErr = ln.Close()
-				livePIDs = len(activeProcPIDs(internProc("inline")))
+				livePIDs = len(activeProcInstances(lookupProc(0, "inline")))
 				close(releaseSibling)
 				<-siblingDone
 				f.Close()
@@ -333,7 +333,7 @@ func TestDSTCrashNestedInvocationParked(t *testing.T) {
 				}()
 				<-entered
 				if mode == "crash" {
-					Crash("outer-" + mode)
+					CrashProcess("", "outer-"+mode)
 				} else {
 					<-outerDead // the outer invocation has fully exited
 				}

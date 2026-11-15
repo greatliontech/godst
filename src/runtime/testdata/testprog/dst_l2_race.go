@@ -64,7 +64,7 @@ func hbEventsSince(from int) []hbEv {
 
 func DSTSyncHBSuppress() {
 	var report string
-	sut := func() bool {
+	sut := func() error {
 		report = ""
 		emit := func(name string, ok bool) {
 			report += name + "=" + strconv.FormatBool(ok) + " "
@@ -169,7 +169,7 @@ func DSTSyncHBSuppress() {
 		runtime.RaceEnable()
 		emit("ignoredAtomic", dstSyncEventLenFP() == b)
 
-		return true
+		return nil
 	}
 	res := simulation.Explore(dstSeedEnv(), simulation.DPOR, sut)
 
@@ -180,7 +180,7 @@ func DSTSyncHBSuppress() {
 	// releases on the mutex identity must appear in every schedule, whichever
 	// path the child took.
 	contendedOK := true
-	csut := func() bool {
+	csut := func() error {
 		var mu sync.Mutex
 		muID := uintptr(unsafe.Pointer(&mu))
 		done := make(chan struct{})
@@ -207,7 +207,7 @@ func DSTSyncHBSuppress() {
 		if acq != 2 || rel != 2 {
 			contendedOK = false
 		}
-		return true
+		return nil
 	}
 	cres := simulation.Explore(dstSeedEnv(), simulation.DPOR, csut)
 

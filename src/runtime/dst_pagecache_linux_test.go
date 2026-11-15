@@ -175,7 +175,7 @@ func faultInProcess(t *testing.T, touch func()) (died, recovered, peerRan bool) 
 	var killErr error
 
 	simulation.Test(t, 1, func(t *testing.T) {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			started := make(chan struct{})
 			go simulation.Process("victim", func() {
 				defer func() {

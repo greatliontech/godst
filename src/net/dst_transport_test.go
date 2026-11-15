@@ -109,7 +109,7 @@ func TestDSTNetSameHostMutualWrite(t *testing.T) {
 	}
 	var got1, got2 string
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			server, client := dialLoopback(t)
 			// Both ends write before reading — the mutual-push deadlock shape.
 			if _, err := client.Write([]byte("ping")); err != nil {
@@ -150,7 +150,7 @@ func TestDSTNetReadsCoalesce(t *testing.T) {
 	var n int
 	var got string
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			server, client := dialLoopback(t)
 			client.Write([]byte("aaa"))
 			client.Write([]byte("bbb"))
@@ -180,7 +180,7 @@ func TestDSTNetConcurrentReadersNoLostWakeup(t *testing.T) {
 	}
 	got := make([]string, 2)
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			server, client := dialLoopback(t)
 			var wg sync.WaitGroup
 			// Two readers, each wants 4 bytes.
@@ -232,7 +232,7 @@ func TestDSTNetConcurrentReadersInFlightTail(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() { // server: two readers
+		simulation.Host("A", func() { // server: two readers
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -256,7 +256,7 @@ func TestDSTNetConcurrentReadersInFlightTail(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() { // client: two back-to-back writes
+		simulation.Host("B", func() { // client: two back-to-back writes
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			time.Sleep(time.Millisecond) // let both readers block first
@@ -286,7 +286,7 @@ func TestDSTNetPartitionPreDeliveredReadable(t *testing.T) {
 		port := make(chan string, 1)
 		read := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() { // server
+		simulation.Host("A", func() { // server
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -302,7 +302,7 @@ func TestDSTNetPartitionPreDeliveredReadable(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() { // client
+		simulation.Host("B", func() { // client
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("early"))

@@ -74,16 +74,10 @@ func TestDSTWirePopDrainsCompletely(t *testing.T) {
 // dropped (in order, a FIN cannot overtake data — a jitter draw can invert
 // closeAt below an undelivered segment's deliverAt, and that FIN is still
 // behind the data on the wire). Manipulates the stream directly so each
-// conjunct is pinned free of scheduler timing. The preserved-arrived-FIN arm
-// is end-to-end reachable today only via an injected RST (the CLOSE_WAIT
-// identity, TestDSTNetResetInCloseWaitIsEPIPE): a retransmit-horizon death in
-// CLOSE_WAIT has no constructible geometry while the wrapper lacks half-close
-// (held outbound bytes written before the peer's Close take the close(2)-RST
-// arm — in-flight counts as queued — and a write after it takes the recorded
-// instant-ECONNRESET divergence). If CloseRead/CloseWrite is ever added, the
-// FIN-arrived-then-horizon-death ladder (reads stay EOF per SOCK_DONE, the
-// one-shot ETIMEDOUT surfaces on the write) becomes reachable and needs its
-// own end-to-end pin; this whitebox holds the freeze half meanwhile.
+// conjunct is pinned free of scheduler timing; the end-to-end CLOSE_WAIT paths
+// are pinned by TestDSTNetResetInCloseWaitIsEPIPE (injected RST) and
+// TestDSTNetHalfCloseCloseWaitHorizonDeath (retransmit-horizon death after a
+// peer CloseWrite FIN arrives).
 func TestDSTWireFreezeAtHorizonFINArrival(t *testing.T) {
 	cases := []struct {
 		name    string

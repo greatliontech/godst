@@ -41,9 +41,9 @@ func TestDSTExploreCoarseFSOrder(t *testing.T) {
 	}
 	skipUnderRace(t)
 	outcomes := map[string]bool{}
-	sut := func() bool {
+	sut := func() error {
 		done := make(chan struct{}, 2)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("a", func() { os.WriteFile("/f", []byte("A"), 0o600); done <- struct{}{} })
 			go Process("b", func() { os.WriteFile("/f", []byte("B"), 0o600); done <- struct{}{} })
 			<-done
@@ -53,7 +53,7 @@ func TestDSTExploreCoarseFSOrder(t *testing.T) {
 				outcomes[string(b)] = true
 			})
 		})
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 500}, sut)
 	t.Logf("schedules=%d exhausted=%v uninstrumented=%v outcomes=%v", res.Schedules, res.Exhausted, res.Uninstrumented, outcomes)
@@ -74,10 +74,10 @@ func TestDSTExploreCoarseFlockWinner(t *testing.T) {
 	}
 	skipUnderRace(t)
 	outcomes := map[string]bool{}
-	sut := func() bool {
+	sut := func() error {
 		results := make(chan string, 2)
 		release := make(chan struct{})
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("setup", func() {
 				if err := os.WriteFile("/l", nil, 0o600); err != nil {
 					panic(err)
@@ -110,7 +110,7 @@ func TestDSTExploreCoarseFlockWinner(t *testing.T) {
 			close(release)
 			outcomes[r1+"/"+r2] = true
 		})
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 500}, sut)
 	t.Logf("schedules=%d exhausted=%v uninstrumented=%v outcomes=%v", res.Schedules, res.Exhausted, res.Uninstrumented, outcomes)
@@ -142,9 +142,9 @@ func TestDSTExploreCoarseFutexLostWakeWindow(t *testing.T) {
 	}
 	skipUnderRace(t)
 	outcomes := map[string]bool{}
-	sut := func() bool {
+	sut := func() error {
 		done := make(chan struct{}, 2)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("setup", func() {
 				f, err := os.Create("/w")
 				if err != nil {
@@ -189,7 +189,7 @@ func TestDSTExploreCoarseFutexLostWakeWindow(t *testing.T) {
 			<-done
 			<-done
 		})
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 500}, sut)
 	t.Logf("schedules=%d exhausted=%v uninstrumented=%v outcomes=%v", res.Schedules, res.Exhausted, res.Uninstrumented, outcomes)
@@ -208,9 +208,9 @@ func TestDSTExploreCoarseNamespaceOrder(t *testing.T) {
 	}
 	skipUnderRace(t)
 	outcomes := map[bool]bool{}
-	sut := func() bool {
+	sut := func() error {
 		done := make(chan struct{}, 2)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("setup", func() {
 				if err := os.WriteFile("/x", []byte("v"), 0o600); err != nil {
 					panic(err)
@@ -238,7 +238,7 @@ func TestDSTExploreCoarseNamespaceOrder(t *testing.T) {
 			<-done
 			<-done
 		})
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 500}, sut)
 	t.Logf("schedules=%d exhausted=%v uninstrumented=%v outcomes=%v", res.Schedules, res.Exhausted, res.Uninstrumented, outcomes)
@@ -257,10 +257,10 @@ func TestDSTExploreCoarseFlockCloseRelease(t *testing.T) {
 	}
 	skipUnderRace(t)
 	outcomes := map[string]bool{}
-	sut := func() bool {
+	sut := func() error {
 		locked := make(chan struct{})
 		attempted := make(chan string, 1)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("setup", func() {
 				if err := os.WriteFile("/l", nil, 0o600); err != nil {
 					panic(err)
@@ -295,7 +295,7 @@ func TestDSTExploreCoarseFlockCloseRelease(t *testing.T) {
 			})
 			outcomes[<-attempted] = true
 		})
-		return false
+		return nil
 	}
 	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 500}, sut)
 	t.Logf("schedules=%d exhausted=%v uninstrumented=%v outcomes=%v", res.Schedules, res.Exhausted, res.Uninstrumented, outcomes)

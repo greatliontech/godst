@@ -418,5 +418,5 @@ and code written for the simulation cannot rely on it to audit lock order.
 Fork code must still respect the rules lock ranking would enforce — above all,
 never allocate or park while holding a runtime `mutex`, since `mallocgc` may
 take `mheap_.lock` beneath a leaf-ranked lock or assist the collector. Prefer
-the lock-free copy-on-write shape (`runtime.dstSetPidLive`,
+the lock-free copy-on-write shape (`runtime.dstPidLiveMutate`,
 `runtime.dstSpanAdd`): build the successor, then compare-and-swap it in.

@@ -44,7 +44,7 @@ func TestDSTNetBackpressureUnblocks(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -65,7 +65,7 @@ func TestDSTNetBackpressureUnblocks(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			writeN, writeErr = c.Write(want)
@@ -102,7 +102,7 @@ func TestDSTNetWriteHorizonTimesOut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		writeDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -112,7 +112,7 @@ func TestDSTNetWriteHorizonTimesOut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli") // cut the established conn: the write's bytes are undeliverable
@@ -153,7 +153,7 @@ func TestDSTNetWritePersistsWithoutPartition(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		writeDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -163,7 +163,7 @@ func TestDSTNetWritePersistsWithoutPartition(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.SetWriteDeadline(time.Now().Add(2 * time.Second)) // > the 1s horizon
@@ -199,7 +199,7 @@ func TestDSTNetConcurrentWritersChainWake(t *testing.T) {
 		port := make(chan string, 1)
 		drain := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -211,7 +211,7 @@ func TestDSTNetConcurrentWritersChainWake(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.Write(make([]byte, cap)) // fill the buffer exactly (returns; buffered == cap)
@@ -246,7 +246,7 @@ func TestDSTNetConnectPaysRTT(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -259,7 +259,7 @@ func TestDSTNetConnectPaysRTT(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			t0 := time.Now()
 			c, err := Dial("tcp", simulation.HostIP("srv")+":"+p)
@@ -292,14 +292,14 @@ func TestDSTNetDialPartitionHorizonTimesOut(t *testing.T) {
 	var dialDur time.Duration
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			// No Accept: the dial is blackholed by the partition, never reaching the
 			// backlog, so no goroutine lingers blocked when the bubble drains.
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			simulation.Partition("srv", "cli") // cut BEFORE dialing; never healed
 			t0 := time.Now()
@@ -332,7 +332,7 @@ func TestDSTNetSmallWriteHorizonKillsConn(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -342,7 +342,7 @@ func TestDSTNetSmallWriteHorizonKillsConn(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")
@@ -374,7 +374,7 @@ func TestDSTNetWriteThenReadHorizonTimesOut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -384,7 +384,7 @@ func TestDSTNetWriteThenReadHorizonTimesOut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")
@@ -419,7 +419,7 @@ func TestDSTNetHorizonHealDisarms(t *testing.T) {
 		port := make(chan string, 1)
 		received := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -433,13 +433,13 @@ func TestDSTNetHorizonHealDisarms(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")
 			c.Write([]byte("hi")) // held at the cut; watchdog armed
 			time.Sleep(500 * time.Millisecond)
-			simulation.Heal("srv", "cli") // before the 1s horizon: bytes flush
+			simulation.HealLink("srv", "cli") // before the 1s horizon: bytes flush
 			<-received
 			time.Sleep(2 * time.Second) // well past the original deadline
 			lateN, lateErr = c.Write([]byte("ok"))
@@ -470,7 +470,7 @@ func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
 		port := make(chan string, 1)
 		sent := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -482,7 +482,7 @@ func TestDSTNetHorizonDeathDrainsDeliveredData(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			<-sent
@@ -529,7 +529,7 @@ func TestDSTNetInFlightBytesCutThenReadTimesOut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -539,7 +539,7 @@ func TestDSTNetInFlightBytesCutThenReadTimesOut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.Write([]byte("hi"))              // live link: in flight for 100ms
@@ -571,7 +571,7 @@ func TestDSTNetHorizonHealRecutAnchorsAtObservation(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -587,13 +587,13 @@ func TestDSTNetHorizonHealRecutAnchorsAtObservation(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli") // cut 1 at t=0
 			c.Write([]byte("w1"))              // arms; anchor t=0
 			time.Sleep(100 * time.Millisecond)
-			simulation.Heal("srv", "cli") // t=0.1: w1 flushes; watchdog still pending until t=1.0
+			simulation.HealLink("srv", "cli") // t=0.1: w1 flushes; watchdog still pending until t=1.0
 			time.Sleep(100 * time.Millisecond)
 			simulation.Partition("srv", "cli") // cut 2 at t=0.2
 			time.Sleep(700 * time.Millisecond)
@@ -601,7 +601,7 @@ func TestDSTNetHorizonHealRecutAnchorsAtObservation(t *testing.T) {
 			// Stale check fires at t=1.0: new episode → re-anchor at NOW (1.0),
 			// never at cut 2's start (0.2), which would kill at t=1.2.
 			time.Sleep(400 * time.Millisecond)
-			simulation.Heal("srv", "cli") // t=1.3: w2 (undeliverable for only 0.4s) flushes
+			simulation.HealLink("srv", "cli") // t=1.3: w2 (undeliverable for only 0.4s) flushes
 			time.Sleep(100 * time.Millisecond)
 			lateN, lateErr = c.Write([]byte("ok")) // t=1.4: the conn must be alive
 			close(done)
@@ -630,7 +630,7 @@ func TestDSTNetOneWayCutInFlightReadTimesOut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -640,7 +640,7 @@ func TestDSTNetOneWayCutInFlightReadTimesOut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.Write([]byte("hi"))                    // live link: in flight for 100ms
@@ -673,7 +673,7 @@ func TestDSTNetCutAfterReadBlockedTimesOut(t *testing.T) {
 		port := make(chan string, 1)
 		readDone := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -683,7 +683,7 @@ func TestDSTNetCutAfterReadBlockedTimesOut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			go func() {
@@ -716,7 +716,7 @@ func TestDSTNetSameHostBackpressure(t *testing.T) {
 	var gotN int
 	var gotSum, wantSum uint64
 	simulation.RunWith(1, opts, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			ln, err := Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				panic(err)
@@ -782,7 +782,7 @@ func TestDSTNetSameHostWriteWriteDeadlocks(t *testing.T) {
 		}
 	}()
 	simulation.RunWith(1, opts, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			ln, _ := Listen("tcp", "127.0.0.1:0")
 			defer ln.Close()
 			done := make(chan struct{})
@@ -834,7 +834,7 @@ func TestDSTNetHorizonDeathHealNoResurrection(t *testing.T) {
 		preSent := make(chan struct{})
 		cutMade := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -848,7 +848,7 @@ func TestDSTNetHorizonDeathHealNoResurrection(t *testing.T) {
 				c.Close() // post-death FIN: meets the CLOSED socket, never queued
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			<-preSent
@@ -857,7 +857,7 @@ func TestDSTNetHorizonDeathHealNoResurrection(t *testing.T) {
 			close(cutMade)
 			c.Write([]byte("hi"))       // undeliverable: arms the watchdog
 			time.Sleep(2 * time.Second) // the 1s horizon kills this end
-			simulation.Heal("srv", "cli")
+			simulation.HealLink("srv", "cli")
 			time.Sleep(100 * time.Millisecond) // held bytes would flush NOW if the death were not terminal
 			firstN, firstErr = c.Read(buf[:])
 			_, secondErr = c.Read(make([]byte, 16))
@@ -903,7 +903,7 @@ func TestDSTNetHorizonDeathLiveInboundNoPostDeathDelivery(t *testing.T) {
 		deadNow := make(chan struct{})
 		srvDone := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -918,7 +918,7 @@ func TestDSTNetHorizonDeathLiveInboundNoPostDeathDelivery(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			<-preSent
@@ -968,7 +968,7 @@ func TestDSTNetHorizonDeathHealPeerNoResurrection(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -988,13 +988,13 @@ func TestDSTNetHorizonDeathHealPeerNoResurrection(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")
 			c.Write([]byte("hi"))       // held at the cut: arms the watchdog
 			time.Sleep(2 * time.Second) // the 1s horizon kills this end
-			simulation.Heal("srv", "cli")
+			simulation.HealLink("srv", "cli")
 			<-done // keep this end open (not app-Closed) while the peer probes
 			c.Close()
 		})
@@ -1029,7 +1029,7 @@ func TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1042,7 +1042,7 @@ func TestDSTNetPeerOfHorizonDeadEndStillTimesOutUnderCut(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli") // permanent
@@ -1065,7 +1065,7 @@ func TestDSTNetHorizonOneShotReadFirst(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1075,7 +1075,7 @@ func TestDSTNetHorizonOneShotReadFirst(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")
@@ -1132,7 +1132,7 @@ func TestDSTNetBlockedWriterDeadPeerProbeResets(t *testing.T) {
 		port := make(chan string, 1)
 		cutMade := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1144,7 +1144,7 @@ func TestDSTNetBlockedWriterDeadPeerProbeResets(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.Write(make([]byte, 4<<10))             // fills the send buffer: all delivered to srv, never read
@@ -1158,8 +1158,8 @@ func TestDSTNetBlockedWriterDeadPeerProbeResets(t *testing.T) {
 				blockedDur = time.Since(t0)
 				close(blockedDone)
 			}()
-			time.Sleep(2 * time.Second)   // past srv's death at 1s: the death's wake re-parked the writer
-			simulation.Heal("srv", "cli") // now the link is live in both directions: the probe fires
+			time.Sleep(2 * time.Second)       // past srv's death at 1s: the death's wake re-parked the writer
+			simulation.HealLink("srv", "cli") // now the link is live in both directions: the probe fires
 			<-blockedDone
 			_, readErr = c.Read(make([]byte, 8))
 			_, writeErr = c.Write([]byte("after"))
@@ -1203,7 +1203,7 @@ func TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets(t *testing.T) {
 		port := make(chan string, 1)
 		cutMade := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1215,7 +1215,7 @@ func TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli") // symmetric cut
@@ -1230,7 +1230,7 @@ func TestDSTNetBlockedReaderDeadPeerHealInDisarmWindowResets(t *testing.T) {
 				close(readDone)
 			}()
 			time.Sleep(800 * time.Millisecond) // t=1.2s: after srv's death (1s), before cli's horizonCheck (1.4s)
-			simulation.Heal("srv", "cli")      // the check will see cut=false and DISARM: only the probe carries the failure
+			simulation.HealLink("srv", "cli")  // the check will see cut=false and DISARM: only the probe carries the failure
 			<-readDone
 			_, secondReadErr = c.Read(make([]byte, 8))
 			_, writeErr = c.Write([]byte("after"))
@@ -1272,7 +1272,7 @@ func TestDSTNetBlockedWriterDeadPeerReturnOnlyCutNoRST(t *testing.T) {
 		port := make(chan string, 1)
 		cutMade := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1283,7 +1283,7 @@ func TestDSTNetBlockedWriterDeadPeerReturnOnlyCutNoRST(t *testing.T) {
 				<-done
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			c.Write(make([]byte, 4<<10))             // fills the send buffer: all delivered, never read
@@ -1320,7 +1320,7 @@ func TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked(t *testing.T) 
 		port := make(chan string, 1)
 		cutMade := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1331,7 +1331,7 @@ func TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked(t *testing.T) 
 				<-done
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			// cli writes NOTHING: no bytes of cli's are ever destroyed.
@@ -1343,8 +1343,8 @@ func TestDSTNetBlockedReaderDeadPeerNothingOutstandingStaysParked(t *testing.T) 
 				_, readErr = c.Read(make([]byte, 8)) // parks; srv's held "v" dies with srv at 1s
 				close(readDone)
 			}()
-			time.Sleep(2 * time.Second)   // past srv's death
-			simulation.Heal("srv", "cli") // live in both directions — but cli has nothing to probe with
+			time.Sleep(2 * time.Second)       // past srv's death
+			simulation.HealLink("srv", "cli") // live in both directions — but cli has nothing to probe with
 			<-readDone
 			close(done)
 			c.Close()
@@ -1371,7 +1371,7 @@ func TestDSTNetHorizonOneShotWriteFirst(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1381,7 +1381,7 @@ func TestDSTNetHorizonOneShotWriteFirst(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.Partition("srv", "cli")

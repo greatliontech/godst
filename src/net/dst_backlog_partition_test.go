@@ -27,7 +27,7 @@ func backlogParkPartition(t *testing.T, cut func(), heal func()) (dialErr error,
 		acceptNow := make(chan struct{})
 		accepted := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				t.Fatalf("listen: %v", err)
@@ -44,7 +44,7 @@ func backlogParkPartition(t *testing.T, cut func(), heal func()) (dialErr error,
 				ln.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			addr := simulation.HostIP("srv") + ":" + p
 			conns := make([]Conn, 0, 128)
@@ -125,8 +125,8 @@ func TestDSTNetBacklogParkPartitionHealCompletes(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	cuts := map[string]struct{ cut, heal func() }{
-		"cli-to-srv": {func() { simulation.PartitionOneWay("cli", "srv") }, func() { simulation.Heal("cli", "srv") }},
-		"srv-to-cli": {func() { simulation.PartitionOneWay("srv", "cli") }, func() { simulation.Heal("srv", "cli") }},
+		"cli-to-srv": {func() { simulation.PartitionOneWay("cli", "srv") }, func() { simulation.HealLink("cli", "srv") }},
+		"srv-to-cli": {func() { simulation.PartitionOneWay("srv", "cli") }, func() { simulation.HealLink("srv", "cli") }},
 	}
 	for name, fns := range cuts {
 		dialErr, held := backlogParkPartition(t, fns.cut, fns.heal)
@@ -155,7 +155,7 @@ func synackPartition(t *testing.T, cut func(), heal func()) (dialErr error, held
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				t.Fatalf("listen: %v", err)
@@ -174,7 +174,7 @@ func synackPartition(t *testing.T, cut func(), heal func()) (dialErr error, held
 				}
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			addr := simulation.HostIP("srv") + ":" + p
 			res := make(chan error, 1)
@@ -220,7 +220,7 @@ func TestDSTNetSYNACKPartitionHealCompletes(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	dialErr, held := synackPartition(t, func() { simulation.PartitionOneWay("srv", "cli") }, func() { simulation.Heal("srv", "cli") })
+	dialErr, held := synackPartition(t, func() { simulation.PartitionOneWay("srv", "cli") }, func() { simulation.HealLink("srv", "cli") })
 	if !held {
 		t.Fatal("dial completed across a cut of the SYN-ACK direction")
 	}
@@ -303,11 +303,11 @@ func TestDSTNetSYNACKHealObservesReset(t *testing.T) {
 	var dialErr error
 	gotResult := false
 	simulation.RunWith(1, opts, func() {
-		simulation.Host("x", simulation.HostConfig{}, func() {}) // the unrelated pair
-		simulation.Host("y", simulation.HostConfig{}, func() {})
+		simulation.Host("x", func() {}) // the unrelated pair
+		simulation.Host("y", func() {})
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				t.Fatalf("listen: %v", err)
@@ -326,7 +326,7 @@ func TestDSTNetSYNACKHealObservesReset(t *testing.T) {
 				}
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			addr := simulation.HostIP("srv") + ":" + p
 			res := make(chan error, 1)
@@ -340,8 +340,8 @@ func TestDSTNetSYNACKHealObservesReset(t *testing.T) {
 			// No yield between the three ops: the unrelated wake commits the
 			// parked select, then the reset and heal land before the dial runs.
 			simulation.Partition("x", "y")
-			simulation.Reset("srv", "cli")
-			simulation.Heal("srv", "cli")
+			simulation.ResetLink("srv", "cli")
+			simulation.HealLink("srv", "cli")
 			select {
 			case dialErr = <-res:
 				gotResult = true

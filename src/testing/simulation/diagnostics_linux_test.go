@@ -8,6 +8,7 @@ package simulation
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"internal/testenv"
 	"io"
@@ -48,7 +49,7 @@ func dstParkedExitWorker(ch <-chan struct{}) {
 func TestDiagnosticsProcessExitKilledGoroutinesOnFailure(t *testing.T) {
 	if os.Getenv("GO_DST_DIAG_EXIT_KILL_CHILD") == "1" {
 		Test(t, 41, func(t *testing.T) {
-			Host("n1", HostConfig{}, func() {
+			Host("n1", func() {
 				Process("srv", func() {
 					ready := make(chan struct{}, 3)
 					block := make(chan struct{})
@@ -105,7 +106,7 @@ func TestDiagnosticsProcessExitKillsReportedOnDeadlockStall(t *testing.T) {
 	if os.Getenv("GO_DST_DIAG_DEADLOCK_CHILD") == "1" {
 		Test(t, 43, func(t *testing.T) {
 			reply := make(chan int)
-			Host("db-host", HostConfig{}, func() {
+			Host("db-host", func() {
 				Process("db-proc", func() {
 					ready := make(chan struct{})
 					never := make(chan struct{})
@@ -141,7 +142,7 @@ func TestDiagnosticsPostRunAssertionEmitsViaCleanup(t *testing.T) {
 	if os.Getenv("GO_DST_DIAG_POSTRUN_CHILD") == "1" {
 		var got int
 		Test(t, 47, func(t *testing.T) {
-			Host("h1", HostConfig{}, func() {
+			Host("h1", func() {
 				Process("worker", func() {
 					fmt.Println("worker-boot-msg")
 					got = 1
@@ -170,7 +171,7 @@ func TestDiagnosticsPostRunAssertionEmitsViaCleanup(t *testing.T) {
 func TestDiagnosticsSilentOnPassAndIntentionalCrashFaults(t *testing.T) {
 	if os.Getenv("GO_DST_DIAG_PASS_CHILD") == "1" {
 		Test(t, 53, func(t *testing.T) {
-			Host("n1", HostConfig{}, func() {
+			Host("n1", func() {
 				Process("srv", func() {
 					ready := make(chan struct{})
 					block := make(chan struct{})
@@ -233,7 +234,7 @@ func TestDiagnosticsSilentOnPassAndIntentionalCrashFaults(t *testing.T) {
 		}, func(t *testing.T, ctl *Ctl) {
 			<-daemonDone
 			<-victimReady
-			Crash("victim")
+			CrashProcess("n2", "victim")
 			CrashHost("n2")
 			// daemon on n1 exited normally above -> recorded; n2/victim died via Crash/CrashHost -> NOT recorded.
 			t.Fatal("trigger diagnostics check")
@@ -288,8 +289,8 @@ func TestDiagnosticsStdioAttributionAndExploreFailure(t *testing.T) {
 	}
 
 	if os.Getenv("GO_DST_DIAG_EXPLORE_CHILD") == "1" {
-		ExploreTest(t, 67, ExploreOptions{Mode: Exhaustive, MaxSchedules: 4}, func() bool {
-			Host("node-a", HostConfig{}, func() {
+		ExploreTest(t, 67, ExploreOptions{Mode: Exhaustive, MaxSchedules: 4}, func() error {
+			Host("node-a", func() {
 				Process("txn", func() {
 					ready := make(chan struct{})
 					block := make(chan struct{})
@@ -301,7 +302,7 @@ func TestDiagnosticsStdioAttributionAndExploreFailure(t *testing.T) {
 					fmt.Println("aborting uncommitted intent")
 				})
 			})
-			return true
+			return errors.New("uncommitted intent")
 		})
 		return
 	}
@@ -462,7 +463,7 @@ func TestDiagnosticsStdioScheduleGCAndExploreNeutrality(t *testing.T) {
 
 	exploreRun := func(emitStdio bool) ExploreResult {
 		msg := []byte("dpor-stdio-line\n")
-		return ExploreWith(79, ExploreOptions{Mode: DPOR}, func() bool {
+		return ExploreWith(79, ExploreOptions{Mode: DPOR}, func() error {
 			var x int
 			var mu sync.Mutex
 			var wg sync.WaitGroup
@@ -479,7 +480,7 @@ func TestDiagnosticsStdioScheduleGCAndExploreNeutrality(t *testing.T) {
 				}(i)
 			}
 			wg.Wait()
-			return false
+			return nil
 		})
 	}
 

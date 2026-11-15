@@ -107,7 +107,7 @@ func TestDSTRWMutexWaitDurable(t *testing.T) {
 // clock has paid every per-op delay.
 func TestDSTSlowDiskUnderSUTMutex(t *testing.T) {
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			SlowDisk("h", time.Millisecond)
 			var mu sync.Mutex
 			start := time.Now()
@@ -272,7 +272,7 @@ func foreignBubbleMutexHelper() {
 // or leak a running count (a wedge).
 func TestDSTCrashWithMutexParkedVictims(t *testing.T) {
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			var mu sync.Mutex
 			go Process("victim", func() {
 				mu.Lock()
@@ -285,10 +285,10 @@ func TestDSTCrashWithMutexParkedVictims(t *testing.T) {
 			for range 50 {
 				runtime.Gosched()
 			}
-			Crash("victim")
+			CrashProcess("h", "victim")
 			time.Sleep(time.Millisecond) // timers must still fire post-crash
 		})
-		Host("h2", HostConfig{}, func() {
+		Host("h2", func() {
 			var mu sync.Mutex
 			go Process("victim2", func() {
 				mu.Lock()

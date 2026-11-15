@@ -29,7 +29,7 @@ func TestDSTHostInvalidClockDeclarationIsStateNeutral(t *testing.T) {
 		rootNow := time.Now()
 		probe := make(chan struct{})
 		observed := make(chan identity, 1)
-		Host("h", HostConfig{Hostname: "old-name", NumCPU: 3, Clock: Skew(50 * time.Millisecond)}, func() {
+		HostWith("h", HostConfig{Hostname: "old-name", NumCPU: 3, Clock: Skew(50 * time.Millisecond)}, func() {
 			go func() {
 				<-probe
 				hostname, _ := os.Hostname()
@@ -39,7 +39,7 @@ func TestDSTHostInvalidClockDeclarationIsStateNeutral(t *testing.T) {
 		for range 2 {
 			func() {
 				defer func() { panicValues = append(panicValues, recover()) }()
-				Host("h", HostConfig{Hostname: "new-name", NumCPU: 7, Clock: Skew(time.Duration(math.MinInt64))}, func() { bodyRan = true })
+				HostWith("h", HostConfig{Hostname: "new-name", NumCPU: 7, Clock: Skew(time.Duration(math.MinInt64))}, func() { bodyRan = true })
 			}()
 		}
 		host, proc := dstCurrentNode()
@@ -55,7 +55,7 @@ func TestDSTHostInvalidClockDeclarationIsStateNeutral(t *testing.T) {
 		CrashHost("h")
 		func() {
 			defer func() { panicValues = append(panicValues, recover()) }()
-			Host("h", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() { bodyRan = true })
+			HostWith("h", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() { bodyRan = true })
 		}()
 		if !dstNetHostDead(hid) {
 			t.Fatal("failed Host re-declaration rebooted a powered-off host")
@@ -77,7 +77,7 @@ func TestDSTHostInvalidClockDeclarationPreservesPendingTimer(t *testing.T) {
 	Run(1, func() {
 		armed := make(chan struct{})
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() {
 			go func() {
 				close(armed)
 				time.Sleep(time.Second)
@@ -88,7 +88,7 @@ func TestDSTHostInvalidClockDeclarationPreservesPendingTimer(t *testing.T) {
 		start := time.Now()
 		func() {
 			defer func() { recover() }()
-			Host("h", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() {})
+			HostWith("h", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() {})
 		}()
 		<-done
 		elapsed = time.Since(start)
@@ -98,7 +98,7 @@ func TestDSTHostInvalidClockDeclarationPreservesPendingTimer(t *testing.T) {
 	}
 }
 
-func TestDSTExplicitHostIdentityWinsConcurrentImplicitDeclaration(t *testing.T) {
+func TestDSTBareProcessDoesNotInternOrCollideWithExplicitHost(t *testing.T) {
 	Run(1, func() {
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -108,7 +108,7 @@ func TestDSTExplicitHostIdentityWinsConcurrentImplicitDeclaration(t *testing.T) 
 		}()
 		go func() {
 			defer wg.Done()
-			Host("h", HostConfig{Hostname: "explicit", NumCPU: 3}, func() {})
+			HostWith("h", HostConfig{Hostname: "explicit", NumCPU: 3}, func() {})
 		}()
 		wg.Wait()
 		Process("h", func() {})
@@ -137,7 +137,7 @@ func TestDSTHostTableExhaustionIsStateNeutral(t *testing.T) {
 		nodeReg.mu.Unlock()
 		func() {
 			defer func() { overflow = recover() }()
-			Host("overflow", HostConfig{}, func() { overflowBody = true })
+			Host("overflow", func() { overflowBody = true })
 		}()
 		nodeReg.mu.Lock()
 		_, interned := nodeReg.hosts["overflow"]
@@ -147,7 +147,7 @@ func TestDSTHostTableExhaustionIsStateNeutral(t *testing.T) {
 		if interned || !unchanged || host != rootHost || proc != rootProc {
 			t.Fatalf("host-table exhaustion state: interned=%v unchanged=%v caller=%d/%d want=%d/%d hosts=%d next=%d", interned, unchanged, host, proc, rootHost, rootProc, beforeHosts, beforeNext)
 		}
-		Host("h1", HostConfig{}, func() { existingBody = true })
+		Host("h1", func() { existingBody = true })
 	})
 	msg, _ := overflow.(string)
 	if overflow == nil || !strings.Contains(msg, "too many distinct hosts") || overflowBody || !existingBody {
@@ -155,32 +155,22 @@ func TestDSTHostTableExhaustionIsStateNeutral(t *testing.T) {
 	}
 }
 
-func TestDSTImplicitHostTableExhaustionIsStateNeutral(t *testing.T) {
-	var overflow any
-	var overflowBody, existingBody bool
+func TestDSTBareProcessUnaffectedByHostTableExhaustion(t *testing.T) {
+	var procBody bool
 	Run(1, func() {
 		nodeReg.mu.Lock()
 		nodeReg.hosts["h1"] = 1
 		nodeReg.nextHost = 4095
 		nodeReg.mu.Unlock()
 		rootHost, rootProc := dstCurrentNode()
-		func() {
-			defer func() { overflow = recover() }()
-			Process("overflow", func() { overflowBody = true })
-		}()
+		Process("root-proc", func() { procBody = true })
 		nodeReg.mu.Lock()
-		_, hostInterned := nodeReg.hosts["overflow"]
-		_, procInterned := nodeReg.procs["overflow"]
+		_, hostInterned := nodeReg.hosts["root-proc"]
 		unchanged := nodeReg.nextHost == 4095
 		nodeReg.mu.Unlock()
 		host, proc := dstCurrentNode()
-		if hostInterned || procInterned || !unchanged || host != rootHost || proc != rootProc {
-			t.Fatalf("implicit host exhaustion state: host=%v proc=%v unchanged=%v caller=%d/%d want=%d/%d", hostInterned, procInterned, unchanged, host, proc, rootHost, rootProc)
+		if hostInterned || !unchanged || host != rootHost || proc != rootProc || !procBody {
+			t.Fatalf("bare process under host exhaustion: hostInterned=%v unchanged=%v caller=%d/%d want=%d/%d procBody=%v", hostInterned, unchanged, host, proc, rootHost, rootProc, procBody)
 		}
-		Process("h1", func() { existingBody = true })
 	})
-	msg, _ := overflow.(string)
-	if overflow == nil || !strings.Contains(msg, "too many distinct hosts") || overflowBody || !existingBody {
-		t.Fatalf("implicit host exhaustion = panic %v overflowBody=%v existingBody=%v", overflow, overflowBody, existingBody)
-	}
 }

@@ -22,7 +22,7 @@ import (
 
 func BenchmarkSimFileOpenWriteClose(b *testing.B) {
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			buf := []byte("x")
 			for i := 0; i < b.N; i++ {
 				f, err := os.Create("/bench")
@@ -42,7 +42,7 @@ func BenchmarkSimFileOpenWriteClose(b *testing.B) {
 
 func BenchmarkSimFileReadAt(b *testing.B) {
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			if err := os.WriteFile("/bench", []byte("payload"), 0o644); err != nil {
 				panic(err)
 			}
@@ -63,7 +63,7 @@ func BenchmarkSimFileReadAt(b *testing.B) {
 
 func BenchmarkSimFileStat(b *testing.B) {
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			if err := os.WriteFile("/bench", []byte("payload"), 0o644); err != nil {
 				panic(err)
 			}

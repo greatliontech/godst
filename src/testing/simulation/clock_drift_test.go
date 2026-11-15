@@ -45,7 +45,7 @@ func driftBaseAdvance(t *testing.T, clock ClockConfig, fn func()) time.Duration 
 	Run(1, func() {
 		done := make(chan struct{})
 		start := time.Now() // root = base
-		Host("h", HostConfig{Clock: clock}, func() {
+		HostWith("h", HostConfig{Clock: clock}, func() {
 			go func() {
 				fn()
 				close(done)
@@ -115,7 +115,7 @@ func TestDSTClockDriftTicker(t *testing.T) {
 	Run(1, func() {
 		done := make(chan struct{})
 		start := time.Now()
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2: each tick 0.5s base
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2: each tick 0.5s base
 			go func() {
 				tk := time.NewTicker(d)
 				defer tk.Stop()
@@ -154,7 +154,7 @@ func TestDSTClockDriftWall(t *testing.T) {
 				ready := make(chan struct{})
 				next := make(chan struct{})
 				done := make(chan struct{})
-				Host("h", HostConfig{Clock: Drift(r.ppb)}, func() {
+				HostWith("h", HostConfig{Clock: Drift(r.ppb)}, func() {
 					go func() {
 						w0 = time.Now()
 						close(ready)
@@ -182,7 +182,7 @@ func driftSince(t *testing.T, ppb int64, d time.Duration) time.Duration {
 	var since time.Duration
 	Run(1, func() {
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(ppb)}, func() {
+		HostWith("h", HostConfig{Clock: Drift(ppb)}, func() {
 			go func() {
 				start := time.Now()
 				time.Sleep(d)
@@ -249,10 +249,10 @@ func TestDSTClockDriftCrossHost(t *testing.T) {
 	var firstBase, secondBase time.Duration
 	Run(1, func() {
 		order := make(chan string, 2)
-		Host("A", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2 -> 0.5s base
+		HostWith("A", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2 -> 0.5s base
 			go func() { time.Sleep(time.Second); order <- "A" }()
 		})
-		Host("B", HostConfig{}, func() { // rate 1 -> 1s base
+		Host("B", func() { // rate 1 -> 1s base
 			go func() { time.Sleep(time.Second); order <- "B" }()
 		})
 		start := time.Now()
@@ -284,7 +284,7 @@ func TestDSTClockDriftWithSkew(t *testing.T) {
 		go1 := make(chan struct{})
 		done := make(chan struct{})
 		var hostWall, rootWall time.Time
-		Host("h", HostConfig{Clock: Skew(skew).WithDrift(1_000_000_000)}, func() { // +50ms, rate 2
+		HostWith("h", HostConfig{Clock: Skew(skew).WithDrift(1_000_000_000)}, func() { // +50ms, rate 2
 			go func() {
 				hostWall = time.Now() // at declaration base: base + skew (drift term ~0)
 				close(ready)
@@ -319,7 +319,7 @@ func TestDSTClockDriftWithStep(t *testing.T) {
 		ready := make(chan struct{})
 		go1 := make(chan struct{})
 		slept := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
+		HostWith("h", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
 			go func() {
 				before = time.Now()
 				close(ready)
@@ -353,7 +353,7 @@ func TestDSTClockDriftDeterminism(t *testing.T) {
 		Run(5, func() {
 			done := make(chan struct{})
 			start := time.Now()
-			Host("h", HostConfig{Clock: Skew(20 * time.Millisecond).WithDrift(300_000_000)}, func() {
+			HostWith("h", HostConfig{Clock: Skew(20 * time.Millisecond).WithDrift(300_000_000)}, func() {
 				go func() {
 					w = time.Now()
 					time.Sleep(900 * time.Millisecond)
@@ -381,7 +381,7 @@ func TestDSTClockDriftMonotonic(t *testing.T) {
 		Run(1, func() {
 			step := make(chan struct{})
 			got := make(chan time.Time, 4)
-			Host("h", HostConfig{Clock: Drift(ppb)}, func() {
+			HostWith("h", HostConfig{Clock: Drift(ppb)}, func() {
 				go func() {
 					for i := 0; i < 4; i++ {
 						got <- time.Now()
@@ -429,10 +429,10 @@ func TestDSTClockDriftVictim(t *testing.T) {
 		aDone := make(chan struct{})
 		bDone := make(chan struct{})
 		var aStart, bStart time.Time
-		Host("A", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
+		HostWith("A", HostConfig{Clock: Drift(1_000_000_000)}, func() { // rate 2
 			go func() { aStart = time.Now(); time.Sleep(time.Second); aDone <- struct{}{} }()
 		})
-		Host("B", HostConfig{}, func() { // rate 1, must be untouched
+		Host("B", func() { // rate 1, must be untouched
 			go func() { bStart = time.Now(); time.Sleep(time.Second); bDone <- struct{}{} }()
 		})
 		root := time.Now()
@@ -460,7 +460,7 @@ func TestDSTClockDriftN1(t *testing.T) {
 		rootT = time.Now()
 		done := make(chan struct{})
 		start := time.Now()
-		Host("h", HostConfig{Clock: Drift(0)}, func() {
+		HostWith("h", HostConfig{Clock: Drift(0)}, func() {
 			hostT = time.Now()
 			go func() { time.Sleep(time.Second); close(done) }()
 		})
@@ -490,7 +490,7 @@ func TestDSTClockDriftLazyTimerTimestamp(t *testing.T) {
 				t.Run(tc.name+"/arm-"+armAfter.String()+"/receive-"+receiveAt.String(), func(t *testing.T) {
 					var offset time.Duration
 					Run(1, func() {
-						Host("h", HostConfig{Clock: Drift(tc.ppb)}, func() {
+						HostWith("h", HostConfig{Clock: Drift(tc.ppb)}, func() {
 							time.Sleep(armAfter)
 							start := time.Now()
 							timer := time.NewTimer(time.Second)
@@ -614,7 +614,7 @@ func TestDSTClockDriftHugeSleepFires(t *testing.T) {
 	woke := false
 	Run(1, func() {
 		done := make(chan struct{})
-		Host("h", HostConfig{Clock: Drift(-1000)}, func() { // 1 ppm slow
+		HostWith("h", HostConfig{Clock: Drift(-1000)}, func() { // 1 ppm slow
 			go func() {
 				time.Sleep(math.MaxInt64)
 				woke = true

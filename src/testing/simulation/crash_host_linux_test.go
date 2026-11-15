@@ -43,7 +43,7 @@ func TestDSTCrashHostRestoresDurableImage(t *testing.T) {
 	var bothErr, dataOnlyErr, neitherErr error
 	var bothData, revertData string
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				// (1) data + entry durable.
 				f, err := os.Create("/both")
@@ -93,7 +93,7 @@ func TestDSTCrashHostRestoresDurableImage(t *testing.T) {
 		CrashHost("h")
 
 		// Reboot the machine and read its recovered disk.
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				b, err := os.ReadFile("/both")
 				bothErr, bothData = err, string(b)
@@ -128,7 +128,7 @@ func TestDSTCrashHostFdatasyncDirCommitsEntries(t *testing.T) {
 	var committedErr, controlErr error
 	var committedData string
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				if err := os.Mkdir("/wal", 0o755); err != nil {
 					t.Errorf("mkdir /wal: %v", err)
@@ -179,7 +179,7 @@ func TestDSTCrashHostFdatasyncDirCommitsEntries(t *testing.T) {
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				b, err := os.ReadFile("/wal/seg0")
 				committedErr, committedData = err, string(b)
@@ -218,7 +218,7 @@ func testCrashHostPreservesMkfsImage(t *testing.T, tear bool) {
 	var readData string
 	var tmpStatErr error
 	TestWith(t, 1, Options{CrashTear: tear}, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.Create("/tmp/state")
 				if err != nil {
@@ -238,7 +238,7 @@ func testCrashHostPreservesMkfsImage(t *testing.T, tear bool) {
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				_, tmpStatErr = os.Stat("/tmp")
 				b, err := os.ReadFile("/tmp/state")
@@ -273,7 +273,7 @@ func testCrashHostSecondCrashIsNoop(t *testing.T, tear bool) {
 	var first, second string
 	var names1, names2 []string
 	boot := func(out *string, outNames *[]string) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				b, err := os.ReadFile("/tmp/state")
 				if err != nil {
@@ -292,7 +292,7 @@ func testCrashHostSecondCrashIsNoop(t *testing.T, tear bool) {
 		})
 	}
 	TestWith(t, 2, Options{CrashTear: tear}, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.Create("/tmp/state")
 				if err != nil {
@@ -342,7 +342,7 @@ func testCrashHostSecondCrashIsNoop(t *testing.T, tear bool) {
 func TestDSTCrashHostResurrectsUnsyncedRemoval(t *testing.T) {
 	var dirErr, createErr, fileErr error
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				if err := os.Mkdir("/d", 0o755); err != nil {
 					t.Errorf("mkdir: %v", err)
@@ -369,7 +369,7 @@ func TestDSTCrashHostResurrectsUnsyncedRemoval(t *testing.T) {
 			}
 		})
 		CrashHost("h")
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				_, dirErr = os.Stat("/d")
 				_, fileErr = os.Stat("/d/f")
@@ -412,7 +412,7 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 	var deadMachineMapping []byte
 	var rebootMapping []byte
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			// Seed a durable baseline: content 'A', data + entry synced.
 			f, err := os.Create("/m")
 			if err != nil {
@@ -443,7 +443,7 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 			})
 			<-mapped
 
-			Crash("mapper") // process crash: write-back into the page cache
+			CrashProcess("h", "mapper") // process crash: write-back into the page cache
 			pb, err := os.ReadFile("/m")
 			if err != nil {
 				t.Fatalf("read after process crash: %v", err)
@@ -477,7 +477,7 @@ func TestDSTCrashHostLosesDirtyMappedBytes(t *testing.T) {
 
 		CrashHost("h") // power loss: the page cache goes
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("reader", func() {
 				hb, err := os.ReadFile("/m")
 				if err != nil {
@@ -532,7 +532,7 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 		exited := make(chan struct{})
 		addrCh := make(chan string, 1)
 
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("vproc", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -549,7 +549,7 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("sibling", HostConfig{}, func() {
+		Host("sibling", func() {
 			go func() {
 				defer close(exited)
 				Process("sproc", func() {
@@ -594,13 +594,13 @@ func TestDSTCrashHostVictimScoping(t *testing.T) {
 
 		// The victim's machine is off: a dial to it blackholes to the
 		// retransmit horizon (only a live kernel could answer RST).
-		Host("sibling", HostConfig{}, func() {
+		Host("sibling", func() {
 			Process("dialer", func() {
 				_, victimDialErr = net.Dial("tcp", addr)
 			})
 		})
 
-		Host("sibling", HostConfig{}, func() {
+		Host("sibling", func() {
 			Process("checker", func() {
 				b, err := os.ReadFile("/s")
 				if err != nil {
@@ -648,7 +648,7 @@ func TestDSTCrashHostClosesRootProcessResources(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		locked := make(chan struct{})
 		otherReady := make(chan struct{})
-		go Host("h", HostConfig{}, func() {
+		go Host("h", func() {
 			// proc 0 on host h: no Process declared.
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Errorf("write: %v", err)
@@ -673,7 +673,7 @@ func TestDSTCrashHostClosesRootProcessResources(t *testing.T) {
 
 		// The root process also has durable state on ANOTHER host; the victim's
 		// teardown must not reach it.
-		go Host("other", HostConfig{}, func() {
+		go Host("other", func() {
 			if err := os.WriteFile("/o", []byte("other"), 0o644); err != nil {
 				t.Errorf("other write: %v", err)
 			}
@@ -694,7 +694,7 @@ func TestDSTCrashHostClosesRootProcessResources(t *testing.T) {
 		// The open file description died with the kernel that held it.
 		_, leakedWriteErr = leaked.Write([]byte("x"))
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				f, err := os.Open("/lock")
 				if err != nil {
@@ -704,7 +704,7 @@ func TestDSTCrashHostClosesRootProcessResources(t *testing.T) {
 				lockErr = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 			})
 		})
-		Host("other", HostConfig{}, func() {
+		Host("other", func() {
 			Process("check", func() {
 				b, err := os.ReadFile("/o")
 				if err != nil {
@@ -734,7 +734,7 @@ func TestDSTRootClosesOnHostCrash(t *testing.T) {
 	var leaked *os.Root
 	Test(t, 1, func(t *testing.T) {
 		ready := make(chan *os.Root, 1)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("owner", func() {
 				os.Mkdir("/d", 0o755)
 				r, err := os.OpenRoot("/d")
@@ -747,7 +747,7 @@ func TestDSTRootClosesOnHostCrash(t *testing.T) {
 			leaked = <-ready
 		})
 		CrashHost("h")
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("reboot", func() {})
 		})
 		if _, err := leaked.Stat("."); !errors.Is(err, os.ErrClosed) {
@@ -761,12 +761,12 @@ func TestDSTCrashHostKillsProcessGoroutineStampedElsewhere(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		inside := make(chan struct{})
 		release := make(chan struct{})
-		Host("other", HostConfig{}, func() {}) // declare it, so the name resolves
-		Host("victim", HostConfig{}, func() {
+		Host("other", func() {}) // declare it, so the name resolves
+		Host("victim", func() {
 			go Process("vproc", func() {
 				// The process lives on "victim", but this goroutine is stamped
 				// with "other" for the dynamic extent of the nested Host body.
-				Host("other", HostConfig{}, func() {
+				Host("other", func() {
 					close(inside)
 					<-release
 				})
@@ -792,9 +792,9 @@ func TestDSTCrashHostKillsNestedRootGoroutine(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		inside := make(chan struct{})
 		release := make(chan struct{})
-		Host("other", HostConfig{}, func() {})
-		go Host("victim", HostConfig{}, func() {
-			Host("other", HostConfig{}, func() {
+		Host("other", func() {})
+		go Host("victim", func() {
+			Host("other", func() {
 				close(inside)
 				<-release
 			})
@@ -817,13 +817,13 @@ func TestDSTCrashHostFindsInheritedMiddleHostScope(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		inside := make(chan struct{})
 		release := make(chan struct{})
-		Host("other", HostConfig{}, func() {})
-		Host("inner", HostConfig{}, func() {})
-		Host("outer", HostConfig{}, func() {
-			Host("victim", HostConfig{}, func() {
+		Host("other", func() {})
+		Host("inner", func() {})
+		Host("outer", func() {
+			Host("victim", func() {
 				go func() {
-					Host("other", HostConfig{}, func() {
-						Host("inner", HostConfig{}, func() {
+					Host("other", func() {
+						Host("inner", func() {
 							close(inside)
 							<-release
 						})
@@ -849,9 +849,9 @@ func TestDSTCrashHostDoesNotKillExitedNestedScope(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		ready := make(chan struct{})
 		release := make(chan struct{})
-		Host("nested", HostConfig{}, func() {})
-		go Host("current", HostConfig{}, func() {
-			Host("nested", HostConfig{}, func() {})
+		Host("nested", func() {})
+		go Host("current", func() {
+			Host("nested", func() {})
 			close(ready)
 			<-release
 			ranAfter.Store(true)
@@ -870,7 +870,7 @@ func TestDSTCrashHostDoesNotKillExitedNestedScope(t *testing.T) {
 
 func TestDSTCrashHostRefusesNestedDriverMachine(t *testing.T) {
 	Run(1, func() {
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			pidc := make(chan int, 1)
 			stop := make(chan struct{})
 			go Process("victim-process", func() {
@@ -878,7 +878,7 @@ func TestDSTCrashHostRefusesNestedDriverMachine(t *testing.T) {
 				<-stop
 			})
 			pid := <-pidc
-			Host("other", HostConfig{}, func() {
+			Host("other", func() {
 				var got any
 				func() {
 					defer func() { got = recover() }()
@@ -890,11 +890,11 @@ func TestDSTCrashHostRefusesNestedDriverMachine(t *testing.T) {
 				if dstNetHostDead(lookupHost("victim")) {
 					t.Fatal("refused nested-driver crash powered off the host")
 				}
-				if err := syscall.Kill(pid, 0); err != nil {
-					t.Fatalf("refused nested-driver crash killed a process before refusal: %v", err)
-				}
-				close(stop)
 			})
+			if err := syscall.Kill(pid, 0); err != nil {
+				t.Fatalf("refused nested-driver crash killed a process before refusal: %v", err)
+			}
+			close(stop)
 		})
 	})
 }
@@ -911,7 +911,7 @@ func TestDSTCrashHostKeepsCreationModeAndBadDisk(t *testing.T) {
 	var readErr error
 	var bornAt, afterReboot time.Time
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR, 0o640)
 				if err != nil {
@@ -937,7 +937,7 @@ func TestDSTCrashHostKeepsCreationModeAndBadDisk(t *testing.T) {
 		FailDisk("h") // the media is bad before the power goes
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				fi, err := os.Stat("/f")
 				if err != nil {
@@ -960,34 +960,57 @@ func TestDSTCrashHostKeepsCreationModeAndBadDisk(t *testing.T) {
 	}
 }
 
-// TestDSTProcessRefusesTwoHosts: a logical process lives on one machine at a
-// time. Two live invocations of one name on different hosts would give the
-// process id two homes, and a host crash would scope its victims by whichever
-// was recorded last — silently sparing a pid on the machine that lost power.
-// The topology is refused instead.
-func TestDSTProcessRefusesTwoHosts(t *testing.T) {
-	var got any
+// TestDSTProcessSameNameAcrossHostsIsolated: Process names are scoped per host,
+// so two machines may concurrently run identically named processes ("p") with
+// independent pids and lifecycles — crashing "p" on one host or powering off
+// one host leaves the sibling machine's "p" untouched.
+func TestDSTProcessSameNameAcrossHostsIsolated(t *testing.T) {
+	var pidA, pidB, restartPidA int
+	var bAliveAfterCrashProcA, aAliveAfterCrashHostB bool
 	Run(1, func() {
-		started := make(chan struct{})
-		release := make(chan struct{})
-		go Host("a", HostConfig{}, func() {
+		readyA := make(chan int, 1)
+		readyB := make(chan int, 1)
+		Host("a", func() {
 			go Process("p", func() {
-				close(started)
-				<-release
+				readyA <- os.Getpid()
+				select {}
 			})
 		})
-		<-started
-		func() {
-			defer func() { got = recover() }()
-			Host("b", HostConfig{}, func() {
-				Process("p", func() {})
+		Host("b", func() {
+			go Process("p", func() {
+				readyB <- os.Getpid()
+				select {}
 			})
-		}()
-		close(release)
+		})
+		pidA = <-readyA
+		pidB = <-readyB
+		CrashProcess("a", "p")
+		Host("b", func() {
+			bAliveAfterCrashProcA = syscall.Kill(pidB, 0) == nil
+		})
+		readyA2 := make(chan int, 1)
+		stopA2 := make(chan struct{})
+		Host("a", func() {
+			go Process("p", func() {
+				readyA2 <- os.Getpid()
+				<-stopA2
+			})
+		})
+		restartPidA = <-readyA2
+		CrashHost("b")
+		Host("a", func() {
+			aAliveAfterCrashHostB = syscall.Kill(restartPidA, 0) == nil
+		})
+		close(stopA2)
 	})
-	msg, _ := got.(string)
-	if got == nil || !strings.Contains(msg, "already live on another host") {
-		t.Fatalf("same-name process on a second host = %v, want the one-machine refusal", got)
+	if pidA != 2 || pidB != 2 || restartPidA != 3 {
+		t.Fatalf("same-name processes across hosts got pids (a:%d->%d, b:%d), want per-host (a:2->3, b:2)", pidA, restartPidA, pidB)
+	}
+	if !bAliveAfterCrashProcA {
+		t.Fatal("CrashProcess(\"a\", \"p\") killed host \"b\"'s process \"p\"")
+	}
+	if !aAliveAfterCrashHostB {
+		t.Fatal("CrashHost(\"b\") killed host \"a\"'s process \"p\"")
 	}
 }
 
@@ -1000,13 +1023,13 @@ func TestDSTCrashHostRefusesDriverMachine(t *testing.T) {
 	Run(1, func() {
 		func() {
 			defer func() { inlineHost = recover() }()
-			Host("driver", HostConfig{}, func() {
+			Host("driver", func() {
 				CrashHost("driver")
 			})
 		}()
 		func() {
 			defer func() { inlineProc = recover() }()
-			Host("h2", HostConfig{}, func() {
+			Host("h2", func() {
 				Process("p2", func() { CrashHost("h2") })
 			})
 		}()
@@ -1019,17 +1042,18 @@ func TestDSTCrashHostRefusesDriverMachine(t *testing.T) {
 	}
 }
 
-// TestDSTCrashHostRestartFreshResources: after the reboot, a restarted process
-// gets a fresh pid and clean process-owned resources — the dead machine's
-// flocks are gone, so it re-acquires immediately.
+// TestDSTCrashHostRestartFreshResources: after the reboot, the fresh kernel
+// resets its pid space, pre-crash pids are dead until reused, and clean
+// process-owned resources are restored — the dead machine's flocks and cwds
+// are gone, so the restarted process re-acquires immediately.
 func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 	var lockErr error
-	var oldPID, newPID int
-	var killErr error
+	var oldPID, newPID, secondPID int
+	var aliveBeforeErr, killBeforeRestartErr error
 	var cwdAfter string
 	Test(t, 1, func(t *testing.T) {
 		locked := make(chan int, 1)
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 					t.Errorf("write: %v", err)
@@ -1058,11 +1082,14 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 			})
 		})
 		oldPID = <-locked
+		Host("h", func() {
+			aliveBeforeErr = syscall.Kill(oldPID, 0)
+		})
 
 		CrashHost("h")
-		killErr = syscall.Kill(oldPID, 0)
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
+			killBeforeRestartErr = syscall.Kill(oldPID, 0)
 			Process("db", func() {
 				newPID = os.Getpid()
 				// A rebooted machine starts its processes at the root: the cwd
@@ -1075,13 +1102,19 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 				defer f.Close()
 				lockErr = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 			})
+			Process("db", func() {
+				secondPID = os.Getpid()
+			})
 		})
 	})
-	if !errors.Is(killErr, syscall.ESRCH) {
-		t.Fatalf("Kill(pid of a process on the crashed host) = %v, want ESRCH", killErr)
+	if aliveBeforeErr != nil {
+		t.Fatalf("Kill(live pid on host before crash) = %v, want nil", aliveBeforeErr)
 	}
-	if newPID == oldPID {
-		t.Fatalf("restart after reboot reused pid %d", oldPID)
+	if !errors.Is(killBeforeRestartErr, syscall.ESRCH) {
+		t.Fatalf("Kill(pid of a process on the crashed host after reboot) = %v, want ESRCH", killBeforeRestartErr)
+	}
+	if oldPID != 2 || newPID != 2 || secondPID != 3 {
+		t.Fatalf("pids across reboot = (boot1:%d, boot2:%d,%d), want (2, 2, 3)", oldPID, newPID, secondPID)
 	}
 	if lockErr != nil {
 		t.Fatalf("flock after reboot = %v, want success (the dead kernel's lock table is gone)", lockErr)
@@ -1098,10 +1131,9 @@ func TestDSTCrashHostRestartFreshResources(t *testing.T) {
 // die with the crashed sender's kernel, and then SILENCE: no packet exists
 // for a powered-off machine to send, so the survivor's default keepalive
 // (Go enables it on every dialed conn) is what finally surfaces the death,
-// ETIMEDOUT (DST-FAULT-SOUND). "abc" is delivered before the crash (its
-// 100ms traversal completes while the dial's SYN-ACK leg runs); "xyz" is
-// written with no virtual time left before the power loss and must never
-// arrive.
+// ETIMEDOUT (DST-FAULT-SOUND). "abc" is delivered before the crash (survivor
+// sleeps one 100ms link traversal after connect); "xyz" is written with no
+// virtual time left before the power loss and must never arrive.
 func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	var n int
 	var got [8]byte
@@ -1109,12 +1141,12 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
 		written := make(chan struct{})
-		dialed := make(chan struct{})
+		delivered := make(chan struct{})
 		crashed := make(chan struct{})
 		readDone := make(chan struct{})
 		exited := make(chan struct{})
 
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("writer", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -1131,7 +1163,7 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 					t.Errorf("victim write abc: %v", err)
 					return
 				}
-				<-dialed
+				<-delivered
 				// Delivered in 100ms of virtual time — but the crash below
 				// runs with none passing, so these bytes die on the wire.
 				if _, err := c.Write([]byte("xyz")); err != nil {
@@ -1144,7 +1176,7 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go func() {
 				defer close(exited)
 				Process("reader", func() {
@@ -1153,10 +1185,8 @@ func TestDSTCrashHostDropsInFlightBytes(t *testing.T) {
 						t.Errorf("survivor dial: %v", err)
 						return
 					}
-					// Dial returned, so both conn ends are registered — the
-					// crash below cannot benignly miss an unregistered conn on
-					// any seed's schedule.
-					close(dialed)
+					time.Sleep(110 * time.Millisecond) // allow "abc" to complete its 100ms traversal
+					close(delivered)
 					<-crashed
 					n, firstErr = c.Read(got[:])
 					_, secondErr = c.Read(make([]byte, 8))
@@ -1197,7 +1227,7 @@ func TestDSTCrashHostSparesAppClosedConns(t *testing.T) {
 		readDone := make(chan struct{})
 		exited := make(chan struct{})
 
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("writer", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -1222,7 +1252,7 @@ func TestDSTCrashHostSparesAppClosedConns(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go func() {
 				defer close(exited)
 				Process("reader", func() {
@@ -1267,7 +1297,7 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 		dialed := make(chan struct{})
 		serverExited := make(chan struct{})
 
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("server", func() {
 				defer close(serverExited)
 				l, err := net.Listen("tcp", HostIP("survivor")+":0")
@@ -1287,7 +1317,7 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 		addr := ln.Addr().String()
 
 		var src *net.TCPAddr
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			src = &net.TCPAddr{IP: net.ParseIP(HostIP("victim")), Port: 34567}
 			go Process("dialer", func() {
 				d := net.Dialer{LocalAddr: src}
@@ -1304,7 +1334,7 @@ func TestDSTCrashHostFreesVictimPorts(t *testing.T) {
 		CrashHost("victim")
 
 		rebooted := make(chan struct{})
-		Host("victim", HostConfig{}, func() { // the restart: same machine, fresh kernel
+		Host("victim", func() { // the restart: same machine, fresh kernel
 			go Process("dialer2", func() {
 				d := net.Dialer{LocalAddr: src}
 				_, redialErr = d.Dial("tcp", addr)
@@ -1338,7 +1368,7 @@ func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 		readDone := make(chan struct{})
 		exited := make(chan struct{})
 
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go func() {
 				defer close(exited)
 				Process("reader", func() {
@@ -1361,7 +1391,7 @@ func TestDSTCrashHostDropsInFlightBytesVictimDialer(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("writer", func() {
 				c, err := net.Dial("tcp", addr)
 				if err != nil {
@@ -1399,7 +1429,7 @@ func TestDSTCrashHostDialBlackholes(t *testing.T) {
 	var deadElapsed time.Duration
 	Test(t, 1, func(t *testing.T) {
 		addrCh := make(chan string, 1)
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("server", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -1415,7 +1445,7 @@ func TestDSTCrashHostDialBlackholes(t *testing.T) {
 		CrashHost("victim")
 
 		dialDone := make(chan struct{})
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("dialer", func() {
 				defer close(dialDone)
 				start := time.Now()
@@ -1429,7 +1459,7 @@ func TestDSTCrashHostDialBlackholes(t *testing.T) {
 		addr2Ch := make(chan string, 1)
 		lnCh := make(chan net.Listener, 1)
 		serverExited := make(chan struct{})
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("server", func() {
 				defer close(serverExited)
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
@@ -1450,7 +1480,7 @@ func TestDSTCrashHostDialBlackholes(t *testing.T) {
 		addr2 := <-addr2Ch
 
 		redialDone := make(chan struct{})
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("dialer2", func() {
 				defer close(redialDone)
 				_, rebootErr = net.Dial("tcp", addr2)
@@ -1477,36 +1507,28 @@ func TestDSTCrashHostDialBlackholes(t *testing.T) {
 // yield a half-alive machine: its server running and listening while every
 // dial to it blackholes — a state reality cannot produce. After the reboot,
 // the restart succeeds.
-func TestDSTCrashHostProcessRestartRefused(t *testing.T) {
-	var panicMsg string
+// TestDSTCrashHostRebootProcessRestart: after CrashHost kills all processes on
+// a machine, a Host re-declaration models the reboot and allows processes to
+// restart cleanly on the rebooted machine.
+func TestDSTCrashHostRebootProcessRestart(t *testing.T) {
 	var rebootRestartOK bool
 	Test(t, 1, func(t *testing.T) {
 		started := make(chan struct{})
-		go Process("node", func() { // implicit dedicated host "node"
-			close(started)
-			select {} // dies with the machine
+		Host("node", func() {
+			go Process("node", func() {
+				close(started)
+				select {} // dies with the machine
+			})
 		})
 		<-started
 
 		CrashHost("node")
 
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					panicMsg = r.(string)
-				}
-			}()
-			Process("node", func() {})
-		}()
-
 		// The reboot: an explicit Host declaration of the same machine.
-		Host("node", HostConfig{}, func() {
+		Host("node", func() {
 			Process("node", func() { rebootRestartOK = true })
 		})
 	})
-	if !strings.Contains(panicMsg, "powered off") {
-		t.Fatalf("restarting a process on a crashed host panicked with %q, want a powered-off refusal naming the Host re-declaration", panicMsg)
-	}
 	if !rebootRestartOK {
 		t.Fatal("process restart after the Host re-declaration did not run")
 	}
@@ -1522,7 +1544,7 @@ func TestDSTCrashHostMidHandshakeDialTimesOut(t *testing.T) {
 	var elapsed time.Duration
 	TestWith(t, 1, Options{Network: NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func(t *testing.T) {
 		addrCh := make(chan string, 1)
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("server", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -1536,7 +1558,7 @@ func TestDSTCrashHostMidHandshakeDialTimesOut(t *testing.T) {
 		addr := <-addrCh
 
 		dialDone := make(chan struct{})
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("dialer", func() {
 				defer close(dialDone)
 				start := time.Now()
@@ -1567,7 +1589,7 @@ func TestDSTCrashHostHealHostCannotResurrect(t *testing.T) {
 	var dialErr error
 	Test(t, 1, func(t *testing.T) {
 		addrCh := make(chan string, 1)
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("server", func() {
 				l, err := net.Listen("tcp", HostIP("victim")+":0")
 				if err != nil {
@@ -1581,10 +1603,10 @@ func TestDSTCrashHostHealHostCannotResurrect(t *testing.T) {
 		addr := <-addrCh
 
 		CrashHost("victim")
-		HealHost("victim") // heals network cuts; cannot power a machine on
+		UnisolateHost("victim") // heals network cuts; cannot power a machine on
 
 		dialDone := make(chan struct{})
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("dialer", func() {
 				defer close(dialDone)
 				_, dialErr = net.Dial("tcp", addr)
@@ -1606,7 +1628,7 @@ func TestDSTHostRebootKeepsIsolation(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		lnCh := make(chan net.Listener, 1)
 		serverExited := make(chan struct{})
-		Host("island", HostConfig{}, func() {
+		Host("island", func() {
 			go Process("server", func() {
 				defer close(serverExited)
 				l, err := net.Listen("tcp", HostIP("island")+":0")
@@ -1625,18 +1647,18 @@ func TestDSTHostRebootKeepsIsolation(t *testing.T) {
 		ln := <-lnCh
 		addr := ln.Addr().String()
 
-		Isolate("island")
-		Host("island", HostConfig{}, func() {}) // reboot: must NOT heal the isolation
+		IsolateHost("island")
+		Host("island", func() {}) // reboot: must NOT heal the isolation
 
 		dialDone := make(chan struct{})
-		Host("survivor", HostConfig{}, func() {
+		Host("survivor", func() {
 			go Process("dialer", func() {
 				defer close(dialDone)
 				_, dialErr = net.Dial("tcp", addr)
 			})
 		})
 		<-dialDone
-		HealHost("island")
+		UnisolateHost("island")
 		ln.Close()
 		<-serverExited
 	})

@@ -22,7 +22,7 @@ var (
 var dstFinqRunBaseQueued, dstFinqRunExecuted atomic.Uint64
 
 func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
-	dstEpoch, dstSeq, dstPid := dstTakeStagedSpecialStamps()
+	dstSt := dstTakeStagedSpecialStamps()
 	if gcphase != _GCoff {
 		throw("queuefinalizer during GC")
 	}
@@ -31,7 +31,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 
 	q := &finq
 	deferred := false
-	if dstActive() && dstEpoch != dstRunEpoch.Load() {
+	if dstActive() && dstSt.epoch != dstRunEpoch.Load() {
 		q = &dstDeferredFinq
 		dstFinqRunExecuted.Add(1)
 		deferred = true
@@ -52,7 +52,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 		dstFinSlabMemo.block = *q
 		dstFinSlabMemo.st = dstFinSlabFor(*q)
 	}
-	dstFinSlabMemo.st[(*q).cnt-1] = dstCallbackStamp{seq: dstSeq, epoch: dstEpoch, pid: dstPid}
+	dstFinSlabMemo.st[(*q).cnt-1] = dstSt
 	finqueued++
 	unlock(&finlock)
 	if !deferred {
@@ -179,7 +179,8 @@ func runFinqBlocks(fb *finBlock, frame unsafe.Pointer, framecap uintptr, onDrain
 			if !onDrain {
 				fingStatus.Or(fingRunningFinalizer)
 			}
-			invoked := dstCallbackOwnerAlive(slab[i-1].epoch, slab[i-1].pid)
+			st := slab[i-1]
+			ownerHost, invoked := dstCallbackOwnerHost(st)
 			if onDrain {
 				lock(&finlock)
 				if invoked {
@@ -194,12 +195,19 @@ func runFinqBlocks(fb *finBlock, frame unsafe.Pointer, framecap uintptr, onDrain
 				slab[i-1].epoch = 0
 			}
 			if invoked {
-				oldPid := gp.dstPid
-				if onDrain && slab[i-1].pid > 0 {
-					gp.dstPid = slab[i-1].pid
+				oldHost, oldProc, oldSlot, oldPid := gp.dstHost, gp.dstProc, gp.dstProcSlot, gp.dstPid
+				if onDrain && (st.pid > 0 || ownerHost != 0) {
+					gp.dstHost = ownerHost
+					gp.dstProc = st.proc
+					gp.dstProcSlot = st.slot
+					if st.pid > 0 {
+						gp.dstPid = st.pid
+					} else {
+						gp.dstPid = int32(dstSimPID)
+					}
 				}
 				reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
-				gp.dstPid = oldPid
+				gp.dstHost, gp.dstProc, gp.dstProcSlot, gp.dstPid = oldHost, oldProc, oldSlot, oldPid
 				executed++
 			}
 			if !onDrain {

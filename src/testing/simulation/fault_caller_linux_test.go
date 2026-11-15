@@ -40,18 +40,18 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		name string
 		call func()
 	}{
-		{"Crash", func() { Crash("h") }},
+		{"CrashProcess", func() { CrashProcess("h", "p") }},
 		{"CrashHost", func() { CrashHost("h") }},
 		{"StepClock", func() { StepClock("h", time.Second) }},
 		{"DriftClock", func() { DriftClock("h", 1000) }},
 		{"Partition", func() { Partition("h", "g") }},
-		{"Heal", func() { Heal("h", "g") }},
-		{"Isolate", func() { Isolate("h") }},
-		{"HealHost", func() { HealHost("h") }},
+		{"HealLink", func() { HealLink("h", "g") }},
+		{"IsolateHost", func() { IsolateHost("h") }},
+		{"UnisolateHost", func() { UnisolateHost("h") }},
 		{"PartitionOneWay", func() { PartitionOneWay("h", "g") }},
 		{"PartitionRefuse", func() { PartitionRefuse("h", "g") }},
-		{"Reset", func() { Reset("h", "g") }},
-		{"ResetProcess", func() { ResetProcess("p") }},
+		{"ResetLink", func() { ResetLink("h", "g") }},
+		{"ResetProcess", func() { ResetProcess("h", "p") }},
 		{"FailDisk", func() { FailDisk("h") }},
 		{"HealDisk", func() { HealDisk("h") }},
 		{"FailWriteback", func() { FailWriteback("h") }},
@@ -61,6 +61,7 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 		{"LimitDisk", func() { LimitDisk("h", 1<<20) }},
 		{"UnlimitDisk", func() { UnlimitDisk("h") }},
 		{"SlowDisk", func() { SlowDisk("h", time.Millisecond) }},
+		{"UnslowDisk", func() { UnslowDisk("h") }},
 		{"CorruptFile", func() { CorruptFile("h", "/f") }},
 	}
 
@@ -87,8 +88,8 @@ func TestDSTFaultFromNonBubbleGoroutinePanics(t *testing.T) {
 
 	var got map[string]string
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {})
-		Host("g", HostConfig{}, func() {})
+		Host("h", func() {})
+		Host("g", func() {})
 		done := make(chan struct{})
 		go Process("p", func() { <-done })
 		got = make(map[string]string, 2*len(faults))
@@ -157,7 +158,7 @@ func TestDSTForeignRuntimeGCPanics(t *testing.T) {
 	var bare, foreignBubble string
 	inBubble := false
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {})
+		Host("h", func() {})
 		inject <- func() { runtime.GC() }
 		bare = <-result
 		inject <- func() { // being in SOME bubble must not pass the guard
@@ -472,7 +473,7 @@ func runKilledCallerGateWaiters() {
 		p2Ready := make(chan struct{})
 		p2Stop := make(chan struct{})
 		p2Done := make(chan struct{})
-		Host("other", HostConfig{}, func() {
+		Host("other", func() {
 			go func() {
 				Process("p2", func() {
 					close(p2Ready)
@@ -485,7 +486,7 @@ func runKilledCallerGateWaiters() {
 
 		exitReady := make(chan struct{})
 		exitNow := make(chan struct{})
-		Host("victim", HostConfig{}, func() {
+		Host("victim", func() {
 			go Process("exiting", func() {
 				close(exitReady)
 				<-exitNow
@@ -496,9 +497,9 @@ func runKilledCallerGateWaiters() {
 		procTeardownMu.Lock()
 		close(exitNow)
 		crashStarted := make(chan struct{})
-		go Host("victim", HostConfig{}, func() {
+		go Host("victim", func() {
 			close(crashStarted)
-			Crash("p2")
+			CrashProcess("other", "p2")
 		})
 		<-crashStarted
 		for range 20 {
@@ -562,7 +563,7 @@ func TestDSTTopologyFromNonBubbleGoroutinePanics(t *testing.T) {
 		name string
 		call func()
 	}{
-		{"Host", func() { Host("foreign-h", HostConfig{}, func() {}) }},
+		{"Host", func() { Host("foreign-h", func() {}) }},
 		{"Process", func() { Process("foreign-p", func() {}) }},
 	}
 
@@ -621,13 +622,13 @@ func TestDSTTopologyFromNonBubbleGoroutinePanics(t *testing.T) {
 		func() {
 			defer func() {
 				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "unknown process") {
-					t.Errorf("Crash(\"foreign-p\") after a refused declaration = %v, want the unknown-process panic (the guard must fire before the intern tables)", r)
+					t.Errorf("CrashProcess(\"\", \"foreign-p\") after a refused declaration = %v, want the unknown-process panic (the guard must fire before the intern tables)", r)
 				}
 			}()
-			Crash("foreign-p")
+			CrashProcess("", "foreign-p")
 		}()
 		// The run's own goroutines: sanctioned declarations still work.
-		Host("h", HostConfig{}, func() {})
+		Host("h", func() {})
 		done := make(chan struct{})
 		go Process("p", func() { <-done })
 		close(done)
@@ -659,7 +660,7 @@ func TestDSTTopologyOutsideRunKeepsBehavior(t *testing.T) {
 		}
 	}()
 	ranHost, ranProc := false, false
-	Host("outside-h", HostConfig{}, func() { ranHost = true })
+	Host("outside-h", func() { ranHost = true })
 	Process("outside-p", func() { ranProc = true })
 	if !ranHost || !ranProc {
 		t.Errorf("outside a run Host/Process must still run f (host=%v proc=%v)", ranHost, ranProc)
@@ -674,18 +675,18 @@ func TestDSTFaultOutsideRunIsNoop(t *testing.T) {
 			t.Fatalf("fault API outside a run panicked: %v", r)
 		}
 	}()
-	Crash("nobody")
+	CrashProcess("nobody", "nobody-proc")
 	CrashHost("nobody")
 	StepClock("nobody", time.Second)
 	DriftClock("nobody", 1000)
 	Partition("a", "b")
-	Heal("a", "b")
-	Isolate("a")
-	HealHost("a")
+	HealLink("a", "b")
+	IsolateHost("a")
+	UnisolateHost("a")
 	PartitionOneWay("a", "b")
 	PartitionRefuse("a", "b")
-	Reset("a", "b")
-	ResetProcess("p")
+	ResetLink("a", "b")
+	ResetProcess("a", "p")
 	FailDisk("a")
 	HealDisk("a")
 	FailWriteback("a")

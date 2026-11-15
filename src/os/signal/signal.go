@@ -102,6 +102,11 @@ func Ignore(sig ...os.Signal) {
 
 // Ignored reports whether sig is currently ignored.
 func Ignored(sig os.Signal) bool {
+	if dstSimEnabled {
+		if dstFenceActive() {
+			panic("os/signal: Ignored unsupported under deterministic simulation")
+		}
+	}
 	sn := signum(sig)
 	return sn >= 0 && signalIgnored(sn)
 }

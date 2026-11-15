@@ -35,35 +35,36 @@ host-capability stance).
 
 ### Identity primitives (the shared contract every fault axis targets)
 
-`g` gains **two** ids — `dstHost uint32` and `dstProc uint32` — plus immutable entered-`Host` ancestry,
+`g` gains **three** ids — `dstHost uint32`, `dstProc uint32` (logical `(host, name)` process id for cumulative memory accounting across restarts), and `dstProcSlot uint32` (unique per-invocation resource slot for cwd, fds, flocks, mappings, sockets, listeners, environment, and callback ownership) — plus immutable entered-`Host` ancestry,
 all **inherited parent→child at `newproc1`**, alongside `g.dstrand` (`proc.go`). The runtime carries integer ids; the string↔id
 interning and the public API live in `testing/simulation`, so no Go string enters the hot `g` copy path
 (the same "lean runtime, public face" split as process identity and the scheduling strategy). Host 0 /
-process 0 is the default — the test driver — so the N=1 program is host 0, process 0, unchanged.
+process 0 / slot 0 is the default — the test driver on the unnamed root host — so the N=1 program is host 0, process 0, unchanged.
 
-**API (explicit, declarative, dynamic).** `simulation.Host(name, HostConfig{...}, f)` establishes a host
-(its FS, hostname, deterministically assigned IP, NumCPU, clock offset, zone); `simulation.Process(name, ..., f)` runs a process. A
-`Process` declared inside a `Host` body is on that host; a `Process` outside any `Host` gets an
-**implicit dedicated host** (the 1:1 "one process per machine" case — the common distributed topology,
-zero-config). Both are callable **at any time**, not only at setup: since there is no `os/exec` under
-DST, calling `Host`/`Process` mid-run **is** how a SUT models a node joining (membership change). The id
-is stamped+inherited, so a process started mid-run, or added to an existing host, just works; the body
-scopes *declaration*, the goroutines it starts outlive it. Mid-run declarations come from goroutines
+**API (explicit, declarative, dynamic).** `simulation.Host(name, f)` and `simulation.HostWith(name, HostConfig{...}, f)` establish a host
+(its FS, hostname, deterministically assigned IP, NumCPU, clock offset/drift, zone); `simulation.Process(name, f)` and `simulation.ProcessWith(name, ProcessConfig{...}, f)` run a process. A
+`Process` declared inside a `Host`/`HostWith` body runs on that host; a `Process` outside any `Host` runs on the
+unnamed root host (`host == ""` / id `0`) without creating a hidden machine. Process names are scoped per `(host, name)`, so multiple hosts may concurrently run processes with the same name (e.g., `"server"` on `"h1"` and `"h2"`). Both `Host` and `Process` are callable **at any time**, not only at setup: since there is no `os/exec` under
+DST, calling `Host`/`Process` mid-run **is** how a SUT models a node joining (membership change). The ids
+are stamped+inherited, so a process started mid-run, or added to an existing host, just works; the body
+scopes *declaration*, while a `Host` body's spawned goroutines may outlive it (a `Process` body's return is the process's exit). Mid-run declarations come from goroutines
 the simulation schedules — a foreign caller panics, like the fault APIs (see "Fault callers fail
-loud too"). An explicit or implicit host declaration validates its candidate ID before publishing
-the name or identity. `Host` also validates its complete clock configuration before publishing the
+loud too"). A host declaration validates its candidate ID and non-empty name before publishing
+the name or identity. `HostWith` also validates its complete clock configuration before publishing the
 caller stamp, timer remap, or reboot. Every rejected declaration is state-neutral. A run is bounded
 to 4096 distinct hosts (`dstMaxSimHosts`, the same fixed-table stance as the `dstMaxSimProcs`
 process bound below): exceeding it panics loudly and state-neutrally, never silently drops a
 declaration (`TestDSTHostTableExhaustionIsStateNeutral`).
 
 ```go
-simulation.Host("h1", simulation.HostConfig{NumCPU: 4, Clock: simulation.Skew(50 * ms)}, func() {
-    simulation.Process("p1", p1main)   // shares h1's FS, IP, port space, clock
-    simulation.Process("p2", p2main)
+simulation.HostWith("h1", simulation.HostConfig{NumCPU: 4, Clock: simulation.Skew(50 * ms)}, func() {
+    go simulation.Process("p1", p1main) // shares h1's FS, IP, port space, clock
+    go simulation.Process("p2", p2main)
 })
-simulation.Process("n3", n3main)       // implicit dedicated host
-h1IP := simulation.HostIP("h1")        // the deterministically assigned routable IP
+simulation.Host("h2", func() {
+    go simulation.Process("p1", h2main) // independent machine; same process name allowed
+})
+h1IP := simulation.HostIP("h1")         // the deterministically assigned routable IP
 ```
 
 (The example is compile-checked by `TestDSTHostConfigDocExample` in
@@ -71,7 +72,7 @@ h1IP := simulation.HostIP("h1")        // the deterministically assigned routabl
 
 ### Per-host filesystem (process isolation by construction)
 
-The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process**
+The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process invocation** (`g.dstProcSlot`)
 (`os/dst_fs.go` — landed; the bullets state the model the code implements).
 
 - **Per-host tree.** `dstFS` holds per-host disks (`nodes map[hostId]*dstFSDisk`), created lazily
@@ -81,9 +82,9 @@ The **tree** is per-**host**; the **cwd** and the **fd table** are per-**process
   source of truth (the host's own tree) rather than guard against the bad state. Co-located processes *do*
   share their host tree (lock files, a shared data dir, a shared SQLite file) — the "N processes on one
   host" requirement.
-- **Per-process cwd + fds.** `Chdir`/`Getwd` are per-process (p1 changing cwd must not move p2's, even on
-  one host); an open `*os.File` belongs to a process (a process crash closes *its* handles while the file
-  content survives on the host tree). The cwd is a directory node reference in the host tree (following
+- **Per-invocation cwd + fds.** `Chdir`/`Getwd` are per-`(host, invocation slot)` (p1 changing cwd must not move p2's or an overlapping restart's, even on
+  one host); an open `*os.File` belongs to a process invocation slot (a process exit or crash closes *its* handles immediately while the file
+  content and any sibling invocation's handles survive on the host tree). The cwd is a directory node reference in the host tree (following
   renames and refusing `Getwd` and entry creation with `ENOENT` once unlinked).
 - **N=1 collapse.** One host → one tree, one process → one cwd = today's behavior; existing `TestDSTFS*`
   pass unchanged.
@@ -114,15 +115,13 @@ Addressing is per-host (`net/dst.go` — the registry keys are host-scoped; land
   faults*, plus a base-latency matrix (fault section). A switch object would re-express, with extra
   machinery, exactly what partition/latency faults already express, and adds no physical behavior in a
   deterministic sim.
-- **Conn attribution** records both the host and process of each end (dialer = the `Dial` caller's
-  `dstHost`/`dstProc`; server = the `Listen` caller's host/process — the process that owns the listener and
-  accepts on it — stamped on the conn at Dial), so net faults target a host-pair (partition) or a process
-  (reset). The **host** half is **landed** (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
-  `net/dst.go`), consumed by the base-latency link lookup; the **process** half is likewise **landed**
-  (`dstConn.localProc`/`remoteProc`, stamped at the same Dial point), consumed by the reset fault's
-  `ResetProcess` targeting.
-- **DNS by hostname is deferred.** Dial by assigned IP:port; `hostname → IP` is a planned minimal sim-DNS
-  increment (until then DNS-by-name stays fenced, as today) — a thin lookup over the host IP assignment,
+- **Conn attribution** records both the host and process invocation slot of each end (dialer = the `Dial` caller's
+  `dstHost`/`dstProcSlot`; server = the `Listen` caller's `dstHost`/`dstProcSlot` — the process invocation that owns the listener and
+  accepts on it — stamped on the conn at Dial), so net faults target a host-pair (partition/reset) or a `(host, process)`
+  (`ResetProcess`). Both the **host** half (`dstConn.localHost`/`remoteHost` + `dstListener.host`,
+  `net/dst.go`) and the **process** half (`dstConn.localProc`/`remoteProc` + `dstListener.proc`, carrying `dstProcSlot`) are **landed**.
+- **Arbitrary DNS by hostname is deferred.** `"localhost"` resolves deterministically to loopback; dial peers by assigned IP:port (`simulation.HostIP(name)`); general `hostname → IP` is a planned minimal sim-DNS
+  increment (until then arbitrary DNS-by-name stays fenced, as today) — a thin lookup over the host IP assignment,
   same address model.
 
 ### Per-host clock (the seam for skew — a hard requirement, in model)
@@ -171,15 +170,15 @@ tolerate*, so it cannot be a single global clock.
   `net.Interfaces` (a fixed synthetic per-host set — `lo` plus `eth0` bearing the host's routable
   `10.0.0.<id>`, retiring the real-NIC nondeterminism the net section recorded). Per-host identity lives in
   a lock-free copy-on-write `atomic.Pointer` table keyed by `g.dstHost` (the string stays off `g`).
-  Per-**process**: `os.Getpid`/`Getppid` (a fresh per-*invocation* pid on `g.dstPid`, so a restart gets a
-  new pid — no stable-pid), cwd; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
-  (per-process possible later, non-foreclosing). `Kill(pid, 0)` is the simulated liveness query over those
-  pids: live process pids succeed, completed or unknown pids return `ESRCH`, and host pids are never probed.
+  Per-**process invocation** (per `(host, boot)` kernel table): `os.Getpid`/`Getppid` (a fresh per-*invocation* pid on `g.dstPid` allocated per `(host, boot)`, so distinct hosts and reboots start independent PID spaces and a restart gets a
+  new pid — no stable-pid), cwd, and environment; `os.Getuid`/`Getgid`/user stay the uniform `7777`/"sim" constants
+  (per-process possible later, non-foreclosing). `Kill(pid, 0)` is the simulated liveness query scoped to the caller's `(host, boot, PIDNamespace)`:
+  live visible process pids succeed, cross-host, cross-namespace, post-reboot, completed, or unknown pids return `ESRCH`, and host pids are never probed by bubble goroutines (non-bubble goroutines retain real host identity and `Kill`).
   Every positive `Options.NumCPU` and `HostConfig.NumCPU` in the target architecture's `int` range is
   reported exactly; non-positive values select the applicable default.
-  Procfs identity follows the same pid registry: `/proc/<pid>/stat` exposes a deterministic field-22
-  starttime only for live simulated pids, and `/proc/self/ns/pid` readlink exposes a stable deterministic
-  namespace identity with no host `/proc` passthrough. Exhausting the finite PID field fails before a
+  Procfs identity follows the same per-`(host, boot, PIDNamespace)` pid registry: `/proc/<pid>/stat` exposes a deterministic field-22
+  starttime (and unique per-`(host, boot, pid, starttime)` file identity) only for live visible simulated pids, and `/proc/self/ns/pid` readlink exposes a deterministic per-`(host, boot)`
+  namespace identity with no host `/proc` passthrough. Exhausting the per-`(host, boot)` PID field (`Options.PidMax` or `math.MaxInt32`) fails before a
   `Process` declaration interns names, stamps identity, registers liveness, or runs its body.
   Host 0 / unconfigured uses the run defaults (`Options.Hostname`/`PID`/`NumCPU`), so the N=1 program is
   unchanged.
@@ -385,27 +384,26 @@ host-pair**, a **zone-pair**, a **process**, or (network sugar) an **address / c
 to the owning host/process (a listen address is owned by the host that registered it). The convenience
 API compiles to per-host-pair / per-process fault records over the full mesh — **not** topology objects:
 
-- `Isolate("h3")` / `Heal("h3")` — cut / restore a host from all others.
-- `Partition({"h1","h2"}, {"h3"})`, `Partition(Zone("dc-a"), Zone("dc-b"))` — split groups (the
-  zone-pair form needs only the host `zone` label, no topology object).
-- `Link("h1","h2").Latency(50*ms)`, `.Blackhole()`, `.Reset()` — per-link policy.
-- `Crash("p2")` / `CrashHost("h1")` / `OOM("p2", budget)` / `Straggle("p2")` / `Skew("h1", drift)`.
+- `IsolateHost("h3")` / `UnisolateHost("h3")` — cut / restore a host from all others.
+- `Partition("h1", "h2")` / `PartitionRefuse("h1", "h2")` / `PartitionOneWay("h1", "h2")` / `HealLink("h1", "h2")` — cut / heal a host-pair link; future L4 sugar `Partition({"h1","h2"}, {"h3"})`, `Partition(Zone("dc-a"), Zone("dc-b"))` splits groups over the host `zone` label.
+- `ResetLink("h1", "h2")` / `ResetProcess("h1", "p2")` — reset a link's or `(host, process)`'s connections; future L4 `Link("h1","h2").Latency(50*ms)` adds per-link latency policy.
+- `CrashProcess("h1", "p2")` / `CrashHost("h1")` / `OOM("h1", "p2", budget)` / `Straggle("h1", "p2")` / `StepClock("h1", delta)` / `DriftClock("h1", ppb)`.
 
-Attribution is what makes targeting sound and leak-free: a conn records both endpoints' host+process, a
-file its host, a goroutine its host+process — so a host-pair partition touches exactly that pair's
-cross-host conns, and a process crash exactly that process's resources (DST-FAULT-VICTIM). The host-pair
-targeting (`Partition`/`Heal`/`Isolate`/`HealHost`) is **landed** as the imperative network-partition API;
-the per-process and per-host forms (`Crash`, `ResetProcess`; `CrashHost`) and the crash/restart axes are landed;
+Attribution is what makes targeting sound and leak-free: a conn records both endpoints' host + invocation slot, a
+file its host (and open handle its invocation slot), a goroutine its host + logical process + invocation slot — so a host-pair partition touches exactly that pair's
+cross-host conns, and a process crash exactly that `(host, process)`'s live invocations and resources (DST-FAULT-VICTIM). The host-pair and host-isolation
+targeting (`Partition`/`PartitionRefuse`/`PartitionOneWay`/`HealLink`/`IsolateHost`/`UnisolateHost`) is **landed** as the imperative network-partition API;
+the per-process and per-host forms (`CrashProcess`, `ResetProcess`; `CrashHost`, `ResetLink`) and the crash/restart axes are landed;
 the group/zone forms and the `Link`/`OOM`/`Straggle` sugar extend it as those axes land.
 
 **Victim names fail loud.** A fault or configuration API that takes a host name (`StepClock`,
-`DriftClock`, `HostIP`, `HostFS`, the partition/reset targets) **panics on a name no `Host`
-declaration has established** — it never interns a fresh host id as a side effect. A typo'd victim
+`DriftClock`, `HostIP`, `HostFS`, the partition/reset/crash/disk targets) **panics on a name no `Host`
+declaration has established** (pass `host == ""` to target a `Process` on the unnamed root host in `CrashProcess` and `ResetProcess`) — it never interns a fresh host id as a side effect. A typo'd victim
 would otherwise mutate state no goroutine observes: the fault silently tests nothing, the run stays
 green, and the SUT's fault handling goes unexercised — a silent no-op at odds with the fail-loud
 posture everywhere else (undeclared-host panics, the `-tags dst` panic). Enforced at the one name→id
 lookup choke point in `testing/simulation` (`lookupHost`/`lookupProc`) that every victim-name intake —
-clock, HostIP/HostFS, partition, reset, disk — shares; outside a run the calls stay documented no-ops.
+clock, HostIP/HostFS, partition, reset, crash, disk — shares; outside a run the calls stay documented no-ops.
 `TestDSTFaultVictimUnknownPanics` / `TestDSTFaultVictimOutsideRunNoop`.
 
 **Fault callers fail loud too.** A fault-injection or clock-fault API invoked during an active run
@@ -515,7 +513,7 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   cut-start of the INCOMING direction (`dstPartCutStartDir(peer→local)`): bytes delivered strictly before
   the cut are readable, in-flight and after-cut bytes are held (`TestDSTNetPartitionPreDeliveredReadable`
   / `TestDSTNetPartitionRecover`). DoF: a transient partition. **Landed** via the imperative targeting API
-  `simulation.Partition(a,b)` (symmetric blackhole) / `Heal(a,b)` / `Isolate(h)` / `HealHost(h)`, plus the
+  `simulation.Partition(a,b)` (symmetric blackhole) / `HealLink(a,b)` / `IsolateHost(h)` / `UnisolateHost(h)`, plus the
   two mode variants: `PartitionRefuse(a,b)` — a Dial across the cut fails `ECONNREFUSED` fast rather than
   blackholing (`TestDSTNetPartitionRefuseConnect`) — and `PartitionOneWay(from,to)` — an **asymmetric** cut
   of only `from→to` while `to→from` still flows (`TestDSTNetPartitionOneWay`). (The declarative
@@ -569,9 +567,9 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   `net/dst_keepalive_test.go`, `net/dst_crash_silence_test.go`.
 - **Connection reset** — inject a connection reset (an RST, surfacing as the one-shot `ECONNRESET`)
   on a process's or a host-pair's conns.
-  DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.Reset(a,b)` (host-pair) and
-  `ResetProcess(p)` (process), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
-  host/process attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
+  DoF: a real RST (peer crash, middlebox). **Landed** via `simulation.ResetLink(a,b)` (host-pair) and
+  `ResetProcess(host, proc)` (process on `host`), over a per-run conn registry (`net/dst_reset.go`) keyed by the conn's
+  host/invocation-slot attribution (`dstConn.localHost`/`remoteHost`/`localProc`/`remoteProc`) — so a reset touches
   exactly the victim's conns (DST-FAULT-VICTIM, now with its process leg). An injected reset hits **both
   ends**, and each end receives it as a real kernel delivers an RST (both ends are SURVIVORS — these
   faults reset connections, not processes): bytes already **delivered** to that end's receive queue
@@ -733,7 +731,7 @@ disk feature built and froze monotonicity on precisely so crash could tear along
   partial-fill, and replay are enforced by `TestDSTDiskENOSPC*` and `TestDSTFallocateHoleChargeAndDurability`
   (`os/dst_disk_fault_test.go`, `os/dst_sparse_linux_test.go`), mutation-tested.
 - **Latency** — **landed**. Delay each disk-touching FS op by a virtual duration (a slow disk), set
-  mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `SlowDisk(host, 0)`). The calling goroutine
+  mid-run by `simulation.SlowDisk(host, perOp)` (and removed by `UnslowDisk(host)` or `SlowDisk(host, 0)`). The calling goroutine
   sleeps the per-host per-op latency (`dstFSDisk.latency`) on the bubble clock *before* the op — every op
   that reads/writes content, traverses directories, or allocates a node (read/write/sync, open, named
   stat and `Chdir` — their path walks touch the disk — mkdir, remove, rename, readdir, truncate, chmod, chtimes);
@@ -911,14 +909,14 @@ Over the per-host clock seam (the distributed model's "Per-host clock"):
   old-list reset, and new-epoch registration are serialized, so multi-P white-box activation cannot
   publish a timer between the new epoch and a later destructive head reset
   (`TestDSTFakeTimerRollPreservesNewEpochRegistration`). **Host
-  re-declaration re-establishes the clock completely**: declaring `Host(name, config)` for an
+  re-declaration re-establishes the clock completely**: declaring `Host(name, f)` or `HostWith(name, config, f)` for an
   already-declared name applies the declared clock in full:
   re-map the host's armed timers from the surviving rate to the declared one, overwrite the offset
   to the declared value (a restarted clock is the declared clock, not a continuation — prior steps
   and accumulated drift are discarded, so no fold is needed), re-anchor, and set the declared rate
-  (zero `HostConfig` = rate 1, in sync with base, as the `HostConfig` doc promises). An
-  implicit-host `Process` restart does **not** re-establish its host's clock: a process restart
-  leaves the machine up — its clock, including applied steps, survives (only `Host` models the
+  (zero `HostConfig` / plain `Host` = rate 1, in sync with base, as the `HostConfig` doc promises). A
+  `Process` restart does **not** re-establish its host's clock: a process restart
+  leaves the machine up — its clock, including applied steps, survives (only `Host`/`HostWith` models the
   reboot). Cross-run freshness needs no re-establishment at all: the per-host clock table is
   per-run state, reset at run entry (`dstSetSimEnv`), so a host id reused by a later run starts
   in sync by construction (`TestDSTClockTableFreshPerRun`).
@@ -972,7 +970,7 @@ process** — so a process dying and the host losing power tear the disk differe
 
 | Fault | Kills | Host FS | Conns | Models |
 |---|---|---|---|---|
-| **Process crash** (`Crash("p")`) | that process's goroutines + memory + fds | **intact** — kernel survives, so un-fsync'd writes persist for host-siblings and the restart | its conns RST at the peer (the live kernel answers) — unless a cut swallows the RST | a process dying / `kill -9` / OOM |
+| **Process crash** (`CrashProcess("h", "p")`) | that `(host, process)`'s goroutines + memory + fds | **intact** — kernel survives, so un-fsync'd writes persist for host-siblings and the restart | its conns RST at the peer (the live kernel answers) — unless a cut swallows the RST | a process dying / `kill -9` / OOM |
 | **Host crash** (`CrashHost("h")`, power loss) | **all** processes on the host | **tears to the fsync'd durable image** (the disk "Crash" above) | all their conns go SILENT at the peer (no kernel exists to emit a packet) | power loss / kernel panic |
 
 Both, at the victim's next cooperative point: the targeted goroutines (process membership or current /
@@ -1011,12 +1009,12 @@ machine, a dial to it **blackholes** — a powered-off kernel answers no SYN, so
 out (deadline or retransmit horizon), never `ECONNREFUSED` (design.md, Connect cost; *enforced:*
 `TestDSTCrashHostDialBlackholes`).
 
-Process resource teardown is the shared substrate for process crash, OOM, restart, AND normal exit. On
-normal exit, the invocation's goroutines are removed from the scheduler/deadlock-visible set first; if it
-is the last live invocation, process-owned simulated files and virtual fds close,
-fd-owned `flock`s release, process-owned mappings unregister (their `MAP_SHARED` bytes already are the
-host page-cache pages; teardown performs no copy-back), and the process's
-connections go down. Only then is its pid marked dead for `Kill(pid, 0)` and procfs. Teardown follows the
+Process resource teardown is the shared substrate for process crash, mapping faults, OOM, restart, AND normal exit. On
+normal exit, the invocation's goroutines are removed from the scheduler/deadlock-visible set first; then
+that invocation slot's (`g.dstProcSlot`) simulated files and virtual fds close immediately,
+fd-owned `flock`s release, invocation-owned mappings unregister (their `MAP_SHARED` bytes already are the
+host page-cache pages; teardown performs no copy-back), its environment view is dropped, and its
+connections and listeners go down — even if an overlapping same-name invocation is concurrently live on the same host. Only then is its pid marked dead for `Kill(pid, 0)` and procfs. Teardown follows the
 kernel's order: the goroutines (threads) die first, then resources close, then PID death is published. A
 `Process` body's normal return (or panic unwind) IS the process's exit and routes
 through this same teardown — the one difference is the connection shape: exit CLOSES the victim's conn
@@ -1037,30 +1035,28 @@ close(2), whoever calls it. The in-flight-counts-as-queued collapse is pinned by
 `TestDSTNetCloseBeforeDeliveryStillResets`. One recorded collapse of the conditional: bytes still in flight count as queued —
 the sim RSTs immediately, which is one of the two orderings a real close-vs-arrival race produces (the
 kernel FINs first and RSTs when the data lands; a peer racing its read can observe either); the
-FIN-then-RST arm is not generated. Goroutine teardown is per-invocation (pid-keyed);
-resource teardown is per logical process (proc-keyed), so with concurrent same-name invocations it runs
-when the LAST live invocation dies. The logical process id remains stable for targeting
-and resource registries, while the pid is the invocation generation; a same-name restart gets a fresh pid and
-does not revive the crashed goroutines. Finalizers and cleanups registered by an invocation carry its
-run epoch and PID through GC discovery and queueing; once PID death is published, queued or later-discovered callbacks
-are discarded rather than executed by the root drain. A live sibling with the same logical process id
-retains its own callbacks.
+FIN-then-RST arm is not generated. Both goroutine teardown (slot- and `(host, pid)`-keyed) and OS/network
+resource teardown (per-invocation `slot`-keyed) are strictly per-invocation, while the logical `(host, name)` process id (`g.dstProc`) remains stable across restarts for fault targeting (`CrashProcess`, `ResetProcess`) and cumulative allocation accounting; a same-name restart gets a fresh pid and fresh resource slot and
+does not revive the crashed goroutines. Finalizers and cleanups registered by a `Process` invocation carry its
+`(run epoch, invocation slot, host, boot, PID)` through GC discovery and queueing; once that invocation's slot is unregistered at exit or crash, queued or later-discovered callbacks
+are discarded rather than executed by the root drain, even if the numeric PID is reused on a reboot/wrap or live on another host. Likewise, callbacks registered directly inside a `Host` scope (outside any `Process`) carry `(run epoch, host, boot)`, execute under that host's simulated identity, and are discarded if that host crashes or reboots. A live sibling with the same logical process id
+retains its own slot, resources, and callbacks.
 
-When a `Process` exits normally (body return or panic unwind) while child goroutines of that `pid` are
+When a `Process` exits normally (body return or panic unwind) while child goroutines of that invocation are
 still live, the runtime records up to 16 killed goroutines per exit event in canonical ascending `dstSeq`
 order (`gopc`, `startpc`, wait state, plus total count) into an off-heap (`sysAlloc`), runtime-lock-guarded
 per-run diagnostic ledger (`0` Go heap allocations and `0` Level-2 DPOR / race-detector synchronization
-edges inside the bubble). Intentional fault teardowns (`Crash`, `CrashHost`, `Ctl.End`) suppress exit-kill
+edges inside the bubble). Intentional fault teardowns (`CrashProcess`, `CrashHost`, `Ctl.End`) suppress exit-kill
 recording so expected power-offs never pollute failure reports. When a `Test`, `TestWith`, `WorldTest`, or
 `ExploreTest` schedule fails — including unrecovered SUT panics and `synctest` bubble-deadlock stalls —
 the harness symbolizes and logs the recorded process-exit kill events alongside any captured bubble
 `stdout`/`stderr` (`TestDiagnostics*`); passing runs emit nothing.
 
-Two consequences of pid-keyed goroutine death, both contractual. **A goroutine cannot outlive its
-process.** One that escaped the pid-keyed mark because it was inside a NESTED `Process` body when its
-enclosing invocation died (it carried the inner pid) is permanently parked the moment it leaves that
+Two consequences of invocation-keyed goroutine death, both contractual. **A goroutine cannot outlive its
+process.** One that escaped the mark because it was inside a NESTED `Process` body when its
+enclosing invocation died (it carried the inner slot/pid) is permanently parked the moment it leaves that
 body — a thread of a dead process never resumes. **A crashed goroutine never unwinds:** its deferred
-functions do not run, exactly as a killed process's threads abandon their stacks. So a `Crash` whose
+functions do not run, exactly as a killed process's threads abandon their stacks. So a `CrashProcess` whose
 caller belongs to the victim (a **self-crash** — the shape an allocation-triggered OOM takes, the victim
 dying where its own workload takes it) never returns, and the code after it is unreachable.
 Although the parked stack allocation and execution state remain intact, a crashed goroutine's stack is
@@ -1085,7 +1081,7 @@ Process-crash refusal likewise preflights every live invocation before clearing 
 or resource; recovering the refusal observes the entire logical process unchanged.
 
 **A host is not a process.** `CrashHost` kills the union of two goroutine sets: every goroutine of a
-process declared on the host (pid-keyed — which also catches a goroutine of that process momentarily
+process declared on the host (slot-keyed — which also catches a goroutine of that process momentarily
 stamped with another host, inside a nested `Host` body: it is still a thread of a process on the dying
 machine), and every goroutine whose current or inherited entered-`Host` ancestry contains the host
 (host-keyed — which catches the ROOT process's goroutines running or descended from the machine's
@@ -1093,11 +1089,10 @@ machine), and every goroutine whose current or inherited entered-`Host` ancestry
 host, so no pid names "the threads on this machine"). Host ancestry is an immutable chain inherited at
 goroutine creation, so a child retains its machine membership after its parent leaves the `Host` body.
 The root process's pid therefore stays live while the
-declared processes' pids die. Correspondingly, **one logical process lives on one machine at a time**:
-a same-name invocation live on a second host is refused, because a host crash would otherwise scope its
-victims by whichever home was recorded last and silently spare a pid on the machine that lost power.
-Different-host validation and live registration are one admission transaction, so concurrent starts
-cannot both publish.
+declared processes' pids die. Because logical process names are scoped per `(host, name)` and live
+invocations carry unique slots, multiple machines may concurrently run processes with the same logical
+name (e.g., `"server"` on `"h1"` and `"h2"`), and `CrashHost("h1")` or `CrashProcess("h1", "server")`
+tears down only `"h1"`'s invocations without touching `"h2"`'s.
 
 What a reboot regenerates is what a booting *kernel* regenerates: the machine's next `Host`
 declaration after `CrashHost` bumps its boot count, serves a fresh
@@ -1105,8 +1100,8 @@ declaration after `CrashHost` bumps its boot count, serves a fresh
 `CLOCK_BOOTTIME` restart at 0 — a pre-crash stamp reads as the new boot's future, the real
 power-cycle relation; design.md, per-boot host identity). A `Host` re-declaration of a machine that
 is UP re-establishes only its clock — no boot, no new boot_id: its processes survive. The
-powered-off state that gates this is owned by `testing/simulation` (not `net`), so the boot
-semantics and the powered-off `Process` refusal below hold in binaries that never link `net`.
+powered-off state that gates this is owned by `testing/simulation` (not `net`), so the boot-edge
+semantics hold even in binaries that never link `net`.
 
 What a reboot keeps is what the *hardware* keeps. The durable image is the disk; the **disk faults** — a
 bad sector (`FailDisk`/`FailFile`), a full disk (`LimitDisk`), a slow device (`SlowDisk`) — are physical
@@ -1132,14 +1127,16 @@ the whole sim.
 
 **Restart** re-runs the victim's entry on a fresh goroutine subtree, over the live (process restart) or
 torn (host reboot) FS and a clean network — the canonical recovery fault, driven by a SUT supervisor or a
-fault policy (`Crash("p", RestartAfter: 3*s)`). A restarted process gets a **freshly allocated pid**
+fault policy (`CrashProcess("h", "p", RestartAfter: 3*s)`). A restarted process gets a **freshly allocated pid**
 (a real restart always does; there is **no stable-pid option** — the stable identity is the logical
-name `"p"`, the footgun-free contract). Under `Options.PidMax` the allocation wraps and skips live
-pids like the kernel's `alloc_pid`, so a numeral can recur only through genuine pid REUSE — the
+`(host, name)` pair, the footgun-free contract). Under `Options.PidMax` the allocation wraps and skips live
+pids per `(host, boot)` like the kernel's `alloc_pid`, so a numeral can recur on a machine only through genuine pid REUSE — the
 kernel hazard start-time discrimination exists for, now constructible — never through a stability
-guarantee; `ppid` is `1`/reparented unless a supervision tree is modeled. A `Process`
-restart on a machine `CrashHost` powered off is **refused loudly** — a process cannot run on a dead
-kernel; model the reboot with a `Host` re-declaration first, then restart the processes inside it.
+guarantee; `ppid` is `1`/reparented unless a supervision tree is modeled. After `CrashHost` powers
+off a machine, re-entering `Host`/`HostWith` for that machine reboots its kernel (new `boot_id`, fresh
+uptime origin, durable disk image restored), and `Process` declarations inside that `Host` body start
+fresh processes on the new boot (while a bare `Process` outside any `Host` body always runs on the
+unnamed root host, never implicitly rebooting or attaching to a named host).
 
 **Soundness boundary (recorded, contractual).** A crash is sound exactly when processes interact *only
 through the simulated network and host filesystem* — the distributed model the whole feature targets. Modeled
@@ -1247,25 +1244,25 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   seed → identical jittered delivery, varying with the seed), mutation-tested. The **clock step** takes an
   explicit delta rather than a fault draw, so its replay rides the deterministic schedule directly (no RNG):
   `TestDSTClockStepDeterminism` (same seed + same `StepClock` sequence → identical readings). **Clock drift**
-  likewise takes an explicit declared rate (the seeded leg is deferred), so the same seed + same `Drift`
+  likewise takes an explicit declared or seed-drawn rate (`Drift` / `BoundedDrift`), so the same seed + same
   config replays identically: `TestDSTClockDriftDeterminism`. **Disk EIO** is likewise an explicit toggle
   (`FailDisk`/`FailFile`, no fault draw), so the same seed + same fault schedule yields an identical
   outcome sequence: `TestDSTDiskEIODeterminism`; **disk ENOSPC** (`LimitDisk`/`UnlimitDisk`) likewise:
-  `TestDSTDiskENOSPCDeterminism`; **disk latency** (`SlowDisk`, an explicit per-op duration) replays the
+  `TestDSTDiskENOSPCDeterminism`; **disk latency** (`SlowDisk`/`UnslowDisk`, an explicit per-op duration) replays the
   same virtual delays: `TestDSTDiskLatencyDeterminism`. (Extends to each further fault class's draws as it
   lands.)
 - **DST-FAULT-VICTIM (entailed: attribution integrity).** Every faultable resource is attributed to its
-  owning layer — a goroutine/conn/fd to a **process**, a file/tree/port to a **host** — and a fault on
-  host hX (or pair {hX,hY}) / process pX affects exactly that victim's resources, no leak onto a
+  owning layer — a goroutine/conn/fd to a **process invocation**, a file/tree/port to a **host** — and a fault on
+  host hX (or pair {hX,hY}) / process `(hX, pX)` affects exactly that victim's resources, no leak onto a
   non-victim. *violation:* a `Partition(h1,h2)` resets a conn between h1 and h3 because attribution
   confused ownership → a failure on h3 the real partition never caused, while the partition itself is
-  correct. *Enforced (network axis landed; per later axis as it lands):* `dstHost`/`dstProc` on `g`
+  correct. *Enforced (network axis landed; per later axis as it lands):* `dstHost`/`dstProc`/`dstProcSlot` on `g`
   inherited at `newproc1`; a cross-host conn records its host pair (`dstConn.localHost`/`remoteHost`, the
   always-wire end's `localHost`/`peerHost`), which keys the partition table; `TestDSTNetPartitionVictim`
   (`net`) asserts `Partition(A,B)` cuts the A-B conn while an A-C conn is untouched, mutation-tested (a
   check that blocks all pairs once any partition exists fails it). The **process leg** is landed with reset
   (`dstConn.localProc`/`remoteProc`; `TestDSTNetResetVictim` asserts an A-B reset spares an A-C conn,
-  `TestDSTNetResetProcess` that `ResetProcess(p)` resets exactly p's conns — both ends). The **clock leg**
+  `TestDSTNetResetProcess` that `ResetProcess(host, p)` resets exactly `(host, p)`'s conns — both ends). The **clock leg**
   is landed with the step and drift: `StepClock(host)` shifts exactly the named host's per-host offset entry,
   and `Drift(host rate)` sets exactly that host's rate (both keyed by host id), so a fault on hA leaves hB and
   the root untouched — `TestDSTClockStepVictim` and `TestDSTClockDriftVictim` (a rate-2 host A wakes at base
@@ -1276,9 +1273,9 @@ it is built (Issue-triage chunk-start gate). For the `kind=entailed` invariants 
   mutation-tested (a check ignoring the host id, or the node, fails it). The **ENOSPC** capacity is keyed
   the same way, so `LimitDisk(hA, …)` caps exactly hA's disk while hB writes the same data unimpeded
   (`TestDSTDiskENOSPCVictim`), and `SlowDisk(hA, …)` delays exactly hA's ops while hB's identical read is
-  instant (`TestDSTDiskLatencyVictim`). The **process-crash leg** keys goroutine death by the victim's
-  per-invocation pids and resource death by its logical process id, so `Crash("p")` takes exactly p's
-  goroutines, fds, flocks, mappings, conns, and listeners — a host-sibling's lock on the same file node
+  instant (`TestDSTDiskLatencyVictim`). The **process-crash leg** keys goroutine death and resource death by the victim's
+  per-invocation slots and `(host, pid)`, so `CrashProcess(h, p)` takes exactly `(h, p)`'s live
+  goroutines, fds, flocks, mappings, env, conns, and listeners — a host-sibling's lock on the same file node
   and the host filesystem itself are untouched (`TestDSTCrashProcessReleasesFileResources`,
   `TestDSTCrashProcessResetsConnections`, `TestDSTCrashAndRestartOverLiveHostFS`). The **host-crash leg**
   keys goroutine death by process membership or current/inherited entered-`Host` membership, and
@@ -1302,17 +1299,17 @@ adversarial loop.
 
 - **L0 — landed substrate.** Scheduler determinism + per-g RNG + universe fake clock + GC + the
   single-host I/O features (net, disk, pipes). Done.
-- **L1 — Host/Process identity.** `g.dstHost` + `g.dstProc` (inherited at `newproc1`), the
-  `simulation.Host`/`Process` API and `HostConfig`, the string↔id interning. The shared contract every
+- **L1 — Host/Process identity.** `g.dstHost` + `g.dstProc` + `g.dstProcSlot` (inherited at `newproc1`), the
+  `simulation.Host`/`HostWith`/`Process`/`ProcessWith` API and `HostConfig`/`ProcessConfig`, the string↔id interning. The shared contract every
   later layer keys on; the N=1 collapse leaves L0 behavior unchanged.
-- **L2 — re-key the substrate per layer.** Per-**host** FS tree (+ per-process cwd/fds, the `HostFS`
+- **L2 — re-key the substrate per layer.** Per-**host** FS tree (+ per-invocation cwd/fds, the `HostFS`
   inspector), per-**host** net address space (loopback / port-space / IP / full mesh + base-latency
-  matrix), per-**host** clock offset, per-**host** hostname / `NumCPU` / interfaces, per-**process** pid /
-  uid / cwd, per-**process** allocation accounting. Establishes DST-NODE-ISOLATION and DST-CLOCK-DET. No
+  matrix), per-**host** clock offset, per-**host** hostname / `NumCPU` / interfaces, per-**invocation** pid /
+  uid / cwd / env, per-**process** allocation accounting. Establishes DST-NODE-ISOLATION and DST-CLOCK-DET. No
   faults yet — the substrate is now correctly *distributed*.
 - **L3 — faults over the complete substrate.** Network (partition / latency / reset / throttle) — **done**;
   clock **step** — **done**, **drift** (constant `Drift` + mid-run `DriftClock` + seed-drawn `BoundedDrift`)
-  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**; **process crash** (`Crash`, incl. the
+  — **done**; disk **EIO** / **ENOSPC** / **latency** — **done**; **process crash** (`CrashProcess`, incl. the
   self-crash form) + **restart** over the live host filesystem — **done**; **host crash** (`CrashHost`,
   power loss) + **reboot** onto the restored durable image — **done**;
   scheduling (straggler), OOM (allocation-triggered process crash) — pending.

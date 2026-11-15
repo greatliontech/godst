@@ -57,7 +57,7 @@ func futexWord(t *testing.T, path string) (*uint32, []byte) {
 // (node, offset) queue identity is what makes the two mappings one futex.
 func TestDSTFutexWaitWakeCrossProcess(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			done := make(chan error, 1)
 			go simulation.Process("waiter", func() {
 				w, _ := futexWord(t, "/w")
@@ -162,7 +162,7 @@ func TestDSTFutexSemantics(t *testing.T) {
 // counts it nor spends a wake slot on it (no stolen wakes).
 func TestDSTFutexCrashDropsWaiters(t *testing.T) {
 	simulation.Run(3, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			go simulation.Process("doomed", func() {
 				w, _ := futexWord(t, "/c")
 				rawFutex(t, w, futexWait, 0, nil) // parks forever; crash reaps it
@@ -171,7 +171,7 @@ func TestDSTFutexCrashDropsWaiters(t *testing.T) {
 			simulation.Process("survivor", func() {
 				w, _ := futexWord(t, "/c")
 				time.Sleep(10 * time.Millisecond) // let the doomed waiter park
-				simulation.Crash("doomed")
+				simulation.CrashProcess("h", "doomed")
 				if n, e := rawFutex(t, w, futexWake, 1, nil); e != 0 || n != 0 {
 					t.Errorf("WAKE after crash = (%d, %v), want (0, nil): the dead waiter must not absorb the wake", n, e)
 				}
@@ -305,7 +305,7 @@ func TestDSTFutexWakeZeroWakesOne(t *testing.T) {
 // queue behind a dead one (a WAKE(1) starving it would be the lost wake).
 func TestDSTFutexHostCrashDropsWaiters(t *testing.T) {
 	simulation.Run(8, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("setup", func() {
 				f, err := os.OpenFile("/n", os.O_RDWR|os.O_CREATE, 0o600)
 				if err != nil {
@@ -337,7 +337,7 @@ func TestDSTFutexHostCrashDropsWaiters(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			done := make(chan struct{})
 			go simulation.Process("fresh", func() {
 				w, _ := futexWord(t, "/n")

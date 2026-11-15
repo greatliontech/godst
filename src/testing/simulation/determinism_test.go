@@ -94,7 +94,7 @@ func dstIdentityProgram(seed uint64) string {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				Host(fmt.Sprintf("h%d", i), HostConfig{}, func() {
+				Host(fmt.Sprintf("h%d", i), func() {
 					Process(fmt.Sprintf("p%d", i), func() {
 						hn, _ := os.Hostname()
 						emit(fmt.Sprintf("h%d=%s/pid%d", i, hn, os.Getpid()))

@@ -81,13 +81,14 @@ func TestDSTPreRunProcessExitCannotTearIntoActiveRun(t *testing.T) {
 		close(foreignDone)
 	}()
 	<-foreignStarted
-	foreignPIDs := activeProcPIDs(lookupProc("db"))
-	if len(foreignPIDs) != 1 {
-		t.Fatalf("pre-run Process pids = %v, want one", foreignPIDs)
+	activeProcs.mu.Lock()
+	preRunProcs := len(activeProcs.byProc)
+	activeProcs.mu.Unlock()
+	if preRunProcs != 0 {
+		t.Fatalf("pre-run Process registered %d active entries outside a run, want 0", preRunProcs)
 	}
-	foreignPID := foreignPIDs[0]
 
-	var killErr, staleKillErr, procfsErr, writeErr, dialErr error
+	var killErr, procfsErr, writeErr, dialErr error
 	var registrationOK bool
 	RunWith(1, Options{PID: 1_000_000}, func() {
 		type state struct {
@@ -98,36 +99,39 @@ func TestDSTPreRunProcessExitCannotTearIntoActiveRun(t *testing.T) {
 		ready := make(chan state, 1)
 		finish := make(chan struct{})
 		currentDone := make(chan struct{})
-		go func() {
-			Process("db", func() {
-				f, _ := os.Create("/current-db")
-				ln, _ := net.Listen("tcp", ":0")
-				_, port, _ := net.SplitHostPort(ln.Addr().String())
-				ready <- state{pid: os.Getpid(), file: f, port: port}
-				<-finish
-			})
-			close(currentDone)
-		}()
+		Host("db", func() {
+			go func() {
+				Process("db", func() {
+					f, _ := os.Create("/current-db")
+					ln, _ := net.Listen("tcp", ":0")
+					_, port, _ := net.SplitHostPort(ln.Addr().String())
+					ready <- state{pid: os.Getpid(), file: f, port: port}
+					<-finish
+				})
+				close(currentDone)
+			}()
+		})
 		current := <-ready
-		staleKillErr = syscall.Kill(int(foreignPID), 0)
 		close(releaseForeign)
 		<-foreignDone
 
-		killErr = syscall.Kill(current.pid, 0)
-		_, procfsErr = os.ReadFile("/proc/" + strconv.Itoa(current.pid) + "/stat")
-		pids := activeProcPIDs(lookupProc("db"))
-		registrationOK = len(pids) == 1 && pids[0] == int32(current.pid)
-		_, writeErr = current.file.Write([]byte("alive"))
-		if c, err := net.Dial("tcp", net.JoinHostPort(HostIP("db"), current.port)); err == nil {
-			c.Close()
-		} else {
-			dialErr = err
-		}
+		Host("db", func() {
+			killErr = syscall.Kill(current.pid, 0)
+			_, procfsErr = os.ReadFile("/proc/" + strconv.Itoa(current.pid) + "/stat")
+			insts := activeProcInstances(lookupProc(lookupHost("db"), "db"))
+			registrationOK = len(insts) == 1 && insts[0].pid == int32(current.pid)
+			_, writeErr = current.file.Write([]byte("alive"))
+			if c, err := net.Dial("tcp", net.JoinHostPort(HostIP("db"), current.port)); err == nil {
+				c.Close()
+			} else {
+				dialErr = err
+			}
+		})
 		close(finish)
 		<-currentDone
 	})
-	if killErr != nil || staleKillErr != syscall.ESRCH || procfsErr != nil || !registrationOK || writeErr != nil || dialErr != nil {
-		t.Fatalf("pre-run Process exit tore into active run: kill=%v staleKill=%v procfs=%v registered=%v write=%v dial=%v", killErr, staleKillErr, procfsErr, registrationOK, writeErr, dialErr)
+	if killErr != nil || procfsErr != nil || !registrationOK || writeErr != nil || dialErr != nil {
+		t.Fatalf("pre-run Process exit tore into active run: kill=%v procfs=%v registered=%v write=%v dial=%v", killErr, procfsErr, registrationOK, writeErr, dialErr)
 	}
 	select {
 	case <-foreignDone:

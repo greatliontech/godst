@@ -12,17 +12,41 @@ import (
 	"unsafe"
 )
 
-//go:linkname dstEnvProcessTeardown
-func dstEnvProcessTeardown(proc uint32) {
+//go:linkname dstEnvSlotTeardown
+func dstEnvSlotTeardown(slot uint32) {
+	if slot == 0 {
+		return
+	}
 	ep := dstEnvRunEpoch()
 	dstEnvMu.Lock()
 	defer dstEnvMu.Unlock()
-	if dstEnvByProc == nil || ep != dstEnvEpoch {
-		dstEnvByProc = make(map[uint32]*dstProcEnv)
+	if dstEnvBySlot == nil || ep != dstEnvEpoch {
+		dstEnvBySlot = make(map[[2]uint32]*dstProcEnv)
 		dstEnvEpoch = ep
 		return
 	}
-	delete(dstEnvByProc, proc)
+	for key := range dstEnvBySlot {
+		if key[1] == slot {
+			delete(dstEnvBySlot, key)
+		}
+	}
+}
+
+//go:linkname dstEnvHostTeardown
+func dstEnvHostTeardown(host uint32) {
+	ep := dstEnvRunEpoch()
+	dstEnvMu.Lock()
+	defer dstEnvMu.Unlock()
+	if dstEnvBySlot == nil || ep != dstEnvEpoch {
+		dstEnvBySlot = make(map[[2]uint32]*dstProcEnv)
+		dstEnvEpoch = ep
+		return
+	}
+	for key := range dstEnvBySlot {
+		if key[0] == host {
+			delete(dstEnvBySlot, key)
+		}
+	}
 }
 
 // dstEnvEnabled is the compile-time gate for the per-process copy-on-write
@@ -36,8 +60,8 @@ func dstEnvDispatchLock()
 //go:linkname dstEnvDispatchUnlock runtime.dstEnvDispatchUnlock
 func dstEnvDispatchUnlock()
 
-//go:linkname dstSimEnvProc runtime.dstSimEnvProc
-func dstSimEnvProc() (proc uint32, ok bool)
+//go:linkname dstSimEnvKey runtime.dstSimEnvKey
+func dstSimEnvKey() (host, slot uint32, ok bool)
 
 //go:linkname dstEnvRunEpoch runtime.dstNetEpoch
 func dstEnvRunEpoch() uint64
@@ -54,26 +78,16 @@ func dstCoarseDep(id uintptr, write bool)
 //go:linkname dstInSimBubble runtime.dstInSimBubble
 func dstInSimBubble() bool
 
-// Per-process copy-on-write environment (design.md "Environment surface").
-// Under a run each simulated process operates on its own copy of the host
-// environment: a Setenv in one process is never visible to another process or
-// the host, and reads of unmodified variables return the host value (machine
-// state, like the inherited stdio handles). The copies are keyed by process id
-// (g.dstProc), reset per run (the run epoch advances), and gated on the sim-env
-// flag — process-global while set, like identity — so a non-bubble goroutine
-// reading env mid-run sees the root process (proc 0). Isolation is the
-// environment leg of DST-NODE-ISOLATION.
-//
-// A copy holds the same (envs, env) representation as the host globals, and the
-// methods below are the env_unix.go algorithms applied to it, so semantics —
-// Environ order, duplicate handling, EINVAL rules — are identical to the real
-// environment, per process. The one difference from the host path is deliberate:
-// no runtimeSetenv/Unsetenv/Clearenv, so the host process environment is never
-// mutated (that is the isolation).
+// Per-(host, process-invocation) copy-on-write environment (design.md
+// "Environment surface"). Under a run each simulated machine's root context
+// (slot 0) and each Process invocation (slot >= 1) operates on its own copy of
+// the host environment: a Setenv in one process or host is never visible to
+// another process, another host, or the real host process, and non-bubble
+// goroutines retain direct access to the real host environment.
 var (
 	dstEnvMu     isync.KernelMutex
 	dstEnvEpoch  uint64
-	dstEnvByProc map[uint32]*dstProcEnv
+	dstEnvBySlot map[[2]uint32]*dstProcEnv
 )
 
 type dstProcEnv struct {
@@ -81,30 +95,23 @@ type dstProcEnv struct {
 	env  map[string]int // key -> first index in envs
 }
 
-// dstEnvCurrent returns the calling process's environment copy while a run's env
-// is active, else nil. It resets every copy when the run epoch advances, so a new
-// run re-initializes each process's view from the host. Must not be called while
+// dstEnvCurrent returns the calling bubble goroutine's environment copy while
+// a run's bubble environment is active, else nil. Must not be called while
 // holding dstEnvMu.
 func dstEnvCurrent() *dstProcEnv {
-	proc, ok := dstSimEnvProc()
+	host, slot, ok := dstSimEnvKey()
 	if !ok {
 		return nil
 	}
-	// The epoch source (dstNetEpoch, gated on dstActive) and the env gate
-	// (dstSimEnvSet) disagree in the brief set/clear windows around a run, where
-	// dstSimEnvSet is already true but dstActive is not yet, so ep reads 0. That
-	// is deliberately benign: the reset below is conservative (0 mismatches any
-	// real epoch), and every in-run read — the only reads determinism depends on
-	// — sees the true epoch N>0 and resets exactly once. No bubble read occurs in
-	// those windows (the bubble spans only the active run).
 	ep := dstEnvRunEpoch()
+	key := [2]uint32{host, slot}
 
 	dstEnvMu.Lock()
-	if dstEnvByProc == nil || ep != dstEnvEpoch {
-		dstEnvByProc = make(map[uint32]*dstProcEnv)
+	if dstEnvBySlot == nil || ep != dstEnvEpoch {
+		dstEnvBySlot = make(map[[2]uint32]*dstProcEnv)
 		dstEnvEpoch = ep
 	}
-	if pe := dstEnvByProc[proc]; pe != nil {
+	if pe := dstEnvBySlot[key]; pe != nil {
 		dstEnvMu.Unlock()
 		return pe
 	}
@@ -115,14 +122,10 @@ func dstEnvCurrent() *dstProcEnv {
 
 	dstEnvMu.Lock()
 	defer dstEnvMu.Unlock()
-	// The epoch is stable within a run (it advances only at run activation, on
-	// the root goroutine, and runs do not overlap), so dstEnvByProc was not reset
-	// between the two locks; only a concurrent goroutine of this same process
-	// could have installed the copy first.
-	if existing := dstEnvByProc[proc]; existing != nil {
+	if existing := dstEnvBySlot[key]; existing != nil {
 		return existing
 	}
-	dstEnvByProc[proc] = pe
+	dstEnvBySlot[key] = pe
 	return pe
 }
 

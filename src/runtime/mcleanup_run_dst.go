@@ -17,8 +17,7 @@ var dstCleanupsDiscarded atomic.Uint64
 //
 // Called by the sweeper, and only the sweeper.
 func (q *cleanupQueue) enqueue(c cleanupFn) {
-	e, sq, pid := dstTakeStagedSpecialStamps()
-	dstSt := dstCallbackStamp{seq: sq, epoch: e, pid: pid}
+	dstSt := dstTakeStagedSpecialStamps()
 	mp := acquirem()
 	pp := mp.p.ptr()
 	if dstActive() && dstSt.epoch != dstRunEpoch.Load() {
@@ -138,7 +137,8 @@ func runCleanupBlock(b *cleanupBlock, onDrain bool) {
 			raceacquire(unsafe.Pointer(c.arg))
 		}
 
-		invoked := dstCallbackOwnerAlive(slab[i].epoch, slab[i].pid)
+		st := slab[i]
+		ownerHost, invoked := dstCallbackOwnerHost(st)
 		if onDrain {
 			if invoked {
 				gcCleanups.executed.Add(1)
@@ -151,12 +151,19 @@ func runCleanupBlock(b *cleanupBlock, onDrain bool) {
 		}
 		if invoked {
 			gp := getg()
-			oldPid := gp.dstPid
-			if onDrain && slab[i].pid > 0 {
-				gp.dstPid = slab[i].pid
+			oldHost, oldProc, oldSlot, oldPid := gp.dstHost, gp.dstProc, gp.dstProcSlot, gp.dstPid
+			if onDrain && (st.pid > 0 || ownerHost != 0) {
+				gp.dstHost = ownerHost
+				gp.dstProc = st.proc
+				gp.dstProcSlot = st.slot
+				if st.pid > 0 {
+					gp.dstPid = st.pid
+				} else {
+					gp.dstPid = int32(dstSimPID)
+				}
 			}
 			c.call(c.fn, c.arg)
-			gp.dstPid = oldPid
+			gp.dstHost, gp.dstProc, gp.dstProcSlot, gp.dstPid = oldHost, oldProc, oldSlot, oldPid
 			executed++
 		}
 

@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"sort"
@@ -94,7 +95,7 @@ func dstSeedEnv() uint64 {
 // G*K on EVERY interleaving; returns true (bug) only on a lost update. dstSyncAcquire
 // makes the lock-acquisition order a transition so Explore visits both orders (else
 // the space would be a single schedule and the test vacuous).
-func yieldLockedSUT() bool {
+func yieldLockedSUT() error {
 	const G, K = 2, 2
 	var mu sync.Mutex
 	count := 0
@@ -114,7 +115,10 @@ func yieldLockedSUT() bool {
 		}()
 	}
 	wg.Wait()
-	return count != G*K
+	if count != G*K {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 // DSTYieldSound EXPLORES yieldLockedSUT (scheduled strategy) and prints "yieldsound
@@ -141,7 +145,7 @@ func DSTYieldSound() {
 // other's two critical sections — needs a switch in the gap, which coarse DST
 // never yields at (random/PCT find it in 0/200 seeds). Under Explore that
 // interleaving is in the tree, so it is found deterministically for any seed.
-func atomicityViolSUT() bool {
+func atomicityViolSUT() error {
 	var mu sync.Mutex
 	balance := 100
 	var wg sync.WaitGroup
@@ -160,7 +164,10 @@ func atomicityViolSUT() bool {
 	go withdraw()
 	go withdraw()
 	wg.Wait()
-	return balance != -100
+	if balance != -100 {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 // mutexCountSUT is the soundness SUT: G goroutines each do K mutex-protected
@@ -169,7 +176,7 @@ func atomicityViolSUT() bool {
 // EVERY interleaving reaches exactly G*K; returns true (bug) only if mutual
 // exclusion was violated. Explore must report ZERO failures over the whole
 // interleaving space (DST-L2-1 at exploration scope).
-func mutexCountSUT() bool {
+func mutexCountSUT() error {
 	const G, K = 2, 2
 	var mu sync.Mutex
 	count := 0
@@ -188,7 +195,10 @@ func mutexCountSUT() bool {
 		}()
 	}
 	wg.Wait()
-	return count != G*K
+	if count != G*K {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 // twoPairSUT runs two independent producer/consumer pairs concurrently. Within
@@ -200,7 +210,7 @@ func mutexCountSUT() bool {
 // a minimal number of schedules; the address-only relation treats each pair's
 // ordered write/read as a dependency and over-explores it. Returns true (bug) only
 // if a consumer fails to see its producer's value — which never happens.
-func twoPairSUT() bool {
+func twoPairSUT() error {
 	var x1, x2 int
 	ch1 := make(chan int)
 	ch2 := make(chan int)
@@ -211,14 +221,17 @@ func twoPairSUT() bool {
 	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x2), true); x2 = 1; ch2 <- 1 }()
 	go func() { defer wg.Done(); <-ch2; dstAccessYield(unsafe.Pointer(&x2), false); _ = x2 }()
 	wg.Wait()
-	return x1 != 1 || x2 != 1
+	if x1 != 1 || x2 != 1 {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 // DSTExplore runs simulation.Explore on a named SUT (DSTEXPLORE) under a mode
 // (DSTMODE=dpor|exhaustive) and prints "schedules=<n> failures=<m>
 // exhausted=<bool> overflow=<bool>" plus the first failing schedule.
 func DSTExplore() {
-	var sut func() bool
+	var sut func() error
 	switch os.Getenv("DSTEXPLORE") {
 	case "atomicity":
 		sut = atomicityViolSUT
@@ -256,14 +269,14 @@ func DSTExplore() {
 // assertion (it returns false), so the ONLY failure signal is the race: it proves
 // Explore surfaces data races, not just assertion failures. The access-yields make
 // the two writes interleavable DPOR transitions.
-func raceOracleSUT() bool {
+func raceOracleSUT() error {
 	var x int
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x), true); x = 1 }()
 	go func() { defer wg.Done(); dstAccessYield(unsafe.Pointer(&x), true); x = 2 }()
 	wg.Wait()
-	return false
+	return nil
 }
 
 // raceCondSUT has an INTERLEAVING-CONDITIONAL data race: the race manifests only on
@@ -276,7 +289,7 @@ func raceOracleSUT() bool {
 // acquisition orders (dstSyncAcquire on the mutex — the sync-decision machinery),
 // reaches the reader-first schedule and the -race oracle reports it. No
 // SUT assertion: the race is the finding.
-func raceCondSUT() bool {
+func raceCondSUT() error {
 	var x, done int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -301,13 +314,13 @@ func raceCondSUT() bool {
 		}
 	}()
 	wg.Wait()
-	return false
+	return nil
 }
 
 // raceMultiSUT has two independent unsynchronized write-write races. They manifest
 // in the same explored schedule, so Explore must append one Race failure for each
 // new RaceErrors increment, not collapse the whole schedule to one race failure.
-func raceMultiSUT() bool {
+func raceMultiSUT() error {
 	var x, y int
 	var wg sync.WaitGroup
 	wg.Add(4)
@@ -317,7 +330,7 @@ func raceMultiSUT() bool {
 	go func() { defer wg.Done(); y = 2 }()
 	wg.Wait()
 	_, _ = x, y
-	return false
+	return nil
 }
 
 // DSTExploreRaceOracle runs a race SUT (DSTRACE=uncond|cond, default uncond) under
@@ -449,7 +462,7 @@ var raceReplayReachedZ bool
 // HB-after initialization and stay inline in one scheduling interval until the
 // explorer promotes b=1 to a forced yield boundary, allowing G2 to observe
 // a==1 && b==0 and write z=1 concurrently with G1's read of z.
-func raceReplayPromotedSUT() bool {
+func raceReplayPromotedSUT() error {
 	raceReplayReachedZ = false
 	a, b, z := 0, 0, 0
 	var wg sync.WaitGroup
@@ -469,7 +482,7 @@ func raceReplayPromotedSUT() bool {
 		}
 	}()
 	wg.Wait()
-	return false
+	return nil
 }
 
 // DSTExploreRaceReplay prints a race failure's full replay token, or replays a token
@@ -483,8 +496,8 @@ func DSTExploreRaceReplay() {
 			Schedule:     decodeSchedule(os.Getenv("DSTSCHEDULE")),
 			AccessForces: decodeAccessForces(os.Getenv("DSTFORCES")),
 		}
-		_, raced := simulation.Replay(seed, failure, raceReplayPromotedSUT)
-		os.Stdout.WriteString("racereplay raced=" + strconv.FormatBool(raced) +
+		rep := simulation.Replay(seed, failure, raceReplayPromotedSUT)
+		os.Stdout.WriteString("racereplay raced=" + strconv.FormatBool(rep.Raced) +
 			" reachedz=" + strconv.FormatBool(raceReplayReachedZ) + "\n")
 		return
 	}
@@ -507,7 +520,7 @@ var budgetPromotionRuns int
 // must stop after the first actual SUT run even if that run discovers a promotion.
 func DSTExploreBudgetPromotion() {
 	budgetPromotionRuns = 0
-	res := simulation.ExploreWith(dstSeedEnv(), simulation.ExploreOptions{Mode: simulation.DPOR, MaxSchedules: 1}, func() bool {
+	res := simulation.ExploreWith(dstSeedEnv(), simulation.ExploreOptions{Mode: simulation.DPOR, MaxSchedules: 1}, func() error {
 		budgetPromotionRuns++
 		return unmodifiedRWRSUT()
 	})
@@ -530,7 +543,7 @@ func DSTExploreBudgetPromotion() {
 // the lost update.
 var autoOutcomes = map[int]bool{}
 
-func unmodifiedRMWSUT() bool {
+func unmodifiedRMWSUT() error {
 	c := 0
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -543,12 +556,15 @@ func unmodifiedRMWSUT() bool {
 	}
 	wg.Wait()
 	autoOutcomes[c] = true
-	return c != 2
+	if c != 2 {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 var autoNoiseOutcomes = map[int]bool{}
 
-func unmodifiedPrivateNoiseRMWSUT() bool {
+func unmodifiedPrivateNoiseRMWSUT() error {
 	c := 0
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -570,12 +586,15 @@ func unmodifiedPrivateNoiseRMWSUT() bool {
 	}
 	wg.Wait()
 	autoNoiseOutcomes[c] = true
-	return c != 2
+	if c != 2 {
+		return errors.New("sut failed")
+	}
+	return nil
 }
 
 var autoRWROutcomes = map[string]bool{}
 
-func unmodifiedRWRSUT() bool {
+func unmodifiedRWRSUT() error {
 	x := 0
 	read := [2]int{-1, -1}
 	var wg sync.WaitGroup
@@ -594,7 +613,7 @@ func unmodifiedRWRSUT() bool {
 	}()
 	wg.Wait()
 	autoRWROutcomes[strconv.Itoa(read[0])+","+strconv.Itoa(read[1])] = true
-	return false
+	return nil
 }
 
 type autoRangePair struct {
@@ -604,7 +623,7 @@ type autoRangePair struct {
 
 var autoRangeFieldOutcomes = map[string]bool{}
 
-func unmodifiedRangeFieldSUT() bool {
+func unmodifiedRangeFieldSUT() error {
 	var p autoRangePair
 	read := -1
 	var wg sync.WaitGroup
@@ -619,7 +638,7 @@ func unmodifiedRangeFieldSUT() bool {
 	}()
 	wg.Wait()
 	autoRangeFieldOutcomes[strconv.Itoa(read)] = true
-	return false
+	return nil
 }
 
 var filteredManualRWROutcomes = map[string]bool{}
@@ -648,7 +667,7 @@ func filteredManualRWRRead1() {
 	filteredManualRWRRead[1] = filteredManualRWRX
 }
 
-func filteredManualRWRSUT() bool {
+func filteredManualRWRSUT() error {
 	filteredManualRWRX = 0
 	filteredManualRWRRead = [2]int{-1, -1}
 	filteredManualRWRWG.Add(3)
@@ -657,13 +676,13 @@ func filteredManualRWRSUT() bool {
 	go filteredManualRWRRead1()
 	filteredManualRWRWG.Wait()
 	filteredManualRWROutcomes[strconv.Itoa(filteredManualRWRRead[0])+","+strconv.Itoa(filteredManualRWRRead[1])] = true
-	return false
+	return nil
 }
 
 var autoCreateOutcomes = map[int]bool{}
 var autoWakeOutcomes = map[int]bool{}
 
-func unmodifiedCreateThenWriteSUT() bool {
+func unmodifiedCreateThenWriteSUT() error {
 	x := 0
 	read := -1
 	var wg sync.WaitGroup
@@ -675,10 +694,10 @@ func unmodifiedCreateThenWriteSUT() bool {
 	x = 1
 	wg.Wait()
 	autoCreateOutcomes[read] = true
-	return false
+	return nil
 }
 
-func unmodifiedWakeThenWriteSUT() bool {
+func unmodifiedWakeThenWriteSUT() error {
 	x := 0
 	read := -1
 	ch := make(chan struct{})
@@ -693,7 +712,7 @@ func unmodifiedWakeThenWriteSUT() bool {
 	x = 1
 	wg.Wait()
 	autoWakeOutcomes[read] = true
-	return false
+	return nil
 }
 
 // DSTExploreAuto runs unmodifiedRMWSUT under BOTH Exhaustive and DPOR and prints
@@ -716,7 +735,7 @@ func unmodifiedWakeThenWriteSUT() bool {
 // Meaningful only in a -tags dst -race build (else no auto-instrumentation).
 func DSTExploreAuto() {
 	seed := dstSeedEnv()
-	runCompare := func(outcomes map[int]bool, sut func() bool) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
+	runCompare := func(outcomes map[int]bool, sut func() error) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
 		for k := range outcomes {
 			delete(outcomes, k)
 		}
@@ -735,7 +754,7 @@ func DSTExploreAuto() {
 		}
 		return exh, dpor, exhSet, dporSet
 	}
-	runStringCompare := func(outcomes map[string]bool, sut func() bool) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
+	runStringCompare := func(outcomes map[string]bool, sut func() error) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
 		for k := range outcomes {
 			delete(outcomes, k)
 		}
@@ -833,7 +852,7 @@ var dstOutcomes = map[int]bool{}
 // lands on several distinct values depending on the interleaving (lost updates).
 // It records the final value into dstOutcomes. Exhaustive enumerates every
 // reachable final value; a COMPLETE DPOR must reach the identical set (DST-L2-3).
-func multiOutcomeSUT() bool {
+func multiOutcomeSUT() error {
 	const G = 2
 	counter := 0
 	var wg sync.WaitGroup
@@ -849,7 +868,7 @@ func multiOutcomeSUT() bool {
 	}
 	wg.Wait()
 	dstOutcomes[counter] = true
-	return false
+	return nil
 }
 
 // --- Runtime sync-decision auto-hook acceptance (deferral 1) -------------------
@@ -886,7 +905,7 @@ var syncAutoSeen map[string]bool
 // shared write per goroutine so brute-force Exhaustive stays tractable under the
 // dense -race memory auto-instrumentation (shared-address filtering is a later
 // increment). Records into syncAutoSeen; always returns false.
-func autoMutexOrderSUT() bool {
+func autoMutexOrderSUT() error {
 	var mu sync.Mutex
 	last := 0
 	var wg sync.WaitGroup
@@ -902,7 +921,7 @@ func autoMutexOrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(last)] = true
-	return false
+	return nil
 }
 
 // autoChanOrderSUT is an UNMODIFIED channel SUT (no manual hooks): two senders send
@@ -914,7 +933,7 @@ func autoMutexOrderSUT() bool {
 // exactly as for mutex acquisition. The receiver writes two scalars (no append /
 // growslice) so Exhaustive stays tractable under -race memory auto-instrumentation.
 // Records into syncAutoSeen; always returns false.
-func autoChanOrderSUT() bool {
+func autoChanOrderSUT() error {
 	ch := make(chan int)
 	var first, second int
 	var wg sync.WaitGroup
@@ -933,13 +952,13 @@ func autoChanOrderSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(first)+","+strconv.Itoa(second)] = true
-	return false
+	return nil
 }
 
 // autoRWMutexRLockOrderSUT distinguishes whether a reader admits before or after a
 // writer. The writer's Lock is already covered by the embedded writer mutex hook; the
 // reader side must announce the same identity before readerCount admission.
-func autoRWMutexRLockOrderSUT() bool {
+func autoRWMutexRLockOrderSUT() error {
 	var rw sync.RWMutex
 	x := 0
 	read := -1
@@ -959,13 +978,13 @@ func autoRWMutexRLockOrderSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(read)] = true
-	return false
+	return nil
 }
 
 // autoTryRLockFailedDecisionSUT distinguishes a TryRLock attempt that races before a
 // writer Lock from one that reaches the already-write-locked rejection path. That
 // failed decision must still announce the RWMutex identity so DPOR can reverse it.
-func autoTryRLockFailedDecisionSUT() bool {
+func autoTryRLockFailedDecisionSUT() error {
 	var rw sync.RWMutex
 	attempted := make(chan struct{}, 1)
 	success := false
@@ -987,13 +1006,13 @@ func autoTryRLockFailedDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.FormatBool(success)] = true
-	return false
+	return nil
 }
 
 // autoTryRLockReleaseDecisionSUT distinguishes a TryRLock attempt before a writer
 // releases from one after it releases. The writer Unlock must record the same RWMutex
 // identity as the read attempt.
-func autoTryRLockReleaseDecisionSUT() bool {
+func autoTryRLockReleaseDecisionSUT() error {
 	var rw sync.RWMutex
 	rw.Lock()
 	success := false
@@ -1012,13 +1031,13 @@ func autoTryRLockReleaseDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.FormatBool(success)] = true
-	return false
+	return nil
 }
 
 // autoRWMutexTryLockReleaseDecisionSUT distinguishes a writer TryLock attempt before
 // the last reader releases from one after it releases. RUnlock must therefore record
 // the writer-mutex identity too.
-func autoRWMutexTryLockReleaseDecisionSUT() bool {
+func autoRWMutexTryLockReleaseDecisionSUT() error {
 	var rw sync.RWMutex
 	rw.RLock()
 	success := false
@@ -1037,7 +1056,7 @@ func autoRWMutexTryLockReleaseDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.FormatBool(success)] = true
-	return false
+	return nil
 }
 
 // autoTryLockOrderSUT distinguishes which goroutine wins a non-blocking TryLock on
@@ -1045,7 +1064,7 @@ func autoRWMutexTryLockReleaseDecisionSUT() bool {
 // conflict for DPOR to reverse) and yields while holding the lock so the other
 // goroutine can observe failure. A successful TryLock is an acquisition just like
 // Lock; the hook must fire before the CAS that chooses the winner.
-func autoTryLockOrderSUT() bool {
+func autoTryLockOrderSUT() error {
 	var mu sync.Mutex
 	got := [2]bool{}
 	var wg sync.WaitGroup
@@ -1069,13 +1088,13 @@ func autoTryLockOrderSUT() bool {
 		winner = 2
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoTryLockFailedDecisionSUT distinguishes a TryLock attempt that races before a
 // Lock from one that reaches the already-locked rejection path. A hook only on the
 // successful CAS misses the failed-attempt outcome class.
-func autoTryLockFailedDecisionSUT() bool {
+func autoTryLockFailedDecisionSUT() error {
 	var mu sync.Mutex
 	attempted := make(chan struct{}, 1)
 	success := false
@@ -1097,12 +1116,12 @@ func autoTryLockFailedDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.FormatBool(success)] = true
-	return false
+	return nil
 }
 
 // autoTryLockReleaseDecisionSUT distinguishes a TryLock attempt before a mutex
 // releases from one after it releases. Unlock must share the TryLock identity.
-func autoTryLockReleaseDecisionSUT() bool {
+func autoTryLockReleaseDecisionSUT() error {
 	var mu sync.Mutex
 	mu.Lock()
 	success := false
@@ -1121,13 +1140,13 @@ func autoTryLockReleaseDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.FormatBool(success)] = true
-	return false
+	return nil
 }
 
 // autoSelectSendOrderSUT uses a two-case non-blocking select so the compiler routes
 // through selectgo, not the one-case selectnbsend helper. Both cases use the shared
 // channel, so the SUT can only pass if selectgo announces that selected identity.
-func autoSelectSendOrderSUT() bool {
+func autoSelectSendOrderSUT() error {
 	ch := make(chan int, 1)
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -1149,11 +1168,11 @@ func autoSelectSendOrderSUT() bool {
 	default:
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoSelectBlockSendOrderSUT is the blocking selectgo send twin.
-func autoSelectBlockSendOrderSUT() bool {
+func autoSelectBlockSendOrderSUT() error {
 	ch := make(chan int)
 	first, second := 0, 0
 	var wg sync.WaitGroup
@@ -1175,13 +1194,13 @@ func autoSelectBlockSendOrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(first)+","+strconv.Itoa(second)] = true
-	return false
+	return nil
 }
 
 // autoSelectNBSendOrderSUT exercises the compiler's one-case select+default rewrite
 // through selectnbsend/chansend(block=false). It is the helper-path twin of the
 // selectgo SUT above.
-func autoSelectNBSendOrderSUT() bool {
+func autoSelectNBSendOrderSUT() error {
 	ch := make(chan int, 1)
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -1202,13 +1221,13 @@ func autoSelectNBSendOrderSUT() bool {
 	default:
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoSelectRecvOrderSUT is the receive twin: one buffered value, two goroutines
 // using a two-case non-blocking select on the same shared channel, and the receiving
 // goroutine's id records the decision outcome.
-func autoSelectRecvOrderSUT() bool {
+func autoSelectRecvOrderSUT() error {
 	ch := make(chan int, 1)
 	ch <- 1
 	got := [2]int{}
@@ -1233,12 +1252,12 @@ func autoSelectRecvOrderSUT() bool {
 		winner = 2
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoSelectBlockRecvOrderSUT is the blocking selectgo receive twin. The first value
 // sent on ch identifies which receiver was queued first by its blocking select.
-func autoSelectBlockRecvOrderSUT() bool {
+func autoSelectBlockRecvOrderSUT() error {
 	ch := make(chan int)
 	got := [2]int{}
 	var wg sync.WaitGroup
@@ -1266,12 +1285,12 @@ func autoSelectBlockRecvOrderSUT() bool {
 		winner = 2
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoSelectNBRecvOrderSUT exercises the compiler's one-case select+default rewrite
 // through selectnbrecv/chanrecv(block=false).
-func autoSelectNBRecvOrderSUT() bool {
+func autoSelectNBRecvOrderSUT() error {
 	ch := make(chan int, 1)
 	ch <- 1
 	got := [2]int{}
@@ -1295,12 +1314,12 @@ func autoSelectNBRecvOrderSUT() bool {
 		winner = 2
 	}
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoChanCloseRecvDecisionSUT distinguishes a non-blocking receive before close
 // from one after close. closechan must announce the same channel identity as recv.
-func autoChanCloseRecvDecisionSUT() bool {
+func autoChanCloseRecvDecisionSUT() error {
 	ch := make(chan int)
 	outcome := "default"
 	var wg sync.WaitGroup
@@ -1323,12 +1342,12 @@ func autoChanCloseRecvDecisionSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[outcome] = true
-	return false
+	return nil
 }
 
 // autoOnceOrderSUT pins sync.Once's successful first execution path across two
 // contenders joined via WaitGroup.
-func autoOnceOrderSUT() bool {
+func autoOnceOrderSUT() error {
 	var once sync.Once
 	winner := 0
 	var wg sync.WaitGroup
@@ -1342,13 +1361,13 @@ func autoOnceOrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // autoOnceFastPathSUT pins sync.Once's pre-done.Load decision hook and fast-path
 // happens-before publication when contenders join via independent channels (so
 // WaitGroup cannot mask missing Once hooks) and read state initialized inside Do.
-func autoOnceFastPathSUT() bool {
+func autoOnceFastPathSUT() error {
 	var once sync.Once
 	winner := 0
 	initialized := 0
@@ -1377,7 +1396,7 @@ func autoOnceFastPathSUT() bool {
 	<-done1
 	<-done2
 	syncAutoSeen[strconv.Itoa(winner)] = true
-	return false
+	return nil
 }
 
 // DSTExploreSyncAuto is the acceptance for runtime sync-decision auto-hooks
@@ -1403,7 +1422,7 @@ func autoOnceFastPathSUT() bool {
 // hand-annotated family.) Meaningful only in a -tags dst -race build.
 func DSTExploreSyncAuto() {
 	seed := dstSeedEnv()
-	check := func(name string, sut func() bool) {
+	check := func(name string, sut func() error) {
 		syncAutoSeen = map[string]bool{}
 		dpor := simulation.Explore(seed, simulation.DPOR, sut)
 		os.Stdout.WriteString(name + "Dpor=" + strconv.Itoa(dpor.Schedules) +
@@ -1649,8 +1668,8 @@ var sweepSeen map[string]bool
 // of dependent accesses differs, so distinct outcomes is a lower bound on the
 // number of Mazurkiewicz classes. Always returns false (the sweep checks
 // completeness via the outcome set, not a bug assertion).
-func makeSweepSUT(p spProg) func() bool {
-	return func() bool {
+func makeSweepSUT(p spProg) func() error {
+	return func() error {
 		vars := make([]int, p.nVars)
 		avars := make([]int32, p.nAVars)
 		mus := make([]sync.Mutex, p.nMu)
@@ -1720,7 +1739,7 @@ func makeSweepSUT(p spProg) func() bool {
 			obs = append(obs, int(v))
 		}
 		sweepSeen[encodeObs(obs, logs)] = true
-		return false
+		return nil
 	}
 }
 
@@ -1773,7 +1792,7 @@ func encodeInts(xs []int) string {
 // announces the channel identity (dstSyncAcquire) before its send so the order is a
 // DPOR transition; without the announce DPOR drops one order (DST-L2-3), exactly as
 // for mutex acquisition — channels are the second sync primitive the fix covers.
-func chanChoiceSUT() bool {
+func chanChoiceSUT() error {
 	ch := make(chan int)
 	var got []int
 	var wg sync.WaitGroup
@@ -1794,7 +1813,7 @@ func chanChoiceSUT() bool {
 	}()
 	wg.Wait()
 	sweepSeen[encodeInts(got)] = true
-	return false
+	return nil
 }
 
 var timerHBSeen map[string]bool
@@ -1804,7 +1823,7 @@ var timerHBSeen map[string]bool
 // the post-sleep read and write are co-enabled. DPOR must therefore reach both read
 // outcomes; treating timer-fire wakeups as ordering the two goroutines would silently
 // drop one class (DST-L2-3).
-func timerHBSUT() bool {
+func timerHBSUT() error {
 	x := 0
 	read := -1
 	var wg sync.WaitGroup
@@ -1829,7 +1848,7 @@ func timerHBSUT() bool {
 	if sweepSeen != nil {
 		sweepSeen[outcome] = true
 	}
-	return false
+	return nil
 }
 
 func timerHBCompare(seed uint64) (exh, dpor simulation.ExploreResult, exhSet, dporSet map[string]bool) {
@@ -1863,7 +1882,7 @@ func DSTExploreTimerHB() {
 // generated interpreter family (which models only reads/writes/mutexes).
 type namedSweepSUT struct {
 	name string
-	sut  func() bool
+	sut  func() error
 }
 
 func namedSweepSUTs() []namedSweepSUT {
@@ -1886,7 +1905,7 @@ type sweepStats struct {
 // A mismatch is a DST-L2-3 violation: DPOR's observable-outcome set differs from
 // Exhaustive's, either mode failed to cleanly exhaust, or DPOR explored MORE
 // schedules than Exhaustive.
-func sweepCheck(st *sweepStats, seed uint64, label string, sut func() bool) {
+func sweepCheck(st *sweepStats, seed uint64, label string, sut func() error) {
 	oldPostGo := dstSetPostGoYield(false)
 	defer dstSetPostGoYield(oldPostGo)
 	st.checks++
@@ -2005,7 +2024,7 @@ func DSTExploreOutcomes() {
 // Meaningful only in a -tags dst -race build.
 func DSTExploreAtomicAuto() {
 	seed := dstSeedEnv()
-	check := func(name string, sut func() bool) {
+	check := func(name string, sut func() error) {
 		syncAutoSeen = map[string]bool{}
 		dpor := simulation.Explore(seed, simulation.DPOR, sut)
 		os.Stdout.WriteString(name + "Dpor=" + strconv.Itoa(dpor.Schedules) +
@@ -2026,7 +2045,7 @@ func DSTExploreAtomicAuto() {
 
 // autoAtomicCASWinnerSUT: both goroutines CAS the same zeroed int32 to their
 // id; exactly one wins, and which is the decision (outcomes "1"/"2").
-func autoAtomicCASWinnerSUT() bool {
+func autoAtomicCASWinnerSUT() error {
 	var x int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2039,11 +2058,11 @@ func autoAtomicCASWinnerSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
-	return false
+	return nil
 }
 
 // autoAtomicStoreOrderSUT: last store wins (outcomes "1"/"2").
-func autoAtomicStoreOrderSUT() bool {
+func autoAtomicStoreOrderSUT() error {
 	var x int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2056,11 +2075,11 @@ func autoAtomicStoreOrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
-	return false
+	return nil
 }
 
 // autoAtomicAddLoadSUT: a load racing an add observes 0 or 1.
-func autoAtomicAddLoadSUT() bool {
+func autoAtomicAddLoadSUT() error {
 	var x, seen int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2074,11 +2093,11 @@ func autoAtomicAddLoadSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&seen)))] = true
-	return false
+	return nil
 }
 
 // autoAtomicSwapOrderSUT: last swap wins (outcomes "1"/"2").
-func autoAtomicSwapOrderSUT() bool {
+func autoAtomicSwapOrderSUT() error {
 	var x int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2091,12 +2110,12 @@ func autoAtomicSwapOrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
-	return false
+	return nil
 }
 
 // autoAtomicOrAndSUT: Or(1) vs And(0) — final value is 0 if the Or commits
 // first, 1 if the And does (outcomes "0"/"1"); covers the And/Or hook names.
-func autoAtomicOrAndSUT() bool {
+func autoAtomicOrAndSUT() error {
 	var x int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2110,12 +2129,12 @@ func autoAtomicOrAndSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(atomic.LoadInt32(&x)))] = true
-	return false
+	return nil
 }
 
 // autoAtomicStore64OrderSUT: the 64-bit widths route through the same
 // emission (outcomes "1"/"2").
-func autoAtomicStore64OrderSUT() bool {
+func autoAtomicStore64OrderSUT() error {
 	var x int64
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2128,11 +2147,11 @@ func autoAtomicStore64OrderSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.FormatInt(atomic.LoadInt64(&x), 10)] = true
-	return false
+	return nil
 }
 
 // autoAtomicCASPointerSUT: pointer-width CAS winner (outcomes "1"/"2").
-func autoAtomicCASPointerSUT() bool {
+func autoAtomicCASPointerSUT() error {
 	var p unsafe.Pointer
 	var a, b int32 = 1, 2
 	var wg sync.WaitGroup
@@ -2146,14 +2165,14 @@ func autoAtomicCASPointerSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(*(*int32)(atomic.LoadPointer(&p))))] = true
-	return false
+	return nil
 }
 
 // autoAtomicTypedCASSUT: the typed API (atomic.Int32 methods) — out-of-line
 // under -race (noRaceFunc methods are not inlinable), so the emission must
 // come from classifying the method symbol at the user call site (outcomes
 // "1"/"2").
-func autoAtomicTypedCASSUT() bool {
+func autoAtomicTypedCASSUT() error {
 	var x atomic.Int32
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2166,13 +2185,13 @@ func autoAtomicTypedCASSUT() bool {
 	}
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(int(x.Load()))] = true
-	return false
+	return nil
 }
 
 // autoChanLenObserveSUT: len(ch) observed concurrently with a send sees 0 or
 // 1 — the chanlen runtime hook (dstSyncObserve) makes the observation a
 // decision DPOR reverses against the send.
-func autoChanLenObserveSUT() bool {
+func autoChanLenObserveSUT() error {
 	ch := make(chan int, 1)
 	var n int
 	var wg sync.WaitGroup
@@ -2187,5 +2206,5 @@ func autoChanLenObserveSUT() bool {
 	}()
 	wg.Wait()
 	syncAutoSeen[strconv.Itoa(n)] = true
-	return false
+	return nil
 }

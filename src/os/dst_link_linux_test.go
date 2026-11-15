@@ -144,7 +144,7 @@ func TestDSTFSHardLinks(t *testing.T) {
 // restored link count equals the surviving durable dirents.
 func TestDSTFSHardLinkCrashDurability(t *testing.T) {
 	simulation.Run(2, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("setup", func() {
 				if err := os.WriteFile("/f", []byte("v"), 0o600); err != nil {
 					t.Fatal(err)
@@ -170,7 +170,7 @@ func TestDSTFSHardLinkCrashDurability(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("after", func() {
 				fi1, err := os.Stat("/f")
 				if err != nil {

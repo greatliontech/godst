@@ -7,6 +7,7 @@
 package simulation
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -90,7 +91,7 @@ func TestDSTWorldBootsFaultsAndEnds(t *testing.T) {
 		{Name: "a", Boot: worldEchoBoot(&serverBoots)},
 		{Name: "b", Boot: func() {}},
 	}, func(ctl *Ctl) {
-		Host("b", HostConfig{}, func() {
+		Host("b", func() {
 			Process("cli", func() {
 				c, err := worldDial(HostIP("a") + ":9000")
 				if err != nil {
@@ -110,7 +111,7 @@ func TestDSTWorldBootsFaultsAndEnds(t *testing.T) {
 					panic("read across the cut succeeded")
 				}
 				log = append(log, "cut-held")
-				Heal("a", "b")
+				HealLink("a", "b")
 				c.SetReadDeadline(time.Time{})
 				c.Write([]byte("y"))
 				if _, err := c.Read(buf); err != nil {
@@ -144,7 +145,7 @@ func TestDSTWorldRestartHostRebootsAgainstDurableImage(t *testing.T) {
 		{Name: "b", Boot: func() {}},
 	}, func(ctl *Ctl) {
 		var c net.Conn
-		Host("b", HostConfig{}, func() {
+		Host("b", func() {
 			Process("cli", func() {
 				var err error
 				c, err = worldDial(HostIP("a") + ":9000")
@@ -161,7 +162,7 @@ func TestDSTWorldRestartHostRebootsAgainstDurableImage(t *testing.T) {
 
 		ctl.RestartHost("a")
 
-		Host("b", HostConfig{}, func() {
+		Host("b", func() {
 			Process("cli2", func() {
 				// The old incarnation's conn: the rebooted kernel knows
 				// nothing of it — traffic meets its RST.
@@ -182,7 +183,7 @@ func TestDSTWorldRestartHostRebootsAgainstDurableImage(t *testing.T) {
 				rebootEcho = string(buf)
 			})
 		})
-		Host("a", HostConfig{}, func() {
+		Host("a", func() {
 			Process("checker", func() {
 				b, err := os.ReadFile("/boots")
 				if err != nil {
@@ -216,7 +217,7 @@ func TestDSTWorldDeterministic(t *testing.T) {
 			{Name: "a", Boot: worldEchoBoot(&boots)},
 			{Name: "b", Boot: func() {}},
 		}, func(ctl *Ctl) {
-			Host("b", HostConfig{}, func() {
+			Host("b", func() {
 				Process("cli", func() {
 					c, err := worldDial(HostIP("a") + ":9000")
 					if err != nil {
@@ -252,11 +253,11 @@ func TestDSTWorldDeterministic(t *testing.T) {
 // regressions.
 func TestDSTExploreTestBridge(t *testing.T) {
 	boots := 0
-	ExploreTest(t, 3, ExploreOptions{Mode: DPOR, MaxSchedules: 16}, func() bool {
+	ExploreTest(t, 3, ExploreOptions{Mode: DPOR, MaxSchedules: 16}, func() error {
 		ctl := StartWorld([]HostDecl{{Name: "a", Boot: worldEchoBoot(&boots)}})
 		defer ctl.End()
 		var ok bool
-		Host("a", HostConfig{}, func() {
+		Host("a", func() {
 			Process("cli", func() {
 				c, err := worldDial("127.0.0.1:9000")
 				if err != nil {
@@ -269,7 +270,10 @@ func TestDSTExploreTestBridge(t *testing.T) {
 				ok = err == nil && buf[0] == 'q'
 			})
 		})
-		return !ok // a failure iff the echo broke
+		if !ok {
+			return errors.New("echo broke")
+		}
+		return nil
 	})
 	if boots == 0 {
 		t.Error("the explored SUT never booted its world")
@@ -337,7 +341,7 @@ func TestDSTExploreReportFormat(t *testing.T) {
 	failures, notes := formatExploreReport(42, ExploreResult{
 		Schedules: 7,
 		Failures: []Failure{
-			{Schedule: []uint64{1, 0, 2}, Race: true, ForeignSched: true, CrashTear: true,
+			{Schedule: []uint64{1, 0, 2}, Race: true, ForeignSched: true, Options: Options{CrashTear: true},
 				AccessForces: []AccessForce{{Seq: 3, Count: 9, PCKey: 0x40}}},
 			{Schedule: []uint64{0}, Panic: "boom"},
 			{Deadlock: "all goroutines blocked"},

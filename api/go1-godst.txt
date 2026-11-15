@@ -13,35 +13,35 @@ pkg testing/simulation, const Random Strategy
 pkg testing/simulation, func BoundedDrift(int64) ClockConfig
 pkg testing/simulation, func BoundedSkew(time.Duration) ClockConfig
 pkg testing/simulation, func CorruptFile(string, string)
-pkg testing/simulation, func Crash(string)
 pkg testing/simulation, func CrashHost(string)
+pkg testing/simulation, func CrashProcess(string, string)
 pkg testing/simulation, func Drift(int64) ClockConfig
 pkg testing/simulation, func DriftClock(string, int64)
-pkg testing/simulation, func Explore(uint64, ExploreMode, func() bool) ExploreResult
-pkg testing/simulation, func ExploreTest(*testing.T, uint64, ExploreOptions, func() bool)
-pkg testing/simulation, func ExploreWith(uint64, ExploreOptions, func() bool) ExploreResult
+pkg testing/simulation, func Explore(uint64, ExploreMode, func() error) ExploreResult
+pkg testing/simulation, func ExploreTest(*testing.T, uint64, ExploreOptions, func() error)
+pkg testing/simulation, func ExploreWith(uint64, ExploreOptions, func() error) ExploreResult
 pkg testing/simulation, func FailDisk(string)
 pkg testing/simulation, func FailFile(string, string)
 pkg testing/simulation, func FailWriteback(string)
-pkg testing/simulation, func Heal(string, string)
 pkg testing/simulation, func HealDisk(string)
 pkg testing/simulation, func HealFile(string, string)
-pkg testing/simulation, func HealHost(string)
+pkg testing/simulation, func HealLink(string, string)
 pkg testing/simulation, func HealWriteback(string)
-pkg testing/simulation, func Host(string, HostConfig, func())
+pkg testing/simulation, func Host(string, func())
+pkg testing/simulation, func HostFS(string) fs.FS
 pkg testing/simulation, func HostIP(string) string
-pkg testing/simulation (dst), func HostFS(string) fs.FS
+pkg testing/simulation, func HostWith(string, HostConfig, func())
 pkg testing/simulation, func InheritFile(*os.File) (*os.File, error)
-pkg testing/simulation, func Isolate(string)
+pkg testing/simulation, func IsolateHost(string)
 pkg testing/simulation, func LimitDisk(string, int64)
 pkg testing/simulation, func Partition(string, string)
 pkg testing/simulation, func PartitionOneWay(string, string)
 pkg testing/simulation, func PartitionRefuse(string, string)
 pkg testing/simulation, func Process(string, func())
 pkg testing/simulation, func ProcessWith(string, ProcessConfig, func())
-pkg testing/simulation, func Replay(uint64, Failure, func() bool) (bool, bool)
-pkg testing/simulation, func Reset(string, string)
-pkg testing/simulation, func ResetProcess(string)
+pkg testing/simulation, func Replay(uint64, Failure, func() error) ReplayResult
+pkg testing/simulation, func ResetLink(string, string)
+pkg testing/simulation, func ResetProcess(string, string)
 pkg testing/simulation, func Run(uint64, func())
 pkg testing/simulation, func RunWith(uint64, Options, func())
 pkg testing/simulation, func Skew(time.Duration) ClockConfig
@@ -50,13 +50,16 @@ pkg testing/simulation, func StartWorld([]HostDecl) *Ctl
 pkg testing/simulation, func StepClock(string, time.Duration)
 pkg testing/simulation, func Test(*testing.T, uint64, func(*testing.T))
 pkg testing/simulation, func TestWith(*testing.T, uint64, Options, func(*testing.T))
+pkg testing/simulation, func UnisolateHost(string)
 pkg testing/simulation, func UnlimitDisk(string)
+pkg testing/simulation, func UnslowDisk(string)
 pkg testing/simulation, func World(uint64, Options, []HostDecl, func(*Ctl))
 pkg testing/simulation, func WorldTest(*testing.T, uint64, Options, []HostDecl, func(*testing.T, *Ctl))
 pkg testing/simulation, method (*Ctl) End()
 pkg testing/simulation, method (*Ctl) RestartHost(string)
 pkg testing/simulation, method (ClockConfig) WithBoundedDrift(int64) ClockConfig
 pkg testing/simulation, method (ClockConfig) WithDrift(int64) ClockConfig
+pkg testing/simulation, method (ReplayResult) Failed() bool
 pkg testing/simulation, type AccessForce struct
 pkg testing/simulation, type AccessForce struct, Count uint64
 pkg testing/simulation, type AccessForce struct, PCKey uintptr
@@ -70,12 +73,12 @@ pkg testing/simulation, type ExploreFootprint struct, PeakEdges int
 pkg testing/simulation, type ExploreFootprint struct, PeakEnabledTotal int
 pkg testing/simulation, type ExploreMode int
 pkg testing/simulation, type ExploreOptions struct
-pkg testing/simulation, type ExploreOptions struct, CrashTear bool
 pkg testing/simulation, type ExploreOptions struct, MaxAccesses int
 pkg testing/simulation, type ExploreOptions struct, MaxEdges int
 pkg testing/simulation, type ExploreOptions struct, MaxSchedules int
 pkg testing/simulation, type ExploreOptions struct, MaxSteps int
 pkg testing/simulation, type ExploreOptions struct, Mode ExploreMode
+pkg testing/simulation, type ExploreOptions struct, embedded Options
 pkg testing/simulation, type ExploreResult struct
 pkg testing/simulation, type ExploreResult struct, BudgetHit bool
 pkg testing/simulation, type ExploreResult struct, Exhausted bool
@@ -88,12 +91,13 @@ pkg testing/simulation, type ExploreResult struct, UnattributedRaces int
 pkg testing/simulation, type ExploreResult struct, Uninstrumented bool
 pkg testing/simulation, type Failure struct
 pkg testing/simulation, type Failure struct, AccessForces []AccessForce
-pkg testing/simulation, type Failure struct, CrashTear bool
 pkg testing/simulation, type Failure struct, Deadlock string
+pkg testing/simulation, type Failure struct, Err string
 pkg testing/simulation, type Failure struct, ForeignSched bool
 pkg testing/simulation, type Failure struct, MaxAccesses int
 pkg testing/simulation, type Failure struct, MaxEdges int
 pkg testing/simulation, type Failure struct, MaxSteps int
+pkg testing/simulation, type Failure struct, Options Options
 pkg testing/simulation, type Failure struct, Panic string
 pkg testing/simulation, type Failure struct, Race bool
 pkg testing/simulation, type Failure struct, Schedule []uint64
@@ -126,4 +130,7 @@ pkg testing/simulation, type Options struct, WedgeDecisionLimit int64
 pkg testing/simulation, type Options struct, WedgeWallLimit time.Duration
 pkg testing/simulation, type ProcessConfig struct
 pkg testing/simulation, type ProcessConfig struct, PIDNamespace string
+pkg testing/simulation, type ReplayResult struct
+pkg testing/simulation, type ReplayResult struct, Err error
+pkg testing/simulation, type ReplayResult struct, Raced bool
 pkg testing/simulation, type Strategy int

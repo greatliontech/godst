@@ -436,7 +436,7 @@ func TestDSTInheritFileRunOwnership(t *testing.T) {
 				t.Errorf("cross-process capability write error = %T, want *fs.PathError", err)
 			}
 		})
-		Host("elsewhere", HostConfig{}, func() {
+		Host("elsewhere", func() {
 			// The Host-body (proc 0 on another host) leg of the same scope.
 			if _, err := capability.Write(nil); err == nil || !strings.Contains(err.Error(), "node-scoped to the root simulation body") {
 				t.Errorf("cross-host capability write error = %v, want the node-scoped refusal", err)
@@ -521,7 +521,7 @@ func TestDSTInheritFileRejectsProcessAdmission(t *testing.T) {
 	defer os.Remove(host.Name())
 	defer host.Close()
 	Run(1, func() {
-		Host("node", HostConfig{}, func() {
+		Host("node", func() {
 			if capability, err := InheritFile(host); err == nil || capability != nil {
 				t.Errorf("host InheritFile = %v, %v; want nil, error", capability, err)
 			}

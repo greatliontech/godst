@@ -36,7 +36,7 @@ func TestDSTFileStateSweptAtRunTeardown(t *testing.T) {
 	deadline := time.Now().Add(60 * time.Second)
 	for r := 0; r < rounds; r++ {
 		Run(1, func() {
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				for i := 0; i < churn; i++ {
 					f, err := os.Create("/sweep-probe")
 					if err != nil {
@@ -53,7 +53,7 @@ func TestDSTFileStateSweptAtRunTeardown(t *testing.T) {
 		// slow collection cannot masquerade as unbounded growth.
 		for {
 			runtime.GC()
-			Run(2, func() { Host("h", HostConfig{}, func() {}) })
+			Run(2, func() { Host("h", func() {}) })
 			if _, free := dstFileStateStats(); free >= churn {
 				break
 			}

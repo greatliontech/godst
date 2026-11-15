@@ -9,6 +9,7 @@ package main
 import (
 	crand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"internal/synctest"
 	"io"
 	"math/rand/v2"
@@ -3761,7 +3762,7 @@ func DSTGCAssistMembershipCarry() {
 	}
 
 	runWorkload := func(withAssist bool) simulation.ExploreResult {
-		return simulation.Explore(42, simulation.Exhaustive, func() bool {
+		return simulation.Explore(42, simulation.Exhaustive, func() error {
 			ch := make(chan int, 2)
 			var wg sync.WaitGroup
 			wg.Add(2)
@@ -3779,7 +3780,10 @@ func DSTGCAssistMembershipCarry() {
 				ch <- 2
 			}()
 			wg.Wait()
-			return <-ch+<-ch != 3
+			if <-ch+<-ch != 3 {
+				return errors.New("sum mismatch")
+			}
+			return nil
 		})
 	}
 	base := runWorkload(false)

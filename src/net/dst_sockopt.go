@@ -59,6 +59,7 @@ const (
 
 type dstSockOpts struct {
 	mu            isync.KernelMutex
+	reuseAddr     bool   // SO_REUSEADDR
 	keepAlive     bool   // SO_KEEPALIVE
 	keepIdleSec   int32  // TCP_KEEPIDLE
 	keepIntvlSec  int32  // TCP_KEEPINTVL
@@ -80,6 +81,19 @@ func newDstSockOpts() *dstSockOpts {
 	}
 }
 
+func (o *dstSockOpts) setReuseAddr(v bool) {
+	o.mu.Lock()
+	o.reuseAddr = v
+	o.mu.Unlock()
+}
+
+func (o *dstSockOpts) isReuseAddr() bool {
+	o.mu.Lock()
+	v := o.reuseAddr
+	o.mu.Unlock()
+	return v
+}
+
 // cloneForChild snapshots the listener's option state for an accepted
 // connection — accept(2) inheritance (tcp(7) documents it for
 // TCP_USER_TIMEOUT; SOL_SOCKET and the keepalive parameters inherit the same
@@ -90,6 +104,7 @@ func (o *dstSockOpts) cloneForChild() *dstSockOpts {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return &dstSockOpts{
+		reuseAddr:     o.reuseAddr,
 		keepAlive:     o.keepAlive,
 		keepIdleSec:   o.keepIdleSec,
 		keepIntvlSec:  o.keepIntvlSec,

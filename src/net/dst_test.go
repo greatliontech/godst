@@ -534,8 +534,8 @@ func TestDSTNetInterfaces(t *testing.T) {
 
 	var hA, hB view
 	simulation.Run(1, func() {
-		simulation.Host("hA", simulation.HostConfig{}, func() { hA = capture() }) // id 1 -> 10.0.0.1
-		simulation.Host("hB", simulation.HostConfig{}, func() { hB = capture() }) // id 2 -> 10.0.0.2
+		simulation.Host("hA", func() { hA = capture() }) // id 1 -> 10.0.0.1
+		simulation.Host("hB", func() { hB = capture() }) // id 2 -> 10.0.0.2
 	})
 
 	for _, tc := range []struct {
@@ -579,7 +579,7 @@ func TestDSTNetHostIsolation(t *testing.T) {
 		var port string
 		ready := make(chan struct{})
 
-		simulation.Host("hA", simulation.HostConfig{}, func() { // host id 1 -> routable 10.0.0.1
+		simulation.Host("hA", func() { // host id 1 -> routable 10.0.0.1
 			ln, err := Listen("tcp", ":0") // wildcard: hA's loopback + 10.0.0.1
 			if err != nil {
 				panic(err)
@@ -607,7 +607,7 @@ func TestDSTNetHostIsolation(t *testing.T) {
 			}()
 		})
 
-		simulation.Host("hB", simulation.HostConfig{}, func() { // host id 2
+		simulation.Host("hB", func() { // host id 2
 			<-ready
 			hbIP = simulation.HostIP("hB")
 			// hB cannot reach hA's loopback (host-private).

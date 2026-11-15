@@ -20,6 +20,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/simulation"
@@ -44,23 +45,30 @@ func TestDSTNetSYNACKObservesContextDeadline(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	const latency = 100 * time.Millisecond
-	var conn Conn
-	var dialErr error
+	var conn, acceptedConn Conn
+	var dialErr, acceptErr error
 	var dialDuration time.Duration
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: latency}}, func() {
 		port := make(chan string, 1)
 		release := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		acceptDone := make(chan struct{})
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			go func() {
-				c, _ := ln.Accept()
 				<-release
-				c.Close()
+				ln.Close()
+			}()
+			go func() {
+				acceptedConn, acceptErr = ln.Accept()
+				if acceptedConn != nil {
+					acceptedConn.Close()
+				}
+				close(acceptDone)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 			defer cancel()
 			start := time.Now()
@@ -68,6 +76,7 @@ func TestDSTNetSYNACKObservesContextDeadline(t *testing.T) {
 			dialDuration = time.Since(start)
 			close(release)
 		})
+		<-acceptDone
 	})
 	if conn != nil || !errors.Is(dialErr, context.DeadlineExceeded) {
 		t.Fatalf("deadline during SYN-ACK returned (%v, %v), want nil context deadline", conn, dialErr)
@@ -75,38 +84,60 @@ func TestDSTNetSYNACKObservesContextDeadline(t *testing.T) {
 	if dialDuration != 150*time.Millisecond {
 		t.Fatalf("SYN-ACK context deadline returned after %v, want 150ms", dialDuration)
 	}
+	if acceptedConn != nil || !errors.Is(acceptErr, ErrClosed) {
+		t.Fatalf("Accept after mid-SYN-ACK context deadline = (%v, %v), want (nil, ErrClosed) with no ghost connection", acceptedConn, acceptErr)
+	}
 }
 
 func TestDSTNetSYNACKObservesReset(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
-	var conn Conn
-	var dialErr error
+	var conn, acceptedConn Conn
+	var dialErr, acceptErr error
 	var dialDuration time.Duration
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		dialStarted := make(chan struct{})
+		release := make(chan struct{})
+		acceptDone := make(chan struct{})
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			go func() {
-				c, _ := ln.Accept()
-				simulation.Reset("A", "B")
-				c.Close()
+				<-dialStarted
+				time.Sleep(150 * time.Millisecond) // mid SYN-ACK [100ms, 200ms]
+				simulation.ResetLink("A", "B")
+				<-release
+				ln.Close()
+			}()
+			go func() {
+				acceptedConn, acceptErr = ln.Accept()
+				if acceptedConn != nil {
+					acceptedConn.Close()
+				}
+				close(acceptDone)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
+			target := simulation.HostIP("A") + ":" + <-port
+			close(dialStarted)
 			start := time.Now()
-			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			conn, dialErr = Dial("tcp", target)
 			dialDuration = time.Since(start)
+			close(release)
 		})
+		<-acceptDone
 	})
 	if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
 		t.Fatalf("reset during SYN-ACK returned (%v, %v), want nil ECONNREFUSED (an RST in SYN_SENT is the connection-refused mapping)", conn, dialErr)
 	}
-	if dialDuration != 100*time.Millisecond {
-		t.Fatalf("SYN-ACK reset returned after %v, want one-way 100ms", dialDuration)
+	if dialDuration != 150*time.Millisecond {
+		t.Fatalf("SYN-ACK reset returned after %v, want 150ms", dialDuration)
+	}
+	if acceptedConn != nil || !errors.Is(acceptErr, ErrClosed) {
+		t.Fatalf("Accept after mid-SYN-ACK reset = (%v, %v), want (nil, ErrClosed)", acceptedConn, acceptErr)
 	}
 }
 
@@ -119,25 +150,30 @@ func TestDSTNetSYNACKObservesServerProcessExit(t *testing.T) {
 	var dialDuration time.Duration
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		dialStarted := make(chan struct{})
+		simulation.Host("A", func() {
 			go simulation.Process("server", func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
 				port <- p
-				_, _ = ln.Accept()
+				<-dialStarted
+				time.Sleep(150 * time.Millisecond) // exit mid SYN-ACK [100ms, 200ms]
+				_ = ln
 			})
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
+			target := simulation.HostIP("A") + ":" + <-port
+			close(dialStarted)
 			start := time.Now()
-			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
+			conn, dialErr = Dial("tcp", target)
 			dialDuration = time.Since(start)
 		})
 	})
 	if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
 		t.Fatalf("server process exit during SYN-ACK returned (%v, %v), want nil ECONNREFUSED (an RST in SYN_SENT is the connection-refused mapping)", conn, dialErr)
 	}
-	if dialDuration != 100*time.Millisecond {
-		t.Fatalf("server exit during SYN-ACK returned after %v, want one-way 100ms", dialDuration)
+	if dialDuration != 150*time.Millisecond {
+		t.Fatalf("server exit during SYN-ACK returned after %v, want 150ms", dialDuration)
 	}
 }
 
@@ -147,34 +183,43 @@ func TestDSTNetSYNACKObservesHostCrash(t *testing.T) {
 	}
 	var conn Conn
 	var dialErr error
+	var accepted atomic.Bool
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
-		accepted := make(chan struct{})
+		dialStarted := make(chan struct{})
 		dialDone := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			go func() {
-				c, _ := ln.Accept()
-				close(accepted)
-				defer c.Close()
+				c, err := ln.Accept()
+				if err == nil {
+					accepted.Store(true)
+					c.Close()
+				}
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			go func() {
+				target := simulation.HostIP("A") + ":" + <-port
+				close(dialStarted)
 				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 				defer cancel()
-				conn, dialErr = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("A")+":"+<-port)
+				conn, dialErr = (&Dialer{}).DialContext(ctx, "tcp", target)
 				close(dialDone)
 			}()
 		})
-		<-accepted
+		<-dialStarted
+		time.Sleep(150 * time.Millisecond) // crash host A mid SYN-ACK [100ms, 200ms]
 		simulation.CrashHost("A")
 		<-dialDone
 	})
 	if conn != nil || dialErr == nil {
 		t.Fatalf("host crash during SYN-ACK returned (%v, %v), want nil error", conn, dialErr)
+	}
+	if accepted.Load() {
+		t.Fatalf("Accept completed before SYN-ACK finished")
 	}
 }
 
@@ -188,7 +233,7 @@ func TestDSTNetSYNACKSurvivesListenerCloseAfterAccept(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
 		release := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -199,7 +244,7 @@ func TestDSTNetSYNACKSurvivesListenerCloseAfterAccept(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			start := time.Now()
 			conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
 			dialDuration = time.Since(start)
@@ -255,7 +300,7 @@ func dstPingPong(t *testing.T, seed uint64, opts simulation.Options) (oneWay, rt
 	var writeAt, serverReadAt, clientRespAt time.Time
 	simulation.RunWith(seed, opts, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() { // server
+		simulation.Host("A", func() { // server
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				panic(err)
@@ -274,7 +319,7 @@ func dstPingPong(t *testing.T, seed uint64, opts simulation.Options) (oneWay, rt
 				c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() { // client
+		simulation.Host("B", func() { // client
 			p := <-port
 			c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
 			if err != nil {
@@ -301,7 +346,7 @@ func TestDSTNetFINPaysLinkLatency(t *testing.T) {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
 		serverDone := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				t.Fatal(err)
@@ -333,7 +378,7 @@ func TestDSTNetFINPaysLinkLatency(t *testing.T) {
 				close(serverDone)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			c, err := Dial("tcp", simulation.HostIP("A")+":"+<-port)
 			if err != nil {
 				t.Fatal(err)
@@ -362,7 +407,7 @@ func TestDSTNetFINJitterDeterministic(t *testing.T) {
 				port := make(chan string, 1)
 				accepted := make(chan struct{})
 				done := make(chan struct{})
-				simulation.Host("A", simulation.HostConfig{}, func() {
+				simulation.Host("A", func() {
 					ln, _ := Listen("tcp", ":0")
 					_, p, _ := SplitHostPort(ln.Addr().String())
 					port <- p
@@ -379,7 +424,7 @@ func TestDSTNetFINJitterDeterministic(t *testing.T) {
 						close(done)
 					}()
 				})
-				simulation.Host("B", simulation.HostConfig{}, func() {
+				simulation.Host("B", func() {
 					c, _ := Dial("tcp", simulation.HostIP("A")+":"+<-port)
 					<-accepted
 					closedAt = time.Now()
@@ -412,7 +457,7 @@ func TestDSTNetPartitionHoldsFINAtCutBoundary(t *testing.T) {
 		timedOut := make(chan struct{})
 		healed := make(chan struct{})
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -434,13 +479,13 @@ func TestDSTNetPartitionHoldsFINAtCutBoundary(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+<-port)
 			<-accepted
 			simulation.Partition("A", "B")
 			c.Close() // closeAt == cutStart: strict boundary must be held.
 			<-timedOut
-			simulation.Heal("A", "B")
+			simulation.HealLink("A", "B")
 			close(healed)
 			<-done
 		})
@@ -473,7 +518,7 @@ func TestDSTNetSameHostInstant(t *testing.T) {
 	}
 	var writeAt, serverReadAt time.Time
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 50 * time.Millisecond}}, func() {
-		simulation.Host("solo", simulation.HostConfig{}, func() {
+		simulation.Host("solo", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
 				panic(err)
@@ -517,7 +562,7 @@ func TestDSTNetLatencyFIFO(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		var base time.Time
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -540,7 +585,7 @@ func TestDSTNetLatencyFIFO(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			base = time.Now()
@@ -601,7 +646,7 @@ func TestDSTNetLatencySkewInvariant(t *testing.T) {
 	var writeWall, serverReadWall, clientRespWall time.Time
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{Clock: simulation.Skew(offA)}, func() {
+		simulation.HostWith("A", simulation.HostConfig{Clock: simulation.Skew(offA)}, func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -617,7 +662,7 @@ func TestDSTNetLatencySkewInvariant(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{Clock: simulation.Skew(offB)}, func() {
+		simulation.HostWith("B", simulation.HostConfig{Clock: simulation.Skew(offB)}, func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			writeWall = time.Now() // host B's skewed wall clock
@@ -671,7 +716,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 		doWrite := make(chan struct{})
 		wrote := make(chan struct{})
 		readDone := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() { // server (receiver)
+		simulation.Host("A", func() { // server (receiver)
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -689,7 +734,7 @@ func TestDSTNetClockStepInvariantDelivery(t *testing.T) {
 				close(readDone)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() { // client (sender)
+		simulation.Host("B", func() { // client (sender)
 			go func() { // in a goroutine so Host("B") returns and the root can drive
 				p := <-port
 				c, err := Dial("tcp", simulation.HostIP("A")+":"+p)
@@ -748,7 +793,7 @@ func TestDSTNetBaseDelaysIgnoreEndpointDrift(t *testing.T) {
 		startOrdinaryTimer := make(chan struct{})
 		ordinaryTimerFired := make(chan struct{})
 
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -784,7 +829,7 @@ func TestDSTNetBaseDelaysIgnoreEndpointDrift(t *testing.T) {
 				close(ordinaryTimerFired)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			go func() {
 				p := <-port
 				<-startDial
@@ -877,7 +922,7 @@ func TestDSTNetLatencyDeadline(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: L}}, func() {
 		port := make(chan string, 1)
 		srvDone := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -894,7 +939,7 @@ func TestDSTNetLatencyDeadline(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			c.Write([]byte("ping"))
@@ -980,7 +1025,7 @@ func TestDSTNetJitterFIFO(t *testing.T) {
 	simulation.RunWith(3, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 5 * time.Millisecond, CrossHostJitter: 50 * time.Millisecond}}, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1002,7 +1047,7 @@ func TestDSTNetJitterFIFO(t *testing.T) {
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			for i := 0; i < N; i++ {
@@ -1032,7 +1077,7 @@ func dstThrottledTransfer(t *testing.T, seed uint64, opts simulation.Options, to
 	simulation.RunWith(seed, opts, func() {
 		port := make(chan string, 1)
 		done := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -1059,7 +1104,7 @@ func dstThrottledTransfer(t *testing.T, seed uint64, opts simulation.Options, to
 				close(done)
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("A")+":"+p)
 			payload := make([]byte, chunk)

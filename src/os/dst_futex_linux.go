@@ -319,7 +319,10 @@ func dstFutexTeardown(dead func(*dstFutexWaiter) bool, proc, host uint32, byHost
 			if dead(w) {
 				removed = true
 				if byHost {
-					delete(dstFutex.procKeys, w.proc)
+					delete(dstFutex.procKeys[w.proc], key)
+					if len(dstFutex.procKeys[w.proc]) == 0 {
+						delete(dstFutex.procKeys, w.proc)
+					}
 				}
 				close(w.ch)
 				continue

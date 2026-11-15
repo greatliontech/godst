@@ -79,7 +79,7 @@ func (ifi *Interface) Addrs() ([]Addr, error) {
 	if ifi == nil {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterface}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return dstInterfaceAddrs(ifi), nil
 	}
 	ifat, err := interfaceAddrTable(ifi)
@@ -95,7 +95,7 @@ func (ifi *Interface) MulticastAddrs() ([]Addr, error) {
 	if ifi == nil {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterface}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return nil, nil // no multicast group memberships modeled under simulation
 	}
 	ifat, err := interfaceMulticastAddrTable(ifi)
@@ -107,7 +107,7 @@ func (ifi *Interface) MulticastAddrs() ([]Addr, error) {
 
 // Interfaces returns a list of the system's network interfaces.
 func Interfaces() ([]Interface, error) {
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		// Deterministic simulation: the calling host's fixed synthetic set, not the
 		// real machine's NICs (see net/dst.go dstInterfaces).
 		return dstInterfaces(), nil
@@ -128,7 +128,7 @@ func Interfaces() ([]Interface, error) {
 // The returned list does not identify the associated interface; use
 // Interfaces and [Interface.Addrs] for more detail.
 func InterfaceAddrs() ([]Addr, error) {
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return dstInterfaceAddrs(nil), nil
 	}
 	ifat, err := interfaceAddrTable(nil)
@@ -147,7 +147,7 @@ func InterfaceByIndex(index int) (*Interface, error) {
 	if index <= 0 {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterfaceIndex}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		for _, ifi := range dstInterfaces() {
 			if ifi.Index == index {
 				return &ifi, nil
@@ -180,7 +180,7 @@ func InterfaceByName(name string) (*Interface, error) {
 	if name == "" {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterfaceName}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		for _, ifi := range dstInterfaces() {
 			if ifi.Name == name {
 				return &ifi, nil

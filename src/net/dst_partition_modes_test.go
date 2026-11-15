@@ -28,13 +28,13 @@ func TestDSTNetPartitionRefuseConnect(t *testing.T) {
 	var dialDur time.Duration
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			// No Accept: a refused dial never reaches the backlog.
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			simulation.PartitionRefuse("srv", "cli") // refuse mode, before dialing
 			t0 := time.Now()
@@ -64,7 +64,7 @@ func TestDSTNetPartitionOneWay(t *testing.T) {
 		port := make(chan string, 1)
 		cutDone := make(chan struct{}) // the cut is applied and cli has written its (held) byte
 		srvDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -82,7 +82,7 @@ func TestDSTNetPartitionOneWay(t *testing.T) {
 				close(srvDone)
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			c, _ := Dial("tcp", simulation.HostIP("srv")+":"+p)
 			simulation.PartitionOneWay("cli", "srv") // cut only cli→srv
@@ -117,13 +117,13 @@ func TestDSTNetPartitionOneWayReverseDialFails(t *testing.T) {
 	var dialErr error
 	simulation.RunWith(1, opts, func() {
 		aPort := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			aPort <- p
 			// A only listens: a reverse dial's SYN arrives, but its SYN-ACK (A→B) is dropped.
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			p := <-aPort
 			simulation.PartitionOneWay("A", "B") // cut only A→B
 			// B dials A: SYN B→A arrives, SYN-ACK A→B is dropped → blackhole → horizon.
@@ -148,15 +148,15 @@ func TestDSTNetPartitionRefuseWithIsolateBlackholes(t *testing.T) {
 	var dialErr error
 	simulation.RunWith(1, opts, func() {
 		port := make(chan string, 1)
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			simulation.PartitionRefuse("srv", "cli") // refuse-mode cut...
-			simulation.Isolate("srv")                // ...plus a dropped-packet cut on srv
+			simulation.IsolateHost("srv")            // ...plus a dropped-packet cut on srv
 			_, dialErr = Dial("tcp", simulation.HostIP("srv")+":"+p)
 		})
 	})
@@ -220,8 +220,8 @@ func TestDSTNetPartitionModeOneWayOverlapAndPartialHeal(t *testing.T) {
 		// Declare the two hosts the raw ids below name: dstDialCut now treats
 		// an UNDECLARED target as an unowned address (blackhole), so a
 		// white-box probe of cut-mode composition must run over declared ids.
-		simulation.Host("h1", simulation.HostConfig{}, func() {}) // id 1
-		simulation.Host("h2", simulation.HostConfig{}, func() {}) // id 2
+		simulation.Host("h1", func() {}) // id 1
+		simulation.Host("h2", func() {}) // id 2
 		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
 		dstApplyPartitionOp(dstPartOpPartitionOneWay, 1, 2)
 		if _, cut, blackhole := dstPartCutStartDir(1, 2); !cut || !blackhole {
@@ -242,8 +242,8 @@ func TestDSTNetPartitionModeOneWayOverlapAndPartialHeal(t *testing.T) {
 		}
 	})
 	simulation.RunWith(1, simulation.Options{}, func() {
-		simulation.Host("h1", simulation.HostConfig{}, func() {}) // id 1 (see above)
-		simulation.Host("h2", simulation.HostConfig{}, func() {}) // id 2
+		simulation.Host("h1", func() {}) // id 1 (see above)
+		simulation.Host("h2", func() {}) // id 2
 		dstApplyPartitionOp(dstPartOpPartitionRefuse, 1, 2)
 		dstApplyPartitionOp(dstPartOpIsolate, 1, 0)
 		dstApplyPartitionOp(dstPartOpHealHost, 1, 0)

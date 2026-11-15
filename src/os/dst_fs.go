@@ -229,7 +229,7 @@ type dstFSDisk struct {
 // the run epoch rolls (dstFSRoll).
 var dstDiskSlow atomic.Bool
 
-//go:linkname dstFSCurrentNode runtime.dstCurrentNode
+//go:linkname dstFSCurrentNode runtime.dstCurrentSlot
 func dstFSCurrentNode() (host, proc uint32)
 
 //go:linkname dstSMaxBytesOS runtime.dstSMaxBytesOS
@@ -1536,16 +1536,16 @@ func dstChdir(dir string) (handled bool, err error) {
 var _ dstFileBackend = (*dstFile)(nil)
 
 type dstFile struct {
-	mu     isync.KernelMutex
-	node   *dstFSNode
-	dentry *dstFSDentry // non-nil on directory handles (for fchdir)
-	disk   *dstFSDisk   // the host disk this handle was opened on (for disk faults)
-	path   string
-	off    int64
-	dirpos int // directory read cursor (sorted-name index)
-	rd, wr bool
-	app    bool
-	osync  bool // full O_SYNC
+	mu        isync.KernelMutex
+	node      *dstFSNode
+	dentry    *dstFSDentry // non-nil on directory handles (for fchdir)
+	disk      *dstFSDisk   // the host disk this handle was opened on (for disk faults)
+	path      string
+	off       int64
+	dirpos    int // directory read cursor (sorted-name index)
+	rd, wr    bool
+	app       bool
+	osync     bool // full O_SYNC
 	odsync    bool // O_DSYNC: data and size, but not timestamps
 	closed    bool
 	closeSync uint64

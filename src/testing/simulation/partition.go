@@ -42,33 +42,34 @@ const (
 
 // Partition cuts the network link between hosts a and b (symmetric). Connections
 // between them — in either direction — are blackholed and new dials across the cut
-// block, until Heal(a, b) (or HealHost on either) restores the link. Like every
+// block, until HealLink(a, b) (or UnisolateHost on either) restores the link. Like every
 // victim-naming fault API, it panics during a run on an undeclared host or process
 // name and is a no-op outside a run.
 func Partition(a, b string) {
 	withBubbleFaultCaller("Partition", func() { dstNetPartitionOp(partOpPartition, lookupHost(a), lookupHost(b)) })
 }
 
-// Heal restores the link between hosts a and b cut by Partition.
-func Heal(a, b string) {
-	withBubbleFaultCaller("Heal", func() { dstNetPartitionOp(partOpHeal, lookupHost(a), lookupHost(b)) })
+// HealLink restores the link between hosts a and b cut by Partition,
+// PartitionOneWay, or PartitionRefuse.
+func HealLink(a, b string) {
+	withBubbleFaultCaller("HealLink", func() { dstNetPartitionOp(partOpHeal, lookupHost(a), lookupHost(b)) })
 }
 
-// Isolate cuts host from every other host at once (a full network partition of one
-// node), until HealHost(host) restores it.
-func Isolate(host string) {
-	withBubbleFaultCaller("Isolate", func() { dstNetPartitionOp(partOpIsolate, lookupHost(host), 0) })
+// IsolateHost cuts host from every other host at once (a full network partition of one
+// node), until UnisolateHost(host) restores it.
+func IsolateHost(host string) {
+	withBubbleFaultCaller("IsolateHost", func() { dstNetPartitionOp(partOpIsolate, lookupHost(host), 0) })
 }
 
-// HealHost restores a host isolated by Isolate.
-func HealHost(host string) {
-	withBubbleFaultCaller("HealHost", func() { dstNetPartitionOp(partOpHealHost, lookupHost(host), 0) })
+// UnisolateHost restores a host isolated by IsolateHost.
+func UnisolateHost(host string) {
+	withBubbleFaultCaller("UnisolateHost", func() { dstNetPartitionOp(partOpHealHost, lookupHost(host), 0) })
 }
 
 // PartitionOneWay cuts ONLY the direction from→to (asymmetric): from's writes never
 // reach to (and to's dials of from time out), while to→from still delivers. This is a
 // real failure mode — asymmetric routing, a firewall dropping one direction — and a
-// classic distributed-systems adversary. Heal(from, to) restores it (Heal clears both
+// classic distributed-systems adversary. HealLink(from, to) restores it (HealLink clears both
 // directions). Same victim-naming rules as Partition.
 func PartitionOneWay(from, to string) {
 	withBubbleFaultCaller("PartitionOneWay", func() { dstNetPartitionOp(partOpPartitionOneWay, lookupHost(from), lookupHost(to)) })
@@ -79,7 +80,7 @@ func PartitionOneWay(from, to string) {
 // semantics), where Partition instead blackholes the dial (the SYN is dropped, the
 // dial blocks). Both are real TCP outcomes a SUT tests against; the choice is the
 // SUT's. Established connections behave as under Partition (reads block, writes buffer
-// then block); the mode governs only new connects. Heal(a, b) restores it. The refuse
+// then block); the mode governs only new connects. HealLink(a, b) restores it. The refuse
 // returns immediately, not after a half-RTT SYN traversal — the same recorded timing
 // simplification a direct ECONNREFUSED to a declared-but-unlistened port carries. If
 // the pair is ALSO isolated or blackhole-cut, the drop wins and the dial blackholes
@@ -88,20 +89,36 @@ func PartitionRefuse(a, b string) {
 	withBubbleFaultCaller("PartitionRefuse", func() { dstNetPartitionOp(partOpPartitionRefuse, lookupHost(a), lookupHost(b)) })
 }
 
-// Reset injects ECONNRESET on every active connection between hosts a and b (in
+// ResetLink injects ECONNRESET on every active connection between hosts a and b (in
 // either direction), modeling a transient that tears those flows down — a real RST
 // from a middlebox. Both ends survive and receive the RST as a real kernel would:
 // each drains the bytes already delivered to its receive queue, then reads fail
 // ECONNRESET and writes fail immediately; in-flight buffered bytes are dropped.
-func Reset(a, b string) {
-	withBubbleFaultCaller("Reset", func() { dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b)) })
+func ResetLink(a, b string) {
+	withBubbleFaultCaller("ResetLink", func() { dstNetPartitionOp(partOpResetPair, lookupHost(a), lookupHost(b)) })
 }
 
-// ResetProcess injects ECONNRESET on every active connection process p owns an end
-// of (as dialer or as the listening process) — modeling that process's sockets
-// being torn down (e.g. as a lighter-weight precursor to the process crash fault).
-// p itself stays alive, so every end — p's own included — drains its delivered
-// bytes before failing ECONNRESET; in-flight bytes are dropped.
-func ResetProcess(p string) {
-	withBubbleFaultCaller("ResetProcess", func() { dstNetPartitionOp(partOpResetProc, lookupProc(p), 0) })
+// ResetProcess injects ECONNRESET on every active connection owned by any live
+// invocation of process proc on host (pass host == "" for a process declared on
+// the unnamed root host) — modeling that process's sockets being torn down as a
+// lighter-weight precursor to CrashProcess. The process itself stays alive, so
+// every end — its own included — drains its delivered bytes before failing
+// ECONNRESET; in-flight bytes are dropped.
+func ResetProcess(host, proc string) {
+	withBubbleFaultCaller("ResetProcess", func() {
+		var hid uint32
+		if host != "" {
+			hid = lookupHost(host)
+			if hid == 0 {
+				return
+			}
+		}
+		p := lookupProc(hid, proc)
+		if p == 0 {
+			return
+		}
+		for _, slot := range activeProcSlots(p) {
+			dstNetPartitionOp(partOpResetProc, slot, 0)
+		}
+	})
 }

@@ -99,7 +99,7 @@ func TestDSTNetUnownedAddressLateDeclaration(t *testing.T) {
 			}
 		}()
 		time.Sleep(500 * time.Millisecond) // the dial is parked on the unowned address
-		simulation.Host("late", simulation.HostConfig{}, func() {
+		simulation.Host("late", func() {
 			ln, err := Listen("tcp", ":12345")
 			if err != nil {
 				t.Errorf("listen on the late host: %v", err)
@@ -123,13 +123,12 @@ func TestDSTNetUnownedAddressLateDeclaration(t *testing.T) {
 	}
 }
 
-// TestDSTNetUnownedAddressLateImplicitProcess: the implicit-host arm of the
-// late-declaration boot — a top-level Process (no Host) allocates an implicit
-// dedicated host, which must relay host-up exactly like an explicit Host
-// declaration, waking a dial parked on the previously unowned address.
-// Mutation: dropping internHost's fresh-host relay leaves the parked dial
-// asleep until the horizon.
-func TestDSTNetUnownedAddressLateImplicitProcess(t *testing.T) {
+// TestDSTNetUnownedAddressBareProcessDoesNotClaimHostIP: a top-level Process
+// (outside Host) runs on the unnamed root host (0) rather than allocating an
+// implicit machine, so a dial parked on 10.0.0.1 stays blackholed across the
+// bare Process declaration and wakes only when an explicit Host("late", ...)
+// boots host 1 (10.0.0.1).
+func TestDSTNetUnownedAddressBareProcessDoesNotClaimHostIP(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
@@ -137,8 +136,6 @@ func TestDSTNetUnownedAddressLateImplicitProcess(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		res := make(chan error, 1)
 		go func() {
-			// The first interned host below gets id 1 → 10.0.0.1. Bounded
-			// refused-retry, as in the explicit-Host test above.
 			for tries := 0; ; tries++ {
 				_, err := Dial("tcp", "10.0.0.1:12345")
 				if err == nil {
@@ -154,11 +151,26 @@ func TestDSTNetUnownedAddressLateImplicitProcess(t *testing.T) {
 			}
 		}()
 		time.Sleep(500 * time.Millisecond) // the dial is parked on the unowned address
-		done := make(chan struct{})
-		go simulation.Process("late", func() { // implicit dedicated host: id 1
+		bareDone := make(chan struct{})
+		go simulation.Process("late", func() {
 			ln, err := Listen("tcp", ":12345")
 			if err != nil {
-				t.Errorf("listen on the implicit host: %v", err)
+				t.Errorf("listen on root process: %v", err)
+				return
+			}
+			defer ln.Close()
+			<-bareDone
+		})
+		time.Sleep(500 * time.Millisecond)
+		select {
+		case err := <-res:
+			t.Fatalf("dial resolved (%v) from a bare Process before Host(\"late\") booted 10.0.0.1", err)
+		default:
+		}
+		simulation.Host("late", func() {
+			ln, err := Listen("tcp", ":12345")
+			if err != nil {
+				t.Errorf("listen on the late host: %v", err)
 				return
 			}
 			go func() {
@@ -167,11 +179,10 @@ func TestDSTNetUnownedAddressLateImplicitProcess(t *testing.T) {
 				}
 				ln.Close()
 			}()
-			<-done
 		})
 		if err := <-res; err != nil {
-			t.Errorf("dial after the implicit-host Process was declared = %v, want eventual success", err)
+			t.Errorf("dial after Host(\"late\") booted 10.0.0.1 = %v, want eventual success", err)
 		}
-		close(done)
+		close(bareDone)
 	})
 }

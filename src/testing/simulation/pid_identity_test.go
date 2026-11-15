@@ -131,8 +131,7 @@ func TestDSTPidMaxExhaustionPanics(t *testing.T) {
 		close(hold)
 		<-exited
 		<-exited
-		// With the holders exited, a later Process must land on its OWN
-		// implicit host, not the refused declaration's.
+		// With the holders exited, a later Process runs cleanly on the root host.
 		Process("h4", func() { laterHostname = pidTestHostname() })
 	})
 	msg, _ := exhaust.(string)
@@ -142,8 +141,8 @@ func TestDSTPidMaxExhaustionPanics(t *testing.T) {
 	if neutralityBroken != "" {
 		t.Fatalf("refused admission mutated state: %s", neutralityBroken)
 	}
-	if laterHostname != "h4" {
-		t.Fatalf("post-refusal Process hostname = %q, want its own implicit host h4", laterHostname)
+	if laterHostname != "sim" {
+		t.Fatalf("post-refusal Process hostname = %q, want root host sim", laterHostname)
 	}
 }
 
@@ -183,7 +182,7 @@ func TestDSTPidMaxValidation(t *testing.T) {
 func TestDSTStarttimeAcrossReboot(t *testing.T) {
 	var preStart, postStart uint64
 	Run(24, func() {
-		Host("m", HostConfig{}, func() {
+		Host("m", func() {
 			sleepMillis(500)
 			Process("w", func() {
 				st, err := processStartTime(os.Getpid())
@@ -195,7 +194,7 @@ func TestDSTStarttimeAcrossReboot(t *testing.T) {
 		})
 		CrashHost("m")
 		sleepMillis(10)
-		Host("m", HostConfig{}, func() {
+		Host("m", func() {
 			sleepMillis(20)
 			Process("w", func() {
 				st, err := processStartTime(os.Getpid())
@@ -219,7 +218,7 @@ func TestDSTStarttimeSameTickCollision(t *testing.T) {
 	var p1, p2 int
 	var s1, s2 uint64
 	Run(25, func() {
-		Host("m", HostConfig{}, func() {
+		Host("m", func() {
 			sleepMillis(15)
 			Process("a", func() { p1 = os.Getpid(); s1, _ = processStartTime(p1) })
 			Process("b", func() { p2 = os.Getpid(); s2, _ = processStartTime(p2) })
@@ -290,7 +289,7 @@ func TestDSTPidNamespaces(t *testing.T) {
 		})
 		// Internal teardown is NOT namespace-filtered: a root-ns caller
 		// crashes the container process.
-		Crash("wa")
+		CrashProcess("", "wa")
 		ProcessWith("pa2", ProcessConfig{PIDNamespace: "container-a"}, func() {
 			postCrashKillErr = syscall.Kill(writerPid, 0)
 		})

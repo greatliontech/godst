@@ -199,7 +199,10 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 		return []string{host}, nil
 	}
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
+			if dstIsLocalhost(host) {
+				return []string{"127.0.0.1", "::1"}, nil
+			}
 			return nil, dstUnsupportedDNSLookup(host)
 		}
 	}
@@ -316,7 +319,10 @@ func (r *Resolver) lookupIPAddr(ctx context.Context, network, host string) ([]IP
 		return []IPAddr{{IP: IP(ip.AsSlice()).To16(), Zone: ip.Zone()}}, nil
 	}
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
+			if addrs, ok := dstLookupLocalhostIPAddr(network, host); ok {
+				return addrs, nil
+			}
 			return nil, dstUnsupportedDNSLookup(host)
 		}
 	}
@@ -433,7 +439,7 @@ func (r *Resolver) LookupPort(ctx context.Context, network, service string) (por
 			return 0, &AddrError{Err: "unknown network", Addr: network}
 		}
 		if dstNetEnabled {
-			if dstActive() {
+			if dstInSimBubble() {
 				return 0, dstUnsupportedServiceLookup(network, service)
 			}
 		}
@@ -483,7 +489,7 @@ func LookupCNAME(host string) (cname string, err error) {
 // formatted presentation-format domain name.
 func (r *Resolver) LookupCNAME(ctx context.Context, host string) (string, error) {
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			return "", dstUnsupportedDNSLookup(host)
 		}
 	}
@@ -541,7 +547,7 @@ func LookupSRV(service, proto, name string) (cname string, addrs []*SRV, err err
 // will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			target := name
 			if service != "" || proto != "" {
 				target = "_" + service + "._" + proto + "." + name
@@ -596,7 +602,7 @@ func LookupMX(name string) ([]*MX, error) {
 // and an error will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupMX(ctx context.Context, name string) ([]*MX, error) {
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			if !isDomainName(name) {
 				return nil, newDNSError(errNoSuchHost, name, "")
 			}
@@ -649,7 +655,7 @@ func LookupNS(name string) ([]*NS, error) {
 // will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupNS(ctx context.Context, name string) ([]*NS, error) {
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			if !isDomainName(name) {
 				return nil, newDNSError(errNoSuchHost, name, "")
 			}
@@ -719,7 +725,7 @@ func LookupAddr(addr string) (names []string, err error) {
 // out and an error will be returned alongside the remaining results, if any.
 func (r *Resolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
 	if dstNetEnabled {
-		if dstActive() {
+		if dstInSimBubble() {
 			if _, err := reverseaddr(addr); err != nil {
 				return nil, err
 			}

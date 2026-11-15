@@ -50,7 +50,7 @@ func dstModelProgram(seed uint64) string {
 			wg.Add(1)
 			go func(hi int) {
 				defer wg.Done()
-				Host(names[hi], HostConfig{Clock: Skew(skews[hi]), Hostname: names[hi], NumCPU: cpus[hi]}, func() {
+				HostWith(names[hi], HostConfig{Clock: Skew(skews[hi]), Hostname: names[hi], NumCPU: cpus[hi]}, func() {
 					for pi := 0; pi < 2; pi++ {
 						wg.Add(1)
 						go func(pi int) {
@@ -124,19 +124,21 @@ func TestDSTModelSeedVaries(t *testing.T) {
 }
 
 // TestDSTModelIntegration asserts the composed observables are individually correct,
-// not merely self-consistent: across three hosts each running one process, the
-// hostname/NumCPU are the configured per-host values, the clock is skewed by the
+// not merely self-consistent: across three hosts each running co-located processes,
+// the hostname/NumCPU are the configured per-host values, the clock is skewed by the
 // configured offset relative to a common base instant, the filesystem is per-host
 // isolated (own files only, checked via the read-only HostFS inspector), memory is
-// attributed per process, and pids are distinct.
+// attributed per process, each host starts its own independent PID space (first
+// process pid == 2), and co-located processes on the same host get distinct pids.
 func TestDSTModelIntegration(t *testing.T) {
 	type node struct {
-		host string
-		cpu  int
-		pid  int
-		wall time.Time
-		mem  int64
-		saw  string
+		host       string
+		cpu        int
+		pid        int
+		sidecarPid int
+		wall       time.Time
+		mem        int64
+		saw        string
 	}
 	cfgs := []struct {
 		name string
@@ -159,18 +161,23 @@ func TestDSTModelIntegration(t *testing.T) {
 			wg.Add(1)
 			go func(name string, skew time.Duration, cpu int) {
 				defer wg.Done()
-				Host(name, HostConfig{Clock: Skew(skew), Hostname: name, NumCPU: cpu}, func() {
+				HostWith(name, HostConfig{Clock: Skew(skew), Hostname: name, NumCPU: cpu}, func() {
+					var n node
 					Process(name+"-proc", func() {
 						hn, _ := os.Hostname()
 						os.WriteFile("/shared", []byte("from-"+hn), 0o644)
 						os.WriteFile("/"+hn, []byte("x"), 0o644) // host-private crumb
 						sb, _ := os.ReadFile("/shared")
 						allocSink(cpu * 8192)
-						n := &node{host: hn, cpu: runtime.NumCPU(), pid: os.Getpid(), wall: time.Now(), mem: procBytes(), saw: string(sb)}
-						mu.Lock()
-						nodes[name] = n
-						mu.Unlock()
+						n = node{host: hn, cpu: runtime.NumCPU(), pid: os.Getpid(), wall: time.Now(), mem: procBytes(), saw: string(sb)}
 					})
+					Process(name+"-sidecar", func() {
+						n.sidecarPid = os.Getpid()
+					})
+					mu.Lock()
+					cp := n
+					nodes[name] = &cp
+					mu.Unlock()
 				})
 			}(c.name, c.skew, c.cpu)
 		}
@@ -190,7 +197,6 @@ func TestDSTModelIntegration(t *testing.T) {
 	if len(nodes) != len(cfgs) {
 		t.Fatalf("captured %d/%d nodes", len(nodes), len(cfgs))
 	}
-	pids := map[int]string{}
 	for _, c := range cfgs {
 		nd := nodes[c.name]
 		if nd == nil {
@@ -212,10 +218,12 @@ func TestDSTModelIntegration(t *testing.T) {
 		if nd.mem <= 0 {
 			t.Errorf("%s: per-process memory=%d, want >0", c.name, nd.mem)
 		}
-		if prev, dup := pids[nd.pid]; dup {
-			t.Errorf("pid %d shared by %s and %s (pids must be distinct)", nd.pid, prev, c.name)
+		if nd.pid != 2 {
+			t.Errorf("%s: first process pid=%d, want 2 (independent per-host PID space)", c.name, nd.pid)
 		}
-		pids[nd.pid] = c.name
+		if nd.sidecarPid != 3 || nd.sidecarPid == nd.pid {
+			t.Errorf("%s: co-located sidecar pid=%d (primary=%d), want 3", c.name, nd.sidecarPid, nd.pid)
+		}
 		if isolation[c.name] != "" {
 			t.Errorf("%s: cross-host FS isolation breach:%s", c.name, isolation[c.name])
 		}

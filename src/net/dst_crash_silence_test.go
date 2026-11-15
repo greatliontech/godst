@@ -29,7 +29,7 @@ import (
 // dstCrashServer starts host "victim" with process "srv": listen, accept,
 // optionally write greet, then park until crashed or done.
 func dstCrashServer(port chan<- string, done <-chan struct{}, greet string) {
-	simulation.Host("victim", simulation.HostConfig{}, func() {
+	simulation.Host("victim", func() {
 		go simulation.Process("srv", func() {
 			ln, err := Listen("tcp", ":0")
 			if err != nil {
@@ -67,7 +67,7 @@ func TestDSTNetCrashHostSurvivorSilence(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "pre")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -108,7 +108,7 @@ func TestDSTNetCrashHostKeepaliveDeath(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "x")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			d := Dialer{KeepAliveConfig: KeepAliveConfig{Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 2}}
 			c, err := d.Dial("tcp", simulation.HostIP("victim")+":"+p)
@@ -152,7 +152,7 @@ func TestDSTNetCrashHostOutstandingTimesOut(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "x")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -198,7 +198,7 @@ func TestDSTNetCrashHostRebootAnswersRST(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "x")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -209,8 +209,8 @@ func TestDSTNetCrashHostRebootAnswersRST(t *testing.T) {
 				panic(err)
 			}
 			simulation.CrashHost("victim")
-			time.Sleep(5 * time.Second) // silent while off
-			simulation.Host("victim", simulation.HostConfig{}, func() {}) // reboot
+			time.Sleep(5 * time.Second)          // silent while off
+			simulation.Host("victim", func() {}) // reboot
 			if _, err := c.Write([]byte("probe")); err != nil {
 				panic(err) // the send itself succeeds; the RST answers it
 			}
@@ -238,7 +238,7 @@ func TestDSTNetCrashHostUnderCutStaysSilent(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "x")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -253,7 +253,7 @@ func TestDSTNetCrashHostUnderCutStaysSilent(t *testing.T) {
 			simulation.CrashHost("victim")
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			_, deadlineErr = c.Read(buf) // silence through cut+crash: the deadline fires first
-			simulation.Heal("survivor", "victim")
+			simulation.HealLink("survivor", "victim")
 			c.SetReadDeadline(time.Time{})
 			_, horizonErr = c.Read(buf) // the machine is still off: held bytes exhaust at the horizon
 			c.Close()
@@ -282,7 +282,7 @@ func TestDSTNetCrashHostAppClosedEndDrainsToEOF(t *testing.T) {
 		closed := make(chan struct{})
 		done := make(chan struct{})
 		defer close(done)
-		simulation.Host("victim", simulation.HostConfig{}, func() {
+		simulation.Host("victim", func() {
 			go simulation.Process("srv", func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
@@ -298,7 +298,7 @@ func TestDSTNetCrashHostAppClosedEndDrainsToEOF(t *testing.T) {
 				ln.Close()
 			})
 		})
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -340,7 +340,7 @@ func TestDSTNetCrashHostAckedBytesDoNotTimeOut(t *testing.T) {
 		accepted := make(chan struct{})
 		done := make(chan struct{})
 		defer close(done)
-		simulation.Host("victim", simulation.HostConfig{}, func() {
+		simulation.Host("victim", func() {
 			go simulation.Process("srv", func() {
 				ln, err := Listen("tcp", ":0")
 				if err != nil {
@@ -356,7 +356,7 @@ func TestDSTNetCrashHostAckedBytesDoNotTimeOut(t *testing.T) {
 				ln.Close()
 			})
 		})
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -390,7 +390,7 @@ func TestDSTNetCrashHostBacklogConnSilent(t *testing.T) {
 		port := make(chan string, 1)
 		done := make(chan struct{})
 		defer close(done)
-		simulation.Host("victim", simulation.HostConfig{}, func() {
+		simulation.Host("victim", func() {
 			go simulation.Process("srv", func() {
 				ln, err := Listen("tcp", ":0")
 				if err != nil {
@@ -402,7 +402,7 @@ func TestDSTNetCrashHostBacklogConnSilent(t *testing.T) {
 				ln.Close()
 			})
 		})
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -437,7 +437,7 @@ func TestDSTNetExitCloseRSTHeldByCut(t *testing.T) {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
 		cut := make(chan struct{})
-		simulation.Host("victim", simulation.HostConfig{}, func() {
+		simulation.Host("victim", func() {
 			go simulation.Process("srv", func() {
 				ln, err := Listen("tcp", ":0")
 				if err != nil {
@@ -455,7 +455,7 @@ func TestDSTNetExitCloseRSTHeldByCut(t *testing.T) {
 				// unread inbound and would RST, but the cut swallows it.
 			})
 		})
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -475,7 +475,7 @@ func TestDSTNetExitCloseRSTHeldByCut(t *testing.T) {
 			c.Write([]byte("probe"))
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			_, deadlineErr = c.Read(make([]byte, 1))
-			simulation.Heal("victim", "survivor")
+			simulation.HealLink("victim", "survivor")
 			c.SetReadDeadline(time.Time{})
 			_, resetErr = c.Read(make([]byte, 1))
 			c.Close()
@@ -502,7 +502,7 @@ func TestDSTNetExitBacklogRSTHeldByCut(t *testing.T) {
 	simulation.RunWith(1, simulation.Options{}, func() {
 		port := make(chan string, 1)
 		cut := make(chan struct{})
-		simulation.Host("victim", simulation.HostConfig{}, func() {
+		simulation.Host("victim", func() {
 			go simulation.Process("srv", func() {
 				ln, err := Listen("tcp", ":0")
 				if err != nil {
@@ -514,7 +514,7 @@ func TestDSTNetExitBacklogRSTHeldByCut(t *testing.T) {
 				ln.Close() // never accepted: the backlog conn's RST meets the cut
 			})
 		})
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -526,7 +526,7 @@ func TestDSTNetExitBacklogRSTHeldByCut(t *testing.T) {
 			c.Write([]byte("probe"))          // destroyed unacknowledged at the frozen socket
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			_, deadlineErr = c.Read(make([]byte, 1))
-			simulation.Heal("victim", "survivor")
+			simulation.HealLink("victim", "survivor")
 			c.SetReadDeadline(time.Time{})
 			_, resetErr = c.Read(make([]byte, 1))
 			c.Close()
@@ -554,7 +554,7 @@ func TestDSTNetProcessCrashRSTHeldByCut(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 		dstCrashServer(port, done, "x")
-		simulation.Host("survivor", simulation.HostConfig{}, func() {
+		simulation.Host("survivor", func() {
 			p := <-port
 			c, err := (&Dialer{KeepAlive: -1}).Dial("tcp", simulation.HostIP("victim")+":"+p)
 			if err != nil {
@@ -565,11 +565,11 @@ func TestDSTNetProcessCrashRSTHeldByCut(t *testing.T) {
 				panic(err)
 			}
 			simulation.PartitionOneWay("victim", "survivor") // the RST's direction is cut
-			simulation.Crash("srv")
+			simulation.CrashProcess("victim", "srv")
 			c.Write([]byte("out")) // outbound is clear; the dead socket cannot answer through the cut
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			_, deadlineErr = c.Read(buf) // silence while the cut swallows the RST
-			simulation.Heal("victim", "survivor")
+			simulation.HealLink("victim", "survivor")
 			c.SetReadDeadline(time.Time{})
 			_, resetErr = c.Read(buf) // the probe meets the CLOSED socket's RST
 			c.Close()

@@ -38,7 +38,7 @@ func TestDSTCrashDropsVictimStackRoots(t *testing.T) {
 				runtime.KeepAlive(x)
 			})
 			w := <-ready
-			Crash("worker")
+			CrashProcess("", "worker")
 			runtime.GC()
 			runtime.GC()
 			if w.Value() != nil {
@@ -65,7 +65,7 @@ func TestDSTCrashDropsVictimDeferredRoots(t *testing.T) {
 			select {}
 		})
 		w := <-ready
-		Crash("worker")
+		CrashProcess("", "worker")
 		runtime.GC()
 		runtime.GC()
 		if w.Value() != nil {
@@ -93,7 +93,7 @@ func testDSTCrashMarksDisassociatedMember(t *testing.T, hostCrash bool) {
 			atomic.StoreUint32(&after, 1)
 		}
 		if hostCrash {
-			go Host("machine", HostConfig{}, body)
+			go Host("machine", body)
 		} else {
 			go Process("worker", body)
 		}
@@ -103,7 +103,7 @@ func testDSTCrashMarksDisassociatedMember(t *testing.T, hostCrash bool) {
 		if hostCrash {
 			CrashHost("machine")
 		} else {
-			Crash("worker")
+			CrashProcess("", "worker")
 		}
 		atomic.StoreUint32(&release, 1)
 		for range 100 {

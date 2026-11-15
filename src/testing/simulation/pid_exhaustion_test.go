@@ -40,9 +40,9 @@ func TestDSTProcessPIDExhaustionIsStateNeutral(t *testing.T) {
 		unchanged := len(nodeReg.hosts) == hosts && len(nodeReg.procs) == procs && nodeReg.nextHost == nextHost && nodeReg.nextProc == nextProc
 		nodeReg.mu.Unlock()
 		activeProcs.mu.Lock()
-		victimPIDs, victimHosts := len(activeProcs.pids), len(activeProcs.host)
+		victimPIDs, victimProcs := len(activeProcs.bySlot), len(activeProcs.byProc)
 		activeProcs.mu.Unlock()
-		if !unchanged || victimPIDs != 0 || victimHosts != 0 {
+		if !unchanged || victimPIDs != 0 || victimProcs != 0 {
 			t.Fatal("PID exhaustion published host, process, or victim registration")
 		}
 	})

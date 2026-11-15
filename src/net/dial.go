@@ -529,7 +529,7 @@ func (d *Dialer) Dial(network, address string) (Conn, error) {
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
 	ctx, cancel := d.dialCtx(ctx)
 	defer cancel()
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		// Deterministic simulation: see net/dst.go (which fires the nettrace
 		// connect callbacks with the resolved address, as production does).
 		return dstDial(ctx, d, network, address)
@@ -902,7 +902,7 @@ func (lc *ListenConfig) SetMultipathTCP(use bool) {
 // The ctx argument is used while resolving the address on which to listen;
 // it does not affect the returned Listener.
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return dstListen(lc, network, address) // deterministic simulation: see net/dst.go
 	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
@@ -942,7 +942,7 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 // The ctx argument is used while resolving the address on which to listen;
 // it does not affect the returned PacketConn.
 func (lc *ListenConfig) ListenPacket(ctx context.Context, network, address string) (PacketConn, error) {
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return nil, dstUnsupportedNetAPI("listen", network, nil, nil)
 	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)

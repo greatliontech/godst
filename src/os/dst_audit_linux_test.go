@@ -84,7 +84,7 @@ func TestDSTFSVirtualFDFstatIdentity(t *testing.T) {
 		// uint64() conversions: st_dev's field width is arch-dependent (uint32
 		// on mips).
 		var h2Dev uint64
-		simulation.Host("h2", simulation.HostConfig{}, func() {
+		simulation.Host("h2", func() {
 			if err := os.WriteFile("/a", []byte("a"), 0o644); err != nil {
 				t.Fatalf("h2 WriteFile: %v", err)
 			}
@@ -361,7 +361,7 @@ func TestDSTFSVirtualFDRawNeverIssuedInRangeFenced(t *testing.T) {
 // lock would produce holder-retains executions no real kernel can.
 func TestDSTFSVirtualFDFlockFailedNBConversionLosesLock(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/lock", []byte("x"), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -525,7 +525,7 @@ func TestDSTFSVirtualFDMmapLeakedAcrossRunsInert(t *testing.T) {
 // fresh).
 func TestDSTProcessExitReleasesResources(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			if err := os.WriteFile("/db", make([]byte, 8), 0o644); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
@@ -1124,7 +1124,7 @@ func TestDSTFSStatfsMadviseAndPreRunHostRootFence(t *testing.T) {
 		}
 
 		// 2. Statfs / Fstatfs (named and raw Syscall) across hosts, LimitDisk, and /proc.
-		simulation.Host("h1", simulation.HostConfig{}, func() {
+		simulation.Host("h1", func() {
 			simulation.LimitDisk("h1", 64<<10) // 16 * 4096 B blocks
 			f, err := os.OpenFile("/data", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 			if err != nil {
@@ -1220,7 +1220,7 @@ func TestDSTFSStatfsMadviseAndPreRunHostRootFence(t *testing.T) {
 			}
 		})
 
-		simulation.Host("h2", simulation.HostConfig{}, func() {
+		simulation.Host("h2", func() {
 			if err := syscall.Statfs("/tmp", &fsH2); err != nil {
 				t.Fatalf("h2 Statfs(/tmp): %v", err)
 			}
@@ -1253,7 +1253,7 @@ func TestDSTFSDualAliasDirCrashRecoveryCwdAndRemove(t *testing.T) {
 
 	t.Run("RemoveAllPreservesSurvivingAliasAndDentryCwd", func(t *testing.T) {
 		simulation.Run(1, func() {
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				if err := os.MkdirAll("/a/dir/sub", 0o755); err != nil {
 					t.Fatalf("MkdirAll /a/dir/sub: %v", err)
 				}
@@ -1279,7 +1279,7 @@ func TestDSTFSDualAliasDirCrashRecoveryCwdAndRemove(t *testing.T) {
 			})
 
 			simulation.CrashHost("h")
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				fiA, err := os.Stat("/a/dir")
 				if err != nil {
 					t.Fatalf("Stat /a/dir: %v", err)
@@ -1368,7 +1368,7 @@ func TestDSTFSDualAliasDirCrashRecoveryCwdAndRemove(t *testing.T) {
 
 	t.Run("SingleRemoveAndCrossRenameCycleGuard", func(t *testing.T) {
 		simulation.Run(2, func() {
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				if err := os.MkdirAll("/a/empty", 0o755); err != nil {
 					t.Fatalf("MkdirAll /a/empty: %v", err)
 				}
@@ -1402,7 +1402,7 @@ func TestDSTFSDualAliasDirCrashRecoveryCwdAndRemove(t *testing.T) {
 			})
 
 			simulation.CrashHost("h")
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				if err := os.Chdir("/a/empty"); err != nil {
 					t.Fatalf("Chdir /a/empty: %v", err)
 				}

@@ -88,7 +88,7 @@ func TestDSTProcessNonLastExitPreservesSharedResources(t *testing.T) {
 		}()
 		addr := <-survivorReady
 		_, port, _ := net.SplitHostPort(addr)
-		target := net.JoinHostPort(HostIP("p"), port)
+		target := net.JoinHostPort("127.0.0.1", port)
 		targetReady := make(chan int, 1)
 		returnTarget := make(chan struct{})
 		probeChild := make(chan struct{})
@@ -209,7 +209,7 @@ func TestDSTProcessExitClosesConnsGracefully(t *testing.T) {
 	var payload string
 	var readErr, dialErr error
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			addrCh := make(chan string, 1)
 			srvErr := make(chan error, 2)
 			done := make(chan struct{})
@@ -271,7 +271,7 @@ func TestDSTProcessExitClosesConnsGracefully(t *testing.T) {
 func TestDSTProcessExitResetsConnWithUnreadData(t *testing.T) {
 	var srvReadErr error
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			addrCh := make(chan string, 1)
 			srvErr := make(chan error, 1)
 			written := make(chan struct{})
@@ -329,7 +329,7 @@ func TestDSTProcessExitResetsConnWithUnreadData(t *testing.T) {
 func TestDSTProcessExitLastInvocationScopesResources(t *testing.T) {
 	var midErr, afterErr error
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			addrCh := make(chan string, 1)
 			hold := make(chan struct{})
 			done := make(chan struct{})
@@ -385,7 +385,7 @@ func TestDSTProcessExitResetDeliversPreExitBytesThenResets(t *testing.T) {
 	RunWith(1, Options{Network: NetworkConfig{CrossHostLatency: 100 * time.Millisecond}}, func() {
 		addrCh := make(chan string, 1)
 		readDone := make(chan struct{})
-		Host("srv", HostConfig{}, func() {
+		Host("srv", func() {
 			go Process("server", func() {
 				l, err := net.Listen("tcp", HostIP("srv")+":0")
 				if err != nil {
@@ -409,7 +409,7 @@ func TestDSTProcessExitResetDeliversPreExitBytesThenResets(t *testing.T) {
 			})
 		})
 		addr := <-addrCh
-		Host("cli", HostConfig{}, func() {
+		Host("cli", func() {
 			go Process("client", func() {
 				c, err := net.Dial("tcp", addr)
 				if err != nil {

@@ -49,7 +49,7 @@ func mustOK(t *testing.T, what string, err error) {
 // onHost runs fn inside a fresh entry of host h (re-entering the same name keeps the
 // same tree, so a seed step and a later assertion step share a disk).
 func onHost(h string, fn func()) {
-	simulation.Host(h, simulation.HostConfig{}, fn)
+	simulation.Host(h, fn)
 }
 
 // TestDSTDiskEIOAllMediaOps: under FailDisk every read/pread/write/pwrite/fsync on
@@ -1262,7 +1262,7 @@ func TestDSTDiskEIOFsyncgateTornCrash(t *testing.T) {
 	for seed := uint64(1); seed <= 6; seed++ {
 		var got string
 		simulation.RunWith(seed, simulation.Options{CrashTear: true}, func() {
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				simulation.Process("db", func() {
 					f, err := os.Create("/f")
 					mustOK(t, "Create", err)
@@ -1292,7 +1292,7 @@ func TestDSTDiskEIOFsyncgateTornCrash(t *testing.T) {
 				})
 			})
 			simulation.CrashHost("h")
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				simulation.Process("db", func() {
 					data, err := os.ReadFile("/f")
 					mustOK(t, "read after crash", err)
@@ -1327,7 +1327,7 @@ func TestDSTFSSpecialModeBitsDurableAcrossCrash(t *testing.T) {
 		}
 	}
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				f, err := os.OpenFile("/named-file", os.O_CREATE|os.O_RDWR, wantFile)
 				mustOK(t, "create named file", err)
@@ -1362,7 +1362,7 @@ func TestDSTFSSpecialModeBitsDurableAcrossCrash(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", check)
 		})
 	})
@@ -1838,7 +1838,7 @@ func TestDSTDiskWritebackDeterminism(t *testing.T) {
 // medium-failure shape: readable the whole time, never durable.
 func TestDSTDiskWritebackPowerLoss(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("db", func() {
 				mustOK(t, "seed", os.WriteFile("/f", []byte("olddata!"), 0o644))
 				f, err := os.OpenFile("/f", os.O_RDWR, 0)
@@ -1863,7 +1863,7 @@ func TestDSTDiskWritebackPowerLoss(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("db2", func() {
 				got, err := os.ReadFile("/f")
 				mustOK(t, "read after reboot", err)

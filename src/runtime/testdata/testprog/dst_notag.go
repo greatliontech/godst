@@ -38,7 +38,7 @@ func DSTRunNoTag() {
 // cleanly and outside a run these calls must be no-ops.
 func DSTFaultAPINoTag() {
 	simulation.CrashHost("nohost")
-	simulation.Crash("noproc")
+	simulation.CrashProcess("nohost", "noproc")
 	simulation.Partition("a", "b")
 	os.Stdout.WriteString("fault api no-op\n")
 }

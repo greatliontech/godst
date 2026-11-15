@@ -348,8 +348,8 @@ func dstDialCut(dialer, target uint32) (cut, refuse bool) {
 	if target != dialer && !dstHostDeclaredQ(target) {
 		// The target address is owned by NO declared host: nothing answers
 		// its SYNs, so the dial blackholes exactly like a powered-off
-		// machine — until the retransmit horizon, a deadline, or a Host (or
-		// implicit-host Process) declaration boots a machine at the address
+		// machine — until the retransmit horizon, a deadline, or a Host
+		// declaration boots a machine at the address
 		// (the declaration relays host-up, waking parked dials). The
 		// dialer's own host is always declared; reachable only via a
 		// hand-constructed literal 10.x IP (HostIP panics on undeclared

@@ -26,11 +26,11 @@ func TestDSTHostConfigDocExample(t *testing.T) {
 	var h1IP string
 	Run(1, func() {
 		// The doc example, verbatim.
-		Host("h1", HostConfig{NumCPU: 4, Clock: Skew(50 * ms)}, func() {
+		HostWith("h1", HostConfig{NumCPU: 4, Clock: Skew(50 * ms)}, func() {
 			Process("p1", p1main) // shares h1's FS, IP, port space, clock
 			Process("p2", p2main)
 		})
-		Process("n3", n3main) // implicit dedicated host
+		Process("n3", n3main) // runs on the unnamed root host
 		h1IP = HostIP("h1")   // the deterministically assigned routable IP
 	})
 	if h1IP == "" {

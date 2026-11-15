@@ -43,12 +43,12 @@ func TestDSTProcessCallbacksStopAtExit(t *testing.T) {
 						body := func() {
 							if callback == "finalizer" {
 								func() {
-									x := new(int)
-									runtime.SetFinalizer(x, func(*int) { ran.Add(1) })
+									x := new([1024]byte)
+									runtime.SetFinalizer(x, func(*[1024]byte) { ran.Add(1) })
 								}()
 							} else {
 								func() {
-									x := new(int)
+									x := new([1024]byte)
 									runtime.AddCleanup(x, func(counter *atomic.Int32) { counter.Add(1) }, &ran)
 								}()
 							}
@@ -63,7 +63,7 @@ func TestDSTProcessCallbacksStopAtExit(t *testing.T) {
 						if crash {
 							go Process("worker", body)
 							<-ready
-							Crash("worker")
+							CrashProcess("", "worker")
 						} else {
 							Process("worker", body)
 							<-ready
@@ -95,8 +95,8 @@ func TestDSTProcessCallbackOwnershipIsPerInvocation(t *testing.T) {
 		go func() {
 			Process("worker", func() {
 				func() {
-					x := new(int)
-					runtime.SetFinalizer(x, func(*int) { exitedRan.Add(1) })
+					x := new([1024]byte)
+					runtime.SetFinalizer(x, func(*[1024]byte) { exitedRan.Add(1) })
 				}()
 				close(exitedReady)
 				<-releaseExited
@@ -105,8 +105,8 @@ func TestDSTProcessCallbackOwnershipIsPerInvocation(t *testing.T) {
 		}()
 		go Process("worker", func() {
 			func() {
-				x := new(int)
-				runtime.SetFinalizer(x, func(*int) { liveRan.Add(1) })
+				x := new([1024]byte)
+				runtime.SetFinalizer(x, func(*[1024]byte) { liveRan.Add(1) })
 			}()
 			close(liveReady)
 			<-releaseLive
@@ -139,8 +139,8 @@ func TestDSTProcessCrashStopsRunningCallback(t *testing.T) {
 		release := make(chan struct{})
 		go Process("worker", func() {
 			func() {
-				x := new(int)
-				runtime.SetFinalizer(x, func(*int) {
+				x := new([1024]byte)
+				runtime.SetFinalizer(x, func(*[1024]byte) {
 					close(started)
 					<-release
 					postCrash.Add(1)
@@ -152,7 +152,7 @@ func TestDSTProcessCrashStopsRunningCallback(t *testing.T) {
 		<-registered
 		runtime.GC()
 		<-started
-		Crash("worker")
+		CrashProcess("", "worker")
 		close(release)
 		time.Sleep(time.Millisecond)
 		if got := postCrash.Load(); got != 0 {
@@ -185,7 +185,7 @@ func TestDSTProcessCrashStopsRunningCleanup(t *testing.T) {
 		<-registered
 		runtime.GC()
 		<-started
-		Crash("worker")
+		CrashProcess("", "worker")
 		close(release)
 		time.Sleep(time.Millisecond)
 		if got := postCrash.Load(); got != 0 {
@@ -208,8 +208,8 @@ func TestDSTProcessExitStopsRunningCallback(t *testing.T) {
 		go func() {
 			Process("worker", func() {
 				func() {
-					x := new(int)
-					runtime.SetFinalizer(x, func(*int) {
+					x := new([1024]byte)
+					runtime.SetFinalizer(x, func(*[1024]byte) {
 						close(started)
 						<-release
 						postExit.Add(1)

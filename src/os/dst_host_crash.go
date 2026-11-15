@@ -34,10 +34,19 @@ func dstRestoreHostDiskFor(host uint32) {
 	if !dstFSActive() {
 		return
 	}
+	dstEnvHostTeardown(host)
 	dstFS.mu.Lock()
 	defer dstFS.mu.Unlock()
 	dstFSRoll()
 	dstCoarseRecord(dstCoarseNamespaceForHost(host), true)
+	// The working directories of the host's processes (including host root slot 0)
+	// live in the dead kernel's task structs and vanish on power loss even if the
+	// host never instantiated its disk tree.
+	for key := range dstFS.cwds {
+		if key[0] == host {
+			delete(dstFS.cwds, key)
+		}
+	}
 	disk := dstFS.disks[host]
 	if disk == nil {
 		return // the host never touched its filesystem: nothing to restore
@@ -88,14 +97,6 @@ func dstRestoreHostDiskFor(host uint32) {
 	for i := len(dstFS.backed) - 1; i >= 0; i-- {
 		if n := dstFS.backed[i]; n.disk == disk {
 			dstNodeMaybeReleaseLocked(n)
-		}
-	}
-	// The working directories of the host's processes are kernel state
-	// (per-process cwd lives in the task struct); a reboot starts every
-	// process at the root of the restored tree.
-	for key := range dstFS.cwds {
-		if key[0] == host {
-			delete(dstFS.cwds, key)
 		}
 	}
 }

@@ -16,16 +16,18 @@ const dstBuild = true
 // In untagged builds (dst_off.go), dstG is an empty struct{} embedded at a
 // non-trailing position, adding 0 bytes to runtime.g.
 //
-// Field ordering packs dstGCInternal and dstInternalGC alongside dstAccWrite,
-// and packs dstKernelDepth alongside the trailing bool flags, so dstG is
-// 72 bytes on 32-bit architectures and 96 bytes on 64-bit architectures.
+// Field ordering packs dstHost alongside dstProc, dstProcSlot alongside dstPid,
+// dstGCInternal and dstInternalGC alongside dstAccWrite, and dstKernelDepth
+// alongside the trailing bool flags, so dstG is 76 bytes on 32-bit
+// architectures and 96 bytes on 64-bit architectures.
 type dstG struct {
 	dstrand        uint64        // deterministic per-g RNG state for DST (testing/simulation); unused when DST off
 	dstPrio        int64         // DST PCT scheduling priority (higher runs first); unused when DST off or strategy != PCT
 	dstSeq         uint64        // DST stable per-bubble goroutine creation index+1 (0 = unassigned); canonicalizes Random/PCT choices and scheduled replay
 	dstHost        uint32        // DST host identity (0 = root/default host); set by testing/simulation.Host, inherited parent→child at newproc1
+	dstProc        uint32        // DST logical process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1
 	dstHostScope   *dstHostScope // DST immutable entered-Host ancestry; inherited parent→child so CrashHost can find nested root-process threads after dstHost changes
-	dstProc        uint32        // DST process identity (0 = root/default process); set by testing/simulation.Process, inherited parent→child at newproc1
+	dstProcSlot    uint32        // DST per-invocation process resource/env slot (0 = root/default); monotonic per run and reset on run teardown
 	dstPid         int32         // DST per-process simulated pid (os.Getpid); set per-invocation by testing/simulation.Process, inherited parent→child at newproc1
 	dstAccAddr     uintptr       // DST pending memory-access address for the next transition (0 = none); set by dstAccessYield, recorded at the scheduling decision for DPOR
 	dstAccSize     uintptr       // DST pending memory-access size in bytes; paired with dstAccAddr for interval-overlap dependencies

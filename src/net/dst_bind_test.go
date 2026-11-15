@@ -25,12 +25,12 @@ func TestDSTNetDialLocalAddrRejectsForeignHostIP(t *testing.T) {
 	var dialErr error
 	simulation.Run(1, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("A")), Port: 35000}}
 			_, dialErr = d.Dial("tcp", simulation.HostIP("A")+":"+<-port)
 		})
@@ -49,7 +49,7 @@ func TestDSTNetDialLocalBindConflictPrecedesPartitionWait(t *testing.T) {
 	simulation.Run(1, func() {
 		port := make(chan string, 1)
 		accepted := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
@@ -59,7 +59,7 @@ func TestDSTNetDialLocalBindConflictPrecedesPartitionWait(t *testing.T) {
 				defer c.Close()
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			target := simulation.HostIP("A") + ":" + <-port
 			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
 			first, err := d.Dial("tcp", target)
@@ -87,12 +87,12 @@ func TestDSTNetPendingLocalBindReservedAndReleased(t *testing.T) {
 	var secondDuration time.Duration
 	simulation.Run(1, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			target := simulation.HostIP("A") + ":" + <-port
 			simulation.Partition("A", "B")
 			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
@@ -131,12 +131,12 @@ func TestDSTNetPendingLocalBindReleasedOnProcessCrash(t *testing.T) {
 	var retryErr error
 	simulation.Run(1, func() {
 		port := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			target := simulation.HostIP("A") + ":" + <-port
 			simulation.Partition("A", "B")
 			started := make(chan struct{})
@@ -147,7 +147,7 @@ func TestDSTNetPendingLocalBindReleasedOnProcessCrash(t *testing.T) {
 			})
 			<-started
 			time.Sleep(time.Nanosecond)
-			simulation.Crash("worker")
+			simulation.CrashProcess("B", "worker")
 			simulation.Process("replacement", func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 				defer cancel()
@@ -170,12 +170,12 @@ func TestDSTNetPendingLocalBindReleasedOnHostReboot(t *testing.T) {
 		port := make(chan string, 1)
 		started := make(chan struct{})
 		var target string
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			target = simulation.HostIP("A") + ":" + <-port
 			simulation.Partition("A", "B")
 			go simulation.Process("worker", func() {
@@ -187,7 +187,7 @@ func TestDSTNetPendingLocalBindReleasedOnHostReboot(t *testing.T) {
 		<-started
 		time.Sleep(time.Nanosecond)
 		simulation.CrashHost("B")
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 			defer cancel()
 			d := Dialer{LocalAddr: &TCPAddr{IP: ParseIP(simulation.HostIP("B")), Port: 35000}}
@@ -208,12 +208,12 @@ func TestDSTNetPendingLocalBindVisibleToListenerAndEphemeralDial(t *testing.T) {
 	simulation.Run(1, func() {
 		aPort := make(chan string, 1)
 		cPort := make(chan string, 1)
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			aPort <- p
 		})
-		simulation.Host("C", simulation.HostConfig{}, func() {
+		simulation.Host("C", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			cPort <- p
@@ -224,7 +224,7 @@ func TestDSTNetPendingLocalBindVisibleToListenerAndEphemeralDial(t *testing.T) {
 				}
 			}()
 		})
-		simulation.Host("B", simulation.HostConfig{}, func() {
+		simulation.Host("B", func() {
 			targetA := simulation.HostIP("A") + ":" + <-aPort
 			targetC := simulation.HostIP("C") + ":" + <-cPort
 			simulation.Partition("A", "B")
@@ -267,7 +267,7 @@ func TestDSTNetWildcardLocalAddrConflictsAcrossHostAddresses(t *testing.T) {
 	simulation.Run(1, func() {
 		remotePort := make(chan string, 1)
 		releaseRemote := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			remotePort <- p
@@ -277,7 +277,7 @@ func TestDSTNetWildcardLocalAddrConflictsAcrossHostAddresses(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("H", simulation.HostConfig{}, func() {
+		simulation.Host("H", func() {
 			loopback, _ := Listen("tcp", "127.0.0.1:0")
 			defer loopback.Close()
 			target := simulation.HostIP("A") + ":" + <-remotePort
@@ -317,7 +317,7 @@ func TestDSTNetEstablishedWildcardBindBlocksConcreteAddress(t *testing.T) {
 	simulation.Run(1, func() {
 		remotePort := make(chan string, 1)
 		releaseRemote := make(chan struct{})
-		simulation.Host("A", simulation.HostConfig{}, func() {
+		simulation.Host("A", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			remotePort <- p
@@ -327,7 +327,7 @@ func TestDSTNetEstablishedWildcardBindBlocksConcreteAddress(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("H", simulation.HostConfig{}, func() {
+		simulation.Host("H", func() {
 			loopback, _ := Listen("tcp", "127.0.0.1:0")
 			defer loopback.Close()
 			target := simulation.HostIP("A") + ":" + <-remotePort
@@ -460,9 +460,9 @@ func TestDSTNetEphemeralAllocatorsAreHostScoped(t *testing.T) {
 				return lp, dp
 			}
 			if priorA {
-				simulation.Host("A", simulation.HostConfig{}, func() { allocate("A") })
+				simulation.Host("A", func() { allocate("A") })
 			}
-			simulation.Host("B", simulation.HostConfig{}, func() {
+			simulation.Host("B", func() {
 				listenPort, dialPort = allocate("B")
 			})
 		})
@@ -484,7 +484,7 @@ func TestDSTNetEphemeralAllocatorSharedByHostProcesses(t *testing.T) {
 	}
 	var ports []int
 	simulation.Run(1, func() {
-		simulation.Host("H", simulation.HostConfig{}, func() {
+		simulation.Host("H", func() {
 			for _, process := range []string{"p1", "p2"} {
 				simulation.Process(process, func() {
 					ln, err := Listen("tcp", ":0")
@@ -511,7 +511,7 @@ func TestDSTNetEphemeralAllocatorSharedByHostProcesses(t *testing.T) {
 func dstBindTestTarget() (addr string, cleanup func()) {
 	var ln Listener
 	ready := make(chan struct{})
-	simulation.Host("srv", simulation.HostConfig{}, func() {
+	simulation.Host("srv", func() {
 		ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 		close(ready)
 	})
@@ -531,7 +531,7 @@ func TestDSTNetDialLocalBindListenerPortEADDRINUSE(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 
 			exact, _ := Listen("tcp", simulation.HostIP("cli")+":33000") // occupies cli:33000 exactly
@@ -565,7 +565,7 @@ func TestDSTNetEphemeralDialSkipsListenerPort(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			squat, _ := Listen("tcp", simulation.HostIP("cli")+":40000") // the allocator's first pick
 			defer squat.Close()
 			c, err := Dial("tcp", target)
@@ -596,7 +596,7 @@ func TestDSTNetListenConnPortEADDRINUSE(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 			// Occupy cli:10000 with a dialer-end conn — inside the LISTENER
 			// allocator's range, so the allocation probe below must skip it.
@@ -643,7 +643,7 @@ func TestDSTNetDialerTimeWaitEADDRINUSE(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
 			c, err := d.Dial("tcp", target)
@@ -678,7 +678,7 @@ func TestDSTNetListenerBindsOverTimeWait(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
 			c, err := d.Dial("tcp", target)
@@ -712,7 +712,7 @@ func TestDSTNetAcceptedEndTimeWaitEADDRINUSE(t *testing.T) {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
 		done := make(chan struct{})
-		simulation.Host("app", simulation.HostConfig{}, func() {
+		simulation.Host("app", func() {
 			me := ParseIP(simulation.HostIP("app"))
 			self := simulation.HostIP("app")
 			ln, err := Listen("tcp", self+":21000")
@@ -755,7 +755,7 @@ func TestDSTNetPassiveCloseSkipsTimeWait(t *testing.T) {
 	simulation.Run(1, func() {
 		var ln Listener
 		ready := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			go func() {
 				c, err := ln.Accept()
@@ -768,7 +768,7 @@ func TestDSTNetPassiveCloseSkipsTimeWait(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 			target := simulation.HostIP("srv") + ":20000"
 			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
@@ -802,7 +802,7 @@ func TestDSTNetRSTCloseSkipsTimeWait(t *testing.T) {
 		var ln Listener
 		ready := make(chan struct{})
 		sent := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			go func() {
 				c, err := ln.Accept()
@@ -816,7 +816,7 @@ func TestDSTNetRSTCloseSkipsTimeWait(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			me := ParseIP(simulation.HostIP("cli"))
 			target := simulation.HostIP("srv") + ":20000"
 			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
@@ -852,7 +852,7 @@ func TestDSTNetEphemeralChurnOutlivesTimeWait(t *testing.T) {
 	simulation.Run(1, func() {
 		var ln Listener
 		ready := make(chan struct{})
-		simulation.Host("sink", simulation.HostConfig{}, func() {
+		simulation.Host("sink", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("sink")+":20000")
 			go func() {
 				// Drain the backlog but KEEP the accepted ends open, so the
@@ -868,7 +868,7 @@ func TestDSTNetEphemeralChurnOutlivesTimeWait(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			target := simulation.HostIP("sink") + ":20000"
 			const span = dstDialEphemeralEnd - dstDialEphemeralStart + 1
 			for i := 0; i < span+100; i++ {
@@ -898,7 +898,7 @@ func TestDSTNetTimeWaitDeadEndsHoldNothing(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			host, _ := dstNetCurrentNode()
 			me := ParseIP(simulation.HostIP("cli"))
 
@@ -943,7 +943,7 @@ func TestDSTNetHostCrashClearsTimeWait(t *testing.T) {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
 		held := make(chan struct{})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			go simulation.Process("app", func() {
 				me := ParseIP(simulation.HostIP("cli"))
 				d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
@@ -959,7 +959,7 @@ func TestDSTNetHostCrashClearsTimeWait(t *testing.T) {
 		<-held
 		simulation.CrashHost("cli") // power loss: the kernel's TIME_WAIT table dies with it
 		rebootDone := make(chan struct{})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			go simulation.Process("app", func() {
 				me := ParseIP(simulation.HostIP("cli"))
 				d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
@@ -994,7 +994,7 @@ func TestDSTNetSimultaneousCloseBothHold(t *testing.T) {
 	simulation.Run(1, func() {
 		target, cleanup := dstBindTestTarget()
 		defer cleanup()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			host, _ := dstNetCurrentNode()
 			me := ParseIP(simulation.HostIP("cli"))
 			d := Dialer{LocalAddr: &TCPAddr{IP: me, Port: 33000}}
@@ -1041,7 +1041,7 @@ func TestDSTNetRelistenWithAcceptedConns(t *testing.T) {
 		port := make(chan string, 1)
 		dialed := make(chan struct{})
 		result := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", simulation.HostIP("srv")+":30000")
 			port <- "30000"
 			go func() {
@@ -1056,7 +1056,7 @@ func TestDSTNetRelistenWithAcceptedConns(t *testing.T) {
 				c.Close()
 			}()
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			c, err := Dial("tcp", simulation.HostIP("srv")+":"+<-port)
 			if err != nil {
 				panic(err)
@@ -1089,13 +1089,13 @@ func TestDSTNetBacklogFullDialTimesOut(t *testing.T) {
 	simulation.RunWith(1, opts, func() {
 		var ln Listener
 		ready := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			close(ready)
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			target := simulation.HostIP("srv") + ":20000"
 			backlog := cap(ln.(*dstListener).accept)
 			for i := 0; i < backlog; i++ { // saturate the backlog
@@ -1162,7 +1162,7 @@ func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 		ready := make(chan struct{})
 		closed := make(chan struct{})
 		readDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			close(ready)
 			go func() {
@@ -1175,7 +1175,7 @@ func TestDSTNetCloseWithUnreadDataResetsPeer(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
 			if err != nil {
 				panic(err)
@@ -1213,7 +1213,7 @@ func TestDSTNetCloseAfterDrainingFINs(t *testing.T) {
 		ready := make(chan struct{})
 		closed := make(chan struct{})
 		readDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			close(ready)
 			go func() {
@@ -1229,7 +1229,7 @@ func TestDSTNetCloseAfterDrainingFINs(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
 			if err != nil {
 				panic(err)
@@ -1267,7 +1267,7 @@ func TestDSTNetCloseBeforeDeliveryStillResets(t *testing.T) {
 		ready := make(chan struct{})
 		closed := make(chan struct{})
 		readDone := make(chan struct{})
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ = Listen("tcp", simulation.HostIP("srv")+":20000")
 			close(ready)
 			go func() {
@@ -1282,7 +1282,7 @@ func TestDSTNetCloseBeforeDeliveryStillResets(t *testing.T) {
 		})
 		<-ready
 		defer ln.Close()
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			c, err := Dial("tcp", simulation.HostIP("srv")+":20000")
 			if err != nil {
 				panic(err)
@@ -1311,7 +1311,7 @@ func TestDSTNetListenPortAllocatorWrapsAndReclaims(t *testing.T) {
 	}
 	var ports []string
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			first, err := Listen("tcp", ":0") // closed below, reclaimed on wrap
 			if err != nil {
 				panic(err)
@@ -1357,7 +1357,7 @@ func TestDSTNetListenPortExhaustionEADDRINUSE(t *testing.T) {
 	}
 	var exhaustErr error
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			me := simulation.HostIP("h")
 			lns := make([]Listener, 0, 65535-10000+1)
 			for port := 10000; port <= 65535; port++ {

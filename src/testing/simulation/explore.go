@@ -49,9 +49,12 @@ type Failure struct {
 	// observed. Replaying a race first found before promotion convergence requires these
 	// in addition to Schedule, because TSan dedups race reports process-wide.
 	AccessForces []AccessForce
+	// Err is non-empty iff sut returned a non-nil error while executing this
+	// schedule (an assertion failure).
+	Err string
 	// Race is true iff the -race detector reported a NEW data race during this
 	// schedule's run (the D5 oracle). False means the failure is a SUT assertion
-	// (sut returned true), a SUT panic (Panic != ""), or a synctest deadlock
+	// (Err != ""), a SUT panic (Panic != ""), or a synctest deadlock
 	// (Deadlock != ""). In a non-race build Race is always false. The detector
 	// dedups by signature, so each distinct race yields exactly one Race failure:
 	// the first schedule that exhibits it.
@@ -74,14 +77,12 @@ type Failure struct {
 	// a prefix divergence aborts loudly, while a divergence that keeps
 	// every prefix entry enabled remains undetected (Failure carries no
 	// enabled sets): a silently different interleaving can report
-	// failed=false.
+	// Failed()==false.
 	ForeignSched bool
-	// CrashTear records whether the exploration that found this failure was
-	// tearing host crashes (ExploreOptions.CrashTear). Replay restores the same
-	// policy: the fault RNG draws that shaped the wreckage are part of the
-	// execution, so a failure found under a torn crash reproduces only under one
-	// (DST-FAULT-REPLAY).
-	CrashTear bool
+	// Options records the simulation environment, network, memory, wedge, and
+	// CrashTear configuration under which this failure was discovered so Replay
+	// restores the identical execution parameters (DST-FAULT-REPLAY).
+	Options Options
 	// MaxSteps, MaxAccesses, and MaxEdges record the ExploreOptions trace budgets
 	// under which this failure was discovered so Replay initializes the runtime's
 	// live shared-address filter and trace tables to the identical capacities
@@ -93,12 +94,26 @@ type Failure struct {
 	diagnostics string
 }
 
+// ReplayResult reports the outcome of a single Replay execution.
+type ReplayResult struct {
+	// Err is the error returned by sut, or nil if sut succeeded.
+	Err error
+	// Raced is true iff the -race detector reported a new data race during
+	// this replay.
+	Raced bool
+}
+
+// Failed reports whether the replay exhibited an assertion failure or a data race.
+func (r ReplayResult) Failed() bool {
+	return r.Err != nil || r.Raced
+}
+
 // ExploreResult reports an Explore run.
 type ExploreResult struct {
 	// Schedules is the number of interleavings actually explored.
 	Schedules int
 	// Failures lists every explored interleaving that exhibited a bug: the SUT returned
-	// true (an assertion failure), panicked (Failure.Panic), deadlocked
+	// a non-nil error (Failure.Err), panicked (Failure.Panic), deadlocked
 	// (Failure.Deadlock), or the -race detector reported a new data race
 	// (Failure.Race; see D5), each with its replay metadata.
 	Failures []Failure
@@ -158,20 +173,20 @@ type ExploreResult struct {
 	Uninstrumented bool
 }
 
-// ExploreOptions configures ExploreWith. The zero value is exhaustive exploration
-// with the implementation's internal trace budgets and no caller-imposed cap.
+// ExploreOptions configures ExploreWith. It embeds Options so explored schedules
+// and their Replay runs carry the same simulated identity, PidMax, MemoryLimit,
+// NetworkConfig, CrashTear, and wedge bounds as RunWith and TestWith (the
+// embedded Strategy/Depth/Steps fields are validated but ignored by Explore's
+// systematic scheduler). The zero value is exhaustive exploration with default
+// simulation options, internal trace budgets, and no caller-imposed cap.
 type ExploreOptions struct {
+	Options
 	// Mode selects the exploration algorithm: Exhaustive or DPOR. The zero value is
 	// Exhaustive, matching Explore's explicit mode argument.
 	Mode ExploreMode
 	// MaxSchedules, if > 0, stops after exploring this many schedules and reports
 	// BudgetHit unless the interleaving space is exhausted exactly at that boundary.
 	MaxSchedules int
-	// CrashTear makes CrashHost tear at page granularity rather than losing every
-	// unsynced byte, exactly as Options.CrashTear does for Run. Each explored
-	// schedule draws its crash outcomes from the per-bubble fault RNG, so a
-	// schedule that finds a crash-recovery bug replays it exactly.
-	CrashTear bool
 	// MaxSteps, if > 0, bounds the scheduling decisions recorded in any one run.
 	// Hitting it reports BudgetHit rather than silently treating the truncated trace
 	// as exhausted.
@@ -230,7 +245,45 @@ func (f *ExploreFootprint) foldPeaks(o ExploreFootprint) {
 // measured arc-scale footprint.
 const exploreBudgetClamp = 1<<30 - 1
 
+type exploreRunParams struct {
+	hostname       string
+	pid            int
+	numcpu         int
+	pidmax         int
+	memLimit       int64
+	latencyNs      int64
+	jitterNs       int64
+	bandwidth      int64
+	sendBuf        int64
+	retransNs      int64
+	crashTear      bool
+	wedgeDecisions int64
+	wedgeWallNs    int64
+}
+
+func resolveExploreRunParams(api string, opts Options) exploreRunParams {
+	_, _, _, hostname, pid, numcpu, pidmax := runOptions(api, opts)
+	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig(api, opts.Network)
+	return exploreRunParams{
+		hostname:       hostname,
+		pid:            pid,
+		numcpu:         numcpu,
+		pidmax:         pidmax,
+		memLimit:       opts.MemoryLimit,
+		latencyNs:      latencyNs,
+		jitterNs:       jitterNs,
+		bandwidth:      bandwidth,
+		sendBuf:        sendBuf,
+		retransNs:      retransNs,
+		crashTear:      opts.CrashTear,
+		wedgeDecisions: opts.WedgeDecisionLimit,
+		wedgeWallNs:    opts.WedgeWallLimit.Nanoseconds(),
+	}
+}
+
 type exploreConfig struct {
+	opts            Options
+	params          exploreRunParams
 	maxDecisions    int
 	maxEnabledTotal int
 	maxEdges        int
@@ -250,6 +303,7 @@ const (
 
 func defaultExploreConfig() exploreConfig {
 	return exploreConfig{
+		params:          resolveExploreRunParams("Run", Options{}),
 		maxDecisions:    exploreMaxDecisions,
 		maxEnabledTotal: exploreMaxEnabledTotal,
 		maxEdges:        exploreMaxEdges,
@@ -258,7 +312,13 @@ func defaultExploreConfig() exploreConfig {
 }
 
 func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
+	return exploreConfigForAPI("ExploreWith", opts)
+}
+
+func exploreConfigForAPI(api string, opts ExploreOptions) exploreConfig {
 	cfg := defaultExploreConfig()
+	cfg.opts = opts.Options
+	cfg.params = resolveExploreRunParams(api, opts.Options)
 	cfg.maxSchedules = opts.MaxSchedules
 	cfg.maxSteps = opts.MaxSteps
 	if opts.MaxSteps > 0 {
@@ -286,8 +346,8 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 }
 
 // Explore systematically explores the sound interleavings of sut under seed. sut
-// returns true iff THIS interleaving exhibited a bug (a failed assertion); Explore
-// records every such schedule. The seed fixes the program's data randomness
+// returns a non-nil error iff THIS interleaving exhibited a bug (a failed assertion);
+// Explore records every such schedule. The seed fixes the program's data randomness
 // (select/map/math+crypto rand); the interleaving is controlled by Explore,
 // independent of the seed. Requires building with -tags dst (and -race to also use
 // the happens-before detector as an oracle within each interleaving). Explore is a
@@ -310,22 +370,22 @@ func exploreConfigFromOptions(opts ExploreOptions) exploreConfig {
 // wrappers. An outcome-determining atomic
 // reached only through those forms may under-explore even when Exhausted
 // reports true.
-func Explore(seed uint64, mode ExploreMode, sut func() bool) ExploreResult {
+func Explore(seed uint64, mode ExploreMode, sut func() error) ExploreResult {
 	return ExploreWith(seed, ExploreOptions{Mode: mode}, sut)
 }
 
-// ExploreWith is Explore with caller-supplied exploration budgets. Budgeted runs
-// report BudgetHit and never report Exhausted for truncated coverage. It has the
-// same process-global non-overlap restriction as Explore.
-func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResult {
+// ExploreWith is Explore with caller-supplied exploration budgets and Options.
+// Budgeted runs report BudgetHit and never report Exhausted for truncated coverage.
+// It has the same process-global non-overlap restriction as Explore.
+func ExploreWith(seed uint64, opts ExploreOptions, sut func() error) ExploreResult {
 	if opts.Mode != Exhaustive && opts.Mode != DPOR {
 		panic("testing/simulation: ExploreWith unknown ExploreMode")
 	}
+	cfg := exploreConfigForAPI("ExploreWith", opts)
 	enterSimulation("Explore", "testing/simulation: Explore requires building with -tags dst")
 	defer leaveSimulation()
-	setCrashTear(opts.CrashTear)
-	dstSetWedgeLimits(0, 0) // exploration runs carry the default wedge bounds
-	cfg := exploreConfigFromOptions(opts)
+	setCrashTear(cfg.params.crashTear)
+	dstSetWedgeLimits(cfg.params.wedgeDecisions, cfg.params.wedgeWallNs)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	var res ExploreResult
 	if opts.Mode == DPOR {
@@ -334,6 +394,7 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 		res = exhaustiveExplore(seed, sut, cfg)
 	}
 	for i := range res.Failures {
+		res.Failures[i].Options = opts.Options
 		res.Failures[i].MaxSteps = opts.MaxSteps
 		res.Failures[i].MaxAccesses = opts.MaxAccesses
 		res.Failures[i].MaxEdges = opts.MaxEdges
@@ -341,29 +402,28 @@ func ExploreWith(seed uint64, opts ExploreOptions, sut func() bool) ExploreResul
 	return res
 }
 
-// Replay executes sut once under failure's recorded schedule and access-force set.
-// It returns the SUT assertion verdict and whether the race detector reported a new
-// race during this replay. For race failures, run Replay in a fresh process if the
-// same process already observed that race, because TSan dedups reports by signature.
-// Replay is a process-global simulation operation and must not overlap any other
-// simulation operation in one process.
+// Replay executes sut once under failure's recorded schedule, Options, and
+// access-force set. It returns sut's error verdict and whether the race detector
+// reported a new race during this replay. For race failures, run Replay in a fresh
+// process if the same process already observed that race, because TSan dedups
+// reports by signature. Replay is a process-global simulation operation and must
+// not overlap any other simulation operation in one process.
 //
-// raced reports whether the race detector fired during the replay; it does not
-// verify the replayed race is the SAME race the original exploration found. A
-// different (new) race also reports raced=true — confirm specific races in a
-// fresh process, where the detector's per-process dedup cannot suppress them.
-func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) {
-	enterSimulation("Replay", "testing/simulation: Replay requires building with -tags dst")
-	defer leaveSimulation()
-	// The crash policy is part of the execution the failure recorded: replaying a
-	// torn crash untorn would restore a different disk and not reproduce.
-	setCrashTear(failure.CrashTear)
-	dstSetWedgeLimits(0, 0) // replays carry the default wedge bounds
-	cfg := exploreConfigFromOptions(ExploreOptions{
+// ReplayResult.Raced reports whether the race detector fired during the replay;
+// it does not verify the replayed race is the SAME race the original exploration
+// found. A different (new) race also reports Raced=true — confirm specific races
+// in a fresh process, where the detector's per-process dedup cannot suppress them.
+func Replay(seed uint64, failure Failure, sut func() error) ReplayResult {
+	cfg := exploreConfigForAPI("Replay", ExploreOptions{
+		Options:     failure.Options,
 		MaxSteps:    failure.MaxSteps,
 		MaxAccesses: failure.MaxAccesses,
 		MaxEdges:    failure.MaxEdges,
 	})
+	enterSimulation("Replay", "testing/simulation: Replay requires building with -tags dst")
+	defer leaveSimulation()
+	setCrashTear(cfg.params.crashTear)
+	dstSetWedgeLimits(cfg.params.wedgeDecisions, cfg.params.wedgeWallNs)
 	dstExploreInit(cfg.maxDecisions, cfg.maxEnabledTotal, cfg.maxEdges, cfg.maxAccesses)
 	r := runOnceResultLocked(seed, failure.Schedule, accessForceMap(failure.AccessForces), sut, cfg, failure.ForeignSched)
 	if r.panic != "" {
@@ -372,7 +432,7 @@ func Replay(seed uint64, failure Failure, sut func() bool) (failed, raced bool) 
 	if r.deadlock != "" {
 		panic(r.deadlock)
 	}
-	return r.failed, r.raceCount > 0
+	return ReplayResult{Err: r.err, Raced: r.raceCount > 0}
 }
 
 // exploreTrace is one scheduled run's recorded decision trace, copied out of the
@@ -476,8 +536,26 @@ func cloneAccessForces(forces map[accessForce]bool) []AccessForce {
 	return out
 }
 
-func newFailure(prefix []uint64, raced bool, panicMsg, deadlockMsg string, forces map[accessForce]bool) Failure {
-	return Failure{Schedule: clonePrefix(prefix), AccessForces: cloneAccessForces(forces), Race: raced, Panic: panicMsg, Deadlock: deadlockMsg, CrashTear: crashTearEnabled()}
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	if s := err.Error(); s != "" {
+		return s
+	}
+	return "<non-nil error>"
+}
+
+func newFailure(prefix []uint64, errMsg string, raced bool, panicMsg, deadlockMsg string, forces map[accessForce]bool, opts Options) Failure {
+	return Failure{
+		Schedule:     clonePrefix(prefix),
+		AccessForces: cloneAccessForces(forces),
+		Err:          errMsg,
+		Race:         raced,
+		Panic:        panicMsg,
+		Deadlock:     deadlockMsg,
+		Options:      opts,
+	}
 }
 
 func installAccessForces(forces map[accessForce]bool) {
@@ -498,12 +576,12 @@ func installAccessForces(forces map[accessForce]bool) {
 
 // runOnce runs sut once under the scheduled strategy following prefix, with the
 // current forced access-yield watchpoints installed, and copies out the recorded
-// trace. failed is sut's verdict for this interleaving; raced is true iff the -race
+// trace. err is sut's verdict for this interleaving; raced is true iff the -race
 // detector reported at least one NEW data race during this run (D5 oracle; always
 // false in a non-race build — dstRaceErrors returns 0). It is kept for white-box
-// tests; Explore uses runOnceResult so it can report panic failures and multiple
-// new races separately.
-func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool) (failed, raced bool, tr exploreTrace) {
+// tests; Explore uses runOnceResultLocked so it can report panic failures and
+// multiple new races separately.
+func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() error) (err error, raced bool, tr exploreTrace) {
 	r := runOnceResult(seed, prefix, forces, sut, defaultExploreConfig())
 	if r.panic != "" {
 		panic(r.panic)
@@ -511,11 +589,11 @@ func runOnce(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func
 	if r.deadlock != "" {
 		panic(r.deadlock)
 	}
-	return r.failed, r.raceCount > 0, r.tr
+	return r.err, r.raceCount > 0, r.tr
 }
 
 type runResult struct {
-	failed    bool
+	err       error
 	raceCount int
 	panic     string
 	deadlock  string
@@ -541,23 +619,20 @@ func panicString(v any) string {
 	}
 }
 
-func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig) (out runResult) {
+func runOnceResult(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() error, cfg exploreConfig) (out runResult) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
-	// Admitted: publish the crash policy like every entry point — the default,
-	// as this internal entry carries no options — so it never inherits the
-	// previous run's setting.
-	setCrashTear(false)
-	dstSetWedgeLimits(0, 0)
+	setCrashTear(cfg.params.crashTear)
+	dstSetWedgeLimits(cfg.params.wedgeDecisions, cfg.params.wedgeWallNs)
 	return runOnceResultLocked(seed, prefix, forces, sut, cfg, false)
 }
 
-func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() bool, cfg exploreConfig, originForeign bool) (out runResult) {
+func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bool, sut func() error, cfg exploreConfig, originForeign bool) (out runResult) {
 	racesBefore := dstRaceErrors()
 	installAccessForces(forces)
-	var failed bool
+	var runErr error
 	defer func() {
-		out.failed = failed
+		out.err = runErr
 		out.raceCount = dstRaceErrors() - racesBefore
 		if out.raceCount < 0 {
 			out.raceCount = 0
@@ -585,11 +660,8 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 			}
 		}
 	}()
-	// The scheduled-replay strategy carries no network config (latency/jitter/bandwidth
-	// are 0, as everywhere here); take the send-buffer/retransmit DEFAULTS from the one
-	// source of truth (resolveNetConfig) so a default change can't silently desync them.
-	_, _, _, defSendBuf, defRetransNs := resolveNetConfig("Explore replay", NetworkConfig{})
-	runLocked(seed, kindScheduled, 0, 0, defaultHostname, defaultPID, defaultNumCPU, 0, 0, 0, 0, 0, defSendBuf, defRetransNs, prefix, false, func() {
+	p := cfg.params
+	runLocked(seed, kindScheduled, 0, 0, p.hostname, p.pid, p.numcpu, p.pidmax, p.memLimit, p.latencyNs, p.jitterNs, p.bandwidth, p.sendBuf, p.retransNs, prefix, false, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
 				if pv, ok := dstExplorePanicFP(); ok {
@@ -599,7 +671,7 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 				}
 			}
 		}()
-		failed = sut()
+		runErr = sut()
 	})
 	return out
 }
@@ -684,7 +756,7 @@ func copyExploreTrace(stepBudget bool) (tr exploreTrace) {
 // exhaustiveExplore enumerates every distinct interleaving by DFS over the
 // scheduling-decision tree: each run reveals its decisions, and every not-taken
 // enabled goroutine at every free decision is queued as a child prefix.
-func exhaustiveExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
+func exhaustiveExplore(seed uint64, sut func() error, cfg exploreConfig) ExploreResult {
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
 	totalSchedules := 0
@@ -804,7 +876,7 @@ func explorePassConfig(cfg exploreConfig, schedules int) (exploreConfig, bool) {
 	return cfg, true
 }
 
-func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
+func exhaustiveExplorePass(seed uint64, sut func() error, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	var res ExploreResult
 	visited := map[string]bool{}
 	// Each queued prefix carries the parent trace's enabled sets over its length
@@ -844,7 +916,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 		if tr.foreignSched {
 			res.ForeignSched = true
 		}
-		appendRunFailures(&res, prefix, forces, r)
+		appendRunFailures(&res, prefix, forces, r, cfg.opts)
 		if tr.traceTruncated {
 			// The decision trace stopped recording (caller step budget or
 			// fan-out capacity): decisions beyond the truncation are
@@ -872,7 +944,7 @@ func exhaustiveExplorePass(seed uint64, sut func() bool, forces map[accessForce]
 	return res, false
 }
 
-func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult) {
+func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessForce]bool, r runResult, opts Options) {
 	start := len(res.Failures)
 	defer func() {
 		if len(res.Failures) == start {
@@ -888,21 +960,21 @@ func appendRunFailures(res *ExploreResult, prefix []uint64, forces map[accessFor
 			res.Failures[i].diagnostics = diag
 		}
 	}()
-	if r.failed {
-		res.Failures = append(res.Failures, newFailure(prefix, false, "", "", forces))
+	if r.err != nil {
+		res.Failures = append(res.Failures, newFailure(prefix, errString(r.err), false, "", "", forces, opts))
 	}
 	if r.tr.foreignSched {
 		res.UnattributedRaces += r.raceCount
 	} else {
 		for i := 0; i < r.raceCount; i++ {
-			res.Failures = append(res.Failures, newFailure(prefix, true, "", "", forces))
+			res.Failures = append(res.Failures, newFailure(prefix, "", true, "", "", forces, opts))
 		}
 	}
 	if r.panic != "" {
-		res.Failures = append(res.Failures, newFailure(prefix, false, r.panic, "", forces))
+		res.Failures = append(res.Failures, newFailure(prefix, "", false, r.panic, "", forces, opts))
 	}
 	if r.deadlock != "" {
-		res.Failures = append(res.Failures, newFailure(prefix, false, "", r.deadlock, forces))
+		res.Failures = append(res.Failures, newFailure(prefix, "", false, "", r.deadlock, forces, opts))
 	}
 }
 
@@ -1074,7 +1146,7 @@ type dporFrame struct {
 // creation prefixes. Race-enabled DPOR therefore uses conservative all-enabled
 // backtracking at each observed conflict anchor and disables sleep sets; the non-race
 // sweep keeps the full source-DPOR + sleep-set algorithm and its optimality guard.
-func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
+func dporExplore(seed uint64, sut func() error, cfg exploreConfig) ExploreResult {
 	// Level-2 event floor for the completeness claim: if this build has no
 	// dst-race auto-instrumentation, the whole exploration fires no manual
 	// hook, AND the schedule tree held at least one real concurrency choice
@@ -1118,7 +1190,7 @@ func dporExplore(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult 
 	return res
 }
 
-func dporExploreRun(seed uint64, sut func() bool, cfg exploreConfig) ExploreResult {
+func dporExploreRun(seed uint64, sut func() error, cfg exploreConfig) ExploreResult {
 	forces := map[accessForce]bool{}
 	var carriedRace []Failure
 	totalSchedules := 0
@@ -1161,7 +1233,7 @@ func dporExploreRun(seed uint64, sut func() bool, cfg exploreConfig) ExploreResu
 	}
 }
 
-func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
+func dporExplorePass(seed uint64, sut func() error, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	if dstRaceEnabledFP() {
 		// The race-enabled path runs conservative all-enabled backtracking
 		// with sleep sets disabled (see dporExplore's doc), so exploration
@@ -1210,7 +1282,7 @@ func dporExplorePass(seed uint64, sut func() bool, forces map[accessForce]bool, 
 		if tr.foreignSched {
 			res.ForeignSched = true
 		}
-		appendRunFailures(&res, prefix, forces, r)
+		appendRunFailures(&res, prefix, forces, r, cfg.opts)
 		if promoteAccessForces(tr, forces) {
 			return res, true
 		}
@@ -1365,7 +1437,7 @@ func dporSelectBacktrack(frame *dporFrame, proc uint64, originForeign bool) {
 // consulted — the race path never used them (filtered intervals and replay
 // promotion make the minimal source-set calculation too narrow; see
 // dporExplore).
-func dporExploreQueuedPass(seed uint64, sut func() bool, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
+func dporExploreQueuedPass(seed uint64, sut func() error, forces map[accessForce]bool, cfg exploreConfig) (ExploreResult, bool) {
 	var res ExploreResult
 	type queued struct {
 		prefix        []uint64
@@ -1422,7 +1494,7 @@ func dporExploreQueuedPass(seed uint64, sut func() bool, forces map[accessForce]
 		if tr.foreignSched {
 			res.ForeignSched = true
 		}
-		appendRunFailures(&res, q.prefix, forces, r)
+		appendRunFailures(&res, q.prefix, forces, r, cfg.opts)
 		if promoteAccessForces(tr, forces) {
 			return res, true
 		}

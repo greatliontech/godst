@@ -7,8 +7,10 @@
 package net
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -103,52 +105,80 @@ func TestDSTNetAcceptHandoffIsLifecycleOwned(t *testing.T) {
 	}
 }
 
-func TestDSTNetAcceptedCloseBeforeDialReturnCleansOwnership(t *testing.T) {
+func TestDSTNetAcceptedCloseAndMidSYNACKAbortCleanOwnership(t *testing.T) {
 	if !dstNetEnabled {
 		t.Skip("requires -tags dst")
 	}
 	for seed := uint64(1); seed <= 50; seed++ {
-		var dialErr error
+		var dialErr, readErr error
 		var conn Conn
-		var leaked int
+		var leakedEstablished, leakedAborted int
 		simulation.RunWith(seed, simulation.Options{Network: simulation.NetworkConfig{CrossHostLatency: 10 * time.Millisecond}}, func() {
 			port := make(chan string, 1)
 			closed := make(chan struct{})
 			var accepted *dstConn
-			simulation.Host("A", simulation.HostConfig{}, func() {
+			simulation.Host("A", func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
 				port <- p
 				go func() {
-					c, _ := ln.Accept()
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
 					accepted = c.(*dstConn)
 					c.Close()
 					close(closed)
+					ln.Close()
 				}()
 			})
-			simulation.Host("B", simulation.HostConfig{}, func() {
+			simulation.Host("B", func() {
 				conn, dialErr = Dial("tcp", simulation.HostIP("A")+":"+<-port)
 			})
 			<-closed
+			if conn != nil {
+				_, readErr = conn.Read(make([]byte, 1))
+				conn.Close()
+			}
 			dstConns.mu.Lock()
 			dstConnsRoll()
 			for candidate := range dstConns.set {
 				if candidate.reset == accepted.reset {
-					leaked++
+					leakedEstablished++
 				}
 			}
 			dstConns.mu.Unlock()
+
+			// Mid-SYN-ACK abort must also remove both pre-registered endpoints.
+			port2 := make(chan string, 1)
+			var ln2 Listener
+			simulation.Host("A", func() {
+				ln2, _ = Listen("tcp", ":0")
+				_, p, _ := SplitHostPort(ln2.Addr().String())
+				port2 <- p
+			})
+			simulation.Host("B", func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+				defer cancel()
+				_, _ = (&Dialer{}).DialContext(ctx, "tcp", simulation.HostIP("A")+":"+<-port2)
+			})
+			ln2.Close()
+			dstConns.mu.Lock()
+			dstConnsRoll()
+			leakedAborted = len(dstConns.set)
+			dstConns.mu.Unlock()
 		})
-		// ECONNREFUSED: the dial is still mid-establishment (SYN-ACK in
-		// flight), and every abort of a not-yet-returned dial carries the
-		// SYN_SENT identity — production cannot produce this exact ordering
-		// (a real child is queued only after the handshake completes), so
-		// the model's uniform mid-establishment rule answers.
-		if conn != nil || !errors.Is(dialErr, syscall.ECONNREFUSED) {
-			t.Fatalf("seed %d: accepted close returned (%v, %v), want nil ECONNREFUSED", seed, conn, dialErr)
+		if conn == nil || dialErr != nil {
+			t.Fatalf("seed %d: accepted close returned (%v, %v), want established conn", seed, conn, dialErr)
 		}
-		if leaked != 0 {
-			t.Fatalf("seed %d: accepted close left %d registered endpoint(s)", seed, leaked)
+		if readErr != io.EOF {
+			t.Fatalf("seed %d: client read after immediate server Close = %v, want io.EOF", seed, readErr)
+		}
+		if leakedEstablished != 0 {
+			t.Fatalf("seed %d: closed established pair left %d registered endpoint(s)", seed, leakedEstablished)
+		}
+		if leakedAborted != 0 {
+			t.Fatalf("seed %d: mid-SYN-ACK abort left %d registered endpoint(s)", seed, leakedAborted)
 		}
 	}
 }
@@ -171,7 +201,7 @@ func TestDSTNetResetOrderDeterministic(t *testing.T) {
 			port := make(chan string, 1)
 			var wg sync.WaitGroup
 			wg.Add(n)
-			simulation.Host("A", simulation.HostConfig{}, func() {
+			simulation.Host("A", func() {
 				ln, _ := Listen("tcp", ":0")
 				_, p, _ := SplitHostPort(ln.Addr().String())
 				port <- p
@@ -191,14 +221,14 @@ func TestDSTNetResetOrderDeterministic(t *testing.T) {
 					}
 				}()
 			})
-			simulation.Host("B", simulation.HostConfig{}, func() {
+			simulation.Host("B", func() {
 				p := <-port
 				conns := make([]Conn, n)
 				for i := 0; i < n; i++ {
 					conns[i], _ = Dial("tcp", simulation.HostIP("A")+":"+p) // dial i registers with seq ~i
 				}
 				time.Sleep(10 * time.Millisecond) // let all readers block
-				simulation.Reset("A", "B")        // resets all n, in registration order
+				simulation.ResetLink("A", "B")    // resets all n, in registration order
 				wg.Wait()
 				for _, c := range conns {
 					c.Close()
@@ -288,13 +318,13 @@ func TestDSTNetLocalAddrReuseEADDRINUSE(t *testing.T) {
 		port := make(chan string, 1)
 		var srv []Conn
 		var mu sync.Mutex
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			acceptN(ln, 1, &srv, &mu) // only the first dial establishes
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			la := &TCPAddr{IP: ParseIP(simulation.HostIP("cli")), Port: 55555}
 			d := Dialer{LocalAddr: la}
@@ -323,13 +353,13 @@ func TestDSTNetEphemeralPortsInRange(t *testing.T) {
 		var srv []Conn
 		var mu sync.Mutex
 		var ports []int
-		simulation.Host("srv", simulation.HostConfig{}, func() {
+		simulation.Host("srv", func() {
 			ln, _ := Listen("tcp", ":0")
 			_, p, _ := SplitHostPort(ln.Addr().String())
 			port <- p
 			acceptN(ln, 20, &srv, &mu)
 		})
-		simulation.Host("cli", simulation.HostConfig{}, func() {
+		simulation.Host("cli", func() {
 			p := <-port
 			var conns []Conn
 			for i := 0; i < 20; i++ {

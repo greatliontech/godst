@@ -44,10 +44,10 @@ func TestDSTKernelMutexUninterruptibleUnderCrashAndExit(t *testing.T) {
 	if !dstRaceEnabledFP() {
 		t.Skip("requires -tags dst -race")
 	}
-	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64, MaxSteps: 256}, func() bool {
+	res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64, MaxSteps: 256}, func() error {
 		hostDone := make(chan struct{})
 		crashReady := make(chan struct{})
-		go Host("h1", HostConfig{}, func() {
+		go Host("h1", func() {
 			defer close(hostDone)
 			// 1. Process that exits normally while a child goroutine is touching
 			// modeled OS/env kernel locks.
@@ -77,7 +77,7 @@ func TestDSTKernelMutexUninterruptibleUnderCrashAndExit(t *testing.T) {
 			})
 		})
 		<-crashReady
-		Crash("crash_proc")
+		CrashProcess("h1", "crash_proc")
 		<-hostDone
 		CrashHost("h1")
 
@@ -88,9 +88,9 @@ func TestDSTKernelMutexUninterruptibleUnderCrashAndExit(t *testing.T) {
 		}
 		_ = os.Setenv("ROOT_K", "1")
 		if os.Getenv("ROOT_K") != "1" {
-			return true
+			return errors.New("sut failed")
 		}
-		return false
+		return nil
 	})
 	if len(res.Failures) != 0 {
 		t.Fatalf("unexpected failures (stranded kernel lock or race): %+v", res.Failures)
@@ -129,7 +129,7 @@ func TestDSTKernelMutexUninterruptibleUnderGCScanstack(t *testing.T) {
 			runtime.GC()
 			runtime.Gosched()
 		}
-		Crash("worker")
+		CrashProcess("", "worker")
 		if err := os.WriteFile("/post_crash", []byte("alive"), 0o644); err != nil {
 			t.Fatalf("WriteFile after GC + Crash failed: %v", err)
 		}
@@ -159,7 +159,7 @@ func TestDSTSemaCrashWaitersMutexNormal(t *testing.T) {
 		for range 30 {
 			runtime.Gosched()
 		}
-		Crash("crashed_all")
+		CrashProcess("", "crashed_all")
 		mu.Unlock()
 
 		// Two fresh contenders must acquire and release cleanly without throwing
@@ -201,7 +201,7 @@ func TestDSTSemaCrashWaitersMutexNormal(t *testing.T) {
 		for range 20 {
 			runtime.Gosched()
 		}
-		Crash("crashed_head")
+		CrashProcess("", "crashed_head")
 		mu.Unlock()
 		<-liveDone
 	})
@@ -247,7 +247,7 @@ func TestDSTSemaCrashWaitersMutexStarving(t *testing.T) {
 					runtime.Gosched()
 				}
 			}
-			Crash("starve_crash")
+			CrashProcess("", "starve_crash")
 			smu.Unlock()
 			if liveDone != nil {
 				<-liveDone
@@ -295,7 +295,7 @@ func TestDSTSemaCrashWaitersRWMutexReaders(t *testing.T) {
 				}
 			}
 
-			Crash("rw_readers")
+			CrashProcess("", "rw_readers")
 			rw.Unlock()
 			if liveDone != nil {
 				<-liveDone
@@ -337,7 +337,7 @@ func TestDSTSemaCrashWaitersWaitGroup(t *testing.T) {
 			runtime.Gosched()
 		}
 
-		Crash("wg_head_crashed")
+		CrashProcess("", "wg_head_crashed")
 		wg.Done()
 		<-liveDone
 	})
@@ -368,7 +368,7 @@ func TestDSTSemaCrashWaitersWaitGroup(t *testing.T) {
 			runtime.Gosched()
 		}
 
-		Crash("wg_tail_crashed")
+		CrashProcess("", "wg_tail_crashed")
 		wg.Done()
 		<-liveDone
 
@@ -405,7 +405,7 @@ func TestDSTExploreReplayPreservesBudgets(t *testing.T) {
 	}
 	const addrCount = 72_000 // > default 65_536 maxAccesses
 	cells := make([]int, addrCount)
-	sut := func() bool {
+	sut := func() error {
 		var ready, flag atomic.Int32
 		done := make(chan struct{})
 		go func() {
@@ -420,7 +420,10 @@ func TestDSTExploreReplayPreservesBudgets(t *testing.T) {
 		ready.Store(1)
 		seen := flag.Load()
 		<-done
-		return seen == 1
+		if seen == 1 {
+			return errors.New("sut failed")
+		}
+		return nil
 	}
 
 	const customMaxAccesses = 1 << 18
@@ -439,8 +442,7 @@ func TestDSTExploreReplayPreservesBudgets(t *testing.T) {
 	if len(msgs) == 0 || !strings.Contains(msgs[0], fmt.Sprintf("MaxAccesses: %d", customMaxAccesses)) {
 		t.Fatalf("formatExploreReport missing MaxAccesses budget: %v", msgs)
 	}
-	failed, _ := Replay(1, f, sut)
-	if !failed {
+	if Replay(1, f, sut).Err == nil {
 		t.Fatalf("Replay did not reproduce failure under custom MaxAccesses budget")
 	}
 }
@@ -450,7 +452,7 @@ func TestDSTExploreWaitGroupMisuseAndHB(t *testing.T) {
 		t.Skip("requires -tags dst -race")
 	}
 	if os.Getenv("DST_WG_MISUSE_HELPER") == "1" {
-		misuse := Explore(1, DPOR, func() bool {
+		misuse := Explore(1, DPOR, func() error {
 			var wg sync.WaitGroup
 			wg.Add(1)
 			done1 := make(chan struct{})
@@ -467,7 +469,7 @@ func TestDSTExploreWaitGroupMisuseAndHB(t *testing.T) {
 			}()
 			<-done1
 			<-done2
-			return false
+			return nil
 		})
 		fmt.Printf("WG_MISUSE_CAUGHT=%v\n", len(misuse.Failures) > 0)
 		return
@@ -487,7 +489,7 @@ func TestDSTExploreWaitGroupMisuseAndHB(t *testing.T) {
 
 	// 2. Happens-before parity: non-waking and waking Done() calls synchronize
 	// worker writes before Wait() returns, producing zero false conflicts/races.
-	hb := Explore(1, DPOR, func() bool {
+	hb := Explore(1, DPOR, func() error {
 		var wg sync.WaitGroup
 		var a, b int
 		wg.Add(2)
@@ -500,7 +502,10 @@ func TestDSTExploreWaitGroupMisuseAndHB(t *testing.T) {
 			wg.Done()
 		}()
 		wg.Wait()
-		return a+b != 30
+		if a+b != 30 {
+			return errors.New("sut failed")
+		}
+		return nil
 	})
 	if len(hb.Failures) != 0 || !hb.Exhausted {
 		t.Fatalf("WaitGroup HB SUT failed or truncated: %+v", hb)
@@ -509,7 +514,7 @@ func TestDSTExploreWaitGroupMisuseAndHB(t *testing.T) {
 
 func TestDSTExploreCondLostWakeupAndBlindDowngrade(t *testing.T) {
 	if dstRaceEnabledFP() {
-		res := Explore(1, DPOR, func() bool {
+		res := Explore(1, DPOR, func() error {
 			var mu sync.Mutex
 			cond := sync.NewCond(&mu)
 			var ready atomic.Bool
@@ -527,7 +532,7 @@ func TestDSTExploreCondLostWakeupAndBlindDowngrade(t *testing.T) {
 				cond.Signal()
 			}()
 			<-done
-			return false
+			return nil
 		})
 		foundDeadlock := false
 		for _, f := range res.Failures {
@@ -543,7 +548,7 @@ func TestDSTExploreCondLostWakeupAndBlindDowngrade(t *testing.T) {
 	}
 
 	// Non-race build: parking in Cond.Wait must trip SyncBlind -> Uninstrumented.
-	res := Explore(1, DPOR, func() bool {
+	res := Explore(1, DPOR, func() error {
 		var mu sync.Mutex
 		cond := sync.NewCond(&mu)
 		parked := make(chan struct{})
@@ -565,7 +570,7 @@ func TestDSTExploreCondLostWakeupAndBlindDowngrade(t *testing.T) {
 		cond.Signal()
 		mu.Unlock()
 		<-done
-		return false
+		return nil
 	})
 	if !res.Uninstrumented || res.Exhausted {
 		t.Fatalf("norace Cond.Wait SUT: Uninstrumented=%v Exhausted=%v, want true/false", res.Uninstrumented, res.Exhausted)
@@ -683,7 +688,7 @@ func TestDSTForeignSynctestBubbleClockAndTimerIsolation(t *testing.T) {
 	Run(1, func() {
 		dstStepHostClock(0, int64(5*time.Hour))
 		dstDriftHostClock(0, -200_000_000)
-		Host("h0", HostConfig{
+		HostWith("h0", HostConfig{
 			Clock: Skew(5 * time.Hour),
 		}, func() {
 			DriftClock("h0", -200_000_000)
@@ -715,7 +720,7 @@ func TestDSTKernelSectionSuppressesHandoffSemreleaseYield(t *testing.T) {
 		{"dstSemrelease1", dstSemreleaseDSTHandoffFP},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res := Explore(1, Exhaustive, func() bool {
+			res := Explore(1, Exhaustive, func() error {
 				var km kernelMutex
 				var sema uint32
 				waiterDone := make(chan struct{})
@@ -733,13 +738,13 @@ func TestDSTKernelSectionSuppressesHandoffSemreleaseYield(t *testing.T) {
 					select {}
 				})
 				<-victimReady
-				Crash("handoff_victim")
+				CrashProcess("", "handoff_victim")
 				km.Lock()
 				km.Unlock()
 				// If victim died before releasing sema, unblock waiter so bubble exits.
 				dstSemreleaseHandoffFP(&sema)
 				<-waiterDone
-				return false
+				return nil
 			})
 			if len(res.Failures) != 0 || !res.Exhausted {
 				t.Fatalf("%s: Exhausted=%v Failures=%+v, want true/none", tc.name, res.Exhausted, res.Failures)
@@ -772,7 +777,7 @@ func TestDSTKernelSectionSuppressesHandoffSemreleaseYield(t *testing.T) {
 			for range int(seed % 4) {
 				runtime.Gosched()
 			}
-			Crash("alloc_victim")
+			CrashProcess("", "alloc_victim")
 			_ = os.Environ()
 			if err := os.Setenv("SURVIVOR_ENV", "ok"); err != nil {
 				t.Fatalf("seed %d: survivor Setenv failed: %v", seed, err)
@@ -783,7 +788,7 @@ func TestDSTKernelSectionSuppressesHandoffSemreleaseYield(t *testing.T) {
 
 func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 	if os.Getenv("DST_KERNEL_RACE_HELPER") == "1" {
-		res := Explore(1, DPOR, func() bool {
+		res := Explore(1, DPOR, func() error {
 			var shared int
 			done1 := make(chan struct{})
 			done2 := make(chan struct{})
@@ -801,13 +806,13 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 			})
 			<-done1
 			<-done2
-			return false
+			return nil
 		})
 		fmt.Printf("KERNEL_NO_FALSE_HB_CAUGHT=%v\n", len(res.Failures) > 0)
 		return
 	}
 	if os.Getenv("DST_USER_BUF_RACE_HELPER") == "1" {
-		res := Explore(1, DPOR, func() bool {
+		res := Explore(1, DPOR, func() error {
 			if err := os.WriteFile("/shared_file", []byte("hello world"), 0o644); err != nil {
 				panic(err)
 			}
@@ -829,7 +834,7 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 			}()
 			<-done1
 			<-done2
-			return false
+			return nil
 		})
 		fmt.Printf("USER_BUF_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
 		return
@@ -837,8 +842,8 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 
 	// 1a. Cross-host independent kernel operations must not create universe-global
 	// DPOR conflicts (exact 1 schedule when each host only touches its own FS/env).
-	res := Explore(1, DPOR, func() bool {
-		go Host("h1", HostConfig{}, func() {
+	res := Explore(1, DPOR, func() error {
+		go Host("h1", func() {
 			Process("p1", func() {
 				_ = os.Setenv("ISOLATED_KEY", "v1")
 				if os.Getenv("ISOLATED_KEY") != "v1" {
@@ -849,7 +854,7 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 				}
 			})
 		})
-		go Host("h2", HostConfig{}, func() {
+		go Host("h2", func() {
 			Process("p2", func() {
 				_ = os.Setenv("ISOLATED_KEY", "v2")
 				if os.Getenv("ISOLATED_KEY") != "v2" {
@@ -861,7 +866,7 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 			})
 		})
 		synctest.Wait()
-		return false
+		return nil
 	})
 	if len(res.Failures) != 0 || !res.Exhausted || res.Schedules != 1 {
 		t.Fatalf("cross-host isolated env/FS SUT: Schedules=%d Exhausted=%v Failures=%v, want 1/true/none",
@@ -871,7 +876,7 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 	// 1b. Within a single process, concurrent Setenv and Getenv share one
 	// environment table and must explore both outcomes ("" and "set").
 	seenEmpty, seenSet := false, false
-	sameProcRes := Explore(1, DPOR, func() bool {
+	sameProcRes := Explore(1, DPOR, func() error {
 		Process("shared_env_proc", func() {
 			go func() {
 				_ = os.Setenv("SAME_PROC_KEY", "set")
@@ -885,7 +890,7 @@ func TestDSTKernelMutexDoesNotForgeHBOrConflicts(t *testing.T) {
 			}()
 			synctest.Wait()
 		})
-		return false
+		return nil
 	})
 	if len(sameProcRes.Failures) != 0 || !seenEmpty || !seenSet {
 		t.Fatalf("same-process Setenv/Getenv exploration: seenEmpty=%v seenSet=%v Schedules=%d Failures=%v",
@@ -980,7 +985,7 @@ func TestDSTWorldRestartAndEndIdempotentOnDownHost(t *testing.T) {
 
 		// Power off again, snapshot platter, and verify ctl.End() is also a no-op
 		// on an already-down host.
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			done := make(chan struct{})
 			go Process("dirty2", func() {
 				defer close(done)
@@ -1010,7 +1015,7 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 	if helper := os.Getenv("DST_MULTICHUNK_RACE_HELPER"); helper != "" {
 		switch helper {
 		case "pipe":
-			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() bool {
+			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() error {
 				r, w, err := os.Pipe()
 				if err != nil {
 					panic(err)
@@ -1031,11 +1036,11 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 				buf[64*1024] = 'X'
 				_, _ = r.Read(tmp)
 				<-done
-				return false
+				return nil
 			})
 			fmt.Printf("PIPE_MULTICHUNK_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
 		case "wire":
-			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 8}, func() bool {
+			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 8}, func() error {
 				dstSetNetSendBuffer(4096)
 				ln, err := net.Listen("tcp", "127.0.0.1:9201")
 				if err != nil {
@@ -1077,11 +1082,11 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 				}
 				_, _ = srv.Read(tmp)
 				<-done
-				return false
+				return nil
 			})
 			fmt.Printf("WIRE_MULTICHUNK_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
 		case "dialer":
-			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() bool {
+			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() error {
 				ln, err := net.Listen("tcp", "127.0.0.1:9202")
 				if err != nil {
 					panic(err)
@@ -1102,12 +1107,12 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 				}()
 				<-done1
 				<-done2
-				return false
+				return nil
 			})
 			fmt.Printf("DIALER_KEEPALIVE_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
 		case "read_l2":
 			seenReadOverwrote, seenMutateOverwrote := false, false
-			_ = ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() bool {
+			_ = ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 64}, func() error {
 				ln, err := net.Listen("tcp", "127.0.0.1:9204")
 				if err != nil {
 					panic(err)
@@ -1145,7 +1150,7 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 				case 0x7f:
 					seenMutateOverwrote = true
 				}
-				return false
+				return nil
 			})
 			fmt.Printf("READ_L2_BOTH_ORDERS=%v\n", seenReadOverwrote && seenMutateOverwrote)
 		}
@@ -1156,7 +1161,7 @@ func TestDSTUserBufCopyOutsideKernelLocks(t *testing.T) {
 	// os.File, procfs, os.Pipe, and net.Conn must never self-deadlock on held
 	// KernelMutex locks, and surviving operations must remain functional.
 	Run(53, func() {
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			if err := os.WriteFile("/backing", bytes.Repeat([]byte("m"), 4096), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -1399,7 +1404,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 	// 1. Concurrent Write and Close on the same net.Conn must serialize FIN vs.
 	// segment commit atomically under the stream lock so peer Read never observes
 	// data after io.EOF.
-	eofOrderRes := Explore(1, DPOR, func() bool {
+	eofOrderRes := Explore(1, DPOR, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9205")
 		if err != nil {
 			panic(err)
@@ -1429,14 +1434,14 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		for range 4 {
 			n, rerr := srv.Read(buf[:])
 			if sawEOF && (n > 0 || rerr != io.EOF) {
-				return true
+				return errors.New("sut failed")
 			}
 			if rerr == io.EOF {
 				sawEOF = true
 			}
 		}
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(eofOrderRes.Failures) != 0 {
 		t.Fatalf("concurrent Write+Close violated monotonic EOF on peer Read: %+v", eofOrderRes.Failures)
@@ -1445,7 +1450,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 	// 2. Non-race and -race coarse DPOR exploration on net.Conn concurrent writes
 	// must explore both segment orders ("AB" and "BA") via dstCoarseDep.
 	sawAB, sawBA := false, false
-	wireCoarseRes := Explore(1, DPOR, func() bool {
+	wireCoarseRes := Explore(1, DPOR, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9208")
 		if err != nil {
 			panic(err)
@@ -1482,7 +1487,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		case "BA":
 			sawBA = true
 		}
-		return false
+		return nil
 	})
 	if len(wireCoarseRes.Failures) != 0 || !wireCoarseRes.Exhausted || !sawAB || !sawBA {
 		t.Fatalf("net.Conn coarse DPOR write ordering: sawAB=%v sawBA=%v Exhausted=%v Failures=%+v",
@@ -1494,7 +1499,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 	// readier->readied DPOR happens-before edge that suppresses reordering
 	// against an independent real waker.
 	sawPipeUnset := false
-	pipeDeadlineRes := Explore(1, DPOR, func() bool {
+	pipeDeadlineRes := Explore(1, DPOR, func() error {
 		_ = os.Unsetenv("PIPE_DEADLINE_K")
 		pr, pw, err := os.Pipe()
 		if err != nil {
@@ -1527,7 +1532,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		}()
 		<-readDone
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(pipeDeadlineRes.Failures) != 0 || !pipeDeadlineRes.Exhausted || !sawPipeUnset {
 		t.Fatalf("pipe SetReadDeadline kernel broadcast leaked DPOR HB: sawPipeUnset=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -1538,7 +1543,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 	// woken waiter (&w.raceSync), never through a shared futex-key object clock
 	// where a second waker waking W2 would pollute W1's clock.
 	sawFutexUnset := false
-	futexPerWaiterRes := Explore(1, DPOR, func() bool {
+	futexPerWaiterRes := Explore(1, DPOR, func() error {
 		_ = os.Unsetenv("FUTEX_WAKER2_K")
 		if err := os.WriteFile("/futex_hb", make([]byte, 4096), 0o644); err != nil {
 			panic(err)
@@ -1587,7 +1592,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		atomic.StoreUint32(word, 1)
 		_, _, _ = syscall.Syscall6(syscall.SYS_FUTEX, uintptr(unsafe.Pointer(word)), 1, 1, 0, 0, 0)
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(futexPerWaiterRes.Failures) != 0 || !futexPerWaiterRes.Exhausted || !sawFutexUnset {
 		t.Fatalf("futex shared key leaked DPOR HB from Waker2 into W1: sawFutexUnset=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -1602,7 +1607,7 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 	// os.Pipe, and os.File must update TSan vector clocks atomically inside
 	// KernelMutex so valid Write->Read message passing produces zero false
 	// data-race reports under Level-2 exploration.
-	hbMsgRes := Explore(1, DPOR, func() bool {
+	hbMsgRes := Explore(1, DPOR, func() error {
 		var wireMsg, pipeMsg, fileMsg int
 
 		ln, err := net.Listen("tcp", "127.0.0.1:9206")
@@ -1664,14 +1669,14 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(hbMsgRes.Failures) != 0 || !hbMsgRes.Exhausted {
 		t.Fatalf("atomic in-kernel HB message-passing SUT failed: Exhausted=%v Failures=%+v", hbMsgRes.Exhausted, hbMsgRes.Failures)
 	}
 
 	defer dstFilterForceConservativeFP(false)
-	fileAtomicityRes := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 128}, func() bool {
+	fileAtomicityRes := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 128}, func() error {
 		wf, err := os.OpenFile("/hb_atomic", os.O_CREATE|os.O_RDWR, 0o644)
 		if err != nil {
 			panic(err)
@@ -1697,13 +1702,13 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		fileMsg = 33
 		_, _ = wf.Write([]byte{1})
 		<-done
-		return false
+		return nil
 	})
 	if len(fileAtomicityRes.Failures) != 0 {
 		t.Fatalf("conservative-filter File.Write->ReadAt HB atomicity failed: %+v", fileAtomicityRes.Failures)
 	}
 
-	wireEOFAtomicityRes := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 128}, func() bool {
+	wireEOFAtomicityRes := ExploreWith(1, ExploreOptions{Mode: Exhaustive, MaxSchedules: 128}, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9207")
 		if err != nil {
 			panic(err)
@@ -1738,10 +1743,10 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 		if sawEOF {
 			var buf [16]byte
 			if n, rerr := srv.Read(buf[:]); n > 0 || rerr != io.EOF {
-				return true
+				return errors.New("sut failed")
 			}
 		}
-		return false
+		return nil
 	})
 	if len(wireEOFAtomicityRes.Failures) != 0 {
 		t.Fatalf("conservative-filter net.Conn Write+Close monotonic EOF failed: %+v", wireEOFAtomicityRes.Failures)
@@ -1750,8 +1755,8 @@ func TestDSTKernelSyncAtomicity(t *testing.T) {
 
 func TestDSTKernelTeardownFlockDPORReversal(t *testing.T) {
 	var sawBusy, sawGranted atomic.Bool
-	res := Explore(1, DPOR, func() bool {
-		Host("h1", HostConfig{}, func() {
+	res := Explore(1, DPOR, func() error {
+		Host("h1", func() {
 			if err := os.WriteFile("/exit_flock", []byte("x"), 0o644); err != nil {
 				panic(err)
 			}
@@ -1790,7 +1795,7 @@ func TestDSTKernelTeardownFlockDPORReversal(t *testing.T) {
 			<-p1Done
 			<-p2Done
 		})
-		return false
+		return nil
 	})
 	if len(res.Failures) != 0 || !res.Exhausted || !sawBusy.Load() || !sawGranted.Load() {
 		t.Fatalf("process-exit flock teardown DPOR reversal: sawBusy=%v sawGranted=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -1811,7 +1816,7 @@ func TestDSTStreamPreBufferedReadDoesNotAcquireCloseHB(t *testing.T) {
 		// the unsynchronized access on schedule 1.
 		switch os.Getenv("DST_PREBUF_CLOSE_RACE_HELPER") {
 		case "wire":
-			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 1}, func() bool {
+			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 1}, func() error {
 				ln, err := net.Listen("tcp", "127.0.0.1:9401")
 				if err != nil {
 					panic(err)
@@ -1845,11 +1850,11 @@ func TestDSTStreamPreBufferedReadDoesNotAcquireCloseHB(t *testing.T) {
 					}
 				}()
 				wg.Wait()
-				return false
+				return nil
 			})
 			fmt.Printf("PREBUF_WIRE_RACE=%v\n", len(res.Failures) > 0)
 		case "pipe":
-			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 1}, func() bool {
+			res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 1}, func() error {
 				pr, pw, err := os.Pipe()
 				if err != nil {
 					panic(err)
@@ -1874,7 +1879,7 @@ func TestDSTStreamPreBufferedReadDoesNotAcquireCloseHB(t *testing.T) {
 					}
 				}()
 				wg.Wait()
-				return false
+				return nil
 			})
 			fmt.Printf("PREBUF_PIPE_RACE=%v\n", len(res.Failures) > 0)
 		}
@@ -1904,7 +1909,7 @@ func TestDSTStreamPreBufferedReadDoesNotAcquireCloseHB(t *testing.T) {
 
 	// Conversely, draining all the way to io.EOF DOES synchronize with the
 	// writer's Close on both net.Conn and os.Pipe.
-	eofSyncRes := Explore(1, DPOR, func() bool {
+	eofSyncRes := Explore(1, DPOR, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9402")
 		if err != nil {
 			panic(err)
@@ -1965,7 +1970,7 @@ func TestDSTStreamPreBufferedReadDoesNotAcquireCloseHB(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(eofSyncRes.Failures) != 0 || !eofSyncRes.Exhausted {
 		t.Fatalf("drained EOF failed to acquire Close HB: Exhausted=%v Failures=%+v", eofSyncRes.Exhausted, eofSyncRes.Failures)
@@ -1979,7 +1984,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 1a. net.Conn SetReadDeadline(past) vs Read on pre-buffered data.
 	var sawWireReadOK, sawWireDeadline atomic.Bool
-	wireDeadRes := Explore(1, DPOR, func() bool {
+	wireDeadRes := Explore(1, DPOR, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9410")
 		if err != nil {
 			panic(err)
@@ -2011,7 +2016,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(wireDeadRes.Failures) != 0 || !wireDeadRes.Exhausted || !sawWireReadOK.Load() || !sawWireDeadline.Load() {
 		t.Fatalf("net.Conn SetReadDeadline vs Read coarse DPOR: ok=%v deadline=%v Exhausted=%v Failures=%+v",
@@ -2020,7 +2025,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 1b. os.Pipe SetReadDeadline(past) vs Read on pre-buffered data.
 	var sawPipeReadOK, sawPipeDeadline atomic.Bool
-	pipeDeadRes := Explore(1, DPOR, func() bool {
+	pipeDeadRes := Explore(1, DPOR, func() error {
 		pr, pw, err := os.Pipe()
 		if err != nil {
 			panic(err)
@@ -2044,7 +2049,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(pipeDeadRes.Failures) != 0 || !pipeDeadRes.Exhausted || !sawPipeReadOK.Load() || !sawPipeDeadline.Load() {
 		t.Fatalf("os.Pipe SetReadDeadline vs Read coarse DPOR: ok=%v deadline=%v Exhausted=%v Failures=%+v",
@@ -2053,7 +2058,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 2. net.Listen vs net.Dial on the same host/port.
 	var sawDialOK, sawDialRefused atomic.Bool
-	listenDialRes := Explore(1, DPOR, func() bool {
+	listenDialRes := Explore(1, DPOR, func() error {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -2071,7 +2076,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(listenDialRes.Failures) != 0 || !listenDialRes.Exhausted || !sawDialOK.Load() || !sawDialRefused.Load() {
 		t.Fatalf("net.Listen vs net.Dial coarse DPOR: ok=%v refused=%v Exhausted=%v Failures=%+v",
@@ -2080,7 +2085,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 3a. Same-handle *os.File Seek vs Read cursor conflict.
 	var sawByteA, sawByteB atomic.Bool
-	seekReadRes := Explore(1, DPOR, func() bool {
+	seekReadRes := Explore(1, DPOR, func() error {
 		if err := os.WriteFile("/seek_race", []byte("ab"), 0o644); err != nil {
 			panic(err)
 		}
@@ -2107,7 +2112,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(seekReadRes.Failures) != 0 || !seekReadRes.Exhausted || !sawByteA.Load() || !sawByteB.Load() {
 		t.Fatalf("same-handle File.Seek vs Read coarse DPOR: sawA=%v sawB=%v Exhausted=%v Failures=%+v",
@@ -2116,7 +2121,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 3b. Same-process os.Chdir vs relative os.ReadFile working-directory conflict.
 	var sawDirOne, sawDirTwo atomic.Bool
-	chdirRes := Explore(1, DPOR, func() bool {
+	chdirRes := Explore(1, DPOR, func() error {
 		if err := os.MkdirAll("/d1", 0o755); err != nil {
 			panic(err)
 		}
@@ -2152,7 +2157,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(chdirRes.Failures) != 0 || !chdirRes.Exhausted || !sawDirOne.Load() || !sawDirTwo.Load() {
 		t.Fatalf("os.Chdir vs relative ReadFile coarse DPOR: saw1=%v saw2=%v Exhausted=%v Failures=%+v",
@@ -2161,7 +2166,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 
 	// 3c. syscall.SetsockoptInt vs syscall.GetsockoptInt on the same socket.
 	var sawOptOff, sawOptOn atomic.Bool
-	sockoptRes := Explore(1, DPOR, func() bool {
+	sockoptRes := Explore(1, DPOR, func() error {
 		ln, err := net.Listen("tcp", "127.0.0.1:9412")
 		if err != nil {
 			panic(err)
@@ -2202,7 +2207,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 			})
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(sockoptRes.Failures) != 0 || !sockoptRes.Exhausted || !sawOptOff.Load() || !sawOptOn.Load() {
 		t.Fatalf("SetsockoptInt vs GetsockoptInt coarse DPOR: off=%v on=%v Exhausted=%v Failures=%+v",
@@ -2213,7 +2218,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 	// leak a readier->readied DPOR happens-before edge that suppresses reversal
 	// against an independent deadline waker.
 	var sawWireBPUnset atomic.Bool
-	wireBPRes := Explore(1, DPOR, func() bool {
+	wireBPRes := Explore(1, DPOR, func() error {
 		dstSetNetSendBuffer(4)
 		_ = os.Unsetenv("WIRE_BP_K")
 		ln, err := net.Listen("tcp", "127.0.0.1:9413")
@@ -2256,7 +2261,7 @@ func TestDSTExploreCoarseDeadlinesNetHandlesCwdSockopt(t *testing.T) {
 		}()
 		<-writeDone
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(wireBPRes.Failures) != 0 || !wireBPRes.Exhausted || !sawWireBPUnset.Load() {
 		t.Fatalf("net.Conn send-buffer backpressure wakeup leaked DPOR HB: sawUnset=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -2271,8 +2276,8 @@ func TestDSTKernelFutexTeardownDPORReversal(t *testing.T) {
 	// explores both woke=0 and woke=1 regardless of initial goroutine order.
 	for _, crashFirst := range []bool{true, false} {
 		var sawZero, sawOne bool
-		res := Explore(1, DPOR, func() bool {
-			Host("h1", HostConfig{}, func() {
+		res := Explore(1, DPOR, func() error {
+			Host("h1", func() {
 				if err := os.WriteFile("/futex_td_crash", make([]byte, 4096), 0o644); err != nil {
 					panic(err)
 				}
@@ -2324,7 +2329,7 @@ func TestDSTKernelFutexTeardownDPORReversal(t *testing.T) {
 				wg.Add(2)
 				runCrash := func() {
 					defer wg.Done()
-					Crash("waiter")
+					CrashProcess("h1", "waiter")
 				}
 				runWake := func() {
 					defer wg.Done()
@@ -2349,7 +2354,7 @@ func TestDSTKernelFutexTeardownDPORReversal(t *testing.T) {
 				}
 				synctest.Wait()
 			})
-			return false
+			return nil
 		})
 		if len(res.Failures) != 0 || !res.Exhausted || !sawZero || !sawOne {
 			t.Fatalf("crashFirst=%v: sawZero=%v sawOne=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -2362,7 +2367,7 @@ func TestDSTKernelFutexTeardownDPORReversal(t *testing.T) {
 	// unmapping its VMA so zero other OS resources remain) must scrub the orphaned
 	// futex queue entry so a subsequent single-waiter FUTEX_WAKE wakes a live peer.
 	Run(1, func() {
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			if err := os.WriteFile("/futex_td_exit", make([]byte, 4096), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -2446,11 +2451,11 @@ func TestDSTKernelFutexTeardownDPORReversal(t *testing.T) {
 
 func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 	if os.Getenv("DST_NET_PREBUF_NO_HB_HELPER") == "1" {
-		res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 16}, func() bool {
+		res := ExploreWith(1, ExploreOptions{Mode: DPOR, MaxSchedules: 16}, func() error {
 			var resetState int
 			var ln net.Listener
 			var addr string
-			Host("h1", HostConfig{}, func() {
+			Host("h1", func() {
 				var err error
 				ln, err = net.Listen("tcp", ":9500")
 				if err != nil {
@@ -2460,7 +2465,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			})
 			defer ln.Close()
 			var cli net.Conn
-			Host("h2", HostConfig{}, func() {
+			Host("h2", func() {
 				var err error
 				cli, err = net.Dial("tcp", addr)
 				if err != nil {
@@ -2469,7 +2474,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			})
 			defer cli.Close()
 			var srv net.Conn
-			Host("h1", HostConfig{}, func() {
+			Host("h1", func() {
 				var err error
 				srv, err = ln.Accept()
 				if err != nil {
@@ -2485,7 +2490,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			done2 := make(chan struct{})
 			go func() {
 				resetState = 77
-				Reset("h1", "h2")
+				ResetLink("h1", "h2")
 				close(done1)
 			}()
 			go func() {
@@ -2501,7 +2506,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			}()
 			<-done1
 			<-done2
-			return false
+			return nil
 		})
 		fmt.Printf("PREBUF_NO_RESET_HB_RACE_CAUGHT=%v\n", len(res.Failures) > 0)
 		return
@@ -2510,11 +2515,11 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 	// 1. Injected Reset after pre-buffered data: draining pre-buffered bytes
 	// succeeds even after Reset, and the post-drain ECONNRESET observation carries
 	// TSan/DPOR HB from the Reset caller without any channel edge between them.
-	resetRes := Explore(1, DPOR, func() bool {
+	resetRes := Explore(1, DPOR, func() error {
 		var resetState int
 		var ln net.Listener
 		var addr string
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			ln, err = net.Listen("tcp", ":9501")
 			if err != nil {
@@ -2524,7 +2529,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer ln.Close()
 		var cli net.Conn
-		Host("h2", HostConfig{}, func() {
+		Host("h2", func() {
 			var err error
 			cli, err = net.Dial("tcp", addr)
 			if err != nil {
@@ -2533,7 +2538,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer cli.Close()
 		var srv net.Conn
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			srv, err = ln.Accept()
 			if err != nil {
@@ -2550,7 +2555,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			resetState = 77
-			Reset("h1", "h2")
+			ResetLink("h1", "h2")
 		}()
 		go func() {
 			defer wg.Done()
@@ -2573,7 +2578,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(resetRes.Failures) != 0 || !resetRes.Exhausted {
 		t.Fatalf("Reset ECONNRESET HB: Schedules=%d Exhausted=%v Failures=%+v",
@@ -2583,12 +2588,12 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 	// 2. Partition + RetransmitTimeout ETIMEDOUT must carry transitive TSan/DPOR
 	// HB from the Partition caller through horizonDie to the ETIMEDOUT observer
 	// with zero channel synchronization between the two goroutines.
-	horizonRes := Explore(1, DPOR, func() bool {
+	horizonRes := Explore(1, DPOR, func() error {
 		dstSetNetRetransmitTimeout(int64(20 * time.Millisecond))
 		var cutState int
 		var ln net.Listener
 		var addr string
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			ln, err = net.Listen("tcp", ":9502")
 			if err != nil {
@@ -2598,7 +2603,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer ln.Close()
 		var cli net.Conn
-		Host("h2", HostConfig{}, func() {
+		Host("h2", func() {
 			var err error
 			cli, err = net.Dial("tcp", addr)
 			if err != nil {
@@ -2607,7 +2612,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer cli.Close()
 		var srv net.Conn
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			srv, err = ln.Accept()
 			if err != nil {
@@ -2639,8 +2644,8 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			}
 		}()
 		wg.Wait()
-		Heal("h2", "h1")
-		return false
+		HealLink("h2", "h1")
+		return nil
 	})
 	if len(horizonRes.Failures) != 0 || !horizonRes.Exhausted {
 		t.Fatalf("Partition ETIMEDOUT HB: Schedules=%d Exhausted=%v Failures=%+v",
@@ -2649,7 +2654,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 
 	// 3. Listener Close racing net.Dial must carry TSan/DPOR HB to the
 	// ECONNREFUSED observer without leaking HB onto successful dials.
-	dialRefusedRes := Explore(1, DPOR, func() bool {
+	dialRefusedRes := Explore(1, DPOR, func() error {
 		var closedState int
 		ln, err := net.Listen("tcp", "127.0.0.1:9503")
 		if err != nil {
@@ -2677,7 +2682,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 			_ = c.Close()
 		}()
 		wg.Wait()
-		return false
+		return nil
 	})
 	if len(dialRefusedRes.Failures) != 0 || !dialRefusedRes.Exhausted {
 		t.Fatalf("Listener Close vs Dial ECONNREFUSED HB: Schedules=%d Exhausted=%v Failures=%+v",
@@ -2687,12 +2692,12 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 	// 4. Write racing Reset across the outside-lock caller-slice copy window must
 	// never self-deadlock on e.out.mu and must carry TSan/DPOR HB on error.
 	var sawWriteOK, sawWriteErr bool
-	writeResetRes := Explore(1, DPOR, func() bool {
+	writeResetRes := Explore(1, DPOR, func() error {
 		var writeResetState int
 		sharedBuf := []byte("hello")
 		var ln net.Listener
 		var addr string
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			ln, err = net.Listen("tcp", ":9504")
 			if err != nil {
@@ -2702,7 +2707,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer ln.Close()
 		var cli net.Conn
-		Host("h2", HostConfig{}, func() {
+		Host("h2", func() {
 			var err error
 			cli, err = net.Dial("tcp", addr)
 			if err != nil {
@@ -2711,7 +2716,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		})
 		defer cli.Close()
 		var srv net.Conn
-		Host("h1", HostConfig{}, func() {
+		Host("h1", func() {
 			var err error
 			srv, err = ln.Accept()
 			if err != nil {
@@ -2726,7 +2731,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			writeResetState = 88
-			Reset("h1", "h2")
+			ResetLink("h1", "h2")
 		}()
 		go func() {
 			defer wg.Done()
@@ -2751,7 +2756,7 @@ func TestDSTKernelNetAbnormalTerminationRaceHB(t *testing.T) {
 		} else {
 			sawWriteErr = true
 		}
-		return false
+		return nil
 	})
 	if len(writeResetRes.Failures) != 0 || !writeResetRes.Exhausted || !sawWriteOK || !sawWriteErr {
 		t.Fatalf("Write racing Reset HB / leaf-lock: ok=%v err=%v Schedules=%d Exhausted=%v Failures=%+v",
@@ -2776,8 +2781,8 @@ func TestDSTKernelSlowDiskCoarseDPOR(t *testing.T) {
 		var sawFastPath, sawSlowPath bool
 		var sawFastRoot, sawSlowRoot bool
 
-		res := Explore(1, DPOR, func() bool {
-			Host("h1", HostConfig{}, func() {
+		res := Explore(1, DPOR, func() error {
+			Host("h1", func() {
 				Process("reader", func() {
 					if err := os.WriteFile("/slow_target", []byte("abcd"), 0o644); err != nil {
 						panic(err)
@@ -2846,7 +2851,7 @@ func TestDSTKernelSlowDiskCoarseDPOR(t *testing.T) {
 					}
 				})
 			})
-			return false
+			return nil
 		})
 		if len(res.Failures) != 0 || !res.Exhausted ||
 			!sawFastHandle || !sawSlowHandle ||
@@ -2868,7 +2873,7 @@ func TestDSTKernelMMapReleaseOrderDeterministic(t *testing.T) {
 		var order [2]int
 		var idx int
 		Run(1, func() {
-			Host("h1", HostConfig{}, func() {
+			Host("h1", func() {
 				if err := os.WriteFile("/lock1", make([]byte, 4096), 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -2944,7 +2949,7 @@ func TestDSTKernelMMapReleaseOrderDeterministic(t *testing.T) {
 				})
 				synctest.Wait()
 
-				Crash("holder")
+				CrashProcess("h1", "holder")
 				<-w1Done
 				<-w2Done
 			})

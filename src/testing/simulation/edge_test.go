@@ -31,7 +31,7 @@ func TestDSTClockExtremeOffsets(t *testing.T) {
 		base := time.Now() // root, unskewed; no timer fires, so the base is shared
 		for _, c := range cases {
 			var got time.Duration
-			Host(c.name, HostConfig{Clock: Skew(c.off)}, func() { got = time.Now().Sub(base) })
+			HostWith(c.name, HostConfig{Clock: Skew(c.off)}, func() { got = time.Now().Sub(base) })
 			if got != c.off {
 				t.Errorf("offset %v on host %q: reading - base = %v, want %v", c.off, c.name, got, c.off)
 			}
@@ -39,27 +39,40 @@ func TestDSTClockExtremeOffsets(t *testing.T) {
 	})
 }
 
-// TestDSTIdentityManyDistinct is a scale property for identity: N distinct bare
-// processes yield N distinct hostnames (each an implicit host named after the
-// process) and N distinct pids — the per-host/per-process keying does not collide as
-// the node count grows.
+// TestDSTIdentityManyDistinct is a scale property for identity: N distinct hosts
+// yield N distinct hostnames (each with its own local kernel pid space starting
+// at 2), and N co-located processes on one host yield N distinct pids — neither
+// the per-host nor the per-process keying collides as the node count grows.
 func TestDSTIdentityManyDistinct(t *testing.T) {
 	const N = 64
 	hostnames := map[string]bool{}
-	pids := map[int]bool{}
+	perHostFirstPIDs := map[int]bool{}
+	colocatedPIDs := map[int]bool{}
 	Run(1, func() {
 		for i := 0; i < N; i++ {
-			Process("n"+strconv.Itoa(i), func() {
-				hostnames[hostname()] = true
-				pids[os.Getpid()] = true
+			Host("n"+strconv.Itoa(i), func() {
+				Process("p", func() {
+					hostnames[hostname()] = true
+					perHostFirstPIDs[os.Getpid()] = true
+				})
 			})
 		}
+		Host("shared", func() {
+			for i := 0; i < N; i++ {
+				Process("p"+strconv.Itoa(i), func() {
+					colocatedPIDs[os.Getpid()] = true
+				})
+			}
+		})
 	})
 	if len(hostnames) != N {
-		t.Errorf("got %d distinct hostnames across %d processes, want %d", len(hostnames), N, N)
+		t.Errorf("got %d distinct hostnames across %d hosts, want %d", len(hostnames), N, N)
 	}
-	if len(pids) != N {
-		t.Errorf("got %d distinct pids across %d processes, want %d", len(pids), N, N)
+	if len(perHostFirstPIDs) != 1 || !perHostFirstPIDs[2] {
+		t.Errorf("per-host initial pids = %v, want each host starting at pid 2", perHostFirstPIDs)
+	}
+	if len(colocatedPIDs) != N {
+		t.Errorf("got %d distinct pids across %d co-located processes, want %d", len(colocatedPIDs), N, N)
 	}
 }
 
@@ -69,7 +82,7 @@ func TestDSTIdentityManyDistinct(t *testing.T) {
 func TestDSTMemColocatedIndependent(t *testing.T) {
 	var aBytes, bBytes int64
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("a", func() {
 				memSink = make([]byte, 8<<20)
 				aBytes = procBytes()
@@ -97,21 +110,21 @@ func TestDSTClockSkewBoundary(t *testing.T) {
 	Run(1, func() {
 		base := time.Now()
 		var fwd time.Time
-		Host("far-future", HostConfig{Clock: Skew(time.Duration(math.MaxInt64))}, func() { fwd = time.Now() })
+		HostWith("far-future", HostConfig{Clock: Skew(time.Duration(math.MaxInt64))}, func() { fwd = time.Now() })
 		if fwd.Before(base) {
 			t.Errorf("Skew(MaxInt64) host reads %v, before base %v — the wall wrapped negative instead of saturating", fwd, base)
 		}
 		var hostPanic, stepPanic any
 		func() {
 			defer func() { hostPanic = recover() }()
-			Host("far-past", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() {})
+			HostWith("far-past", HostConfig{Clock: Skew(time.Duration(math.MinInt64))}, func() {})
 		}()
 		if hostPanic == nil {
 			t.Errorf("Skew(MinInt64) did not panic — a pre-epoch wall must be rejected at application")
 		}
 		func() {
 			defer func() { stepPanic = recover() }()
-			Host("stepped", HostConfig{}, func() {})
+			Host("stepped", func() {})
 			StepClock("stepped", time.Duration(math.MinInt64))
 		}()
 		if stepPanic == nil {
@@ -119,7 +132,7 @@ func TestDSTClockSkewBoundary(t *testing.T) {
 		}
 		// A rejected step applies nothing: the host still reads base.
 		var after time.Time
-		Host("stepped", HostConfig{}, func() { after = time.Now() })
+		Host("stepped", func() { after = time.Now() })
 		if !after.Equal(time.Now()) {
 			t.Errorf("rejected StepClock left partial state: host reads %v, want base %v", after, time.Now())
 		}
@@ -136,7 +149,7 @@ func TestDSTClockDriftFoldSaturates(t *testing.T) {
 		read := make(chan struct{})
 		done := make(chan struct{})
 		var got time.Time
-		Host("h", HostConfig{Clock: Skew(time.Duration(math.MaxInt64)).WithDrift(1_000_000_000)}, func() {
+		HostWith("h", HostConfig{Clock: Skew(time.Duration(math.MaxInt64)).WithDrift(1_000_000_000)}, func() {
 			go func() { // survives the fold; reads through the SAME incarnation's offset
 				<-read
 				got = time.Now()

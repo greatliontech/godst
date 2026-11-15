@@ -42,7 +42,7 @@ func TestDSTCrashProcessPidAndGoroutines(t *testing.T) {
 		for progress.Load() == 0 {
 			runtime.Gosched()
 		}
-		crashProcess("victim")
+		crashProcess("", "victim")
 		killErr = syscall.Kill(pid, 0)
 		_, statErr = os.Stat("/proc/" + strconv.Itoa(pid) + "/stat")
 		Process("victim", func() {
@@ -82,7 +82,7 @@ func TestDSTCrashProcessSameNameActiveInvocations(t *testing.T) {
 			})
 		}
 		pids = append(pids, <-ready, <-ready)
-		crashProcess("dup")
+		crashProcess("", "dup")
 		for _, pid := range pids {
 			killErrs = append(killErrs, syscall.Kill(pid, 0))
 		}
@@ -107,7 +107,7 @@ func TestDSTCrashProcessAbandonsBlockedChannelSend(t *testing.T) {
 		for range 5 {
 			runtime.Gosched()
 		}
-		crashProcess("sender")
+		crashProcess("", "sender")
 		Process("receiver", func() {
 			select {
 			case <-ch:
@@ -126,7 +126,7 @@ func TestDSTCrashProcessReleasesFileResources(t *testing.T) {
 	var leakedWriteErr, lockErr error
 	var content string
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			ready := make(chan *os.File, 1)
 			go Process("owner", func() {
 				f, err := os.OpenFile("/db", os.O_CREATE|os.O_RDWR, 0o644)
@@ -143,7 +143,7 @@ func TestDSTCrashProcessReleasesFileResources(t *testing.T) {
 				select {}
 			})
 			leaked = <-ready
-			crashProcess("owner")
+			crashProcess("h", "owner")
 			_, leakedWriteErr = leaked.Write([]byte("x"))
 			Process("peer", func() {
 				f, err := os.OpenFile("/db", os.O_RDWR, 0)
@@ -180,7 +180,7 @@ func TestDSTRootClosesOnProcessExitAndCrash(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var leaked *os.Root
 			Test(t, 1, func(t *testing.T) {
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					ready := make(chan *os.Root, 1)
 					go Process("owner", func() {
 						os.Mkdir("/d", 0o755)
@@ -195,7 +195,7 @@ func TestDSTRootClosesOnProcessExitAndCrash(t *testing.T) {
 					})
 					leaked = <-ready
 					if crash {
-						crashProcess("owner")
+						crashProcess("h", "owner")
 					}
 					if _, err := leaked.Stat("."); !errors.Is(err, os.ErrClosed) {
 						t.Fatalf("Root.Stat after process %s = %v, want ErrClosed", name, err)
@@ -220,7 +220,7 @@ func TestDSTCrashProcessClosesListeners(t *testing.T) {
 			select {}
 		})
 		p := <-port
-		crashProcess("server")
+		crashProcess("", "server")
 		Process("server", func() {
 			ln, err := net.Listen("tcp", ":"+p)
 			restartListenErr = err
@@ -237,7 +237,7 @@ func TestDSTCrashProcessClosesListeners(t *testing.T) {
 func TestDSTCrashProcessMmapPreservesSharedContents(t *testing.T) {
 	var content []byte
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			ready := make(chan struct{}, 1)
 			go Process("mapper", func() {
 				f, err := os.OpenFile("/mapped", os.O_CREATE|os.O_RDWR, 0o644)
@@ -256,7 +256,7 @@ func TestDSTCrashProcessMmapPreservesSharedContents(t *testing.T) {
 				select {}
 			})
 			<-ready
-			crashProcess("mapper")
+			crashProcess("h", "mapper")
 			Process("reader", func() {
 				var err error
 				content, err = os.ReadFile("/mapped")
@@ -282,30 +282,34 @@ func TestDSTCrashProcessResetsConnections(t *testing.T) {
 	Test(t, 1, func(t *testing.T) {
 		port := make(chan string, 1)
 		accepted := make(chan net.Conn, 1)
-		go Process("server", func() {
-			ln, err := net.Listen("tcp", ":0")
-			if err != nil {
-				t.Fatalf("listen: %v", err)
-			}
-			_, p, _ := net.SplitHostPort(ln.Addr().String())
-			port <- p
-			c, err := ln.Accept()
-			if err != nil {
-				t.Fatalf("accept: %v", err)
-			}
-			accepted <- c
-			select {}
+		Host("server", func() {
+			go Process("server", func() {
+				ln, err := net.Listen("tcp", ":0")
+				if err != nil {
+					t.Fatalf("listen: %v", err)
+				}
+				_, p, _ := net.SplitHostPort(ln.Addr().String())
+				port <- p
+				c, err := ln.Accept()
+				if err != nil {
+					t.Fatalf("accept: %v", err)
+				}
+				accepted <- c
+				select {}
+			})
 		})
-		Process("client", func() {
-			p := <-port
-			c, err := net.Dial("tcp", HostIP("server")+":"+p)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			<-accepted
-			crashProcess("server")
-			_ = c.SetReadDeadline(time.Now().Add(time.Minute))
-			_, readErr = c.Read(make([]byte, 1))
+		Host("client", func() {
+			Process("client", func() {
+				p := <-port
+				c, err := net.Dial("tcp", HostIP("server")+":"+p)
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				<-accepted
+				crashProcess("server", "server")
+				_ = c.SetReadDeadline(time.Now().Add(time.Minute))
+				_, readErr = c.Read(make([]byte, 1))
+			})
 		})
 	})
 	if !errors.Is(readErr, syscall.ECONNRESET) {
@@ -330,7 +334,7 @@ func TestDSTCrashProcessSurvivorDrainsDeliveredBytes(t *testing.T) {
 		written := make(chan struct{})
 		exited := make(chan struct{})
 
-		Host("victimhost", HostConfig{}, func() {
+		Host("victimhost", func() {
 			go Process("writer", func() {
 				l, err := net.Listen("tcp", HostIP("victimhost")+":0")
 				if err != nil {
@@ -358,7 +362,7 @@ func TestDSTCrashProcessSurvivorDrainsDeliveredBytes(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("survivorhost", HostConfig{}, func() {
+		Host("survivorhost", func() {
 			go func() {
 				defer close(exited)
 				Process("reader", func() {
@@ -370,7 +374,7 @@ func TestDSTCrashProcessSurvivorDrainsDeliveredBytes(t *testing.T) {
 					time.Sleep(20 * time.Millisecond) // "abc" is delivered to this queue
 					close(delivered)
 					<-written
-					Crash("writer")
+					CrashProcess("victimhost", "writer")
 					n, firstErr = c.Read(got[:])
 					_, secondErr = c.Read(make([]byte, 8))
 				})
@@ -403,7 +407,7 @@ func TestDSTCrashProcessSparesAppClosedConns(t *testing.T) {
 		closed := make(chan struct{})
 		exited := make(chan struct{})
 
-		Host("victimhost", HostConfig{}, func() {
+		Host("victimhost", func() {
 			go Process("writer", func() {
 				l, err := net.Listen("tcp", HostIP("victimhost")+":0")
 				if err != nil {
@@ -428,7 +432,7 @@ func TestDSTCrashProcessSparesAppClosedConns(t *testing.T) {
 		})
 		addr := <-addrCh
 
-		Host("survivorhost", HostConfig{}, func() {
+		Host("survivorhost", func() {
 			go func() {
 				defer close(exited)
 				Process("reader", func() {
@@ -439,7 +443,7 @@ func TestDSTCrashProcessSparesAppClosedConns(t *testing.T) {
 					}
 					close(dialed)
 					<-closed
-					Crash("writer")
+					CrashProcess("victimhost", "writer")
 					n, firstErr = c.Read(got[:])
 					_, secondErr = c.Read(make([]byte, 8))
 				})
@@ -481,7 +485,7 @@ func TestDSTCrashProcessAbandonsCondWait(t *testing.T) {
 		// Fake time advances only at quiescence: after the sleep the victim
 		// is durably parked inside Wait, holding the oldest ticket.
 		time.Sleep(time.Millisecond)
-		crashProcess("victim")
+		crashProcess("", "victim")
 
 		signalDone := make(chan struct{})
 		go Process("waiter", func() {
@@ -510,7 +514,7 @@ func TestDSTCrashProcessAbandonsCondWait(t *testing.T) {
 		})
 		<-parked
 		time.Sleep(time.Millisecond)
-		crashProcess("victim2")
+		crashProcess("", "victim2")
 
 		broadcastDone := make(chan struct{})
 		go Process("waiter2", func() {

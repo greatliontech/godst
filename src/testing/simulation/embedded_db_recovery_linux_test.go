@@ -173,7 +173,7 @@ func TestDSTEmbeddedDBRecovery(t *testing.T) {
 		rebootReadsDurableOnly string
 	)
 	Test(t, 1, func(t *testing.T) {
-		Host("db-host", HostConfig{}, func() {
+		Host("db-host", func() {
 			if err := os.Mkdir("/db", 0o755); err != nil {
 				t.Fatalf("mkdir: %v", err)
 			}
@@ -277,7 +277,7 @@ func TestDSTEmbeddedDBRecovery(t *testing.T) {
 
 			// The writer's machine keeps running; the writer dies. Its lock and
 			// its slot are released by the kernel, its unsynced tail survives.
-			Crash("writer")
+			CrashProcess("db-host", "writer")
 			staleAfterCrash = !processAlive(writerPID)
 			_, startTimeAfterCrash = processStartTime(writerPID)
 
@@ -302,7 +302,7 @@ func TestDSTEmbeddedDBRecovery(t *testing.T) {
 		// tail (page cache only).
 		CrashHost("db-host")
 
-		Host("db-host", HostConfig{}, func() {
+		Host("db-host", func() {
 			Process("reboot", func() {
 				b, err := os.ReadFile("/db/data")
 				if err != nil {
@@ -370,7 +370,7 @@ func TestDSTEmbeddedDBPagerLifecycle(t *testing.T) {
 		rebootMappedUnsynced byte
 	)
 	TestWith(t, 1, Options{CrashTear: true}, func(t *testing.T) {
-		Host("db", HostConfig{}, func() {
+		Host("db", func() {
 			f, err := os.OpenFile("/data", os.O_CREATE|os.O_RDWR, 0o644)
 			if err != nil {
 				t.Fatalf("create data file: %v", err)
@@ -544,7 +544,7 @@ func TestDSTEmbeddedDBPagerLifecycle(t *testing.T) {
 
 		CrashHost("db") // power loss, TORN: page-granular wreckage of the unsynced tail
 
-		Host("db", HostConfig{}, func() {
+		Host("db", func() {
 			Process("recovery", func() {
 				g, err := os.OpenFile("/data", os.O_RDWR, 0)
 				if err != nil {
@@ -649,7 +649,7 @@ func TestDSTEmbeddedDBNotifyFutex(t *testing.T) {
 		t.Skip("dst simulation test")
 	}
 	Run(11, func() {
-		Host("db", HostConfig{}, func() {
+		Host("db", func() {
 			mkWord := func() *uint32 {
 				lf, err := os.OpenFile("/db.lock", os.O_RDWR|os.O_CREATE, 0o600)
 				if err != nil {
@@ -716,7 +716,7 @@ func TestDSTEmbeddedDBBootEpoch(t *testing.T) {
 	var heartbeat1, now2 int64
 
 	Run(11, func() {
-		Host("db", HostConfig{}, func() {
+		Host("db", func() {
 			Process("writer", func() {
 				b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 				if err != nil {
@@ -733,7 +733,7 @@ func TestDSTEmbeddedDBBootEpoch(t *testing.T) {
 		})
 		CrashHost("db")
 		sleepMillis(10)
-		Host("db", HostConfig{}, func() {
+		Host("db", func() {
 			Process("writer", func() {
 				b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 				if err != nil {
@@ -779,7 +779,7 @@ func TestDSTEmbeddedDBIdentityDivergence(t *testing.T) {
 		// (pids are compared through one host's shared lock file), and
 		// starttimes are host-uptime-relative — a dedicated implicit host per
 		// process would start every process at its own machine's boot.
-		Host("db-host", HostConfig{}, func() {
+		Host("db-host", func() {
 			runIdentityReuseLeg(t, &stampedPid, &reusedPid, &stampedStart, &reusedStart, &probedStart, &probeAlive)
 		})
 	})
@@ -815,7 +815,7 @@ func TestDSTEmbeddedDBIdentityDivergence(t *testing.T) {
 			}
 			crossKill = syscall.Kill(writerPid, 0)
 		})
-		writerStillLive = dstPidAliveSim(int32(writerPid))
+		writerStillLive = dstPidAliveSim(0, int32(writerPid))
 		close(hold)
 	})
 	if writerNS == "" || proberNS == "" || writerNS == proberNS {

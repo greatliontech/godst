@@ -179,6 +179,15 @@ func dstPopHostScope(oldHost, oldProc uint32)
 //go:linkname dstCurrentNode runtime.dstCurrentNode
 func dstCurrentNode() (host, proc uint32)
 
+//go:linkname dstSetProcSlot runtime.dstSetProcSlot
+func dstSetProcSlot(slot uint32) (old uint32)
+
+//go:linkname dstCurrentSlot runtime.dstCurrentSlot
+func dstCurrentSlot() (host, slot uint32)
+
+//go:linkname dstCurrentHostBootCount runtime.dstCurrentHostBootCount
+func dstCurrentHostBootCount(host uint32) uint64
+
 //go:linkname dstNetEpoch runtime.dstNetEpoch
 func dstNetEpoch() uint64
 
@@ -210,13 +219,13 @@ func dstSetProcessPid(pid int32) (old int32)
 func dstRegisterPid(pid int32, ns uint32)
 
 //go:linkname dstUnregisterPid runtime.dstUnregisterPid
-func dstUnregisterPid(pid int32)
+func dstUnregisterPid(host uint32, pid int32)
 
 //go:linkname dstCrashProcessPid runtime.dstCrashProcessPid
-func dstCrashProcessPid(pid int32)
+func dstCrashProcessPid(host, slot uint32, pid int32)
 
 //go:linkname dstStopProcessThreads runtime.dstStopProcessThreads
-func dstStopProcessThreads(pid int32)
+func dstStopProcessThreads(host, slot uint32, pid int32)
 
 //go:linkname dstProcessTeardown runtime.dstProcessTeardown
 func dstProcessTeardown(proc uint32)
@@ -228,7 +237,7 @@ func dstProcessHasResources(proc uint32) bool
 func dstProcessStateTeardown(proc uint32)
 
 //go:linkname dstSetMappingFaultTeardownHook runtime.dstSetMappingFaultTeardownHook
-func dstSetMappingFaultTeardownHook(fn func(proc uint32))
+func dstSetMappingFaultTeardownHook(fn func(slot uint32, pid int32))
 
 //go:linkname dstSetHostDeclaredHook runtime.dstSetHostDeclaredHook
 func dstSetHostDeclaredHook(fn func(host uint32) bool)
@@ -240,10 +249,13 @@ func dstSelfCrashed() bool
 func dstParkCrashedSelf()
 
 //go:linkname dstPidAliveSim runtime.dstPidAlive
-func dstPidAliveSim(pid int32) bool
+func dstPidAliveSim(host uint32, pid int32) bool
+
+//go:linkname dstSlotAliveSim runtime.dstSlotAlive
+func dstSlotAliveSim(slot uint32) bool
 
 //go:linkname dstPidOwnsBubbleMain runtime.dstPidOwnsBubbleMain
-func dstPidOwnsBubbleMain(pid int32) bool
+func dstPidOwnsBubbleMain(slot uint32, pid int32) bool
 
 //go:linkname dstHostOwnsBubbleMain runtime.dstHostOwnsBubbleMain
 func dstHostOwnsBubbleMain(host uint32) bool

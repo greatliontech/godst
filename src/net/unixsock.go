@@ -218,7 +218,7 @@ func dialUnix(ctx context.Context, dialer *Dialer, network string, laddr, raddr 
 	default:
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: UnknownNetworkError(network)}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return nil, dstUnsupportedNetAPI("dial", network, laddr.opAddr(), raddr.opAddr())
 	}
 	sd := &sysDialer{network: network, address: raddr.String()}
@@ -341,7 +341,7 @@ func ListenUnix(network string, laddr *UnixAddr) (*UnixListener, error) {
 	if laddr == nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: errMissingAddress}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return nil, dstUnsupportedNetAPI("listen", network, nil, laddr.opAddr())
 	}
 	sl := &sysListener{network: network, address: laddr.String()}
@@ -364,7 +364,7 @@ func ListenUnixgram(network string, laddr *UnixAddr) (*UnixConn, error) {
 	if laddr == nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: errMissingAddress}
 	}
-	if dstNetEnabled && dstActive() {
+	if dstNetEnabled && dstInSimBubble() {
 		return nil, dstUnsupportedNetAPI("listen", network, nil, laddr.opAddr())
 	}
 	sl := &sysListener{network: network, address: laddr.String()}

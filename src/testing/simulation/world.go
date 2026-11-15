@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -99,7 +100,7 @@ func StartWorld(hosts []HostDecl) *Ctl {
 			panic("testing/simulation: duplicate HostDecl " + d.Name)
 		}
 		seen[d.Name] = true
-		Host(d.Name, d.Config, d.Boot)
+		HostWith(d.Name, d.Config, d.Boot)
 	}
 	return &Ctl{decls: append([]HostDecl(nil), hosts...)}
 }
@@ -115,7 +116,7 @@ func (c *Ctl) RestartHost(name string) {
 	for _, d := range c.decls {
 		if d.Name == name {
 			CrashHost(name) // a power-cycle of a live host begins with the power loss; a no-op if already down
-			Host(d.Name, d.Config, d.Boot)
+			HostWith(d.Name, d.Config, d.Boot)
 			return
 		}
 	}
@@ -144,7 +145,7 @@ func (c *Ctl) End() {
 // ExploreTest surfaces is promoted to one. Truncated coverage (budgets hit,
 // overflow, foreign goroutines) reports through t.Log — visible, never a
 // silent cap.
-func ExploreTest(t *testing.T, seed uint64, opts ExploreOptions, sut func() bool) {
+func ExploreTest(t *testing.T, seed uint64, opts ExploreOptions, sut func() error) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("exploration sweep: discovery is off the -short path (pin failing seeds as Test regressions)")
@@ -161,7 +162,7 @@ func ExploreTest(t *testing.T, seed uint64, opts ExploreOptions, sut func() bool
 
 // formatExploreReport renders an ExploreResult as ExploreTest reports it:
 // one replayable artifact per failure (the full replay token — Schedule,
-// AccessForces, CrashTear, AND ForeignSched, which Replay consumes to
+// AccessForces, Options, AND ForeignSched, which Replay consumes to
 // diagnose prefix divergence correctly on foreign-tainted failures), and
 // one note per coverage or oracle condition — each condition independently,
 // so no cap or dropped signal is ever silent.
@@ -175,19 +176,24 @@ func formatExploreReport(seed uint64, r ExploreResult) (failures, notes []string
 			kind = "panic: " + f.Panic
 		case f.Deadlock != "":
 			kind = "deadlock: " + f.Deadlock
+		case f.Err != "":
+			kind = "assertion: " + f.Err
 		}
-		budgetFields := ""
+		extraFields := ""
+		if f.Options != (Options{}) {
+			extraFields += ", Options: " + formatOptionsLiteral(f.Options)
+		}
 		if f.MaxSteps != 0 {
-			budgetFields += fmt.Sprintf(", MaxSteps: %d", f.MaxSteps)
+			extraFields += fmt.Sprintf(", MaxSteps: %d", f.MaxSteps)
 		}
 		if f.MaxAccesses != 0 {
-			budgetFields += fmt.Sprintf(", MaxAccesses: %d", f.MaxAccesses)
+			extraFields += fmt.Sprintf(", MaxAccesses: %d", f.MaxAccesses)
 		}
 		if f.MaxEdges != 0 {
-			budgetFields += fmt.Sprintf(", MaxEdges: %d", f.MaxEdges)
+			extraFields += fmt.Sprintf(", MaxEdges: %d", f.MaxEdges)
 		}
-		msg := fmt.Sprintf("explore seed %d failure %d/%d (%s): replay with\n\tsimulation.Replay(%d, simulation.Failure{Schedule: %#v, AccessForces: %#v, CrashTear: %v, ForeignSched: %v%s}, sut)",
-			seed, i+1, len(r.Failures), kind, seed, f.Schedule, f.AccessForces, f.CrashTear, f.ForeignSched, budgetFields)
+		msg := fmt.Sprintf("explore seed %d failure %d/%d (%s): replay with\n\tsimulation.Replay(%d, simulation.Failure{Schedule: %#v, AccessForces: %#v, ForeignSched: %v%s}, sut)",
+			seed, i+1, len(r.Failures), kind, seed, f.Schedule, f.AccessForces, f.ForeignSched, extraFields)
 		if f.diagnostics != "" {
 			msg += "\n" + f.diagnostics
 		}
@@ -214,4 +220,65 @@ func formatExploreReport(seed uint64, r ExploreResult) (failures, notes []string
 		notes = append(notes, fmt.Sprintf("explore seed %d: %d race report(s) could not be attributed to a replayable schedule (UnattributedRaces) — real oracle signals, not represented in Failures", seed, r.UnattributedRaces))
 	}
 	return failures, notes
+}
+
+func formatOptionsLiteral(o Options) string {
+	var parts []string
+	if o.Strategy != 0 {
+		if o.Strategy == PCT {
+			parts = append(parts, "Strategy: simulation.PCT")
+		} else {
+			parts = append(parts, fmt.Sprintf("Strategy: simulation.Strategy(%d)", o.Strategy))
+		}
+	}
+	if o.Depth != 0 {
+		parts = append(parts, fmt.Sprintf("Depth: %d", o.Depth))
+	}
+	if o.Steps != 0 {
+		parts = append(parts, fmt.Sprintf("Steps: %d", o.Steps))
+	}
+	if o.Hostname != "" {
+		parts = append(parts, fmt.Sprintf("Hostname: %q", o.Hostname))
+	}
+	if o.PID != 0 {
+		parts = append(parts, fmt.Sprintf("PID: %d", o.PID))
+	}
+	if o.PidMax != 0 {
+		parts = append(parts, fmt.Sprintf("PidMax: %d", o.PidMax))
+	}
+	if o.NumCPU != 0 {
+		parts = append(parts, fmt.Sprintf("NumCPU: %d", o.NumCPU))
+	}
+	if o.MemoryLimit != 0 {
+		parts = append(parts, fmt.Sprintf("MemoryLimit: %d", o.MemoryLimit))
+	}
+	if o.Network != (NetworkConfig{}) {
+		var netParts []string
+		if o.Network.CrossHostLatency != 0 {
+			netParts = append(netParts, fmt.Sprintf("CrossHostLatency: %d", o.Network.CrossHostLatency))
+		}
+		if o.Network.CrossHostJitter != 0 {
+			netParts = append(netParts, fmt.Sprintf("CrossHostJitter: %d", o.Network.CrossHostJitter))
+		}
+		if o.Network.CrossHostBandwidth != 0 {
+			netParts = append(netParts, fmt.Sprintf("CrossHostBandwidth: %d", o.Network.CrossHostBandwidth))
+		}
+		if o.Network.SendBuffer != 0 {
+			netParts = append(netParts, fmt.Sprintf("SendBuffer: %d", o.Network.SendBuffer))
+		}
+		if o.Network.RetransmitTimeout != 0 {
+			netParts = append(netParts, fmt.Sprintf("RetransmitTimeout: %d", o.Network.RetransmitTimeout))
+		}
+		parts = append(parts, "Network: simulation.NetworkConfig{"+strings.Join(netParts, ", ")+"}")
+	}
+	if o.CrashTear {
+		parts = append(parts, "CrashTear: true")
+	}
+	if o.WedgeDecisionLimit != 0 {
+		parts = append(parts, fmt.Sprintf("WedgeDecisionLimit: %d", o.WedgeDecisionLimit))
+	}
+	if o.WedgeWallLimit != 0 {
+		parts = append(parts, fmt.Sprintf("WedgeWallLimit: %d", o.WedgeWallLimit))
+	}
+	return "simulation.Options{" + strings.Join(parts, ", ") + "}"
 }

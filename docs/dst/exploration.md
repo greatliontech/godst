@@ -638,21 +638,25 @@ stored global states.
 
 The driver lives above the seam, orchestrating repeated Runs:
 
-- `simulation.Explore(seed uint64, mode ExploreMode, f func() bool) ExploreResult` — runs the selected
-  worklist (Exhaustive or DPOR): pop a schedule, execute `f` under it, analyze the trace, push new
-  schedules, until the worklist is empty (the pruned interleaving space is **exhausted**) or a budget is
-  hit. `simulation.ExploreWith(seed, ExploreOptions{Mode, MaxSchedules, MaxSteps}, f)` is the budgeted
-  form. `ExploreResult` carries schedules/exhausted/overflow/budget-hit + every found failure (a `-race`
-  report, a SUT assertion, a SUT panic, or a synctest deadlock) with replay metadata: the observing schedule
-  plus any forced access-yield watchpoints active when the failure was observed. Top-level SUT callback
+- `simulation.Explore(seed uint64, mode ExploreMode, f func() error) ExploreResult` — runs the selected
+  worklist (Exhaustive or DPOR): pop a schedule, execute `f` under it (`nil` return = pass, non-`nil`
+  error = SUT failure recorded on `Failure.Err`), analyze the trace, push new schedules, until the
+  worklist is empty (the pruned interleaving space is **exhausted**) or a budget is hit.
+  `simulation.ExploreWith(seed, ExploreOptions{Options, Mode, MaxSchedules, MaxSteps, MaxAccesses, MaxEdges}, f)` is the
+  configured and budgeted form (its embedded `Options` configures identity, network, memory limit, crash
+  tear, and wedge bounds for every explored pass and is validated as in `RunWith`, while the outer
+  exploration loop drives scheduling systematically). `ExploreResult` carries schedules/exhausted/overflow/budget-hit + every found
+  failure (a `-race` report, a non-`nil` `Failure.Err` return, a SUT panic, or a synctest deadlock) with
+  replay metadata: the observing schedule, active `Options` and trace capacities, plus any forced access-yield watchpoints active when the failure
+  was observed. Top-level SUT callback
   panics are recovered in the Explore driver; unrecovered panics from SUT-created bubble goroutines or
   finalizer/cleanup callbacks on the DST drain are recorded by the runtime after the panicking goroutine's
   defers run, then that goroutine exits. Scheduled
   synctest deadlocks are recorded as `Failure.Deadlock` inside `synctestRun` before it returns, avoiding the
   unsafe outer-recover path while leaving the blocked goroutines isolated in their deadlocked bubble.
-- `simulation.Replay(seed, failure, f)` replays one schedule for reproduction/debug using a `Failure`'s
-  recorded schedule plus any forced access-yield watchpoints. `RunWith` remains the Random/PCT control
-  surface and rejects unknown strategies instead of silently falling back to Random.
+- `simulation.Replay(seed, failure, f)` replays one schedule for reproduction/debug using `failure`'s recorded
+  schedule, `Options`, trace capacities, and forced access-yield watchpoints, returning a structured `ReplayResult` (`Err`, `Raced`, and `Failed()`; panic and deadlock failures reproduce the recorded panic directly). `RunWith` remains the
+  Random/PCT control surface and rejects unknown strategies instead of silently falling back to Random.
 - **No silent cap (No silent downscoping):** if a budget truncates exploration, `Report` says so and how
   much was covered — "exhausted" and "budget-hit" are distinct verdicts; the latter is never reported as
   the former.

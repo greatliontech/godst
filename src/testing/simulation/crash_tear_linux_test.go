@@ -31,7 +31,7 @@ func tornRun(t *testing.T, seed uint64) (content []byte, dirEntries []string) {
 	unsynced := bytes.Repeat([]byte("U"), 2*page)
 
 	RunWith(seed, Options{CrashTear: true}, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.Create("/f")
 				if err != nil {
@@ -65,7 +65,7 @@ func tornRun(t *testing.T, seed uint64) (content []byte, dirEntries []string) {
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				b, err := os.ReadFile("/f")
 				if err != nil {
@@ -205,7 +205,7 @@ func TestDSTCrashTearOffIsAllOrNothing(t *testing.T) {
 	var content []byte
 	var names []string
 	Run(1, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, _ := os.Create("/f")
 				f.Write(bytes.Repeat([]byte("D"), page))
@@ -221,7 +221,7 @@ func TestDSTCrashTearOffIsAllOrNothing(t *testing.T) {
 			}
 		})
 		CrashHost("h")
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				content, _ = os.ReadFile("/f")
 				des, _ := os.ReadDir("/")
@@ -247,7 +247,7 @@ func TestDSTCrashTearOffIsAllOrNothing(t *testing.T) {
 // exploration strategy the scheduler chooses, and a spin can starve the writer.
 func crashTearProbe() (survived bool) {
 	written := make(chan struct{})
-	Host("h", HostConfig{}, func() {
+	Host("h", func() {
 		go Process("db", func() {
 			f, err := os.Create("/p")
 			if err == nil {
@@ -260,7 +260,7 @@ func crashTearProbe() (survived bool) {
 		<-written
 	})
 	CrashHost("h")
-	Host("h", HostConfig{}, func() {
+	Host("h", func() {
 		Process("recover", func() {
 			b, err := os.ReadFile("/p")
 			survived = err == nil && len(b) > 0
@@ -286,9 +286,13 @@ func TestDSTCrashTearDoesNotLeakAcrossRuns(t *testing.T) {
 	})
 
 	// So must an Explore that did not ask for it.
-	res := Explore(3, Exhaustive, func() bool {
-		return crashTearProbe() // a "failure" means the byte survived
-	})
+	probeErr := func() error {
+		if crashTearProbe() {
+			return errors.New("unsynced byte survived")
+		}
+		return nil
+	}
+	res := Explore(3, Exhaustive, probeErr)
 	if len(res.Failures) != 0 {
 		t.Fatalf("Explore inherited the previous run's crash-tear policy")
 	}
@@ -298,9 +302,7 @@ func TestDSTCrashTearDoesNotLeakAcrossRuns(t *testing.T) {
 	// "failure" by the probe's contract).
 	torn := false
 	for seed := uint64(1); seed <= 40 && !torn; seed++ {
-		r := ExploreWith(seed, ExploreOptions{CrashTear: true, MaxSchedules: 1}, func() bool {
-			return crashTearProbe()
-		})
+		r := ExploreWith(seed, ExploreOptions{Options: Options{CrashTear: true}, MaxSchedules: 1}, probeErr)
 		if len(r.Failures) != 0 {
 			torn = true
 		}
@@ -315,28 +317,30 @@ func TestDSTCrashTearDoesNotLeakAcrossRuns(t *testing.T) {
 // replay would restore a different disk (the untorn one) and the bug would
 // vanish — the "found once, re-runnable forever" promise of DST-FAULT-REPLAY.
 func TestDSTCrashTearFailureReplays(t *testing.T) {
+	probeErr := func() error {
+		if crashTearProbe() {
+			return errors.New("unsynced byte survived")
+		}
+		return nil
+	}
 	var seed uint64
 	var failure Failure
-	for s := uint64(1); s <= 40 && failure.Schedule == nil && !failure.CrashTear; s++ {
-		r := ExploreWith(s, ExploreOptions{CrashTear: true, MaxSchedules: 1}, func() bool {
-			return crashTearProbe() // "fails" when the unsynced byte survives
-		})
+	for s := uint64(1); s <= 40 && failure.Schedule == nil && !failure.Options.CrashTear; s++ {
+		r := ExploreWith(s, ExploreOptions{Options: Options{CrashTear: true}, MaxSchedules: 1}, probeErr)
 		if len(r.Failures) > 0 {
 			seed, failure = s, r.Failures[0]
 		}
 	}
-	if !failure.CrashTear {
+	if !failure.Options.CrashTear {
 		t.Fatalf("no torn failure found to replay, or the policy was not recorded in the Failure")
 	}
-	failed, _ := Replay(seed, failure, func() bool { return crashTearProbe() })
-	if !failed {
+	if !Replay(seed, failure, probeErr).Failed() {
 		t.Fatalf("replaying a torn failure did not reproduce it: the crash policy was not restored")
 	}
 	// And a failure recorded WITHOUT the tear replays untorn: the byte stays lost.
 	untorn := failure
-	untorn.CrashTear = false
-	failedUntorn, _ := Replay(seed, untorn, func() bool { return crashTearProbe() })
-	if failedUntorn {
+	untorn.Options.CrashTear = false
+	if Replay(seed, untorn, probeErr).Failed() {
 		t.Fatalf("replaying with CrashTear cleared still tore the disk")
 	}
 }
@@ -352,7 +356,7 @@ func TestDSTCrashTearTruncateDown(t *testing.T) {
 		var got []byte
 		RunWith(seed, Options{CrashTear: true}, func() {
 			done := make(chan struct{})
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				go Process("db", func() {
 					f, err := os.Create("/t")
 					if err == nil {
@@ -368,7 +372,7 @@ func TestDSTCrashTearTruncateDown(t *testing.T) {
 				<-done
 			})
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				Process("recover", func() { got, _ = os.ReadFile("/t") })
 			})
 		})
@@ -406,7 +410,7 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 		var srcErr, dstErr error
 		RunWith(seed, Options{CrashTear: true}, func() {
 			done := make(chan struct{})
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				go Process("db", func() {
 					os.Mkdir("/a", 0o755)
 					os.Mkdir("/b", 0o755)
@@ -430,7 +434,7 @@ func TestDSTCrashTearRenameDoubleLinkRestoredOnce(t *testing.T) {
 				<-done
 			})
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				Process("recover", func() {
 					src, srcErr = os.ReadFile("/a/f")
 					dst, dstErr = os.ReadFile("/b/f")
@@ -479,7 +483,7 @@ func TestDSTCrashTearDirectoryAliasesCannotFormCycle(t *testing.T) {
 	for seed := uint64(1); seed <= 64; seed++ {
 		RunWith(seed, Options{CrashTear: true}, func() {
 			done := make(chan struct{})
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				go Process("db", func() {
 					os.Mkdir("/a", 0o755)
 					os.Mkdir("/b", 0o755)
@@ -493,7 +497,7 @@ func TestDSTCrashTearDirectoryAliasesCannotFormCycle(t *testing.T) {
 				<-done
 			})
 			CrashHost("h")
-			Host("h", HostConfig{}, func() {
+			Host("h", func() {
 				Process("recover", func() {
 					a, aerr := os.Stat("/a/d")
 					b, berr := os.Stat("/b/d")
@@ -542,7 +546,7 @@ func TestDSTRejectedNestedRunKeepsCrashTearPolicy(t *testing.T) {
 			RunWith(1, Options{CrashTear: false}, func() {})
 		}()
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.Create("/tmp/state")
 				if err != nil {
@@ -571,7 +575,7 @@ func TestDSTRejectedNestedRunKeepsCrashTearPolicy(t *testing.T) {
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("db", func() {
 				b, err := os.ReadFile("/tmp/state")
 				if err != nil {
@@ -601,7 +605,7 @@ func multiAppendRun(t *testing.T, seed uint64, appends int, appendLen int) (cont
 	durable := bytes.Repeat([]byte("D"), page)
 
 	RunWith(seed, Options{CrashTear: true}, func() {
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			go Process("db", func() {
 				f, err := os.Create("/f")
 				if err != nil {
@@ -633,7 +637,7 @@ func multiAppendRun(t *testing.T, seed uint64, appends int, appendLen int) (cont
 
 		CrashHost("h")
 
-		Host("h", HostConfig{}, func() {
+		Host("h", func() {
 			Process("recover", func() {
 				b, err := os.ReadFile("/f")
 				if err != nil {

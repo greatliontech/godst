@@ -321,16 +321,28 @@ func dstLinkDelay(latencyNs, jitterNs int64) int64 {
 // A FIN toward a frozen stream is discarded like any late segment (the receiving
 // socket is CLOSED; it answers with RST, it never queues) — recording it would
 // resurrect a clean EOF on a dead end.
-func (s *dstStream) closeWrite(latencyNs, jitterNs int64) {
+func (s *dstStream) closeWrite(latencyNs, jitterNs int64) (dead bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	if s.frozen {
-		return
+		s.deadDropped = true
+		return true
 	}
 	s.closed = true
 	s.closeAt = dstDelayAdd(dstDelayAdd(dstBaseNanos(), latencyNs), dstFaultRandN(jitterNs))
 	dstKernelRaceReleaseMerge(unsafe.Pointer(&s.eofSync))
 	s.bumpReadyLocked()
+	return false
+}
+
+func (s *dstStream) isClosed() bool {
+	s.mu.Lock()
+	c := s.closed
+	s.mu.Unlock()
+	return c
 }
 
 // pop copies bytes that have ARRIVED (deliverAt <= maxArrival) into b, coalescing
@@ -466,12 +478,29 @@ type dstWireEnd struct {
 	rstKill    chan struct{}
 	rstSync    uint64
 
-	// rstCloseWait records that the injected RST arrived with the peer's FIN
+	// rstCloseWait records that an injected RST arrived with the peer's FIN
 	// already delivered — production CLOSE_WAIT, where tcp_reset pends EPIPE
 	// instead of ECONNRESET (host-probed: post-RST reads are plain EOF and
-	// writes EPIPE, with no ECONNRESET arm). Written once inside rstOnce;
-	// consumed by the dstConn wrapper's consumeSkErr.
-	rstCloseWait atomic.Bool
+	// writes EPIPE, with no ECONNRESET arm). rstAfterPeerFIN records that a
+	// peer emitted Close-with-unread RST after already emitting its FIN via
+	// CloseWrite; it enters the CLOSE_WAIT arm only once that FIN has arrived
+	// at this end (streamFinArrived).
+	rstCloseWait    atomic.Bool
+	rstAfterPeerFIN atomic.Bool
+
+	writeOnce     isync.KernelOnce
+	writeShut     atomic.Bool
+	writeSync     uint64
+	writeShutdown chan struct{}
+
+	readOnce     isync.KernelOnce
+	readShut     atomic.Bool
+	readSync     uint64
+	readShutdown chan struct{}
+
+	activeCloserMu isync.KernelMutex
+	activeStamped  bool
+	activeCloser   bool
 
 	once          isync.KernelOnce
 	closeSync     uint64
@@ -565,6 +594,7 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 		localHost: dialerHost, peerHost: listenHost,
 		opts: dialerOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneA, remoteDone: doneB, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
+		writeShutdown: make(chan struct{}), readShutdown: make(chan struct{}),
 		rdDead: makeDstDeadline(), wrDead: makeDstDeadline(),
 	}
 	b := &dstWireEnd{
@@ -572,6 +602,7 @@ func dstWirePair(latencyNs, jitterNs, bandwidthBps, capacity, retransNs int64, d
 		localHost: listenHost, peerHost: dialerHost,
 		opts: serverOpts, bornAt: born, kaEpisode: -1,
 		localDone: doneB, remoteDone: doneA, horizonKill: make(chan struct{}), rstKill: make(chan struct{}),
+		writeShutdown: make(chan struct{}), readShutdown: make(chan struct{}),
 		rdDead: makeDstDeadline(), wrDead: makeDstDeadline(),
 	}
 	a.peerCloseSync = &b.closeSync
@@ -1014,11 +1045,73 @@ func (e *dstWireEnd) isRSTArrivedAcquire() bool {
 func (e *dstWireEnd) isRSTCloseWaitAcquire() bool {
 	dstKernelSectionEnter()
 	cw := e.rstCloseWait.Load()
+	afterFIN := e.rstAfterPeerFIN.Load()
 	if cw {
 		dstKernelRaceAcquire(unsafe.Pointer(&e.in.eofSync))
 	}
 	dstKernelSectionExit()
-	return cw
+	if cw {
+		return true
+	}
+	if afterFIN && e.streamFinArrived(e.peerHost, e.localHost, e.in) {
+		dstKernelSectionEnter()
+		dstKernelRaceAcquire(unsafe.Pointer(&e.in.raceSync))
+		dstKernelRaceAcquire(unsafe.Pointer(&e.in.eofSync))
+		dstKernelSectionExit()
+		return true
+	}
+	return false
+}
+
+func (e *dstWireEnd) markRSTAfterPeerFIN() {
+	dstKernelSectionEnter()
+	e.rstAfterPeerFIN.Store(true)
+	dstKernelSectionExit()
+}
+
+func (e *dstWireEnd) isWriteShutdownKernel() bool {
+	dstKernelSectionEnter()
+	v := e.writeShut.Load()
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) isWriteShutdownAcquire() bool {
+	dstKernelSectionEnter()
+	v := e.writeShut.Load()
+	if v {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.writeSync))
+	}
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) isReadShutdownKernel() bool {
+	dstKernelSectionEnter()
+	v := e.readShut.Load()
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) isReadShutdownAcquire() bool {
+	dstKernelSectionEnter()
+	v := e.readShut.Load()
+	if v {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.readSync))
+	}
+	dstKernelSectionExit()
+	return v
+}
+
+func (e *dstWireEnd) stampActiveCloser() bool {
+	e.activeCloserMu.Lock()
+	if !e.activeStamped {
+		e.activeStamped = true
+		e.activeCloser = !e.in.isClosed() && !dstIsClosedKernelChan(e.remoteDone)
+	}
+	res := e.activeCloser
+	e.activeCloserMu.Unlock()
+	return res
 }
 
 func (e *dstWireEnd) acquireLocalCloseSync() {
@@ -1236,6 +1329,7 @@ func (e *dstWireEnd) unreadInbound() bool {
 func (e *dstWireEnd) coarseRead() {
 	dstCoarseDep(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.eofSync)), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.readSync)), false)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), false)
 	if e.localHost != e.peerHost {
@@ -1246,6 +1340,7 @@ func (e *dstWireEnd) coarseRead() {
 
 func (e *dstWireEnd) coarseWrite() {
 	dstCoarseDep(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.writeSync)), false)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
 	if e.peerCloseSync != nil {
 		dstCoarseRecord(uintptr(unsafe.Pointer(e.peerCloseSync)), false)
@@ -1257,8 +1352,29 @@ func (e *dstWireEnd) coarseWrite() {
 	}
 }
 
+func (e *dstWireEnd) coarseCloseWrite() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.writeSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.eofSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.wrDead)), true)
+	if e.localHost != e.peerHost {
+		dstCoarseRecord(dstCoarseNetHostID(e.localHost), false)
+		dstCoarseRecord(dstCoarseNetHostID(e.peerHost), false)
+	}
+}
+
+func (e *dstWireEnd) coarseCloseRead() {
+	dstCoarseDep(uintptr(unsafe.Pointer(&e.readSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.closeSync)), false)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.rdDead)), true)
+}
+
 func (e *dstWireEnd) coarseClose() {
 	dstCoarseDep(uintptr(unsafe.Pointer(&e.closeSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.writeSync)), true)
+	dstCoarseRecord(uintptr(unsafe.Pointer(&e.readSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.in.raceSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.raceSync)), true)
 	dstCoarseRecord(uintptr(unsafe.Pointer(&e.out.eofSync)), true)
@@ -1353,12 +1469,17 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 		}
 		// An injected RST follows the same tcp_recvmsg rule: the delivered
 		// bytes above drained first (injectRST truncated everything else), and
-		// only then does the socket error surface — before any FIN wait, since
-		// the RST supersedes a still-traveling graceful close. The dstConn
-		// wrapper maps ErrClosedPipe through the one-shot sk_err (consumeSkErr;
-		// the shared reset flag routes the drained-EOF path there too).
+		// only then does the socket error surface — before any FIN wait or
+		// RCV_SHUTDOWN (host-probed: CloseRead followed by RST still surfaces
+		// ECONNRESET on Read), since the RST supersedes a still-traveling
+		// graceful close. The dstConn wrapper maps ErrClosedPipe through the
+		// one-shot sk_err (consumeSkErr; the shared reset flag routes the
+		// drained-EOF path there too).
 		if e.isRSTArrivedAcquire() {
 			return 0, io.ErrClosedPipe
+		}
+		if e.isReadShutdownAcquire() {
+			return 0, io.EOF
 		}
 		// A read parked against a DEAD counterpart socket re-probes at every
 		// wake (probeDeadPeer): its destroyed, never-to-be-ACKed outbound
@@ -1412,6 +1533,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			case <-wake:
 			case <-e.horizonKill:
 			case <-e.rstKill:
+			case <-e.readShutdown:
 			case <-e.localDone:
 			case <-e.rdDead.wait():
 			}
@@ -1442,6 +1564,7 @@ func (e *dstWireEnd) read(b []byte) (int, error) {
 			// one wakeup per fault op, no spin.
 		case <-e.horizonKill:
 		case <-e.rstKill:
+		case <-e.readShutdown:
 		case <-e.localDone:
 		case <-e.rdDead.wait():
 		}
@@ -1458,10 +1581,10 @@ func (e *dstWireEnd) Write(b []byte) (int, error) {
 
 func (e *dstWireEnd) writeAfterCoarse(b []byte) (int, error) {
 	n, err := e.write(b)
-	if err != nil && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT {
+	if err != nil && err != io.ErrClosedPipe && err != syscall.ETIMEDOUT && err != syscall.EPIPE {
 		err = &OpError{Op: "write", Net: "pipe", Err: err}
 	}
-	// io.ErrClosedPipe / syscall.ETIMEDOUT pass raw for the dstConn wrapper to map (a
+	// io.ErrClosedPipe / syscall.ETIMEDOUT / syscall.EPIPE pass raw for the dstConn wrapper to map (a
 	// pipe-OpError here would double-wrap and leak "pipe" into the error identity).
 	return n, err
 }
@@ -1478,9 +1601,15 @@ func (e *dstWireEnd) writeCheck(outClosed bool) error {
 		// send fails with it immediately (no drain applies to writes). The
 		// dstConn wrapper maps ErrClosedPipe through the one-shot sk_err.
 		return io.ErrClosedPipe
-	case outClosed || dstIsClosedKernelChan(e.localDone):
+	case dstIsClosedKernelChan(e.localDone):
 		e.acquireLocalCloseSync()
 		return io.ErrClosedPipe
+	case e.isWriteShutdownAcquire() || outClosed:
+		if !e.isWriteShutdownKernel() {
+			e.acquireLocalCloseSync()
+			return io.ErrClosedPipe
+		}
+		return syscall.EPIPE
 	case dstIsClosedKernelChan(e.remoteDone):
 		e.acquirePeerCloseSync()
 		return io.ErrClosedPipe
@@ -1495,6 +1624,7 @@ func (e *dstWireEnd) writeCheck(outClosed bool) error {
 // condition while holding e.out.mu as a pure leaf lock (zero nested locks).
 func (e *dstWireEnd) writeAbortedOutLocked(wrDeadCh <-chan struct{}) bool {
 	return e.out.closed ||
+		e.isWriteShutdownKernel() ||
 		e.isTimedOutKernel() ||
 		e.isRSTArrivedKernel() ||
 		dstIsClosedKernelChan(e.localDone) ||
@@ -1645,6 +1775,12 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 					horizonT.Stop()
 				}
 				return total, os.ErrDeadlineExceeded
+			case <-e.writeShutdown:
+				if horizonT != nil {
+					horizonT.Stop()
+				}
+				e.isWriteShutdownAcquire()
+				return total, syscall.EPIPE
 			case <-e.localDone:
 				if horizonT != nil {
 					horizonT.Stop()
@@ -1745,6 +1881,102 @@ func (e *dstWireEnd) write(b []byte) (int, error) {
 	return total, nil
 }
 
+func (s *dstStream) finArrivedAt(horizon int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed || s.closeAt > horizon {
+		return false
+	}
+	for i := range s.segs {
+		if s.segs[i].deliverAt > horizon {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *dstWireEnd) streamFinArrived(from, to uint32, s *dstStream) bool {
+	horizon := dstBaseNanos()
+	if cutStart, cut, _ := dstPartCutStartDir(from, to); cut && cutStart-1 < horizon {
+		horizon = cutStart - 1
+	}
+	return s.finArrivedAt(horizon)
+}
+
+// isSocketDisconnected reports whether the TCP socket has already transitioned
+// to TCP_CLOSE (RST arrived, retransmit horizon expired, or both directions'
+// FINs completed), where inet_shutdown returns ENOTCONN without modifying
+// sk_shutdown or consuming sk_err.
+func (e *dstWireEnd) isSocketDisconnected() bool {
+	if e.isTimedOutAcquire() || e.isRSTArrivedAcquire() {
+		return true
+	}
+	return e.streamFinArrived(e.localHost, e.peerHost, e.out) &&
+		e.streamFinArrived(e.peerHost, e.localHost, e.in)
+}
+
+func (e *dstWireEnd) CloseWrite() error {
+	e.coarseCloseWrite()
+	return e.closeWriteAfterCoarse()
+}
+
+func (e *dstWireEnd) closeWriteAfterCoarse() error {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
+		return io.ErrClosedPipe
+	}
+	if e.isSocketDisconnected() {
+		return syscall.ENOTCONN
+	}
+	e.writeOnce.Do(func() {
+		dstKernelSectionEnter()
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.writeSync))
+		e.writeShut.Store(true)
+		if e.writeShutdown != nil {
+			close(e.writeShutdown)
+		}
+		dstKernelSectionExit()
+		if e.isTimedOutKernel() || e.isRSTArrivedKernel() {
+			return
+		}
+		e.stampActiveCloser()
+		dead := e.out.closeWrite(e.latencyNs, e.jitterNs)
+		if dead && !e.isTimedOutKernel() && !e.isRSTArrivedKernel() &&
+			!dstPartitionedDir(e.localHost, e.peerHost) && !dstPartitionedDir(e.peerHost, e.localHost) &&
+			!dstHostDead(e.peerHost) {
+			dstDeadPushRST(e)
+		} else if (dstPartAnyCut() && dstPartitionedDir(e.localHost, e.peerHost)) || (dead && dstHostDead(e.peerHost)) {
+			e.armHorizon()
+		}
+	})
+	return nil
+}
+
+func (e *dstWireEnd) CloseRead() error {
+	e.coarseCloseRead()
+	return e.closeReadAfterCoarse()
+}
+
+func (e *dstWireEnd) closeReadAfterCoarse() error {
+	if dstIsClosedKernelChan(e.localDone) {
+		dstKernelRaceAcquire(unsafe.Pointer(&e.closeSync))
+		return io.ErrClosedPipe
+	}
+	if e.isSocketDisconnected() {
+		return syscall.ENOTCONN
+	}
+	e.readOnce.Do(func() {
+		dstKernelSectionEnter()
+		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.readSync))
+		e.readShut.Store(true)
+		if e.readShutdown != nil {
+			close(e.readShutdown)
+		}
+		dstKernelSectionExit()
+	})
+	return nil
+}
+
 func (e *dstWireEnd) Close() error {
 	e.coarseClose()
 	return e.closeAfterCoarse()
@@ -1754,6 +1986,7 @@ func (e *dstWireEnd) closeAfterCoarse() error {
 	e.once.Do(func() {
 		dstKernelRaceReleaseMerge(unsafe.Pointer(&e.closeSync))
 		close(e.localDone)
+		e.stampActiveCloser()
 		// Stop accepting reads/writes locally (localDone) and let the peer drain
 		// what we already sent, then see EOF (closeWrite on our out = peer's in).
 		e.out.closeWrite(e.latencyNs, e.jitterNs)

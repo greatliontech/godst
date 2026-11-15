@@ -55,7 +55,7 @@ func TestDSTClockGettimeVirtualMonotonic(t *testing.T) {
 		stepped := make(chan struct{})
 		done := make(chan struct{})
 		go func() {
-			simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Host("h", func() {
 				wallBefore = time.Now().UnixNano()
 				hostMonoBefore, hostMonoBeforeErr = dstRawClockGettime(dstClockMonotonic)
 				close(ready)
@@ -135,7 +135,7 @@ func TestDSTClockUptimePerHostBoot(t *testing.T) {
 		rootU0 = read(dstClockMonotonic)
 		time.Sleep(5 * time.Second)
 		rootU1 = read(dstClockMonotonic)
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			hostMono0 = read(dstClockMonotonic)
 			hostBoot0 = read(dstClockBoottime)
 			time.Sleep(2 * time.Second)
@@ -143,7 +143,7 @@ func TestDSTClockUptimePerHostBoot(t *testing.T) {
 		})
 		simulation.CrashHost("h")
 		time.Sleep(3 * time.Second)
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			postBoot = read(dstClockBoottime)
 			time.Sleep(1 * time.Second)
 			postBoot2 = read(dstClockBoottime)
@@ -153,12 +153,12 @@ func TestDSTClockUptimePerHostBoot(t *testing.T) {
 		// a drifting host's uptime advances in BASE time — its own Sleep(2s)
 		// (host-perceived) waits out ceil(2s/rate) of base time, the timer
 		// remap's documented rounding, not 2s.
-		simulation.Host("skewed", simulation.HostConfig{Clock: simulation.Skew(9 * time.Hour)}, func() {
+		simulation.HostWith("skewed", simulation.HostConfig{Clock: simulation.Skew(9 * time.Hour)}, func() {
 			skewU0 = read(dstClockMonotonic)
 			time.Sleep(1 * time.Second)
 			skewU1 = read(dstClockBoottime)
 		})
-		simulation.Host("drifty", simulation.HostConfig{Clock: simulation.Drift(500_000_000)}, func() { // rate 1.5
+		simulation.HostWith("drifty", simulation.HostConfig{Clock: simulation.Drift(500_000_000)}, func() { // rate 1.5
 			driftU0 = read(dstClockMonotonic)
 			time.Sleep(2 * time.Second)
 			driftU1 = read(dstClockMonotonic)

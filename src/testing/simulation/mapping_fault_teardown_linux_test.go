@@ -25,8 +25,12 @@ func TestDSTMappingFaultRunsCompleteProcessTeardown(t *testing.T) {
 	var leakedConn net.Conn
 	var leakedMapping []byte
 	Test(t, 1, func(t *testing.T) {
-		Host("h", HostConfig{}, func() {
-			ready := make(chan int, 1)
+		Host("h", func() {
+			type procInfo struct {
+				slot uint32
+				pid  int
+			}
+			ready := make(chan procInfo, 1)
 			go Process("worker", func() {
 				os.Mkdir("/old", 0o755)
 				os.Chdir("/old")
@@ -68,10 +72,12 @@ func TestDSTMappingFaultRunsCompleteProcessTeardown(t *testing.T) {
 				}
 				_ = server
 				leakedConn = <-connReady
-				ready <- os.Getpid()
+				_, slot := dstCurrentSlot()
+				ready <- procInfo{slot: slot, pid: os.Getpid()}
 				mappingFaultTeardownSink = m[page] // SIGBUS: mapped wholly beyond EOF.
 			})
-			pid := <-ready
+			info := <-ready
+			pid := info.pid
 			for syscall.Kill(pid, 0) == nil {
 				runtime.Gosched()
 			}
@@ -87,9 +93,8 @@ func TestDSTMappingFaultRunsCompleteProcessTeardown(t *testing.T) {
 			if _, err := leakedRoot.Stat("."); !errors.Is(err, os.ErrClosed) {
 				t.Fatalf("Root after mapping fault = %v, want ErrClosed", err)
 			}
-			proc := lookupProc("worker")
 			runs := mappingFaultTeardownRuns
-			mappingFaultProcessTeardown(proc)
+			mappingFaultProcessTeardown(info.slot, int32(pid))
 			if mappingFaultTeardownRuns != runs {
 				t.Fatalf("duplicate mapping-fault teardown ran twice: %d -> %d", runs, mappingFaultTeardownRuns)
 			}

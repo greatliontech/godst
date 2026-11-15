@@ -18,7 +18,7 @@ import (
 func TestDSTFODSyncCommitsDataWithoutMetadata(t *testing.T) {
 	var durableMtime time.Time
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				f, err := os.OpenFile("/f", os.O_CREATE|os.O_RDWR, 0o644)
 				if err != nil {
@@ -54,7 +54,7 @@ func TestDSTFODSyncCommitsDataWithoutMetadata(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				data, err := os.ReadFile("/f")
 				if err != nil || string(data) != "new-data" {
@@ -73,7 +73,7 @@ func TestDSTFODSyncWriteAtAndRootedHandle(t *testing.T) {
 	paths := map[string]string{"/at": "write-at", "/rooted": "rooted-data"}
 	mtimes := map[string]time.Time{}
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				for path := range paths {
 					f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
@@ -108,7 +108,7 @@ func TestDSTFODSyncWriteAtAndRootedHandle(t *testing.T) {
 			})
 		})
 		simulation.CrashHost("h")
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				for path, want := range paths {
 					data, err := os.ReadFile(path)
@@ -127,7 +127,7 @@ func TestDSTFODSyncWriteAtAndRootedHandle(t *testing.T) {
 
 func TestDSTFODSyncWriteCommitThreshold(t *testing.T) {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			simulation.Process("p", func() {
 				f, _ := os.OpenFile("/zero", os.O_CREATE|os.O_RDWR, 0o644)
 				f.Sync()

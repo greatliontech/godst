@@ -18,7 +18,7 @@ func TestDSTHostNumCPUExactRange(t *testing.T) {
 		t.Run(strconv.FormatInt(int64(want), 10), func(t *testing.T) {
 			var direct, child int
 			Run(1, func() {
-				Host("h", HostConfig{NumCPU: want}, func() {
+				HostWith("h", HostConfig{NumCPU: want}, func() {
 					direct = runtime.NumCPU()
 					done := make(chan struct{})
 					go func() {
@@ -57,8 +57,8 @@ func TestDSTHostNumCPULargeRedeclarationExact(t *testing.T) {
 	second := int(wrapsPositive)
 	var gotFirst, gotSecond int
 	Run(1, func() {
-		Host("h", HostConfig{NumCPU: first}, func() { gotFirst = runtime.NumCPU() })
-		Host("h", HostConfig{NumCPU: second}, func() { gotSecond = runtime.NumCPU() })
+		HostWith("h", HostConfig{NumCPU: first}, func() { gotFirst = runtime.NumCPU() })
+		HostWith("h", HostConfig{NumCPU: second}, func() { gotSecond = runtime.NumCPU() })
 	})
 	if gotFirst != first || gotSecond != second {
 		t.Fatalf("runtime.NumCPU across redeclaration = %d then %d, want %d then %d", gotFirst, gotSecond, first, second)

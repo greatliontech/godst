@@ -50,7 +50,7 @@ func DSTMappingAddr() {
 // as a harness bug, and never a laundered process death.
 func DSTCrashedMappingTouch() {
 	simulation.Run(1, func() {
-		simulation.Host("h", simulation.HostConfig{}, func() {
+		simulation.Host("h", func() {
 			mapped := make(chan []byte, 1)
 			go simulation.Process("victim", func() {
 				f, err := os.OpenFile("/m", os.O_CREATE|os.O_RDWR, 0o644)
@@ -67,7 +67,7 @@ func DSTCrashedMappingTouch() {
 				select {}
 			})
 			b := <-mapped
-			simulation.Crash("victim")
+			simulation.CrashProcess("h", "victim")
 			fmt.Println("touching:", b[0]) // aborts with the named reason
 		})
 	})

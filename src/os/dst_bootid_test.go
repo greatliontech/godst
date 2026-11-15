@@ -8,7 +8,6 @@ package os_test
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -72,11 +71,11 @@ func TestDSTProcBootID(t *testing.T) {
 	simulation.Run(1, func() {
 		rootID = readBootID(t)
 		rootID2 = readBootID(t)
-		simulation.Host("a", simulation.HostConfig{}, func() {
+		simulation.Host("a", func() {
 			simulation.Process("a1", func() { hostA1 = readBootID(t) })
 			simulation.Process("a2", func() { hostA2 = readBootID(t) })
 		})
-		simulation.Host("b", simulation.HostConfig{}, func() {
+		simulation.Host("b", func() {
 			hostB = readBootID(t)
 			hostBInfo, _ = os.Stat(bootIDPath)
 		})
@@ -185,7 +184,7 @@ func TestDSTProcBootIDDeterministicPerSeed(t *testing.T) {
 	get := func(seed uint64) (root, host string) {
 		simulation.Run(seed, func() {
 			root = readBootID(t)
-			simulation.Host("m", simulation.HostConfig{}, func() { host = readBootID(t) })
+			simulation.Host("m", func() { host = readBootID(t) })
 		})
 		return
 	}
@@ -211,23 +210,23 @@ func TestDSTBootIDReboot(t *testing.T) {
 	var fiBoot1, fiBoot2 os.FileInfo
 
 	simulation.Run(3, func() {
-		simulation.Host("m", simulation.HostConfig{}, func() {
+		simulation.Host("m", func() {
 			simulation.Process("w", func() { boot1 = readBootID(t) })
 			// A process restart is not a boot.
 			simulation.Process("w", func() { boot1Restart = readBootID(t) })
 			fiBoot1, _ = os.Stat(bootIDPath)
 		})
 		// A clock-only re-declaration of a LIVE machine is not a boot.
-		simulation.Host("m", simulation.HostConfig{}, func() {
+		simulation.Host("m", func() {
 			boot1Live = readBootID(t)
 		})
 		simulation.CrashHost("m")
-		simulation.Host("m", simulation.HostConfig{}, func() {
+		simulation.Host("m", func() {
 			simulation.Process("w", func() { boot2 = readBootID(t) })
 			fiBoot2, _ = os.Stat(bootIDPath)
 		})
 		simulation.CrashHost("m")
-		simulation.Host("m", simulation.HostConfig{}, func() {
+		simulation.Host("m", func() {
 			boot3 = readBootID(t)
 		})
 	})
@@ -273,7 +272,7 @@ func TestDSTBootRejectedDeclarationStateNeutral(t *testing.T) {
 	preEpoch := simulation.Skew(-100 * 365 * 24 * time.Hour)
 	run := func(withRejected bool) (boot1, boot2 string, uptime2 int64) {
 		simulation.Run(13, func() {
-			simulation.Host("m", simulation.HostConfig{}, func() { boot1 = readBootID(t) })
+			simulation.Host("m", func() { boot1 = readBootID(t) })
 			simulation.CrashHost("m")
 			if withRejected {
 				func() {
@@ -282,11 +281,11 @@ func TestDSTBootRejectedDeclarationStateNeutral(t *testing.T) {
 							t.Fatalf("pre-epoch clock re-declaration did not panic")
 						}
 					}()
-					simulation.Host("m", simulation.HostConfig{Clock: preEpoch}, func() {})
+					simulation.HostWith("m", simulation.HostConfig{Clock: preEpoch}, func() {})
 				}()
 			}
 			time.Sleep(7 * time.Second)
-			simulation.Host("m", simulation.HostConfig{}, func() {
+			simulation.Host("m", func() {
 				uptime2 = rawUptime(t)
 				boot2 = readBootID(t)
 			})
@@ -309,31 +308,30 @@ func TestDSTBootRejectedDeclarationStateNeutral(t *testing.T) {
 	}
 }
 
-// TestDSTProcessRestartPoweredOffHostRefused pins the powered-off refusal on
-// the simulation-owned state (this binary's behavior does not depend on net
-// being linked): restarting a process whose implicit host lost power panics,
-// naming the fix; the Host re-declaration then boots the machine with a fresh
-// boot_id and admits the restart.
-func TestDSTProcessRestartPoweredOffHostRefused(t *testing.T) {
-	var before, after string
-	var refusal any
+// TestDSTProcessOutsideHostUsesRootBootID pins that a Process declared outside
+// any Host runs on the unnamed root host (sharing its boot_id) rather than
+// implicitly allocating or entering a same-named machine, while an explicit
+// Host("p", ...) has its own boot_id that advances on CrashHost + reboot.
+func TestDSTProcessOutsideHostUsesRootBootID(t *testing.T) {
+	var rootID, rootProcID, hostBoot1, rootProcAfterCrash, hostBoot2 string
 
 	simulation.Run(5, func() {
-		simulation.Process("p", func() { before = readBootID(t) })
+		rootID = readBootID(t)
+		simulation.Process("p", func() { rootProcID = readBootID(t) })
+		simulation.Host("p", func() {
+			simulation.Process("p", func() { hostBoot1 = readBootID(t) })
+		})
 		simulation.CrashHost("p")
-		func() {
-			defer func() { refusal = recover() }()
-			simulation.Process("p", func() {})
-		}()
-		simulation.Host("p", simulation.HostConfig{}, func() {
-			simulation.Process("p", func() { after = readBootID(t) })
+		simulation.Process("p", func() { rootProcAfterCrash = readBootID(t) })
+		simulation.Host("p", func() {
+			simulation.Process("p", func() { hostBoot2 = readBootID(t) })
 		})
 	})
 
-	if refusal == nil || !strings.Contains(fmt.Sprint(refusal), "powered off") {
-		t.Fatalf("Process restart on powered-off host: recovered %v, want the powered-off refusal", refusal)
+	if rootProcID != rootID || rootProcAfterCrash != rootID {
+		t.Fatalf("root Process boot_id = (%q, %q), want root %q", rootProcID, rootProcAfterCrash, rootID)
 	}
-	if before == "" || after == "" || after == before {
-		t.Fatalf("boot_id before %q / after reboot %q, want distinct non-empty ids", before, after)
+	if hostBoot1 == "" || hostBoot2 == "" || hostBoot1 == rootID || hostBoot2 == rootID || hostBoot2 == hostBoot1 {
+		t.Fatalf("Host(\"p\") boot_id across CrashHost = (%q, %q) vs root %q, want distinct non-empty ids", hostBoot1, hostBoot2, rootID)
 	}
 }

@@ -22,7 +22,7 @@ func TestDSTProcessRestartResetsCWDAndEnvironment(t *testing.T) {
 		for _, mutation := range []string{"set", "unset", "clear"} {
 			t.Run(death+"/"+mutation, func(t *testing.T) {
 				Test(t, 1, func(t *testing.T) {
-					Host("h", HostConfig{}, func() {
+					Host("h", func() {
 						first := func() {
 							os.Mkdir("/old", 0o755)
 							if err := os.Chdir("/old"); err != nil {
@@ -45,7 +45,7 @@ func TestDSTProcessRestartResetsCWDAndEnvironment(t *testing.T) {
 								select {}
 							})
 							<-ready
-							crashProcess("worker")
+							crashProcess("h", "worker")
 						} else {
 							Process("worker", first)
 						}
@@ -80,7 +80,7 @@ func TestDSTHostCrashRestartResetsProcessState(t *testing.T) {
 		t.Run(mutation, func(t *testing.T) {
 			Test(t, 1, func(t *testing.T) {
 				ready := make(chan struct{})
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					go Process("worker", func() {
 						os.Mkdir("/old", 0o755)
 						os.Chdir("/old")
@@ -98,7 +98,7 @@ func TestDSTHostCrashRestartResetsProcessState(t *testing.T) {
 					<-ready
 				})
 				CrashHost("h")
-				Host("h", HostConfig{}, func() {
+				Host("h", func() {
 					Process("worker", func() {
 						if cwd, _ := os.Getwd(); cwd != "/" {
 							t.Fatalf("restart cwd = %q, want /", cwd)
