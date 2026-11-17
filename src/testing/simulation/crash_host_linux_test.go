@@ -1666,3 +1666,242 @@ func TestDSTHostRebootKeepsIsolation(t *testing.T) {
 		t.Fatalf("dial to an isolated host after its reboot = %v, want ETIMEDOUT: a reboot does not heal an injected network cut", dialErr)
 	}
 }
+
+// TestDSTCrashHostDynamicEntryNamesRaceClean: dynamically constructed path and
+// environment strings passed into VFS create/mkdir/rename/chdir and Setenv are
+// copied into kernel-owned backing memory under KernelMutex rather than
+// retained by reference, so reading directory entries, working directories, or
+// env vars from another goroutine or across CrashHost never triggers a TSan
+// false-positive race against the creator's user-space string buffer.
+func TestDSTCrashHostDynamicEntryNamesRaceClean(t *testing.T) {
+	TestWith(t, 7, Options{CrashTear: true}, func(t *testing.T) {
+		var ready atomic.Bool
+		Host("db", func() {
+			go Process("writer", func() {
+				var sb strings.Builder
+				sb.WriteString("/wal")
+				dir := sb.String()
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Errorf("mkdir: %v", err)
+					return
+				}
+				syncDir(t, "/")
+
+				sb.Reset()
+				sb.WriteString(dir)
+				sb.WriteString("/0000000000000001.seg")
+				seg := sb.String()
+				f, err := os.Create(seg)
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				_ = f.Sync()
+				_ = f.Close()
+				syncDir(t, dir)
+				ready.Store(true)
+
+				// Everything below runs after the controller observed ready, so no
+				// user-space atomic edge connects these path/env allocations to the
+				// post-CrashHost reboot process.
+				sb.Reset()
+				sb.WriteString(dir)
+				sb.WriteString("/0000000000000001.pool")
+				pool := sb.String()
+				if err := os.Rename(seg, pool); err != nil {
+					t.Errorf("rename: %v", err)
+					return
+				}
+				syncDir(t, dir)
+
+				sb.Reset()
+				sb.WriteString(dir)
+				sb.WriteString("/sub")
+				sub := sb.String()
+				if err := os.Mkdir(sub, 0o755); err != nil {
+					t.Errorf("mkdir sub: %v", err)
+					return
+				}
+				syncDir(t, dir)
+
+				// Spawn the sibling reader BEFORE mutating envSB and calling os.Setenv
+				// so newproc1 does not establish a user-space TSan happens-before edge
+				// from envSB.WriteString to the reader's os.Getenv / os.Environ calls.
+				go func() {
+					time.Sleep(50 * time.Microsecond)
+					var probe strings.Builder
+					probe.WriteString(os.Getenv("DYN_KEY"))
+					for _, e := range os.Environ() {
+						probe.WriteString(e)
+					}
+					_ = probe.String()
+				}()
+				time.Sleep(10 * time.Microsecond)
+				var envSB strings.Builder
+				envSB.WriteString("DYN_KEY")
+				k := envSB.String()
+				envSB.Reset()
+				envSB.WriteString("dyn_val")
+				if err := os.Setenv(k, envSB.String()); err != nil {
+					t.Errorf("setenv: %v", err)
+					return
+				}
+				select {}
+			})
+		})
+		for !ready.Load() {
+			time.Sleep(100 * time.Microsecond)
+		}
+		time.Sleep(200 * time.Microsecond)
+		CrashHost("db")
+
+		Host("db", func() {
+			Process("recover", func() {
+				ents, err := os.ReadDir("/wal")
+				if err != nil {
+					t.Errorf("readdir: %v", err)
+					return
+				}
+				var out strings.Builder
+				for _, e := range ents {
+					out.WriteString("/wal/")
+					out.WriteString(e.Name())
+				}
+				if err := os.Chdir("/wal/sub"); err != nil {
+					t.Errorf("chdir: %v", err)
+					return
+				}
+				wd, err := os.Getwd()
+				if err != nil {
+					t.Errorf("getwd: %v", err)
+					return
+				}
+				out.WriteString(wd)
+				if !strings.Contains(out.String(), "0000000000000001.pool") {
+					t.Errorf("missing renamed pool entry in %q", out.String())
+				}
+			})
+		})
+	})
+}
+
+func TestDSTDynamicHostnameAndNodeNamesRaceClean(t *testing.T) {
+	Test(t, 42, func(t *testing.T) {
+		var ready atomic.Bool
+		Host("db", func() {
+			go Process("observer", func() {
+				ready.Store(true)
+				// Wait in virtual time with no user-space happens-before edge from
+				// the controller's HostWith dynamic Hostname update below.
+				time.Sleep(100 * time.Microsecond)
+				hn, err := os.Hostname()
+				if err != nil {
+					t.Errorf("hostname: %v", err)
+					return
+				}
+				var hprobe strings.Builder
+				hprobe.WriteString(hn)
+				if hprobe.String() != "db-reconfigured" {
+					t.Errorf("hostname = %q, want %q", hn, "db-reconfigured")
+				}
+			})
+		})
+		for !ready.Load() {
+			time.Sleep(10 * time.Microsecond)
+		}
+		var sb strings.Builder
+		sb.WriteString("db-")
+		sb.WriteString("reconfigured")
+		HostWith("db", HostConfig{Hostname: sb.String()}, func() {})
+		time.Sleep(200 * time.Microsecond)
+
+		// Also exercise nodeNames over crashed dynamic Host / Process names with
+		// no completion edge from the crashed goroutine back to the controller.
+		go func() {
+			var nsb strings.Builder
+			nsb.WriteString("dyn-")
+			nsb.WriteString("host")
+			hname := nsb.String()
+			Host(hname, func() {
+				var psb strings.Builder
+				psb.WriteString("dyn-")
+				psb.WriteString("proc")
+				Process(psb.String(), func() {
+					select {}
+				})
+			})
+		}()
+		time.Sleep(50 * time.Microsecond)
+		CrashHost("dyn-host")
+		h, p := nodeNames(2, 2)
+		var nprobe strings.Builder
+		nprobe.WriteString(h)
+		nprobe.WriteString("/")
+		nprobe.WriteString(p)
+		if nprobe.String() != "dyn-host/dyn-proc" {
+			t.Errorf("nodeNames(2, 2) = (%q, %q), want (\"dyn-host\", \"dyn-proc\")", h, p)
+		}
+	})
+}
+
+func TestDSTRunEntryEnvSnapshotIsolatesMidRunForeignMutation(t *testing.T) {
+	const baseKey = "GODST_RUN_ENTRY_SNAP_BASE"
+	const foreignKey = "GODST_MID_RUN_FOREIGN_MUT"
+	if err := os.Setenv(baseKey, "initial"); err != nil {
+		t.Fatalf("setenv baseKey: %v", err)
+	}
+	_ = os.Unsetenv(foreignKey)
+	defer func() {
+		_ = os.Unsetenv(baseKey)
+		_ = os.Unsetenv(foreignKey)
+	}()
+
+	foreignReady := make(chan struct{})
+	foreignMutate := make(chan struct{})
+	foreignDone := make(chan struct{})
+	go func() {
+		close(foreignReady)
+		<-foreignMutate
+		var sb strings.Builder
+		sb.WriteString("foreign-")
+		sb.WriteString("value")
+		_ = os.Setenv(foreignKey, sb.String())
+		_ = os.Setenv(baseKey, sb.String())
+		close(foreignDone)
+	}()
+	<-foreignReady
+
+	Test(t, 42, func(t *testing.T) {
+		// Trigger foreign non-bubble host Setenv mid-run before spawning or
+		// rebooting simulated processes.
+		close(foreignMutate)
+		<-foreignDone
+
+		Host("db", func() {
+			Process("p1", func() {
+				if got := os.Getenv(baseKey); got != "initial" {
+					t.Errorf("p1 Getenv(%q) = %q, want run-entry snapshot %q", baseKey, got, "initial")
+				}
+				if got, ok := os.LookupEnv(foreignKey); ok {
+					t.Errorf("p1 LookupEnv(%q) = (%q, true), want absent from run-entry snapshot", foreignKey, got)
+				}
+				_ = os.Setenv(baseKey, "sim-mutated")
+			})
+		})
+		CrashHost("db")
+		Host("db", func() {
+			Process("p2", func() {
+				if got := os.Getenv(baseKey); got != "initial" {
+					t.Errorf("post-CrashHost Getenv(%q) = %q, want run-entry snapshot %q", baseKey, got, "initial")
+				}
+				if got, ok := os.LookupEnv(foreignKey); ok {
+					t.Errorf("post-CrashHost LookupEnv(%q) = (%q, true), want absent", foreignKey, got)
+				}
+			})
+		})
+	})
+
+	if got := os.Getenv(foreignKey); got != "foreign-value" {
+		t.Fatalf("host Getenv(%q) = %q, want %q", foreignKey, got, "foreign-value")
+	}
+}

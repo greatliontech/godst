@@ -140,6 +140,12 @@ func dstEnvDispatchLock()
 //go:linkname dstEnvDispatchUnlock runtime.dstEnvDispatchUnlock
 func dstEnvDispatchUnlock()
 
+//go:linkname dstEnvRunActivate syscall.dstEnvRunActivate
+func dstEnvRunActivate()
+
+//go:linkname dstEnvRunDeactivate syscall.dstEnvRunDeactivate
+func dstEnvRunDeactivate()
+
 //go:linkname dstSetMemLimit runtime.dstSetMemLimit
 func dstSetMemLimit(limit int64)
 

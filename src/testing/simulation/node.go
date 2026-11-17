@@ -8,7 +8,21 @@ import (
 	"slices"
 	"strconv"
 	"time"
+	"unsafe"
 )
+
+// cloneKernelString copies s into kernel-owned memory while the caller holds a
+// kernelMutex (where __tsan_thread_ignore_begin is active under -race), so
+// user-space readers (os.Hostname, failure diagnostics nodeNames) never read
+// caller-owned buffers such as strings.Builder without a TSan happens-before edge.
+func cloneKernelString(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	b := make([]byte, len(s))
+	copy(b, s)
+	return unsafe.String(&b[0], len(b))
+}
 
 // Host and Process declare the distributed model's two identity layers within a
 // simulation (see docs/dst/faults.md "The distributed model"): a Host is a machine
@@ -31,7 +45,7 @@ var dstHostIdentMu kernelMutex
 
 func setHostIdent(host uint32, hostname string, numcpu int) {
 	dstHostIdentMu.Lock()
-	dstSetHostIdent(host, hostname, numcpu)
+	dstSetHostIdent(host, cloneKernelString(hostname), numcpu)
 	dstHostIdentMu.Unlock()
 }
 
@@ -473,7 +487,7 @@ func admitProcAndSlot(host uint32, name string) (proc, slot uint32) {
 	dstProcAllocEnsure(proc)
 	if !exists {
 		nodeReg.nextProc = proc
-		nodeReg.procs[key] = proc
+		nodeReg.procs[procKey{host: host, name: cloneKernelString(name)}] = proc
 	}
 	nodeReg.nextSlot++
 	slot = nodeReg.nextSlot
@@ -543,6 +557,7 @@ func hostWith(api, name string, config HostConfig, f func()) {
 			if hostname == "" {
 				hostname = name
 			}
+			hostname = cloneKernelString(hostname)
 			if !dstReestablishHostClock(hid, offset, ppb) {
 				panic("testing/simulation: " + api + " clock skew takes the wall clock before the epoch (no real kernel accepts a pre-epoch wall clock)")
 			}
@@ -551,7 +566,7 @@ func hostWith(api, name string, config HostConfig, f func()) {
 					nodeReg.hosts = make(map[string]uint32)
 				}
 				nodeReg.nextHost = hid
-				nodeReg.hosts[name] = hid
+				nodeReg.hosts[cloneKernelString(name)] = hid
 			}
 			// The machine BOOTS on the powered-off→up edge only: its first
 			// declaration, or its first re-declaration after CrashHost. A
@@ -718,6 +733,7 @@ func internPIDNS(host uint32, name string) uint32 {
 	hb := hostBootKey{host: key.host, boot: key.boot}
 	nodeReg.pidnsNext[hb]++
 	id := 1 + nodeReg.pidnsNext[hb]
+	key.name = cloneKernelString(key.name)
 	nodeReg.pidns[key] = id
 	return id
 }

@@ -711,6 +711,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 	func() {
 		dstEnvDispatchLock()
 		defer dstEnvDispatchUnlock()
+		dstEnvRunActivate()
 		dstSetSimEnv(hostname, pid, numcpu, pidmax) // before dstActivate: published to the bubble by the activation store
 		dstSetMemLimit(memLimit)
 		dstSetNetCrossHostLatency(netLatencyNs)
@@ -730,6 +731,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 			dstDeactivate()
 			dstSetSchedStrategy(kindRandom, 0, 0) // reset for the next run
 			dstClearSimEnv()
+			dstEnvRunDeactivate()
 		}()
 		dstSetMemLimit(0)
 		dstSetNetCrossHostLatency(0)

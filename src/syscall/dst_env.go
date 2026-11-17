@@ -85,10 +85,60 @@ func dstInSimBubble() bool
 // another process, another host, or the real host process, and non-bubble
 // goroutines retain direct access to the real host environment.
 var (
-	dstEnvMu     isync.KernelMutex
-	dstEnvEpoch  uint64
-	dstEnvBySlot map[[2]uint32]*dstProcEnv
+	dstEnvMu          isync.KernelMutex
+	dstEnvEpoch       uint64
+	dstEnvBySlot      map[[2]uint32]*dstProcEnv
+	dstEnvRunSnapshot []string
+	dstEnvSnapValid   bool
 )
+
+func dstCloneEnvString(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	b := make([]byte, len(s))
+	copy(b, s)
+	return unsafe.String(&b[0], len(b))
+}
+
+// dstEnvRunActivate captures and byte-clones the host environment snapshot at
+// simulation Run entry (design.md "Environment surface"). Called under
+// dstEnvDispatchLock before dstActivate so mid-run non-bubble host Setenv /
+// Unsetenv / Clearenv calls neither perturb simulated (host, slot) views nor
+// race with lazy per-slot environment materialization.
+//
+//go:linkname dstEnvRunActivate
+func dstEnvRunActivate() {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
+
+	copyenv()
+
+	envLock.RLock()
+	snap := make([]string, len(envs))
+	for i, s := range envs {
+		snap[i] = dstCloneEnvString(s)
+	}
+	envLock.RUnlock()
+
+	dstEnvMu.Lock()
+	dstEnvRunSnapshot = snap
+	dstEnvSnapValid = true
+	dstEnvBySlot = nil
+	dstEnvMu.Unlock()
+}
+
+// dstEnvRunDeactivate releases the run-entry host environment snapshot and
+// per-slot views when a simulation Run exits.
+//
+//go:linkname dstEnvRunDeactivate
+func dstEnvRunDeactivate() {
+	dstEnvMu.Lock()
+	dstEnvRunSnapshot = nil
+	dstEnvSnapValid = false
+	dstEnvBySlot = nil
+	dstEnvMu.Unlock()
+}
 
 type dstProcEnv struct {
 	envs []string       // "key=value"; "" means deleted or duplicate (as in the host)
@@ -115,10 +165,21 @@ func dstEnvCurrent() *dstProcEnv {
 		dstEnvMu.Unlock()
 		return pe
 	}
+	var snap []string
+	valid := dstEnvSnapValid
+	if valid {
+		snap = dstEnvRunSnapshot
+	}
 	dstEnvMu.Unlock()
 
-	// Build the copy outside dstEnvMu (dstNewProcEnvFromHost takes envLock).
-	pe := dstNewProcEnvFromHost()
+	// Build the copy outside dstEnvMu (fallback path takes envLock when invoked
+	// outside a full simulation.Run harness).
+	var pe *dstProcEnv
+	if valid {
+		pe = dstNewProcEnvFromSnapshot(snap)
+	} else {
+		pe = dstNewProcEnvFromHost()
+	}
 
 	dstEnvMu.Lock()
 	defer dstEnvMu.Unlock()
@@ -129,8 +190,17 @@ func dstEnvCurrent() *dstProcEnv {
 	return pe
 }
 
-// dstNewProcEnvFromHost copies the host environment (deduplicated) into a fresh
-// per-process view and builds its key index, mirroring copyenv.
+func dstNewProcEnvFromSnapshot(snap []string) *dstProcEnv {
+	dstKernelSectionEnter()
+	defer dstKernelSectionExit()
+
+	e := make([]string, len(snap))
+	copy(e, snap)
+	return dstIndexProcEnv(e)
+}
+
+// dstNewProcEnvFromHost copies and byte-clones the host environment into a
+// fresh per-process view when no run-entry snapshot is active.
 func dstNewProcEnvFromHost() *dstProcEnv {
 	dstKernelSectionEnter()
 	defer dstKernelSectionExit()
@@ -139,9 +209,15 @@ func dstNewProcEnvFromHost() *dstProcEnv {
 
 	envLock.RLock()
 	e := make([]string, len(envs))
-	copy(e, envs)
+	for i, s := range envs {
+		e[i] = dstCloneEnvString(s)
+	}
 	envLock.RUnlock()
 
+	return dstIndexProcEnv(e)
+}
+
+func dstIndexProcEnv(e []string) *dstProcEnv {
 	pe := &dstProcEnv{envs: e, env: make(map[string]int, len(e))}
 	for i, s := range e {
 		for j := 0; j < len(s); j++ {
@@ -197,14 +273,18 @@ func (pe *dstProcEnv) setenv(key, value string) error {
 	dstEnvMu.Lock()
 	defer dstEnvMu.Unlock()
 	i, ok := pe.env[key]
-	kv := key + "=" + value
+	buf := make([]byte, len(key)+1+len(value))
+	copy(buf, key)
+	buf[len(key)] = '='
+	copy(buf[len(key)+1:], value)
+	kv := unsafe.String(&buf[0], len(buf))
 	if ok {
 		pe.envs[i] = kv
 	} else {
 		i = len(pe.envs)
 		pe.envs = append(pe.envs, kv)
 	}
-	pe.env[key] = i
+	pe.env[kv[:len(key)]] = i
 	// No runtimeSetenv: the host process environment is left untouched.
 	return nil
 }

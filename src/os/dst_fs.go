@@ -436,10 +436,26 @@ type dstFSDentry struct {
 	unlinked bool                    // true once this specific alias edge is unlinked
 }
 
+// dstCloneKernelString copies a caller-supplied string into kernel-owned
+// backing memory. Must be called inside a KernelMutex / dstKernelSectionEnter
+// region (__tsan_thread_ignore_begin under -race) so the copy neither reads
+// nor writes user-tracked TSan shadow state: subsequent readers in other
+// goroutines or post-CrashHost reboots (e.g. Readdir, Stat, Getwd) then never
+// alias the original caller's user-space string buffer.
+func dstCloneKernelString(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	b := make([]byte, len(s))
+	copy(b, s)
+	return unsafe.String(&b[0], len(b))
+}
+
 func (d *dstFSDentry) childLocked(name string, child *dstFSNode) *dstFSDentry {
 	if c := d.children[name]; c != nil && c.node == child && !c.unlinked {
 		return c
 	}
+	name = dstCloneKernelString(name)
 	c := &dstFSDentry{
 		node:   child,
 		parent: d,
@@ -485,6 +501,7 @@ func (cur *dstFSDentry) dentryChainLocked(root *dstFSDentry) []*dstFSDentry {
 // parent-edge counts (dirLinks) so unlinking one alias of a crash-recovered
 // dual-alias directory leaves the surviving alias live. Caller holds dstFS.mu.
 func (parent *dstFSNode) attachEntryLocked(name string, child *dstFSNode) {
+	name = dstCloneKernelString(name)
 	prev := parent.entries[name]
 	parent.entries[name] = child
 	if child.isDir && prev != child {
@@ -905,6 +922,7 @@ func dstFSMoveEntryLocked(oldParentDentry *dstFSDentry, oldBase string, oldNode 
 	if newNode != nil {
 		dstFSUnlinkEntryLocked(newParentDentry.node, newBase, newNode)
 	}
+	newBase = dstCloneKernelString(newBase)
 	oldParent := oldParentDentry.node
 	newParent := newParentDentry.node
 	delete(oldParent.entries, oldBase)
@@ -1739,14 +1757,18 @@ func dstOpenDir(name string) (f *File, handled bool, err error) {
 func dstNewFile(d dstFileBackend, name string) *File {
 	dstKernelSectionEnter()
 	defer dstKernelSectionExit()
+	name = dstCloneKernelString(name)
 	switch b := d.(type) {
 	case *dstFile:
 		b.epoch = dstFSEpoch()
+		b.path = dstCloneKernelString(b.path)
 		if b.node != nil && !b.node.isDir && !b.node.isDevice() {
 			b.node.openFiles++
 		}
 	case *dstProcFile:
 		b.epoch = dstFSEpoch()
+		b.name = dstCloneKernelString(b.name)
+		b.base = dstCloneKernelString(b.base)
 	}
 	f := &File{&file{name: name}}
 	dstSetFileBackend(f.file, d)

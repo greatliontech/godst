@@ -59,6 +59,8 @@ func dstSetSimEnv(hostname string, pid, numcpu, pidmax int)          {}
 func dstClearSimEnv()                                                {}
 func dstEnvDispatchLock()                                            {}
 func dstEnvDispatchUnlock()                                          {}
+func dstEnvRunActivate()                                             {}
+func dstEnvRunDeactivate()                                           {}
 func dstSetMemLimit(limit int64)                                     {}
 func dstSetNetCrossHostLatency(ns int64)                             {}
 func dstSetNetCrossHostJitter(ns int64)                              {}
