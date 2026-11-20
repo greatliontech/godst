@@ -96,6 +96,9 @@ func dstNetCrossHostJitterNs() int64
 //go:linkname dstNetCrossHostBandwidthBps runtime.dstNetCrossHostBandwidthBps
 func dstNetCrossHostBandwidthBps() int64
 
+//go:linkname dstNetCrossHostPacketFaults runtime.dstNetCrossHostPacketFaults
+func dstNetCrossHostPacketFaults() (loss, duplicate float64, reorder bool)
+
 // dstFaultRandN draws a deterministic value in [0,n) from the dedicated, seeded,
 // stream-isolated fault RNG (n<=0 draws nothing) — the source for the per-segment
 // jitter, so injected jitter replays exactly and never perturbs the schedule.

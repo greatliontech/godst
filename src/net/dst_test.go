@@ -244,7 +244,6 @@ func TestDSTNetTypedAndPacketAPIsDoNotTouchHost(t *testing.T) {
 	}
 	ctx := context.Background()
 	dialer := Dialer{}
-	lc := ListenConfig{}
 	loopback := IPv4(127, 0, 0, 1)
 	addr := netip.AddrFrom4([4]byte{127, 0, 0, 1})
 	ap := netip.AddrPortFrom(addr, 1)
@@ -269,26 +268,6 @@ func TestDSTNetTypedAndPacketAPIsDoNotTouchHost(t *testing.T) {
 			name: "Dialer.DialTCP",
 			call: func() error {
 				c, err := dialer.DialTCP(ctx, "tcp", netip.AddrPort{}, ap)
-				if c != nil {
-					c.Close()
-				}
-				return err
-			},
-		},
-		{
-			name: "DialUDP",
-			call: func() error {
-				c, err := DialUDP("udp", nil, &UDPAddr{IP: loopback, Port: 1})
-				if c != nil {
-					c.Close()
-				}
-				return err
-			},
-		},
-		{
-			name: "Dialer.DialUDP",
-			call: func() error {
-				c, err := dialer.DialUDP(ctx, "udp", netip.AddrPort{}, ap)
 				if c != nil {
 					c.Close()
 				}
@@ -336,41 +315,11 @@ func TestDSTNetTypedAndPacketAPIsDoNotTouchHost(t *testing.T) {
 			},
 		},
 		{
-			name: "ListenPacket",
-			call: func() error {
-				c, err := ListenPacket("udp", "127.0.0.1:0")
-				if c != nil {
-					c.Close()
-				}
-				return err
-			},
-		},
-		{
-			name: "ListenConfig.ListenPacket",
-			call: func() error {
-				c, err := lc.ListenPacket(ctx, "udp", "127.0.0.1:0")
-				if c != nil {
-					c.Close()
-				}
-				return err
-			},
-		},
-		{
 			name: "ListenTCP",
 			call: func() error {
 				l, err := ListenTCP("tcp", &TCPAddr{IP: loopback})
 				if l != nil {
 					l.Close()
-				}
-				return err
-			},
-		},
-		{
-			name: "ListenUDP",
-			call: func() error {
-				c, err := ListenUDP("udp", &UDPAddr{IP: loopback})
-				if c != nil {
-					c.Close()
 				}
 				return err
 			},
@@ -1080,18 +1029,32 @@ func TestDSTNetUnsupportedNetworkText(t *testing.T) {
 		t.Skip("requires -tags dst")
 	}
 	simulation.Run(1, func() {
-		_, err := Dial("udp", "127.0.0.1:53")
-		var op *OpError
-		if !errors.As(err, &op) || !strings.Contains(op.Err.Error(), "unsupported under deterministic simulation") {
-			t.Errorf("Dial udp = %v, want unsupported-under-simulation error", err)
+		for _, bad := range []struct {
+			op  string
+			err error
+		}{
+			{"Dial unix", func() error { _, err := Dial("unix", "/tmp/x.sock"); return err }()},
+			{"Dial ip4:icmp", func() error { _, err := Dial("ip4:icmp", "127.0.0.1"); return err }()},
+			{"ListenPacket unixgram", func() error { _, err := ListenPacket("unixgram", "/tmp/x.sock"); return err }()},
+			{"ListenPacket ip4:icmp", func() error { _, err := ListenPacket("ip4:icmp", "127.0.0.1"); return err }()},
+		} {
+			var op *OpError
+			if !errors.As(bad.err, &op) || !strings.Contains(op.Err.Error(), "unsupported under deterministic simulation") {
+				t.Errorf("%s = %v, want unsupported-under-simulation error", bad.op, bad.err)
+			}
+			var unk UnknownNetworkError
+			if errors.As(bad.err, &unk) {
+				t.Errorf("%s classified as unknown network: %v", bad.op, bad.err)
+			}
 		}
 		var unk UnknownNetworkError
-		if errors.As(err, &unk) {
-			t.Errorf("Dial udp classified as unknown network: %v", err)
-		}
-		_, err = Dial("bogusnet", "127.0.0.1:1")
+		_, err := Dial("bogusnet", "127.0.0.1:1")
 		if !errors.As(err, &unk) {
 			t.Errorf("Dial bogusnet = %v, want UnknownNetworkError", err)
+		}
+		_, err = ListenPacket("bogusnet", "127.0.0.1:1")
+		if !errors.As(err, &unk) {
+			t.Errorf("ListenPacket bogusnet = %v, want UnknownNetworkError", err)
 		}
 	})
 }

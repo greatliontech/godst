@@ -65,6 +65,9 @@ func dstSetMemLimit(limit int64)                                     {}
 func dstSetNetCrossHostLatency(ns int64)                             {}
 func dstSetNetCrossHostJitter(ns int64)                              {}
 func dstSetNetCrossHostBandwidth(bytesPerSec int64)                  {}
+func dstSetNetCrossHostPacketFaults(loss, duplicate float64, reorder bool) {
+}
+func dstNetRunTeardown()                                             {}
 func dstSetNetSendBuffer(bytes int64)                                {}
 func dstSetNetRetransmitTimeout(ns int64)                            {}
 func dstSetWedgeLimits(decisions, wallNs int64)                      {}
@@ -106,7 +109,7 @@ func dstMarkHostGoroutinesCrashed(host uint32)                       {}
 func dstProcAllocEnsure(procid uint32)                               {}
 func dstProcAllocBytes(procid uint32) int64                          { return 0 }
 func dstNetPartitionOp(op, a, b uint32)                              {}
-func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool) {
 }
 func dstNetHostDead(host uint32) bool                        { return false }
 func dstInSimBubble() bool                                   { return false }

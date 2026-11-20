@@ -943,7 +943,7 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 // it does not affect the returned PacketConn.
 func (lc *ListenConfig) ListenPacket(ctx context.Context, network, address string) (PacketConn, error) {
 	if dstNetEnabled && dstInSimBubble() {
-		return nil, dstUnsupportedNetAPI("listen", network, nil, nil)
+		return dstListenPacket(ctx, lc, network, address)
 	}
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
 	if err != nil {

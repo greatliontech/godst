@@ -109,9 +109,9 @@ func PartitionRefuse(a, b string) {
 // panic before mutating state; outside a run, valid calls are no-ops.
 func ConfigureLink(a, b string, cfg LinkConfig) {
 	withBubbleFaultCaller("ConfigureLink", func() {
-		lat, jit, bw := validateLinkConfig("ConfigureLink", cfg)
+		lat, jit, bw, loss, dup, reorder := validateLinkConfig("ConfigureLink", cfg)
 		ha, hb := lookupHost(a), lookupHost(b)
-		dstNetLinkConfigOp(linkOpSetBoth, ha, hb, lat, jit, bw)
+		dstNetLinkConfigOp(linkOpSetBoth, ha, hb, lat, jit, bw, loss, dup, reorder)
 	})
 }
 
@@ -121,9 +121,9 @@ func ConfigureLink(a, b string, cfg LinkConfig) {
 // outside-run rules as ConfigureLink.
 func ConfigureLinkOneWay(from, to string, cfg LinkConfig) {
 	withBubbleFaultCaller("ConfigureLinkOneWay", func() {
-		lat, jit, bw := validateLinkConfig("ConfigureLinkOneWay", cfg)
+		lat, jit, bw, loss, dup, reorder := validateLinkConfig("ConfigureLinkOneWay", cfg)
 		hf, ht := lookupHost(from), lookupHost(to)
-		dstNetLinkConfigOp(linkOpSetOneWay, hf, ht, lat, jit, bw)
+		dstNetLinkConfigOp(linkOpSetOneWay, hf, ht, lat, jit, bw, loss, dup, reorder)
 	})
 }
 
@@ -133,7 +133,7 @@ func ConfigureLinkOneWay(from, to string, cfg LinkConfig) {
 func UnconfigureLink(a, b string) {
 	withBubbleFaultCaller("UnconfigureLink", func() {
 		ha, hb := lookupHost(a), lookupHost(b)
-		dstNetLinkConfigOp(linkOpClearBoth, ha, hb, 0, 0, 0)
+		dstNetLinkConfigOp(linkOpClearBoth, ha, hb, 0, 0, 0, 0, 0, false)
 	})
 }
 

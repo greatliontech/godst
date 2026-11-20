@@ -28,13 +28,16 @@ import (
 func dstSetNetPartitionHook(fn func(op, a, b uint32))
 
 //go:linkname dstSetNetLinkConfigHook runtime.dstSetNetLinkConfigHook
-func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64))
+func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool))
 
 //go:linkname dstSetNetHostDeadHook runtime.dstSetNetHostDeadHook
 func dstSetNetHostDeadHook(fn func(host uint32) bool)
 
 //go:linkname dstSetNetHasProcResourcesHook runtime.dstSetNetHasProcResourcesHook
 func dstSetNetHasProcResourcesHook(fn func(proc uint32) bool)
+
+//go:linkname dstSetNetRunTeardownHook runtime.dstSetNetRunTeardownHook
+func dstSetNetRunTeardownHook(fn func())
 
 // dstHostDeclaredQ reports whether host is a declared simulated host this run
 // (the runtime relay to testing/simulation's intern registry; true when no
@@ -72,6 +75,7 @@ func init() {
 	dstSetNetLinkConfigHook(dstApplyLinkConfigOp)
 	dstSetNetHostDeadHook(dstHostDead) // simulation's Process guard queries the same mark dials consult
 	dstSetNetHasProcResourcesHook(dstNetHasProcResources)
+	dstSetNetRunTeardownHook(dstNetRunTeardown)
 }
 
 // dstApplyNetFaultOp dispatches a net-fault targeting op (from testing/simulation
@@ -84,6 +88,7 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstResetProc(a)
 	case dstFaultOpCloseProcListeners:
 		dstCloseProcListeners(a)
+		dstUDPCloseProc(a)
 	case dstFaultOpCloseProcConns:
 		dstCloseProcConns(a)
 	case dstFaultOpCrashProcConns:
@@ -92,10 +97,13 @@ func dstApplyNetFaultOp(op, a, b uint32) {
 		dstResetHost(a)
 	case dstFaultOpCloseHostListeners:
 		dstCloseHostListeners(a)
+		dstUDPCrashHost(a)
 	case dstFaultOpHostDown, dstFaultOpHostUp:
 		dstApplyPartitionOp(op, a, b)
+		dstUDPOnPartitionOp(op, a, b)
 	default:
 		dstApplyPartitionOp(op, a, b)
+		dstUDPOnPartitionOp(op, a, b)
 	}
 }
 
@@ -400,6 +408,9 @@ type dstLinkParams struct {
 	latencyNs    int64
 	jitterNs     int64
 	bandwidthBps int64
+	lossProb     float64
+	dupProb      float64
+	reorder      bool
 }
 
 // dstLinkOverrideEpoch holds dstNetEpoch() (> 0) when dstLinks.dirs contains at
@@ -436,7 +447,7 @@ func dstLinksRoll() {
 	}
 }
 
-func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, lossProb, dupProb float64, reorder bool) {
 	if !dstInSimBubble() {
 		return
 	}
@@ -455,6 +466,9 @@ func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int
 		latencyNs:    latencyNs,
 		jitterNs:     jitterNs,
 		bandwidthBps: bandwidthBps,
+		lossProb:     lossProb,
+		dupProb:      dupProb,
+		reorder:      reorder,
 	}
 	switch op {
 	case dstLinkOpSetBoth:
@@ -472,6 +486,7 @@ func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int
 		dstLinkOverrideEpoch.Store(0)
 	}
 	dstLinks.mu.Unlock()
+	dstUDPResetLossDiag(op, a, b)
 }
 
 // dstLinkParamsForDir resolves the active (latencyNs, jitterNs, bandwidthBps)
@@ -480,8 +495,16 @@ func dstApplyLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int
 // Never emits TSan happens-before edges (timing policy only), while recording
 // Level-2 DPOR coarse reads on both host keys inside a simulation bubble.
 func dstLinkParamsForDir(from, to uint32) (latencyNs, jitterNs, bandwidthBps int64) {
+	latencyNs, jitterNs, bandwidthBps, _, _, _ = dstUDPLinkParamsForDir(from, to)
+	return latencyNs, jitterNs, bandwidthBps
+}
+
+// dstUDPLinkParamsForDir resolves the full directional LinkConfig policy
+// (latency, jitter, bandwidth, packet loss, packet duplication, and packet
+// reorder) for from→to.
+func dstUDPLinkParamsForDir(from, to uint32) (latencyNs, jitterNs, bandwidthBps int64, lossProb, dupProb float64, reorder bool) {
 	if from == to {
-		return 0, 0, 0
+		return 0, 0, 0, 0, 0, false
 	}
 	if dstInSimBubble() {
 		dstCoarseRecord(dstCoarseNetHostID(from), false)
@@ -494,10 +517,11 @@ func dstLinkParamsForDir(from, to uint32) (latencyNs, jitterNs, bandwidthBps int
 		latencyNs = dstNetCrossHostLatencyNs()
 		jitterNs = dstNetCrossHostJitterNs()
 		bandwidthBps = dstNetCrossHostBandwidthBps()
+		lossProb, dupProb, reorder = dstNetCrossHostPacketFaults()
 	}
 	dstKernelSectionExit()
 	if !hasOverrides {
-		return latencyNs, jitterNs, bandwidthBps
+		return latencyNs, jitterNs, bandwidthBps, lossProb, dupProb, reorder
 	}
 	dstLinks.mu.Lock()
 	dstLinksRoll()
@@ -506,9 +530,11 @@ func dstLinkParamsForDir(from, to uint32) (latencyNs, jitterNs, bandwidthBps int
 		latencyNs = dstNetCrossHostLatencyNs()
 		jitterNs = dstNetCrossHostJitterNs()
 		bandwidthBps = dstNetCrossHostBandwidthBps()
+		lossProb, dupProb, reorder = dstNetCrossHostPacketFaults()
 	} else {
 		latencyNs, jitterNs, bandwidthBps = p.latencyNs, p.jitterNs, p.bandwidthBps
+		lossProb, dupProb, reorder = p.lossProb, p.dupProb, p.reorder
 	}
 	dstLinks.mu.Unlock()
-	return latencyNs, jitterNs, bandwidthBps
+	return latencyNs, jitterNs, bandwidthBps, lossProb, dupProb, reorder
 }

@@ -647,19 +647,21 @@ func dstNetHasProcResources(p uint32) bool {
 	dstConns.mu.Unlock()
 
 	dstNet.mu.Lock()
-	defer dstNet.mu.Unlock()
 	dstNetRoll()
 	for _, l := range dstNet.listeners {
 		if l.proc == p {
+			dstNet.mu.Unlock()
 			return true
 		}
 	}
 	for _, proc := range dstNet.pendingBinds {
 		if proc == p {
+			dstNet.mu.Unlock()
 			return true
 		}
 	}
-	return false
+	dstNet.mu.Unlock()
+	return dstUDPHasProcResources(p)
 }
 
 func dstReleasePendingBinds(match func(dstBindKey, uint32) bool) {

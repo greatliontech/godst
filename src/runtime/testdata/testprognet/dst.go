@@ -89,14 +89,15 @@ func DSTNet() {
 }
 
 // DSTNetSemantics checks that the DST network shim preserves public net semantics
-// for the TCP surface it owns, and rejects protocol shapes it does not model.
+// for the TCP and UDP surfaces it owns, and rejects protocol shapes it does not model.
 // Prints booleans for: canceled/deadline DialContext errors, nil DialContext
-// panics, unsupported UDP Listen/Dial errors, deterministic :0 listener ports,
-// invalid ports, localhost canonicalization, DNS/service-name rejection, and
-// tcp4/tcp6 address-family constraints.
+// panics, stream Listen("udp") rejection, connected Dial("udp") + Unix Dial
+// rejection, deterministic :0 listener ports, invalid ports, localhost
+// canonicalization, DNS/service-name rejection, and tcp4/tcp6 address-family
+// constraints.
 func DSTNetSemantics() {
 	n, _ := strconv.ParseUint(os.Getenv("DSTSEED"), 10, 64)
-	var canceled, deadline, nilPanic, udpRejected, udpDialRejected, zeroPorts, invalidPort, localhost, dnsRejected, serviceRejected, familyRejected, wildcardFamilyRejected, tcp6WildcardRejected, tcp6Local, tcp4Unspecified bool
+	var canceled, deadline, nilPanic, udpRejected, udpDialOK, unixDialRejected, zeroPorts, invalidPort, localhost, dnsRejected, serviceRejected, familyRejected, wildcardFamilyRejected, tcp6WildcardRejected, tcp6Local, tcp4Unspecified bool
 	simulation.Run(n, func() {
 		ln, err := net.Listen("tcp", "127.0.0.1:9100")
 		if err == nil {
@@ -131,8 +132,12 @@ func DSTNetSemantics() {
 		} else {
 			ln.Close()
 		}
-		if c, err := net.Dial("udp", "127.0.0.1:9100"); err != nil {
-			udpDialRejected = true
+		if c, err := net.Dial("udp", "127.0.0.1:9100"); err == nil {
+			udpDialOK = true
+			c.Close()
+		}
+		if c, err := net.Dial("unix", "/tmp/dst.sock"); err != nil {
+			unixDialRejected = strings.Contains(err.Error(), "unsupported under deterministic simulation")
 		} else {
 			c.Close()
 		}
@@ -235,7 +240,8 @@ func DSTNetSemantics() {
 		" deadline=" + strconv.FormatBool(deadline) +
 		" nilpanic=" + strconv.FormatBool(nilPanic) +
 		" udpreject=" + strconv.FormatBool(udpRejected) +
-		" udpdialreject=" + strconv.FormatBool(udpDialRejected) +
+		" udpdial=" + strconv.FormatBool(udpDialOK) +
+		" unixdialreject=" + strconv.FormatBool(unixDialRejected) +
 		" zeroports=" + strconv.FormatBool(zeroPorts) +
 		" invalidport=" + strconv.FormatBool(invalidPort) +
 		" localhost=" + strconv.FormatBool(localhost) +

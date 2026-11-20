@@ -69,6 +69,12 @@ var errnoNames = map[syscall.Errno]string{
 	syscall.EROFS:         "EROFS",
 	syscall.EBUSY:         "EBUSY",
 	syscall.EOVERFLOW:     "EOVERFLOW",
+	syscall.EMSGSIZE:      "EMSGSIZE",
+	syscall.EDESTADDRREQ:  "EDESTADDRREQ",
+	syscall.ENOTCONN:      "ENOTCONN",
+	syscall.EOPNOTSUPP:    "EOPNOTSUPP",
+	syscall.ENETUNREACH:   "ENETUNREACH",
+	syscall.ENOPROTOOPT:   "ENOPROTOOPT",
 }
 
 // errClass normalizes an error to an identity class: the wrapping
@@ -195,6 +201,7 @@ type world struct {
 	roots []*os.Root
 	lns   []net.Listener
 	conns []net.Conn
+	udps  []*net.UDPConn
 }
 
 func (w *world) path(rel string) string {
@@ -223,6 +230,11 @@ func (w *world) close() {
 	for _, l := range w.lns {
 		if l != nil {
 			l.Close()
+		}
+	}
+	for _, u := range w.udps {
+		if u != nil {
+			u.Close()
 		}
 	}
 }

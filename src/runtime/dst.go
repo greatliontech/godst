@@ -1341,6 +1341,33 @@ func dstFaultRandN(n int64) int64 {
 	return int64(dstFaultRandUint64() % uint64(n))
 }
 
+// dstFaultProb draws a deterministic Bernoulli decision with probability prob
+// in [0, 1] from the dedicated, stream-isolated fault RNG (dstFaultRand).
+// prob <= 0 returns false and prob >= 1 returns true WITHOUT drawing, so
+// inactive (0) or deterministic (1) packet-fault policies leave the fault RNG
+// stream untouched. Reached via //go:linkname from net's UDP datagram layer.
+//
+//go:linkname dstFaultProb
+func dstFaultProb(prob float64) bool {
+	if prob <= 0 {
+		return false
+	}
+	if prob >= 1 {
+		return true
+	}
+	u := float64(dstFaultRandUint64()>>11) * (1.0 / (1 << 53))
+	return u < prob
+}
+
+// dstCurrentSeed returns the active simulation seed (0 outside an active run)
+// without advancing any RNG stream, used for stateless deterministic hashing
+// such as UDP SO_REUSEPORT 4-tuple socket selection.
+//
+//go:linkname dstCurrentSeed
+func dstCurrentSeed() uint64 {
+	return dstSeed.Load()
+}
+
 // dstSchedRandUint64 advances and returns the next scheduling-RNG value.
 //
 //go:nosplit
@@ -3172,6 +3199,25 @@ func dstSetNetCrossHostBandwidth(bytesPerSec int64) { dstNetCrossHostBandwidth =
 //go:linkname dstNetCrossHostBandwidthBps
 func dstNetCrossHostBandwidthBps() int64 { return dstNetCrossHostBandwidth }
 
+// Cross-host UDP datagram packet-fault baseline (Options.Network.CrossHost).
+var (
+	dstNetCrossHostLoss      float64
+	dstNetCrossHostDuplicate float64
+	dstNetCrossHostReorder   bool
+)
+
+//go:linkname dstSetNetCrossHostPacketFaults
+func dstSetNetCrossHostPacketFaults(loss, duplicate float64, reorder bool) {
+	dstNetCrossHostLoss = loss
+	dstNetCrossHostDuplicate = duplicate
+	dstNetCrossHostReorder = reorder
+}
+
+//go:linkname dstNetCrossHostPacketFaults
+func dstNetCrossHostPacketFaults() (loss, duplicate float64, reorder bool) {
+	return dstNetCrossHostLoss, dstNetCrossHostDuplicate, dstNetCrossHostReorder
+}
+
 // dstNetSendBuffer is the per-run per-direction send-buffer capacity in bytes: a Write
 // blocks once this many written-but-undelivered bytes are outstanding (backpressure).
 // 0 means unbounded (writes never block; SendBuffer<0). dstNetRetransmitNs is the
@@ -3239,34 +3285,78 @@ func dstNetPartitionOp(op, a, b uint32) {
 }
 
 // dstNetLinkConfigHook is net's handler for per-link latency/jitter/bandwidth
-// overrides (ConfigureLink / ConfigureLinkOneWay / UnconfigureLink), registered
-// by net at init when built with -tags dst. A nil hook (net not linked) makes
-// the call a no-op.
-var dstNetLinkConfigHook func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)
+// and UDP packet-fault overrides (ConfigureLink / ConfigureLinkOneWay /
+// UnconfigureLink), registered by net at init when built with -tags dst. A nil
+// hook (net not linked) makes the call a no-op.
+var dstNetLinkConfigHook func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool)
 
 // dstSetNetLinkConfigHook registers net's link-policy handler. Reached via
 // //go:linkname from net's init.
 //
 //go:linkname dstSetNetLinkConfigHook
-func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)) {
+func dstSetNetLinkConfigHook(fn func(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool)) {
 	dstNetLinkConfigHook = fn
+}
+
+func dstPutUint64LE(b []byte, v uint64) {
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+	b[3] = byte(v >> 24)
+	b[4] = byte(v >> 32)
+	b[5] = byte(v >> 40)
+	b[6] = byte(v >> 48)
+	b[7] = byte(v >> 56)
 }
 
 // dstNetLinkConfigOp invokes net's link-policy handler (no-op if net is not linked).
 // Reached via //go:linkname from testing/simulation's link configuration API.
 //
 //go:linkname dstNetLinkConfigOp
-func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64) {
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool) {
+	var flags uint8
+	if reorder {
+		flags |= 1
+	}
+	lossBits := *(*uint64)(unsafe.Pointer(&loss))
+	dupBits := *(*uint64)(unsafe.Pointer(&duplicate))
+	if loss != 0 {
+		flags |= 2
+	}
+	if duplicate != 0 {
+		flags |= 4
+	}
+	var payload [16]byte
+	var str string
+	if flags&(2|4) != 0 {
+		dstPutUint64LE(payload[0:8], lossBits)
+		dstPutUint64LE(payload[8:16], dupBits)
+		str = unsafe.String(&payload[0], len(payload))
+	}
 	switch op {
 	case 1: // linkOpSetBoth
-		dstRecordCausalEvent(dstCausalConfigureLink, 0, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, "")
+		dstRecordCausalEvent(dstCausalConfigureLink, flags, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, str)
 	case 2: // linkOpSetOneWay
-		dstRecordCausalEvent(dstCausalConfigureLinkOneWay, 0, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, "")
+		dstRecordCausalEvent(dstCausalConfigureLinkOneWay, flags, a, b, 0, 0, latencyNs, jitterNs, bandwidthBps, str)
 	case 3: // linkOpClearBoth
 		dstRecordCausalEvent(dstCausalUnconfigureLink, 0, a, b, 0, 0, 0, 0, 0, "")
 	}
 	if dstNetLinkConfigHook != nil {
-		dstNetLinkConfigHook(op, a, b, latencyNs, jitterNs, bandwidthBps)
+		dstNetLinkConfigHook(op, a, b, latencyNs, jitterNs, bandwidthBps, loss, duplicate, reorder)
+	}
+}
+
+// dstNetRunTeardownHook sweeps collected out-of-line simulated netFD rows in
+// host context after a simulation bubble exits (registered by net's init).
+var dstNetRunTeardownHook func()
+
+//go:linkname dstSetNetRunTeardownHook
+func dstSetNetRunTeardownHook(fn func()) { dstNetRunTeardownHook = fn }
+
+//go:linkname dstNetRunTeardown
+func dstNetRunTeardown() {
+	if dstNetRunTeardownHook != nil {
+		dstNetRunTeardownHook()
 	}
 }
 
@@ -4381,6 +4471,10 @@ const (
 	dstCausalFSEIO                uint8 = 50
 	dstCausalFSFsyncgateDrop      uint8 = 51
 	dstCausalFSENOSPC             uint8 = 52
+	dstCausalUDPBind              uint8 = 60
+	dstCausalUDPClose             uint8 = 61
+	dstCausalUDPRefused           uint8 = 62
+	dstCausalUDPDrop              uint8 = 63
 )
 
 type dstKilledG struct {

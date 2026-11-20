@@ -21,9 +21,12 @@ import (
 // philosophy at option granularity: nothing is silently accepted whose
 // behavior the model does not provide).
 
-// TCP_USER_TIMEOUT's number (linux uapi tcp.h; absent from the frozen
-// zerrors tables).
-const dstTCP_USER_TIMEOUT = 18
+// TCP_USER_TIMEOUT and SO_REUSEPORT numbers across all supported Linux DST
+// architectures (amd64, arm64, 386, arm, ppc64, ppc64le, riscv64, s390x).
+const (
+	dstTCP_USER_TIMEOUT = 18
+	dstSO_REUSEPORT     = 0xf
+)
 
 //go:linkname dstSetSetsockoptHook syscall.dstSetSetsockoptHook
 func dstSetSetsockoptHook(fn func(fd, level, opt int, val []byte) (syscall.Errno, bool))
@@ -69,19 +72,25 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 	switch {
 	case level == syscall.SOL_SOCKET && opt == syscall.SO_REUSEADDR:
 		o.setReuseAddr(v != 0)
-	case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
+	case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == dstSO_REUSEPORT:
+		o.setReusePort(v != 0)
+	case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == syscall.SO_RCVBUF:
+		o.setRcvBuf(v)
+	case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == syscall.SO_SNDBUF:
+		o.setSndBuf(v)
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
 		o.mu.Lock()
 		o.keepAlive = v != 0
 		o.mu.Unlock()
 		o.kicked()
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
 		if v == 0 {
 			// Nagle coalescing is unmodeled (every Write emits a segment
 			// immediately); refuse disabling TCP_NODELAY rather than silently
 			// ignoring it.
 			return syscall.ENOPROTOOPT, true
 		}
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
 		if v < 1 || v > dstKeepIdleMaxSec {
 			return syscall.EINVAL, true
 		}
@@ -89,7 +98,7 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 		o.keepIdleSec = v
 		o.mu.Unlock()
 		o.kicked()
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
 		if v < 1 || v > dstKeepIntvlMaxSec {
 			return syscall.EINVAL, true
 		}
@@ -97,7 +106,7 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 		o.keepIntvlSec = v
 		o.mu.Unlock()
 		o.kicked()
-	case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
 		if v < 1 || v > dstKeepCntMax {
 			return syscall.EINVAL, true
 		}
@@ -105,7 +114,7 @@ func dstSockSetsockopt(fd, level, opt int, val []byte) (syscall.Errno, bool) {
 		o.keepCnt = v
 		o.mu.Unlock()
 		o.kicked()
-	case level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
+	case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
 		// Unsigned milliseconds (tcp(7)); the kernel takes any u32.
 		o.mu.Lock()
 		o.userTimeoutMs = uint32(v)
@@ -137,20 +146,30 @@ func dstSockGetsockopt(fd, level, opt int, val []byte) (int, syscall.Errno, bool
 				return 1, true
 			}
 			return 0, true
-		case level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
+		case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == dstSO_REUSEPORT:
+			if o.reusePort {
+				return 1, true
+			}
+			return 0, true
+		case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == syscall.SO_RCVBUF:
+			// o.rcvBuf already stores sk_rcvbuf (doubled & clamped in dstClampSockBuf).
+			return o.rcvBuf, true
+		case o.sotype == syscall.SOCK_DGRAM && level == syscall.SOL_SOCKET && opt == syscall.SO_SNDBUF:
+			return o.sndBuf, true
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.SOL_SOCKET && opt == syscall.SO_KEEPALIVE:
 			if o.keepAlive {
 				return 1, true
 			}
 			return 0, true
-		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_NODELAY:
 			return 1, true
-		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPIDLE:
 			return o.keepIdleSec, true
-		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPINTVL:
 			return o.keepIntvlSec, true
-		case level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == syscall.TCP_KEEPCNT:
 			return o.keepCnt, true
-		case level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
+		case o.sotype == syscall.SOCK_STREAM && level == syscall.IPPROTO_TCP && opt == dstTCP_USER_TIMEOUT:
 			return int32(o.userTimeoutMs), true
 		default:
 			return 0, false

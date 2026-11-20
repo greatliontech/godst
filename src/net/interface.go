@@ -255,6 +255,9 @@ func (zc *ipv6ZoneCache) name(index int) string {
 	if index == 0 {
 		return ""
 	}
+	if dstNetEnabled && dstInSimBubble() {
+		return dstZoneName(index)
+	}
 	updated := zoneCache.update(nil, false)
 	zoneCache.RLock()
 	name, ok := zoneCache.toName[index]
@@ -274,6 +277,9 @@ func (zc *ipv6ZoneCache) name(index int) string {
 func (zc *ipv6ZoneCache) index(name string) int {
 	if name == "" {
 		return 0
+	}
+	if dstNetEnabled && dstInSimBubble() {
+		return dstZoneIndex(name)
 	}
 	updated := zoneCache.update(nil, false)
 	zoneCache.RLock()

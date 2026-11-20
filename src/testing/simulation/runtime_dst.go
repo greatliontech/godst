@@ -158,6 +158,12 @@ func dstSetNetCrossHostJitter(ns int64)
 //go:linkname dstSetNetCrossHostBandwidth runtime.dstSetNetCrossHostBandwidth
 func dstSetNetCrossHostBandwidth(bytesPerSec int64)
 
+//go:linkname dstSetNetCrossHostPacketFaults runtime.dstSetNetCrossHostPacketFaults
+func dstSetNetCrossHostPacketFaults(loss, duplicate float64, reorder bool)
+
+//go:linkname dstNetRunTeardown runtime.dstNetRunTeardown
+func dstNetRunTeardown()
+
 //go:linkname dstSetNetSendBuffer runtime.dstSetNetSendBuffer
 func dstSetNetSendBuffer(bytes int64)
 
@@ -282,7 +288,7 @@ func dstProcAllocBytes(procid uint32) int64
 func dstNetPartitionOp(op, a, b uint32)
 
 //go:linkname dstNetLinkConfigOp runtime.dstNetLinkConfigOp
-func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64)
+func dstNetLinkConfigOp(op, a, b uint32, latencyNs, jitterNs, bandwidthBps int64, loss, duplicate float64, reorder bool)
 
 //go:linkname dstNetHostDead runtime.dstNetHostDead
 func dstNetHostDead(host uint32) bool

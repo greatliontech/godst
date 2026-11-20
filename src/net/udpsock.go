@@ -298,7 +298,7 @@ func dialUDP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
 	if dstNetEnabled && dstInSimBubble() {
-		return nil, dstUnsupportedNetAPI("dial", network, laddr.opAddr(), raddr.opAddr())
+		return dstDialUDP(ctx, dialer, network, laddr, raddr)
 	}
 	sd := &sysDialer{network: network, address: raddr.String()}
 	if dialer != nil {
@@ -330,7 +330,7 @@ func ListenUDP(network string, laddr *UDPAddr) (*UDPConn, error) {
 		laddr = &UDPAddr{}
 	}
 	if dstNetEnabled && dstInSimBubble() {
-		return nil, dstUnsupportedNetAPI("listen", network, nil, laddr.opAddr())
+		return dstListenUDP(network, laddr)
 	}
 	sl := &sysListener{network: network, address: laddr.String()}
 	c, err := sl.listenUDP(context.Background(), laddr)

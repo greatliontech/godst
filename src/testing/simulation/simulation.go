@@ -249,30 +249,54 @@ type Options struct {
 	WedgeWallLimit time.Duration
 }
 
-// LinkConfig configures one-way delivery latency, jitter, and per-flow
-// bandwidth on simulated cross-host network links. It is used both for the
-// run-wide baseline (Options.Network.CrossHost) and for dynamic per-link
-// overrides (ConfigureLink and ConfigureLinkOneWay).
+// LinkConfig configures one-way delivery latency, jitter, per-flow bandwidth,
+// and UDP datagram packet-fault policies on simulated cross-host network links.
+// It is used both for the run-wide baseline (Options.Network.CrossHost) and for
+// dynamic per-link overrides (ConfigureLink and ConfigureLinkOneWay).
 //
-// Within a LinkConfig, 0 means disabled (0 delay, 0 jitter, or unlimited
-// bandwidth). Negative Latency, Jitter, or Bandwidth, or a positive Jitter
-// where Latency + (Jitter - 1) overflows time.Duration, panics before any
-// simulation or link state is modified.
+// Within a LinkConfig, 0 means disabled (0 delay, 0 jitter, unlimited
+// bandwidth, 0 packet loss, or 0 packet duplication; PacketReorder false means
+// in-order delivery). Negative Latency, Jitter, or Bandwidth, a positive Jitter
+// where Latency + (Jitter - 1) overflows time.Duration, or PacketLoss /
+// PacketDuplicate outside [0, 1] (including NaN) panics before any simulation
+// or link state is modified.
 type LinkConfig struct {
 	// Latency is the base one-way delivery delay in universe base (virtual)
 	// time. Same-host and loopback connections are always instant.
 	Latency time.Duration
 
-	// Jitter, if > 0, is the maximum extra per-segment delivery delay: each
-	// segment propagates for Latency plus a value drawn from [0, Jitter) by
-	// the dedicated seeded fault RNG (FIFO-preserving and stream-isolated from
-	// goroutine scheduling).
+	// Jitter, if > 0, is the maximum extra per-segment or per-datagram delivery
+	// delay: each unit propagates for Latency plus a value drawn from [0, Jitter)
+	// by the dedicated seeded fault RNG (stream-isolated from goroutine
+	// scheduling).
 	Jitter time.Duration
 
 	// Bandwidth, if > 0, is the store-and-forward transmit rate in bytes per
-	// second for each connection direction (per flow): a segment of S bytes
-	// occupies the link for S/Bandwidth before Latency and Jitter apply.
+	// second for each connection or sender-to-target flow direction: a payload
+	// of S bytes occupies the link for S/Bandwidth before Latency and Jitter
+	// apply.
 	Bandwidth int64
+
+	// PacketLoss, if > 0, is the independent per-datagram drop probability in
+	// [0, 1] on cross-host UDP links. Ignored for TCP streams (which retransmit
+	// across losses; see docs/dst/faults.md). 0 and 1 draw nothing from the
+	// fault RNG. NaN or values outside [0, 1] panic state-neutrally.
+	PacketLoss float64
+
+	// PacketDuplicate, if > 0, is the independent per-datagram duplication
+	// probability in [0, 1] on cross-host UDP links (evaluated for non-dropped
+	// datagrams; a duplicated copy draws its own independent jitter). Ignored
+	// for TCP streams. 0 and 1 draw nothing from the fault RNG. NaN or values
+	// outside [0, 1] panic state-neutrally.
+	PacketDuplicate float64
+
+	// PacketReorder, when true, permits cross-host UDP datagrams with smaller
+	// jitter draws (or sent after a dynamic latency reduction) to overtake
+	// earlier in-flight datagrams on the same directed link. When false (the
+	// default), cross-host UDP delivery timestamps are clamped monotonically
+	// per sender-to-target flow so jitter varies arrival spacing without
+	// reordering. Ignored for TCP streams (which always preserve FIFO order).
+	PacketReorder bool
 }
 
 // NetworkConfig configures the simulated network for a run.
@@ -513,8 +537,8 @@ func Test(t *testing.T, seed uint64, f func(*testing.T)) {
 //	}
 func RunWith(seed uint64, opts Options, f func()) {
 	kind, depth, steps, hostname, pid, numcpu, pidmax := runOptions("RunWith", opts)
-	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("RunWith", opts.Network)
-	run(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, opts.CrashTear, opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds(), nil, f)
+	latencyNs, jitterNs, bandwidth, loss, duplicate, reorder, sendBuf, retransNs := resolveNetConfig("RunWith", opts.Network)
+	run(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, loss, duplicate, reorder, sendBuf, retransNs, opts.CrashTear, opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds(), nil, f)
 }
 
 // TestWith is Test with explicit RunWith-style options. The *testing.T passed to
@@ -523,7 +547,7 @@ func RunWith(seed uint64, opts Options, f func()) {
 // and T.Deadline must not be called.
 func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	kind, depth, steps, hostname, pid, numcpu, pidmax := runOptions("TestWith", opts)
-	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig("TestWith", opts.Network)
+	latencyNs, jitterNs, bandwidth, loss, duplicate, reorder, sendBuf, retransNs := resolveNetConfig("TestWith", opts.Network)
 	if testingSimulationCleanupStarted(t) {
 		// Reject on the caller goroutine, before the bubble exists: the
 		// equivalent check inside the bubble would panic on the bubble main
@@ -550,7 +574,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T)) {
 	}()
 	setCrashTear(opts.CrashTear) // admitted: publish the run's crash policy (see run)
 	dstSetWedgeLimits(opts.WedgeDecisionLimit, opts.WedgeWallLimit.Nanoseconds())
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, sendBuf, retransNs, nil, true, func() {
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, opts.MemoryLimit, latencyNs, jitterNs, bandwidth, loss, duplicate, reorder, sendBuf, retransNs, nil, true, func() {
 		ok = testingSimulationTest(t, f)
 	})
 	finished = true
@@ -623,7 +647,7 @@ func runOptions(api string, opts Options) (kind uint8, depth, steps int32, hostn
 	return kind, depth, steps, hostname, pid, numcpu, pidmax
 }
 
-func validateLinkConfig(api string, cfg LinkConfig) (latencyNs, jitterNs, bandwidth int64) {
+func validateLinkConfig(api string, cfg LinkConfig) (latencyNs, jitterNs, bandwidth int64, loss, duplicate float64, reorder bool) {
 	if cfg.Latency < 0 {
 		panic("testing/simulation: " + api + " LinkConfig.Latency must be non-negative")
 	}
@@ -633,21 +657,30 @@ func validateLinkConfig(api string, cfg LinkConfig) (latencyNs, jitterNs, bandwi
 	if cfg.Bandwidth < 0 {
 		panic("testing/simulation: " + api + " LinkConfig.Bandwidth must be non-negative")
 	}
+	if !(cfg.PacketLoss >= 0 && cfg.PacketLoss <= 1) {
+		panic("testing/simulation: " + api + " LinkConfig.PacketLoss must be in [0, 1]")
+	}
+	if !(cfg.PacketDuplicate >= 0 && cfg.PacketDuplicate <= 1) {
+		panic("testing/simulation: " + api + " LinkConfig.PacketDuplicate must be in [0, 1]")
+	}
 	latencyNs = cfg.Latency.Nanoseconds()
 	jitterNs = cfg.Jitter.Nanoseconds()
 	bandwidth = cfg.Bandwidth
+	loss = cfg.PacketLoss
+	duplicate = cfg.PacketDuplicate
+	reorder = cfg.PacketReorder
 	if jitterNs > 0 && latencyNs > math.MaxInt64-(jitterNs-1) {
 		panic("testing/simulation: " + api + " LinkConfig latency plus jitter overflows time.Duration")
 	}
-	return latencyNs, jitterNs, bandwidth
+	return latencyNs, jitterNs, bandwidth, loss, duplicate, reorder
 }
 
 // resolveNetConfig validates n.CrossHost and applies the SendBuffer/RetransmitTimeout
 // defaults, returning the values the runtime globals want: sendBuf 0 = unbounded
 // (default 1 MiB when the field is 0, unbounded when it is negative); retransNs 0 =
 // no horizon (default 2 minutes when the field is 0, disabled when it is negative).
-func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwidth, sendBuf, retransNs int64) {
-	latencyNs, jitterNs, bandwidth = validateLinkConfig(api+" Options.Network.CrossHost", n.CrossHost)
+func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwidth int64, loss, duplicate float64, reorder bool, sendBuf, retransNs int64) {
+	latencyNs, jitterNs, bandwidth, loss, duplicate, reorder = validateLinkConfig(api+" Options.Network.CrossHost", n.CrossHost)
 	switch {
 	case n.SendBuffer == 0:
 		sendBuf = 1 << 20 // default 1 MiB
@@ -671,7 +704,7 @@ func resolveNetConfig(api string, n NetworkConfig) (latencyNs, jitterNs, bandwid
 // bubble, restoring everything on return (including on panic). When kind is
 // kindScheduled, prefix is the explicit decision sequence the scheduled strategy
 // follows (see explore.go); for the other strategies prefix is nil.
-func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, crashTear bool, wedgeDecisions, wedgeWallNs int64, prefix []uint64, f func()) {
+func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps int64, netLoss, netDup float64, netReorder bool, netSendBuf, netRetransNs int64, crashTear bool, wedgeDecisions, wedgeWallNs int64, prefix []uint64, f func()) {
 	enterSimulation("Run", "testing/simulation: Run requires building with -tags dst (for a reproducible map hash key)")
 	defer leaveSimulation()
 	// Admitted: publish the run's crash-tear policy. Every admitted entry point
@@ -685,14 +718,14 @@ func run(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numc
 	// entry point publishes them explicitly (the option-less entries publish
 	// the defaults), so no run inherits a previous run's bounds.
 	dstSetWedgeLimits(wedgeDecisions, wedgeWallNs)
-	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs, prefix, true, f)
+	runLocked(seed, kind, depth, steps, hostname, pid, numcpu, pidmax, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netLoss, netDup, netReorder, netSendBuf, netRetransNs, prefix, true, f)
 }
 
 var dstEnvRunEdgeHook func(activating bool)
 
 // runLocked runs one simulation after enterSimulation has reserved the
 // process-global DST state.
-func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
+func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid, numcpu, pidmax int, memLimit, netLatencyNs, netJitterNs, netBandwidthBps int64, netLoss, netDup float64, netReorder bool, netSendBuf, netRetransNs int64, prefix []uint64, propagateGoexit bool, f func()) {
 	// The pin below sets the runtime's custom-GOMAXPROCS flag (that is what
 	// keeps the sysmon container-aware auto-updater from resizing P count
 	// mid-run); remember whether the process was in auto mode so the restore
@@ -717,6 +750,7 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetNetCrossHostLatency(netLatencyNs)
 		dstSetNetCrossHostJitter(netJitterNs)
 		dstSetNetCrossHostBandwidth(netBandwidthBps)
+		dstSetNetCrossHostPacketFaults(netLoss, netDup, netReorder)
 		dstSetNetSendBuffer(netSendBuf)
 		dstSetNetRetransmitTimeout(netRetransNs)
 		dstActivate(seed)
@@ -737,13 +771,14 @@ func runLocked(seed uint64, kind uint8, depth, steps int32, hostname string, pid
 		dstSetNetCrossHostLatency(0)
 		dstSetNetCrossHostJitter(0)
 		dstSetNetCrossHostBandwidth(0)
+		dstSetNetCrossHostPacketFaults(0, 0, false)
 		dstSetNetSendBuffer(0)
 		dstSetNetRetransmitTimeout(0)
 		// The bubble has exited and the run is deactivated: release the run's
-		// filesystem host residue (page-cache memfds, the mapping region) now,
-		// so the run leaves the host descriptor table as it found it rather
-		// than parking the release on the next run's first filesystem op.
+		// filesystem host residue (page-cache memfds, the mapping region) and
+		// sweep collected out-of-line netFD rows now in host context.
 		dstFSRunTeardown()
+		dstNetRunTeardown()
 		dstSetAsyncPreemptOff(oldPreempt)
 		if autoProcs {
 			runtime.SetDefaultGOMAXPROCS()

@@ -26,6 +26,7 @@ func fullAllowlist() []allowEntry {
 	all = append(all, rootAllowlist()...)
 	all = append(all, pipeAllowlist()...)
 	all = append(all, tcpAllowlist()...)
+	all = append(all, udpAllowlist()...)
 	return all
 }
 
@@ -138,6 +139,15 @@ func TestDSTConformanceAllowlistMatchesOnlyRecordedShapes(t *testing.T) {
 			simOK:    outcome{Err: "LinkError(symlinkat)/dst-unsupported", N: -1, State: "old=f1 new=lnk"},
 			hostMiss: outcome{N: -1},
 			simMiss:  outcome{Err: "LinkError(linkat)/dst-unsupported", N: -1, State: "old=f1 new=lnk"},
+		},
+		{
+			name:     "udp-file",
+			key:      "udp-file-fenced",
+			op:       op{name: "udp-file(slot 0)"},
+			hostOK:   outcome{N: -1, State: "file=ok"},
+			simOK:    outcome{Err: "OpError(file)/dst-unsupported", N: -1},
+			hostMiss: outcome{N: -1, State: "file=ok"},
+			simMiss:  outcome{Err: "OpError(file)/errno:EINVAL", N: -1},
 		},
 	}
 	// Host-condition-gated rows skip (not fail) where their entry is
@@ -279,6 +289,9 @@ func TestDSTConformanceGeneratorDeterminism(t *testing.T) {
 		if a, b := opNames(genTCPOps(seed, 80)), opNames(genTCPOps(seed, 80)); !slices.Equal(a, b) {
 			t.Errorf("tcp generator diverged from itself at seed %d", seed)
 		}
+		if a, b := opNames(genUDPOps(seed, 80)), opNames(genUDPOps(seed, 80)); !slices.Equal(a, b) {
+			t.Errorf("udp generator diverged from itself at seed %d", seed)
+		}
 	}
 	// Distinct seeds must actually vary the sequence (a constant
 	// generator would silently shrink the sweep to one sequence).
@@ -287,6 +300,9 @@ func TestDSTConformanceGeneratorDeterminism(t *testing.T) {
 	}
 	if slices.Equal(opNames(genRootOps(1, 200)), opNames(genRootOps(2, 200))) {
 		t.Error("root generator emitted identical sequences for different seeds")
+	}
+	if slices.Equal(opNames(genUDPOps(1, 90)), opNames(genUDPOps(2, 90))) {
+		t.Error("udp generator emitted identical sequences for different seeds")
 	}
 }
 
@@ -310,5 +326,9 @@ func TestDSTConformanceSimSameSeedStable(t *testing.T) {
 	tcpOps := genTCPOps(seed, 60)
 	if a, b := runOpsSim(t, seed, tcpOps), runOpsSim(t, seed, tcpOps); !slices.Equal(a, b) {
 		t.Error("tcp sim leg transcript differs across same-seed runs")
+	}
+	udpOps := genUDPOps(seed, 80)
+	if a, b := runOpsSim(t, seed, udpOps), runOpsSim(t, seed, udpOps); !slices.Equal(a, b) {
+		t.Error("udp sim leg transcript differs across same-seed runs")
 	}
 }

@@ -117,6 +117,9 @@ pkg testing/simulation, type LinkConfig struct
 pkg testing/simulation, type LinkConfig struct, Bandwidth int64
 pkg testing/simulation, type LinkConfig struct, Jitter time.Duration
 pkg testing/simulation, type LinkConfig struct, Latency time.Duration
+pkg testing/simulation, type LinkConfig struct, PacketDuplicate float64
+pkg testing/simulation, type LinkConfig struct, PacketLoss float64
+pkg testing/simulation, type LinkConfig struct, PacketReorder bool
 pkg testing/simulation, type NetworkConfig struct
 pkg testing/simulation, type NetworkConfig struct, CrossHost LinkConfig
 pkg testing/simulation, type NetworkConfig struct, RetransmitTimeout time.Duration

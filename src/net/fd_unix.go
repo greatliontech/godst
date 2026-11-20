@@ -168,6 +168,11 @@ func (fd *netFD) accept() (netfd *netFD, err error) {
 func newUnixFile(fd int, name string) *os.File
 
 func (fd *netFD) dup() (f *os.File, err error) {
+	if dstNetEnabled {
+		if f, handled, err := dstFDDup(fd); handled {
+			return f, err
+		}
+	}
 	ns, call, err := fd.pfd.Dup()
 	if err != nil {
 		if call != "" {

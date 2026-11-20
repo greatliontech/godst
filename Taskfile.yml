@@ -104,7 +104,7 @@ tasks:
       - '{{.RUN}} test -tags dst -count=1 -timeout 20m testing/simulation/determinism'
 
   test:conformance:
-    desc: Host-vs-sim differential conformance harness (pipes/TCP/fs/os.Root) — bounded seed sweep; DST_CONFORMANCE_SEEDS widens
+    desc: Host-vs-sim differential conformance harness (pipes/TCP/UDP/fs/os.Root) — bounded seed sweep; DST_CONFORMANCE_SEEDS widens
     dir: src
     deps: [tmpdir]
     cmds:

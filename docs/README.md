@@ -4,7 +4,7 @@
 
 - **Deterministic scheduling & randomness:** goroutine scheduling, `select` poll order, value-keyed map iteration, `math/rand`, `math/rand/v2`, `hash/maphash`, and `crypto/rand` derive from per-goroutine seeded streams.
 - **Virtual time & per-host clocks:** `time` runs on a `synctest` virtual clock advancing instantly at durable quiescence, with per-host static/seeded clock skew, crystal drift, and mid-run NTP steps.
-- **In-memory TCP network:** per-host loopback (`127.0.0.1` / `localhost`) and routable `10.0.0.<id>` full-mesh TCP with configurable latency, jitter, bandwidth throttling, send-buffer backpressure, half-close (`CloseWrite`/`CloseRead`), keepalive, `TCP_USER_TIMEOUT`, `SO_REUSEADDR`, partitions, and connection resets.
+- **In-memory TCP & UDP network:** per-host loopback (`127.0.0.1` / `::1` / `localhost`) and routable `10.0.0.<id>` full-mesh TCP and UDP (`*net.UDPConn`, `ListenPacket`, `ListenUDP`, `DialUDP`) with independent per-host TCP/UDP port spaces, configurable latency, jitter, bandwidth throttling, UDP packet loss/duplication/reorder (`LinkConfig`), TCP send-buffer backpressure, half-close (`CloseWrite`/`CloseRead`), keepalive, `TCP_USER_TIMEOUT`, `SO_REUSEADDR`, UDP `SO_REUSEPORT` load-balancing groups, `SO_RCVBUF`/`SO_SNDBUF`, connected-UDP `ECONNREFUSED`, partitions, and connection resets.
 - **Crash-faithful in-memory storage & VM:** per-host sparse 4 KiB page-cache filesystems (`os`, `os.Root`), `MAP_SHARED` `mmap` coherent with `read`/`write`, `flock`, `fallocate`, `SEEK_DATA`/`SEEK_HOLE`, shared `futex`, power-loss durability tears (`CrashHost` + `CrashTear`), `fsyncgate` writeback failures, `ENOSPC` quotas, disk latency, and platter bit-rot.
 - **Multi-host / multi-process isolation:** independent per-`(host, boot)` PID spaces, `PIDNamespace` isolation, `/proc/<pid>/stat` + `boot_id`, per-invocation file/socket/environment ownership, and deterministic STW garbage collection.
 - **Systematic schedule exploration:** Level-2 memory-access-granularity preemption and source-DPOR (`Explore`, `ExploreWith`, `ExploreTest`, `Replay`) paired with the `-race` detector as a deterministic data-race oracle.
@@ -304,7 +304,7 @@ func TestWith(t *testing.T, seed uint64, opts Options, f func(*testing.T))
 ```
 
 - **`Run` / `RunWith`** execute `f` inside a deterministic simulation bubble seeded by `seed`. For the duration of the call, `GOMAXPROCS` is pinned to `1` (attempts to resize via `runtime.GOMAXPROCS` inside the run are ignored and restored on return), asynchronous preemption is disabled, GC runs deterministically stop-the-world with synchronous sweep, and two quiet `sync.Pool` generations are drained before bubble teardown so bubble-stamped objects never leak into subsequent runs.
-- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, the chronological failure-only causal event timeline (up to the last 256 topology, fault, TCP lifecycle/timeout/reset, and filesystem fault-hit transitions), activated `Sometimes` fault sites, abnormal process-exit goroutine kill diagnostics, and captured in-bubble `stdout`/`stderr` output are automatically formatted and logged to `t`.
+- **`Test` / `TestWith`** wrap `RunWith` with a bubble-scoped `*testing.T` (matching `testing/synctest.Test` rules: `t.Cleanup` and `t.Context()` run inside the bubble; do not call `t.Run`, `t.Parallel`, or `t.Deadline` on the inner `*testing.T`). If the test fails, panics, or deadlocks, the chronological failure-only causal event timeline (up to the last 256 topology, fault, TCP/UDP lifecycle/timeout/reset/drop, and filesystem fault-hit transitions), activated `Sometimes` fault sites, abnormal process-exit goroutine kill diagnostics, and captured in-bubble `stdout`/`stderr` output are automatically formatted and logged to `t`.
 
 #### `Strategy`
 
@@ -332,7 +332,7 @@ type Options struct {
 	PIDMax             int           // Per-(host, boot) kernel pid_max wrap bound; 0 = unbounded monotonic
 	NumCPU             int           // Default runtime.NumCPU() for hosts; <= 0 selects default 8
 	MemoryLimit        int64         // Bubble-local heap growth soft GC trigger in bytes; 0 = GOGC default
-	Network            NetworkConfig // Simulated TCP latency, jitter, bandwidth, buffer, and timeout policy
+	Network            NetworkConfig // Simulated TCP/UDP latency, jitter, bandwidth, datagram faults, buffer, and timeout policy
 	CrashTear          bool          // Enable seeded page/entry/size power-loss tears on CrashHost
 	WedgeDecisionLimit int64         // Max decisions without durable quiescence; 0 = default 1<<26, < 0 disables
 	WedgeWallLimit     time.Duration // Max wall time without a scheduler decision; 0 = default 60s, < 0 disables
@@ -350,9 +350,12 @@ Key `Options` details:
 
 ```go
 type LinkConfig struct {
-	Latency   time.Duration // One-way base virtual delay (0 = 0ns delay)
-	Jitter    time.Duration // Max extra seeded per-segment delay in [0, Jitter) (0 = disabled; FIFO preserved)
-	Bandwidth int64         // Per-flow per-direction throughput limit in bytes/sec (0 = unlimited)
+	Latency         time.Duration // One-way base virtual delay (0 = 0ns delay)
+	Jitter          time.Duration // Max extra seeded per-segment/packet delay in [0, Jitter) (0 = disabled)
+	Bandwidth       int64         // Per-flow per-direction throughput limit in bytes/sec (0 = unlimited)
+	PacketLoss      float64       // Cross-host UDP packet drop probability in [0, 1] (0 = disabled; ignored by TCP)
+	PacketDuplicate float64       // Cross-host UDP packet duplication probability in [0, 1] (0 = disabled; ignored by TCP)
+	PacketReorder   bool          // Allow jittered cross-host UDP datagrams to arrive out of order (ignored by TCP)
 }
 
 type NetworkConfig struct {
@@ -362,8 +365,8 @@ type NetworkConfig struct {
 }
 ```
 
-- Cross-host `net.Dial` pays a full 1-RTT (`SYN` + `SYN-ACK`) before completing, and `Listener.Accept` yields connections only once `ESTABLISHED`.
-- Specific host pairs can override `NetworkConfig.CrossHost` symmetrically or directionally via `ConfigureLink`, `ConfigureLinkOneWay`, and `UnconfigureLink`. Negative `Latency`, `Jitter`, or `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` overflows `time.Duration`, panics state-neutrally before publishing or mutating run state.
+- Cross-host TCP `net.Dial` pays a full 1-RTT (`SYN` + `SYN-ACK`) before completing, and `Listener.Accept` yields connections only once `ESTABLISHED`. Cross-host UDP datagrams traverse each target host's deterministic in-flight min-heap and bounded `SO_RCVBUF` receive queue (`256 KiB` default), dropping mid-flight datagrams across partitions/power-loss and delivering transient one-shot `ECONNREFUSED` on connected UDP sockets targeting unbound ports on live hosts.
+- Specific host pairs can override `NetworkConfig.CrossHost` symmetrically or directionally via `ConfigureLink`, `ConfigureLinkOneWay`, and `UnconfigureLink`. Negative `Latency`, `Jitter`, or `Bandwidth`, `Jitter > 0` where `Latency + (Jitter - 1)` overflows `time.Duration`, or `PacketLoss` / `PacketDuplicate` outside `[0, 1]` (including `NaN`) panics state-neutrally before publishing or mutating run state.
 - All link delays are measured in universe **base virtual time**, unaffected by per-host wall-clock skew.
 
 ---
@@ -373,8 +376,8 @@ type NetworkConfig struct {
 `godst` models three isolation layers:
 
 1. **Universe (per-run):** scheduler, base virtual clock, Go heap/GC, seeded RNG streams, and inter-host network mesh.
-2. **Host (per-machine, up to 4096 per run):** filesystem tree + page cache + durable platter, routable IP (`10.0.0.<id>`), private loopback (`127.0.0.1` / `::1` / `"localhost"`), TCP port space, wall/drift clock, `os.Hostname()`, `runtime.NumCPU()`, `/proc/sys/kernel/random/boot_id`, and per-`(host, boot)` PID & `PIDNamespace` tables.
-3. **Process (`(host, name)`, up to 4096 logical processes per run):** crash/restart unit with cumulative heap-allocation accounting across restarts (`g.dstProc`) plus a **unique per-invocation resource slot** (`g.dstProcSlot`) owning `os.Getpid()`, open `*os.File` handles and virtual FDs, `flock` advisory locks, `mmap` mappings, working directory (`Chdir`/`Getwd`), copy-on-write environment (`Getenv`/`Setenv`/`Environ`), TCP listeners/sockets, and GC finalizers/cleanups.
+2. **Host (per-machine, up to 4096 per run):** filesystem tree + page cache + durable platter, routable IP (`10.0.0.<id>`), private loopback (`127.0.0.1` / `::1` / `"localhost"`), independent TCP and UDP port spaces, wall/drift clock, `os.Hostname()`, `runtime.NumCPU()`, `/proc/sys/kernel/random/boot_id`, and per-`(host, boot)` PID & `PIDNamespace` tables.
+3. **Process (`(host, name)`, up to 4096 logical processes per run):** crash/restart unit with cumulative heap-allocation accounting across restarts (`g.dstProc`) plus a **unique per-invocation resource slot** (`g.dstProcSlot`) owning `os.Getpid()`, open `*os.File` handles and virtual FDs, `flock` advisory locks, `mmap` mappings, working directory (`Chdir`/`Getwd`), copy-on-write environment (`Getenv`/`Setenv`/`Environ`), TCP listeners/sockets, UDP sockets, and GC finalizers/cleanups.
 
 #### Hosts
 
@@ -430,7 +433,7 @@ type ProcessConfig struct {
 - **Crashable process rule:** Always launch crashable processes on their own goroutine (`go simulation.Process("server", fn)`). Declaring `Process` inline on the simulation's main driver goroutine makes that invocation own the driver; `CrashProcess` and `CrashHost` refuse (panic before tearing anything down) if killing the target would destroy the simulation's main goroutine.
 - **Process exit semantics:** When `f()` returns (or unwinds via panic), the process **exits**:
   1. Any child goroutines spawned inside `f()` that are still alive are permanently stopped (and recorded in the off-heap exit-kill diagnostic ledger if the test fails).
-  2. That invocation slot's open files, `flock`s, `mmap`s, and listeners close immediately (even if another overlapping invocation of the same process name is running).
+  2. That invocation slot's open files, `flock`s, `mmap`s, TCP listeners, and UDP sockets close immediately (even if another overlapping invocation of the same process name is running).
   3. Open TCP sockets close with Linux `close(2)` semantics: if unread bytes sit in the socket's receive buffer, the peer receives `RST` (`ECONNRESET` after draining already-delivered bytes); otherwise `FIN` (`io.EOF`).
   4. Pending GC finalizers/cleanups registered by that invocation are discarded, and its PID disappears from `Kill(pid, 0)` and `/proc/<pid>/stat`.
 - **`PIDNamespace`:** Interned per `(host, boot)`. Processes in distinct namespaces on the same host (or on distinct hosts/boots) cannot see each other via `syscall.Kill(pid, 0)` (`ESRCH`) or `/proc/<pid>/stat` (`os.ErrNotExist`), while co-pod processes sharing a `PIDNamespace` on the same host boot can probe each other's liveness and `starttime`.
@@ -501,12 +504,12 @@ func ResetLinkConns(a, b string)
 func ResetProcessConns(host, proc string)
 ```
 
-- **`Partition(a, b)`**: symmetric blackhole cut between hosts `a` and `b`. New `Dial`s block (until heal, deadline, or `RetransmitTimeout` `ETIMEDOUT`). Established connections still read bytes delivered *before* the cut, while in-flight and post-cut writes buffer up to `SendBuffer` and flush in FIFO order upon `HealLink(a, b)` (unless `RetransmitTimeout` or keepalive kills the socket first).
-- **`PartitionOneWay(from, to)`**: asymmetric blackhole cut dropping `from → to` while `to → from` continues to flow (new handshakes fail in both directions because TCP requires both `SYN` and `SYN-ACK`).
-- **`PartitionRefuse(a, b)`**: symmetric cut where new `Dial`s fail immediately with `syscall.ECONNREFUSED` ("peer down" RST) unless a blackhole/isolation cut also covers the link (blackhole dominates refuse).
+- **`Partition(a, b)`**: symmetric blackhole cut between hosts `a` and `b`. New TCP `Dial`s block (until heal, deadline, or `RetransmitTimeout` `ETIMEDOUT`). Established TCP connections still read bytes delivered *before* the cut, while in-flight and post-cut TCP writes buffer up to `SendBuffer` and flush in FIFO order upon `HealLink(a, b)` (unless `RetransmitTimeout` or keepalive kills the socket first). Cross-host UDP datagrams that arrived before the cut remain readable, while mid-flight and post-cut UDP datagrams (and mid-flight ICMP refusals) are permanently dropped.
+- **`PartitionOneWay(from, to)`**: asymmetric blackhole cut dropping `from → to` while `to → from` continues to flow (new TCP handshakes fail in both directions because TCP requires both `SYN` and `SYN-ACK`; UDP drops only `from → to`).
+- **`PartitionRefuse(a, b)`**: symmetric cut where new TCP `Dial`s fail immediately with `syscall.ECONNREFUSED` ("peer down" RST) and connected UDP sends pend a 1-RTT one-shot `syscall.ECONNREFUSED` unless a blackhole/isolation cut also covers the link (blackhole dominates refuse).
 - **`HealLink(a, b)`**: clears `Partition`, `PartitionOneWay`, and `PartitionRefuse` between `a` and `b` (does not clear `IsolateHost` or per-link `ConfigureLink*` policies).
 - **`IsolateHost(host)` / `UnisolateHost(host)`**: cuts / restores blackhole connectivity between `host` and every other host.
-- **`ConfigureLink(a, b, cfg)` / `ConfigureLinkOneWay(from, to, cfg)` / `UnconfigureLink(a, b)`**: installs a symmetric (`a ↔ b`) or directional (`from → to`) `LinkConfig{Latency, Jitter, Bandwidth}` policy overriding `Options.Network.CrossHost`, or removes overrides in both directions so `a ↔ b` reverts to `Options.Network.CrossHost`. A configured `LinkConfig` replaces the directional triple completely (`0` means `0` delay / `0` jitter / unlimited bandwidth, modeling fast intra-AZ links inside a WAN baseline as well as slow WAN or gray-failure links inside a fast baseline). Overrides apply dynamically to new `Dial` handshakes (`SYN` on `dialer → target`, `SYN-ACK` on `target → dialer`) and subsequent outbound `Write` / `CloseWrite` / graceful `Close` FIN segments on established cross-host connections while preserving `DST-NET-FIFO` and `linkFreeAt` serialization; same-host pairs remain instant and unthrottled, and per-link policies survive both `HealLink` and `CrashHost`.
+- **`ConfigureLink(a, b, cfg)` / `ConfigureLinkOneWay(from, to, cfg)` / `UnconfigureLink(a, b)`**: installs a symmetric (`a ↔ b`) or directional (`from → to`) `LinkConfig{Latency, Jitter, Bandwidth, PacketLoss, PacketDuplicate, PacketReorder}` policy overriding `Options.Network.CrossHost`, or removes overrides in both directions so `a ↔ b` reverts to `Options.Network.CrossHost`. A configured `LinkConfig` replaces the directional policy completely (`0` / `false` means `0` delay / `0` jitter / unlimited bandwidth / lossless in-order delivery, modeling fast intra-AZ links inside a WAN baseline as well as slow WAN or lossy gray-failure links inside a fast baseline). Overrides apply dynamically to new TCP `Dial` handshakes (`SYN` on `dialer → target`, `SYN-ACK` on `target → dialer`), subsequent outbound TCP `Write` / `CloseWrite` / graceful `Close` FIN segments (ignoring `PacketLoss`/`PacketDuplicate`/`PacketReorder` to preserve `DST-NET-FIFO`), and outbound cross-host UDP datagrams; same-host pairs remain instant and lossless, and per-link policies survive both `HealLink` and `CrashHost`.
 - **`ResetLinkConns(a, b)` / `ResetProcessConns(host, proc)`**: injects TCP `RST` on every active connection between `a` and `b` (or owned by live invocations of `(host, proc)`), ordered deterministically by connection registration sequence. Already-delivered bytes drain first, followed by one-shot `ECONNRESET` (subsequent reads `io.EOF`, writes `EPIPE`); in-flight bytes are dropped.
 
 #### Crash & Power-Loss Faults
@@ -519,10 +522,10 @@ func CrashHost(name string)
 | Property | `CrashProcess(host, proc)` (`kill -9`) | `CrashHost(name)` (power loss / kernel panic) |
 |---|---|---|
 | **Goroutines** | Descheduled permanently (no `defer`s run; stack roots dropped for GC); self-crash never returns. | All processes *and* root-process goroutines on `name` descheduled permanently; self-crash never returns. |
-| **FDs, flocks, `mmap`s** | Victim's FDs close, `flock`s release, shared mappings unregister. | All FDs, `flock`s, mappings, listeners, and root-host env/cwd on `name` wiped. |
+| **FDs, flocks, `mmap`s** | Victim's FDs and TCP/UDP sockets close, `flock`s release, shared mappings unregister. | All FDs, `flock`s, mappings, TCP listeners, UDP sockets + in-flight queue, and root-host env/cwd on `name` wiped. |
 | **Filesystem / Page cache** | **Intact** — kernel survives; unsynced writes and dirty `MAP_SHARED` bytes remain visible on `host`. | **Tears to durable image** — reverts to `fsync`'d file contents and `fsync`'d parent directory entries (or page-granular subset under `Options.CrashTear`). |
-| **Open TCP peers** | Live kernel emits `RST`: peers drain already-delivered bytes, then observe `ECONNRESET` (unless blackholed). | **Silence**: no packet emitted; in-flight bytes vanish; peers detect death via `RetransmitTimeout`, TCP keepalive (~150s default), or `RST` after `name` reboots. |
-| **New incoming `Dial`s** | `ECONNREFUSED` (live kernel, closed listener). | **Blackholed** (`ETIMEDOUT` / deadline) until a subsequent `Host` / `HostWith` reboots `name`. |
+| **Open TCP/UDP peers** | Live kernel emits TCP `RST` (peers drain then `ECONNRESET`) and ICMP `ECONNREFUSED` for subsequent connected UDP sends to closed ports (unless blackholed). | **Silence**: no packet emitted; in-flight bytes/datagrams vanish; TCP peers detect death via `RetransmitTimeout`, keepalive (~150s default), or `RST` after reboot; UDP drops silently. |
+| **New incoming TCP `Dial`s** | `ECONNREFUSED` (live kernel, closed listener). | **Blackholed** (`ETIMEDOUT` / deadline) until a subsequent `Host` / `HostWith` reboots `name`. |
 
 #### Disk & Storage Media Faults
 
@@ -705,10 +708,10 @@ Unmodified application and library code (`net/http`, `crypto/tls`, custom binary
   - In-bubble `sync.Mutex`, `sync.RWMutex`, `sync.WaitGroup`, `sync.Cond`, and `sync.Once` waits are durably tracked with deterministic starvation handoff and Level-2 DPOR happens-before edges.
   - `math/rand`, `math/rand/v2`, `crypto/rand`, `hash/maphash`, `select` case order, and value-keyed map iteration derive from per-goroutine seeded streams (`g.dstrand`) immune to OS thread migration and host load.
 - **Networking (`net`):**
-  - `net.Dial`, `DialTimeout`, ` (*net.Dialer).DialContext`, `net.Listen`, `(*net.ListenConfig).Listen` over `"tcp"`, `"tcp4"`, `"tcp6"`.
-  - Deterministic `"localhost"` resolution (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `LookupHost`, `LookupIP`, `LookupNetIP`, and `ResolveTCPAddr`, plus built-in protocol number resolution (`tcp`/`udp`/`icmp`) without touching host `/etc/protocols` or DNS.
+  - TCP (`net.Dial`, `DialTimeout`, `(*net.Dialer).DialContext`, `net.Listen`, `(*net.ListenConfig).Listen` over `"tcp"`, `"tcp4"`, `"tcp6"`) and UDP (`net.ListenPacket`, `(*net.ListenConfig).ListenPacket`, `net.ListenUDP`, `net.Dial("udp*", ...)`, `net.DialUDP`, `(*net.Dialer).DialUDP` over `"udp"`, `"udp4"`, `"udp6"` returning `*net.UDPConn`).
+  - Deterministic `"localhost"` resolution (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `ListenPacket`, `LookupHost`, `LookupIP`, `LookupNetIP`, `ResolveTCPAddr`, and `ResolveUDPAddr`, plus built-in protocol number resolution (`tcp`/`udp`/`icmp`) without touching host `/etc/protocols` or DNS.
   - Synthetic per-host `net.Interfaces()` / `InterfaceAddrs()` (`lo` `127.0.0.1/8` + `::1/128`, and `eth0` `10.<b>.<c>.<d>/24`).
-  - Simulated connections implement `net.Conn`, `syscall.Conn` (`Dialer.Control`, `ListenConfig.Control`), and structural TCP half-close (`CloseWrite() error` and `CloseRead() error`), with `TCP_NODELAY=1` by default, `SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT`.
+  - Simulated TCP connections implement `net.Conn`, `syscall.Conn` (`Dialer.Control`, `ListenConfig.Control`), and structural TCP half-close (`CloseWrite() error` and `CloseRead() error`), with `TCP_NODELAY=1` by default, `SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT`; simulated `*net.UDPConn` sockets implement `net.Conn`, `net.PacketConn`, and `syscall.Conn` with `SO_REUSEADDR`, `SO_REUSEPORT` load-balancing groups, `SO_RCVBUF`/`SetReadBuffer`, and `SO_SNDBUF`/`SetWriteBuffer`.
 - **Filesystem, VM, Locking, & Synchronization (`os`, `syscall`, `golang.org/x/sys/unix`):**
   - Per-host in-memory tree initialized with `/tmp` (`01777`, `os.TempDir() == "/tmp"`) and `/dev/null`, full `os.File` / `os.Root` operations (including `os.Truncate` and `(*os.File).Truncate`), `O_SYNC` / `O_DSYNC`, and anonymous pipes (`os.Pipe` with 64 KiB buffer and `PIPE_BUF` atomicity).
   - Linux virtual FDs supporting `syscall.Read`/`Write`/`Pread`/`Pwrite`/`Fsync`/`Fdatasync`/`Fstat`/`Statfs`/`Fstatfs`/`Flock`/`Fallocate`/`Seek` (`SEEK_DATA`/`SEEK_HOLE`).
@@ -717,7 +720,7 @@ Unmodified application and library code (`net/http`, `crypto/tls`, custom binary
   - Synthetic `/proc/self/ns/pid`, `/proc/<pid>/stat` (deterministic field-22 `starttime` in `USER_HZ` ticks), `/proc/sys/kernel/random/boot_id`, and `syscall.Kill(pid, 0)` liveness probes.
 - **Environment & Failure-Only Diagnostics:**
   - Per-`(host, process invocation)` copy-on-write `os.Getenv` / `Setenv` / `Unsetenv` / `Clearenv` / `Environ`.
-  - A 256-slot chronological causal event timeline (host/process lifecycle, injected faults & link policies, TCP `Listen`/`Close`/`Dial`/timeout/`RST` transitions, and filesystem `EIO`/`fsyncgate`/`ENOSPC`/`CorruptFile` hits), activated `Sometimes` fault sites, abnormal process-exit goroutine kills, and ungranted bubble writes to `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) are recorded off-heap (`sysAlloc`) with zero heap, RNG, or scheduler perturbation and printed automatically only if the test or explored schedule fails.
+  - A 256-slot chronological causal event timeline (host/process lifecycle, injected faults & link policies, TCP `Listen`/`Close`/`Dial`/timeout/`RST` transitions, UDP `Bind`/`Close`/`ECONNREFUSED`/drop transitions, and filesystem `EIO`/`fsyncgate`/`ENOSPC`/`CorruptFile` hits), activated `Sometimes` fault sites, abnormal process-exit goroutine kills, and ungranted bubble writes to `os.Stdout` / `os.Stderr` (or raw `fd 1` / `fd 2`) are recorded off-heap (`sysAlloc`) with zero heap, RNG, or scheduler perturbation and printed automatically only if the test or explored schedule fails.
 
 ---
 
@@ -737,4 +740,4 @@ Unmodified application and library code (`net/http`, `crypto/tls`, custom binary
 2. **Launch crashable processes with `go simulation.Process(...)`:** Never call `CrashProcess` or `CrashHost` on a process/host whose goroutine set includes the simulation's root driver goroutine; start server processes on child goroutines and drive faults from the root script.
 3. **Never share Go memory across simulated `Process` boundaries if crashing them:** Real OS processes share only the host filesystem, shared `MAP_SHARED` files, and the network. If Process A holds a Go `sync.Mutex` or channel shared in-memory with Process B and Process A is killed via `CrashProcess`, Process A's threads stop without unwinding and that Go mutex stays locked forever (as documented in [dst/faults.md](dst/faults.md)).
 4. **Do not let pointer-keyed map iteration drive externally visible order:** Value-keyed maps (`string`, integers, structs without pointers) iterate deterministically under `-tags dst`, whereas `map[*T]V` hashes heap addresses that can vary with allocator history. Sort keys or key by deterministic IDs when order affects wire/disk output.
-5. **Respect interception fences:** Operations that would leak host nondeterminism or mutate the host OS — `os/exec`, `cgo` calls, `os/signal` (`Notify`, `Ignore`, `Reset`, `Stop`, `Ignored`), `os.Executable`, UDP/Unix/raw sockets, arbitrary external DNS lookups, and unmodeled raw syscalls — panic immediately with `"unsupported under deterministic simulation"` naming the operation. Non-bubble goroutines outside the simulation remain completely unfenced.
+5. **Respect interception fences:** Operations that would leak host nondeterminism or mutate the host OS — `os/exec`, `cgo` calls, `os/signal` (`Notify`, `Ignore`, `Reset`, `Stop`, `Ignored`), `os.Executable`, Unix/raw/multicast sockets, arbitrary external DNS lookups, and unmodeled raw syscalls — panic immediately with `"unsupported under deterministic simulation"` naming the operation. Non-bubble goroutines outside the simulation remain completely unfenced.

@@ -946,3 +946,91 @@ func TestDiagnosticsCausalTimelineObservationNeutrality(t *testing.T) {
 			repOff.Schedules, repOff.Footprint, repOff.UnattributedRaces, repOff.ForeignSched, yieldsOff)
 	}
 }
+
+func TestDiagnosticsCausalTimelineUDPTransitions(t *testing.T) {
+	if os.Getenv("GO_DST_DIAG_CAUSAL_UDP_CHILD") == "1" {
+		TestWith(t, 95, Options{}, func(t *testing.T) {
+			var srvIP string
+			Host("u-srv", func() { srvIP = HostIP("u-srv") })
+			Host("u-cli", func() {})
+
+			ConfigureLink("u-cli", "u-srv", LinkConfig{
+				Latency:         2 * time.Millisecond,
+				PacketLoss:      1.0,
+				PacketDuplicate: 0.5,
+				PacketReorder:   true,
+			})
+
+			portCh := make(chan int, 1)
+			overflowDone := make(chan struct{})
+			go Host("u-srv", func() {
+				Process("dnsd", func() {
+					u, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(srvIP), Port: 0})
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					_ = u.SetReadBuffer(1152)
+					portCh <- u.LocalAddr().(*net.UDPAddr).Port
+					<-overflowDone
+					_ = u.Close()
+				})
+			})
+			srvPort := <-portCh
+
+			Host("u-cli", func() {
+				Process("resolver", func() {
+					c, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(srvIP), Port: srvPort})
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _ = c.Write([]byte("drop-by-loss"))
+
+					UnconfigureLink("u-cli", "u-srv")
+					Partition("u-cli", "u-srv")
+					_, _ = c.Write([]byte("drop-by-part"))
+					HealLink("u-cli", "u-srv")
+
+					pkt := make([]byte, 1000)
+					for range 4 {
+						_, _ = c.Write(pkt)
+					}
+					close(overflowDone)
+					time.Sleep(5 * time.Millisecond)
+					_ = c.Close()
+
+					cRef, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(srvIP), Port: 49999})
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _ = cRef.Write([]byte("ping"))
+					var b [8]byte
+					_, _ = cRef.Read(b[:])
+					_ = cRef.Close()
+				})
+			})
+			t.Fatal("inspect UDP causal timeline")
+		})
+		return
+	}
+
+	out := runDiagnosticsChild(t, "TestDiagnosticsCausalTimelineUDPTransitions", "GO_DST_DIAG_CAUSAL_UDP_CHILD", true)
+	lines := parseCausalTimelineLines(t, out)
+	verifyMonotonicTimeline(t, lines)
+	joined := strings.Join(lines, "\n")
+
+	for _, want := range []string{
+		`ConfigureLink "u-cli" <-> "u-srv" (latency=2ms jitter=0s bandwidth=0B/s loss=1 dup=0.5 reorder=true)`,
+		`UDP Bind [host="u-srv" proc="dnsd"`,
+		`UDP datagram dropped "u-cli":`,
+		`(reason=packet-loss)`,
+		`(reason=partition)`,
+		`(reason=recv-buffer-full)`,
+		`UDP Close [host="u-srv" proc="dnsd"`,
+		`UDP ECONNREFUSED "u-cli":`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in UDP causal timeline:\n%s", want, joined)
+		}
+	}
+}

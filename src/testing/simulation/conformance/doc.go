@@ -4,7 +4,7 @@
 
 // Package conformance holds the differential host-vs-sim conformance
 // harness for the deterministic simulation's modeled I/O surfaces
-// (pipes, TCP, filesystem, and os.Root — docs/dst/design.md is the
+// (pipes, TCP, UDP, filesystem, and os.Root — docs/dst/design.md is the
 // authoritative contract). The package carries no library code:
 // everything lives in dst-tagged Linux test files, run by the
 // `test:conformance` Taskfile leg.

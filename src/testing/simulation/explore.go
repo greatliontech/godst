@@ -254,6 +254,9 @@ type exploreRunParams struct {
 	latencyNs      int64
 	jitterNs       int64
 	bandwidth      int64
+	loss           float64
+	duplicate      float64
+	reorder        bool
 	sendBuf        int64
 	retransNs      int64
 	crashTear      bool
@@ -263,7 +266,7 @@ type exploreRunParams struct {
 
 func resolveExploreRunParams(api string, opts Options) exploreRunParams {
 	_, _, _, hostname, pid, numcpu, pidmax := runOptions(api, opts)
-	latencyNs, jitterNs, bandwidth, sendBuf, retransNs := resolveNetConfig(api, opts.Network)
+	latencyNs, jitterNs, bandwidth, loss, duplicate, reorder, sendBuf, retransNs := resolveNetConfig(api, opts.Network)
 	return exploreRunParams{
 		hostname:       hostname,
 		pid:            pid,
@@ -273,6 +276,9 @@ func resolveExploreRunParams(api string, opts Options) exploreRunParams {
 		latencyNs:      latencyNs,
 		jitterNs:       jitterNs,
 		bandwidth:      bandwidth,
+		loss:           loss,
+		duplicate:      duplicate,
+		reorder:        reorder,
 		sendBuf:        sendBuf,
 		retransNs:      retransNs,
 		crashTear:      opts.CrashTear,
@@ -661,7 +667,7 @@ func runOnceResultLocked(seed uint64, prefix []uint64, forces map[accessForce]bo
 		}
 	}()
 	p := cfg.params
-	runLocked(seed, kindScheduled, 0, 0, p.hostname, p.pid, p.numcpu, p.pidmax, p.memLimit, p.latencyNs, p.jitterNs, p.bandwidth, p.sendBuf, p.retransNs, prefix, false, func() {
+	runLocked(seed, kindScheduled, 0, 0, p.hostname, p.pid, p.numcpu, p.pidmax, p.memLimit, p.latencyNs, p.jitterNs, p.bandwidth, p.loss, p.duplicate, p.reorder, p.sendBuf, p.retransNs, prefix, false, func() {
 		defer func() {
 			if v := recover(); v != nil && out.panic == "" {
 				if pv, ok := dstExplorePanicFP(); ok {

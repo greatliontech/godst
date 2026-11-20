@@ -55,30 +55,103 @@ const (
 	dstKeepIdleMaxSec  = 32767
 	dstKeepIntvlMaxSec = 32767
 	dstKeepCntMax      = 127
+
+	// Deterministic socket buffer bounds for SOCK_DGRAM virtual descriptors
+	// (matching Linux SOCK_MIN_RCVBUF/SOCK_MIN_SNDBUF floor and a 16 MiB cap,
+	// without reading host /proc/sys/net/core/{rmem,wmem}_max).
+	dstSockBufMin        = 2304
+	dstSockBufMax        = 16 << 20
+	dstUDPRcvBufDefault  = 256 << 10
+	dstUDPSndBufDefault  = 256 << 10
 )
 
 type dstSockOpts struct {
 	mu            isync.KernelMutex
+	sotype        int    // syscall.SOCK_STREAM or syscall.SOCK_DGRAM
 	reuseAddr     bool   // SO_REUSEADDR
+	reusePort     bool   // SO_REUSEPORT (SOCK_DGRAM)
 	keepAlive     bool   // SO_KEEPALIVE
 	keepIdleSec   int32  // TCP_KEEPIDLE
 	keepIntvlSec  int32  // TCP_KEEPINTVL
 	keepCnt       int32  // TCP_KEEPCNT
 	userTimeoutMs uint32 // TCP_USER_TIMEOUT (milliseconds; 0 = system default)
+	rcvBuf        int32  // effective SO_RCVBUF byte capacity (SOCK_DGRAM)
+	sndBuf        int32  // effective SO_SNDBUF byte capacity (SOCK_DGRAM)
 
 	// kick, when set (at connection establishment), re-arms the owning wire
 	// end's keepalive prober after an option write — so enabling SO_KEEPALIVE
 	// through a stashed RawConn starts probing, exactly as the kernel's
 	// keepalive timer arms on the setsockopt. Called without the mutex held.
 	kick func()
+
+	// onRcvBuf, when set on a SOCK_DGRAM socket, updates the live receive
+	// queue capacity when SO_RCVBUF / SetReadBuffer mutates rcvBuf.
+	onRcvBuf func(int)
 }
 
 func newDstSockOpts() *dstSockOpts {
 	return &dstSockOpts{
+		sotype:       syscall.SOCK_STREAM,
 		keepIdleSec:  dstKeepIdleDefaultSec,
 		keepIntvlSec: dstKeepIntvlDefaultSec,
 		keepCnt:      dstKeepCntDefault,
 	}
+}
+
+func newDstUDPSockOpts(onRcvBuf func(int)) *dstSockOpts {
+	return &dstSockOpts{
+		sotype:   syscall.SOCK_DGRAM,
+		rcvBuf:   dstUDPRcvBufDefault,
+		sndBuf:   dstUDPSndBufDefault,
+		onRcvBuf: onRcvBuf,
+	}
+}
+
+func dstClampSockBuf(v int32) int32 {
+	// Linux __sock_set_rcvbuf / SO_SNDBUF treats val as u32, caps at rmem_max
+	// (dstSockBufMax/2 = 8 MiB), doubles for kernel sk_rcvbuf/sk_sndbuf overhead
+	// (max 16 MiB), and clamps the floor at SOCK_MIN_RCVBUF/SOCK_MIN_SNDBUF (2304).
+	const maxReq = dstSockBufMax / 2
+	u := uint32(v)
+	if u > maxReq {
+		u = maxReq
+	}
+	doubled := int32(u * 2)
+	if doubled < dstSockBufMin {
+		return dstSockBufMin
+	}
+	return doubled
+}
+
+func (o *dstSockOpts) setReusePort(v bool) {
+	o.mu.Lock()
+	o.reusePort = v
+	o.mu.Unlock()
+}
+
+func (o *dstSockOpts) isReusePort() bool {
+	o.mu.Lock()
+	v := o.reusePort
+	o.mu.Unlock()
+	return v
+}
+
+func (o *dstSockOpts) setRcvBuf(v int32) {
+	clamped := dstClampSockBuf(v)
+	o.mu.Lock()
+	o.rcvBuf = clamped
+	fn := o.onRcvBuf
+	o.mu.Unlock()
+	if fn != nil {
+		fn(int(clamped))
+	}
+}
+
+func (o *dstSockOpts) setSndBuf(v int32) {
+	clamped := dstClampSockBuf(v)
+	o.mu.Lock()
+	o.sndBuf = clamped
+	o.mu.Unlock()
 }
 
 func (o *dstSockOpts) setReuseAddr(v bool) {
@@ -104,6 +177,7 @@ func (o *dstSockOpts) cloneForChild() *dstSockOpts {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return &dstSockOpts{
+		sotype:        o.sotype,
 		reuseAddr:     o.reuseAddr,
 		keepAlive:     o.keepAlive,
 		keepIdleSec:   o.keepIdleSec,

@@ -20,14 +20,6 @@ resolved entry is deleted.
   writes, optional ZNS/SMR sequential write-pointer and open-zone enforcement,
   and a deterministic `io_uring` block-I/O subset. See
   [raw-and-zoned-block-devices.md](raw-and-zoned-block-devices.md).
-- **simulated UDP datagram network (`udp`/`udp4`/`udp6` + `LinkConfig` packet faults)** —
-  Lands: deferred until triggered by user when `mindns` or a QUIC transport enters
-  DST integration (user-authorized deferral; zero retrofit — additive unfencing in
-  `net` plus additive packet-fault fields on `LinkConfig`). Models per-host UDP
-  port spaces, `net.ListenPacket` / `ListenUDP` / `DialUDP`, ephemeral port binding,
-  ICMP port-unreachable error reporting on connected UDP sockets, and per-link
-  packet drop, duplication, and bounded reorder policies over `LinkConfig`. See
-  [udp-datagram-network.md](udp-datagram-network.md).
 - **simulated Unix domain sockets (`unix` / `unixpacket` over per-host VFS `S_IFSOCK` inodes)** —
   Lands: deferred until triggered by user when a workload requires local IPC over
   `AF_UNIX` sockets (user-authorized deferral; zero retrofit — additive unfencing

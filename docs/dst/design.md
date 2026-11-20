@@ -33,7 +33,7 @@ What DST does **not** virtualize: unsupported network kinds, cgo, raw syscalls, 
 signals — each **fenced** (a loud, deterministic refusal for bubble goroutines; see "The
 interception boundary") rather than silently reaching the host — and, deliberately, the standard
 streams explicitly granted through an inherited-file capability; see "Deterministic pipes and the
-stdio stance"). TCP `net.Dial`/`net.Listen` are modeled by the in-memory deterministic
+stdio stance"). TCP `net.Dial`/`net.Listen` and UDP `net.ListenPacket`/`ListenUDP`/`DialUDP`/`Dial("udp*", ...)` are modeled by the in-memory deterministic
 network below, the filesystem by the in-memory deterministic filesystem, and `os.Pipe` by the
 in-memory deterministic pipe (all per-bubble, all reset by the run epoch); what remains is modeled
 in-memory by the program under test or avoided. The remaining pending fault axes are OOM kill and
@@ -387,11 +387,12 @@ retransmission-horizon, and connect-cost legs are landed; the FIN/RST leg and th
 no-declared-host connect timeout land with a follow-on (both marked below). The wire
 models a TCP socket pair, not a message queue:
 
-Network delay configuration (`LinkConfig{Latency, Jitter, Bandwidth}` on both run-level
+Network delay and datagram-fault configuration (`LinkConfig{Latency, Jitter, Bandwidth, PacketLoss, PacketDuplicate, PacketReorder}` on both run-level
 `Options.Network.CrossHost` and dynamic per-link `ConfigureLink` / `ConfigureLinkOneWay`; see
 [faults.md](./faults.md)) is validated before publishing
-or mutating state (`TestDSTLinkConfigValidationStateNeutral`): `0` disables latency, jitter, or bandwidth on that policy, while negative `Latency`,
-`Jitter`, or `Bandwidth`, or `Jitter > 0` where `Latency + (Jitter - 1)` cannot fit in `time.Duration`,
+or mutating state (`TestDSTLinkConfigValidationStateNeutral`): `0` disables latency, jitter, bandwidth, packet loss, or packet duplication on that policy (`false` disables packet reorder), while negative `Latency`,
+`Jitter`, or `Bandwidth`, `Jitter > 0` where `Latency + (Jitter - 1)` cannot fit in `time.Duration`,
+or `PacketLoss` / `PacketDuplicate` outside `[0, 1]` (including `NaN`)
 panics state-neutrally (`UnconfigureLink` restores the `Options.Network.CrossHost` baseline). Runtime
 delay arithmetic that also depends on
 the current base clock or a write's size saturates at the latest representable virtual-time deadline;
@@ -717,32 +718,76 @@ re-Listen the same address). Connections and listeners are stateful capabilities
 epoch: stale reads, writes, accepts, and deadline changes fail as closed without touching transport or
 current-run state. Address accessors retain creation-time metadata, while stale `Close` performs only
 wrapper-local idempotent cleanup. This is the reliable, in-order **base** on which network faults layer
-later as policies on the same registry+conns — and because the base is reliable, in-order TCP, the
-sound faults are **flow-granular** (latency, partition/blackhole, connection reset, throttle), *not*
-byte/message-granular: dropping, reordering, or duplicating bytes on a live stream is not a degree of
-freedom TCP has, so packet-granular drop/reorder/duplicate land with the UDP/`PacketConn` follow-on,
-not this base. See [faults.md](./faults.md).
+later as policies on the same registry+conns — and because the TCP base is reliable, in-order TCP, the
+sound TCP faults are **flow-granular** (latency, partition/blackhole, connection reset, throttle), while
+the **simulated UDP datagram network** below models message-granular datagrams and packet-granular link
+faults (`PacketLoss`, `PacketDuplicate`, `PacketReorder`). See [faults.md](./faults.md).
 
-**Caveat (fidelity).** `Dial` returns the `net.Conn` *interface* (plus `CloseWrite() error` and
+**Simulated UDP datagram network (`udp`, `udp4`, `udp6` — landed).** Alongside TCP, `net.ListenPacket`,
+`(*net.ListenConfig).ListenPacket`, `net.ListenUDP`, `net.Dial("udp*", ...)`, `(*net.Dialer).DialContext`,
+`net.DialUDP`, and `(*net.Dialer).DialUDP` run over per-host in-memory UDP port tables completely
+independent of each host's TCP port table (`:53/udp` and `:53/tcp` coexist on one host), returning real
+`*net.UDPConn` handles whose per-socket state attaches out of line via `dstUDPStateTable`
+(`fd.pfd.Sysfd = -2 - idx`, swept in host context at `dstNetRunTeardown`; `INV-VANILLA` and `INV-TYPESHAPE`
+preserved with zero added fields or methods on `netFD`, `UDPConn`, `conn`, or `rawConn`, and untagged
+zero-allocation `ReadFromUDPAddrPort` / `WriteToUDPAddrPort` intact):
+- **Port binding, dual-stack, `SO_REUSEADDR`, & `SO_REUSEPORT`:** Ephemeral port allocation is deterministic
+  per host (`[10000, 65535]` for unconnected `:0` binds, failing `EADDRINUSE` on exhaustion; `[40000, 65535]`
+  for connected dials, failing `EADDRNOTAVAIL` on exhaustion). Plain `"udp"` wildcard listens (`""`, `":0"`,
+  `"0.0.0.0:0"`) create dual-stack `AF_INET6` sockets (`[::]:port`, receiving IPv4 senders as `::ffff:a.b.c.d`
+  on `ReadFromUDPAddrPort` matching Linux `SockaddrInet6`), `"udp4"` creates `AF_INET` sockets, and `"udp6"`
+  creates `IPV6_V6ONLY` `AF_INET6` sockets (refusing IPv4 targets with `ENETUNREACH`). Unlike TCP `listenStream`,
+  UDP `listenDatagram` defaults `SO_REUSEADDR=0`; setting `SO_REUSEADDR=1` on both sockets allows wildcard +
+  specific-IP coexistence on one port, while setting `SOL_SOCKET, SO_REUSEPORT` (`0xf` on all supported Linux
+  architectures, refused `ENOPROTOOPT` on TCP sockets) via `ListenConfig.Control` / `Dialer.Control` on all
+  overlapping UDP sockets forms a deterministic multi-socket load-balancing group routed by a stateless
+  run-seed-salted 4-tuple hash `(seed, dstHost, srcIP, srcPort, dstIP, dstPort)` advancing zero RNG streams.
+  Incoming datagram lookup ranks connected 4-tuple > exact local IP > wildcard.
+- **Datagram framing, receive buffers (`SO_RCVBUF`), & deadlines:** Exact datagram boundaries are preserved
+  (writes never coalesce; `0`-byte datagrams deliver `n = 0, err = nil`, never `io.EOF`; payloads above
+  `65507` bytes on IPv4 or `65527` bytes on IPv6 fail `EMSGSIZE`; short read buffers truncate excess bytes
+  per POSIX `recvmsg`, and `ReadMsgUDP*` with `len(oob) == 0` sets `syscall.MSG_TRUNC` while non-empty `oob`
+  and `ListenMulticastUDP` remain fenced). Each UDP socket maintains a bounded kernel receive queue
+  (default `256 KiB` = `262144` bytes; `SetReadBuffer` / `SO_RCVBUF` doubles the requested value per Linux
+  `__sock_set_rcvbuf` and clamps `sk_rcvbuf` to `[2304, 16 MiB]`, returned directly by `getsockopt`;
+  `SetWriteBuffer` / `SO_SNDBUF` follows the same rule on UDP virtual descriptors), charging `max(len(payload), 1)`
+  at delivery maturation and dropping excess arriving datagrams without backpressuring the sender. Blocked
+  reads wait on `dstNewBaseTimer` for packet/refusal maturation and a socket-host `time.Timer` for read
+  deadlines (zero `AfterFunc` goroutines).
+- **Cross-host delivery, mid-flight cuts, connected-UDP `ECONNREFUSED`, & lifecycle:** Same-host/loopback
+  datagrams deliver instantly (`0ns`). Cross-host datagrams traverse the target host's deterministic in-flight
+  min-heap (paying `Bandwidth` serialization + `Latency` + `Jitter`, subject to `PacketLoss`, `PacketDuplicate`,
+  and `PacketReorder`). `Partition`, `PartitionOneWay`, `IsolateHost`, and `CrashHost` mature datagrams with
+  `deliverAt <= now` and permanently drop datagrams caught mid-flight (`deliverAt > now`, as UDP never
+  retransmits). Sending from a **connected** UDP socket to an unbound port on a live declared host (or across
+  a non-blackhole `PartitionRefuse` link) succeeds on `Write` and pends a transient one-shot
+  `sk_err = syscall.ECONNREFUSED` (after round-trip propagation if neither leg is blackholed or lost), surfaced
+  on the next `Read` or `Write` while leaving the UDP socket open for subsequent traffic; blackholed,
+  isolated, powered-off, or undeclared hosts drop silently. Every UDP socket is attributed to `(host, procSlot)`
+  so process exit, `CrashProcess`, and `CrashHost` close owned UDP sockets deterministically.
+
+**Caveat (fidelity).** TCP `Dial` returns the `net.Conn` *interface* (plus `CloseWrite() error` and
 `CloseRead() error` half-close methods matching standard structural TCP half-close interfaces); code
-that type-asserts the concrete `*net.TCPConn` (`SetNoDelay` method) will not get one — though
-conns and listeners implement `syscall.Conn` (`TCP_NODELAY` defaults to `1`, matching Go's
-`*net.TCPConn` default, and `SO_REUSEADDR` is modeled alongside keepalive options), and
+that type-asserts the concrete `*net.TCPConn` (`SetNoDelay` method) will not get one (whereas UDP
+entry points return concrete `*net.UDPConn`) — though
+conns, listeners, and UDP sockets implement `syscall.Conn` (`TCP_NODELAY` defaults to `1` on TCP, matching Go's
+`*net.TCPConn` default; `SO_REUSEADDR` and keepalive options are modeled on TCP, and `SO_REUSEADDR`, `SO_REUSEPORT`,
+`SO_RCVBUF`, and `SO_SNDBUF` on UDP), and
 `Dialer.Control`, `Dialer.ControlContext`, `ListenConfig.Control`, and explicit keepalive
 configuration are MODELED (the socket-option layer and keepalive death law — see "Socket options &
 keepalive" in the transport model): callbacks run against a virtual socket descriptor whose sockopts
-land in per-socket option state, the modeled set carries full death-machinery semantics, and an
+land in per-socket option state, the modeled set carries full semantics, and an
 option outside the modeled set fails `ENOPROTOOPT` rather than being silently ignored — the same
 fail-loud contract at option granularity. Explicit MPTCP enable/use still fails (multipath needs path
 semantics the single-link wire does not have); explicitly disabling MPTCP is accepted because the base
-model is ordinary TCP. Arbitrary DNS resolution, service-name ports, UDP (`PacketConn`), Unix sockets, and `net.Interfaces` (landed: synthetic `lo` + `eth0`) have explicit boundaries: `"localhost"` resolves deterministically to loopback (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `LookupHost`, `LookupIP`, `LookupNetIP`, and `ResolveTCPAddr`, while arbitrary DNS names and
+model is ordinary TCP. Arbitrary DNS resolution, service-name ports, multicast/OOB UDP, Unix sockets, and `net.Interfaces` (landed: synthetic `lo` + `eth0`) have explicit boundaries: `"localhost"` resolves deterministically to loopback (`127.0.0.1` / `::1`) across `Dial`, `Listen`, `ListenPacket`, `LookupHost`, `LookupIP`, `LookupNetIP`, `ResolveTCPAddr`, and `ResolveUDPAddr`, while arbitrary DNS names and
 service-name port lookups fail under DST rather than touching the host resolver, and literal-IP,
 numeric-port, and pre-I/O validation fast paths keep their normal no-I/O behavior. Unsupported networks
-at the intercepted `Dial`/`Listen` seam fail under DST rather than being modeled as TCP-like streams or
-falling through to the real OS: a known-but-unmodeled network (UDP, Unix, IP) carries the same
+at the intercepted `Dial`/`Listen`/`ListenPacket` seams fail under DST rather than being modeled as TCP-like streams or
+falling through to the real OS: a known-but-unmodeled network (Unix, IP) carries the same
 "unsupported under deterministic simulation" shape as the typed-API gates, while a genuinely unknown
 network string keeps `UnknownNetworkError` identity. `net.FileConn`/`FileListener`/`FilePacketConn`
-are likewise rejected fast under a run — an inherited fd is a host socket, the one
+and `(*UDPConn).File` are likewise rejected fast under a run — an inherited or duplicated fd is a host socket, the one
 conn/listener-producing surface the typed gates did not cover. FIPS/Boring-style configs are out of
 scope as elsewhere.
 
@@ -1288,9 +1333,11 @@ each simulation run maintains two additional observation-neutral, off-heap (`sys
      `ResetLinkConns`, `ResetProcessConns`, `FailDisk`, `HealDisk`, `FailWriteback`, `HealWriteback`, `FailFile`,
      `HealFile`, `LimitDisk`, `UnlimitDisk`, `SlowDisk`, `UnslowDisk`, `CorruptFile` (when a durable
      4 KiB block bit flips), `StepClock`, and `DriftClock`.
-   - *TCP lifecycle & fault transitions (`net`):* `Listen`, `Listener.Close`, `Dial` established /
-     refused / timed out, and established-socket retransmission-horizon `ETIMEDOUT`, keepalive
-     `ETIMEDOUT`, and `RST` delivery.
+   - *TCP & UDP lifecycle & fault transitions (`net`):* TCP `Listen`, `Listener.Close`, `Dial` established /
+     refused / timed out, established-socket retransmission-horizon `ETIMEDOUT`, keepalive
+     `ETIMEDOUT`, and `RST` delivery; UDP `Bind`, `Close`, connected-socket `ECONNREFUSED` delivery,
+     and deduplicated per-`(srcHost, dstHost, reason)` / per-socket faulted datagram drop summaries
+     (`partition`, `packet-loss`, `recv-buffer-full`).
    - *Filesystem fault hits (`os`):* `EIO` returned on read/write/sync, `fsyncgate` dirty-page
      writeback drop, and `ENOSPC` short-write or refusal.
 2. **Activated `Sometimes` fault-site table (`256` distinct site slots + overflow counter) (enforced):** Records
@@ -1658,10 +1705,10 @@ keeping hot simulation state in-record where needed:
   in `runtime/dst.go`), keeping both block entry counts and `finptrmask`/`cleanupBlockPtrMask`
   untouched.
 - Outside `runtime`, `os.file`'s simulated backing and virtual-fd map, `os`'s unexported `root`'s
-  DST root pointer, and `testing.chattyPrinter`'s host-stream fd live out of line (`dstStateTable`
-  in `os/dst_filestate.go`, `dstChattyEntries` in `testing/dst_hostio.go`), so user-importable
+  DST root pointer, `net.netFD`'s simulated UDP socket state, and `testing.chattyPrinter`'s host-stream fd live out of line (`dstStateTable`
+  in `os/dst_filestate.go` and `net/dst_udp.go`, `dstChattyEntries` in `testing/dst_hostio.go`), so user-importable
   packages carry zero fork-added struct fields in either build mode. Each `dstStateTable` row
-  carries a weak backref to its object and is reclaimed at run teardown (`dstFSRunTeardown`, host
+  carries a weak backref to its object and is reclaimed at run teardown (`dstFSRunTeardown` / `dstNetRunTeardown`, host
   context after bubble exit) once its object is collected, while `runtime.KeepAlive` pins the object
   across every derived-index window.
 - In `cmd/compile/internal/types2` and `go/types`, `(*Checker).isComplete` guards its `Named.fromRHS`
@@ -1743,7 +1790,7 @@ authoritative statement of its leg, and the command in the Taskfile is its defin
   `DST_DIVERSITY_SEEDS=<n>` widens it. Recorded coverage bounds live in the package's doc.go.
 - **`test:conformance`** (`go test -tags dst -count=1 -timeout 30m testing/simulation/conformance`,
   Linux): the differential host-vs-sim conformance harness — seeded op-grammar sequences over the
-  modeled pipe, TCP, filesystem, and `os.Root` surfaces, executed against real Linux primitives outside a run
+  modeled pipe, TCP, UDP, filesystem, and `os.Root` surfaces, executed against real Linux primitives outside a run
   (build-mode inertness) and inside `simulation.Run`, with normalized outcomes diffed. Its
   allowlist is machine-checked spec: every entry is one divergence THIS document records as
   deliberate, with a citation; an unallowlisted divergence fails the leg with the op sequence as
@@ -1979,7 +2026,7 @@ Status: ✅ owned by the fork · ⏳ pending feature (see Roadmap) · ⛔ out of
 | `sync.Mutex` starvation-mode switch (wall-timed handoff-order flip at 1ms of waiter wait) | in-bubble the flip is measured on the waiter's own LOST-WAKEUP count, a pure function of the seeded schedule: a bubbled waiter that returns from semacquire without acquiring more than 64 times within one Lock call flips its mutex to starvation mode (`internal/sync` `lockSlow` + `dst_mutex_on.go`; the wall clock stays out of the schedule — its value was a demonstrated same-seed escape — and the fake clock was rejected when this landed because mutex waits were then non-durable (fake time never passed mid-wait, so a fake-clock flip could deterministically never fire, livelocking a starvation-dependent SUT undetectably); mutex waits have since become durable, which removes that impossibility but not the choice: the lost-wakeup count stays the seed-pure trigger, independent of any clock). Sound in both directions: production flips after ANY wait >1ms, and N lost handoffs take >1ms of wall in some real execution, so a flipped in-sim execution is production-producible and an unflipped one is production below the threshold — the flip POINT differs from any given production run (starvation mode engages by contention depth, not elapsed wall), never the reachable behavior set. Liveness restored: a starvation-handoff-dependent SUT terminates in-sim (`TestMutexStarvationHandoffLiveness`); the wall clock stays out (`TestMutexStarvationHandoffDeterministic`); the count is same-seed stable (`TestMutexStarvationHandoffCountDeterministic`); programs whose waiters never cross the threshold are byte-identical to the prior barging-only determinization (the branch reads only waiter-local state). | ✅ |
 | GC (count, finalizer/weak set, memory bound) | STW in-bubble GC + per-bubble relative trigger | ✅ |
 | process identity (pid/ppid/hostname/uid/gid/NumCPU/user) | `os`/`os/user` seams + sim-env | ✅ |
-| network I/O | in-memory deterministic `net` (`Dial`/`Listen`/`Conn`, address registry) | ✅ |
+| network I/O | in-memory deterministic `net` (TCP `Dial`/`Listen`/`Conn` and UDP `ListenPacket`/`ListenUDP`/`DialUDP`/`*UDPConn`, per-host TCP & UDP port registries) | ✅ |
 | filesystem / disk I/O | in-memory deterministic filesystem (os surface, per-bubble tree) | ✅ |
 | pipes (`os.Pipe`) | in-memory deterministic pipe (stream backend behind the `os.File` seam) | ✅ |
 | standard streams (stdio) | `os.Stdin` fenced; ungranted `fd 1`/`fd 2` writes (`os.Stdout`/`os.Stderr`, `syscall.Write`, `Syscall(SYS_WRITE)`) captured off-heap per `(host, proc, pid, fd)` with zero heap/schedule perturbation and emitted only on test/explore failure (`RawSyscall` stays fenced); explicit live host stdio granted via `simulation.InheritFile` (node-scoped to the root body); swap package vars to simulated files for in-run capture; granted capability syscalls dispatch raw (scheduler-invisible, the P held) so a blocked capability write serializes, never reorders — sysmon's syscall retake stays run-gated for foreign goroutines; the testing framework's `-v` stream rides its own framework-stream grant | ✅ |
@@ -2024,8 +2071,8 @@ trees in the *same* bubble, all driven by the one seed. The axes:
   holding a private RNG instance reseeds from a seeded source.
 - **Network / Disk / I/O** — in-memory and deterministic (landed), with sound faults: on the
   reliable TCP base, flow-granular latency (= a fake timer), partition/blackhole, connection reset,
-  throttle (byte-granular drop/reorder/duplicate are a UDP follow-on, not sound on a reliable
-  stream); EIO/ENOSPC/disk latency (landed); torn and lost unsynced writes on host crash (landed:
+  throttle; on the UDP datagram transport, packet-granular loss, duplication, and reorder (`LinkConfig`);
+  EIO/ENOSPC/disk latency (landed); torn and lost unsynced writes on host crash (landed:
   page-granular subset + byte-granular tear, `Options.CrashTear`).
 - **Faults** — net, disk, clock skew/step/drift, process crash+restart, and host crash+reboot axes
   landed; OOM kill and *scheduling* faults (straggler) pending — each anchored to a real degree of
@@ -2176,8 +2223,8 @@ later steps add, never rewrite.
   itself. Determinism rides the scheduler (no new seed plumbing); the registry is keyed by a per-run
   epoch so it resets between runs. The reliable, in-order base for network faults. See the "In-memory
   deterministic network" section above; tested by `TestDSTNet`. Caveat: `net.Conn` with `CloseWrite`/`CloseRead` half-close and `syscall.Conn` sockopts (`TCP_NODELAY=1`, `SO_REUSEADDR`, keepalive) — code type-asserting concrete
-  `*net.TCPConn` does not get one. Arbitrary DNS/service-name ports/UDP/Unix are
-  follow-ons (`net.Interfaces` is landed — the synthetic `lo`+`eth0` set, and `"localhost"` resolves deterministically to loopback); arbitrary DNS and service-name
+  `*net.TCPConn` does not get one (whereas UDP entry points return concrete `*net.UDPConn` with `SO_REUSEADDR`/`SO_REUSEPORT`/`SO_RCVBUF`/`SO_SNDBUF`). Arbitrary DNS/service-name ports/Unix are
+  follow-ons (`net.Interfaces` is landed — the synthetic `lo`+`eth0` set, UDP `ListenPacket`/`ListenUDP`/`DialUDP` is landed, and `"localhost"` resolves deterministically to loopback); arbitrary DNS and service-name
   lookups fail under DST rather than touching host resolver state.
 
 - **Disk (in-memory deterministic filesystem). LANDED (second I/O feature).** Under DST the exported
@@ -2235,10 +2282,6 @@ table); the open work is the OOM and scheduling faults and the declarative orche
     intern registry, like the declared-host query hook (`"localhost"` already resolves
     deterministically to loopback). Until it lands, arbitrary DNS-by-name stays fenced;
     its error identities (NXDOMAIN shape, resolver API scope) are the increment's design work.
-  - **UDP / `PacketConn`.** The datagram transport, which is also what unlocks the packet-granular
-    fault axis (drop/reorder/duplicate — degrees of freedom a reliable in-order stream does not
-    have; see the network-faults collapse-check in faults.md). Reuses the Host/Process victim
-    contract and the fault table unchanged (DST-FAULT-NONFORECLOSE).
 
 - **Fault orchestration** — compose scheduling, network, disk, clock, OOM, and crash/restart faults under
   one seed, with replay and failure shrinking. Each fault is anchored to a real degree of freedom (sound);

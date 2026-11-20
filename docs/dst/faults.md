@@ -104,8 +104,8 @@ Addressing is per-host (`net/dst.go` — the registry keys are host-scoped; land
 
 - **Loopback is host-private** — `127.0.0.1`/`localhost` resolve within the *dialing process's host*, so
   `p1` on `h1` dialing `localhost:80` reaches a listener on `h1`, never `h2`.
-- **Port space is per-host** — two processes on `h1` cannot both bind `:80` (`EADDRINUSE`); the same port
-  on `h2` is independent. The registry keys by `(hostId, addr)`.
+- **Port space is per-host and per-protocol** — two TCP processes on `h1` cannot both bind `:80` (`EADDRINUSE`); the same port
+  on `h2` is independent, and each host's UDP port space (`net/dst_udp.go`) is completely independent of its TCP port space (`:53/udp` and `:53/tcp` coexist on `h1`, and UDP sockets opt into multi-socket port sharing via `SO_REUSEPORT` before bind). The registries key by `(hostId, addr)`.
 - **Each host has a routable IP** — deterministically assigned (`10.0.0.<id>`, like ephemeral ports)
   and queried by `simulation.HostIP(name)`; there is no per-host IP configuration knob (the
   assignment-only contract: a configured IP would have to validate against the deterministic scheme
@@ -387,7 +387,7 @@ API compiles to per-host-pair / per-process fault records over the full mesh —
 
 - `IsolateHost("h3")` / `UnisolateHost("h3")` — cut / restore a host from all others.
 - `Partition("h1", "h2")` / `PartitionRefuse("h1", "h2")` / `PartitionOneWay("h1", "h2")` / `HealLink("h1", "h2")` — cut / heal a host-pair link; future L4 sugar `Partition({"h1","h2"}, {"h3"})`, `Partition(Zone("dc-a"), Zone("dc-b"))` splits groups over the host `zone` label.
-- `ConfigureLink("h1", "h2", cfg)` / `ConfigureLinkOneWay("h1", "h2", cfg)` / `UnconfigureLink("h1", "h2")` — symmetric or directional per-link `LinkConfig{Latency, Jitter, Bandwidth}` policy overriding `Options.Network.CrossHost` defaults.
+- `ConfigureLink("h1", "h2", cfg)` / `ConfigureLinkOneWay("h1", "h2", cfg)` / `UnconfigureLink("h1", "h2")` — symmetric or directional per-link `LinkConfig{Latency, Jitter, Bandwidth, PacketLoss, PacketDuplicate, PacketReorder}` policy overriding `Options.Network.CrossHost` defaults.
 - `ResetLinkConns("h1", "h2")` / `ResetProcessConns("h1", "p2")` — inject TCP `RST` on a link's or `(host, process)`'s open connections.
 - `CrashProcess("h1", "p2")` / `CrashHost("h1")` / `OOM("h1", "p2", budget)` / `Straggle("h1", "p2")` / `StepClock("h1", delta)` / `DriftClock("h1", ppb)`.
 - `Sometimes("site-name", prob)` — deterministic inline SUT fault-point activation (an inline query rather than an external victim-mutator; see `Inline fault-point activation` below).
@@ -646,15 +646,30 @@ reliable, in-order TCP base** — i.e. **flow/connection-granular**, never byte/
   overtake an already-transmitting throttled segment's serialization horizon (`TestDSTNetLinkConfigMidStreamFIFOUnthrottleAndFINHorizon`).
   Shared-link contention (one budget across all flows between a host-pair) remains a future refinement;
   this is per-flow (each direction an independent B-capacity link, so executions stay ⊆ real).
+- **Datagram packet loss, duplication, & reorder (`LinkConfig.PacketLoss` / `PacketDuplicate` / `PacketReorder`)** —
+  **landed** (`net/dst_udp.go`). Packet-granular network faults apply **exclusively** to cross-host UDP datagrams,
+  leaving TCP streams strictly FIFO and lossless (`DST-NET-FIFO`, `DST-FAULT-SOUND`):
+  - `PacketLoss` (`[0, 1]`, `NaN` or out-of-range panics state-neutrally): each cross-host datagram independently
+    drops with probability `PacketLoss` drawn from `dstFaultRand` (`0` and `1` draw nothing, preserving RNG stream
+    isolation when inactive).
+  - `PacketDuplicate` (`[0, 1]`, `NaN` or out-of-range panics state-neutrally): each non-dropped cross-host datagram
+    independently emits a second copy with probability `PacketDuplicate` drawn from `dstFaultRand` (`0` and `1` draw
+    nothing), with the duplicate drawing its own independent jitter.
+  - `PacketReorder` (`bool`): when `false` (default), cross-host UDP `deliverAt` timestamps are clamped monotonically
+    per sender-to-target flow so jitter varies inter-arrival spacing without reordering; when `true`, `deliverAt` is
+    unclamped so smaller-jitter datagrams (or datagrams sent after a dynamic latency reduction) overtake earlier
+    in-flight datagrams in the target host's delivery min-heap.
+  - Cross-host `Partition`, `PartitionOneWay`, `IsolateHost`, and `CrashHost` mature already-arrived datagrams
+    (`deliverAt <= now`) into the receiver's bounded `SO_RCVBUF` queue and permanently drop datagrams caught mid-flight
+    (`deliverAt > now`), while non-blackhole `PartitionRefuse` (and unbound ports on live declared hosts) pend a
+    transient one-shot `ECONNREFUSED` on connected UDP sockets.
 
-Collapse-check (net axis): **not finer** — each fault is a real TCP-flow event; crucially **no
-drop/reorder/duplicate of bytes on a live stream** (those are not real degrees of freedom of a reliable
-in-order transport — injecting them would make executions ⊄ real, the false positive the Soundness
-invariant forbids). **Not coarser** — hooks the registry+conn seam that already mediates every simulated
-`Dial`/`Listen`/`Read`/`Write`. **Not foreclosing** — packet-granular drop/reorder/duplicate are degrees
-of freedom of a **datagram** transport and land with the **UDP/`PacketConn` follow-on** (already a named
-net increment), keyed by the *same* node victim contract and fault table; building the TCP-flow faults
-now reserves nothing they need.
+Collapse-check (net axis): **not finer** — each fault is a real protocol-faithful event: TCP faults stay flow-granular
+(**no drop/reorder/duplicate of bytes on a live TCP stream**, preserving `DST-NET-FIFO` and `DST-FAULT-SOUND`), while
+packet-granular drop/reorder/duplicate act only on UDP datagrams (`net/dst_udp.go`), where loss, duplication, and
+out-of-order delivery are real IP/UDP degrees of freedom. **Not coarser** — hooks the TCP and UDP registry+socket seams
+that mediate every simulated `Dial`/`Listen`/`ListenPacket`/`Read`/`Write`. **Not foreclosing** — shares the exact same
+`Host`/`Process` victim contract and `LinkConfig` policy table (`DST-FAULT-NONFORECLOSE`).
 
 ### Disk faults
 
@@ -1443,5 +1458,4 @@ adversarial loop.
   exploration (`Options.FaultPolicy`) as the `Explore`/`Failure` fault dimension; `Replay` of a fault set;
   failure shrinking.
 
-The UDP/`PacketConn` net increment (which unlocks packet-granular drop/reorder/duplicate) stays a
-net-feature follow-on, not a fault chunk; when it lands, its packet faults reuse this contract.
+The UDP/`PacketConn` net increment and its packet-granular drop/reorder/duplicate `LinkConfig` policies are **landed**, reusing this contract verbatim (`DST-FAULT-NONFORECLOSE`).

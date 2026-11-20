@@ -29,6 +29,14 @@ func (c *rawConn) Control(f func(uintptr)) error {
 	if !c.ok() {
 		return syscall.EINVAL
 	}
+	if dstNetEnabled {
+		if handled, err := dstFDRawControl(c.fd, f); handled {
+			if err != nil {
+				err = &OpError{Op: "raw-control", Net: c.fd.net, Source: nil, Addr: c.fd.laddr, Err: err}
+			}
+			return err
+		}
+	}
 	err := c.fd.pfd.RawControl(f)
 	runtime.KeepAlive(c.fd)
 	if err != nil {
@@ -41,6 +49,14 @@ func (c *rawConn) Read(f func(uintptr) bool) error {
 	if !c.ok() {
 		return syscall.EINVAL
 	}
+	if dstNetEnabled {
+		if handled, err := dstFDRawRead(c.fd, f); handled {
+			if err != nil {
+				err = &OpError{Op: "raw-read", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+			}
+			return err
+		}
+	}
 	err := c.fd.pfd.RawRead(f)
 	runtime.KeepAlive(c.fd)
 	if err != nil {
@@ -52,6 +68,14 @@ func (c *rawConn) Read(f func(uintptr) bool) error {
 func (c *rawConn) Write(f func(uintptr) bool) error {
 	if !c.ok() {
 		return syscall.EINVAL
+	}
+	if dstNetEnabled {
+		if handled, err := dstFDRawWrite(c.fd, f); handled {
+			if err != nil {
+				err = &OpError{Op: "raw-write", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+			}
+			return err
+		}
 	}
 	err := c.fd.pfd.RawWrite(f)
 	runtime.KeepAlive(c.fd)

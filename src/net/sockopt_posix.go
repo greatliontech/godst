@@ -43,12 +43,22 @@ func interfaceToIPv4Addr(ifi *Interface) (IP, error) {
 }
 
 func setReadBuffer(fd *netFD, bytes int) error {
+	if dstNetEnabled {
+		if handled, err := dstFDSetReadBuffer(fd, bytes); handled {
+			return err
+		}
+	}
 	err := fd.pfd.SetsockoptInt(syscall.SOL_SOCKET, syscall.SO_RCVBUF, bytes)
 	runtime.KeepAlive(fd)
 	return wrapSyscallError("setsockopt", err)
 }
 
 func setWriteBuffer(fd *netFD, bytes int) error {
+	if dstNetEnabled {
+		if handled, err := dstFDSetWriteBuffer(fd, bytes); handled {
+			return err
+		}
+	}
 	err := fd.pfd.SetsockoptInt(syscall.SOL_SOCKET, syscall.SO_SNDBUF, bytes)
 	runtime.KeepAlive(fd)
 	return wrapSyscallError("setsockopt", err)

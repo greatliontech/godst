@@ -6,6 +6,7 @@ package simulation
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"time"
@@ -54,6 +55,10 @@ const (
 	causalFSEIO                uint8 = 50
 	causalFSFsyncgateDrop      uint8 = 51
 	causalFSENOSPC             uint8 = 52
+	causalUDPBind              uint8 = 60
+	causalUDPClose             uint8 = 61
+	causalUDPRefused           uint8 = 62
+	causalUDPDrop              uint8 = 63
 )
 
 // formatRunDiagnostics snapshots and renders the current run's failure-only
@@ -359,9 +364,9 @@ func formatCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, 
 	case causalUnisolateHost:
 		return fmt.Sprintf("UnisolateHost %s", formatCausalHost(hostA))
 	case causalConfigureLink:
-		return fmt.Sprintf("ConfigureLink %s <-> %s (latency=%s jitter=%s bandwidth=%dB/s)", formatCausalHost(hostA), formatCausalHost(hostB), time.Duration(arg0), time.Duration(arg1), arg2)
+		return fmt.Sprintf("ConfigureLink %s <-> %s (%s)", formatCausalHost(hostA), formatCausalHost(hostB), formatLinkConfigDiag(flags, arg0, arg1, arg2, str))
 	case causalConfigureLinkOneWay:
-		return fmt.Sprintf("ConfigureLinkOneWay %s -> %s (latency=%s jitter=%s bandwidth=%dB/s)", formatCausalHost(hostA), formatCausalHost(hostB), time.Duration(arg0), time.Duration(arg1), arg2)
+		return fmt.Sprintf("ConfigureLinkOneWay %s -> %s (%s)", formatCausalHost(hostA), formatCausalHost(hostB), formatLinkConfigDiag(flags, arg0, arg1, arg2, str))
 	case causalUnconfigureLink:
 		return fmt.Sprintf("UnconfigureLink %s <-> %s", formatCausalHost(hostA), formatCausalHost(hostB))
 	case causalResetLinkConns:
@@ -427,7 +432,54 @@ func formatCausalEvent(kind, flags uint8, hostA, hostB, proc uint32, pid int32, 
 			return fmt.Sprintf("FS ENOSPC [%s] op=%s path=%s (written=%d requested=%d)", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen), arg0, arg1)
 		}
 		return fmt.Sprintf("FS ENOSPC [%s] op=%s path=%s", formatDiagNode(hostA, proc, pid), formatFSOpName(flags), formatCausalStr(str, origLen))
+	case causalUDPBind:
+		return fmt.Sprintf("UDP Bind [%s] addr=%s (port=%d)", formatDiagNode(hostA, proc, pid), formatCausalStr(str, origLen), arg0)
+	case causalUDPClose:
+		return fmt.Sprintf("UDP Close [%s] addr=%s (port=%d)", formatDiagNode(hostA, proc, pid), formatCausalStr(str, origLen), arg0)
+	case causalUDPRefused:
+		return fmt.Sprintf("UDP ECONNREFUSED %s:%d <- %s:%d", formatCausalHost(hostA), arg0, formatCausalHost(hostB), arg1)
+	case causalUDPDrop:
+		reason := "unknown"
+		switch flags {
+		case 1:
+			reason = "partition"
+		case 2:
+			reason = "packet-loss"
+		case 3:
+			reason = "recv-buffer-full"
+		}
+		return fmt.Sprintf("UDP datagram dropped %s:%d -> %s:%d (reason=%s)", formatCausalHost(hostA), arg0, formatCausalHost(hostB), arg1, reason)
 	default:
 		return fmt.Sprintf("event#%d", kind)
 	}
+}
+
+func diagUint64LE(s string, off int) uint64 {
+	return uint64(s[off]) |
+		uint64(s[off+1])<<8 |
+		uint64(s[off+2])<<16 |
+		uint64(s[off+3])<<24 |
+		uint64(s[off+4])<<32 |
+		uint64(s[off+5])<<40 |
+		uint64(s[off+6])<<48 |
+		uint64(s[off+7])<<56
+}
+
+func formatLinkConfigDiag(flags uint8, latencyNs, jitterNs, bandwidthBps int64, str string) string {
+	base := fmt.Sprintf("latency=%s jitter=%s bandwidth=%dB/s", time.Duration(latencyNs), time.Duration(jitterNs), bandwidthBps)
+	if flags == 0 {
+		return base
+	}
+	var b strings.Builder
+	b.WriteString(base)
+	if flags&2 != 0 && len(str) >= 8 {
+		fmt.Fprintf(&b, " loss=%g", math.Float64frombits(diagUint64LE(str, 0)))
+	}
+	if flags&4 != 0 && len(str) >= 16 {
+		fmt.Fprintf(&b, " dup=%g", math.Float64frombits(diagUint64LE(str, 8)))
+	}
+	if flags&1 != 0 {
+		b.WriteString(" reorder=true")
+	}
+	return b.String()
 }

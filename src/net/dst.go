@@ -214,6 +214,29 @@ func dstInterfaces() []Interface {
 	}
 }
 
+func dstZoneName(index int) string {
+	switch index {
+	case 1:
+		return "lo"
+	case 2:
+		return "eth0"
+	default:
+		return strconv.Itoa(index)
+	}
+}
+
+func dstZoneIndex(name string) int {
+	switch name {
+	case "lo":
+		return 1
+	case "eth0":
+		return 2
+	default:
+		index, _, _ := dtoi(name)
+		return index
+	}
+}
+
 // dstHostMAC is a host's deterministic locally-administered MAC (02:00 prefix, the
 // host id in the low four octets), so a SUT that reads HardwareAddr replays.
 func dstHostMAC(host uint32) HardwareAddr {
@@ -273,8 +296,16 @@ func dstTCPNetwork(network string) bool {
 	return false
 }
 
-// dstUnsupportedNetwork rejects a network Dial/Listen cannot model. A KNOWN
-// but unmodeled network (UDP, Unix, IP) gets the same "unsupported under
+func dstUDPNetwork(network string) bool {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return true
+	}
+	return false
+}
+
+// dstUnsupportedNetwork rejects a network Dial/Listen/ListenPacket cannot model.
+// A KNOWN but unmodeled network (Unix, IP) gets the same "unsupported under
 // deterministic simulation" shape as the typed APIs — it is a simulation
 // boundary, not an unknown name; a genuinely unknown network string keeps the
 // production UnknownNetworkError identity.
@@ -289,7 +320,7 @@ func dstUnsupportedNetwork(op, network string) error {
 		}
 	}
 	switch base {
-	case "udp", "udp4", "udp6", "unix", "unixgram", "unixpacket", "ip", "ip4", "ip6":
+	case "unix", "unixgram", "unixpacket", "ip", "ip4", "ip6":
 		return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: errors.New("network " + network + " unsupported under deterministic simulation")}
 	}
 	return &OpError{Op: op, Net: network, Source: nil, Addr: nil, Err: UnknownNetworkError(network)}
@@ -1402,6 +1433,9 @@ func (l *dstListener) Addr() Addr { return dstCloneAddr(l.addr) }
 
 // dstListen is net.Listen under DST: register a simulated listener.
 func dstListen(lc *ListenConfig, network, address string) (retL Listener, retErr error) {
+	if dstUDPNetwork(network) {
+		return nil, dstListenStreamOnUDP(network, address)
+	}
 	if !dstTCPNetwork(network) {
 		return nil, dstUnsupportedNetwork("listen", network)
 	}
@@ -1655,6 +1689,9 @@ func dstConnectSYNACK(ctx context.Context, latencyNs, jitterNs int64, e *dstWire
 // dstDial is net.Dial under DST: find the matching listener and hand back the
 // dialer end of a new in-memory connection.
 func dstDial(ctx context.Context, d *Dialer, network, address string) (Conn, error) {
+	if dstUDPNetwork(network) {
+		return dstDialUDPString(ctx, d, network, address)
+	}
 	c, err := dstDialConnect(ctx, d, network, address)
 	if err == nil {
 		dstKernelSectionEnter()
