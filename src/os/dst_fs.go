@@ -110,12 +110,14 @@ func dstOpenFilesRollLocked() {
 	}
 }
 
-func dstRegisterOpenFile(f *file, host, proc uint32) {
+func dstRegisterOpenFile(f *file, host, proc uint32) uint64 {
 	dstOpenFiles.mu.Lock()
 	dstOpenFilesRollLocked()
 	dstOpenFiles.seq++
-	dstOpenFiles.files[f] = dstOpenFileEntry{host: host, proc: proc, seq: dstOpenFiles.seq}
+	seq := dstOpenFiles.seq
+	dstOpenFiles.files[f] = dstOpenFileEntry{host: host, proc: proc, seq: seq}
 	dstOpenFiles.mu.Unlock()
+	return seq
 }
 
 func dstUnregisterOpenFile(f *file) {
@@ -648,9 +650,11 @@ type dstFSNode struct {
 	syncedMode    FileMode
 	syncedModTime time.Time
 
-	// Advisory flock state. This is host file-node state, not durable file
-	// content; fd and process ownership live in the lock owner key.
+	// Advisory lock state (BSD flock and Linux open-file-description byte-range
+	// locks). Both are host file-node state, not durable file content, and the
+	// two families do not conflict with each other.
 	flock dstFlockState
+	ofd   dstOFDState
 
 	// Scoped per-node race-detector synchronization word: dataSync orders
 	// writes/truncates before reads of this node's file data without forging
@@ -666,6 +670,20 @@ type dstFlockOwner struct {
 
 type dstFlockState struct {
 	holders  map[dstFlockOwner]bool // true means exclusive, false means shared
+	wait     chan struct{}
+	raceSync uint64
+}
+
+type dstOFDLock struct {
+	owner     *dstFile
+	ownerSeq  uint64 // deterministic open-order stamp for F_OFD_GETLK conflict scans
+	start     int64  // inclusive byte offset (>= 0)
+	end       int64  // inclusive byte offset (>= start, <= 1<<63 - 1)
+	exclusive bool   // true = F_WRLCK, false = F_RDLCK
+}
+
+type dstOFDState struct {
+	locks    []dstOFDLock // sorted by (ownerSeq, start); non-overlapping per owner
 	wait     chan struct{}
 	raceSync uint64
 }
@@ -1602,12 +1620,17 @@ type dstFile struct {
 	// dereferenced them. The virtual-fd front door has the same gate
 	// (dstFDLookup's epoch check answers EBADF).
 	epoch uint64
-	// flockPending is a flock this description still holds after its
-	// descriptor closed: Linux releases a BSD flock with the open file
-	// description's last reference, and a shared mapping taken through
-	// the description is one, so the close defers the release to the last
-	// unmap (dstFlockReleaseFD, dstMMapReleaseFile). Atomic: set and taken
-	// under the mapping registry's lock, never under this handle's mu.
+	// openSeq is this description's per-run creation counter (dstOpenFiles.seq),
+	// ordering F_OFD_GETLK conflict scans deterministically without pointer-map
+	// iteration.
+	openSeq uint64
+	// flockPending records advisory locks (BSD flock and/or OFD byte-range
+	// locks) this description still holds after its descriptor closed: Linux
+	// releases both families with the open file description's last reference,
+	// and a shared mapping taken through the description is one, so the close
+	// defers the release to the last unmap (dstFlockReleaseFD,
+	// dstMMapReleaseFile). Atomic: set and taken under the mapping registry's
+	// lock, never under this handle's mu.
 	flockPending atomic.Pointer[dstFlockPending]
 }
 
@@ -1773,7 +1796,10 @@ func dstNewFile(d dstFileBackend, name string) *File {
 	f := &File{&file{name: name}}
 	dstSetFileBackend(f.file, d)
 	host, proc := dstFSCurrentNode()
-	dstRegisterOpenFile(f.file, host, proc)
+	seq := dstRegisterOpenFile(f.file, host, proc)
+	if b, ok := d.(*dstFile); ok {
+		b.openSeq = seq
+	}
 	return f
 }
 

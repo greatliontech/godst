@@ -67,7 +67,7 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			dstFS.mu.Lock()
 			if op == syscall.LOCK_UN {
 				dstMMapRegistry.mu.Lock()
-				file.flockPending.Store(nil)
+				dstStorePendingLocksLocked(file, node, true, dstFlockOwner{}, false, false, false)
 				dstMMapRegistry.mu.Unlock()
 				node.flock.unlockNode(node, owner)
 				dstFS.mu.Unlock()
@@ -79,9 +79,9 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 				dstMMapRollLocked()
 				if dstMMapLiveThroughLocked(file) > 0 {
 					node.flock.lock(owner, exclusive)
-					file.flockPending.Store(&dstFlockPending{node: node, owner: owner})
+					dstStorePendingLocksLocked(file, node, true, owner, true, false, false)
 				} else {
-					file.flockPending.Store(nil)
+					dstStorePendingLocksLocked(file, node, true, dstFlockOwner{}, false, false, false)
 				}
 				dstMMapRegistry.mu.Unlock()
 				dstKernelRaceAcquire(unsafe.Pointer(&node.flock.raceSync))
@@ -90,7 +90,7 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			}
 			if _, stillHeld := node.flock.holders[owner]; !stillHeld {
 				dstMMapRegistry.mu.Lock()
-				file.flockPending.Store(nil)
+				dstStorePendingLocksLocked(file, node, true, dstFlockOwner{}, false, false, false)
 				dstMMapRegistry.mu.Unlock()
 			}
 			if nonblock {
@@ -100,6 +100,10 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 			wait := node.flock.waiter()
 			dstFS.mu.Unlock()
 			<-wait
+			if dstFSActive() {
+				dstCoarseDep(uintptr(unsafe.Pointer(file)), false)
+				dstCoarseRecord(uintptr(unsafe.Pointer(node)), true)
+			}
 			continue
 		}
 		if op == syscall.LOCK_UN {
@@ -127,6 +131,10 @@ func dstFDFlock(fd int, how int) (syscall.Errno, bool) {
 		wait := node.flock.waiter()
 		file.leave()
 		<-wait
+		if dstFSActive() {
+			dstCoarseDep(uintptr(unsafe.Pointer(file)), false)
+			dstCoarseRecord(uintptr(unsafe.Pointer(node)), true)
+		}
 	}
 }
 
@@ -139,12 +147,43 @@ func (d *dstFile) flockClosedInRun() bool {
 	return dstFSActive() && d.closed && d.epoch == dstFSEpoch()
 }
 
-// dstFlockPending is a flock whose descriptor closed while shared
-// mappings taken through the description were still live: the owner
-// and the node the lock is held on, released at the last unmap.
+// dstFlockPending records advisory locks (BSD flock and/or OFD byte-range
+// locks) whose descriptor closed while shared mappings taken through the
+// description were still live, released at the last unmap.
 type dstFlockPending struct {
-	node  *dstFSNode
-	owner dstFlockOwner
+	node     *dstFSNode
+	file     *dstFile
+	owner    dstFlockOwner
+	hasFlock bool
+	hasOFD   bool
+}
+
+// dstStorePendingLocksLocked updates file.flockPending while preserving the
+// sibling lock family's pending state. Caller holds dstFS.mu and
+// dstMMapRegistry.mu.
+func dstStorePendingLocksLocked(file *dstFile, node *dstFSNode, setFlock bool, owner dstFlockOwner, hasFlock bool, setOFD bool, hasOFD bool) {
+	var next dstFlockPending
+	if prev := file.flockPending.Load(); prev != nil {
+		next = *prev
+	}
+	next.node = node
+	next.file = file
+	if setFlock {
+		next.hasFlock = hasFlock
+		if hasFlock {
+			next.owner = owner
+		} else {
+			next.owner = dstFlockOwner{}
+		}
+	}
+	if setOFD {
+		next.hasOFD = hasOFD
+	}
+	if !next.hasFlock && !next.hasOFD {
+		file.flockPending.Store(nil)
+		return
+	}
+	file.flockPending.Store(&next)
 }
 
 func dstFlockReleaseFD(entry dstFDEntry, fd int) {
@@ -153,13 +192,13 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 		return
 	}
 	owner := dstFlockOwner{host: entry.host, proc: entry.proc, fd: fd}
-	// Linux releases a flock with the open file description's LAST
-	// reference, and every shared mapping taken through the description
-	// holds one: a close under live mappings keeps the lock until the last
-	// of them is unmapped (an exiting process drops both). Acquire dstFS.mu
-	// before dstMMapRegistry.mu (the canonical lock order shared with
-	// dstFDMmap and dstMunmapLocked) so an unmap racing this close cannot
-	// deadlock or slip between the live-mapping count and flockPending.
+	// Linux releases both BSD flocks and OFD byte-range locks with the open
+	// file description's LAST reference, and every shared mapping taken through
+	// the description holds one: a close under live mappings keeps the locks
+	// until the last of them is unmapped (an exiting process drops both).
+	// Acquire dstFS.mu before dstMMapRegistry.mu (the canonical lock order
+	// shared with dstFDMmap and dstMunmapLocked) so an unmap racing this close
+	// cannot deadlock or slip between the live-mapping count and flockPending.
 	file.mu.Lock()
 	node := file.node
 	epochOk := dstFSActive() && file.epoch == dstFSEpoch()
@@ -168,12 +207,12 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 		return
 	}
 	dstFS.mu.Lock()
-	_, held := node.flock.holders[owner]
-	if held {
+	_, heldFlock := node.flock.holders[owner]
+	if heldFlock {
 		dstMMapRegistry.mu.Lock()
 		dstMMapRollLocked()
 		if dstMMapLiveThroughLocked(file) > 0 {
-			file.flockPending.Store(&dstFlockPending{node: node, owner: owner})
+			dstStorePendingLocksLocked(file, node, true, owner, true, false, false)
 			dstMMapRegistry.mu.Unlock()
 			dstFS.mu.Unlock()
 			return
@@ -181,7 +220,7 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 		dstMMapRegistry.mu.Unlock()
 	}
 	dstFS.mu.Unlock()
-	if !held {
+	if !heldFlock {
 		return
 	}
 	dstCoarseDep(uintptr(unsafe.Pointer(node)), true)
@@ -190,15 +229,20 @@ func dstFlockReleaseFD(entry dstFDEntry, fd int) {
 	dstFS.mu.Unlock()
 }
 
-// dstFlockReleasePending releases the flock a closed descriptor left on
-// its description once the description's last mapping is gone.
+// dstFlockReleasePending releases the advisory locks a closed descriptor left
+// on its description once the description's last mapping is gone.
 func dstFlockReleasePending(p *dstFlockPending) {
-	if p == nil || p.node == nil {
+	if p == nil || p.node == nil || (!p.hasFlock && !p.hasOFD) {
 		return
 	}
 	dstCoarseDep(uintptr(unsafe.Pointer(p.node)), true)
 	dstFS.mu.Lock()
-	p.node.flock.unlockNode(p.node, p.owner)
+	if p.hasFlock {
+		p.node.flock.unlockNode(p.node, p.owner)
+	}
+	if p.hasOFD {
+		p.node.ofd.unlockOwner(p.node, p.file)
+	}
 	dstFS.mu.Unlock()
 }
 

@@ -972,7 +972,7 @@ host descriptor, and the raw-syscall fence still catches host-resource minting a
 syscalls before they can reach the host. The **raw boundary dispatches a settled subset**: a SUT that
 reaches the kernel through `golang.org/x/sys/unix` (whose asm enters `syscall.Syscall`/`Syscall6`
 directly, never the named wrappers) gets the same modeled behavior for the file barriers (`fsync`,
-`fdatasync`), advisory locking (`flock`), descriptor `close`, filesystem metadata (`statfs`,
+`fdatasync`), advisory locking (`flock` and open-file-description `fcntl` `F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`), descriptor `close`, filesystem metadata (`statfs`,
 `fstatfs` — reporting `EXT4_SUPER_MAGIC` `0xef53` with 4096-byte blocks, per-host `f_fsid`, and
 `f_blocks`/`f_bfree`/`f_bavail` reflecting `LimitDisk` when capped, or `PROC_SUPER_MAGIC` `0x9fa0` on
 modeled `/proc` leaves), the mapping operations (`madvise`, `mprotect`, `munmap`), `renameat2`, and
@@ -1063,8 +1063,28 @@ compatible. Lock **conversions** follow Linux's remove-then-try semantics (`fs/l
 existing lock of the other type is dropped before the conflict scan, so a successful conversion is atomic
 and a FAILED nonblocking conversion has lost the old lock — `EWOULDBLOCK` leaves the caller holding
 nothing (retaining it would keep executions no real kernel produces). Exit- and crash-time release are
-part of process resource teardown in the fault contract. Other file-lock
-front doors remain fenced until they have a split-safe virtual-fd dispatch.
+part of process resource teardown in the fault contract.
+
+Linux virtual fds also support open-file-description (OFD) byte-range advisory locks via `fcntl`
+(`F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW` — through both `syscall.FcntlFlock` and
+`golang.org/x/sys/unix.FcntlFlock`, which share `SYS_FCNTL` on 64-bit Linux and `SYS_FCNTL64` on 32-bit
+Linux) on regular tree files, directories, and `/dev/null`. Following Linux's `fs/locks.c`: `l_pid` must
+be `0` (`EINVAL` otherwise); `F_OFD_SETLK`/`F_OFD_SETLKW` require a readable description for `F_RDLCK`
+and a writable description for `F_WRLCK` (`EBADF` otherwise; `F_UNLCK` and `F_OFD_GETLK` require neither);
+byte ranges resolve `SEEK_SET`/`SEEK_CUR`/`SEEK_END` with kernel `EINVAL`/`EOVERFLOW` bounds, `l_len == 0`
+covering `[start, ∞)` and `l_len < 0` covering `[start+l_len, start)`. Locks are owned by the open file
+description (`*dstFile`) and live in an independent table from BSD `flock` (the two lock families never
+conflict). Locks held by the same description never conflict with themselves — overlapping requests split,
+convert, coalesce adjacent equal-type ranges, or unlock atomically — while conflicting locks held by any
+other description (even within the same process via a separate `OpenFile`) answer `EAGAIN` (`F_OFD_SETLK`),
+wait without deadlock detection (`F_OFD_SETLKW`, retaining any existing lock held by the caller across a
+failed or blocked conversion, unlike BSD `flock`), or report the first conflicting range with `l_whence =
+SEEK_SET` and `l_pid = -1` (`F_OFD_GETLK`, with `l_type = F_UNLCK` querying locks held by the *same*
+description per Linux `>= 6.6` `posix_test_locks_conflict`, and setting `l_type = F_UNLCK` preserving other
+fields when no range matches).
+Like BSD `flock`, OFD locks release when the open file description drops its last reference (`close`, last
+`MAP_SHARED` `munmap`, process exit/crash, or host crash). Process-scoped POSIX `F_GETLK`/`F_SETLK`/
+`F_SETLKW` and all other `fcntl` commands remain fenced.
 
 Linux virtual fds support shared file mappings for database page readers and lock-file coordination.
 **A regular file's bytes are its page cache**: a memfd the harness owns (no simulated descriptor ever
@@ -1496,7 +1516,7 @@ targets a regular file would refuse `EINVAL`; truncate (by handle or name) and `
 `EINVAL`; `Stat` reports `ModeDevice|ModeCharDevice|0666`, size 0, an mtime writes never move, and
 one inode for every name and handle; the raw virtual-fd fstat carries `S_IFCHR` with the fixed
 `(1, 3)` st_rdev; mmap is `ENODEV`; deadlines keep the non-pollable `ErrNoDeadline` shape; flock
-works; `O_TRUNC` on open is ignored as the kernel ignores it for non-regular files. The device
+and OFD locks work; `O_TRUNC` on open is ignored as the kernel ignores it for non-regular files. The device
 stores nothing and is not on the disk: disk faults (EIO, capacity, latency) never apply to device
 I/O, and the device is part of the mkfs durable image, so a host crash reboots with it intact.
 Removing it is an ordinary namespace operation — a subsequent `O_CREAT` mints a plain regular file
@@ -1560,7 +1580,7 @@ build probes across all five). Untagged builds remain valid upstream ports every
   request can prove read-only, non-minting behavior for an arbitrary inherited handle. Terminal
   probing therefore requires a modeled terminal capability rather than host passthrough. The reserved virtual-fd number range never reaches
   the host from this raw boundary: `Syscall`/`Syscall6` DISPATCH the settled subset (`fsync`,
-  `fdatasync`, `flock`, `close`, `statfs`, `fstatfs`, `madvise`, `mprotect`, `munmap`, `renameat2`,
+  `fdatasync`, `flock`, `fcntl` `F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`, `close`, `statfs`, `fstatfs`, `madvise`, `mprotect`, `munmap`, `renameat2`,
   `fallocate`, `futex`, and virtual-socket `setsockopt`/`getsockopt` — the surface `golang.org/x/sys/unix`
   reaches, since its asm enters these trampolines rather than the named wrappers), and every other
   in-range number or operation is refused outright, issued or not. `RawSyscall`/`RawSyscall6` refuse the

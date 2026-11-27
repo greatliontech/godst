@@ -55,6 +55,9 @@ func dstSetFdatasyncHook(func(fd int) (err syscall.Errno, handled bool))
 //go:linkname dstSetFlockHook syscall.dstSetFlockHook
 func dstSetFlockHook(func(fd int, how int) (err syscall.Errno, handled bool))
 
+//go:linkname dstSetOFDFlockHook syscall.dstSetOFDFlockHook
+func dstSetOFDFlockHook(func(fd int, cmd int, lk *syscall.Flock_t) (err syscall.Errno, handled bool))
+
 //go:linkname dstSetRenameat2Hook syscall.dstSetRenameat2Hook
 func dstSetRenameat2Hook(func(oldpath, newpath string, flags int) (err syscall.Errno, handled bool))
 
@@ -77,6 +80,7 @@ func init() {
 	dstSetFsyncHook(dstFDFsync)
 	dstSetFdatasyncHook(dstFDFdatasync)
 	dstSetFlockHook(dstFDFlock)
+	dstSetOFDFlockHook(dstFDOFDFlock)
 	dstSetRenameat2Hook(dstRenameat2)
 	dstSetFallocateHook(dstFDFallocate)
 	dstSetFutexHook(dstFutexOp)
@@ -266,6 +270,9 @@ func dstFDHasFlockForProc(proc uint32) bool {
 		if node != nil {
 			dstFS.mu.Lock()
 			_, held := node.flock.holders[owner]
+			if !held {
+				held = node.ofd.hasOwner(file)
+			}
 			dstFS.mu.Unlock()
 			if held {
 				return true
@@ -298,6 +305,7 @@ func dstReleaseFDs(match func(dstFDEntry) bool) {
 
 func dstDropClosedNode(backend dstFileBackend) {
 	if file, ok := backend.(*dstFile); ok {
+		dstOFDReleaseClosedFile(file)
 		file.dropClosedNode()
 	}
 }

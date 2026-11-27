@@ -23,15 +23,20 @@ const dstVirtualSockFDCount = 1 << 20
 
 type dstStatfsHook func(path string, buf *Statfs_t) (err Errno, handled bool)
 type dstFstatfsHook func(fd int, buf *Statfs_t) (err Errno, handled bool)
+type dstOFDFlockHook func(fd int, cmd int, lk *Flock_t) (err Errno, handled bool)
 
 var dstStatfsHookFn dstStatfsHook
 var dstFstatfsHookFn dstFstatfsHook
+var dstOFDFlockHookFn dstOFDFlockHook
 
 //go:linkname dstSetStatfsHook
 func dstSetStatfsHook(fn dstStatfsHook) { dstStatfsHookFn = fn }
 
 //go:linkname dstSetFstatfsHook
 func dstSetFstatfsHook(fn dstFstatfsHook) { dstFstatfsHookFn = fn }
+
+//go:linkname dstSetOFDFlockHook
+func dstSetOFDFlockHook(fn dstOFDFlockHook) { dstOFDFlockHookFn = fn }
 
 func dstTryStatfs(path string, buf *Statfs_t) (err Errno, handled bool) {
 	if !dstHookActive() || dstStatfsHookFn == nil {
@@ -45,6 +50,13 @@ func dstTryFstatfs(fd int, buf *Statfs_t) (err Errno, handled bool) {
 		return 0, false
 	}
 	return dstFstatfsHookFn(fd, buf)
+}
+
+func dstTryOFDFlock(fd int, cmd int, lk *Flock_t) (err Errno, handled bool) {
+	if !dstHookActive() || dstOFDFlockHookFn == nil {
+		return 0, false
+	}
+	return dstOFDFlockHookFn(fd, cmd, lk)
 }
 
 // dstSyscallHostClose reports whether a bubble goroutine is closing a real

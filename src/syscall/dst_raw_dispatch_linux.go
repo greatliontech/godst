@@ -135,6 +135,24 @@ func dstRawDispatch(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1 uintptr, err Errno
 		}
 		return dstRawFstatfs(int(a1), buf)
 	}
+	if trap == fcntl64Syscall {
+		// fcntl(fd, F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW, *Flock_t) — the
+		// open-file-description byte-range advisory locks both syscall.FcntlFlock
+		// and golang.org/x/sys/unix.FcntlFlock dispatch through fcntl64Syscall
+		// (SYS_FCNTL on 64-bit Linux, SYS_FCNTL64 on 32-bit Linux). Every other
+		// fcntl command (including process-scoped F_GETLK/F_SETLK/F_SETLKW and
+		// fd-minting F_DUPFD*) and any non-virtual fd fall through to the fence.
+		cmd := int(a2)
+		if (cmd != dstFcntlOFDGetlk && cmd != dstFcntlOFDSetlk && cmd != dstFcntlOFDSetlkw) ||
+			a1 < dstVirtualFDBase || a1 >= dstVirtualFDBase+dstVirtualFDCount {
+			return 0, 0, false
+		}
+		var lk *Flock_t
+		if a3 != 0 {
+			lk = (*Flock_t)(unsafe.Pointer(a3))
+		}
+		return dstRawOFDFlock(int(a1), cmd, lk)
+	}
 	switch trap {
 	case SYS_WRITE:
 		// Ungranted bubble writes to standard output/error (fd 1/2) route to
@@ -332,6 +350,21 @@ func dstRawFstatfs(fd int, buf *Statfs_t) (r1 uintptr, err Errno, handled bool) 
 		return 0, e, true
 	}
 	dstSyscallRefuse(dstSysFstatfs)
+	return 0, 0, true
+}
+
+const (
+	dstFcntlOFDGetlk  = 36
+	dstFcntlOFDSetlk  = 37
+	dstFcntlOFDSetlkw = 38
+)
+
+//go:noinline
+func dstRawOFDFlock(fd int, cmd int, lk *Flock_t) (r1 uintptr, err Errno, handled bool) {
+	if e, ok := dstTryOFDFlock(fd, cmd, lk); ok {
+		return 0, e, true
+	}
+	dstSyscallRefuse(fcntl64Syscall)
 	return 0, 0, true
 }
 

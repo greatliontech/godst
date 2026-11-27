@@ -896,6 +896,16 @@ func (g *rootGen) step() {
 			g.add(rootOpenFile(0, esc, os.O_RDONLY, 0, false))
 		case 1:
 			g.add(rootMkdirAll(0, esc, 0o755))
+			// MkdirAll walks component-wise and creates a missing leading pool
+			// directory ("d1", "d2") before rejecting the subsequent ".." escape.
+			if head, _, ok := strings.Cut(esc, "/"); ok && head != "" && head != "." && head != ".." {
+				for j, q := range rootPathPool {
+					if q == head && g.kind[j] == 0 {
+						g.kind[j] = 'd'
+						g.permCreate[j] = true
+					}
+				}
+			}
 		case 2:
 			g.add(rootStat(0, esc, g.rng.IntN(2) == 0, false))
 		case 3:

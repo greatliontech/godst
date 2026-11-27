@@ -550,6 +550,28 @@ func fsFlock(slot, how int, label string) op {
 	}
 }
 
+func fsOFDFlock(slot, cmd int, lk syscall.Flock_t, label string) op {
+	return op{
+		name: fmt.Sprintf("ofdflock(slot %d, %s)", slot, label),
+		run: func(w *world) outcome {
+			f := slotFile(w, slot)
+			if f == nil {
+				return outcome{Err: nilSlot, N: -1}
+			}
+			q := lk
+			err := syscall.FcntlFlock(f.Fd(), cmd, &q)
+			if err != nil {
+				return outcome{Err: errClass(err), N: -1}
+			}
+			var state string
+			if cmd == 36 { // F_OFD_GETLK
+				state = fmt.Sprintf("type=%d whence=%d start=%d len=%d pid=%d", q.Type, q.Whence, q.Start, q.Len, q.Pid)
+			}
+			return outcome{N: -1, State: state}
+		},
+	}
+}
+
 // fsMmapProbe maps the slot's file MAP_SHARED read-only and hashes the
 // mapped bytes: the page-cache identity probe.
 func fsMmapProbe(slot, length int) op {
@@ -739,7 +761,7 @@ func fsAllowlist() []allowEntry {
 			key:  "fs-rawfd-fence-loud",
 			cite: `design.md §In-memory deterministic filesystem (the virtual-fd paragraph): "Fd() on a CLOSED simulated file reports -1 ... so a raw syscall naming that -1 meets the raw boundary's fence (the loud unsupported refusal) where the host kernel answers EBADF for a closed real descriptor: a deliberate loud-refusal divergence"`,
 			match: func(o op, host, sim outcome) bool {
-				return (strings.HasPrefix(o.name, "fdatasync-") || strings.HasPrefix(o.name, "flock(")) &&
+				return (strings.HasPrefix(o.name, "fdatasync-") || strings.HasPrefix(o.name, "flock(") || strings.HasPrefix(o.name, "ofdflock(")) &&
 					host.Err == "errno:EBADF" && sim.Err == "panic:dst-unsupported"
 			},
 		},
@@ -918,6 +940,40 @@ func fsCoverageOps() []op {
 	add(fsFlock(fl2, syscall.LOCK_UN, "LOCK_UN"))
 	add(fsClose(fl2))
 
+	// OFD byte-range lock ladder: validation, coalescing, splitting, failed
+	// conversion retention, open-ended GETLK, flock independence, and close release.
+	const (
+		fOFDGetlk = 36
+		fOFDSetlk = 37
+	)
+	ofd1 := track(fsOpen("f1", os.O_RDWR, 0, true))
+	ofd2 := track(fsOpen("f1", os.O_RDWR, 0, true))
+	ofdRO := track(fsOpen("f1", os.O_RDONLY, 0, true))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_RDLCK, Pid: 1, Len: 4}, "pid!=0"))
+	add(fsOFDFlock(ofdRO, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Len: 4}, "wrlck-on-rdonly"))
+	add(fsOFDFlock(ofdRO, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: -1, Len: 4}, "ro-wrlck-neg-start"))
+	add(fsOFDFlock(ofdRO, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Pid: 1, Start: 1<<63 - 1, Len: 2}, "ro-pid1-overflow"))
+	add(fsOFDFlock(ofdRO, fOFDGetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Pid: 1, Start: 1<<63 - 1, Len: 2}, "getlk-pid1-overflow"))
+	add(fsOFDFlock(ofdRO, fOFDGetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 2, Start: -4, Len: 4}, "getlk-free-on-rdonly"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 0, Len: 10}, "wrlck-0-10"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 10, Len: 10}, "wrlck-10-20-coalesce"))
+	add(fsOFDFlock(ofd1, fOFDGetlk, syscall.Flock_t{Type: syscall.F_UNLCK, Start: 2, Len: 4}, "getlk-unlck-self"))
+	add(fsOFDFlock(ofd2, fOFDGetlk, syscall.Flock_t{Type: syscall.F_UNLCK, Whence: 2, Start: -4, Len: 4}, "getlk-unlck-peer"))
+	add(fsOFDFlock(ofd2, fOFDGetlk, syscall.Flock_t{Type: syscall.F_RDLCK, Start: 5, Len: 10}, "getlk-coalesced"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_RDLCK, Start: 5, Len: 10}, "split-downgrade-5-15"))
+	add(fsOFDFlock(ofd2, fOFDSetlk, syscall.Flock_t{Type: syscall.F_RDLCK, Start: 5, Len: 10}, "peer-rdlck-5-15"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 5, Len: 10}, "failed-upgrade-retains-rdlck"))
+	add(fsOFDFlock(ofd2, fOFDSetlk, syscall.Flock_t{Type: syscall.F_UNLCK, Start: 5, Len: 10}, "peer-unlck-5-15"))
+	add(fsOFDFlock(ofd2, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 5, Len: 10}, "peer-wrlck-blocked-by-retained-rdlck"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 0, Len: 0}, "wrlck-open-ended"))
+	add(fsOFDFlock(ofd1, fOFDSetlk, syscall.Flock_t{Type: syscall.F_UNLCK, Start: 0, Len: 8}, "unlck-prefix-0-8"))
+	add(fsOFDFlock(ofd2, fOFDGetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 0, Len: 16}, "getlk-open-tail"))
+	add(fsClose(ofd1))
+	add(fsOFDFlock(ofd2, fOFDSetlk, syscall.Flock_t{Type: syscall.F_WRLCK, Start: 8, Len: 8}, "acquire-after-ofd1-close"))
+	add(fsClose(ofd2))
+	add(fsClose(ofdRO))
+	add(fsOFDFlock(ofd2, fOFDSetlk, syscall.Flock_t{Type: syscall.F_UNLCK, Len: 4}, "closed-fd-fence"))
+
 	// Page-cache/mmap identity probe.
 	mm := track(fsOpen("mapped", os.O_RDWR|os.O_CREATE, 0o644, true))
 	add(fsWrite(mm, pat(4096, 9)))
@@ -1010,6 +1066,13 @@ type fsGenSlot struct {
 	writable bool
 	isDir    bool
 	closed   bool
+	// dirMutated marks an open directory handle whose child entry set may
+	// have changed after open(2): POSIX leaves post-opendir entry
+	// additions/removals unspecified (btrfs pins last_index at opendir and
+	// omits post-open creates, whereas tmpfs/ext4 and the sim surface
+	// them). Unmutated and IS_DEADDIR (rmdir'd) directory handles still
+	// exercise chunked Readdirnames.
+	dirMutated bool
 	// permCreate is the slot's OWN provenance snapshot: the node's perm
 	// is still its create-time request. Cleared when a chmod reaches the
 	// node through its current path; survives renames and unlinks (the
@@ -1056,6 +1119,18 @@ func (g *fsGen) parentIsDir(idx int) bool {
 		return true
 	}
 	return p >= 0 && g.kind[p] == 'd'
+}
+
+func (g *fsGen) markDirMutatedParent(idx int) {
+	p := fsParentIdx(fsPathPool[idx])
+	if p < 0 {
+		return
+	}
+	for s := range g.slots {
+		if g.slots[s].isDir && !g.slots[s].closed && g.slots[s].pathIdx == p {
+			g.slots[s].dirMutated = true
+		}
+	}
 }
 
 func (g *fsGen) add(o op)  { g.ops = append(g.ops, o) }
@@ -1107,6 +1182,7 @@ func (g *fsGen) step() {
 			if g.kind[idx] == 0 {
 				g.kind[idx] = 'f'
 				g.permCreate[idx] = true
+				g.markDirMutatedParent(idx)
 			}
 			acc := flag & 0x3
 			g.slots = append(g.slots, fsGenSlot{
@@ -1129,6 +1205,7 @@ func (g *fsGen) step() {
 				// (surfaced by the widened sweep, fs seed 13).
 				g.kind[idx] = 'f'
 				g.permCreate[idx] = true
+				g.markDirMutatedParent(idx)
 			}
 		}
 	case r < 40: // slot I/O
@@ -1155,7 +1232,11 @@ func (g *fsGen) step() {
 			case 2:
 				g.add(fsFstat(s, sl.permCreate))
 			case 3:
-				g.add(fsReaddirnamesChunks(s, 1+g.rng.IntN(3)))
+				if sl.dirMutated {
+					g.add(fsFstat(s, sl.permCreate))
+				} else {
+					g.add(fsReaddirnamesChunks(s, 1+g.rng.IntN(3)))
+				}
 			}
 			return
 		}
@@ -1203,6 +1284,7 @@ func (g *fsGen) step() {
 			if g.kind[idx] == 0 && g.parentIsDir(idx) {
 				g.kind[idx] = 'd'
 				g.permCreate[idx] = true
+				g.markDirMutatedParent(idx)
 			}
 		} else {
 			g.add(fsMkdirAll(rel, perm))
@@ -1212,6 +1294,7 @@ func (g *fsGen) step() {
 				if g.kind[j] == 0 && g.parentIsDir(j) {
 					g.kind[j] = 'd'
 					g.permCreate[j] = true
+					g.markDirMutatedParent(j)
 				}
 			}
 		}
@@ -1223,6 +1306,7 @@ func (g *fsGen) step() {
 			for j := range fsPathPool {
 				if j == idx || strings.HasPrefix(fsPathPool[j], rel+"/") {
 					if g.kind[j] != 0 {
+						g.markDirMutatedParent(j)
 						g.unlinkSlotsAt(j)
 					}
 				}
@@ -1231,6 +1315,7 @@ func (g *fsGen) step() {
 		} else {
 			g.add(fsRemove(rel))
 			if g.kind[idx] == 'f' {
+				g.markDirMutatedParent(idx)
 				g.unlinkSlotsAt(idx)
 				g.kind[idx] = 0
 			}
@@ -1259,6 +1344,8 @@ func (g *fsGen) step() {
 		switch g.kind[src] {
 		case 'f':
 			if src != dst && !slashOld && !slashNew && g.kind[dst] != 'd' && g.parentIsDir(dst) {
+				g.markDirMutatedParent(src)
+				g.markDirMutatedParent(dst)
 				if g.kind[dst] != 0 {
 					g.unlinkSlotsAt(dst) // the replaced node leaves the namespace
 				}
@@ -1274,6 +1361,8 @@ func (g *fsGen) step() {
 		case 'd':
 			dstInsideSrc := src == dst || strings.HasPrefix(fsPathPool[dst], fsPathPool[src]+"/")
 			if g.kind[dst] == 0 && g.parentIsDir(dst) && !dstInsideSrc {
+				g.markDirMutatedParent(src)
+				g.markDirMutatedParent(dst)
 				g.moveSubtree(src, dst)
 			}
 		}
